@@ -22,7 +22,7 @@ func NewStateManager(filePath string) (*StateManager, error) {
 	}
 
 	// Check for RESET_STATE environment variable
-	if os.Getenv("RESET_STATE") != "" {
+	if os.Getenv("RESET_STATE") == "true" || os.Getenv("RESET_STATE") == "1" {
 		log.Println("RESET_STATE environment variable detected, creating fresh state")
 		return sm, sm.saveState()
 	}

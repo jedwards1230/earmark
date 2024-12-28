@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"transcriber/internal/config"
 	"transcriber/internal/queue"
@@ -170,7 +171,11 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		threads = "1"
 	}
 
-	cmd := exec.Command(
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(t.ctx, 2*time.Hour)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx,
 		"whisper-ctranslate2",
 		preprocessedPath,
 		"--model", t.config.WhisperModel,
@@ -188,12 +193,52 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		"--verbose", fmt.Sprintf("%v", t.config.Debug),
 	)
 
-	var stderr bytes.Buffer
-	cmd.Stdout = os.Stdout
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	// Set process group for proper cleanup
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		customLog.Printf("Failed to start transcription: %s (%v)", shortPath, err)
+		return
+	}
+
+	// Handle process cleanup on context cancellation
+	go func() {
+		<-ctx.Done()
+		if ctx.Err() == context.DeadlineExceeded {
+			customLog.Printf("Transcription timeout for: %s", shortPath)
+		}
+		// Kill process group
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}()
+
+	err = cmd.Wait()
+
+	// Log output regardless of error
+	if t.config.Debug {
+		if stdout.Len() > 0 {
+			customLog.Printf("Whisper stdout:\n%s", stdout.String())
+		}
+		if stderr.Len() > 0 {
+			customLog.Printf("Whisper stderr:\n%s", stderr.String())
+		}
+	}
+
+	if err != nil {
 		customLog.Printf("Transcription failed: %s (%v)", shortPath, err)
+		if stderr.Len() > 0 {
+			customLog.Printf("Error output:\n%s", stderr.String())
+		}
+		return
+	}
+
+	// Verify output file exists
+	outputFile := filepath.Join(outputDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
+	if _, err := os.Stat(outputFile); os.IsNotExist(err) {
+		customLog.Printf("Transcription failed: output file not created for %s", shortPath)
 		return
 	}
 
@@ -211,11 +256,32 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 }
 
 func checkDependencies() error {
+	// Check for Python
+	pythonCmd := exec.Command("python3", "--version")
+	if err := pythonCmd.Run(); err != nil {
+		pythonCmd = exec.Command("python", "--version")
+		if err := pythonCmd.Run(); err != nil {
+			return fmt.Errorf("python not found: %w", err)
+		}
+	}
+
+	// Check for pip
+	pipCmd := exec.Command("pip3", "--version")
+	if err := pipCmd.Run(); err != nil {
+		pipCmd = exec.Command("pip", "--version")
+		if err := pipCmd.Run(); err != nil {
+			return fmt.Errorf("pip not found: %w", err)
+		}
+	}
+
+	// Check whisper-ctranslate2
 	if err := checkAndInstallWhisperCtranslate2(); err != nil {
 		return fmt.Errorf("whisper-ctranslate2 check failed: %w", err)
 	}
 
-	_, err := exec.LookPath("ffmpeg")
+	// Check ffmpeg with version
+	ffmpegCmd := exec.Command("ffmpeg", "-version")
+	_, err := ffmpegCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("ffmpeg is not installed: %w", err)
 	}
@@ -330,17 +396,27 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 }
 
 func checkAndInstallWhisperCtranslate2() error {
-	// Check if whisper-ctranslate2 is installed
-	_, err := exec.LookPath("whisper-ctranslate2")
-	if err == nil {
+	// Try to get version first
+	versionCmd := exec.Command("whisper-ctranslate2", "--version")
+	if err := versionCmd.Run(); err == nil {
 		return nil
 	}
 
 	// Attempt to install whisper-ctranslate2 using pip
 	customLog.Println("Installing whisper-ctranslate2...")
-	cmd := exec.Command("pip", "install", "-U", "whisper-ctranslate2")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to install whisper-ctranslate2: %v", err)
+	installCmd := exec.Command("pip", "install", "-U", "whisper-ctranslate2")
+
+	var stderr bytes.Buffer
+	installCmd.Stderr = &stderr
+
+	if err := installCmd.Run(); err != nil {
+		return fmt.Errorf("failed to install whisper-ctranslate2: %v\nError output: %s", err, stderr.String())
+	}
+
+	// Verify installation
+	versionCmd = exec.Command("whisper-ctranslate2", "--version")
+	if err := versionCmd.Run(); err != nil {
+		return fmt.Errorf("whisper-ctranslate2 installation verification failed: %w", err)
 	}
 
 	return nil
