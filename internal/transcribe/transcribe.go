@@ -246,21 +246,24 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 		return "", fmt.Errorf("unable to determine relative path: %w", err)
 	}
 
-	// Build cached file path using the same structure and filename
-	cachedPath := filepath.Join(t.config.CacheDir, relPath)
+	// Build cached file path using the same structure but with .mp3 extension
+	cachedPath := filepath.Join(t.config.CacheDir, strings.TrimSuffix(relPath, filepath.Ext(relPath))+".mp3")
 	if err := os.MkdirAll(filepath.Dir(cachedPath), 0755); err != nil {
 		return "", fmt.Errorf("failed to create cache directories: %w", err)
 	}
 
-	// Improved ffmpeg settings for better compression
+	// Only process audio stream, ignore video/cover art
 	cmd := exec.Command(
 		"ffmpeg",
 		"-i", audioFilePath,
+		"-vn", // Skip video streams
 		"-c:a", "libmp3lame",
 		"-b:a", "32k", // Reduced bitrate
 		"-ac", "1", // Mono
 		"-ar", "16000", // Sample rate
 		"-compression_level", "9", // Max compression
+		"-map", "0:a:0", // Only map the first audio stream
+		"-f", "mp3", // Force MP3 format
 		"-y", // Overwrite output files
 		cachedPath,
 	)
@@ -284,11 +287,13 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 		cmd = exec.Command(
 			"ffmpeg",
 			"-i", audioFilePath,
+			"-vn", // Skip video streams
 			"-c:a", "libmp3lame",
 			"-b:a", "24k", // Even lower bitrate
 			"-ac", "1", // Mono
 			"-ar", "16000", // Sample rate
 			"-compression_level", "9",
+			"-map", "0:a:0", // Only map the first audio stream
 			"-y",
 			cachedPath,
 		)
