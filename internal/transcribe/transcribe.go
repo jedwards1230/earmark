@@ -7,11 +7,21 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 	"transcriber/internal/config"
 	"transcriber/internal/queue"
 	"transcriber/internal/state"
 )
+
+// Create custom logger without timestamps
+var customLog = log.New(os.Stdout, "", 0)
+
+func init() {
+	// Replace default logger with custom logger
+	log.SetFlags(0)
+}
 
 type Transcriber struct {
 	config       *config.Config
@@ -23,8 +33,13 @@ type Transcriber struct {
 }
 
 func NewTranscriber(cfg *config.Config, sm *state.StateManager, q *queue.Queue) *Transcriber {
-	if err := checkAndInstallWhisperCtranslate2(); err != nil {
-		log.Fatalf("Error checking or installing whisper-ctranslate2: %v", err)
+	if err := checkDependencies(); err != nil {
+		log.Fatalf("Error checking dependencies: %v", err)
+	}
+
+	// Clear cache directory on startup
+	if err := clearCacheDir(cfg.CacheDir); err != nil {
+		log.Fatalf("Error clearing cache directory: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -40,17 +55,17 @@ func NewTranscriber(cfg *config.Config, sm *state.StateManager, q *queue.Queue) 
 }
 
 func (t *Transcriber) StartWorker() {
-	log.Println("Starting transcription worker...")
+	customLog.Println("Starting worker...")
 	for {
 		select {
 		case <-t.ctx.Done():
-			log.Println("Transcriber context canceled, exiting worker.")
+			customLog.Println("Transcriber context canceled, exiting worker.")
 			close(t.done)
 			return
 		default:
 			audioFilePath, ok := t.queue.Dequeue()
 			if !ok {
-				log.Println("Queue shutdown signal received, exiting worker.")
+				customLog.Println("Queue shutdown signal received, exiting worker.")
 				close(t.done)
 				return
 			}
@@ -62,7 +77,7 @@ func (t *Transcriber) StartWorker() {
 
 			// Process files sequentially
 			t.transcribeAudio(audioFilePath)
-			log.Printf("Finished processing file: %s", audioFilePath)
+			customLog.Printf("Finished processing file: %s", audioFilePath)
 		}
 	}
 }
@@ -110,24 +125,43 @@ func formatFileSize(size int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
 }
 
+func shortenPath(path string) string {
+	// Remove common prefixes like absolute paths and 'audiobooks/'
+	if idx := strings.Index(path, "/audiobooks/"); idx != -1 {
+		return path[idx+len("/audiobooks/"):]
+	}
+	return filepath.Base(path)
+}
+
 func (t *Transcriber) transcribeAudio(audioFilePath string) {
+	shortPath := shortenPath(audioFilePath)
+
 	if t.stateManager.IsProcessed(audioFilePath) {
-		log.Printf("Skipping already processed file: %s", audioFilePath)
+		customLog.Printf("Skipping already processed: %s", shortPath)
 		return
 	}
 
-	fileInfo, err := os.Stat(audioFilePath)
+	// Preprocess audio
+	preprocessedPath, err := t.preprocessAudio(audioFilePath)
 	if err != nil {
-		log.Printf("Failed to get file info: %v", err)
+		customLog.Printf("Failed to preprocess: %s (%v)", shortPath, err)
 		return
 	}
-	log.Printf("Transcribing: %s (Size: %s)", audioFilePath, formatFileSize(fileInfo.Size()))
+	defer os.Remove(preprocessedPath)
+
+	fileInfo, err := os.Stat(preprocessedPath)
+	if err != nil {
+		customLog.Printf("Failed to get file info: %s (%v)", shortPath, err)
+		return
+	}
+
+	customLog.Printf("Processing: %s (%s)", shortPath, formatFileSize(fileInfo.Size()))
 
 	// Get the relative path and create output directory
 	relativePath := t.getRelativePath(audioFilePath)
 	outputDir, err := t.ensureOutputDir(relativePath)
 	if err != nil {
-		log.Printf("Failed to create output directory: %v", err)
+		customLog.Printf("Failed to create output directory: %v", err)
 		return
 	}
 
@@ -138,7 +172,7 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 
 	cmd := exec.Command(
 		"whisper-ctranslate2",
-		audioFilePath,
+		preprocessedPath,
 		"--model", t.config.WhisperModel,
 		"--compute_type", "float32",
 		"--language", "en",
@@ -151,6 +185,7 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		"--batch_size", "16",
 		"--threads", threads,
 		"--initial_prompt", "", // https://cookbook.openai.com/examples/whisper_prompting_guide
+		"--verbose", fmt.Sprintf("%v", t.config.Debug),
 	)
 
 	var stderr bytes.Buffer
@@ -158,38 +193,150 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		log.Printf("Failed to run transcription command: %v\nStderr: %s", err, stderr.String())
+		customLog.Printf("Transcription failed: %s (%v)", shortPath, err)
 		return
 	}
 
 	if _, err := os.Stat(audioFilePath); os.IsNotExist(err) {
-		log.Printf("Audio file not found: %s", audioFilePath)
+		customLog.Printf("Audio file not found: %s", audioFilePath)
 		return
 	}
 
 	if err := t.stateManager.MarkProcessed(audioFilePath); err != nil {
-		log.Printf("Failed to mark file as processed: %v", err)
+		customLog.Printf("Failed to mark as processed: %s (%v)", shortPath, err)
 		return
 	}
-	log.Printf("Transcription completed for %s", audioFilePath)
+
+	customLog.Printf("✓ Completed: %s", shortPath)
+}
+
+func checkDependencies() error {
+	if err := checkAndInstallWhisperCtranslate2(); err != nil {
+		return fmt.Errorf("whisper-ctranslate2 check failed: %w", err)
+	}
+
+	_, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return fmt.Errorf("ffmpeg is not installed: %w", err)
+	}
+
+	return nil
+}
+
+func clearCacheDir(cacheDir string) error {
+	if err := os.RemoveAll(cacheDir); err != nil {
+		return err
+	}
+	return os.MkdirAll(cacheDir, 0755)
+}
+
+func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
+	shortPath := shortenPath(audioFilePath)
+
+	// Get original file size
+	originalInfo, err := os.Stat(audioFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to get original file info: %w", err)
+	}
+	originalSize := originalInfo.Size()
+
+	// Compute relative path from AudioDir
+	relPath, err := filepath.Rel(t.config.AudioDir, audioFilePath)
+	if err != nil {
+		return "", fmt.Errorf("unable to determine relative path: %w", err)
+	}
+
+	// Build cached file path using the same structure and filename
+	cachedPath := filepath.Join(t.config.CacheDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(cachedPath), 0755); err != nil {
+		return "", fmt.Errorf("failed to create cache directories: %w", err)
+	}
+
+	// Improved ffmpeg settings for better compression
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i", audioFilePath,
+		"-c:a", "libmp3lame",
+		"-b:a", "32k", // Reduced bitrate
+		"-ac", "1", // Mono
+		"-ar", "16000", // Sample rate
+		"-compression_level", "9", // Max compression
+		"-y", // Overwrite output files
+		cachedPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to preprocess audio: %w\nffmpeg error: %s", err, stderr.String())
+	}
+
+	// Check processed file size
+	fileInfo, err := os.Stat(cachedPath)
+	if err != nil {
+		return "", err
+	}
+	processedSize := fileInfo.Size()
+
+	// If processed file is larger, try with even more aggressive compression
+	if processedSize > originalSize {
+		cmd = exec.Command(
+			"ffmpeg",
+			"-i", audioFilePath,
+			"-c:a", "libmp3lame",
+			"-b:a", "24k", // Even lower bitrate
+			"-ac", "1", // Mono
+			"-ar", "16000", // Sample rate
+			"-compression_level", "9",
+			"-y",
+			cachedPath,
+		)
+
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("failed to reprocess audio: %w", err)
+		}
+
+		fileInfo, err = os.Stat(cachedPath)
+		if err != nil {
+			return "", err
+		}
+		processedSize = fileInfo.Size()
+	}
+
+	// Calculate size reduction percentage
+	reductionPct := float64(originalSize-processedSize) / float64(originalSize) * 100
+
+	customLog.Printf("Converting: %s", shortPath)
+	customLog.Printf("  Size: %s → %s (%+.1f%%)",
+		formatFileSize(originalSize),
+		formatFileSize(processedSize),
+		reductionPct)
+
+	if processedSize > 500*1024*1024 {
+		customLog.Printf("  Warning: Output still exceeds 500MB")
+	}
+
+	if t.config.Debug {
+		customLog.Printf("ffmpeg output file: %s", cachedPath)
+	}
+
+	return cachedPath, nil
 }
 
 func checkAndInstallWhisperCtranslate2() error {
 	// Check if whisper-ctranslate2 is installed
 	_, err := exec.LookPath("whisper-ctranslate2")
 	if err == nil {
-		log.Println("whisper-ctranslate2 is already installed.")
 		return nil
 	}
 
 	// Attempt to install whisper-ctranslate2 using pip
-	log.Println("whisper-ctranslate2 is not installed. Attempting to install it using pip...")
+	customLog.Println("Installing whisper-ctranslate2...")
 	cmd := exec.Command("pip", "install", "-U", "whisper-ctranslate2")
-	installOutput, installErr := cmd.CombinedOutput()
-	if installErr != nil {
-		return fmt.Errorf("failed to install whisper-ctranslate2: %v\nOutput: %s", installErr, string(installOutput))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to install whisper-ctranslate2: %v", err)
 	}
 
-	log.Println("whisper-ctranslate2 installed successfully.")
 	return nil
 }

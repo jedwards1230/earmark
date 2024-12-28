@@ -17,6 +17,9 @@ type Config struct {
 	StateFile string `json:"state_file"`
 	// WhisperModel should be an absolute path to the model file
 	WhisperModel string `json:"whisper_model"`
+	// CacheDir should be an absolute path to the directory for caching
+	CacheDir string `json:"cache_dir"`
+	Debug    bool   `json:"debug"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -50,6 +53,9 @@ func (c *Config) initializePaths() error {
 	c.AudioDir = resolveAndCreatePath(cwd, c.AudioDir)
 	c.ModelsDir = resolveAndCreatePath(cwd, c.ModelsDir)
 	c.OutputDir = resolveAndCreatePath(cwd, c.OutputDir)
+	c.CacheDir = resolveAndCreatePath(cwd, c.CacheDir)
+
+	c.Debug = os.Getenv("WHISPER_DEBUG") == "1" || c.Debug
 
 	// Resolve StateFile path (don't create directory yet)
 	if !filepath.IsAbs(c.StateFile) {

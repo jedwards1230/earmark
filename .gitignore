@@ -2,5 +2,6 @@ transcriptions/
 models/
 audiobooks/
 data/
+cache/
 
 .DS_Store

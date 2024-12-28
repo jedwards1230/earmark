@@ -10,6 +10,9 @@ services:
             - ./config.json:/config.json
             - ./audiobooks:/audiobooks
             - ./data:/data
-            - ./models:/models
+            - models:/models
             - ./transcriptions:/transcriptions
         restart: unless-stopped
+
+volumes:
+    models:

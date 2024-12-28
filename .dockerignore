@@ -2,3 +2,4 @@ audiobooks/
 data/
 transcriptions/
 models/
+cache/

@@ -49,50 +49,24 @@ func isAudioFile(filename string) bool {
 
 // Add new method to scan existing files
 func (fm *FileMonitor) scanExistingFiles() error {
-	log.Println("Scanning for existing audio files...")
-	rootDir := fm.config.AudioDir
-	fm.foundFiles = make([]string, 0)
-
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+	var foundFiles []string
+	err := filepath.Walk(fm.config.AudioDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return fmt.Errorf("failed to access path %s: %w", path, err)
+			return err
 		}
-
-		if info.IsDir() {
-			return nil
+		if isAudioFile(info.Name()) {
+			foundFiles = append(foundFiles, strings.TrimPrefix(path, fm.config.AudioDir+"/"))
 		}
-
-		if !isAudioFile(path) {
-			return nil
-		}
-
-		relPath, err := filepath.Rel(rootDir, path)
-		if err != nil {
-			log.Printf("Error getting relative path for %s: %v", path, err)
-			return nil
-		}
-
-		fm.foundFiles = append(fm.foundFiles, path)
-		log.Printf("Found existing audio file: %s", relPath)
 		return nil
 	})
-
 	if err != nil {
 		return err
 	}
 
-	// Print summary of found files
-	log.Printf("\nFound %d audio files:", len(fm.foundFiles))
-	for _, file := range fm.foundFiles {
-		relPath, _ := filepath.Rel(rootDir, file)
-		log.Printf("- %s", relPath)
-	}
-	log.Println("\nBeginning transcription process...")
-
-	// Now enqueue files for processing
-	for _, file := range fm.foundFiles {
-		if !fm.stateManager.IsProcessed(file) {
-			fm.queue.Enqueue(file)
+	if len(foundFiles) > 0 {
+		log.Printf("Found %d existing audio files:", len(foundFiles))
+		for _, file := range foundFiles {
+			fm.queue.Enqueue(filepath.Join(fm.config.AudioDir, file))
 		}
 	}
 
