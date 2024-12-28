@@ -11,7 +11,6 @@ RUN go build -o /transcriber ./cmd/main.go
 FROM python:3.9-slim
 
 WORKDIR /
-COPY --from=builder /transcriber /transcriber
 
 RUN apt-get update && apt-get install -y \
     gcc g++ make cmake \
@@ -25,5 +24,7 @@ ENV PYTHONPATH="$VIRTUAL_ENV/lib/python3.9/site-packages:$PYTHONPATH"
 
 RUN pip install --no-cache-dir --upgrade pip wheel setuptools
 RUN pip install --no-cache-dir ctranslate2 whisper-ctranslate2
+
+COPY --from=builder /transcriber /transcriber
 
 ENTRYPOINT ["/transcriber"]

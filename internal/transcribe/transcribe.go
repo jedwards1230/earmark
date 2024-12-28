@@ -97,13 +97,31 @@ func (t *Transcriber) ensureOutputDir(relativePath string) (string, error) {
 	return fullOutputDir, nil
 }
 
+func formatFileSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
 func (t *Transcriber) transcribeAudio(audioFilePath string) {
 	if t.stateManager.IsProcessed(audioFilePath) {
 		log.Printf("Skipping already processed file: %s", audioFilePath)
 		return
 	}
 
-	log.Printf("Transcribing: %s", audioFilePath)
+	fileInfo, err := os.Stat(audioFilePath)
+	if err != nil {
+		log.Printf("Failed to get file info: %v", err)
+		return
+	}
+	log.Printf("Transcribing: %s (Size: %s)", audioFilePath, formatFileSize(fileInfo.Size()))
 
 	// Get the relative path and create output directory
 	relativePath := t.getRelativePath(audioFilePath)
