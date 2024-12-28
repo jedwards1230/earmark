@@ -31,30 +31,35 @@ func NewFileMonitor(cfg *config.Config, q *queue.Queue, sm *state.StateManager) 
 // Add new method to scan existing files
 func (fm *FileMonitor) scanExistingFiles() error {
 	log.Println("Scanning for existing audio files...")
-	entries, err := os.ReadDir(fm.config.AudioDir)
-	if err != nil {
-		return fmt.Errorf("failed to read directory: %w", err)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		filePath := filepath.Join(fm.config.AudioDir, entry.Name())
-		if filepath.Ext(filePath) == ".txt" {
-			continue
+	rootDir := fm.config.AudioDir
+	return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return fmt.Errorf("failed to access path %s: %w", path, err)
 		}
 
-		log.Printf("Found existing file: %s", filePath)
-		if !fm.stateManager.IsProcessed(filePath) {
-			fm.queue.Enqueue(filePath)
+		if info.IsDir() {
+			return nil
 		}
-	}
-	return nil
+
+		if filepath.Ext(path) == ".txt" {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(rootDir, path)
+		if err != nil {
+			log.Printf("Error getting relative path for %s: %v", path, err)
+			return nil
+		}
+
+		log.Printf("Found existing file: %s", relPath)
+		if !fm.stateManager.IsProcessed(path) {
+			fm.queue.Enqueue(path)
+		}
+		return nil
+	})
 }
 
 func (fm *FileMonitor) Start() {
-	// Scan existing files before starting the watcher
 	log.Println("Starting file monitor...")
 
 	if err := fm.scanExistingFiles(); err != nil {
@@ -67,12 +72,12 @@ func (fm *FileMonitor) Start() {
 	}
 	defer watcher.Close()
 
-	err = watcher.Add(fm.config.AudioDir)
-	if err != nil {
-		log.Fatalf("Failed to add directory to watcher: %v", err)
+	// Watch the root directory and recursively add all subdirectories
+	if err := fm.addDirAndSubDirs(watcher, fm.config.AudioDir); err != nil {
+		log.Fatalf("Failed to set up directory watchers: %v", err)
 	}
 
-	log.Printf("Monitoring directory: %s", fm.config.AudioDir)
+	log.Printf("Monitoring root directory: %s", fm.config.AudioDir)
 
 	for {
 		select {
@@ -81,7 +86,15 @@ func (fm *FileMonitor) Start() {
 				return
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
-				go fm.handleFileCreate(event.Name)
+				// Check if the created item is a directory
+				info, err := os.Stat(event.Name)
+				if err == nil && info.IsDir() {
+					if err := fm.addDirAndSubDirs(watcher, event.Name); err != nil {
+						log.Printf("Error adding new directory to watcher: %v", err)
+					}
+				} else {
+					go fm.handleFileCreate(event.Name)
+				}
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -90,6 +103,21 @@ func (fm *FileMonitor) Start() {
 			log.Println("File watcher error:", err)
 		}
 	}
+}
+
+// Helper function to add a directory and all its subdirectories to the watcher
+func (fm *FileMonitor) addDirAndSubDirs(watcher *fsnotify.Watcher, root string) error {
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if err := watcher.Add(path); err != nil {
+				return fmt.Errorf("failed to watch directory %s: %w", path, err)
+			}
+		}
+		return nil
+	})
 }
 
 func (fm *FileMonitor) handleFileCreate(filePath string) {

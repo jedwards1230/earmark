@@ -67,6 +67,36 @@ func (t *Transcriber) StartWorker() {
 	}
 }
 
+func (t *Transcriber) getRelativePath(audioFilePath string) string {
+	// Find the "audiobooks" directory in the path
+	audioBooksIndex := bytes.LastIndex([]byte(audioFilePath), []byte("/audiobooks/"))
+	if audioBooksIndex == -1 {
+		return "" // Return empty if "audiobooks" not found
+	}
+
+	// Get everything after "audiobooks/"
+	relativePath := audioFilePath[audioBooksIndex+len("/audiobooks/"):]
+	// Get the directory part of the relative path
+	lastSlash := bytes.LastIndex([]byte(relativePath), []byte("/"))
+	if lastSlash == -1 {
+		return ""
+	}
+	return relativePath[:lastSlash]
+}
+
+func (t *Transcriber) ensureOutputDir(relativePath string) (string, error) {
+	fullOutputDir := t.config.OutputDir
+	if relativePath != "" {
+		fullOutputDir = fmt.Sprintf("%s/%s", t.config.OutputDir, relativePath)
+	}
+
+	err := os.MkdirAll(fullOutputDir, 0755)
+	if err != nil {
+		return "", fmt.Errorf("failed to create output directory: %v", err)
+	}
+	return fullOutputDir, nil
+}
+
 func (t *Transcriber) transcribeAudio(audioFilePath string) {
 	if t.stateManager.IsProcessed(audioFilePath) {
 		log.Printf("Skipping already processed file: %s", audioFilePath)
@@ -75,7 +105,19 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 
 	log.Printf("Transcribing: %s", audioFilePath)
 
+	// Get the relative path and create output directory
+	relativePath := t.getRelativePath(audioFilePath)
+	outputDir, err := t.ensureOutputDir(relativePath)
+	if err != nil {
+		log.Printf("Failed to create output directory: %v", err)
+		return
+	}
+
 	threads := os.Getenv("WHISPER_THREADS")
+	if threads == "" {
+		threads = "1"
+	}
+
 	cmd := exec.Command(
 		"whisper-ctranslate2",
 		audioFilePath,
@@ -83,7 +125,8 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		"--compute_type", "float32",
 		"--language", "en",
 		"--beam_size", "5",
-		"--output_dir", t.config.OutputDir,
+		"--output_dir", outputDir,
+		"--model_dir", t.config.ModelsDir,
 		"--output_format", "txt",
 		"--vad_filter", "True", // Voice Activity Detection - On by default when batched is True
 		"--batched", "True",

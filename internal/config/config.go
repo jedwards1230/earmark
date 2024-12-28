@@ -9,6 +9,8 @@ import (
 type Config struct {
 	// AudioDir should be an absolute path to the directory containing audio files
 	AudioDir string `json:"audio_dir"`
+	// ModelsDir should be an absolute path to the directory containing models
+	ModelsDir string `json:"models_dir"`
 	// OutputDir should be an absolute path to the directory where transcriptions will be saved
 	OutputDir string `json:"output_dir"`
 	// StateFile can be a relative path from the working directory, or an absolute path
@@ -46,7 +48,7 @@ func (c *Config) initializePaths() error {
 	}
 
 	c.AudioDir = resolveAndCreatePath(cwd, c.AudioDir)
-
+	c.ModelsDir = resolveAndCreatePath(cwd, c.ModelsDir)
 	c.OutputDir = resolveAndCreatePath(cwd, c.OutputDir)
 
 	// Resolve StateFile path (don't create directory yet)
