@@ -1,0 +1,6 @@
+transcriptions/
+models/
+audiobooks/
+data/
+
+.DS_Store

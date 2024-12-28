@@ -1,0 +1,14 @@
+services:
+    audio-processor:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        environment:
+            - RESET_STATE=false
+            - WHISPER_THREADS=1
+        volumes:
+            - ./config.json:/config.json
+            - ./audiobooks:/audiobooks
+            - ./data:/data
+            - ./transcriptions:/transcriptions
+        restart: unless-stopped
