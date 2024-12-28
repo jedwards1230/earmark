@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -134,8 +135,25 @@ func shortenPath(path string) string {
 	return filepath.Base(path)
 }
 
+func countWords(path string) (int, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	re := regexp.MustCompile(`\S+`)
+	return len(re.FindAll(content, -1)), nil
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
+}
+
 func (t *Transcriber) transcribeAudio(audioFilePath string) {
 	shortPath := shortenPath(audioFilePath)
+	startTime := time.Now()
 
 	if t.stateManager.IsProcessed(audioFilePath) {
 		customLog.Printf("Skipping already processed: %s", shortPath)
@@ -156,7 +174,8 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		return
 	}
 
-	customLog.Printf("Processing: %s (%s)", shortPath, formatFileSize(fileInfo.Size()))
+	inputSize := fileInfo.Size()
+	customLog.Printf("▶ Processing: %s (%s)", shortPath, formatFileSize(inputSize))
 
 	// Get the relative path and create output directory
 	relativePath := t.getRelativePath(audioFilePath)
@@ -179,7 +198,7 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		"whisper-ctranslate2",
 		preprocessedPath,
 		"--model", t.config.WhisperModel,
-		"--compute_type", "float32",
+		"--compute_type", "int8",
 		"--language", "en",
 		"--beam_size", "5",
 		"--output_dir", outputDir,
@@ -189,7 +208,7 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		"--batched", "True",
 		"--batch_size", "16",
 		"--threads", threads,
-		"--initial_prompt", "", // https://cookbook.openai.com/examples/whisper_prompting_guide
+		"--initial_prompt", fmt.Sprintf("Transcribe from %s", shortPath), // https://cookbook.openai.com/examples/whisper_prompting_guide
 		"--verbose", fmt.Sprintf("%v", t.config.Debug),
 	)
 
@@ -252,7 +271,24 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		return
 	}
 
-	customLog.Printf("✓ Completed: %s", shortPath)
+	// Get word count from output file
+	wordCount, err := countWords(outputFile)
+	if err != nil {
+		customLog.Printf("Failed to count words: %s (%v)", shortPath, err)
+		return
+	}
+	duration := time.Since(startTime)
+
+	// Calculate speed in KB/s instead of MB/s
+	kbPerSec := float64(inputSize) / 1024 / duration.Seconds()
+	wordsPerSec := float64(wordCount) / duration.Seconds()
+
+	customLog.Printf("✓ Done: %s [%s | %.1fKB/s | %.0fw/s]",
+		shortPath,
+		formatDuration(duration),
+		kbPerSec,
+		wordsPerSec,
+	)
 }
 
 func checkDependencies() error {
@@ -375,17 +411,16 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 		processedSize = fileInfo.Size()
 	}
 
-	// Calculate size reduction percentage
 	reductionPct := float64(originalSize-processedSize) / float64(originalSize) * 100
-
-	customLog.Printf("Converting: %s", shortPath)
-	customLog.Printf("  Size: %s → %s (%+.1f%%)",
+	customLog.Printf("⚡ Converting: %s (%s → %s | -%d%%)",
+		shortPath,
 		formatFileSize(originalSize),
 		formatFileSize(processedSize),
-		reductionPct)
+		int(reductionPct),
+	)
 
 	if processedSize > 500*1024*1024 {
-		customLog.Printf("  Warning: Output still exceeds 500MB")
+		customLog.Printf("  ⚠ Output exceeds 500MB")
 	}
 
 	if t.config.Debug {
