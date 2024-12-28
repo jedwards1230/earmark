@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"transcriber/internal/config"
@@ -18,6 +19,7 @@ type FileMonitor struct {
 	config       *config.Config
 	queue        *queue.Queue
 	stateManager *state.StateManager
+	foundFiles   []string
 }
 
 func NewFileMonitor(cfg *config.Config, q *queue.Queue, sm *state.StateManager) *FileMonitor {
@@ -28,11 +30,30 @@ func NewFileMonitor(cfg *config.Config, q *queue.Queue, sm *state.StateManager) 
 	}
 }
 
+// Add constant for supported audio extensions
+var supportedAudioExtensions = map[string]bool{
+	".mp3":  true,
+	".wav":  true,
+	".m4a":  true,
+	".m4b":  true,
+	".ogg":  true,
+	".flac": true,
+	".aac":  true,
+	".wma":  true,
+}
+
+func isAudioFile(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	return supportedAudioExtensions[ext]
+}
+
 // Add new method to scan existing files
 func (fm *FileMonitor) scanExistingFiles() error {
 	log.Println("Scanning for existing audio files...")
 	rootDir := fm.config.AudioDir
-	return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+	fm.foundFiles = make([]string, 0)
+
+	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return fmt.Errorf("failed to access path %s: %w", path, err)
 		}
@@ -41,7 +62,7 @@ func (fm *FileMonitor) scanExistingFiles() error {
 			return nil
 		}
 
-		if filepath.Ext(path) == ".txt" {
+		if !isAudioFile(path) {
 			return nil
 		}
 
@@ -51,12 +72,31 @@ func (fm *FileMonitor) scanExistingFiles() error {
 			return nil
 		}
 
-		log.Printf("Found existing file: %s", relPath)
-		if !fm.stateManager.IsProcessed(path) {
-			fm.queue.Enqueue(path)
-		}
+		fm.foundFiles = append(fm.foundFiles, path)
+		log.Printf("Found existing audio file: %s", relPath)
 		return nil
 	})
+
+	if err != nil {
+		return err
+	}
+
+	// Print summary of found files
+	log.Printf("\nFound %d audio files:", len(fm.foundFiles))
+	for _, file := range fm.foundFiles {
+		relPath, _ := filepath.Rel(rootDir, file)
+		log.Printf("- %s", relPath)
+	}
+	log.Println("\nBeginning transcription process...")
+
+	// Now enqueue files for processing
+	for _, file := range fm.foundFiles {
+		if !fm.stateManager.IsProcessed(file) {
+			fm.queue.Enqueue(file)
+		}
+	}
+
+	return nil
 }
 
 func (fm *FileMonitor) Start() {
@@ -121,12 +161,11 @@ func (fm *FileMonitor) addDirAndSubDirs(watcher *fsnotify.Watcher, root string) 
 }
 
 func (fm *FileMonitor) handleFileCreate(filePath string) {
-	if filepath.Ext(filePath) == ".txt" {
-		log.Printf("Ignoring text file: %s", filePath)
+	if !isAudioFile(filePath) {
 		return
 	}
 
-	log.Printf("New file detected: %s", filePath)
+	log.Printf("New audio file detected: %s", filePath)
 
 	// Add a small delay to allow file creation to complete
 	time.Sleep(1 * time.Second)
@@ -134,6 +173,6 @@ func (fm *FileMonitor) handleFileCreate(filePath string) {
 	if !fm.stateManager.IsProcessed(filePath) {
 		fm.queue.Enqueue(filePath)
 	} else {
-		log.Printf("File already processed: %s", filePath)
+		log.Printf("Audio file already processed: %s", filePath)
 	}
 }
