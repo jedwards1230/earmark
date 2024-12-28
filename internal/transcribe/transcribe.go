@@ -1,6 +1,7 @@
 package transcribe
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -212,17 +213,45 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		"--verbose", fmt.Sprintf("%v", t.config.Debug),
 	)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Create pipes for stdout and stderr
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		customLog.Printf("Failed to create stdout pipe: %v", err)
+		return
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		customLog.Printf("Failed to create stderr pipe: %v", err)
+		return
+	}
 
-	// Set process group for proper cleanup
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
+	// Start the command
 	if err := cmd.Start(); err != nil {
 		customLog.Printf("Failed to start transcription: %s (%v)", shortPath, err)
 		return
 	}
+
+	// Create channels to signal when output processing is done
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+
+	// Process stdout in real-time
+	go func() {
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			customLog.Printf("Whisper stdout: %s", scanner.Text())
+		}
+		close(stdoutDone)
+	}()
+
+	// Process stderr in real-time
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			customLog.Printf("Whisper stderr: %s", scanner.Text())
+		}
+		close(stderrDone)
+	}()
 
 	// Handle process cleanup on context cancellation
 	go func() {
@@ -234,23 +263,13 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}()
 
+	// Wait for command to complete and output processing to finish
 	err = cmd.Wait()
-
-	// Log output regardless of error
-	if t.config.Debug {
-		if stdout.Len() > 0 {
-			customLog.Printf("Whisper stdout:\n%s", stdout.String())
-		}
-		if stderr.Len() > 0 {
-			customLog.Printf("Whisper stderr:\n%s", stderr.String())
-		}
-	}
+	<-stdoutDone
+	<-stderrDone
 
 	if err != nil {
 		customLog.Printf("Transcription failed: %s (%v)", shortPath, err)
-		if stderr.Len() > 0 {
-			customLog.Printf("Error output:\n%s", stderr.String())
-		}
 		return
 	}
 
