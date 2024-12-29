@@ -6,13 +6,15 @@ services:
         environment:
             - RESET_STATE=false
             - WHISPER_THREADS=2
+            - WHISPER_COMPUTE_TYPE=int8
         volumes:
             - ./config.json:/config.json
             - ./audiobooks:/audiobooks
-            - ./data:/data
-            - models:/models
             - ./transcriptions:/transcriptions
+            - data:/data
+            - models:/models
         restart: unless-stopped
 
 volumes:
+    data:
     models:

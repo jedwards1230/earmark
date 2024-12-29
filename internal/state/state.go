@@ -7,17 +7,28 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
+type ProcessingMetadata struct {
+	Processed      bool    `json:"processed"`
+	OriginalSize   int64   `json:"original_size"`
+	ProcessedSize  int64   `json:"processed_size"`
+	ProcessingTime float64 `json:"processing_time"`
+	ModelUsed      string  `json:"model_used"`
+	ComputeType    string  `json:"compute_type"`
+	ProcessedAt    string  `json:"processed_at"`
+}
+
 type StateManager struct {
-	state    map[string]bool
+	state    map[string]ProcessingMetadata
 	filePath string
 	mu       sync.RWMutex
 }
 
 func NewStateManager(filePath string) (*StateManager, error) {
 	sm := &StateManager{
-		state:    make(map[string]bool),
+		state:    make(map[string]ProcessingMetadata),
 		filePath: filePath,
 	}
 
@@ -65,6 +76,10 @@ func (sm *StateManager) loadState() error {
 }
 
 func (sm *StateManager) saveState() error {
+	if err := os.MkdirAll(filepath.Dir(sm.filePath), 0755); err != nil {
+		return fmt.Errorf("failed to create state directory: %w", err)
+	}
+
 	sm.mu.RLock() // Use RLock since we're only reading
 	data, err := json.MarshalIndent(sm.state, "", "  ")
 	sm.mu.RUnlock()
@@ -90,14 +105,25 @@ func (sm *StateManager) saveState() error {
 func (sm *StateManager) IsProcessed(filePath string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	return sm.state[filePath]
+	metadata, exists := sm.state[filePath]
+	return exists && metadata.Processed
 }
 
-func (sm *StateManager) MarkProcessed(filePath string) error {
+func (sm *StateManager) MarkProcessed(filePath string, originalSize, processedSize int64, processingTime float64, modelUsed string, compute_type string) error {
 	log.Printf("Marking %s as processed", filePath)
 
+	metadata := ProcessingMetadata{
+		Processed:      true,
+		OriginalSize:   originalSize,
+		ProcessedSize:  processedSize,
+		ProcessingTime: processingTime,
+		ModelUsed:      modelUsed,
+		ComputeType:    compute_type,
+		ProcessedAt:    time.Now().UTC().Format(time.RFC3339),
+	}
+
 	sm.mu.Lock()
-	sm.state[filePath] = true
+	sm.state[filePath] = metadata
 	sm.mu.Unlock()
 
 	// Save state after updating the map

@@ -179,6 +179,11 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		threads = "1"
 	}
 
+	compute_type := os.Getenv("WHISPER_COMPUTE_TYPE")
+	if compute_type == "" {
+		compute_type = "int8"
+	}
+
 	// Create a context with timeout
 	ctx, cancel := context.WithTimeout(t.ctx, 2*time.Hour)
 	defer cancel()
@@ -187,7 +192,7 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		"whisper-ctranslate2",
 		preprocessedPath,
 		"--model", t.config.WhisperModel,
-		"--compute_type", "int8",
+		"--compute_type", compute_type,
 		"--language", "en",
 		"--beam_size", "5",
 		"--output_dir", outputDir,
@@ -273,7 +278,23 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		return
 	}
 
-	if err := t.stateManager.MarkProcessed(audioFilePath); err != nil {
+	// Get the output file size
+	outputFileInfo, err := os.Stat(outputFile)
+	outputSize := int64(0)
+	if err == nil {
+		outputSize = outputFileInfo.Size()
+	}
+
+	processingTime := time.Since(startTime).Seconds()
+
+	if err := t.stateManager.MarkProcessed(
+		audioFilePath,
+		inputSize,
+		outputSize,
+		processingTime,
+		t.config.WhisperModel,
+		compute_type,
+	); err != nil {
 		customLog.Printf("Failed to mark as processed: %s (%v)", shortPath, err)
 		return
 	}
