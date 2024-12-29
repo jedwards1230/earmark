@@ -86,26 +86,18 @@ func (t *Transcriber) StartWorker() {
 }
 
 func (t *Transcriber) getRelativePath(audioFilePath string) string {
-	// Find the "audiobooks" directory in the path
-	audioBooksIndex := bytes.LastIndex([]byte(audioFilePath), []byte("/audiobooks/"))
-	if audioBooksIndex == -1 {
-		return "" // Return empty if "audiobooks" not found
+	// Get relative path from configured AudioDir
+	relPath, err := filepath.Rel(t.config.AudioDir, audioFilePath)
+	if err != nil {
+		return "" // Return empty if we can't determine relative path
 	}
-
-	// Get everything after "audiobooks/"
-	relativePath := audioFilePath[audioBooksIndex+len("/audiobooks/"):]
-	// Get the directory part of the relative path
-	lastSlash := bytes.LastIndex([]byte(relativePath), []byte("/"))
-	if lastSlash == -1 {
-		return ""
-	}
-	return relativePath[:lastSlash]
+	return filepath.Dir(relPath)
 }
 
 func (t *Transcriber) ensureOutputDir(relativePath string) (string, error) {
 	fullOutputDir := t.config.OutputDir
 	if relativePath != "" {
-		fullOutputDir = fmt.Sprintf("%s/%s", t.config.OutputDir, relativePath)
+		fullOutputDir = filepath.Join(t.config.OutputDir, relativePath)
 	}
 
 	err := os.MkdirAll(fullOutputDir, 0755)
@@ -129,10 +121,7 @@ func formatFileSize(size int64) string {
 }
 
 func shortenPath(path string) string {
-	// Remove common prefixes like absolute paths and 'audiobooks/'
-	if idx := strings.Index(path, "/audiobooks/"); idx != -1 {
-		return path[idx+len("/audiobooks/"):]
-	}
+	// Use filepath.Base to get just the filename
 	return filepath.Base(path)
 }
 
