@@ -73,8 +73,6 @@ func (sm *StateManager) saveState() error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	log.Printf("Saving state with %d items", len(sm.state))
-
 	// Write atomically using a temporary file
 	tmpFile := sm.filePath + ".tmp"
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
@@ -86,7 +84,6 @@ func (sm *StateManager) saveState() error {
 		return fmt.Errorf("failed to rename state file: %w", err)
 	}
 
-	log.Printf("State file saved successfully to %s", sm.filePath)
 	return nil
 }
 

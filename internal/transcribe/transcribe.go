@@ -80,7 +80,6 @@ func (t *Transcriber) StartWorker() {
 
 			// Process files sequentially
 			t.transcribeAudio(audioFilePath)
-			customLog.Printf("Finished processing file: %s", audioFilePath)
 		}
 	}
 }
