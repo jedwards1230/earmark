@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 	"transcriber/internal/config"
-	"transcriber/internal/queue"
 	"transcriber/internal/state"
 )
 
@@ -29,13 +28,9 @@ func init() {
 type Transcriber struct {
 	config       *config.Config
 	stateManager *state.StateManager
-	queue        *queue.Queue
-	done         chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
 }
 
-func NewTranscriber(cfg *config.Config, sm *state.StateManager, q *queue.Queue) *Transcriber {
+func NewTranscriber(cfg *config.Config, sm *state.StateManager) *Transcriber {
 	if err := checkDependencies(); err != nil {
 		log.Fatalf("Error checking dependencies: %v", err)
 	}
@@ -45,42 +40,9 @@ func NewTranscriber(cfg *config.Config, sm *state.StateManager, q *queue.Queue) 
 		log.Fatalf("Error clearing cache directory: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	return &Transcriber{
 		config:       cfg,
 		stateManager: sm,
-		queue:        q,
-		done:         make(chan struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
-	}
-}
-
-func (t *Transcriber) StartWorker() {
-	customLog.Println("Starting worker...")
-	for {
-		select {
-		case <-t.ctx.Done():
-			customLog.Println("Transcriber context canceled, exiting worker.")
-			close(t.done)
-			return
-		default:
-			audioFilePath, ok := t.queue.Dequeue()
-			if !ok {
-				customLog.Println("Queue shutdown signal received, exiting worker.")
-				close(t.done)
-				return
-			}
-			if audioFilePath == "" {
-				// No work available, wait a bit before checking again
-				time.Sleep(time.Second)
-				continue
-			}
-
-			// Process files sequentially
-			t.transcribeAudio(audioFilePath)
-		}
 	}
 }
 
@@ -140,27 +102,29 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
-func (t *Transcriber) transcribeAudio(audioFilePath string) {
+func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string) (string, error) {
 	shortPath := shortenPath(audioFilePath)
 	startTime := time.Now()
 
 	if t.stateManager.IsProcessed(audioFilePath) {
 		customLog.Printf("Skipping already processed: %s", shortPath)
-		return
+		return "", nil
 	}
+
+	customLog.Println("Preparation for: ", shortPath)
 
 	// Preprocess audio
 	preprocessedPath, err := t.preprocessAudio(audioFilePath)
 	if err != nil {
 		customLog.Printf("Failed to preprocess: %s (%v)", shortPath, err)
-		return
+		return "", err
 	}
 	defer os.Remove(preprocessedPath)
 
 	fileInfo, err := os.Stat(preprocessedPath)
 	if err != nil {
 		customLog.Printf("Failed to get file info: %s (%v)", shortPath, err)
-		return
+		return "", err
 	}
 
 	inputSize := fileInfo.Size()
@@ -171,7 +135,7 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 	outputDir, err := t.ensureOutputDir(relativePath)
 	if err != nil {
 		customLog.Printf("Failed to create output directory: %v", err)
-		return
+		return "", err
 	}
 
 	threads := os.Getenv("WHISPER_THREADS")
@@ -185,7 +149,7 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 	}
 
 	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(t.ctx, 2*time.Hour)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Hour)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx,
@@ -210,18 +174,18 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		customLog.Printf("Failed to create stdout pipe: %v", err)
-		return
+		return "", err
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		customLog.Printf("Failed to create stderr pipe: %v", err)
-		return
+		return "", err
 	}
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
 		customLog.Printf("Failed to start transcription: %s (%v)", shortPath, err)
-		return
+		return "", err
 	}
 
 	// Create channels to signal when output processing is done
@@ -263,19 +227,19 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 
 	if err != nil {
 		customLog.Printf("Transcription failed: %s (%v)", shortPath, err)
-		return
+		return "", err
 	}
 
 	// Verify output file exists
 	outputFile := filepath.Join(outputDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
 	if _, err := os.Stat(outputFile); os.IsNotExist(err) {
 		customLog.Printf("Transcription failed: output file not created for %s", shortPath)
-		return
+		return "", err
 	}
 
 	if _, err := os.Stat(audioFilePath); os.IsNotExist(err) {
 		customLog.Printf("Audio file not found: %s", audioFilePath)
-		return
+		return "", err
 	}
 
 	// Get the output file size
@@ -296,14 +260,14 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		compute_type,
 	); err != nil {
 		customLog.Printf("Failed to mark as processed: %s (%v)", shortPath, err)
-		return
+		return "", err
 	}
 
 	// Get word count from output file
 	wordCount, err := countWords(outputFile)
 	if err != nil {
 		customLog.Printf("Failed to count words: %s (%v)", shortPath, err)
-		return
+		return "", err
 	}
 	duration := time.Since(startTime)
 
@@ -317,6 +281,8 @@ func (t *Transcriber) transcribeAudio(audioFilePath string) {
 		kbPerSec,
 		wordsPerSec,
 	)
+
+	return outputFile, nil
 }
 
 func checkDependencies() error {
@@ -382,9 +348,7 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 		return "", fmt.Errorf("failed to create cache directories: %w", err)
 	}
 
-	// Only process audio stream, ignore video/cover art
-	cmd := exec.Command(
-		"ffmpeg",
+	if err := RunFfmpegCmd(
 		"-i", audioFilePath,
 		"-vn", // Skip video streams
 		"-c:a", "libmp3lame",
@@ -396,13 +360,8 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 		"-f", "mp3", // Force MP3 format
 		"-y", // Overwrite output files
 		cachedPath,
-	)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to preprocess audio: %w\nffmpeg error: %s", err, stderr.String())
+	); err != nil {
+		return "", err
 	}
 
 	// Check processed file size
@@ -414,8 +373,7 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 
 	// If processed file is larger, try with even more aggressive compression
 	if processedSize > originalSize {
-		cmd = exec.Command(
-			"ffmpeg",
+		if err := RunFfmpegCmd(
 			"-i", audioFilePath,
 			"-vn", // Skip video streams
 			"-c:a", "libmp3lame",
@@ -426,10 +384,8 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 			"-map", "0:a:0", // Only map the first audio stream
 			"-y",
 			cachedPath,
-		)
-
-		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("failed to reprocess audio: %w", err)
+		); err != nil {
+			return "", err
 		}
 
 		fileInfo, err = os.Stat(cachedPath)
@@ -460,8 +416,7 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 
 func checkAndInstallWhisperCtranslate2() error {
 	// Try to get version first
-	versionCmd := exec.Command("whisper-ctranslate2", "--version")
-	if err := versionCmd.Run(); err == nil {
+	if err := RunWhisperCTranslate2Cmd("--version"); err == nil {
 		return nil
 	}
 
@@ -477,10 +432,29 @@ func checkAndInstallWhisperCtranslate2() error {
 	}
 
 	// Verify installation
-	versionCmd = exec.Command("whisper-ctranslate2", "--version")
-	if err := versionCmd.Run(); err != nil {
+	if err := RunWhisperCTranslate2Cmd("--version"); err != nil {
 		return fmt.Errorf("whisper-ctranslate2 installation verification failed: %w", err)
 	}
 
+	return nil
+}
+
+func RunWhisperCTranslate2Cmd(args ...string) error {
+	cmd := exec.Command("whisper-ctranslate2", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("whisper-ctranslate2 error: %w\n%s", err, stderr.String())
+	}
+	return nil
+}
+
+func RunFfmpegCmd(args ...string) error {
+	cmd := exec.Command("ffmpeg", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg error: %w\n%s", err, stderr.String())
+	}
 	return nil
 }

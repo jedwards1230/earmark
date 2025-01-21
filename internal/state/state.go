@@ -18,6 +18,8 @@ type ProcessingMetadata struct {
 	ModelUsed      string  `json:"model_used"`
 	ComputeType    string  `json:"compute_type"`
 	ProcessedAt    string  `json:"processed_at"`
+	FilePathAudio  string  `json:"file_path_audio"`
+	FilePathText   string  `json:"file_path_text"`
 }
 
 type StateManager struct {
@@ -106,7 +108,7 @@ func (sm *StateManager) IsProcessed(filePath string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	metadata, exists := sm.state[filePath]
-	return exists && metadata.Processed
+	return exists && metadata.Processed && metadata.FilePathText != ""
 }
 
 func (sm *StateManager) MarkProcessed(filePath string, originalSize, processedSize int64, processingTime float64, modelUsed string, compute_type string) error {
@@ -120,6 +122,8 @@ func (sm *StateManager) MarkProcessed(filePath string, originalSize, processedSi
 		ModelUsed:      modelUsed,
 		ComputeType:    compute_type,
 		ProcessedAt:    time.Now().UTC().Format(time.RFC3339),
+		FilePathAudio:  filePath,
+		FilePathText:   "",
 	}
 
 	sm.mu.Lock()

@@ -20,6 +20,16 @@ type Config struct {
 	// CacheDir should be an absolute path to the directory for caching
 	CacheDir string `json:"cache_dir"`
 	Debug    bool   `json:"debug"`
+	// DBHost is the database host
+	DBHost string `json:"db_host"`
+	// DBUser is the database user
+	DBUser string `json:"db_user"`
+	// DBPassword is the database password
+	DBPassword string `json:"db_password"`
+	// DBName is the database name
+	DBName string `json:"db_name"`
+	// OpenAIKey is the OpenAI API key
+	OpenAIAPIKey string `json:"openai_api_key"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -34,6 +44,24 @@ func LoadConfig() (*Config, error) {
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(config); err != nil {
 		return nil, err
+	}
+
+	// Override with environment variables
+	if env := os.Getenv("DB_HOST"); env != "" {
+		config.DBHost = env
+	}
+	if env := os.Getenv("DB_USER"); env != "" {
+		config.DBUser = env
+	}
+	if env := os.Getenv("DB_PASSWORD"); env != "" {
+		config.DBPassword = env
+	}
+	if env := os.Getenv("DB_NAME"); env != "" {
+		config.DBName = env
+	}
+
+	if env := os.Getenv("OPENAI_API_KEY"); env != "" {
+		config.OpenAIAPIKey = env
 	}
 
 	// Resolve and create directories

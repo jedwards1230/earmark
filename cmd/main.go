@@ -7,10 +7,11 @@ import (
 	"syscall"
 
 	"transcriber/internal/config"
+	"transcriber/internal/db"
 	"transcriber/internal/monitor"
 	"transcriber/internal/queue"
 	"transcriber/internal/state"
-	"transcriber/internal/transcribe"
+	"transcriber/internal/worker"
 )
 
 func main() {
@@ -24,12 +25,23 @@ func main() {
 		log.Fatalf("Failed to initialize state manager: %v", err)
 	}
 
+	database, err := db.New(
+		cfg.DBHost,
+		cfg.DBUser,
+		cfg.DBPassword,
+		cfg.DBName,
+	)
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %v", err)
+	}
+	defer database.Close()
+
 	workQueue := queue.NewQueue()
-	transcriber := transcribe.NewTranscriber(cfg, stateManager, workQueue)
+	worker := worker.NewWorker(workQueue, database)
 	fileMonitor := monitor.NewFileMonitor(cfg, workQueue, stateManager)
 
 	go fileMonitor.Start()
-	go transcriber.StartWorker()
+	go worker.Start(cfg, stateManager)
 
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -37,6 +49,6 @@ func main() {
 	<-sigChan
 
 	log.Println("Shutting down...")
-
+	worker.Stop()
 	log.Println("Shutdown complete")
 }

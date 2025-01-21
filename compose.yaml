@@ -1,12 +1,11 @@
 services:
-    audio-processor:
+    proc:
         build:
             context: .
             dockerfile: Dockerfile
-        environment:
-            - RESET_STATE=false
-            - WHISPER_THREADS=2
-            - WHISPER_COMPUTE_TYPE=int8
+        container_name: audio-processor
+        env_file:
+            - .env
         volumes:
             - ./config.json:/config.json
             - ./audiobooks:/audiobooks
@@ -15,6 +14,18 @@ services:
             - models:/models
         restart: unless-stopped
 
+    db:
+        image: pgvector/pgvector:0.8.0-pg17
+        container_name: postgres
+        restart: unless-stopped
+        env_file:
+            - .env
+        ports:
+            - 5432:5432
+        volumes:
+            - db:/var/lib/postgresql/data
+
 volumes:
     data:
     models:
+    db:
