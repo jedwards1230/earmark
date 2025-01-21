@@ -1,24 +1,47 @@
 package queue
 
+import (
+	"sync"
+	"transcriber/internal/meta"
+)
+
 type Queue struct {
-	items chan string
+	items []QueueItem
+	mu    sync.Mutex
+}
+
+type QueueItem struct {
+	FilePath string
+	Metadata *meta.BookMetadata
 }
 
 func NewQueue() *Queue {
 	return &Queue{
-		items: make(chan string, 100),
+		items: make([]QueueItem, 0),
 	}
 }
 
-func (q *Queue) Enqueue(item string) {
-	q.items <- item
+func (q *Queue) Enqueue(item QueueItem) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.items = append(q.items, item)
 }
 
-func (q *Queue) Dequeue() (string, bool) {
-	item, ok := <-q.items
-	return item, ok
+func (q *Queue) Dequeue() (QueueItem, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.items) == 0 {
+		return QueueItem{}, false
+	}
+
+	item := q.items[0]
+	q.items = q.items[1:]
+	return item, true
 }
 
 func (q *Queue) IsEmpty() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	return len(q.items) == 0
 }

@@ -3,10 +3,8 @@ package meta
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"path/filepath"
-
-	goisbn "github.com/abx123/go-isbn"
+	"transcriber/internal/meta/fetcher"
 )
 
 type FileMetadata struct {
@@ -29,19 +27,6 @@ func NewMetadata(file_path, author, title, chapter, isbn string) *FileMetadata {
 		Chapter:  chapter,
 		ISBN:     isbn,
 	}
-}
-
-func GetBook(isbn string) *goisbn.Book {
-	// go-isbn instance
-	gi := goisbn.NewGoISBN(goisbn.DEFAULT_PROVIDERS)
-
-	// Get book details
-	book, err := gi.Get(isbn)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	fmt.Println(book)
-	return book
 }
 
 // BookMetadata represents common metadata across all formats
@@ -79,11 +64,15 @@ func (p *AudibleMetadataParser) Parse(data []byte) (*BookMetadata, error) {
 		return nil, fmt.Errorf("no ASIN found")
 	}
 
-	title, _ := raw["title"].(string)
+	bookInfo, err := fetcher.GetBookMetadata(asin, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch ASIN metadata: %w", err)
+	}
 
 	return &BookMetadata{
-		ASIN:  asin,
-		Title: title,
+		ASIN:   bookInfo.ASIN,
+		Title:  bookInfo.Title,
+		Author: bookInfo.Author,
 	}, nil
 }
 
@@ -106,8 +95,14 @@ func (p *StandardMetadataParser) Parse(data []byte) (*BookMetadata, error) {
 		return nil, fmt.Errorf("no ISBN found")
 	}
 
+	bookInfo, err := fetcher.GetBookMetadata(isbn, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch ISBN metadata: %w", err)
+	}
+
 	return &BookMetadata{
-		ISBN:  isbn,
-		Title: book["title"].(string),
+		ISBN:   bookInfo.ISBN,
+		Title:  bookInfo.Title,
+		Author: bookInfo.Author,
 	}, nil
 }

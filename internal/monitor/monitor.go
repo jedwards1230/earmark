@@ -188,8 +188,11 @@ func (fm *FileMonitor) scanBooks() error {
 			// Enqueue audio files that haven't been processed
 			for _, fileMeta := range metadata.FileMetas {
 				if !fm.stateManager.IsProcessed(fileMeta.FilePath) {
-					log.Printf("Enqueueing audio file for book '%s': %s", metadata.Title, fileMeta.FilePath)
-					fm.queue.Enqueue(fileMeta.FilePath)
+					log.Printf("Enqueueing audio file for book '%s' by %s", metadata.Title, fileMeta.Author)
+					fm.queue.Enqueue(queue.QueueItem{
+						FilePath: fileMeta.FilePath,
+						Metadata: metadata,
+					})
 				}
 			}
 		}
@@ -321,7 +324,17 @@ func (fm *FileMonitor) handleFileCreate(filePath string) {
 	time.Sleep(1 * time.Second)
 
 	if !fm.stateManager.IsProcessed(filePath) {
-		fm.queue.Enqueue(filePath)
+		// Extract basic metadata from filepath for new files
+		author, title := parseFilePath(filePath)
+		metadata := &meta.BookMetadata{
+			Author: author,
+			Title:  title,
+		}
+
+		fm.queue.Enqueue(queue.QueueItem{
+			FilePath: filePath,
+			Metadata: metadata,
+		})
 	} else {
 		log.Printf("Audio file already processed: %s", filePath)
 	}

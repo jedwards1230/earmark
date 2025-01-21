@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"time"
 	"transcriber/internal/config"
@@ -43,24 +44,23 @@ func (w *Worker) Start(cfg *config.Config, sm *state.StateManager) {
 			close(w.done)
 			return
 		default:
-			filePath, ok := w.queue.Dequeue()
-			if !ok {
-				close(w.done)
-				return
-			}
-			if filePath == "" {
+			queueItem, ok := w.queue.Dequeue()
+			if !ok || queueItem.FilePath == "" {
+				// Instead of exiting, sleep briefly and try again
 				time.Sleep(time.Second)
 				continue
 			}
 
+			log.Printf("Processing file: %s", queueItem.FilePath)
+
 			transcriber := transcribe.NewTranscriber(cfg, sm)
-			textFilePath, err := transcriber.TranscribeAudio(w.ctx, filePath)
+			textFilePath, err := transcriber.TranscribeAudio(w.ctx, queueItem.FilePath)
 			if err != nil {
-				fmt.Printf("Failed to transcribe %s: %v\n", filePath, err)
+				fmt.Printf("Failed to transcribe %s: %v\n", queueItem.FilePath, err)
 				continue
 			}
 
-			fmt.Printf("Transcribed %s to %s\n", filePath, textFilePath)
+			fmt.Printf("Transcribed %s to %s\n", queueItem.FilePath, textFilePath)
 			content, err := OpenFile(textFilePath)
 			if err != nil {
 				fmt.Printf("Failed to open file: %v\n", err)
@@ -74,9 +74,19 @@ func (w *Worker) Start(cfg *config.Config, sm *state.StateManager) {
 			}
 			fmt.Printf("Generated embedding with %d dimensions\n", len(embedding))
 
-			fmt.Printf("Storing embedding for %s\n", filePath)
-			metadata := meta.NewMetadata(filePath, "", "", "", "")
-			w.db.StoreWithMetadata(w.ctx, embedding, content, metadata)
+			fmt.Printf("Storing embedding for %s\n", queueItem.FilePath)
+			w.db.StoreWithMetadata(
+				w.ctx,
+				embedding,
+				content,
+				meta.NewMetadata(
+					queueItem.FilePath,
+					queueItem.Metadata.Author,
+					queueItem.Metadata.Title,
+					"",
+					queueItem.Metadata.ISBN,
+				),
+			)
 		}
 	}
 }
