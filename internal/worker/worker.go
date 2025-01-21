@@ -38,9 +38,11 @@ func NewWorker(q *queue.Queue, db *db.DB) *Worker {
 }
 
 func (w *Worker) Start(cfg *config.Config, sm *state.StateManager) {
+	log.Println("Worker started")
 	for {
 		select {
 		case <-w.ctx.Done():
+			log.Println("Worker received shutdown signal")
 			close(w.done)
 			return
 		default:
@@ -51,31 +53,33 @@ func (w *Worker) Start(cfg *config.Config, sm *state.StateManager) {
 				continue
 			}
 
-			log.Printf("Processing file: %s", queueItem.FilePath)
+			log.Printf("Processing file: %s (author: %s, title: %s)",
+				queueItem.FilePath, queueItem.Metadata.Author, queueItem.Metadata.Title)
 
 			transcriber := transcribe.NewTranscriber(cfg, sm)
 			textFilePath, err := transcriber.TranscribeAudio(w.ctx, queueItem.FilePath)
 			if err != nil {
-				fmt.Printf("Failed to transcribe %s: %v\n", queueItem.FilePath, err)
+				log.Printf("Transcription failed for %s: %v", queueItem.FilePath, err)
 				continue
 			}
 
-			fmt.Printf("Transcribed %s to %s\n", queueItem.FilePath, textFilePath)
+			log.Printf("Successfully transcribed %s to %s", queueItem.FilePath, textFilePath)
 			content, err := OpenFile(textFilePath)
 			if err != nil {
-				fmt.Printf("Failed to open file: %v\n", err)
+				log.Printf("Failed to open transcribed file %s: %v", textFilePath, err)
 				continue
 			}
 
+			log.Printf("Generating embedding for %s", queueItem.FilePath)
 			embedding, err := tokenizer.GetEmbedding(content, cfg.OpenAIAPIKey)
 			if err != nil {
-				fmt.Printf("Failed to get embedding: %v\n", err)
+				log.Printf("Failed to generate embedding for %s: %v", queueItem.FilePath, err)
 				continue
 			}
-			fmt.Printf("Generated embedding with %d dimensions\n", len(embedding))
+			log.Printf("Successfully generated embedding with %d dimensions", len(embedding))
 
-			fmt.Printf("Storing embedding for %s\n", queueItem.FilePath)
-			w.db.StoreWithMetadata(
+			log.Printf("Storing embedding and metadata for %s", queueItem.FilePath)
+			if err := w.db.StoreWithMetadata(
 				w.ctx,
 				embedding,
 				content,
@@ -86,7 +90,11 @@ func (w *Worker) Start(cfg *config.Config, sm *state.StateManager) {
 					"",
 					queueItem.Metadata.ISBN,
 				),
-			)
+			); err != nil {
+				log.Printf("Failed to store embedding for %s: %v", queueItem.FilePath, err)
+				continue
+			}
+			log.Printf("Successfully processed %s", queueItem.FilePath)
 		}
 	}
 }

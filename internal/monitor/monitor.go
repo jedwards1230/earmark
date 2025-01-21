@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -21,14 +22,21 @@ type FileMonitor struct {
 	queue        *queue.Queue
 	stateManager *state.StateManager
 	queuedFiles  map[string]bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	done         chan struct{}
 }
 
 func NewFileMonitor(cfg *config.Config, q *queue.Queue, sm *state.StateManager) *FileMonitor {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FileMonitor{
 		config:       cfg,
 		queue:        q,
 		stateManager: sm,
 		queuedFiles:  make(map[string]bool),
+		ctx:          ctx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
 	}
 }
 
@@ -247,6 +255,7 @@ func findAudioFilesInDir(dir string) ([]string, error) {
 }
 
 func (fm *FileMonitor) Start() {
+	defer close(fm.done)
 	log.Println("Starting file monitor...")
 
 	// Check for orphaned audio files first
@@ -294,6 +303,8 @@ func (fm *FileMonitor) Start() {
 				return
 			}
 			log.Println("File watcher error:", err)
+		case <-fm.ctx.Done():
+			return
 		}
 	}
 }
@@ -338,4 +349,9 @@ func (fm *FileMonitor) handleFileCreate(filePath string) {
 	} else {
 		log.Printf("Audio file already processed: %s", filePath)
 	}
+}
+
+func (fm *FileMonitor) Stop() {
+	fm.cancel()
+	<-fm.done
 }

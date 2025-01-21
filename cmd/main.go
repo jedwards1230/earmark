@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"transcriber/internal/config"
 	"transcriber/internal/db"
 	"transcriber/internal/monitor"
 	"transcriber/internal/queue"
+	"transcriber/internal/server"
 	"transcriber/internal/state"
 	"transcriber/internal/worker"
 )
@@ -40,15 +44,49 @@ func main() {
 	worker := worker.NewWorker(workQueue, database)
 	fileMonitor := monitor.NewFileMonitor(cfg, workQueue, stateManager)
 
-	go fileMonitor.Start()
-	go worker.Start(cfg, stateManager)
+	var wg sync.WaitGroup
 
-	// Handle graceful shutdown
+	// Start services
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		fileMonitor.Start()
+	}()
+
+	go func() {
+		defer wg.Done()
+		worker.Start(cfg, stateManager)
+	}()
+
+	// Initialize and start HTTP server
+	srv := server.NewServer(database, cfg)
+	httpServer := srv.Start()
+
+	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("Shutting down...")
+	log.Println("Received shutdown signal, starting graceful shutdown...")
+
+	// Stop all services
+	fileMonitor.Stop()
 	worker.Stop()
-	log.Println("Shutdown complete")
+
+	// Shutdown HTTP server with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	}
+
+	// Wait for all goroutines to finish
+	log.Println("Waiting for all tasks to complete...")
+	wg.Wait()
+
+	// Close database connection
+	database.Close()
+
+	log.Println("Graceful shutdown complete")
 }

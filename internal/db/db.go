@@ -3,9 +3,11 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
 	"transcriber/internal/meta"
 
 	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/sashabaranov/go-openai"
 )
 
 type VectorEntry struct {
@@ -91,8 +93,11 @@ func (db *DB) Store(ctx context.Context, vec []float32, content string) error {
 }
 
 func (db *DB) StoreWithMetadata(ctx context.Context, vec []float32, content string, meta *meta.FileMetadata) error {
+	log.Printf("Storing metadata for file: %s", meta.FilePath)
+
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
+		log.Printf("Failed to begin transaction: %v", err)
 		return err
 	}
 	defer tx.Rollback(ctx)
@@ -100,6 +105,7 @@ func (db *DB) StoreWithMetadata(ctx context.Context, vec []float32, content stri
 	var existingID int
 	err = tx.QueryRow(ctx, "SELECT id FROM metadata WHERE file_path = $1", meta.FilePath).Scan(&existingID)
 	if err == nil {
+		log.Printf("Duplicate entry found for file: %s (ID: %d)", meta.FilePath, existingID)
 		return fmt.Errorf("metadata for file_path '%s' already exists (ID: %d)", meta.FilePath, existingID)
 	}
 
@@ -119,6 +125,7 @@ func (db *DB) StoreWithMetadata(ctx context.Context, vec []float32, content stri
 		return err
 	}
 
+	log.Printf("Successfully stored metadata for file: %s", meta.FilePath)
 	return tx.Commit(ctx)
 }
 
@@ -169,6 +176,49 @@ func (db *DB) FindSimilar(ctx context.Context, vec []float32, limit int) ([]Vect
 	return results, nil
 }
 
+func (db *DB) Search(ctx context.Context, query string, limit int, apiKey string) ([]VectorEntry, error) {
+	log.Printf("Performing search with query: %q (limit: %d)", query, limit)
+
+	embedding, err := db.GetEmbedding(query, apiKey)
+	if err != nil {
+		log.Printf("Failed to get embedding: %v", err)
+		return nil, err
+	}
+
+	results, err := db.FindSimilar(ctx, embedding, limit)
+	if err != nil {
+		log.Printf("Failed to find similar vectors: %v", err)
+		return nil, err
+	}
+
+	log.Printf("Search completed. Found %d results", len(results))
+	return results, nil
+}
+
 func (db *DB) Close() {
 	db.pool.Close()
+}
+
+// GetEmbedding returns a vector embedding suitable for similarity search
+func (db *DB) GetEmbedding(content string, apiKey string) ([]float32, error) {
+	log.Printf("Requesting embedding from OpenAI (content length: %d)", len(content))
+
+	client := openai.NewClient(apiKey)
+	resp, err := client.CreateEmbeddings(
+		context.Background(),
+		openai.EmbeddingRequest{
+			Input: []string{content},
+			Model: openai.SmallEmbedding3,
+		},
+	)
+	if err != nil {
+		log.Printf("OpenAI API error: %v", err)
+		return nil, fmt.Errorf("creating embedding: %v", err)
+	}
+
+	if len(resp.Data) == 0 {
+		return nil, fmt.Errorf("no embeddings returned")
+	}
+
+	return resp.Data[0].Embedding, nil
 }
