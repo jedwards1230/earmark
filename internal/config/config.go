@@ -4,32 +4,35 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 type Config struct {
-	// AudioDir should be an absolute path to the directory containing audio files
-	AudioDir string `json:"audio_dir"`
-	// ModelsDir should be an absolute path to the directory containing models
+	// Directory config
+	AudioDir  string `json:"audio_dir"`
+	CacheDir  string `json:"cache_dir"`
 	ModelsDir string `json:"models_dir"`
-	// OutputDir should be an absolute path to the directory where transcriptions will be saved
 	OutputDir string `json:"output_dir"`
-	// StateFile can be a relative path from the working directory, or an absolute path
 	StateFile string `json:"state_file"`
-	// WhisperModel should be an absolute path to the model file
-	WhisperModel string `json:"whisper_model"`
-	// CacheDir should be an absolute path to the directory for caching
-	CacheDir string `json:"cache_dir"`
-	Debug    bool   `json:"debug"`
-	// DBHost is the database host
-	DBHost string `json:"db_host"`
-	// DBUser is the database user
-	DBUser string `json:"db_user"`
-	// DBPassword is the database password
+
+	// Whisper Local transcription config
+	WhisperModel       string `json:"whisper_model"`
+	WhisperThreads     int    `json:"whisper_threads"`
+	WhisperComputeType string `json:"whisper_compute_type"`
+
+	// Service config
+	Debug      bool `json:"debug"`
+	ResetState bool `json:"reset_state"`
+
+	// Postgres with PGVector config
+	DBHost     string `json:"db_host"`
+	DBUser     string `json:"db_user"`
 	DBPassword string `json:"db_password"`
-	// DBName is the database name
-	DBName string `json:"db_name"`
-	// OpenAIKey is the OpenAI API key
-	OpenAIAPIKey string `json:"openai_api_key"`
+	DBName     string `json:"db_name"`
+
+	// OpenAI API config
+	OpenAIAPIKey  string `json:"openai_api_key"`
+	OpenAIBaseURL string `json:"openai_base_url"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -44,6 +47,26 @@ func LoadConfig() (*Config, error) {
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(config); err != nil {
 		return nil, err
+	}
+
+	if env := os.Getenv("WHISPER_MODEL"); env != "" {
+		config.WhisperModel = env
+	}
+
+	if env := os.Getenv("WHISPER_THREADS"); env != "" {
+		if threads, err := strconv.Atoi(env); err == nil {
+			config.WhisperThreads = threads
+		} else {
+			return nil, err
+		}
+	} else {
+		config.WhisperThreads = 1
+	}
+
+	if env := os.Getenv("WHISPER_COMPUTE_TYPE"); env != "" {
+		config.WhisperComputeType = env
+	} else {
+		config.WhisperComputeType = "int8"
 	}
 
 	// Override with environment variables
@@ -62,6 +85,20 @@ func LoadConfig() (*Config, error) {
 
 	if env := os.Getenv("OPENAI_API_KEY"); env != "" {
 		config.OpenAIAPIKey = env
+	}
+
+	if env := os.Getenv("OPENAI_BASE_URL"); env != "" {
+		config.OpenAIBaseURL = env
+	} else {
+		config.OpenAIBaseURL = "https://api.openai.com/v1"
+	}
+
+	if env := os.Getenv("DEBUG"); env != "" {
+		config.Debug = env == "1" || env == "true"
+	}
+
+	if env := os.Getenv("RESET_STATE"); env != "" {
+		config.ResetState = env == "1" || env == "true"
 	}
 
 	// Resolve and create directories

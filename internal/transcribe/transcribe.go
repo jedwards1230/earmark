@@ -10,11 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"transcriber/internal/config"
-	"transcriber/internal/state"
+	"transcriber/internal/meta"
 )
 
 // Create custom logger without timestamps
@@ -26,11 +27,10 @@ func init() {
 }
 
 type Transcriber struct {
-	config       *config.Config
-	stateManager *state.StateManager
+	config *config.Config
 }
 
-func NewTranscriber(cfg *config.Config, sm *state.StateManager) *Transcriber {
+func NewTranscriber(cfg *config.Config) *Transcriber {
 	if err := checkDependencies(); err != nil {
 		log.Fatalf("Error checking dependencies: %v", err)
 	}
@@ -41,8 +41,7 @@ func NewTranscriber(cfg *config.Config, sm *state.StateManager) *Transcriber {
 	}
 
 	return &Transcriber{
-		config:       cfg,
-		stateManager: sm,
+		config: cfg,
 	}
 }
 
@@ -102,33 +101,30 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
-func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string) (string, error) {
+func (t *Transcriber) TranscribeAudio(
+	ctx context.Context,
+	audioFilePath string,
+	fileMeta *meta.FileMetadata,
+	threads int,
+	computeType string,
+) (string, error) {
 	shortPath := shortenPath(audioFilePath)
 	startTime := time.Now()
 
-	if t.stateManager.IsProcessed(audioFilePath) {
-		customLog.Printf("Skipping already processed: %s", shortPath)
-		return "", nil
-	}
-
-	customLog.Println("Preparation for: ", shortPath)
+	customLog.Println("Preprocessing audio...")
 
 	// Preprocess audio
 	preprocessedPath, err := t.preprocessAudio(audioFilePath)
 	if err != nil {
-		customLog.Printf("Failed to preprocess: %s (%v)", shortPath, err)
+		customLog.Printf("Preprocessing failed: %v", err)
 		return "", err
 	}
 	defer os.Remove(preprocessedPath)
 
-	fileInfo, err := os.Stat(preprocessedPath)
+	inputSize, err := getInputSize(audioFilePath)
 	if err != nil {
-		customLog.Printf("Failed to get file info: %s (%v)", shortPath, err)
 		return "", err
 	}
-
-	inputSize := fileInfo.Size()
-	customLog.Printf("▶ Processing: %s (%s)", shortPath, formatFileSize(inputSize))
 
 	// Get the relative path and create output directory
 	relativePath := t.getRelativePath(audioFilePath)
@@ -138,25 +134,21 @@ func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string)
 		return "", err
 	}
 
-	threads := os.Getenv("WHISPER_THREADS")
-	if threads == "" {
-		threads = "1"
-	}
-
-	compute_type := os.Getenv("WHISPER_COMPUTE_TYPE")
-	if compute_type == "" {
-		compute_type = "int8"
-	}
-
 	// Create a context with timeout
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Hour)
 	defer cancel()
+
+	fmt.Println("Transcribing...")
+	fmt.Println("Running whisper-ctranslate2 with:")
+	fmt.Printf("  - Model: %s\n", t.config.WhisperModel)
+	fmt.Printf("  - Compute Type: %s\n", computeType)
+	fmt.Printf("  - Threads: %d\n", threads)
 
 	cmd := exec.CommandContext(ctx,
 		"whisper-ctranslate2",
 		preprocessedPath,
 		"--model", t.config.WhisperModel,
-		"--compute_type", compute_type,
+		"--compute_type", computeType,
 		"--language", "en",
 		"--beam_size", "5",
 		"--output_dir", outputDir,
@@ -165,8 +157,8 @@ func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string)
 		"--vad_filter", "True", // Voice Activity Detection - On by default when batched is True
 		"--batched", "True",
 		"--batch_size", "16",
-		"--threads", threads,
-		"--initial_prompt", fmt.Sprintf("Transcribe from %s", shortPath), // https://cookbook.openai.com/examples/whisper_prompting_guide
+		"--threads", strconv.Itoa(threads),
+		"--initial_prompt", fmt.Sprintf("Transcribe %s by %s", fileMeta.Title, fileMeta.Author), // https://cookbook.openai.com/examples/whisper_prompting_guide
 		"--verbose", fmt.Sprintf("%v", t.config.Debug),
 	)
 
@@ -196,7 +188,7 @@ func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string)
 	go func() {
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			customLog.Printf("Whisper stdout: %s", scanner.Text())
+			customLog.Printf("%s", scanner.Text())
 		}
 		close(stdoutDone)
 	}()
@@ -205,7 +197,7 @@ func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string)
 	go func() {
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			customLog.Printf("Whisper stderr: %s", scanner.Text())
+			customLog.Printf("%s", scanner.Text())
 		}
 		close(stderrDone)
 	}()
@@ -242,27 +234,6 @@ func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string)
 		return "", err
 	}
 
-	// Get the output file size
-	outputFileInfo, err := os.Stat(outputFile)
-	outputSize := int64(0)
-	if err == nil {
-		outputSize = outputFileInfo.Size()
-	}
-
-	processingTime := time.Since(startTime).Seconds()
-
-	if err := t.stateManager.MarkProcessed(
-		audioFilePath,
-		inputSize,
-		outputSize,
-		processingTime,
-		t.config.WhisperModel,
-		compute_type,
-	); err != nil {
-		customLog.Printf("Failed to mark as processed: %s (%v)", shortPath, err)
-		return "", err
-	}
-
 	// Get word count from output file
 	wordCount, err := countWords(outputFile)
 	if err != nil {
@@ -275,7 +246,7 @@ func (t *Transcriber) TranscribeAudio(ctx context.Context, audioFilePath string)
 	kbPerSec := float64(inputSize) / 1024 / duration.Seconds()
 	wordsPerSec := float64(wordCount) / duration.Seconds()
 
-	customLog.Printf("✓ Done: %s [%s | %.1fKB/s | %.0fw/s]",
+	customLog.Printf("Done: %s [%s | %.1fKB/s | %.0fw/s]",
 		shortPath,
 		formatDuration(duration),
 		kbPerSec,
@@ -319,6 +290,18 @@ func checkDependencies() error {
 	return nil
 }
 
+func getInputSize(filepath string) (int64, error) {
+	fileInfo, err := os.Stat(filepath)
+	if err != nil {
+		customLog.Printf("Failed to get preprocessed file info: %v", err)
+		return 0, err
+	}
+
+	inputSize := fileInfo.Size()
+	customLog.Printf("Processing audio file (%s)", formatFileSize(inputSize))
+	return inputSize, nil
+}
+
 func clearCacheDir(cacheDir string) error {
 	if err := os.RemoveAll(cacheDir); err != nil {
 		return err
@@ -327,9 +310,6 @@ func clearCacheDir(cacheDir string) error {
 }
 
 func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
-	shortPath := shortenPath(audioFilePath)
-
-	// Get original file size
 	originalInfo, err := os.Stat(audioFilePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to get original file info: %w", err)
@@ -364,7 +344,6 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 		return "", err
 	}
 
-	// Check processed file size
 	fileInfo, err := os.Stat(cachedPath)
 	if err != nil {
 		return "", err
@@ -396,15 +375,14 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 	}
 
 	reductionPct := float64(originalSize-processedSize) / float64(originalSize) * 100
-	customLog.Printf("⚡ Converting: %s (%s → %s | -%d%%)",
-		shortPath,
+	customLog.Printf("Converted audio: %s → %s (-%d%%)",
 		formatFileSize(originalSize),
 		formatFileSize(processedSize),
 		int(reductionPct),
 	)
 
 	if processedSize > 500*1024*1024 {
-		customLog.Printf("  ⚠ Output exceeds 500MB")
+		customLog.Printf("Output exceeds 500MB")
 	}
 
 	if t.config.Debug {

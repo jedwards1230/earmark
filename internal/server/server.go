@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"transcriber/internal/config"
 	"transcriber/internal/db"
 )
@@ -31,13 +32,40 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.db.Search(context.Background(), query, 10, s.cfg.OpenAIAPIKey)
+	thresholdStr := r.URL.Query().Get("p")
+	if thresholdStr == "" {
+		thresholdStr = "0.3"
+	}
+
+	threshold, err := strconv.ParseFloat(thresholdStr, 64)
+	if err != nil {
+		log.Printf("Bad request: invalid threshold parameter from %s", r.RemoteAddr)
+		http.Error(w, "invalid threshold parameter", http.StatusBadRequest)
+		return
+	}
+
+	itemLimitStr := r.URL.Query().Get("k")
+	if itemLimitStr == "" {
+		itemLimitStr = "10"
+	}
+
+	itemLimit, err := strconv.Atoi(itemLimitStr)
+	if err != nil {
+		log.Printf("Bad request: invalid item limit parameter from %s", r.RemoteAddr)
+		http.Error(w, "invalid item limit parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Log the search parameters
+	log.Printf("Performing search with query: %q", query)
+	results, err := s.db.Search(context.Background(), query, itemLimit, threshold) // Added minimum similarity threshold
 	if err != nil {
 		log.Printf("Search error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf("Search returned %d results", len(results))
 	// Ensure we return an empty array instead of null when no results
 	if results == nil {
 		results = []db.VectorEntry{}

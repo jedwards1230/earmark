@@ -7,7 +7,8 @@ RUN go mod download
 
 COPY ./cmd ./cmd
 COPY ./internal ./internal
-RUN go build -o /transcriber ./cmd/main.go
+COPY ./main.go ./main.go
+RUN go build -o /transcriber .
 
 FROM python:3.9-slim
 
@@ -29,4 +30,5 @@ RUN pip install --no-cache-dir ctranslate2 whisper-ctranslate2
 
 COPY --from=builder /transcriber /transcriber
 
-ENTRYPOINT ["/transcriber"]
+#ENTRYPOINT ["/transcriber", "search", "eragon"]
+ENTRYPOINT ["/transcriber", "start"]

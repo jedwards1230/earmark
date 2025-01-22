@@ -8,14 +8,22 @@ import (
 )
 
 type FileMetadata struct {
-	ID       int
-	FilePath string
-	FileName string
-	Author   string
-	Title    string
-	Chapter  string
-	ISBN     string
-	VectorID int
+	ID           int
+	FilePath     string
+	FileName     string
+	Author       string
+	Title        string
+	ChapterIndex int    // renamed from Chapter
+	Chapter      string // new field for chapter name
+	ASIN         string
+	ISBN         string
+	VectorID     int
+}
+
+type ChapterInfo struct {
+	Title         string `json:"title"`
+	StartOffsetMs int64  `json:"start_offset_ms"`
+	LengthMs      int64  `json:"length_ms"`
 }
 
 func NewMetadata(file_path, author, title, chapter, isbn string) *FileMetadata {
@@ -31,11 +39,12 @@ func NewMetadata(file_path, author, title, chapter, isbn string) *FileMetadata {
 
 // BookMetadata represents common metadata across all formats
 type BookMetadata struct {
-	ISBN      string
-	ASIN      string
-	Title     string
-	Author    string
-	FileMetas []FileMetadata
+	ISBN         string
+	ASIN         string
+	Title        string
+	Author       string
+	FileMetas    []FileMetadata
+	ChaptersInfo []ChapterInfo `json:"chapters"` // new field for chapter information
 }
 
 // MetadataParser interface for different metadata formats
@@ -64,15 +73,33 @@ func (p *AudibleMetadataParser) Parse(data []byte) (*BookMetadata, error) {
 		return nil, fmt.Errorf("no ASIN found")
 	}
 
+	// Parse chapter info if available
+	var chapters []ChapterInfo
+	if chapterInfo, exists := raw["ChapterInfo"].(map[string]interface{}); exists {
+		if chaptersList, ok := chapterInfo["chapters"].([]interface{}); ok {
+			for _, ch := range chaptersList {
+				if chMap, ok := ch.(map[string]interface{}); ok {
+					chapter := ChapterInfo{
+						Title:         chMap["title"].(string),
+						StartOffsetMs: int64(chMap["start_offset_ms"].(float64)),
+						LengthMs:      int64(chMap["length_ms"].(float64)),
+					}
+					chapters = append(chapters, chapter)
+				}
+			}
+		}
+	}
+
 	bookInfo, err := fetcher.GetBookMetadata(asin, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch ASIN metadata: %w", err)
 	}
 
 	return &BookMetadata{
-		ASIN:   bookInfo.ASIN,
-		Title:  bookInfo.Title,
-		Author: bookInfo.Author,
+		ASIN:         bookInfo.ASIN,
+		Title:        bookInfo.Title,
+		Author:       bookInfo.Author,
+		ChaptersInfo: chapters,
 	}, nil
 }
 
