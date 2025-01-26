@@ -8,6 +8,7 @@ RUN go mod download
 COPY ./cmd ./cmd
 COPY ./internal ./internal
 COPY ./main.go ./main.go
+
 RUN go build -o /transcriber .
 
 FROM python:3.9-slim

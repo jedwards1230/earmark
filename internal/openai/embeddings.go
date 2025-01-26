@@ -18,12 +18,12 @@ type Embeddings struct {
 func NewEmbeddings(cfg *config.Config) *Embeddings {
 	return &Embeddings{
 		c:          InitOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL),
-		tokenLimit: 2048,
+		tokenLimit: cfg.ChunkSize,
 	}
 }
 
 // GetEmbedding returns a vector embedding suitable for similarity search
-func (e *Embeddings) GetEmbedding(content string) ([]float32, error) {
+func (e *Embeddings) GetEmbeddings(content string) (embeddings [][]float32, err error) {
 	tokens, err := tokenizer.GetTokens(content)
 	if err != nil {
 		return nil, fmt.Errorf("getting tokens: %v", err)
@@ -50,31 +50,11 @@ func (e *Embeddings) GetEmbedding(content string) ([]float32, error) {
 		return nil, fmt.Errorf("no embeddings returned")
 	}
 
-	embedding := resp.Data[0].Embedding
-
-	return embedding, nil
-
 	// compile all embeddings into a single array
-	/* embeddings := make([][]float32, len(resp.Data))
+	embeddings = make([][]float32, len(resp.Data))
 	for i, emb := range resp.Data {
 		embeddings[i] = emb.Embedding
 	}
 
-	return embeddings, nil */
+	return embeddings, nil
 }
-
-// func loadEmbeddingFromString(raw string) (*openai.Embedding, error) {
-// 	// Assuming raw is a base64 encoded string of float32 values
-// 	decodedData, err := base64.StdEncoding.DecodeString(raw)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	const sizeOfFloat32 = 4
-// 	floats := make([]float32, len(decodedData)/sizeOfFloat32)
-// 	for i := 0; i < len(floats); i++ {
-// 		floats[i] = math.Float32frombits(binary.LittleEndian.Uint32(decodedData[i*4 : (i+1)*4]))
-// 	}
-
-// 	return &openai.Embedding{Embedding: floats}, nil
-// }

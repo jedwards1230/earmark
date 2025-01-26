@@ -121,7 +121,7 @@ func (t *Transcriber) TranscribeAudio(
 	}
 	defer os.Remove(preprocessedPath)
 
-	inputSize, err := getInputSize(audioFilePath)
+	inputSize, err := getInputSize(preprocessedPath)
 	if err != nil {
 		return "", err
 	}

@@ -8,16 +8,17 @@ import (
 )
 
 type FileMetadata struct {
-	ID           int
-	FilePath     string
-	FileName     string
-	Author       string
-	Title        string
-	ChapterIndex int    // renamed from Chapter
-	Chapter      string // new field for chapter name
-	ASIN         string
-	ISBN         string
-	VectorID     int
+	ID            int
+	FilePath      string
+	FileName      string
+	Author        string
+	Title         string
+	ChapterIndex  int
+	TotalChapters int
+	Chapter       string
+	ASIN          string
+	ISBN          string
+	VectorID      int
 }
 
 type ChapterInfo struct {

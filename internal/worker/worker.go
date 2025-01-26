@@ -79,6 +79,7 @@ func (w *Worker) Start(cfg *config.Config) {
 			}
 			endTime := time.Now()
 			duration := endTime.Sub(startTime)
+			duration = duration.Round(time.Second)
 			log.Printf("Transcription of Chapter %s of '%s' took %s",
 				fileMeta.Chapter, queueItem.Metadata.Title, duration)
 

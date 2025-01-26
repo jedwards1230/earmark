@@ -2,9 +2,12 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -30,12 +33,17 @@ type Config struct {
 	DBPassword string `json:"db_password"`
 	DBName     string `json:"db_name"`
 
+	// Vectors
+	ChunkSize int `json:"chunk_size"`
+
 	// OpenAI API config
 	OpenAIAPIKey  string `json:"openai_api_key"`
 	OpenAIBaseURL string `json:"openai_base_url"`
 }
 
 func LoadConfig() (*Config, error) {
+	log.Println("Loading configuration...")
+
 	configFile := "config.json"
 	file, err := os.Open(configFile)
 	if err != nil {
@@ -81,6 +89,16 @@ func LoadConfig() (*Config, error) {
 	}
 	if env := os.Getenv("DB_NAME"); env != "" {
 		config.DBName = env
+	}
+
+	if env := os.Getenv("CHUNK_SIZE"); env != "" {
+		if chunkSize, err := strconv.Atoi(env); err == nil {
+			config.ChunkSize = chunkSize
+		} else {
+			return nil, err
+		}
+	} else {
+		config.ChunkSize = 1024
 	}
 
 	if env := os.Getenv("OPENAI_API_KEY"); env != "" {
@@ -145,4 +163,40 @@ func resolveAndCreatePath(cwd, path string) string {
 	}
 
 	return path
+}
+
+func MaskSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	return strings.Repeat("*", len(secret))
+}
+
+func (c *Config) PrintEnvVars() {
+	fmt.Println("=== Current Configuration ===")
+	fmt.Printf("Whisper Model: %s\n", c.WhisperModel)
+	fmt.Printf("Whisper Threads: %d\n", c.WhisperThreads)
+	fmt.Printf("Whisper Compute Type: %s\n", c.WhisperComputeType)
+	fmt.Printf("Debug: %v\n", c.Debug)
+	fmt.Printf("Reset State: %v\n", c.ResetState)
+
+	// Database configuration
+	fmt.Printf("DB Host: %s\n", c.DBHost)
+	fmt.Printf("DB User: %s\n", c.DBUser)
+	fmt.Printf("DB Password: %s\n", MaskSecret(c.DBPassword))
+	fmt.Printf("DB Name: %s\n", c.DBName)
+
+	// OpenAI configuration
+	fmt.Printf("OpenAI Base URL: %s\n", c.OpenAIBaseURL)
+	fmt.Printf("OpenAI API Key: %s\n", MaskSecret(c.OpenAIAPIKey))
+
+	// Directory configuration
+	fmt.Printf("Audio Directory: %s\n", c.AudioDir)
+	fmt.Printf("Cache Directory: %s\n", c.CacheDir)
+	fmt.Printf("Models Directory: %s\n", c.ModelsDir)
+	fmt.Printf("Output Directory: %s\n", c.OutputDir)
+	fmt.Printf("State File: %s\n", c.StateFile)
+
+	// Other configuration
+	fmt.Printf("Chunk Size: %d\n", c.ChunkSize)
 }

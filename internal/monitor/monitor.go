@@ -400,10 +400,10 @@ func (fm *FileMonitor) Start() {
 		log.Printf("Error collecting statistics: %v", err)
 	} else {
 		log.Printf("Library Statistics:")
-		log.Printf("- Total Books Found: %d", stats.TotalBooks)
-		log.Printf("- Total Audio Files: %d", stats.TotalAudioFiles)
-		log.Printf("- Processed Books: %d", stats.ProcessedBooks)
-		log.Printf("- Processed Chapters: %d", stats.ProcessedChapters)
+		log.Printf("  - Total Metadata Files Found: %d", stats.TotalBooks)
+		log.Printf("  - Total Audio Files Found: %d", stats.TotalAudioFiles)
+		log.Printf("  - Processed Books: %d", stats.ProcessedBooks)
+		log.Printf("  - Processed Chapters: %d", stats.ProcessedChapters)
 	}
 
 	// Check for orphaned audio files first

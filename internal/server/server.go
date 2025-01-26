@@ -68,7 +68,7 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Search returned %d results", len(results))
 	// Ensure we return an empty array instead of null when no results
 	if results == nil {
-		results = []db.VectorEntry{}
+		results = []db.SearchResultWithMetadata{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

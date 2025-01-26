@@ -31,6 +31,8 @@ func runService() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	cfg.PrintEnvVars()
+
 	database, err := initDB(cfg)
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %v", err)
@@ -42,6 +44,8 @@ func runService() {
 			log.Fatalf("Failed to reset database: %v", err)
 		}
 	}
+
+	log.Println("Database connection established")
 
 	workQueue := queue.NewQueue()
 	worker := worker.NewWorker(workQueue, database)
