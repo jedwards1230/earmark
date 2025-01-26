@@ -58,7 +58,7 @@ func TestChunkByToken(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := chunker(tt.content, tt.chunkSize, SplitTypeToken)
+			got := Chunker(tt.content, tt.chunkSize, SplitTypeToken)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -109,7 +109,7 @@ func TestChunkByChar(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := chunker(tt.content, tt.chunkSize, SplitTypeChar)
+			got := Chunker(tt.content, tt.chunkSize, SplitTypeChar)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -167,7 +167,7 @@ func TestChunkByWord(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := chunker(tt.content, tt.chunkSize, SplitTypeWord)
+			got := Chunker(tt.content, tt.chunkSize, SplitTypeWord)
 			assert.Equal(t, tt.want, got)
 		})
 	}

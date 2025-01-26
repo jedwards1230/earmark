@@ -40,6 +40,7 @@ type Statistics struct {
 type DB struct {
 	conn *pgx.Conn
 	e    *openai.Embeddings
+	cfg  *config.Config
 }
 
 type Author struct {
@@ -97,6 +98,7 @@ func New(host, user, password, dbName string, cfg *config.Config) (*DB, error) {
 	db := &DB{
 		conn: conn,
 		e:    openai.NewEmbeddings(cfg),
+		cfg:  cfg,
 	}
 
 	// Reset the schema if RESET_STATE=true
@@ -227,25 +229,49 @@ func (db *DB) InsertContentWithMetadata(ctx context.Context, content string, met
 		return fmt.Errorf("failed to insert chapter: %v", err)
 	}
 
-	// Insert vector chunks
-	allEmbeddings, err := db.e.GetEmbeddings(content)
+	chunks, allEmbeddings, err := db.ChunkAndEmbed(content, db.cfg.ChunkSize)
 	if err != nil {
-		return fmt.Errorf("failed to generate embeddings: %v", err)
+		return fmt.Errorf("failed to chunk and embed content: %v", err)
 	}
 
+	// Insert vector chunks
 	for i, emb := range allEmbeddings {
 		_, err = tx.Exec(ctx, `
             INSERT INTO vectors (chapter_id, chunk_index, content, embedding)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (chapter_id, chunk_index) DO UPDATE 
             SET content = EXCLUDED.content, embedding = EXCLUDED.embedding
-        `, chapterID, i, content, pgvector.NewVector(emb))
+        `, chapterID, i, chunks[i], pgvector.NewVector(emb))
 		if err != nil {
 			return fmt.Errorf("failed to insert vector chunk: %v", err)
 		}
 	}
 
 	return tx.Commit(ctx)
+}
+
+func (db *DB) ChunkAndEmbed(content string, chunkSize int) (chunks []string, embeddings [][]float32, err error) {
+	if content == "" {
+		return nil, nil, fmt.Errorf("empty content")
+	}
+
+	chunks = openai.Chunker(content, chunkSize, openai.SplitTypeToken)
+	if len(chunks) == 0 {
+		return nil, nil, fmt.Errorf("no chunks found")
+	}
+
+	fmt.Printf("Splitting content into %d chunks\n", len(chunks))
+
+	allEmbeddings, err := db.e.GetEmbeddings(chunks)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate embeddings: %v", err)
+	}
+
+	if len(allEmbeddings) != len(chunks) {
+		return nil, nil, fmt.Errorf("mismatched embeddings and chunks: %d vs %d", len(allEmbeddings), len(chunks))
+	}
+
+	return chunks, allEmbeddings, nil
 }
 
 func (db *DB) GetMetadataByVectorID(ctx context.Context, vectorID int) (*meta.FileMetadata, error) {
@@ -283,10 +309,9 @@ func (db *DB) IsProcessed(ctx context.Context, filePath string) (bool, error) {
 
 func (db *DB) Search(ctx context.Context, query string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
 	log.Printf("Performing search with query: %q (limit: %d, threshold: %.2f)", query, limit, threshold)
-	allEmbeddings, err := db.e.GetEmbeddings(query)
+	_, allEmbeddings, err := db.ChunkAndEmbed(query, db.cfg.ChunkSize)
 	if err != nil {
-		log.Printf("Failed to get embedding: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("failed to chunk and embed content: %v", err)
 	}
 
 	// Collect combined results from each embedding
@@ -538,9 +563,9 @@ func (db *DB) InsertChunkWithMetadata(ctx context.Context, content string, autho
 		}
 	}
 
-	allEmbeddings, err := db.e.GetEmbeddings(content)
+	chunks, allEmbeddings, err := db.ChunkAndEmbed(content, db.cfg.ChunkSize)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to chunk and embed content: %v", err)
 	}
 
 	var lastVecID int
@@ -548,7 +573,7 @@ func (db *DB) InsertChunkWithMetadata(ctx context.Context, content string, autho
 		err = tx.QueryRow(ctx, `
 			INSERT INTO vectors (embedding, content, chapter_id, chunk_index) 
 			VALUES ($1, $2, $3, $4) RETURNING id
-		`, pgvector.NewVector(emb), content, chapterID, i).Scan(&lastVecID)
+		`, pgvector.NewVector(emb), chunks[i], chapterID, i).Scan(&lastVecID)
 		if err != nil {
 			return 0, err
 		}
@@ -601,9 +626,9 @@ func (db *DB) SearchChunksByMetadata(ctx context.Context, query string, authorFi
 	}
 
 	// Step 2: Perform the vector search across these candidates
-	allEmbeddings, err := db.e.GetEmbeddings(query)
+	_, allEmbeddings, err := db.ChunkAndEmbed(query, db.cfg.ChunkSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get embedding: %v", err)
+		return nil, fmt.Errorf("failed to chunk and embed content: %v", err)
 	}
 
 	var fullResults []SearchResult

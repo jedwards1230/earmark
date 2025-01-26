@@ -5,35 +5,22 @@ import (
 	"fmt"
 	"log"
 	"transcriber/internal/config"
-	"transcriber/internal/tokenizer"
 
 	"github.com/sashabaranov/go-openai"
 )
 
 type Embeddings struct {
-	c          *openai.Client
-	tokenLimit int
+	c *openai.Client
 }
 
 func NewEmbeddings(cfg *config.Config) *Embeddings {
 	return &Embeddings{
-		c:          InitOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL),
-		tokenLimit: cfg.ChunkSize,
+		c: InitOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL),
 	}
 }
 
 // GetEmbedding returns a vector embedding suitable for similarity search
-func (e *Embeddings) GetEmbeddings(content string) (embeddings [][]float32, err error) {
-	tokens, err := tokenizer.GetTokens(content)
-	if err != nil {
-		return nil, fmt.Errorf("getting tokens: %v", err)
-	}
-	fmt.Printf("Token count: %d\n", len(tokens))
-
-	chunks := chunker(content, e.tokenLimit, SplitTypeToken)
-
-	fmt.Printf("Splitting content into %d chunks\n", len(chunks))
-
+func (e *Embeddings) GetEmbeddings(chunks []string) (embeddings [][]float32, err error) {
 	resp, err := e.c.CreateEmbeddings(
 		context.Background(),
 		openai.EmbeddingRequest{

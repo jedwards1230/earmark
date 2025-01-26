@@ -13,7 +13,7 @@ const (
 	SplitTypeToken SplitType = "token"
 )
 
-func chunker(content string, chunkSize int, splitType SplitType) []string {
+func Chunker(content string, chunkSize int, splitType SplitType) []string {
 	switch splitType {
 	case SplitTypeChar:
 		return chunkByChar(content, chunkSize)
