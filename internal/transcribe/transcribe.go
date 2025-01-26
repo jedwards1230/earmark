@@ -4,16 +4,20 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
 	"transcriber/internal/config"
 	"transcriber/internal/meta"
 )
@@ -169,16 +173,49 @@ func (t *Transcriber) TranscribeAudio(
 		t.log.Printf("Failed to create stdout pipe: %v", err)
 		return "", err
 	}
-	stderrPipe, err := cmd.StderrPipe()
+
+	// Create a pipe for stderr that we can both read from and write to
+	stderrReader, stderrWriter, err := os.Pipe()
 	if err != nil {
 		t.log.Printf("Failed to create stderr pipe: %v", err)
 		return "", err
 	}
 
-	// Start the command
+	// Create a buffer for capturing stderr
+	var stderr bytes.Buffer
+
+	// Set up command stderr
+	cmd.Stderr = stderrWriter
+
+	// Add memory monitoring
+	memStatChan := make(chan struct{})
+	if t.config.Debug {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					var mem runtime.MemStats
+					runtime.ReadMemStats(&mem)
+					t.log.Printf("Memory stats - Alloc: %s, Sys: %s, NumGC: %d",
+						formatFileSize(int64(mem.Alloc)),
+						formatFileSize(int64(mem.Sys)),
+						mem.NumGC)
+				case <-memStatChan:
+					return
+				}
+			}
+		}()
+	}
+
+	// Start the command with detailed error capture
 	if err := cmd.Start(); err != nil {
+		close(memStatChan)
+		stderrReader.Close()
+		stderrWriter.Close()
 		t.log.Printf("Failed to start transcription: %s (%v)", shortPath, err)
-		return "", err
+		return "", fmt.Errorf("failed to start transcription process: %v", err)
 	}
 
 	// Create channels to signal when output processing is done
@@ -194,9 +231,10 @@ func (t *Transcriber) TranscribeAudio(
 		close(stdoutDone)
 	}()
 
-	// Process stderr in real-time
+	// Process stderr in real-time while also capturing it
 	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
+		tee := io.TeeReader(stderrReader, &stderr)
+		scanner := bufio.NewScanner(tee)
 		for scanner.Scan() {
 			t.log.Printf("%s", scanner.Text())
 		}
@@ -215,12 +253,28 @@ func (t *Transcriber) TranscribeAudio(
 
 	// Wait for command to complete and output processing to finish
 	err = cmd.Wait()
+	close(memStatChan)
+	stderrWriter.Close() // Close writer after command exits
+
+	// Wait for output processors to finish
 	<-stdoutDone
 	<-stderrDone
+	stderrReader.Close() // Close reader last
 
 	if err != nil {
-		t.log.Printf("Transcription failed: %s (%v)", shortPath, err)
-		return "", err
+		errMsg := fmt.Sprintf("Transcription failed for %s: %v", shortPath, err)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			errMsg += fmt.Sprintf("\nExit Code: %d", exitErr.ExitCode())
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				errMsg += fmt.Sprintf("\nSignal: %v", status.Signal())
+				if status.Signaled() {
+					errMsg += fmt.Sprintf("\nTerminated by signal: %v", status.Signal())
+				}
+			}
+		}
+		errMsg += fmt.Sprintf("\nStderr Output:\n%s", stderr.String())
+		t.log.Print(errMsg)
+		return "", errors.New(errMsg)
 	}
 
 	// Verify output file exists

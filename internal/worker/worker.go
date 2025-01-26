@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"time"
 	"transcriber/internal/config"
 	"transcriber/internal/db"
@@ -97,16 +98,24 @@ func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, f
 	transcriber := transcribe.NewTranscriber(cfg)
 	textFilePath, err := transcriber.TranscribeAudio(w.ctx, queueItem.FilePath, fileMeta, cfg.WhisperThreads, cfg.WhisperComputeType)
 	if err != nil {
-		w.log.Printf("Failed to transcribe Chapter %s of '%s': %v",
-			fileMeta.Chapter, queueItem.Metadata.Title, err)
-		return "", err
+		baseErr := fmt.Sprintf("Transcription failed for %q (Chapter %q)",
+			queueItem.FilePath, fileMeta.Chapter)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			baseErr += fmt.Sprintf(" - Exit Code: %d", exitErr.ExitCode())
+			if exitErr.Sys() != nil {
+				baseErr += fmt.Sprintf(" - System Error: %v", exitErr.Sys())
+			}
+		}
+		w.log.Printf("Error: %s - %v", baseErr, err)
+		return "", fmt.Errorf("%s: %w", baseErr, err)
 	}
 
 	content, err := OpenFile(textFilePath)
 	if err != nil {
-		w.log.Printf("Failed to read Chapter %s of '%s': %v",
-			fileMeta.Chapter, queueItem.Metadata.Title, err)
-		return "", err
+		errMsg := fmt.Sprintf("Failed to read output file %q for Chapter %q of %q",
+			textFilePath, fileMeta.Chapter, queueItem.Metadata.Title)
+		w.log.Printf("%s: %v", errMsg, err)
+		return "", fmt.Errorf("%s: %w", errMsg, err)
 	}
 
 	return content, nil
