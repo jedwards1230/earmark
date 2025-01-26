@@ -10,8 +10,8 @@ services:
             - .env
         volumes:
             - ./config.json:/config.json
-            - ./audiobooks:/audiobooks
-            - ./transcriptions:/transcriptions
+            - ./media/audiobooks:/audiobooks
+            - ./media/transcriptions:/transcriptions
             - data:/data
             - models:/models
         restart: unless-stopped
