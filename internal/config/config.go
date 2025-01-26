@@ -169,6 +169,9 @@ func MaskSecret(secret string) string {
 	if secret == "" {
 		return ""
 	}
+	if len(secret) > 8 {
+		return strings.Repeat("*", 8)
+	}
 	return strings.Repeat("*", len(secret))
 }
 

@@ -67,7 +67,7 @@ var listCmd = &cobra.Command{
 					if j == len(entry.Chapters)-1 {
 						chapterPrefix = treeLeaf
 					}
-					fmt.Printf("%s%s %s\n", chapterIndent, chapterPrefix, chapter)
+					fmt.Printf("%s%s Chapter %d: %s\n", chapterIndent, chapterPrefix, j+1, chapter)
 				}
 			}
 		}

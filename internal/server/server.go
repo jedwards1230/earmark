@@ -58,7 +58,7 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Log the search parameters
 	log.Printf("Performing search with query: %q", query)
-	results, err := s.db.Search(context.Background(), query, itemLimit, threshold) // Added minimum similarity threshold
+	results, err := s.db.Search(context.Background(), query, itemLimit, threshold)
 	if err != nil {
 		log.Printf("Search error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)

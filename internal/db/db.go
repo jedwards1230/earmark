@@ -4,31 +4,21 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"transcriber/internal/config"
 	"transcriber/internal/meta"
 	"transcriber/internal/openai"
+	"transcriber/internal/utils"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 )
 
-type VectorEntry struct {
-	ID      int
-	Content string
-}
-
 type HierarchicalEntry struct {
 	Author   string
 	Title    string
 	Chapters []string
-}
-
-type SearchResult struct {
-	Author  string
-	Title   string
-	Chapter string
-	Content string
 }
 
 type Statistics struct {
@@ -40,31 +30,6 @@ type DB struct {
 	conn *pgx.Conn
 	e    *openai.Embeddings
 	cfg  *config.Config
-}
-
-type Author struct {
-	ID   int
-	Name string
-}
-
-type Book struct {
-	ID       int
-	AuthorID int
-	Title    string
-}
-
-type ChapterData struct {
-	ID     int
-	BookID int
-	Title  string
-	Index  int
-}
-
-type ChunkEntry struct {
-	ID         int
-	ChapterID  int
-	ChunkIndex int
-	Content    string
 }
 
 type SearchResultWithMetadata struct {
@@ -98,14 +63,6 @@ func New(host, user, password, dbName string, cfg *config.Config) (*DB, error) {
 		conn: conn,
 		e:    openai.NewEmbeddings(cfg),
 		cfg:  cfg,
-	}
-
-	// Reset the schema if RESET_STATE=true
-	if cfg.ResetState {
-		if err := db.Reset(context.Background()); err != nil {
-			conn.Close(context.Background())
-			return nil, fmt.Errorf("failed to reset DB: %v", err)
-		}
 	}
 
 	if err := db.initialize(context.Background()); err != nil {
@@ -227,7 +184,7 @@ func (db *DB) InsertContentWithMetadata(ctx context.Context, content string, met
 		return fmt.Errorf("failed to insert chapter: %v", err)
 	}
 
-	chunks, allEmbeddings, err := db.ChunkAndEmbed(content, db.cfg.ChunkSize)
+	chunks, allEmbeddings, err := db.chunkAndEmbed(content, db.cfg.ChunkSize)
 	if err != nil {
 		return fmt.Errorf("failed to chunk and embed content: %v", err)
 	}
@@ -248,7 +205,7 @@ func (db *DB) InsertContentWithMetadata(ctx context.Context, content string, met
 	return tx.Commit(ctx)
 }
 
-func (db *DB) ChunkAndEmbed(content string, chunkSize int) (chunks []string, embeddings [][]float32, err error) {
+func (db *DB) chunkAndEmbed(content string, chunkSize int) (chunks []string, embeddings [][]float32, err error) {
 	if content == "" {
 		return nil, nil, fmt.Errorf("empty content")
 	}
@@ -289,25 +246,30 @@ func (db *DB) GetMetadataByVectorID(ctx context.Context, vectorID int) (*meta.Fi
 }
 
 func (db *DB) IsProcessed(ctx context.Context, filePath string) (bool, error) {
+	// Extract chapter info from the filepath directly to use in check
+	_, _, chapterIndex, chapterTitle := utils.ParseFilePath(filePath)
+
 	var exists bool
-	// Check if any vectors exist for this book/chapter combination
 	err := db.conn.QueryRow(ctx, `
         SELECT EXISTS(
             SELECT 1 FROM vectors v
             JOIN chapters c ON v.chapter_id = c.id
             JOIN books b ON c.book_id = b.id
-            WHERE b.title = $1
+            JOIN authors a ON b.author_id = a.id
+            WHERE c.title = $1 AND c.index = $2
         )
-    `, filePath).Scan(&exists)
+    `, chapterTitle, chapterIndex).Scan(&exists)
+
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("error checking if file is processed: %w", err)
 	}
+
 	return exists, nil
 }
 
 func (db *DB) Search(ctx context.Context, query string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
 	log.Printf("Performing search with query: %q (limit: %d, threshold: %.2f)", query, limit, threshold)
-	_, allEmbeddings, err := db.ChunkAndEmbed(query, db.cfg.ChunkSize)
+	_, allEmbeddings, err := db.chunkAndEmbed(query, db.cfg.ChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to chunk and embed content: %v", err)
 	}
@@ -355,38 +317,6 @@ func (db *DB) GetHierarchicalData(ctx context.Context) ([]HierarchicalEntry, err
 
 func (db *DB) Close() {
 	db.conn.Close(context.Background())
-}
-
-func (db *DB) SearchContent(ctx context.Context, query string, limit int) ([]SearchResult, error) {
-	rows, err := db.conn.Query(ctx, `
-        SELECT 
-            a.name as author,
-            b.title,
-            c.title as chapter,
-            v.content
-        FROM vectors v
-        JOIN chapters c ON v.chapter_id = c.id
-        JOIN books b ON c.book_id = b.id
-        JOIN authors a ON b.author_id = a.id
-        WHERE v.content ILIKE $1
-        ORDER BY a.name, b.title, c.title
-        LIMIT $2
-    `, "%"+query+"%", limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []SearchResult
-	for rows.Next() {
-		var result SearchResult
-		if err := rows.Scan(&result.Author, &result.Title, &result.Chapter, &result.Content); err != nil {
-			return nil, err
-		}
-		results = append(results, result)
-	}
-
-	return results, rows.Err()
 }
 
 func (db *DB) GetProcessingStats(ctx context.Context) (*Statistics, error) {
@@ -514,4 +444,63 @@ func (db *DB) Reset(ctx context.Context) error {
 
 	log.Println("Database reset completed successfully")
 	return nil
+}
+
+// TextSearch performs a PostgreSQL full-text search on the content
+func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]SearchResultWithMetadata, error) {
+	// Convert the query to a tsquery format and escape special characters
+	tsQuery := strings.Replace(query, "'", "''", -1)
+	tsQuery = strings.Replace(tsQuery, " ", " & ", -1)
+
+	sql := `
+        SELECT 
+            v.id,
+            v.content,
+            a.name as author,
+            b.title,
+            c.title as chapter,
+            v.chunk_index,
+            0.0 as similarity,
+            c.index as chapter_index,
+            c.title as chapter_title,
+            (SELECT COUNT(*) FROM vectors WHERE chapter_id = c.id) as total_chunks,
+            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters
+        FROM vectors v
+        JOIN chapters c ON v.chapter_id = c.id
+        JOIN books b ON c.book_id = b.id
+        JOIN authors a ON b.author_id = a.id
+        WHERE to_tsvector('english', v.content) @@ to_tsquery('english', $1)
+        ORDER BY ts_rank(to_tsvector('english', v.content), to_tsquery('english', $1)) DESC
+        LIMIT $2
+    `
+
+	rows, err := db.conn.Query(ctx, sql, tsQuery, limit)
+	if err != nil {
+		return nil, fmt.Errorf("text search query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var results []SearchResultWithMetadata
+	for rows.Next() {
+		var result SearchResultWithMetadata
+		err := rows.Scan(
+			&result.ID,
+			&result.Content,
+			&result.Author,
+			&result.Title,
+			&result.Chapter,
+			&result.ChunkIndex,
+			&result.Similarity,
+			&result.ChapterIndex,
+			&result.ChapterTitle,
+			&result.TotalChunks,
+			&result.TotalChapters,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("error scanning search result: %w", err)
+		}
+		results = append(results, result)
+	}
+
+	return results, nil
 }

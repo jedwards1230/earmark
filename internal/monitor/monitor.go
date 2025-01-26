@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	"transcriber/internal/db"
 	"transcriber/internal/meta"
 	"transcriber/internal/queue"
+	"transcriber/internal/utils"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -65,60 +65,6 @@ func isAudioFile(filename string) bool {
 	return supportedAudioExtensions[ext]
 }
 
-// parseFilePath extracts author, title, and chapter information from a filepath
-func parseFilePath(path string) (author, title string, chapterIndex int, chapterName string) {
-	// Remove the base audiobooks directory
-	parts := strings.Split(path, string(os.PathSeparator))
-	if len(parts) < 3 {
-		return "", "", 0, ""
-	}
-
-	// Author is typically the first directory after "audiobooks"
-	for i, part := range parts {
-		if part == "audiobooks" && i+1 < len(parts) {
-			author = parts[i+1]
-			break
-		}
-	}
-
-	// Get the filename without extension
-	filename := filepath.Base(path)
-	ext := filepath.Ext(filename)
-	filename = strings.TrimSuffix(filename, ext)
-
-	// Check if the filename contains chapter information
-	if parts := strings.Split(filename, " - "); len(parts) >= 3 {
-		// Last two parts are chapter index and name
-		chapterName = parts[len(parts)-1]
-		chapterIndexStr := parts[len(parts)-2]
-		if idx, err := strconv.Atoi(chapterIndexStr); err == nil {
-			chapterIndex = idx
-		}
-
-		// Title is everything before the chapter parts, up to any ASIN/ISBN
-		titlePart := strings.Join(parts[:len(parts)-2], " - ")
-		if idx := strings.Index(titlePart, "["); idx != -1 {
-			title = strings.TrimSpace(titlePart[:idx])
-		} else {
-			title = titlePart
-		}
-	} else {
-		// Extract title up to the ASIN/ISBN if no chapter information is found
-		if titleIdx := strings.LastIndex(path, author) + len(author) + 1; titleIdx < len(path) {
-			title = path[titleIdx:]
-			titleParts := strings.Split(title, string(os.PathSeparator))
-			if len(titleParts) > 0 {
-				title = titleParts[0]
-			}
-			if idx := strings.Index(title, "["); idx != -1 {
-				title = strings.TrimSpace(title[:idx])
-			}
-		}
-	}
-
-	return author, title, chapterIndex, chapterName
-}
-
 // tryParsers attempts to parse metadata using available parsers
 func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetadata, error) {
 	parsers := meta.GetMetadataParsers()
@@ -130,7 +76,7 @@ func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetad
 		if err == nil {
 			// If we got metadata but no author/title, try to get from filepath
 			if metadata.Author == "" || metadata.Title == "" {
-				author, title, _, _ := parseFilePath(filePath)
+				author, title, _, _ := utils.ParseFilePath(filePath)
 				if metadata.Author == "" {
 					metadata.Author = author
 					if author != "" {
@@ -158,7 +104,7 @@ func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetad
 	}
 
 	// If no parser succeeded, create metadata from filepath
-	author, title, _, _ := parseFilePath(filePath)
+	author, title, _, _ := utils.ParseFilePath(filePath)
 	if author != "" || title != "" {
 		log.Printf("Using filepath metadata - Author: '%s', Title: '%s' (no ASIN/ISBN)",
 			author, title)
@@ -208,19 +154,24 @@ func (fm *FileMonitor) scanBooks() error {
 				return nil
 			}
 
-			// Add audio files to metadata
-			metadata.FileMetas = []meta.FileMetadata{}
-			bookSize := 0
+			// Extract chapter info from file paths and add files to metadata
+			metadata.FileMetas = make([]meta.FileMetadata, 0, len(audioFiles))
+			newFiles := 0
 			for _, audioFile := range audioFiles {
-				bookSize += int(info.Size())
-
-				// Get chapter info from file path
-				_, _, chapterIndex, chapterName := parseFilePath(audioFile)
-
-				// If we didn't get chapter info from the path, try the chapters info
+				_, _, chapterIndex, chapterName := utils.ParseFilePath(audioFile)
 				if chapterIndex == 0 || chapterName == "" {
-					// Find matching chapter info from metadata
 					chapterIndex, chapterName = findChapterInfo(metadata.ChaptersInfo, audioFile, len(metadata.FileMetas))
+				}
+
+				// Check if the file has already been processed using the chapter info
+				processed, err := fm.db.IsProcessed(fm.ctx, audioFile)
+				if err != nil {
+					log.Printf("Error checking processing status: %v", err)
+					continue
+				}
+
+				if processed {
+					continue
 				}
 
 				fileMeta := meta.FileMetadata{
@@ -233,21 +184,21 @@ func (fm *FileMonitor) scanBooks() error {
 					Chapter:      chapterName,
 				}
 				metadata.FileMetas = append(metadata.FileMetas, fileMeta)
+
+				fm.queue.Enqueue(queue.QueueItem{
+					FilePath: audioFile,
+					Metadata: metadata,
+				})
+				newFiles++
 			}
 
-			// Enqueue audio files that haven't been processed
-			queuedFiles := 0
-			for _, fileMeta := range metadata.FileMetas {
-				if processed, _ := fm.db.IsProcessed(fm.ctx, fileMeta.FilePath); !processed {
-					fm.queue.Enqueue(queue.QueueItem{
-						FilePath: fileMeta.FilePath,
-						Metadata: metadata,
-					})
-					queuedFiles++
-				}
+			if newFiles > 0 {
+				log.Printf("Enqueued %d new files for '%s' by %s (total files found: %d)",
+					newFiles, metadata.Title, metadata.Author, len(audioFiles))
+			} else {
+				log.Printf("No new files to process for '%s' by %s (total files found: %d)",
+					metadata.Title, metadata.Author, len(audioFiles))
 			}
-
-			fmt.Printf("Enqueued %d files for '%s' by %s (%d)\n", queuedFiles, metadata.Title, metadata.Author, bookSize)
 		}
 		return nil
 	})
@@ -477,7 +428,7 @@ func (fm *FileMonitor) handleFileCreate(filePath string) {
 		return
 	}
 
-	author, title, _, _ := parseFilePath(filePath)
+	author, title, _, _ := utils.ParseFilePath(filePath)
 	if author != "" && title != "" {
 		log.Printf("New audio file detected: '%s' by %s", title, author)
 	} else {

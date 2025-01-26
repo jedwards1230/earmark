@@ -18,9 +18,8 @@ var (
 var searchCmd = &cobra.Command{
 	Use:   "search [query]",
 	Short: "Search for content in the database",
-	Long: `Search for content in the database. By default, uses semantic vector similarity search.
-Use --text flag to switch to text-based fuzzy matching.`,
-	Args: cobra.ExactArgs(1),
+	Long:  `Search for content in the database. By default, uses semantic vector similarity search.`,
+	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		query := args[0]
 
@@ -37,7 +36,7 @@ Use --text flag to switch to text-based fuzzy matching.`,
 		defer db.Close()
 
 		if textMatch {
-			results, err := db.SearchContent(cmd.Context(), query, limit)
+			results, err := db.TextSearch(cmd.Context(), query, limit)
 			if err != nil {
 				fmt.Printf("Error searching database: %v\n", err)
 				return
@@ -46,20 +45,22 @@ Use --text flag to switch to text-based fuzzy matching.`,
 			return
 		}
 
-		// Vector similarity search
-		vectors, err := db.Search(cmd.Context(), query, limit, threshold)
+		if threshold == 0 {
+			threshold = 0.3 // default threshold
+		}
+
+		results, err := db.Search(cmd.Context(), query, limit, threshold)
 		if err != nil {
 			fmt.Printf("Error searching database: %v\n", err)
 			return
 		}
-
-		if len(vectors) == 0 {
+		if len(results) == 0 {
 			fmt.Println("No results found")
 			return
 		}
 
-		fmt.Printf("Found %d results:\n\n", len(vectors))
-		for i, result := range vectors {
+		fmt.Printf("Found %d results:\n\n", len(results))
+		for i, result := range results {
 			metadata, err := db.GetMetadataByVectorID(cmd.Context(), result.ID)
 			if err != nil {
 				fmt.Printf("Error getting metadata for result %d: %v\n", i+1, err)
@@ -68,8 +69,9 @@ Use --text flag to switch to text-based fuzzy matching.`,
 			fmt.Printf("%d. Author: %s\n", i+1, metadata.Author)
 			fmt.Printf("   Title: %s\n", metadata.Title)
 			if metadata.Chapter != "" {
-				fmt.Printf("   Chapter: %s\n", metadata.Chapter)
+				fmt.Printf("   Chapter %d/%d: %s\n", result.ChapterIndex, result.TotalChapters, result.Chapter)
 			}
+			fmt.Printf("   Chunk %d/%d (similarity: %.2f)\n", result.ChunkIndex+1, result.TotalChunks, result.Similarity)
 			fmt.Printf("   Content: %s\n\n", result.Content)
 		}
 	},
@@ -77,11 +79,11 @@ Use --text flag to switch to text-based fuzzy matching.`,
 
 func init() {
 	searchCmd.Flags().IntVarP(&limit, "limit", "k", 10, "maximum number of results to return")
-	searchCmd.Flags().BoolVarP(&textMatch, "text", "t", false, "use text-based fuzzy matching instead of semantic search")
-	searchCmd.Flags().Float64VarP(&threshold, "precision", "p", 0, "minimum similarity threshold (0..1)")
+	searchCmd.Flags().BoolVarP(&textMatch, "text", "t", false, "use text-based search instead of semantic search")
+	searchCmd.Flags().Float64VarP(&threshold, "precision", "p", 0.3, "minimum similarity threshold (0..1)")
 }
 
-func printResults(results []db.SearchResult) {
+func printResults(results []db.SearchResultWithMetadata) {
 	if len(results) == 0 {
 		fmt.Println("No results found")
 		return
@@ -92,8 +94,9 @@ func printResults(results []db.SearchResult) {
 		fmt.Printf("%d. Author: %s\n", i+1, result.Author)
 		fmt.Printf("   Title: %s\n", result.Title)
 		if result.Chapter != "" {
-			fmt.Printf("   Chapter: %s\n", result.Chapter)
+			fmt.Printf("   Chapter %d/%d: %s\n", result.ChapterIndex, result.TotalChapters, result.Chapter)
 		}
+		fmt.Printf("   Chunk %d/%d (similarity: %.2f)\n", result.ChunkIndex+1, result.TotalChunks, result.Similarity)
 		fmt.Printf("   Content: %s\n\n", result.Content)
 	}
 }

@@ -41,6 +41,7 @@ func runService() {
 
 	if cfg.ResetState {
 		if err := database.Reset(context.Background()); err != nil {
+			database.Close()
 			log.Fatalf("Failed to reset database: %v", err)
 		}
 	}
