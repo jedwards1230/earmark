@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"transcriber/internal/config"
 	"transcriber/internal/meta"
 	"transcriber/internal/openai"
@@ -102,8 +101,7 @@ func New(host, user, password, dbName string, cfg *config.Config) (*DB, error) {
 	}
 
 	// Reset the schema if RESET_STATE=true
-	if os.Getenv("RESET_STATE") == "true" {
-		log.Println("RESET_STATE=true, resetting DB")
+	if cfg.ResetState {
 		if err := db.Reset(context.Background()); err != nil {
 			conn.Close(context.Background())
 			return nil, fmt.Errorf("failed to reset DB: %v", err)
@@ -516,177 +514,4 @@ func (db *DB) Reset(ctx context.Context) error {
 
 	log.Println("Database reset completed successfully")
 	return nil
-}
-
-func (db *DB) InsertChunkWithMetadata(ctx context.Context, content string, authorName, bookTitle, chapterTitle string, chapterIndex, chunkIndex int) (int, error) {
-	tx, err := db.conn.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	// Insert or get author ID
-	var authorID int
-	if err := tx.QueryRow(ctx, `
-		INSERT INTO authors (name) VALUES ($1)
-		ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-		RETURNING id
-	`, authorName).Scan(&authorID); err != nil {
-		return 0, err
-	}
-
-	// Insert or get book ID
-	var bookID int
-	if err := tx.QueryRow(ctx, `
-		INSERT INTO books (author_id, title) VALUES ($1, $2)
-		ON CONFLICT (author_id, title) DO UPDATE SET title = EXCLUDED.title
-		RETURNING id
-	`, authorID, bookTitle).Scan(&bookID); err != nil {
-		return 0, err
-	}
-
-	// Insert or get chapter ID
-	var chapterID int
-	if err := tx.QueryRow(ctx, `
-		INSERT INTO chapters (book_id, title, index) VALUES ($1, $2, $3)
-		ON CONFLICT (book_id, title, index) DO NOTHING
-		RETURNING id
-	`, bookID, chapterTitle, chapterIndex).Scan(&chapterID); err != nil && err != pgx.ErrNoRows {
-		return 0, err
-	}
-	if chapterID == 0 {
-		// If conflict, fetch existing ID
-		if err := tx.QueryRow(ctx, `
-			SELECT id FROM chapters WHERE book_id = $1 AND title = $2 AND index = $3
-		`, bookID, chapterTitle, chapterIndex).Scan(&chapterID); err != nil {
-			return 0, err
-		}
-	}
-
-	chunks, allEmbeddings, err := db.ChunkAndEmbed(content, db.cfg.ChunkSize)
-	if err != nil {
-		return 0, fmt.Errorf("failed to chunk and embed content: %v", err)
-	}
-
-	var lastVecID int
-	for i, emb := range allEmbeddings {
-		err = tx.QueryRow(ctx, `
-			INSERT INTO vectors (embedding, content, chapter_id, chunk_index) 
-			VALUES ($1, $2, $3, $4) RETURNING id
-		`, pgvector.NewVector(emb), chunks[i], chapterID, i).Scan(&lastVecID)
-		if err != nil {
-			return 0, err
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return lastVecID, nil
-}
-
-// Example method to search chunks with optional metadata filters
-func (db *DB) SearchChunksByMetadata(ctx context.Context, query string, authorFilter, bookTitleFilter string, limit int, threshold float64) ([]SearchResult, error) {
-	// Step 1: Optionally apply filters to retrieve candidate vector IDs
-	// For brevity, showing example logic:
-	filterQuery := `
-		SELECT v.id
-		FROM vectors v
-		JOIN metadata m ON v.metadata_id = m.id
-		WHERE 1=1
-	`
-	args := []interface{}{}
-	argIndex := 1
-
-	if authorFilter != "" {
-		filterQuery += fmt.Sprintf(" AND m.author = $%d", argIndex)
-		args = append(args, authorFilter)
-		argIndex++
-	}
-	if bookTitleFilter != "" {
-		filterQuery += fmt.Sprintf(" AND m.title = $%d", argIndex)
-		args = append(args, bookTitleFilter)
-		argIndex++
-	}
-
-	// Now fetch all candidate IDs
-	rows, err := db.conn.Query(ctx, filterQuery, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var candidateIDs []int
-	for rows.Next() {
-		var id int
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		candidateIDs = append(candidateIDs, id)
-	}
-
-	// Step 2: Perform the vector search across these candidates
-	_, allEmbeddings, err := db.ChunkAndEmbed(query, db.cfg.ChunkSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to chunk and embed content: %v", err)
-	}
-
-	var fullResults []SearchResult
-	for _, emb := range allEmbeddings {
-		vectorArg := pgvector.NewVector(emb)
-
-		// Example: refine the findSimilar query to limit to candidate IDs
-		searchQuery := `
-			SELECT v.id, v.content,
-				   1 - (v.embedding <=> $1) AS similarity
-			FROM vectors v
-			WHERE v.id = ANY($2)
-		`
-		if threshold > 0 {
-			searchQuery += " AND (1 - (v.embedding <=> $1)) >= $3"
-			searchQuery += " ORDER BY v.embedding <=> $1 LIMIT $4"
-		} else {
-			searchQuery += " ORDER BY v.embedding <=> $1 LIMIT $3"
-		}
-
-		// Build search args
-		searchArgs := []interface{}{vectorArg, candidateIDs, limit}
-		if threshold > 0 {
-			searchArgs = []interface{}{vectorArg, candidateIDs, threshold, limit}
-		}
-
-		sRows, err := db.conn.Query(ctx, searchQuery, searchArgs...)
-		if err != nil {
-			return nil, err
-		}
-		defer sRows.Close()
-
-		// Collect partial results
-		var partial []SearchResult
-		for sRows.Next() {
-			var entryID int
-			var content string
-			var sim float64
-			if err := sRows.Scan(&entryID, &content, &sim); err != nil {
-				return nil, err
-			}
-
-			// Step 3: Fetch metadata (join with authors/books/chapters as needed)
-			var r SearchResult
-			if err := db.conn.QueryRow(ctx, `
-				SELECT au.name, bo.title, ch.title
-				FROM vectors v
-				JOIN chapters ch ON v.chapter_id = ch.id
-				JOIN books bo ON ch.book_id = bo.id
-				JOIN authors au ON bo.author_id = au.id
-				WHERE v.id = $1
-			`, entryID).Scan(&r.Author, &r.Title, &r.Chapter); err != nil {
-				return nil, err
-			}
-			r.Content = content
-			partial = append(partial, r)
-		}
-		fullResults = append(fullResults, partial...)
-	}
-	return fullResults, nil
 }
