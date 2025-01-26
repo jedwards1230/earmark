@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"transcriber/internal/chunker"
 	"transcriber/internal/config"
 	"transcriber/internal/meta"
 	"transcriber/internal/openai"
@@ -210,7 +211,7 @@ func (db *DB) chunkAndEmbed(content string, chunkSize int) (chunks []string, emb
 		return nil, nil, fmt.Errorf("empty content")
 	}
 
-	chunks = openai.Chunker(content, chunkSize, openai.SplitTypeToken)
+	chunks = chunker.Chunker(content, chunkSize, chunker.SplitTypeToken)
 	if len(chunks) == 0 {
 		return nil, nil, fmt.Errorf("no chunks found")
 	}
