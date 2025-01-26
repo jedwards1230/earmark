@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 	"transcriber/internal/config"
+	"transcriber/internal/db"
 	"transcriber/internal/monitor"
 	"transcriber/internal/queue"
 	"transcriber/internal/server"
@@ -33,7 +34,7 @@ func runService() {
 
 	cfg.PrintEnvVars()
 
-	database, err := initDB(cfg)
+	database, err := db.New(cfg)
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %v", err)
 	}
@@ -45,8 +46,6 @@ func runService() {
 			log.Fatalf("Failed to reset database: %v", err)
 		}
 	}
-
-	log.Println("Database connection established")
 
 	workQueue := queue.NewQueue()
 	worker := worker.NewWorker(workQueue, database)

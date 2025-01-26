@@ -5,13 +5,10 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-
-	"transcriber/internal/config"
-	"transcriber/internal/db"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "lilbro-whisper",
+	Use:   "lil-whisper",
 	Short: "A transcription service using Whisper",
 }
 
@@ -24,14 +21,4 @@ func Run() {
 		log.Printf("Error executing command: %v", err)
 		os.Exit(1)
 	}
-}
-
-func initDB(cfg *config.Config) (*db.DB, error) {
-	return db.New(
-		cfg.DBHost,
-		cfg.DBUser,
-		cfg.DBPassword,
-		cfg.DBName,
-		cfg,
-	)
 }

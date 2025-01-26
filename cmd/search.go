@@ -28,7 +28,7 @@ var searchCmd = &cobra.Command{
 			log.Fatalf("Failed to load config: %v", err)
 		}
 
-		db, err := initDB(cfg)
+		db, err := db.New(cfg)
 		if err != nil {
 			fmt.Printf("Error connecting to database: %v\n", err)
 			return

@@ -2,13 +2,14 @@ package config
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+var logger = log.New(os.Stdout, "(config) ", 0)
 
 type Config struct {
 	// Directory config
@@ -42,7 +43,7 @@ type Config struct {
 }
 
 func LoadConfig() (*Config, error) {
-	log.Println("Loading configuration...")
+	logger.Println("Loading configuration...")
 
 	configFile := "config.json"
 	file, err := os.Open(configFile)
@@ -176,30 +177,30 @@ func MaskSecret(secret string) string {
 }
 
 func (c *Config) PrintEnvVars() {
-	fmt.Println("=== Current Configuration ===")
-	fmt.Printf("Whisper Model: %s\n", c.WhisperModel)
-	fmt.Printf("Whisper Threads: %d\n", c.WhisperThreads)
-	fmt.Printf("Whisper Compute Type: %s\n", c.WhisperComputeType)
-	fmt.Printf("Debug: %v\n", c.Debug)
-	fmt.Printf("Reset State: %v\n", c.ResetState)
+	logger.Println("=== Current Configuration ===")
+	logger.Printf("Whisper Model: %s\n", c.WhisperModel)
+	logger.Printf("Whisper Threads: %d\n", c.WhisperThreads)
+	logger.Printf("Whisper Compute Type: %s\n", c.WhisperComputeType)
+	logger.Printf("Debug: %v\n", c.Debug)
+	logger.Printf("Reset State: %v\n", c.ResetState)
 
 	// Database configuration
-	fmt.Printf("DB Host: %s\n", c.DBHost)
-	fmt.Printf("DB User: %s\n", c.DBUser)
-	fmt.Printf("DB Password: %s\n", MaskSecret(c.DBPassword))
-	fmt.Printf("DB Name: %s\n", c.DBName)
+	logger.Printf("DB Host: %s\n", c.DBHost)
+	logger.Printf("DB User: %s\n", c.DBUser)
+	logger.Printf("DB Password: %s\n", MaskSecret(c.DBPassword))
+	logger.Printf("DB Name: %s\n", c.DBName)
 
 	// OpenAI configuration
-	fmt.Printf("OpenAI Base URL: %s\n", c.OpenAIBaseURL)
-	fmt.Printf("OpenAI API Key: %s\n", MaskSecret(c.OpenAIAPIKey))
+	logger.Printf("OpenAI Base URL: %s\n", c.OpenAIBaseURL)
+	logger.Printf("OpenAI API Key: %s\n", MaskSecret(c.OpenAIAPIKey))
 
 	// Directory configuration
-	fmt.Printf("Audio Directory: %s\n", c.AudioDir)
-	fmt.Printf("Cache Directory: %s\n", c.CacheDir)
-	fmt.Printf("Models Directory: %s\n", c.ModelsDir)
-	fmt.Printf("Output Directory: %s\n", c.OutputDir)
-	fmt.Printf("State File: %s\n", c.StateFile)
+	logger.Printf("Audio Directory: %s\n", c.AudioDir)
+	logger.Printf("Cache Directory: %s\n", c.CacheDir)
+	logger.Printf("Models Directory: %s\n", c.ModelsDir)
+	logger.Printf("Output Directory: %s\n", c.OutputDir)
+	logger.Printf("State File: %s\n", c.StateFile)
 
 	// Other configuration
-	fmt.Printf("Chunk Size: %d\n", c.ChunkSize)
+	logger.Printf("Chunk Size: %d\n", c.ChunkSize)
 }

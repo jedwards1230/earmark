@@ -9,7 +9,7 @@ COPY ./cmd ./cmd
 COPY ./internal ./internal
 COPY ./main.go ./main.go
 
-RUN go build -o /transcriber .
+RUN go build -o /lil-whisper .
 
 FROM python:3.9-slim
 
@@ -29,7 +29,6 @@ ENV PYTHONPATH="$VIRTUAL_ENV/lib/python3.9/site-packages:$PYTHONPATH"
 RUN pip install --no-cache-dir --upgrade pip wheel setuptools
 RUN pip install --no-cache-dir ctranslate2 whisper-ctranslate2
 
-COPY --from=builder /transcriber /transcriber
+COPY --from=builder /lil-whisper /lil-whisper
 
-#ENTRYPOINT ["/transcriber", "search", "eragon"]
-ENTRYPOINT ["/transcriber", "start"]
+ENTRYPOINT ["/lil-whisper", "start"]
