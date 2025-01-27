@@ -51,6 +51,10 @@ func ParseFilePath(path string) (author, title string, chapterIndex int, chapter
 			titleParts := strings.Split(title, string(os.PathSeparator))
 			if len(titleParts) > 0 {
 				title = titleParts[0]
+				// Skip if the title is metadata.json
+				if title == "metadata.json" {
+					title = ""
+				}
 			}
 			if idx := strings.Index(title, "["); idx != -1 {
 				title = strings.TrimSpace(title[:idx])

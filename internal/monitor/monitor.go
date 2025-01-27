@@ -142,7 +142,7 @@ func (fm *FileMonitor) scanBooks() error {
 			fm.log.Printf("Found metadata file: %s", path)
 
 			metadata, err := fm.parseBookMetadataFile(path)
-			if err != nil {
+			if err != nil || metadata == nil {
 				fm.log.Printf("Error parsing metadata file %s: %v", path, err)
 				return nil // Continue walking
 			}

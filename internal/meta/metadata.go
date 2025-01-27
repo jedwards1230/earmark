@@ -3,9 +3,13 @@ package meta
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"transcriber/internal/meta/fetcher"
 )
+
+var logger = log.New(os.Stdout, "(metadata) ", 0)
 
 type FileMetadata struct {
 	ID            int
@@ -66,11 +70,13 @@ type AudibleMetadataParser struct{}
 func (p *AudibleMetadataParser) Parse(data []byte) (*BookMetadata, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
+		logger.Printf("Error parsing Audible metadata: %v", err)
 		return nil, err
 	}
 
 	asin, ok := raw["asin"].(string)
 	if !ok {
+		logger.Printf("Error: no ASIN found in metadata")
 		return nil, fmt.Errorf("no ASIN found")
 	}
 
@@ -91,8 +97,9 @@ func (p *AudibleMetadataParser) Parse(data []byte) (*BookMetadata, error) {
 		}
 	}
 
-	bookInfo, err := fetcher.GetBookMetadata(asin, true)
+	bookInfo, err := fetcher.GetBookByASIN(asin)
 	if err != nil {
+		logger.Printf("Error fetching Audible metadata: %v", err)
 		return nil, fmt.Errorf("failed to fetch ASIN metadata: %w", err)
 	}
 
@@ -110,27 +117,59 @@ type StandardMetadataParser struct{}
 func (p *StandardMetadataParser) Parse(data []byte) (*BookMetadata, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
+		logger.Printf("Error parsing standard metadata: %v", err)
 		return nil, err
 	}
 
 	book, ok := raw["book"].(map[string]interface{})
 	if !ok {
+		logger.Printf("Error: no book data found in metadata")
 		return nil, fmt.Errorf("no book data found")
 	}
 
-	isbn, ok := book["isbn"].(string)
-	if !ok {
+	title := book["title"].(string)
+	authorsInterface := book["authors"].([]interface{})
+	var authors []string
+	for _, a := range authorsInterface {
+		authors = append(authors, a.(string))
+	}
+	author := authors[0]
+
+	// Handle ISBN which might be in scientific notation
+	var isbn string
+	switch v := book["isbn"].(type) {
+	case string:
+		isbn = v
+	case float64:
+		isbn = fmt.Sprintf("%.0f", v)
+	default:
+		logger.Printf("Error: ISBN has unexpected type: %T", v)
+		return nil, fmt.Errorf("invalid ISBN format")
+	}
+
+	if isbn == "" {
+		logger.Printf("Error: no ISBN found in metadata")
 		return nil, fmt.Errorf("no ISBN found")
 	}
 
-	bookInfo, err := fetcher.GetBookMetadata(isbn, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch ISBN metadata: %w", err)
+	logger.Printf("Found ISBN: %s", isbn)
+
+	bookInfo, err := fetcher.GetBookByISBN(isbn)
+	if err == nil {
+		if title == "" && bookInfo.Title != "" {
+			title = bookInfo.Title
+		}
+
+		if author == "" && bookInfo.Author != "" {
+			author = bookInfo.Author
+		}
+	} else {
+		logger.Printf("Error fetching ISBN metadata: %v", err)
 	}
 
 	return &BookMetadata{
-		ISBN:   bookInfo.ISBN,
-		Title:  bookInfo.Title,
-		Author: bookInfo.Author,
+		ISBN:   isbn,
+		Title:  title,
+		Author: author,
 	}, nil
 }
