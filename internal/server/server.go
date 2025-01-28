@@ -1,21 +1,22 @@
 package server
 
 import (
-	"log"
+	"fmt"
 	"net/http"
-	"os"
+
 	"transcriber/internal/config"
 	"transcriber/internal/db"
+	"transcriber/internal/log"
 )
 
 type Server struct {
 	cfg *config.Config
 	db  *db.DB
-	log *log.Logger
+	log log.Logger
 }
 
 func NewServer(database *db.DB, cfg *config.Config) *Server {
-	logger := log.New(os.Stdout, "(server) ", 0)
+	logger := log.NewLogger("server")
 	return &Server{
 		cfg: cfg,
 		db:  database,
@@ -33,8 +34,11 @@ func (s *Server) Start() *http.Server {
 	}
 
 	go func() {
-		s.log.Printf("HTTP server listening on http://localhost%s\n", srv.Addr)
+		s.log.Info("HTTP server listening",
+			"address", srv.Addr,
+			"url", fmt.Sprintf("http://localhost%s", srv.Addr))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			s.log.Error("Server error", "error", err)
 			panic(err)
 		}
 	}()

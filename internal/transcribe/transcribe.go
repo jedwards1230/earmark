@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,29 +18,27 @@ import (
 	"time"
 
 	"transcriber/internal/config"
+	"transcriber/internal/log"
 	"transcriber/internal/meta"
 )
 
-func init() {
-	// Replace default logger with custom logger
-	log.SetFlags(0)
-}
-
 type Transcriber struct {
 	config *config.Config
-	log    *log.Logger
+	log    log.Logger
 }
 
 func NewTranscriber(cfg *config.Config) *Transcriber {
-	logger := log.New(os.Stdout, "(transcribe) ", 0)
+	logger := log.NewLogger("transcribe")
 
 	if err := checkDependencies(); err != nil {
-		logger.Fatalf("Error checking dependencies: %v", err)
+		logger.Error("Failed checking dependencies", "error", err)
+		os.Exit(1)
 	}
 
 	// Clear cache directory on startup
 	if err := clearCacheDir(cfg.CacheDir); err != nil {
-		logger.Fatalf("Error clearing cache directory: %v", err)
+		logger.Error("Failed clearing cache directory", "error", err)
+		os.Exit(1)
 	}
 
 	return &Transcriber{
@@ -116,12 +113,12 @@ func (t *Transcriber) TranscribeAudio(
 	shortPath := shortenPath(audioFilePath)
 	startTime := time.Now()
 
-	t.log.Println("Preprocessing audio...")
+	t.log.Info("Starting audio preprocessing", "file", shortPath)
 
 	// Preprocess audio
 	preprocessedPath, err := t.preprocessAudio(audioFilePath)
 	if err != nil {
-		t.log.Printf("Preprocessing failed: %v", err)
+		t.log.Error("Preprocessing failed", "file", shortPath, "error", err)
 		return "", err
 	}
 	defer os.Remove(preprocessedPath)
@@ -135,7 +132,7 @@ func (t *Transcriber) TranscribeAudio(
 	relativePath := t.getRelativePath(audioFilePath)
 	outputDir, err := t.ensureOutputDir(relativePath)
 	if err != nil {
-		t.log.Printf("Failed to create output directory: %v", err)
+		t.log.Error("Failed to create output directory", "file", shortPath, "error", err)
 		return "", err
 	}
 
@@ -143,11 +140,10 @@ func (t *Transcriber) TranscribeAudio(
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Hour)
 	defer cancel()
 
-	t.log.Println("Transcribing...")
-	t.log.Println("Running whisper-ctranslate2 with:")
-	t.log.Printf("  - Model: %s\n", t.config.WhisperModel)
-	t.log.Printf("  - Compute Type: %s\n", computeType)
-	t.log.Printf("  - Threads: %d\n", threads)
+	t.log.Info("Starting transcription",
+		"model", t.config.WhisperModel,
+		"compute_type", computeType,
+		"threads", threads)
 
 	cmd := exec.CommandContext(ctx,
 		"whisper-ctranslate2",
@@ -170,14 +166,14 @@ func (t *Transcriber) TranscribeAudio(
 	// Create pipes for stdout and stderr
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		t.log.Printf("Failed to create stdout pipe: %v", err)
+		t.log.Error("Failed to create stdout pipe", "file", shortPath, "error", err)
 		return "", err
 	}
 
 	// Create a pipe for stderr that we can both read from and write to
 	stderrReader, stderrWriter, err := os.Pipe()
 	if err != nil {
-		t.log.Printf("Failed to create stderr pipe: %v", err)
+		t.log.Error("Failed to create stderr pipe", "file", shortPath, "error", err)
 		return "", err
 	}
 
@@ -198,10 +194,10 @@ func (t *Transcriber) TranscribeAudio(
 				case <-ticker.C:
 					var mem runtime.MemStats
 					runtime.ReadMemStats(&mem)
-					t.log.Printf("Memory stats - Alloc: %s, Sys: %s, NumGC: %d",
-						formatFileSize(int64(mem.Alloc)),
-						formatFileSize(int64(mem.Sys)),
-						mem.NumGC)
+					t.log.Debug("Memory stats",
+						"alloc", formatFileSize(int64(mem.Alloc)),
+						"sys", formatFileSize(int64(mem.Sys)),
+						"num_gc", mem.NumGC)
 				case <-memStatChan:
 					return
 				}
@@ -214,7 +210,7 @@ func (t *Transcriber) TranscribeAudio(
 		close(memStatChan)
 		stderrReader.Close()
 		stderrWriter.Close()
-		t.log.Printf("Failed to start transcription: %s (%v)", shortPath, err)
+		t.log.Error("Failed to start transcription", "file", shortPath, "error", err)
 		return "", fmt.Errorf("failed to start transcription process: %v", err)
 	}
 
@@ -226,7 +222,7 @@ func (t *Transcriber) TranscribeAudio(
 	go func() {
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			t.log.Printf("%s", scanner.Text())
+			t.log.Info(scanner.Text())
 		}
 		close(stdoutDone)
 	}()
@@ -236,7 +232,7 @@ func (t *Transcriber) TranscribeAudio(
 		tee := io.TeeReader(stderrReader, &stderr)
 		scanner := bufio.NewScanner(tee)
 		for scanner.Scan() {
-			t.log.Printf("%s", scanner.Text())
+			t.log.Info(scanner.Text())
 		}
 		close(stderrDone)
 	}()
@@ -245,7 +241,7 @@ func (t *Transcriber) TranscribeAudio(
 	go func() {
 		<-ctx.Done()
 		if ctx.Err() == context.DeadlineExceeded {
-			t.log.Printf("Transcription timeout for: %s", shortPath)
+			t.log.Warn("Transcription timeout", "file", shortPath)
 		}
 		// Kill process group
 		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -264,35 +260,31 @@ func (t *Transcriber) TranscribeAudio(
 	if err != nil {
 		errMsg := fmt.Sprintf("Transcription failed for %s: %v", shortPath, err)
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			errMsg += fmt.Sprintf("\nExit Code: %d", exitErr.ExitCode())
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				errMsg += fmt.Sprintf("\nSignal: %v", status.Signal())
-				if status.Signaled() {
-					errMsg += fmt.Sprintf("\nTerminated by signal: %v", status.Signal())
-				}
-			}
+			t.log.Error("Transcription process failed",
+				"file", shortPath,
+				"exit_code", exitErr.ExitCode(),
+				"signal", exitErr.Sys(),
+				"stderr", stderr.String())
 		}
-		errMsg += fmt.Sprintf("\nStderr Output:\n%s", stderr.String())
-		t.log.Print(errMsg)
 		return "", errors.New(errMsg)
 	}
 
 	// Verify output file exists
 	outputFile := filepath.Join(outputDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
 	if _, err := os.Stat(outputFile); os.IsNotExist(err) {
-		t.log.Printf("Transcription failed: output file not created for %s", shortPath)
+		t.log.Error("Transcription failed: output file not created", "file", shortPath)
 		return "", err
 	}
 
 	if _, err := os.Stat(audioFilePath); os.IsNotExist(err) {
-		t.log.Printf("Audio file not found: %s", audioFilePath)
+		t.log.Error("Audio file not found", "file", audioFilePath)
 		return "", err
 	}
 
 	// Get word count from output file
 	wordCount, err := countWords(outputFile)
 	if err != nil {
-		t.log.Printf("Failed to count words: %s (%v)", shortPath, err)
+		t.log.Error("Failed to count words", "file", shortPath, "error", err)
 		return "", err
 	}
 	duration := time.Since(startTime)
@@ -301,12 +293,11 @@ func (t *Transcriber) TranscribeAudio(
 	kbPerSec := float64(inputSize) / 1024 / duration.Seconds()
 	wordsPerSec := float64(wordCount) / duration.Seconds()
 
-	t.log.Printf("Done: %s [%s | %.1fKB/s | %.0fw/s]",
-		shortPath,
-		formatDuration(duration),
-		kbPerSec,
-		wordsPerSec,
-	)
+	t.log.Info("Transcription completed",
+		"file", shortPath,
+		"duration", formatDuration(duration),
+		"speed_kb_sec", fmt.Sprintf("%.1f", kbPerSec),
+		"words_sec", fmt.Sprintf("%.0f", wordsPerSec))
 
 	return outputFile, nil
 }
@@ -428,29 +419,32 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 	}
 
 	reductionPct := float64(originalSize-processedSize) / float64(originalSize) * 100
-	t.log.Printf("Converted audio: %s → %s (-%d%%)",
-		formatFileSize(originalSize),
-		formatFileSize(processedSize),
-		int(reductionPct),
-	)
+	t.log.Info("Audio conversion completed",
+		"original_size", formatFileSize(originalSize),
+		"processed_size", formatFileSize(processedSize),
+		"reduction_percent", int(reductionPct))
 
 	if processedSize > 500*1024*1024 {
-		t.log.Printf("Output exceeds 500MB")
+		t.log.Warn("Output file exceeds size limit", "size", formatFileSize(processedSize))
 	}
 
 	if t.config.Debug {
-		t.log.Printf("ffmpeg output file: %s", cachedPath)
+		t.log.Debug("FFmpeg output file created", "path", cachedPath)
 	}
 
 	return cachedPath, nil
 }
 
 func checkAndInstallWhisperCtranslate2() error {
+	// Move logger creation to package level
+	logger := log.NewLogger("whisper-deps")
+
 	// Try to get version first
 	if err := RunWhisperCTranslate2Cmd("--version"); err == nil {
 		return nil
 	}
 
+	logger.Info("Installing whisper-ctranslate2")
 	// Attempt to install whisper-ctranslate2 using pip
 	fmt.Println("Installing whisper-ctranslate2...")
 	installCmd := exec.Command("pip", "install", "-U", "whisper-ctranslate2")

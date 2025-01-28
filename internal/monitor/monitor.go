@@ -3,7 +3,6 @@ package monitor
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +10,7 @@ import (
 
 	"transcriber/internal/config"
 	"transcriber/internal/db"
+	"transcriber/internal/log"
 	"transcriber/internal/meta"
 	"transcriber/internal/queue"
 	"transcriber/internal/utils"
@@ -26,7 +26,7 @@ type FileMonitor struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	done              chan struct{}
-	log               *log.Logger
+	log               log.Logger
 	reprocessingCount int
 }
 
@@ -34,12 +34,14 @@ type FileMonitor struct {
 type Statistics struct {
 	TotalBooks      int
 	TotalAudioFiles int
-	*db.Statistics  // Embed DB statistics
+	*db.Statistics
 }
 
 func NewFileMonitor(cfg *config.Config, q *queue.Queue, database *db.DB) *FileMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
-	logger := log.New(os.Stdout, "(monitor) ", 0)
+
+	logger := log.NewLogger("monitor")
+
 	return &FileMonitor{
 		config:      cfg,
 		queue:       q,
@@ -67,13 +69,13 @@ func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetad
 				if metadata.Author == "" {
 					metadata.Author = author
 					if author != "" {
-						fm.log.Printf("Found author from filepath: %s", author)
+						fm.log.Info("found author from filepath", "author", author)
 					}
 				}
 				if metadata.Title == "" {
 					metadata.Title = title
 					if title != "" {
-						fm.log.Printf("Found title from filepath: %s", title)
+						fm.log.Info("found title from filepath", "title", title)
 					}
 				}
 				identifier := "none"
@@ -82,8 +84,10 @@ func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetad
 				} else if metadata.ISBN != "" {
 					identifier = "ISBN: " + metadata.ISBN
 				}
-				fm.log.Printf("Book metadata: Author: '%s', Title: '%s', %s",
-					metadata.Author, metadata.Title, identifier)
+				fm.log.Info("book metadata",
+					"author", metadata.Author,
+					"title", metadata.Title,
+					"identifier", identifier)
 			}
 			return metadata, nil
 		}
@@ -93,8 +97,7 @@ func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetad
 	// If no parser succeeded, create metadata from filepath
 	author, title, _, _ := utils.ParseFilePath(filePath)
 	if author != "" || title != "" {
-		fm.log.Printf("Using filepath metadata - Author: '%s', Title: '%s' (no ASIN/ISBN)",
-			author, title)
+		fm.log.Info("using filepath metadata", "author", author, "title", title)
 		return &meta.BookMetadata{
 			Author: author,
 			Title:  title,
@@ -123,11 +126,11 @@ func (fm *FileMonitor) scanBooks() error {
 
 		// Only look for metadata.json files
 		if !info.IsDir() && strings.HasSuffix(info.Name(), "metadata.json") {
-			fm.log.Printf("Found metadata file: %s", path)
+			fm.log.Debug("found metadata file", "path", path)
 
 			metadata, err := fm.parseBookMetadataFile(path)
 			if err != nil || metadata == nil {
-				fm.log.Printf("Error parsing metadata file %s: %v", path, err)
+				fm.log.Error("error parsing metadata file", "path", path, "error", err)
 				return nil // Continue walking
 			}
 
@@ -137,7 +140,7 @@ func (fm *FileMonitor) scanBooks() error {
 			// Find all audio files in the same directory
 			audioFiles, err := findAudioFilesInDir(dir)
 			if err != nil {
-				fm.log.Printf("Error finding audio files for '%s': %v", metadata.Title, err)
+				fm.log.Error("error finding audio files", "title", metadata.Title, "error", err)
 				return nil
 			}
 
@@ -147,13 +150,13 @@ func (fm *FileMonitor) scanBooks() error {
 			for _, audioFile := range audioFiles {
 				_, _, chapterIndex, chapterName := utils.ParseFilePath(audioFile)
 				if chapterIndex == 0 || chapterName == "" {
-					chapterIndex, chapterName = findChapterInfo(metadata.ChaptersInfo, audioFile, len(metadata.FileMetas))
+					chapterIndex, chapterName = fm.findChapterInfo(metadata.ChaptersInfo, audioFile, len(metadata.FileMetas))
 				}
 
 				// Check if the file has already been processed using the chapter info
 				processed, err := fm.db.IsProcessed(fm.ctx, audioFile)
 				if err != nil {
-					fm.log.Printf("Error checking processing status: %v", err)
+					fm.log.Error("error checking processing status", "error", err)
 					continue
 				}
 
@@ -180,11 +183,16 @@ func (fm *FileMonitor) scanBooks() error {
 			}
 
 			if newFiles > 0 {
-				fm.log.Printf("Enqueued %d new files for '%s' by %s (total files found: %d)",
-					newFiles, metadata.Title, metadata.Author, len(audioFiles))
+				fm.log.Info("enqueued new files",
+					"count", newFiles,
+					"title", metadata.Title,
+					"author", metadata.Author,
+					"total_files", len(audioFiles))
 			} else {
-				fm.log.Printf("No new files to process for '%s' by %s (total files found: %d)",
-					metadata.Title, metadata.Author, len(audioFiles))
+				fm.log.Info("no new files to process",
+					"title", metadata.Title,
+					"author", metadata.Author,
+					"total_files", len(audioFiles))
 			}
 		}
 		return nil
@@ -192,7 +200,7 @@ func (fm *FileMonitor) scanBooks() error {
 }
 
 // findChapterInfo attempts to match an audio file to its chapter information
-func findChapterInfo(chaptersInfo []meta.ChapterInfo, audioFile string, fileIndex int) (int, string) {
+func (fm *FileMonitor) findChapterInfo(chaptersInfo []meta.ChapterInfo, audioFile string, fileIndex int) (int, string) {
 	if chaptersInfo == nil {
 		return fileIndex + 1, fmt.Sprintf("%d", fileIndex+1) // fallback to old behavior
 	}
@@ -225,9 +233,12 @@ func findChapterInfo(chaptersInfo []meta.ChapterInfo, audioFile string, fileInde
 	}
 
 	if len(matches) > 1 {
-		log.Printf("Multiple chapter matches found for %s:", audioFile)
+		fm.log.Info(fmt.Sprintf("Multiple chapter matches found for %s:", audioFile))
 		for _, m := range matches {
-			log.Printf("- Chapter %d: %s (distance: %d)", m.index, m.name, m.dist)
+			fm.log.Debug("Multiple chapter matches found",
+				"chapter_index", m.index,
+				"chapter_name", m.name,
+				"distance", m.dist)
 		}
 	}
 
@@ -273,7 +284,7 @@ func (fm *FileMonitor) checkOrphanedAudioFiles() error {
 			}
 
 			if !hasMetadata {
-				fm.log.Printf("Warning: Found orphaned audio file with no metadata: %s", path)
+				fm.log.Warn("found orphaned audio file with no metadata", "path", path)
 			}
 		}
 		return nil
@@ -333,7 +344,7 @@ func (fm *FileMonitor) getStatistics(ctx context.Context) (*Statistics, error) {
 
 func (fm *FileMonitor) Start(ready chan<- struct{}) {
 	defer close(fm.done)
-	fm.log.Println("Starting file monitor...")
+	fm.log.Info("starting file monitor")
 
 	// Create a context with timeout for initial setup
 	ctx, cancel := context.WithTimeout(fm.ctx, 30*time.Second)
@@ -341,7 +352,7 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 
 	// Check for mismatched chunks before anything else starts
 	if err := fm.verifyChunkSizes(ctx); err != nil {
-		fm.log.Printf("Fatal error during chunk size verification: %v", err)
+		fm.log.Error("fatal error during chunk size verification", "error", err)
 		close(ready)
 		return
 	}
@@ -349,38 +360,38 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 	// Collect and log initial statistics
 	stats, err := fm.getStatistics(ctx)
 	if err != nil {
-		fm.log.Printf("Error collecting statistics: %v", err)
+		fm.log.Error("error collecting statistics", "error", err)
 	} else {
-		fm.log.Printf("Library Statistics:")
-		fm.log.Printf("  - Total Metadata Files Found: %d", stats.TotalBooks)
-		fm.log.Printf("  - Total Audio Files Found: %d", stats.TotalAudioFiles)
-		fm.log.Printf("  - Processed Books: %d", stats.ProcessedBooks)
-		fm.log.Printf("  - Processed Chapters: %d", stats.ProcessedChapters)
-		fm.log.Printf("  - Books Needing Reprocessing: %d", stats.ReprocessingBooks)
+		fm.log.Info("library statistics",
+			"total_books", stats.TotalBooks,
+			"total_audio_files", stats.TotalAudioFiles,
+			"processed_books", stats.ProcessedBooks,
+			"processed_chapters", stats.ProcessedChapters,
+			"reprocessing_books", stats.ReprocessingBooks)
 	}
 
 	// Check for orphaned audio files first
 	if err := fm.checkOrphanedAudioFiles(); err != nil {
-		fm.log.Printf("Error checking for orphaned audio files: %v", err)
+		fm.log.Error("error checking for orphaned audio files", "error", err)
 	}
 
 	// Then proceed with normal book scanning
 	if err := fm.scanBooks(); err != nil {
-		fm.log.Printf("Error scanning books: %v", err)
+		fm.log.Error("error scanning books", "error", err)
 	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		fm.log.Fatalf("Failed to create file watcher: %v", err)
+		fm.log.Error("failed to create file watcher", "error", err)
 	}
 	defer watcher.Close()
 
 	// Watch the root directory and recursively add all subdirectories
 	if err := fm.addDirAndSubDirs(watcher, fm.config.AudioDir); err != nil {
-		fm.log.Fatalf("Failed to set up directory watchers: %v", err)
+		fm.log.Error("failed to set up directory watchers", "error", err)
 	}
 
-	fm.log.Printf("Monitoring root directory: %s", fm.config.AudioDir)
+	fm.log.Info("monitoring root directory", "path", fm.config.AudioDir)
 
 	// Signal that initialization is complete
 	close(ready)
@@ -396,7 +407,7 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 				info, err := os.Stat(event.Name)
 				if err == nil && info.IsDir() {
 					if err := fm.addDirAndSubDirs(watcher, event.Name); err != nil {
-						fm.log.Printf("Error adding new directory to watcher: %v", err)
+						fm.log.Error("error adding new directory to watcher", "error", err)
 					}
 				} else {
 					go fm.handleFileCreate(event.Name)
@@ -406,7 +417,7 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 			if !ok {
 				return
 			}
-			fm.log.Println("File watcher error:", err)
+			fm.log.Error("file watcher error", "error", err)
 		case <-fm.ctx.Done():
 			return
 		}
@@ -435,16 +446,16 @@ func (fm *FileMonitor) handleFileCreate(filePath string) {
 
 	author, title, _, _ := utils.ParseFilePath(filePath)
 	if author != "" && title != "" {
-		fm.log.Printf("New audio file detected: '%s' by %s", title, author)
+		fm.log.Info("new audio file detected", "title", title, "author", author)
 	} else {
-		fm.log.Printf("New audio file detected: %s", filePath)
+		fm.log.Info("new audio file detected", "path", filePath)
 	}
 
 	// Add a small delay to allow file creation to complete
 	time.Sleep(1 * time.Second)
 
 	if processed, _ := fm.db.IsProcessed(fm.ctx, filePath); processed {
-		fm.log.Printf("Audio file already processed: %s", filePath)
+		fm.log.Info("audio file already processed", "path", filePath)
 		return
 	}
 
@@ -472,11 +483,11 @@ func (fm *FileMonitor) verifyChunkSizes(ctx context.Context) error {
 
 	if len(booksToReprocess) > 0 {
 		fm.reprocessingCount = len(booksToReprocess) // Store the count
-		fm.log.Printf("Found %d books with mismatched chunk sizes that need reprocessing", len(booksToReprocess))
+		fm.log.Info("found books with mismatched chunk sizes", "count", len(booksToReprocess))
 
 		// Process each book sequentially
 		for _, book := range booksToReprocess {
-			fm.log.Printf("Reprocessing '%s' by %s", book.Title, book.Author)
+			fm.log.Info("reprocessing book", "title", book.Title, "author", book.Author)
 
 			// Create new context for each delete operation
 			deleteCtx, deleteCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -493,10 +504,10 @@ func (fm *FileMonitor) verifyChunkSizes(ctx context.Context) error {
 					Metadata: &book,
 				})
 			}
-			fm.log.Printf("Successfully queued %d chapters for reprocessing", len(book.FileMetas))
+			fm.log.Info("successfully queued chapters for reprocessing", "count", len(book.FileMetas))
 		}
 	} else {
-		fm.log.Printf("No books found with mismatched chunk sizes")
+		fm.log.Info("no books found with mismatched chunk sizes")
 	}
 
 	return nil

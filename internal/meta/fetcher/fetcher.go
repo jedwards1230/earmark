@@ -2,14 +2,13 @@ package fetcher
 
 import (
 	"fmt"
-	"log"
-	"os"
+	"transcriber/internal/log"
 
 	goisbn "github.com/abx123/go-isbn"
 	"github.com/bobbyrward/abs-importer/pkg/api/audible"
 )
 
-var logger = log.New(os.Stdout, "(book-fetcher) ", 0)
+var logger = log.NewLogger("book-fetcher")
 
 type BookInfo struct {
 	Title       string
@@ -20,7 +19,7 @@ type BookInfo struct {
 }
 
 func GetBookByASIN(asin string) (*BookInfo, error) {
-	logger.Printf("Fetching book metadata for ASIN: %s", asin)
+	logger.Debug("Fetching book metadata for ASIN", "asin", asin)
 
 	book, err := audible.NewAudibleApiClient().GetMetadataFromAsin(asin)
 	if err != nil {
@@ -36,15 +35,16 @@ func GetBookByASIN(asin string) (*BookInfo, error) {
 }
 
 func GetBookByISBN(isbn string) (*BookInfo, error) {
-	logger.Printf("Fetching book metadata for ISBN: %s", isbn)
+	logger.Debug("Fetching book metadata for ISBN", "isbn", isbn)
 
-	gi := goisbn.NewGoISBN(goisbn.DEFAULT_PROVIDERS)
+	gi := goisbn.NewGoISBN([]string{
+		goisbn.ProviderGoogle,
+		goisbn.ProviderOpenLibrary,
+	})
 	book, err := gi.Get(isbn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch ISBN data: %w", err)
 	}
-
-	logger.Printf("Book data: %+v", book)
 
 	return &BookInfo{
 		Title:       book.Title,

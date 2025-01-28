@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"time"
 	"transcriber/internal/config"
 	"transcriber/internal/db"
+	"transcriber/internal/log"
 	"transcriber/internal/meta"
 	"transcriber/internal/queue"
 	"transcriber/internal/transcribe"
@@ -21,12 +21,12 @@ type Worker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	db     *db.DB
-	log    *log.Logger
+	log    log.Logger
 }
 
 func NewWorker(q *queue.Queue, db *db.DB) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
-	logger := log.New(os.Stdout, "(worker) ", 0)
+	logger := log.NewLogger("worker")
 	return &Worker{
 		queue:  q,
 		done:   make(chan struct{}),
@@ -38,11 +38,11 @@ func NewWorker(q *queue.Queue, db *db.DB) *Worker {
 }
 
 func (w *Worker) Start(cfg *config.Config) {
-	w.log.Println("Worker started")
+	w.log.Info("Worker started", "status", "started")
 	for {
 		select {
 		case <-w.ctx.Done():
-			w.log.Println("Worker received shutdown signal")
+			w.log.Info("Worker received shutdown signal", "status", "shutdown")
 			close(w.done)
 			return
 		default:
@@ -62,34 +62,43 @@ func (w *Worker) Start(cfg *config.Config) {
 			}
 
 			if fileMeta == nil {
-				w.log.Printf("No metadata found for file: %s", queueItem.FilePath)
+				w.log.Debug("No metadata found for file", "path", queueItem.FilePath)
 				continue
 			}
 
-			w.log.Printf("Processing '%s' by %s - Chapter %d: %s",
-				queueItem.Metadata.Title, queueItem.Metadata.Author, fileMeta.ChapterIndex, fileMeta.Chapter)
+			w.log.Info("Processing chapter",
+				"title", queueItem.Metadata.Title,
+				"author", queueItem.Metadata.Author,
+				"chapter_index", fileMeta.ChapterIndex,
+				"chapter_name", fileMeta.Chapter)
 
 			startTime := time.Now()
 			content, err := w.transcribeFile(cfg, queueItem, fileMeta)
 			if err != nil {
-				w.log.Printf("Failed to transcribe Chapter %s of '%s': %v",
-					fileMeta.Chapter, queueItem.Metadata.Title, err)
+				w.log.Error("Failed to transcribe chapter",
+					"chapter", fileMeta.Chapter,
+					"title", queueItem.Metadata.Title,
+					"error", err)
 				continue
 			}
 			endTime := time.Now()
-			duration := endTime.Sub(startTime)
-			duration = duration.Round(time.Second)
-			w.log.Printf("Transcription of Chapter %s of '%s' took %s",
-				fileMeta.Chapter, queueItem.Metadata.Title, duration)
+			duration := endTime.Sub(startTime).Round(time.Second)
+			w.log.Info("Transcription completed",
+				"chapter", fileMeta.Chapter,
+				"title", queueItem.Metadata.Title,
+				"duration", duration)
 
 			if err := w.db.InsertContentWithMetadata(w.ctx, content, fileMeta); err != nil {
-				w.log.Printf("Failed to store Chapter %s of '%s': %v",
-					fileMeta.Chapter, queueItem.Metadata.Title, err)
+				w.log.Error("Failed to store chapter",
+					"chapter", fileMeta.Chapter,
+					"title", queueItem.Metadata.Title,
+					"error", err)
 				continue
 			}
 
-			w.log.Printf("Completed Chapter %s of '%s'",
-				fileMeta.Chapter, queueItem.Metadata.Title)
+			w.log.Info("Chapter completed",
+				"chapter", fileMeta.Chapter,
+				"title", queueItem.Metadata.Title)
 		}
 	}
 }
@@ -101,21 +110,24 @@ func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, f
 		baseErr := fmt.Sprintf("Transcription failed for %q (Chapter %q)",
 			queueItem.FilePath, fileMeta.Chapter)
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			baseErr += fmt.Sprintf(" - Exit Code: %d", exitErr.ExitCode())
-			if exitErr.Sys() != nil {
-				baseErr += fmt.Sprintf(" - System Error: %v", exitErr.Sys())
-			}
+			w.log.Error("Transcription process error",
+				"file", queueItem.FilePath,
+				"chapter", fileMeta.Chapter,
+				"exit_code", exitErr.ExitCode(),
+				"system_error", exitErr.Sys(),
+				"error", err)
 		}
-		w.log.Printf("Error: %s - %v", baseErr, err)
 		return "", fmt.Errorf("%s: %w", baseErr, err)
 	}
 
 	content, err := OpenFile(textFilePath)
 	if err != nil {
-		errMsg := fmt.Sprintf("Failed to read output file %q for Chapter %q of %q",
-			textFilePath, fileMeta.Chapter, queueItem.Metadata.Title)
-		w.log.Printf("%s: %v", errMsg, err)
-		return "", fmt.Errorf("%s: %w", errMsg, err)
+		w.log.Error("Failed to read output file",
+			"file", textFilePath,
+			"chapter", fileMeta.Chapter,
+			"title", queueItem.Metadata.Title,
+			"error", err)
+		return "", fmt.Errorf("failed to read output file %q: %w", textFilePath, err)
 	}
 
 	return content, nil

@@ -3,11 +3,11 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
-	"os"
 	"strings"
+
 	"transcriber/internal/chunker"
 	"transcriber/internal/config"
+	"transcriber/internal/log"
 	"transcriber/internal/meta"
 	"transcriber/internal/openai"
 	"transcriber/internal/utils"
@@ -33,7 +33,7 @@ type DB struct {
 	conn *pgx.Conn
 	e    *openai.Embeddings
 	cfg  *config.Config
-	log  *log.Logger
+	log  log.Logger
 }
 
 type SearchResultWithMetadata struct {
@@ -57,7 +57,7 @@ func New(cfg *config.Config) (*DB, error) {
 		return nil, err
 	}
 
-	logger := log.New(os.Stdout, "(db) ", 0)
+	logger := log.NewLogger("db")
 
 	db := &DB{
 		conn: conn,
@@ -71,7 +71,7 @@ func New(cfg *config.Config) (*DB, error) {
 		return nil, err
 	}
 
-	db.log.Printf("Database initialized at %s", cfg.DBHost)
+	db.log.Info(fmt.Sprintf("Database initialized at %s", cfg.DBHost))
 	return db, nil
 }
 
@@ -142,7 +142,7 @@ func (db *DB) initialize(ctx context.Context) error {
             ON vectors USING hnsw (embedding vector_cosine_ops)
             WITH (m = 16, ef_construction = 64);
     `); err != nil {
-		db.log.Printf("Warning: schema creation failed: %v", err)
+		db.log.Warn("Warning: schema creation failed", "error", err)
 		return fmt.Errorf("failed creating schema: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func (db *DB) chunkAndEmbed(content string, chunkSize int) (chunks []string, emb
 		return nil, nil, fmt.Errorf("no chunks found")
 	}
 
-	db.log.Printf("Splitting content into %d chunks\n", len(chunks))
+	db.log.Debug("Splitting content into chunks", "count", len(chunks))
 
 	allEmbeddings, err := db.e.GetEmbeddings(chunks)
 	if err != nil {
@@ -279,7 +279,7 @@ func (db *DB) IsProcessed(ctx context.Context, filePath string) (bool, error) {
 }
 
 func (db *DB) Search(ctx context.Context, query string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	db.log.Printf("Performing search with query: %q (limit: %d, threshold: %.2f)", query, limit, threshold)
+	db.log.Debug("Performing search", "query", query, "limit", limit, "threshold", threshold)
 	_, allEmbeddings, err := db.chunkAndEmbed(query, db.cfg.ChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to chunk and embed content: %v", err)
@@ -409,7 +409,7 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 }
 
 func (db *DB) Reset(ctx context.Context) error {
-	db.log.Println("Performing complete database reset...")
+	db.log.Warn("Performing complete database reset...")
 
 	tx, err := db.conn.Begin(ctx)
 	if err != nil {
@@ -453,7 +453,7 @@ func (db *DB) Reset(ctx context.Context) error {
 		return fmt.Errorf("failed to reinitialize database: %v", err)
 	}
 
-	db.log.Println("Database reset completed successfully")
+	db.log.Info("Database reset completed successfully")
 	return nil
 }
 

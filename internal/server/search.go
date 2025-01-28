@@ -9,11 +9,14 @@ import (
 )
 
 func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
-	s.log.Printf("Received search request from %s: %s", r.RemoteAddr, r.URL.String())
+	s.log.Info("Received search request",
+		"remote_addr", r.RemoteAddr,
+		"url", r.URL.String())
 
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		s.log.Printf("Bad request: missing query parameter from %s", r.RemoteAddr)
+		s.log.Warn("Bad request: missing query parameter",
+			"remote_addr", r.RemoteAddr)
 		http.Error(w, "missing query parameter", http.StatusBadRequest)
 		return
 	}
@@ -25,7 +28,9 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 
 	threshold, err := strconv.ParseFloat(thresholdStr, 64)
 	if err != nil {
-		s.log.Printf("Bad request: invalid threshold parameter from %s", r.RemoteAddr)
+		s.log.Warn("Bad request: invalid threshold parameter",
+			"remote_addr", r.RemoteAddr,
+			"threshold", thresholdStr)
 		http.Error(w, "invalid threshold parameter", http.StatusBadRequest)
 		return
 	}
@@ -37,21 +42,29 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 
 	itemLimit, err := strconv.Atoi(itemLimitStr)
 	if err != nil {
-		s.log.Printf("Bad request: invalid item limit parameter from %s", r.RemoteAddr)
+		s.log.Warn("Bad request: invalid item limit parameter",
+			"remote_addr", r.RemoteAddr,
+			"limit", itemLimitStr)
 		http.Error(w, "invalid item limit parameter", http.StatusBadRequest)
 		return
 	}
 
-	// Log the search parameters
-	s.log.Printf("Performing search with query: %q", query)
+	s.log.Info("Performing search",
+		"query", query,
+		"threshold", threshold,
+		"limit", itemLimit)
+
 	results, err := s.db.Search(context.Background(), query, itemLimit, threshold)
 	if err != nil {
-		s.log.Printf("Search error: %v", err)
+		s.log.Error("Search error", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	s.log.Printf("Search returned %d results", len(results))
+	s.log.Info("Search completed",
+		"query", query,
+		"result_count", len(results))
+
 	// Ensure we return an empty array instead of null when no results
 	if results == nil {
 		results = []db.SearchResultWithMetadata{}
@@ -64,7 +77,7 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 		"results": results,
 	})
 	if err != nil {
-		s.log.Printf("JSON marshaling error: %v", err)
+		s.log.Error("JSON marshaling error", "error", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
