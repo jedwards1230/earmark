@@ -17,10 +17,17 @@ const (
 	colorWhite  = "\033[37m"
 )
 
+var debugEnabled bool
+
+func init() {
+	debugEnabled = os.Getenv("LOG_DEBUG") == "1" || os.Getenv("LOG_DEBUG") == "true"
+}
+
 // PrettyHandler provides a more readable log format
 type PrettyHandler struct {
-	l      *log.Logger
-	module string
+	l        *log.Logger
+	module   string
+	logLevel slog.Level
 }
 
 type Logger struct {
@@ -28,14 +35,23 @@ type Logger struct {
 }
 
 func NewLogger(module string) Logger {
+	logLevel := slog.LevelInfo
+	if debugEnabled {
+		logLevel = slog.LevelDebug
+	}
 	prettyHandler := &PrettyHandler{
-		l: log.New(os.Stdout, "", 0),
+		l:        log.New(os.Stdout, "", 0),
+		module:   module,
+		logLevel: logLevel,
 	}
 	return Logger{slog.New(prettyHandler).With("module", module)}
 }
 
 // Implement the required slog.Handler interface methods
 func (h *PrettyHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if level == slog.LevelDebug {
+		return debugEnabled
+	}
 	return true
 }
 

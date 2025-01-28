@@ -178,30 +178,30 @@ func MaskSecret(secret string) string {
 }
 
 func (c *Config) PrintEnvVars() {
-	logger.Info("=== Current Configuration ===")
-	logger.Info("Whisper Model", "value", c.WhisperModel)
-	logger.Info("Whisper Threads", "value", c.WhisperThreads)
-	logger.Info("Whisper Compute Type", "value", c.WhisperComputeType)
-	logger.Info("Debug", "value", c.Debug)
-	logger.Info("Reset State", "value", c.ResetState)
+	logger.Debug("=== Current Configuration ===")
+	logger.Debug("Whisper Model", "value", c.WhisperModel)
+	logger.Debug("Whisper Threads", "value", c.WhisperThreads)
+	logger.Debug("Whisper Compute Type", "value", c.WhisperComputeType)
+	logger.Debug("Debug", "value", c.Debug)
+	logger.Debug("Reset State", "value", c.ResetState)
 
 	// Database configuration
-	logger.Info("DB Host", "value", c.DBHost)
-	logger.Info("DB User", "value", c.DBUser)
-	logger.Info("DB Password", "value", MaskSecret(c.DBPassword))
-	logger.Info("DB Name", "value", c.DBName)
+	logger.Debug("DB Host", "value", c.DBHost)
+	logger.Debug("DB User", "value", c.DBUser)
+	logger.Debug("DB Password", "value", MaskSecret(c.DBPassword))
+	logger.Debug("DB Name", "value", c.DBName)
 
 	// OpenAI configuration
-	logger.Info("OpenAI Base URL", "value", c.OpenAIBaseURL)
-	logger.Info("OpenAI API Key", "value", MaskSecret(c.OpenAIAPIKey))
+	logger.Debug("OpenAI Base URL", "value", c.OpenAIBaseURL)
+	logger.Debug("OpenAI API Key", "value", MaskSecret(c.OpenAIAPIKey))
 
 	// Directory configuration
-	logger.Info("Audio Directory", "value", c.AudioDir)
-	logger.Info("Cache Directory", "value", c.CacheDir)
-	logger.Info("Models Directory", "value", c.ModelsDir)
-	logger.Info("Output Directory", "value", c.OutputDir)
-	logger.Info("State File", "value", c.StateFile)
+	logger.Debug("Audio Directory", "value", c.AudioDir)
+	logger.Debug("Cache Directory", "value", c.CacheDir)
+	logger.Debug("Models Directory", "value", c.ModelsDir)
+	logger.Debug("Output Directory", "value", c.OutputDir)
+	logger.Debug("State File", "value", c.StateFile)
 
 	// Other configuration
-	logger.Info("Chunk Size", "value", c.ChunkSize)
+	logger.Debug("Chunk Size", "value", c.ChunkSize)
 }
