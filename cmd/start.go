@@ -48,18 +48,21 @@ func runService() {
 	}
 
 	workQueue := queue.NewQueue()
-	worker := worker.NewWorker(workQueue, database)
 	fileMonitor := monitor.NewFileMonitor(cfg, workQueue, database)
+	worker := worker.NewWorker(workQueue, database)
 
-	var wg sync.WaitGroup
-
-	// Start services
-	wg.Add(2)
+	// Start monitor first and wait for initial scan to complete
+	monitorReady := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		fileMonitor.Start()
+		fileMonitor.Start(monitorReady)
 	}()
 
+	// Wait for monitor to complete initialization
+	<-monitorReady
+
+	// Then start worker and other services
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		worker.Start(cfg)

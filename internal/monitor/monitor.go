@@ -19,14 +19,15 @@ import (
 )
 
 type FileMonitor struct {
-	config      *config.Config
-	queue       *queue.Queue
-	db          *db.DB
-	queuedFiles map[string]bool
-	ctx         context.Context
-	cancel      context.CancelFunc
-	done        chan struct{}
-	log         *log.Logger
+	config            *config.Config
+	queue             *queue.Queue
+	db                *db.DB
+	queuedFiles       map[string]bool
+	ctx               context.Context
+	cancel            context.CancelFunc
+	done              chan struct{}
+	log               *log.Logger
+	reprocessingCount int
 }
 
 // Statistics struct to track book and file counts
@@ -341,15 +342,32 @@ func (fm *FileMonitor) getStatistics(ctx context.Context) (*Statistics, error) {
 	}
 	stats.Statistics = dbStats
 
+	// Override the reprocessing count with our stored value
+	stats.ReprocessingBooks = fm.reprocessingCount
+
 	return stats, nil
 }
 
-func (fm *FileMonitor) Start() {
+func (fm *FileMonitor) Start(ready chan<- struct{}) {
 	defer close(fm.done)
 	fm.log.Println("Starting file monitor...")
 
+	// Create a context with timeout for initial setup
+	ctx, cancel := context.WithTimeout(fm.ctx, 30*time.Second)
+	defer cancel()
+
+	// Check for mismatched chunks before anything else starts
+	if err := fm.verifyChunkSizes(ctx); err != nil {
+		fm.log.Printf("Fatal error during chunk size verification: %v", err)
+		close(ready)
+		return
+	}
+
+	// Signal that initialization is complete
+	close(ready)
+
 	// Collect and log initial statistics
-	stats, err := fm.getStatistics(fm.ctx)
+	stats, err := fm.getStatistics(ctx)
 	if err != nil {
 		fm.log.Printf("Error collecting statistics: %v", err)
 	} else {
@@ -358,6 +376,7 @@ func (fm *FileMonitor) Start() {
 		fm.log.Printf("  - Total Audio Files Found: %d", stats.TotalAudioFiles)
 		fm.log.Printf("  - Processed Books: %d", stats.ProcessedBooks)
 		fm.log.Printf("  - Processed Chapters: %d", stats.ProcessedChapters)
+		fm.log.Printf("  - Books Needing Reprocessing: %d", stats.ReprocessingBooks)
 	}
 
 	// Check for orphaned audio files first
@@ -456,6 +475,48 @@ func (fm *FileMonitor) handleFileCreate(filePath string) {
 		FilePath: filePath,
 		Metadata: metadata,
 	})
+}
+
+func (fm *FileMonitor) verifyChunkSizes(ctx context.Context) error {
+	// Create a new context with timeout specifically for this operation
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	booksToReprocess, err := fm.db.CheckForMismatchedChunks(queryCtx, fm.config.ChunkSize)
+	if err != nil {
+		return fmt.Errorf("failed to check for mismatched chunks: %v", err)
+	}
+
+	if len(booksToReprocess) > 0 {
+		fm.reprocessingCount = len(booksToReprocess) // Store the count
+		fm.log.Printf("Found %d books with mismatched chunk sizes that need reprocessing", len(booksToReprocess))
+
+		// Process each book sequentially
+		for _, book := range booksToReprocess {
+			fm.log.Printf("Reprocessing '%s' by %s", book.Title, book.Author)
+
+			// Create new context for each delete operation
+			deleteCtx, deleteCancel := context.WithTimeout(ctx, 5*time.Second)
+			if err := fm.db.DeleteBookChunks(deleteCtx, book.ID); err != nil {
+				deleteCancel()
+				return fmt.Errorf("failed to delete existing chunks for '%s': %v", book.Title, err)
+			}
+			deleteCancel()
+
+			// Re-queue all chapters for processing
+			for _, chapter := range book.FileMetas {
+				fm.queue.Enqueue(queue.QueueItem{
+					FilePath: chapter.FilePath,
+					Metadata: &book,
+				})
+			}
+			fm.log.Printf("Successfully queued %d chapters for reprocessing", len(book.FileMetas))
+		}
+	} else {
+		fm.log.Printf("No books found with mismatched chunk sizes")
+	}
+
+	return nil
 }
 
 func (fm *FileMonitor) Stop() {

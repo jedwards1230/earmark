@@ -44,12 +44,13 @@ func NewMetadata(file_path, author, title, chapter, isbn string) *FileMetadata {
 
 // BookMetadata represents common metadata across all formats
 type BookMetadata struct {
+	ID           int
 	ISBN         string
 	ASIN         string
 	Title        string
 	Author       string
 	FileMetas    []FileMetadata
-	ChaptersInfo []ChapterInfo `json:"chapters"` // new field for chapter information
+	ChaptersInfo []ChapterInfo `json:"chapters"`
 }
 
 // MetadataParser interface for different metadata formats

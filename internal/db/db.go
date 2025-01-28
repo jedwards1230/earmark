@@ -26,6 +26,7 @@ type HierarchicalEntry struct {
 type Statistics struct {
 	ProcessedBooks    int
 	ProcessedChapters int
+	ReprocessingBooks int
 }
 
 type DB struct {
@@ -126,6 +127,7 @@ func (db *DB) initialize(ctx context.Context) error {
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
             embedding vector(1536),
+            chunk_size INTEGER NOT NULL,
             UNIQUE(chapter_id, chunk_index)
         );
 
@@ -199,11 +201,13 @@ func (db *DB) InsertContentWithMetadata(ctx context.Context, content string, met
 	// Insert vector chunks
 	for i, emb := range allEmbeddings {
 		_, err = tx.Exec(ctx, `
-            INSERT INTO vectors (chapter_id, chunk_index, content, embedding)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO vectors (chapter_id, chunk_index, content, embedding, chunk_size)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (chapter_id, chunk_index) DO UPDATE 
-            SET content = EXCLUDED.content, embedding = EXCLUDED.embedding
-        `, chapterID, i, chunks[i], pgvector.NewVector(emb))
+            SET content = EXCLUDED.content, 
+                embedding = EXCLUDED.embedding,
+                chunk_size = EXCLUDED.chunk_size
+        `, chapterID, i, chunks[i], pgvector.NewVector(emb), db.cfg.ChunkSize)
 		if err != nil {
 			return fmt.Errorf("failed to insert vector chunk: %v", err)
 		}
@@ -330,8 +334,8 @@ func (db *DB) GetProcessingStats(ctx context.Context) (*Statistics, error) {
 	stats := &Statistics{}
 	err := db.conn.QueryRow(ctx, `
         SELECT 
-            COUNT(DISTINCT b.id) as processed_books,
-            COUNT(DISTINCT c.id) as processed_chapters
+            COUNT(DISTINCT b.id),
+            COUNT(DISTINCT c.id)
         FROM books b
         LEFT JOIN chapters c ON c.book_id = b.id
     `).Scan(&stats.ProcessedBooks, &stats.ProcessedChapters)
@@ -510,4 +514,94 @@ func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]Search
 	}
 
 	return results, nil
+}
+
+// CheckForMismatchedChunks finds books that have chunks with different sizes than current config
+func (db *DB) CheckForMismatchedChunks(ctx context.Context, configuredChunkSize int) ([]meta.BookMetadata, error) {
+	// Get all mismatched books in one query without a transaction
+	rows, err := db.conn.Query(ctx, `
+        WITH mismatched_chunks AS (
+            SELECT DISTINCT c.book_id
+            FROM vectors v
+            JOIN chapters c ON v.chapter_id = c.id
+            WHERE v.chunk_size != $1
+        )
+        SELECT DISTINCT
+            b.id,
+            b.title,
+            b.isbn,
+            b.asin,
+            a.name as author
+        FROM mismatched_chunks mc
+        JOIN books b ON b.id = mc.book_id
+        JOIN authors a ON a.id = b.author_id
+    `, configuredChunkSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check for mismatched chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var books []meta.BookMetadata
+	for rows.Next() {
+		var book meta.BookMetadata
+		if err := rows.Scan(&book.ID, &book.Title, &book.ISBN, &book.ASIN, &book.Author); err != nil {
+			return nil, fmt.Errorf("failed to scan book data: %w", err)
+		}
+		books = append(books, book)
+	}
+
+	// Now get chapters for each book in separate queries
+	for i := range books {
+		chapters, err := db.getChaptersForBook(ctx, books[i].ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get chapters for book %d: %w", books[i].ID, err)
+		}
+		books[i].FileMetas = chapters
+	}
+
+	return books, nil
+}
+
+func (db *DB) getChaptersForBook(ctx context.Context, bookID int) ([]meta.FileMetadata, error) {
+	rows, err := db.conn.Query(ctx, `
+        SELECT c.id, c.title, c.index, b.title, b.isbn, b.asin, a.name
+        FROM chapters c
+        JOIN books b ON c.book_id = b.id
+        JOIN authors a ON b.author_id = a.id
+        WHERE c.book_id = $1
+        ORDER BY c.index
+    `, bookID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chapters []meta.FileMetadata
+	for rows.Next() {
+		var chapter meta.FileMetadata
+		if err := rows.Scan(
+			&chapter.ID,
+			&chapter.Chapter,
+			&chapter.ChapterIndex,
+			&chapter.Title,
+			&chapter.ISBN,
+			&chapter.ASIN,
+			&chapter.Author,
+		); err != nil {
+			return nil, err
+		}
+		chapters = append(chapters, chapter)
+	}
+
+	return chapters, nil
+}
+
+func (db *DB) DeleteBookChunks(ctx context.Context, bookID int) error {
+	_, err := db.conn.Exec(ctx, `
+        DELETE FROM vectors
+        WHERE chapter_id IN (
+            SELECT id FROM chapters WHERE book_id = $1
+        )
+    `, bookID)
+	return err
 }
