@@ -123,7 +123,7 @@ func (p *StandardMetadataParser) Parse(data []byte) (*BookMetadata, error) {
 
 	book, ok := raw["book"].(map[string]interface{})
 	if !ok {
-		logger.Error("No book data found in metadata", "data", raw)
+		logger.Error("No book data found in metadata")
 		return nil, fmt.Errorf("no book data found")
 	}
 
