@@ -52,23 +52,6 @@ func NewFileMonitor(cfg *config.Config, q *queue.Queue, database *db.DB) *FileMo
 	}
 }
 
-// Update supported extensions to include source formats we want to convert
-var supportedAudioExtensions = map[string]bool{
-	".mp3":  true,
-	".m4a":  true,
-	".m4b":  true,
-	".ogg":  true,
-	".flac": true,
-	".aac":  true,
-	".wma":  true,
-	".wav":  true,
-}
-
-func isAudioFile(filename string) bool {
-	ext := strings.ToLower(filepath.Ext(filename))
-	return supportedAudioExtensions[ext]
-}
-
 // tryParsers attempts to parse metadata using available parsers
 func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetadata, error) {
 	parsers := meta.GetMetadataParsers()
@@ -363,9 +346,6 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 		return
 	}
 
-	// Signal that initialization is complete
-	close(ready)
-
 	// Collect and log initial statistics
 	stats, err := fm.getStatistics(ctx)
 	if err != nil {
@@ -401,6 +381,9 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 	}
 
 	fm.log.Printf("Monitoring root directory: %s", fm.config.AudioDir)
+
+	// Signal that initialization is complete
+	close(ready)
 
 	for {
 		select {
@@ -522,4 +505,21 @@ func (fm *FileMonitor) verifyChunkSizes(ctx context.Context) error {
 func (fm *FileMonitor) Stop() {
 	fm.cancel()
 	<-fm.done
+}
+
+// Update supported extensions to include source formats we want to convert
+var supportedAudioExtensions = map[string]bool{
+	".mp3":  true,
+	".m4a":  true,
+	".m4b":  true,
+	".ogg":  true,
+	".flac": true,
+	".aac":  true,
+	".wma":  true,
+	".wav":  true,
+}
+
+func isAudioFile(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	return supportedAudioExtensions[ext]
 }
