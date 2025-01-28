@@ -57,12 +57,6 @@ func New(cfg *config.Config) (*DB, error) {
 		return nil, err
 	}
 
-	// Register pgvector types
-	if err := pgxvector.RegisterTypes(context.Background(), conn); err != nil {
-		conn.Close(context.Background())
-		return nil, fmt.Errorf("failed to register vector types: %v", err)
-	}
-
 	logger := log.New(os.Stdout, "(db) ", 0)
 
 	db := &DB{
@@ -91,6 +85,12 @@ func (db *DB) initialize(ctx context.Context) error {
 	// Enable vector extension
 	if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
 		return fmt.Errorf("failed to create vector extension: %v", err)
+	}
+
+	// Register pgvector types
+	if err := pgxvector.RegisterTypes(context.Background(), db.conn); err != nil {
+		db.conn.Close(context.Background())
+		return fmt.Errorf("failed to register vector types: %v", err)
 	}
 
 	// Create tables and indexes in one transaction
