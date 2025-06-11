@@ -212,13 +212,20 @@ func (fm *FileMonitor) findChapterInfo(chaptersInfo []meta.ChapterInfo, audioFil
 	}
 
 	// Look for matches in chapter titles
+	// Extract the base filename without extension and path for matching
+	baseFileName := filepath.Base(audioFile)
+	baseFileName = strings.TrimSuffix(baseFileName, filepath.Ext(baseFileName))
+
 	for i, chapter := range chaptersInfo {
 		// Skip "Opening Credits", "End Credits" etc
 		// if strings.Contains(strings.ToLower(chapter.Title), "credits") {
 		// 	continue
 		// }
 
-		if strings.Contains(audioFile, chapter.Title) {
+		// Check if the chapter title contains parts of the filename or vice versa
+		if strings.Contains(audioFile, chapter.Title) ||
+			strings.Contains(chapter.Title, baseFileName) ||
+			strings.Contains(strings.ToLower(chapter.Title), strings.ToLower(baseFileName)) {
 			dist := abs(i - fileIndex)
 			matches = append(matches, struct {
 				index int

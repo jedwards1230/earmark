@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"time"
 	"transcriber/internal/config"
 	"transcriber/internal/db"
@@ -73,7 +74,17 @@ func (w *Worker) Start(cfg *config.Config) {
 				"chapter_name", fileMeta.Chapter)
 
 			startTime := time.Now()
-			content, err := w.transcribeFile(cfg, queueItem, fileMeta)
+
+			// Get file info for transcription storage
+			fileInfo, err := os.Stat(queueItem.FilePath)
+			if err != nil {
+				w.log.Error("Failed to get file info",
+					"file", queueItem.FilePath,
+					"error", err)
+				continue
+			}
+
+			content, err := w.transcribeFile(cfg, queueItem, fileMeta, startTime, fileInfo.Size())
 			if err != nil {
 				w.log.Error("Failed to transcribe chapter",
 					"chapter", fileMeta.Chapter,
@@ -103,7 +114,28 @@ func (w *Worker) Start(cfg *config.Config) {
 	}
 }
 
-func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, fileMeta *meta.FileMetadata) (string, error) {
+func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, fileMeta *meta.FileMetadata, startTime time.Time, fileSize int64) (string, error) {
+	// Check if transcription already exists and is up to date
+	fileChecksum, err := w.db.ComputeFileChecksum(queueItem.FilePath)
+	if err != nil {
+		w.log.Warn("Failed to compute file checksum, proceeding with transcription", "file", queueItem.FilePath, "error", err)
+	} else {
+		settingsHash := w.db.ComputeSettingsHash(cfg)
+		needsTranscription, err := w.db.NeedsTranscription(w.ctx, queueItem.FilePath, fileChecksum, settingsHash)
+		if err != nil {
+			w.log.Warn("Failed to check transcription status, proceeding with transcription", "file", queueItem.FilePath, "error", err)
+		} else if !needsTranscription {
+			// Transcription exists and is up to date, retrieve it
+			transcription, err := w.db.GetTranscription(w.ctx, queueItem.FilePath)
+			if err != nil {
+				w.log.Warn("Failed to retrieve existing transcription, proceeding with new transcription", "file", queueItem.FilePath, "error", err)
+			} else {
+				w.log.Info("Using existing transcription", "file", queueItem.FilePath, "word_count", transcription.WordCount)
+				return transcription.TranscriptionText, nil
+			}
+		}
+	}
+
 	transcriber := transcribe.NewTranscriber(cfg)
 	textFilePath, err := transcriber.TranscribeAudio(w.ctx, queueItem.FilePath, fileMeta, cfg.WhisperThreads, cfg.WhisperComputeType)
 	if err != nil {
@@ -130,12 +162,43 @@ func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, f
 		return "", fmt.Errorf("failed to read output file %q: %w", textFilePath, err)
 	}
 
+	// Calculate processing duration
+	endTime := time.Now()
+	processingDuration := endTime.Sub(startTime)
+	processingDurationMs := processingDuration.Milliseconds()
+
+	// Count words in transcription
+	wordCount := w.countWords(content)
+
+	// Store raw transcription in database
+	if fileChecksum != "" {
+		settingsHash := w.db.ComputeSettingsHash(cfg)
+		err = w.db.StoreTranscription(w.ctx, queueItem.FilePath, fileChecksum, settingsHash, content, fileSize, wordCount, processingDurationMs)
+		if err != nil {
+			w.log.Error("Failed to store transcription in database",
+				"file", queueItem.FilePath,
+				"error", err)
+			// Don't fail the entire process, just log the error
+		} else {
+			w.log.Debug("Stored raw transcription",
+				"file", queueItem.FilePath,
+				"word_count", wordCount,
+				"duration_ms", processingDurationMs)
+		}
+	}
+
 	return content, nil
 }
 
 func (w *Worker) Stop() {
 	w.cancel()
 	<-w.done
+}
+
+// countWords counts the number of words in a string
+func (w *Worker) countWords(content string) int {
+	re := regexp.MustCompile(`\S+`)
+	return len(re.FindAllString(content, -1))
 }
 
 func OpenFile(filepath string) (string, error) {

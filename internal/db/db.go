@@ -2,7 +2,11 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
+	"os"
+	"sort"
 	"strings"
 
 	"transcriber/internal/chunker"
@@ -27,6 +31,19 @@ type Statistics struct {
 	ProcessedBooks    int
 	ProcessedChapters int
 	ReprocessingBooks int
+}
+
+type Transcription struct {
+	ID                   int    `json:"id"`
+	FilePath             string `json:"file_path"`
+	FileChecksum         string `json:"file_checksum"`
+	FileSize             int64  `json:"file_size"`
+	SettingsHash         string `json:"settings_hash"`
+	TranscriptionText    string `json:"transcription_text"`
+	WordCount            int    `json:"word_count"`
+	ProcessingDurationMs int64  `json:"processing_duration_ms"`
+	CreatedAt            string `json:"created_at"`
+	UpdatedAt            string `json:"updated_at"`
 }
 
 type DB struct {
@@ -131,11 +148,28 @@ func (db *DB) initialize(ctx context.Context) error {
             UNIQUE(chapter_id, chunk_index)
         );
 
+        -- Transcriptions table (raw transcription storage)
+        CREATE TABLE IF NOT EXISTS transcriptions (
+            id SERIAL PRIMARY KEY,
+            file_path TEXT NOT NULL UNIQUE,
+            file_checksum TEXT NOT NULL,
+            file_size BIGINT NOT NULL,
+            settings_hash TEXT NOT NULL,
+            transcription_text TEXT NOT NULL,
+            word_count INTEGER,
+            processing_duration_ms BIGINT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+
         -- Standard indexes
         CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name);
         CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
         CREATE INDEX IF NOT EXISTS idx_chapters_book_id ON chapters(book_id);
         CREATE INDEX IF NOT EXISTS idx_vectors_chapter_id ON vectors(chapter_id);
+        CREATE INDEX IF NOT EXISTS idx_transcriptions_checksum_settings 
+            ON transcriptions(file_checksum, settings_hash);
+        CREATE INDEX IF NOT EXISTS idx_transcriptions_file_path ON transcriptions(file_path);
 
         -- HNSW index for vector similarity
         CREATE INDEX IF NOT EXISTS vectors_embedding_idx 
@@ -257,6 +291,27 @@ func (db *DB) GetMetadataByVectorID(ctx context.Context, vectorID int) (*meta.Fi
 }
 
 func (db *DB) IsProcessed(ctx context.Context, filePath string) (bool, error) {
+	// Use the new transcriptions table with checksum and settings validation
+	fileChecksum, err := db.ComputeFileChecksum(filePath)
+	if err != nil {
+		// If we can't compute checksum, fall back to old method
+		db.log.Warn("Failed to compute file checksum, using legacy check", "file", filePath, "error", err)
+		return db.isProcessedLegacy(ctx, filePath)
+	}
+
+	settingsHash := db.ComputeSettingsHash(db.cfg)
+
+	needsTranscription, err := db.NeedsTranscription(ctx, filePath, fileChecksum, settingsHash)
+	if err != nil {
+		return false, fmt.Errorf("error checking transcription status: %w", err)
+	}
+
+	// Return true if already processed (doesn't need transcription)
+	return !needsTranscription, nil
+}
+
+// isProcessedLegacy is the original implementation for fallback
+func (db *DB) isProcessedLegacy(ctx context.Context, filePath string) (bool, error) {
 	// Extract chapter info from the filepath directly to use in check
 	_, _, chapterIndex, chapterTitle := utils.ParseFilePath(filePath)
 
@@ -604,4 +659,119 @@ func (db *DB) DeleteBookChunks(ctx context.Context, bookID int) error {
         )
     `, bookID)
 	return err
+}
+
+// ComputeFileChecksum calculates the SHA256 checksum of a file
+func (db *DB) ComputeFileChecksum(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("failed to compute checksum: %w", err)
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// ComputeSettingsHash generates a hash from transcription settings for deduplication
+func (db *DB) ComputeSettingsHash(cfg *config.Config) string {
+	// Collect all transcription-relevant settings
+	settings := map[string]string{
+		"whisper_model":        cfg.WhisperModel,
+		"whisper_threads":      fmt.Sprintf("%d", cfg.WhisperThreads),
+		"whisper_compute_type": cfg.WhisperComputeType,
+		"chunk_size":           fmt.Sprintf("%d", cfg.ChunkSize),
+	}
+
+	// Create a deterministic string from settings
+	var keys []string
+	for k := range settings {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // Ensure consistent ordering
+
+	var parts []string
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, settings[k]))
+	}
+
+	settingsString := strings.Join(parts, "|")
+	hash := sha256.Sum256([]byte(settingsString))
+	return fmt.Sprintf("%x", hash[:8]) // Use first 8 bytes for shorter hash
+}
+
+// NeedsTranscription checks if a file needs to be transcribed based on checksum and settings
+func (db *DB) NeedsTranscription(ctx context.Context, filePath string, fileChecksum, settingsHash string) (bool, error) {
+	var exists bool
+	err := db.conn.QueryRow(ctx, `
+        SELECT EXISTS(
+            SELECT 1 FROM transcriptions
+            WHERE file_path = $1 AND file_checksum = $2 AND settings_hash = $3
+        )
+    `, filePath, fileChecksum, settingsHash).Scan(&exists)
+
+	if err != nil {
+		return false, fmt.Errorf("error checking transcription status: %w", err)
+	}
+
+	// Return true if transcription is needed (doesn't exist)
+	return !exists, nil
+}
+
+// StoreTranscription stores raw transcription text and metadata in the database
+func (db *DB) StoreTranscription(ctx context.Context, filePath, fileChecksum, settingsHash, transcriptionText string, fileSize int64, wordCount int, processingDurationMs int64) error {
+	_, err := db.conn.Exec(ctx, `
+        INSERT INTO transcriptions (
+            file_path, file_checksum, file_size, settings_hash, 
+            transcription_text, word_count, processing_duration_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (file_path) DO UPDATE SET
+            file_checksum = EXCLUDED.file_checksum,
+            file_size = EXCLUDED.file_size,
+            settings_hash = EXCLUDED.settings_hash,
+            transcription_text = EXCLUDED.transcription_text,
+            word_count = EXCLUDED.word_count,
+            processing_duration_ms = EXCLUDED.processing_duration_ms,
+            updated_at = NOW()
+    `, filePath, fileChecksum, fileSize, settingsHash, transcriptionText, wordCount, processingDurationMs)
+
+	if err != nil {
+		return fmt.Errorf("failed to store transcription: %w", err)
+	}
+
+	db.log.Debug("Stored transcription", "file_path", filePath, "word_count", wordCount)
+	return nil
+}
+
+// GetTranscription retrieves transcription data for a file
+func (db *DB) GetTranscription(ctx context.Context, filePath string) (*Transcription, error) {
+	var transcription Transcription
+	err := db.conn.QueryRow(ctx, `
+        SELECT id, file_path, file_checksum, file_size, settings_hash,
+               transcription_text, word_count, processing_duration_ms,
+               created_at, updated_at
+        FROM transcriptions
+        WHERE file_path = $1
+    `, filePath).Scan(
+		&transcription.ID,
+		&transcription.FilePath,
+		&transcription.FileChecksum,
+		&transcription.FileSize,
+		&transcription.SettingsHash,
+		&transcription.TranscriptionText,
+		&transcription.WordCount,
+		&transcription.ProcessingDurationMs,
+		&transcription.CreatedAt,
+		&transcription.UpdatedAt,
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transcription: %w", err)
+	}
+
+	return &transcription, nil
 }
