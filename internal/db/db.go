@@ -681,10 +681,7 @@ func (db *DB) ComputeFileChecksum(filePath string) (string, error) {
 func (db *DB) ComputeSettingsHash(cfg *config.Config) string {
 	// Collect all transcription-relevant settings
 	settings := map[string]string{
-		"whisper_model":        cfg.WhisperModel,
-		"whisper_threads":      fmt.Sprintf("%d", cfg.WhisperThreads),
-		"whisper_compute_type": cfg.WhisperComputeType,
-		"chunk_size":           fmt.Sprintf("%d", cfg.ChunkSize),
+		"chunk_size": fmt.Sprintf("%d", cfg.ChunkSize),
 	}
 
 	// Create a deterministic string from settings

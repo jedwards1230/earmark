@@ -1,13 +1,14 @@
 package config
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"transcriber/internal/log"
+
+	"github.com/joho/godotenv"
 )
 
 var logger = log.NewLogger("config")
@@ -16,14 +17,7 @@ type Config struct {
 	// Directory config
 	AudioDir  string `json:"audio_dir"`
 	CacheDir  string `json:"cache_dir"`
-	ModelsDir string `json:"models_dir"`
 	OutputDir string `json:"output_dir"`
-	StateFile string `json:"state_file"`
-
-	// Whisper Local transcription config
-	WhisperModel       string `json:"whisper_model"`
-	WhisperThreads     int    `json:"whisper_threads"`
-	WhisperComputeType string `json:"whisper_compute_type"`
 
 	// Service config
 	Debug      bool `json:"debug"`
@@ -46,37 +40,28 @@ type Config struct {
 func LoadConfig() (*Config, error) {
 	logger.Info("Loading configuration...")
 
-	configFile := "config.json"
-	file, err := os.Open(configFile)
-	if err != nil {
-		return nil, err
+	if err := godotenv.Overload(); err != nil {
+		logger.Info("No .env file found")
 	}
-	defer file.Close()
 
 	config := &Config{}
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(config); err != nil {
-		return nil, err
-	}
 
-	if env := os.Getenv("WHISPER_MODEL"); env != "" {
-		config.WhisperModel = env
-	}
-
-	if env := os.Getenv("WHISPER_THREADS"); env != "" {
-		if threads, err := strconv.Atoi(env); err == nil {
-			config.WhisperThreads = threads
-		} else {
-			return nil, err
-		}
+	if env := os.Getenv("AUDIO_DIR"); env != "" {
+		config.AudioDir = env
 	} else {
-		config.WhisperThreads = 1
+		config.AudioDir = "media/audiobooks"
 	}
 
-	if env := os.Getenv("WHISPER_COMPUTE_TYPE"); env != "" {
-		config.WhisperComputeType = env
+	if env := os.Getenv("CACHE_DIR"); env != "" {
+		config.CacheDir = env
 	} else {
-		config.WhisperComputeType = "int8"
+		config.CacheDir = "cache"
+	}
+
+	if env := os.Getenv("OUTPUT_DIR"); env != "" {
+		config.OutputDir = env
+	} else {
+		config.OutputDir = "media/transcriptions"
 	}
 
 	// Override with environment variables
@@ -136,16 +121,8 @@ func (c *Config) initializePaths() error {
 	}
 
 	c.AudioDir = resolveAndCreatePath(cwd, c.AudioDir)
-	c.ModelsDir = resolveAndCreatePath(cwd, c.ModelsDir)
 	c.OutputDir = resolveAndCreatePath(cwd, c.OutputDir)
 	c.CacheDir = resolveAndCreatePath(cwd, c.CacheDir)
-
-	c.Debug = os.Getenv("WHISPER_DEBUG") == "1" || c.Debug
-
-	// Resolve StateFile path (don't create directory yet)
-	if !filepath.IsAbs(c.StateFile) {
-		c.StateFile = filepath.Join(cwd, c.StateFile)
-	}
 
 	return nil
 }
@@ -179,9 +156,6 @@ func MaskSecret(secret string) string {
 
 func (c *Config) PrintEnvVars() {
 	logger.Debug("=== Current Configuration ===")
-	logger.Debug("Whisper Model", "value", c.WhisperModel)
-	logger.Debug("Whisper Threads", "value", c.WhisperThreads)
-	logger.Debug("Whisper Compute Type", "value", c.WhisperComputeType)
 	logger.Debug("Debug", "value", c.Debug)
 	logger.Debug("Reset State", "value", c.ResetState)
 
@@ -198,9 +172,7 @@ func (c *Config) PrintEnvVars() {
 	// Directory configuration
 	logger.Debug("Audio Directory", "value", c.AudioDir)
 	logger.Debug("Cache Directory", "value", c.CacheDir)
-	logger.Debug("Models Directory", "value", c.ModelsDir)
 	logger.Debug("Output Directory", "value", c.OutputDir)
-	logger.Debug("State File", "value", c.StateFile)
 
 	// Other configuration
 	logger.Debug("Chunk Size", "value", c.ChunkSize)

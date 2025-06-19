@@ -148,11 +148,8 @@ func TestNewTranscriber(t *testing.T) {
 	defer os.RemoveAll(tmpCacheDir)
 
 	cfg := &config.Config{
-		CacheDir:           tmpCacheDir,
-		OutputDir:          "/tmp/test_output",
-		WhisperModel:       "small",
-		WhisperThreads:     4,
-		WhisperComputeType: "int8",
+		CacheDir:  tmpCacheDir,
+		OutputDir: "/tmp/test_output",
 	}
 
 	// Note: This test will skip dependency checks in a real environment

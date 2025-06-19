@@ -137,7 +137,7 @@ func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, f
 	}
 
 	transcriber := transcribe.NewTranscriber(cfg)
-	textFilePath, err := transcriber.TranscribeAudio(w.ctx, queueItem.FilePath, fileMeta, cfg.WhisperThreads, cfg.WhisperComputeType)
+	textFilePath, err := transcriber.TranscribeAudio(w.ctx, queueItem.FilePath, fileMeta)
 	if err != nil {
 		baseErr := fmt.Sprintf("Transcription failed for %q (Chapter %q)",
 			queueItem.FilePath, fileMeta.Chapter)

@@ -121,19 +121,13 @@ func TestComputeSettingsHash(t *testing.T) {
 		{
 			name: "basic_config",
 			config: &config.Config{
-				WhisperModel:       "small",
-				WhisperThreads:     4,
-				WhisperComputeType: "int8",
-				ChunkSize:          1024,
+				ChunkSize: 1024,
 			},
 		},
 		{
 			name: "large_model_config",
 			config: &config.Config{
-				WhisperModel:       "large-v3",
-				WhisperThreads:     8,
-				WhisperComputeType: "float32",
-				ChunkSize:          2048,
+				ChunkSize: 2048,
 			},
 		},
 	}
@@ -160,50 +154,20 @@ func TestComputeSettingsHash(t *testing.T) {
 
 func TestComputeSettingsHash_DifferentConfigs(t *testing.T) {
 	config1 := &config.Config{
-		WhisperModel:       "small",
-		WhisperThreads:     4,
-		WhisperComputeType: "int8",
-		ChunkSize:          1024,
+		ChunkSize: 1024,
 	}
 
 	config2 := &config.Config{
-		WhisperModel:       "large-v3", // Different model
-		WhisperThreads:     4,
-		WhisperComputeType: "int8",
-		ChunkSize:          1024,
-	}
-
-	config3 := &config.Config{
-		WhisperModel:       "small",
-		WhisperThreads:     8, // Different threads
-		WhisperComputeType: "int8",
-		ChunkSize:          1024,
-	}
-
-	config4 := &config.Config{
-		WhisperModel:       "small",
-		WhisperThreads:     4,
-		WhisperComputeType: "float32", // Different compute type
-		ChunkSize:          1024,
-	}
-
-	config5 := &config.Config{
-		WhisperModel:       "small",
-		WhisperThreads:     4,
-		WhisperComputeType: "int8",
-		ChunkSize:          2048, // Different chunk size
+		ChunkSize: 2048, // Different chunk size
 	}
 
 	db := &DB{}
 
 	hash1 := db.ComputeSettingsHash(config1)
 	hash2 := db.ComputeSettingsHash(config2)
-	hash3 := db.ComputeSettingsHash(config3)
-	hash4 := db.ComputeSettingsHash(config4)
-	hash5 := db.ComputeSettingsHash(config5)
 
 	// All hashes should be different
-	hashes := []string{hash1, hash2, hash3, hash4, hash5}
+	hashes := []string{hash1, hash2}
 	for i := 0; i < len(hashes); i++ {
 		for j := i + 1; j < len(hashes); j++ {
 			if hashes[i] == hashes[j] {
@@ -216,10 +180,7 @@ func TestComputeSettingsHash_DifferentConfigs(t *testing.T) {
 func TestComputeSettingsHash_IgnoresNonTranscriptionSettings(t *testing.T) {
 	// These configs differ only in non-transcription settings
 	config1 := &config.Config{
-		WhisperModel:       "small",
-		WhisperThreads:     4,
-		WhisperComputeType: "int8",
-		ChunkSize:          1024,
+		ChunkSize: 1024,
 		// Non-transcription settings
 		AudioDir:     "/path1",
 		OutputDir:    "/output1",
@@ -228,10 +189,7 @@ func TestComputeSettingsHash_IgnoresNonTranscriptionSettings(t *testing.T) {
 	}
 
 	config2 := &config.Config{
-		WhisperModel:       "small",
-		WhisperThreads:     4,
-		WhisperComputeType: "int8",
-		ChunkSize:          1024,
+		ChunkSize: 1024,
 		// Different non-transcription settings
 		AudioDir:     "/path2",
 		OutputDir:    "/output2",
@@ -324,50 +282,20 @@ func TestSettingsHashScenarios(t *testing.T) {
 		{
 			name: "identical_configs",
 			config1: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 1024,
+				ChunkSize: 1024,
 			},
 			config2: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 1024,
+				ChunkSize: 1024,
 			},
 			shouldMatch: true,
 		},
 		{
-			name: "different_model",
-			config1: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 1024,
-			},
-			config2: &config.Config{
-				WhisperModel: "large-v3", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 1024,
-			},
-			shouldMatch: false,
-		},
-		{
-			name: "different_threads",
-			config1: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 1024,
-			},
-			config2: &config.Config{
-				WhisperModel: "small", WhisperThreads: 8, WhisperComputeType: "int8", ChunkSize: 1024,
-			},
-			shouldMatch: false,
-		},
-		{
-			name: "different_compute_type",
-			config1: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 1024,
-			},
-			config2: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "float32", ChunkSize: 1024,
-			},
-			shouldMatch: false,
-		},
-		{
 			name: "different_chunk_size",
 			config1: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 1024,
+				ChunkSize: 1024,
 			},
 			config2: &config.Config{
-				WhisperModel: "small", WhisperThreads: 4, WhisperComputeType: "int8", ChunkSize: 2048,
+				ChunkSize: 2048,
 			},
 			shouldMatch: false,
 		},
@@ -416,10 +344,7 @@ func BenchmarkComputeFileChecksum(b *testing.B) {
 
 func BenchmarkComputeSettingsHash(b *testing.B) {
 	config := &config.Config{
-		WhisperModel:       "large-v3",
-		WhisperThreads:     8,
-		WhisperComputeType: "float32",
-		ChunkSize:          2048,
+		ChunkSize: 2048,
 	}
 
 	db := &DB{}

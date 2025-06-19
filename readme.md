@@ -33,11 +33,7 @@ The service is configured using a `config.json` file and environment variables:
 {
   "audio_dir": "/audiobooks",
   "cache_dir": "/cache", 
-  "models_dir": "/models",
   "output_dir": "/transcriptions",
-  "whisper_model": "small",
-  "whisper_threads": 4,
-  "whisper_compute_type": "int8",
   "db_host": "db",
   "db_user": "postgres",
   "db_password": "password",
@@ -50,7 +46,6 @@ The service is configured using a `config.json` file and environment variables:
 
 Key configuration options:
 *   `audio_dir`: Directory to monitor for new audio files
-*   `whisper_model`: Whisper model to use (tiny, small, medium, large, etc.)
 *   `db_*`: PostgreSQL database connection settings
 *   `chunk_size`: Size of text chunks for embedding generation
 *   `openai_api_key`: API key for generating embeddings

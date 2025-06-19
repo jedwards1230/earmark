@@ -9,7 +9,7 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "lil-whisper",
-	Short: "A transcription service using Whisper",
+	Short: "A transcription service using Yap and MacOS native APIs",
 }
 
 func Run() {

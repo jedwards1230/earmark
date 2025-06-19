@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -107,8 +106,6 @@ func (t *Transcriber) TranscribeAudio(
 	ctx context.Context,
 	audioFilePath string,
 	fileMeta *meta.FileMetadata,
-	threads int,
-	computeType string,
 ) (string, error) {
 	shortPath := shortenPath(audioFilePath)
 	startTime := time.Now()
@@ -140,27 +137,16 @@ func (t *Transcriber) TranscribeAudio(
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Hour)
 	defer cancel()
 
-	t.log.Info("Starting transcription",
-		"model", t.config.WhisperModel,
-		"compute_type", computeType,
-		"threads", threads)
+	t.log.Info("Starting transcription")
+
+	outputFile := filepath.Join(outputDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
 
 	cmd := exec.CommandContext(ctx,
-		"whisper-ctranslate2",
+		"yap",
+		"transcribe",
 		preprocessedPath,
-		"--model", t.config.WhisperModel,
-		"--compute_type", computeType,
-		"--language", "en",
-		"--beam_size", "5",
-		"--output_dir", outputDir,
-		"--model_dir", t.config.ModelsDir,
-		"--output_format", "txt",
-		"--vad_filter", "True", // Voice Activity Detection - On by default when batched is True
-		"--batched", "True",
-		"--batch_size", "16",
-		"--threads", strconv.Itoa(threads),
-		"--initial_prompt", fmt.Sprintf("Transcribe %s by %s", fileMeta.Title, fileMeta.Author), // https://cookbook.openai.com/examples/whisper_prompting_guide
-		"--verbose", fmt.Sprintf("%v", t.config.Debug),
+		"--output-file", outputFile,
+		// "--initial_prompt", fmt.Sprintf("Transcribe %s by %s", fileMeta.Title, fileMeta.Author),
 	)
 
 	// Create pipes for stdout and stderr
@@ -270,7 +256,6 @@ func (t *Transcriber) TranscribeAudio(
 	}
 
 	// Verify output file exists
-	outputFile := filepath.Join(outputDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
 	if _, err := os.Stat(outputFile); os.IsNotExist(err) {
 		t.log.Error("Transcription failed: output file not created", "file", shortPath)
 		return "", err
@@ -319,11 +304,6 @@ func checkDependencies() error {
 		if err := pipCmd.Run(); err != nil {
 			return fmt.Errorf("pip not found: %w", err)
 		}
-	}
-
-	// Check whisper-ctranslate2
-	if err := checkAndInstallWhisperCtranslate2(); err != nil {
-		return fmt.Errorf("whisper-ctranslate2 check failed: %w", err)
 	}
 
 	// Check ffmpeg with version
@@ -433,45 +413,6 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 	}
 
 	return cachedPath, nil
-}
-
-func checkAndInstallWhisperCtranslate2() error {
-	// Move logger creation to package level
-	logger := log.NewLogger("whisper-deps")
-
-	// Try to get version first
-	if err := RunWhisperCTranslate2Cmd("--version"); err == nil {
-		return nil
-	}
-
-	logger.Info("Installing whisper-ctranslate2")
-	// Attempt to install whisper-ctranslate2 using pip
-	fmt.Println("Installing whisper-ctranslate2...")
-	installCmd := exec.Command("pip", "install", "-U", "whisper-ctranslate2")
-
-	var stderr bytes.Buffer
-	installCmd.Stderr = &stderr
-
-	if err := installCmd.Run(); err != nil {
-		return fmt.Errorf("failed to install whisper-ctranslate2: %v\nError output: %s", err, stderr.String())
-	}
-
-	// Verify installation
-	if err := RunWhisperCTranslate2Cmd("--version"); err != nil {
-		return fmt.Errorf("whisper-ctranslate2 installation verification failed: %w", err)
-	}
-
-	return nil
-}
-
-func RunWhisperCTranslate2Cmd(args ...string) error {
-	cmd := exec.Command("whisper-ctranslate2", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("whisper-ctranslate2 error: %w\n%s", err, stderr.String())
-	}
-	return nil
 }
 
 func RunFfmpegCmd(args ...string) error {

@@ -1,9 +1,0 @@
-{
-	"audio_dir": "audiobooks",
-	"cache_dir": "cache",
-	"models_dir": "models",
-	"output_dir": "transcriptions",
-	"state_file": "data/transcriber_state.json",
-	"whisper_model": "large-v3-turbo",
-	"debug": false
-}

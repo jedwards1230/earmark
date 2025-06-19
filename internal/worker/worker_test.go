@@ -156,7 +156,7 @@ func (m *MockDB) ComputeFileChecksum(filePath string) (string, error) {
 }
 
 func (m *MockDB) ComputeSettingsHash(cfg *config.Config) string {
-	key := cfg.WhisperModel + "_" + cfg.WhisperComputeType
+	key := fmt.Sprintf("%d", cfg.ChunkSize)
 	if hash, exists := m.settingsHashes[key]; exists {
 		return hash
 	}
@@ -247,10 +247,7 @@ func TestWorkerDeduplicationLogic(t *testing.T) {
 
 	// Create test config
 	cfg := &config.Config{
-		WhisperModel:       "small",
-		WhisperThreads:     4,
-		WhisperComputeType: "int8",
-		ChunkSize:          1024,
+		ChunkSize: 1024,
 	}
 
 	// Create test metadata
