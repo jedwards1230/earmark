@@ -6,7 +6,7 @@ import (
 
 func InitOpenAI(authToken, baseUrl string) *openai.Client {
 	config := openai.DefaultConfig(authToken)
-	config.BaseURL = "https://api.openai.com/v1"
+	config.BaseURL = baseUrl
 	client := openai.NewClientWithConfig(config)
 	return client
 }

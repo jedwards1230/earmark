@@ -1,10 +1,10 @@
 # Audiobook Transcription Service
 
-This is a personal service to automatically transcribe audiobooks using Whisper and provide semantic search capabilities through embeddings.
+This is a personal service to automatically transcribe audiobooks using Yap and provide semantic search capabilities through OpenAI embeddings.
 
 ## Overview
 
-The service monitors a specified directory for new audio files. When a new audio file is detected, it is added to a queue for transcription. A worker process takes audio files from the queue, transcribes them using `whisper-ctranslate2`, processes the transcriptions into chunks with embeddings, and stores everything in a PostgreSQL database with pgvector for semantic search.
+The service monitors a specified directory for new audio files. When a new audio file is detected, it is added to a queue for transcription. A worker process takes audio files from the queue, transcribes them using Yap (Apple's native speech recognition), processes the transcriptions into chunks with OpenAI embeddings, and stores everything in a PostgreSQL database with pgvector for semantic search.
 
 The service uses a PostgreSQL database to track processed files and avoid redundant transcriptions.
 
@@ -13,8 +13,8 @@ The service uses a PostgreSQL database to track processed files and avoid redund
 *   **Directory Monitoring:** Uses `fsnotify` to watch for new audio files in the input directory.
 *   **Queue Management:** Uses a simple in-memory channel to queue audio files for processing.
 *   **Database:** PostgreSQL with pgvector extension for storing transcriptions, embeddings, and metadata.
-*   **Transcription:** Uses `whisper-ctranslate2` installed in the container for audio transcription.
-*   **Semantic Search:** Chunks transcriptions and creates embeddings for vector similarity search.
+*   **Transcription:** Uses Yap (Apple's native speech recognition) for fast, accurate local transcription.
+*   **Semantic Search:** Chunks transcriptions and creates OpenAI embeddings for vector similarity search.
 *   **Full-Text Search:** PostgreSQL full-text search capabilities across all content.
 
 ## Dependencies
@@ -22,8 +22,9 @@ The service uses a PostgreSQL database to track processed files and avoid redund
 *   **Go:** The service is written in Go.
 *   **PostgreSQL:** Database with pgvector extension for vector operations.
 *   **Docker:** For containerization and orchestration.
-*   **whisper-ctranslate2:** For audio transcription.
+*   **Yap:** Apple's native speech recognition for audio transcription.
 *   **OpenAI API:** For generating embeddings (configurable endpoint).
+*   **macOS 26+:** Required for Yap speech recognition capabilities.
 
 ## Configuration
 
@@ -55,7 +56,7 @@ Key configuration options:
 1.  **Setup environment variables:**
     ```bash
     cp .env.example .env
-    # Edit .env with your database credentials and API keys
+    # Edit .env with your database credentials and OpenAI API key
     ```
 
 2.  **Start the services:**
@@ -94,14 +95,15 @@ The service uses a sophisticated PostgreSQL schema:
 
 ## Current Limitations
 
-- Uses direct `exec` calls to `whisper-ctranslate2` (will be moved to sidecar service)
-- Limited transcription settings change detection for complex configurations
+- Requires macOS 26+ for Yap speech recognition
+- Requires OpenAI API key for embeddings generation
+- Hybrid architecture: local transcription + cloud embeddings
 
 ## Roadmap to v1.0.0
 
 See [PROJECT-PLAN.md](PROJECT-PLAN.md) for detailed roadmap. Key improvements planned:
 
-- **Whisper Sidecar Service:** Move transcription to dedicated container with REST API
+- **Hybrid Architecture Enhancements:** Optimize the Yap + OpenAI integration
 - **MCP Server:** Model Context Protocol server for LLM integration
 - **Enhanced Error Handling:** Robust retry logic and better error reporting
 

@@ -35,6 +35,7 @@ type Config struct {
 	// OpenAI API config
 	OpenAIAPIKey  string `json:"openai_api_key"`
 	OpenAIBaseURL string `json:"openai_base_url"`
+
 }
 
 func LoadConfig() (*Config, error) {
@@ -87,6 +88,7 @@ func LoadConfig() (*Config, error) {
 	} else {
 		config.ChunkSize = 1024
 	}
+
 
 	if env := os.Getenv("OPENAI_API_KEY"); env != "" {
 		config.OpenAIAPIKey = env
@@ -165,14 +167,15 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("DB Password", "value", MaskSecret(c.DBPassword))
 	logger.Debug("DB Name", "value", c.DBName)
 
-	// OpenAI configuration
-	logger.Debug("OpenAI Base URL", "value", c.OpenAIBaseURL)
-	logger.Debug("OpenAI API Key", "value", MaskSecret(c.OpenAIAPIKey))
 
 	// Directory configuration
 	logger.Debug("Audio Directory", "value", c.AudioDir)
 	logger.Debug("Cache Directory", "value", c.CacheDir)
 	logger.Debug("Output Directory", "value", c.OutputDir)
+
+	// OpenAI configuration
+	logger.Debug("OpenAI Base URL", "value", c.OpenAIBaseURL)
+	logger.Debug("OpenAI API Key", "value", MaskSecret(c.OpenAIAPIKey))
 
 	// Other configuration
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
