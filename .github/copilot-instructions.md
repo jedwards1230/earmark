@@ -1,0 +1,1 @@
+Use VS Code's built-in test tools to run golang tests. Use the `run_tests` tool to execute tests through VS Code's Test Explorer.

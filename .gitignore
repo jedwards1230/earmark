@@ -6,4 +6,6 @@ cache/
 .DS_Store
 .env
 
+coverage.out
+
 lil-whisper
