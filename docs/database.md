@@ -35,7 +35,20 @@ The database schema consists of the following tables and their relationships:
    - `chunk_index`: Index of the chunk
    - `content`: Text content of the chunk
    - `embedding`: Vector embedding of the content (1536 dimensions)
+   - `chunk_size`: Size of the chunk used for processing
    - UNIQUE constraint on (chapter_id, chunk_index)
+
+5. **transcriptions**: Stores raw transcription data with deduplication
+   - `id`: Primary key
+   - `file_path`: Path to the original audio file (UNIQUE)
+   - `file_checksum`: SHA256 checksum of the file content
+   - `file_size`: Size of the original file in bytes
+   - `settings_hash`: Hash of processing settings for deduplication
+   - `transcription_text`: Complete raw transcription text
+   - `word_count`: Number of words in the transcription
+   - `processing_duration_ms`: Time taken to process in milliseconds
+   - `created_at`: Timestamp of creation
+   - `updated_at`: Timestamp of last update
 
 ## Indexes
 
@@ -53,6 +66,10 @@ The following indexes optimize query performance:
 4. **vectors indexes**:
    - `idx_vectors_chapter_id`: Index on the `chapter_id` column
    - `vectors_embedding_idx`: HNSW index on the `embedding` column for vector similarity search
+
+5. **transcriptions indexes**:
+   - `idx_transcriptions_checksum_settings`: Index on `(file_checksum, settings_hash)` for deduplication
+   - `idx_transcriptions_file_path`: Index on the `file_path` column
 
 ## Example Queries
 

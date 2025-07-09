@@ -21,35 +21,42 @@ The service uses a PostgreSQL database to track processed files and avoid redund
 
 *   **Go:** The service is written in Go.
 *   **PostgreSQL:** Database with pgvector extension for vector operations.
-*   **Docker:** For containerization and orchestration.
+*   **Docker Compose:** For running the PostgreSQL database.
 *   **Yap:** Apple's native speech recognition for audio transcription.
 *   **OpenAI API:** For generating embeddings (configurable endpoint).
 *   **macOS 26+:** Required for Yap speech recognition capabilities.
 
 ## Configuration
 
-The service is configured using a `config.json` file and environment variables:
+The service is configured using environment variables:
 
-```json
-{
-  "audio_dir": "/audiobooks",
-  "cache_dir": "/cache", 
-  "output_dir": "/transcriptions",
-  "db_host": "db",
-  "db_user": "postgres",
-  "db_password": "password",
-  "db_name": "transcriber",
-  "chunk_size": 1024,
-  "openai_api_key": "your-api-key-here",
-  "debug": false
-}
+```bash
+# Core directories
+AUDIO_DIR=/audiobooks
+CACHE_DIR=/cache
+OUTPUT_DIR=/transcriptions
+
+# Database connection
+DB_HOST=db
+DB_USER=postgres
+DB_PASSWORD=password
+DB_NAME=transcriber
+
+# OpenAI integration
+OPENAI_API_KEY=your-api-key-here
+OPENAI_BASE_URL=https://api.openai.com/v1
+CHUNK_SIZE=1024
+
+# Debug settings
+DEBUG=false
+RESET_STATE=false
 ```
 
 Key configuration options:
-*   `audio_dir`: Directory to monitor for new audio files
-*   `db_*`: PostgreSQL database connection settings
-*   `chunk_size`: Size of text chunks for embedding generation
-*   `openai_api_key`: API key for generating embeddings
+*   `AUDIO_DIR`: Directory to monitor for new audio files
+*   `DB_*`: PostgreSQL database connection settings
+*   `CHUNK_SIZE`: Size of text chunks for embedding generation
+*   `OPENAI_API_KEY`: API key for generating embeddings
 
 ## Usage
 
@@ -59,23 +66,24 @@ Key configuration options:
     # Edit .env with your database credentials and OpenAI API key
     ```
 
-2.  **Start the services:**
+2.  **Start the database:**
     ```bash
     docker compose up -d
     ```
 
-3.  **Place audiobooks in the monitored directory:**
-    - The service will automatically detect and process new audio files
-    - Transcriptions are stored in the database with embeddings for search
-    - Progress is logged to the container output
+3.  **Build and run the application:**
+    ```bash
+    go build -o lil-whisper
+    ./lil-whisper start    # Start monitoring service
+    ```
 
 4.  **Search transcriptions:**
     ```bash
     # Semantic search
-    docker compose exec proc ./lil-whisper search "your query here"
+    ./lil-whisper search "your query here"
     
     # List processed books
-    docker compose exec proc ./lil-whisper list
+    ./lil-whisper list
     ```
 
 ## Database Schema
@@ -103,8 +111,8 @@ The service uses a sophisticated PostgreSQL schema:
 
 See [PROJECT-PLAN.md](PROJECT-PLAN.md) for detailed roadmap. Key improvements planned:
 
+- **MCP Server Implementation:** 🚧 **MAJOR TODO** - Model Context Protocol server for LLM integration and tool access
 - **Hybrid Architecture Enhancements:** Optimize the Yap + OpenAI integration
-- **MCP Server:** Model Context Protocol server for LLM integration
 - **Enhanced Error Handling:** Robust retry logic and better error reporting
 
 ## Notes

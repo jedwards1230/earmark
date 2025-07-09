@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 
@@ -9,13 +10,18 @@ import (
 	"transcriber/internal/log"
 )
 
+// DBInterface defines the database methods used by the server
+type DBInterface interface {
+	Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error)
+}
+
 type Server struct {
 	cfg *config.Config
-	db  *db.DB
+	db  DBInterface
 	log log.Logger
 }
 
-func NewServer(database *db.DB, cfg *config.Config) *Server {
+func NewServer(database DBInterface, cfg *config.Config) *Server {
 	logger := log.NewLogger("server")
 	return &Server{
 		cfg: cfg,

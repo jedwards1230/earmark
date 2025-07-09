@@ -37,7 +37,7 @@ Complex relational schema: **authors** → **books** → **chapters** → **vect
 # Build the application
 go build -o lil-whisper
 
-# Run with Docker Compose (recommended)
+# Start database only
 docker compose up -d
 
 # Run individual commands
@@ -64,23 +64,13 @@ go test ./internal/transcribe
 # Access database via Docker
 docker compose exec db psql -U postgres -d transcriber
 
-# View logs
-docker compose logs -f proc
+# View application logs (when running locally)
+# Check terminal output where you ran ./lil-whisper start
 ```
 
 ## Configuration
 
-The application uses environment variables and optional .env file:
-
-- **AUDIO_DIR**: Directory to monitor (default: "media/audiobooks")
-- **OUTPUT_DIR**: Transcription output directory (default: "media/transcriptions")
-- **CACHE_DIR**: Cache directory (default: "cache")
-- **DB_HOST, DB_USER, DB_PASSWORD, DB_NAME**: PostgreSQL connection
-- **OPENAI_API_KEY**: For embeddings generation
-- **OPENAI_BASE_URL**: Custom OpenAI endpoint (default: https://api.openai.com/v1)
-- **CHUNK_SIZE**: Text chunk size for embeddings (default: 1024)
-- **DEBUG**: Enable debug logging
-- **RESET_STATE**: Reset processing state on startup
+The application uses environment variables (see README.md for complete list and examples). Key settings include database connection, OpenAI API key, directory paths, and processing parameters. Configuration is loaded from .env file with environment variable overrides.
 
 ## Key Components
 
@@ -100,3 +90,7 @@ The project uses a hybrid approach combining the best of local and cloud service
 - **Whisper Deprecated**: Removed all Whisper dependencies in favor of Yap
 
 This approach provides optimal performance with local transcription speed and cloud embedding quality.
+
+## Major TODOs
+
+- **🚧 MCP Server Implementation**: Model Context Protocol server for LLM integration and tool access - this is a critical component for making the service accessible to AI assistants and workflow automation tools

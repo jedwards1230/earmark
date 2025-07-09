@@ -278,7 +278,7 @@ func TestWorkerDeduplicationLogic(t *testing.T) {
 			name: "first_time_transcription",
 			setupMock: func(mockDB *MockDB) {
 				// File needs transcription (first time)
-				mockDB.SetNeedsTranscription(tmpFile.Name(), "mock_checksum_"+filepath.Base(tmpFile.Name()), "mock_settings_hash_small_int8", true)
+				mockDB.SetNeedsTranscription(tmpFile.Name(), "mock_checksum_"+filepath.Base(tmpFile.Name()), "mock_settings_hash_1024", true)
 			},
 			expectTranscriptionRun: true,
 			expectError:            false,
@@ -288,7 +288,7 @@ func TestWorkerDeduplicationLogic(t *testing.T) {
 			name: "existing_transcription_current",
 			setupMock: func(mockDB *MockDB) {
 				// File doesn't need transcription (already exists and current)
-				mockDB.SetNeedsTranscription(tmpFile.Name(), "mock_checksum_"+filepath.Base(tmpFile.Name()), "mock_settings_hash_small_int8", false)
+				mockDB.SetNeedsTranscription(tmpFile.Name(), "mock_checksum_"+filepath.Base(tmpFile.Name()), "mock_settings_hash_1024", false)
 
 				// Set up existing transcription
 				mockDB.transcriptions[tmpFile.Name()] = &db.Transcription{

@@ -6,79 +6,60 @@ import (
 	"strconv"
 	"strings"
 
-	"transcriber/internal/log"
-
 	"github.com/joho/godotenv"
+	"transcriber/internal/log"
 )
 
 var logger = log.NewLogger("config")
 
 type Config struct {
 	// Directory config
-	AudioDir  string `json:"audio_dir"`
-	CacheDir  string `json:"cache_dir"`
-	OutputDir string `json:"output_dir"`
+	AudioDir  string `env:"AUDIO_DIR"`
+	CacheDir  string `env:"CACHE_DIR"`
+	OutputDir string `env:"OUTPUT_DIR"`
 
 	// Service config
-	Debug      bool `json:"debug"`
-	ResetState bool `json:"reset_state"`
+	Debug      bool `env:"DEBUG"`
+	ResetState bool `env:"RESET_STATE"`
 
 	// Postgres with PGVector config
-	DBHost     string `json:"db_host"`
-	DBUser     string `json:"db_user"`
-	DBPassword string `json:"db_password"`
-	DBName     string `json:"db_name"`
+	DBHost     string `env:"DB_HOST"`
+	DBUser     string `env:"DB_USER"`
+	DBPassword string `env:"DB_PASSWORD"`
+	DBName     string `env:"DB_NAME"`
 
 	// Vectors
-	ChunkSize int `json:"chunk_size"`
+	ChunkSize int `env:"CHUNK_SIZE"`
 
 	// OpenAI API config
-	OpenAIAPIKey  string `json:"openai_api_key"`
-	OpenAIBaseURL string `json:"openai_base_url"`
-
+	OpenAIAPIKey  string `env:"OPENAI_API_KEY"`
+	OpenAIBaseURL string `env:"OPENAI_BASE_URL"`
 }
 
 func LoadConfig() (*Config, error) {
 	logger.Info("Loading configuration...")
 
-	if err := godotenv.Overload(); err != nil {
-		logger.Info("No .env file found")
+	// Load .env file if it exists (environment variables take precedence)
+	if err := godotenv.Load(); err != nil {
+		logger.Debug("No .env file found or error loading it", "error", err)
+	} else {
+		logger.Debug("Loaded .env file")
 	}
 
 	config := &Config{}
 
-	if env := os.Getenv("AUDIO_DIR"); env != "" {
-		config.AudioDir = env
-	} else {
-		config.AudioDir = "media/audiobooks"
-	}
+	// Load directory configuration with defaults
+	config.AudioDir = getEnvOrDefault("AUDIO_DIR", "media/audiobooks")
+	config.CacheDir = getEnvOrDefault("CACHE_DIR", "cache")
+	config.OutputDir = getEnvOrDefault("OUTPUT_DIR", "media/transcriptions")
 
-	if env := os.Getenv("CACHE_DIR"); env != "" {
-		config.CacheDir = env
-	} else {
-		config.CacheDir = "cache"
-	}
+	// Load database configuration
+	config.DBHost = os.Getenv("DB_HOST")
+	config.DBUser = os.Getenv("DB_USER")
+	config.DBPassword = os.Getenv("DB_PASSWORD")
+	config.DBName = os.Getenv("DB_NAME")
 
-	if env := os.Getenv("OUTPUT_DIR"); env != "" {
-		config.OutputDir = env
-	} else {
-		config.OutputDir = "media/transcriptions"
-	}
-
-	// Override with environment variables
-	if env := os.Getenv("DB_HOST"); env != "" {
-		config.DBHost = env
-	}
-	if env := os.Getenv("DB_USER"); env != "" {
-		config.DBUser = env
-	}
-	if env := os.Getenv("DB_PASSWORD"); env != "" {
-		config.DBPassword = env
-	}
-	if env := os.Getenv("DB_NAME"); env != "" {
-		config.DBName = env
-	}
-
+	// Load chunk size with default
 	if env := os.Getenv("CHUNK_SIZE"); env != "" {
 		if chunkSize, err := strconv.Atoi(env); err == nil {
 			config.ChunkSize = chunkSize
@@ -89,24 +70,13 @@ func LoadConfig() (*Config, error) {
 		config.ChunkSize = 1024
 	}
 
+	// Load OpenAI configuration
+	config.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
+	config.OpenAIBaseURL = getEnvOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
-	if env := os.Getenv("OPENAI_API_KEY"); env != "" {
-		config.OpenAIAPIKey = env
-	}
-
-	if env := os.Getenv("OPENAI_BASE_URL"); env != "" {
-		config.OpenAIBaseURL = env
-	} else {
-		config.OpenAIBaseURL = "https://api.openai.com/v1"
-	}
-
-	if env := os.Getenv("DEBUG"); env != "" {
-		config.Debug = env == "1" || env == "true"
-	}
-
-	if env := os.Getenv("RESET_STATE"); env != "" {
-		config.ResetState = env == "1" || env == "true"
-	}
+	// Load boolean flags
+	config.Debug = parseBoolEnv("DEBUG")
+	config.ResetState = parseBoolEnv("RESET_STATE")
 
 	// Resolve and create directories
 	if err := config.initializePaths(); err != nil {
@@ -156,6 +126,20 @@ func MaskSecret(secret string) string {
 	return strings.Repeat("*", len(secret))
 }
 
+// getEnvOrDefault returns the environment variable value or a default value if not set
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// parseBoolEnv parses a boolean environment variable
+func parseBoolEnv(key string) bool {
+	value := os.Getenv(key)
+	return value == "1" || value == "true"
+}
+
 func (c *Config) PrintEnvVars() {
 	logger.Debug("=== Current Configuration ===")
 	logger.Debug("Debug", "value", c.Debug)
@@ -166,7 +150,6 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("DB User", "value", c.DBUser)
 	logger.Debug("DB Password", "value", MaskSecret(c.DBPassword))
 	logger.Debug("DB Name", "value", c.DBName)
-
 
 	// Directory configuration
 	logger.Debug("Audio Directory", "value", c.AudioDir)
