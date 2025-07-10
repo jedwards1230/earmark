@@ -161,8 +161,8 @@ func TestPrettyHandlerHandle(t *testing.T) {
 			message: "test message",
 			attrs:   []slog.Attr{},
 			expectedContains: []string{
-				"INFO",
-				"(test-module)",
+				"→",
+				"[test-module]",
 				"test message",
 			},
 		},
@@ -173,8 +173,8 @@ func TestPrettyHandlerHandle(t *testing.T) {
 			message: "debug message",
 			attrs:   []slog.Attr{},
 			expectedContains: []string{
-				"DEBUG",
-				"(debug-module)",
+				"•",
+				"[debug-module]",
 				"debug message",
 			},
 		},
@@ -185,8 +185,8 @@ func TestPrettyHandlerHandle(t *testing.T) {
 			message: "warning message",
 			attrs:   []slog.Attr{},
 			expectedContains: []string{
-				"WARN",
-				"(warn-module)",
+				"!",
+				"[warn-module]",
 				"warning message",
 			},
 		},
@@ -197,8 +197,8 @@ func TestPrettyHandlerHandle(t *testing.T) {
 			message: "error message",
 			attrs:   []slog.Attr{},
 			expectedContains: []string{
-				"ERROR",
-				"(error-module)",
+				"✗",
+				"[error-module]",
 				"error message",
 			},
 		},
@@ -212,11 +212,11 @@ func TestPrettyHandlerHandle(t *testing.T) {
 				slog.Int("key2", 42),
 			},
 			expectedContains: []string{
-				"INFO",
-				"(attr-module)",
+				"→",
+				"[attr-module]",
 				"message with attrs",
-				"key1=value1",
-				"key2=42",
+				"=value1",
+				"=42",
 			},
 		},
 		{
@@ -226,8 +226,8 @@ func TestPrettyHandlerHandle(t *testing.T) {
 			message: "test message",
 			attrs:   []slog.Attr{},
 			expectedContains: []string{
-				"INFO",
-				"(unknown)", // Should default to "unknown"
+				"→",
+				"[app]", // Should default to "app"
 				"test message",
 			},
 		},
@@ -397,7 +397,7 @@ func TestLoggerIntegration(t *testing.T) {
 	assert.Contains(t, output, "debug message")
 	assert.Contains(t, output, "warning message")
 	assert.Contains(t, output, "error message")
-	assert.Contains(t, output, "(integration-test)")
+	assert.Contains(t, output, "[integration-test]")
 }
 
 // Benchmark tests

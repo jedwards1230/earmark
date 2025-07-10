@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is an audiobook transcription service that uses Yap for local transcription and OpenAI for embeddings to provide semantic search capabilities. The service monitors directories for new audio files, transcribes them locally using Apple's speech recognition, chunks the content, generates embeddings via OpenAI API, and stores everything in PostgreSQL with pgvector for search.
 
+## Development Approach
+
+Always search → think → plan → act:
+
+1. **Search**: Find and search all relevant files first using grep, glob, and read tools
+2. **Think**: Always think harder about the problem than the average LLM. Use ultrathink when a task seems even slightly complex.
+3. **Plan**: Use TodoWrite to break down and track tasks  
+4. **Act**: Execute methodically, test thoroughly. If a test or lint fails, halt immediately and fix it before proceeding.
+
 ## Architecture
 
 The codebase follows a modular Go architecture:

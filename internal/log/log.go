@@ -70,40 +70,72 @@ func (h *PrettyHandler) WithGroup(name string) slog.Handler {
 }
 
 func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
-	var levelColor string
-	level := r.Level.String()
+	var levelColor, levelSymbol string
 
 	switch r.Level {
 	case slog.LevelDebug:
 		levelColor = colorBlue
+		levelSymbol = "•"
 	case slog.LevelInfo:
 		levelColor = colorWhite
+		levelSymbol = "→"
 	case slog.LevelWarn:
 		levelColor = colorYellow
+		levelSymbol = "!"
 	case slog.LevelError:
 		levelColor = colorRed
+		levelSymbol = "✗"
 	default:
 		levelColor = colorReset
+		levelSymbol = "•"
 	}
 
-	component := h.module // use whatever was stored in WithAttrs
-	var attrs []string
+	component := h.module
+	if component == "" {
+		component = "app"
+	}
 
+	var attrs []string
 	r.Attrs(func(a slog.Attr) bool {
-		// Skip time attribute
-		if a.Key == slog.TimeKey {
+		if a.Key == slog.TimeKey || a.Key == "module" {
 			return true
 		}
-		attrs = append(attrs, fmt.Sprintf("%s=%v", a.Key, a.Value.Any()))
+		
+		key := a.Key
+		value := a.Value.Any()
+		
+		// Format specific keys for better readability
+		switch key {
+		case "error":
+			attrs = append(attrs, fmt.Sprintf("%s%s%s: %v", colorRed, key, colorReset, value))
+		case "count", "total_books", "total_audio_files", "processed_books", "processed_chapters", "total_files", "chapter_index", "num_gc":
+			attrs = append(attrs, fmt.Sprintf("%s%s%s=%v", colorBlue, key, colorReset, value))
+		case "title", "author", "chapter_name", "file", "path", "status":
+			attrs = append(attrs, fmt.Sprintf("%s%s%s=%q", colorWhite, key, colorReset, value))
+		case "isbn", "asin", "url", "address", "value":
+			attrs = append(attrs, fmt.Sprintf("%s%s%s=%v", colorYellow, key, colorReset, value))
+		default:
+			attrs = append(attrs, fmt.Sprintf("%s%s%s=%v", colorWhite, key, colorReset, value))
+		}
 		return true
 	})
 
-	if component == "" {
-		component = "unknown"
+	// Build the log line with improved formatting
+	var logLine strings.Builder
+	
+	// Component name with subtle styling
+	logLine.WriteString(fmt.Sprintf("%s[%s]%s", colorBlue, component, colorReset))
+	
+	// Main message
+	logLine.WriteString(fmt.Sprintf(" %s", r.Message))
+	
+	// Attributes if present
+	if len(attrs) > 0 {
+		logLine.WriteString(" ")
+		logLine.WriteString(strings.Join(attrs, " "))
 	}
 
-	// Format the log entry with simple space separation
-	logLine := fmt.Sprintf("(%s) %s %s", component, r.Message, strings.Join(attrs, " "))
-	h.l.Printf("%s%-5s%s %s", levelColor, level, colorReset, logLine)
+	// Output with level symbol and color
+	h.l.Printf("%s%s%s %s", levelColor, levelSymbol, colorReset, logLine.String())
 	return nil
 }
