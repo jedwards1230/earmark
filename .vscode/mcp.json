@@ -1,0 +1,12 @@
+{
+	"servers": {
+		"lil-whisper": {
+			"type": "stdio",
+			"command": "/Users/justin/dev/homelab-workspace/lilbro-whisper/lil-whisper",
+			"args": [
+				"mcp"
+			]
+		}
+	},
+	"inputs": []
+}

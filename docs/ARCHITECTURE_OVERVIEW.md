@@ -142,7 +142,33 @@ transcriptions (id, file_path, checksum, text, word_count)
 }
 ```
 
-#### 9. Queue System (`internal/queue/`)
+#### 9. MCP Server (`internal/mcp/`)
+**Purpose**: Model Context Protocol server for AI assistant integration
+
+**Key Features**:
+- Three integrated tools for audiobook search and browsing
+- Support for both stdio and HTTP transports
+- Interface-based architecture for clean separation from database layer
+- Comprehensive formatting for AI assistant display
+- Environment-based configuration
+
+**Components**:
+- `types.go`: Formatting functions for MCP responses (search results, library hierarchy)
+- `tools.go`: Tool handlers implementing MCP tool interface with database abstraction
+- `server.go`: MCP server setup and transport configuration
+- Complete test coverage using TDD approach
+
+**Available Tools**:
+1. **semantic_search_audiobooks**: Vector similarity search using OpenAI embeddings
+2. **text_search_audiobooks**: PostgreSQL full-text search across transcriptions
+3. **browse_audiobook_library**: Hierarchical library browsing with optional filtering
+
+**Integration**:
+- Integrated as Cobra command (`./lil-whisper mcp`)
+- Environment variable configuration (`MCP_TRANSPORT`, `MCP_HTTP_ADDR`)
+- Compatible with Claude Desktop and other MCP clients
+
+#### 10. Queue System (`internal/queue/`)
 **Purpose**: In-memory work queue for processing coordination
 
 **Key Features**:
@@ -151,7 +177,7 @@ transcriptions (id, file_path, checksum, text, word_count)
 - Bounded capacity (configurable)
 - Status checking utilities
 
-#### 10. Configuration Management (`internal/config/`)
+#### 11. Configuration Management (`internal/config/`)
 **Purpose**: Centralized configuration with environment variable support
 
 **Key Settings**:
@@ -162,7 +188,7 @@ transcriptions (id, file_path, checksum, text, word_count)
 - LLM correction settings (model, temperature, retry logic)
 - Feature flags and operational settings
 
-#### 11. Metadata System (`internal/meta/`)
+#### 12. Metadata System (`internal/meta/`)
 **Purpose**: Extracts and manages book/chapter metadata
 
 **Key Features**:
@@ -172,7 +198,7 @@ transcriptions (id, file_path, checksum, text, word_count)
 - File metadata association
 - Metadata context for LLM correction prompts
 
-#### 12. Logging System (`internal/log/`)
+#### 13. Logging System (`internal/log/`)
 **Purpose**: Structured logging across all components
 
 **Key Features**:

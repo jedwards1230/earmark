@@ -96,7 +96,48 @@ Key configuration options:
     
     # List processed books
     ./lil-whisper list
+    
+    # Start MCP server for AI assistant integration
+    ./lil-whisper mcp
     ```
+
+## MCP Integration (Model Context Protocol)
+
+The service now includes a complete MCP server implementation for integration with AI assistants like Claude Desktop:
+
+### Available Tools
+
+- **semantic_search_audiobooks**: Search using semantic similarity with OpenAI embeddings
+- **text_search_audiobooks**: Full-text search across all transcriptions
+- **browse_audiobook_library**: Browse library structure with hierarchical display
+
+### Usage
+
+```bash
+# Start MCP server with stdio transport (default)
+./lil-whisper mcp
+
+# Start with HTTP transport
+MCP_TRANSPORT=http ./lil-whisper mcp
+
+# Start with custom HTTP address
+MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 ./lil-whisper mcp
+```
+
+### Claude Desktop Integration
+
+Add to your Claude Desktop MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "lilbro-whisper": {
+      "command": "/path/to/lil-whisper",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
 ## Database Schema
 
@@ -108,10 +149,12 @@ The service uses a sophisticated PostgreSQL schema:
 
 ## Recent Improvements (v0.9)
 
+- ✅ **MCP Server Implementation:** Complete Model Context Protocol server with 3 tools for AI assistant integration
 - ✅ **Raw Transcription Storage:** Store full transcriptions alongside chunked content
 - ✅ **Settings-Based Deduplication:** Re-transcribe only when settings change
 - ✅ **File Checksum Validation:** Use SHA256 checksums for reliable deduplication
 - ✅ **Enhanced Database Schema:** Added transcriptions table with optimized indexes
+- ✅ **Cobra Command Structure:** All CLI functionality properly integrated as commands
 
 ## Current Limitations
 
@@ -124,8 +167,7 @@ The service uses a sophisticated PostgreSQL schema:
 See [PROJECT-PLAN.md](PROJECT-PLAN.md) for detailed roadmap. Key improvements planned:
 
 - **LLM Text Correction Implementation:** Three-stage correction pipeline using OpenAI-compatible APIs
-- **MCP Server Implementation:** 🚧 **MAJOR TODO** - Model Context Protocol server for LLM integration and tool access
-- **Command Structure Refactor:** Split `start` command into separate monitor/transcribe and serve commands
+- **Command Structure Refactor:** Split `start` command into separate monitor/transcribe and serve commands  
 - **Hybrid Architecture Enhancements:** Optimize the Yap + LLM Correction + OpenAI integration
 - **Enhanced Error Handling:** Robust retry logic and better error reporting
 

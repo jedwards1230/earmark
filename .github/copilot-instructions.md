@@ -30,6 +30,13 @@ FileMonitor → Queue → Worker → [Yap Transcription → LLM Correction → C
 - Table-driven tests (see `internal/transcribe/transcribe_test.go`)
 - Interface mocking for database operations in tests
 - Test utilities in `internal/utils/utils_test.go` for common patterns
+- In development, use the runTests MCP tool for running tests instead of `go test` directly
+
+### 5. Command Structure (CRITICAL REQUIREMENT)
+- **ALL CLI functionality MUST use Cobra commands in `cmd/` package**
+- NO standalone executables in `cmd/subdirectories/` - integrate as commands instead
+- Follow existing pattern: add commands to `cmd/main.go` and implement in separate files
+- Example: MCP server is `./lil-whisper mcp`, not a separate binary
 
 ## Development Workflows
 
@@ -37,6 +44,12 @@ FileMonitor → Queue → Worker → [Yap Transcription → LLM Correction → C
 ```bash
 # Build and run locally
 go build -o lil-whisper && ./lil-whisper start
+
+# Run MCP server
+./lil-whisper mcp
+
+# List available commands
+./lil-whisper --help
 
 # Database via Docker (required dependency)
 docker compose up -d
@@ -71,6 +84,13 @@ go test ./...
 - **OpenAI-compatible APIs**: Configurable base URL for different providers
 - **Cost/rate limiting**: Critical for production deployment
 
+### 4. MCP Server Implementation (COMPLETED)
+- **Complete implementation**: Located in `internal/mcp/` package with full test coverage
+- **Three tools**: semantic_search_audiobooks, text_search_audiobooks, browse_audiobook_library
+- **Transport support**: Both stdio (default) and HTTP transports via environment configuration
+- **Cobra integration**: Accessible via `./lil-whisper mcp` command (not standalone binary)
+- **AI assistant compatibility**: Works with Claude Desktop and other MCP clients
+
 ## Project-Specific Conventions
 
 ### 1. Metadata Handling
@@ -86,7 +106,8 @@ go test ./...
 ### 3. Documentation Maintenance
 - **Live documentation**: Keep `docs/` directory updated with code changes
 - **Architecture docs**: `ARCHITECTURE_OVERVIEW.md`, `DATABASE_SCHEMA.md` must reflect actual implementation
-- **API documentation**: Update `docs/API_REFERENCE.md` when modifying search endpoints
+- **API documentation**: Update `docs/API_REFERENCE.md` when modifying search endpoints or MCP tools
+- **MCP documentation**: Update MCP-related documentation when modifying tools or server configuration
 
 ## External Dependencies
 

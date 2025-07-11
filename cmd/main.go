@@ -16,6 +16,7 @@ func Run() {
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(searchCmd)
+	rootCmd.AddCommand(mcpCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Printf("Error executing command: %v", err)

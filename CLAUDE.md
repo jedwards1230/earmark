@@ -30,7 +30,10 @@ Always search → think → plan → act:
 
 The codebase follows a modular Go architecture:
 
-- **cmd/**: CLI commands using Cobra (start, list, search)
+- **cmd/**: CLI commands using Cobra (start, list, search, mcp)
+  - **CRITICAL REQUIREMENT**: ALL CLI functionality MUST use Cobra commands
+  - NO standalone executables in subdirectories - integrate as commands instead
+  - Follow existing pattern: add commands to main.go and implement in separate files
 - **internal/**: Core business logic modules
   - **config/**: Configuration management with environment variable support
   - **db/**: PostgreSQL database operations with pgvector
@@ -46,6 +49,7 @@ The codebase follows a modular Go architecture:
   - **tokenizer/**: Text tokenization utilities
   - **utils/**: Shared utilities
   - **log/**: Structured logging
+  - **mcp/**: Model Context Protocol server implementation
 
 ## Database Schema
 
@@ -65,6 +69,7 @@ docker compose up -d
 ./lil-whisper start    # Start the monitoring service and HTTP server
 ./lil-whisper list     # List processed books
 ./lil-whisper search "query"  # Search transcriptions
+./lil-whisper mcp      # Start MCP server for AI assistant integration
 ```
 
 ### Testing
@@ -91,7 +96,7 @@ docker compose exec db psql -U postgres -d transcriber
 
 ## Configuration
 
-The application uses environment variables (see README.md for complete list and examples). Key settings include database connection, OpenAI API key, directory paths, and processing parameters. Configuration is loaded from .env file with environment variable overrides.
+The application uses environment variables (see README.md for complete list and examples). Key settings include database connection, OpenAI API key, directory paths, processing parameters, and MCP server configuration. Configuration is loaded from .env file with environment variable overrides.
 
 ## Key Components
 
@@ -110,9 +115,10 @@ The project uses a hybrid approach combining the best of local and cloud service
 - **Yap for Transcription**: Local Apple speech recognition (macOS 26+) for fast, reliable transcription
 - **LLM Correction Pipeline**: Three-stage text correction using OpenAI-compatible APIs to fix transcription errors
 - **OpenAI for Embeddings**: Proven OpenAI API for high-quality vector embeddings
+- **MCP Integration**: Complete Model Context Protocol server for AI assistant tool access
 - **Whisper Deprecated**: Removed all Whisper dependencies in favor of Yap
 
-This approach provides optimal performance with local transcription speed, intelligent error correction (when implemented), and cloud embedding quality.
+This approach provides optimal performance with local transcription speed, intelligent error correction (when implemented), cloud embedding quality, and seamless AI assistant integration.
 
 ## LLM Text Correction Pipeline (Planned Feature)
 
@@ -124,18 +130,25 @@ Three-stage correction process to improve transcription accuracy:
 
 **Integration**: Correction will occur between transcription and chunking, with fallback to original text on errors.
 
-## Major TODOs
-
-- **🚧 LLM Text Correction Implementation**: Three-stage correction pipeline using OpenAI-compatible APIs
-- **🚧 MCP Server Implementation**: Model Context Protocol server for LLM integration and tool access - this is a critical component for making the service accessible to AI assistants and workflow automation tools
-- **🚧 Command Structure Refactor**: Split `start` command into separate monitor/transcribe and serve (HTTP/MCP) commands
-
-## MCP Server Planning
+## MCP Server Implementation (✅ COMPLETED)
 
 **Library**: `github.com/mark3labs/mcp-go` - exposes service to LLM applications and AI assistants
 
-**Architecture**: HTTP and MCP servers run as parallel services accessing the same database layer
+**Architecture**: MCP server runs as Cobra command (`./lil-whisper mcp`) accessing the same database layer as HTTP API
 
-**Planned Tools**: search, list_books, get_book_info, get_chapter, transcription_status  
-**Planned Resources**: book://{id}, search://{query}, stats://library  
-**Implementation**: Reuse existing database layer, support stdio and HTTP transports
+**Implemented Tools**:
+- **semantic_search_audiobooks**: Vector similarity search using OpenAI embeddings
+- **text_search_audiobooks**: PostgreSQL full-text search across transcriptions  
+- **browse_audiobook_library**: Hierarchical library browsing with optional filtering
+
+**Features**:
+- Support for both stdio and HTTP transports
+- Environment-based configuration (`MCP_TRANSPORT`, `MCP_HTTP_ADDR`)
+- Interface-based architecture for clean separation from database layer
+- Comprehensive test coverage using TDD approach
+- Integration with Claude Desktop and other MCP clients
+
+## Major TODOs
+
+- **🚧 LLM Text Correction Implementation**: Three-stage correction pipeline using OpenAI-compatible APIs  
+- **🚧 Command Structure Refactor**: Split `start` command into separate monitor/transcribe and serve (HTTP/MCP) commands
