@@ -55,16 +55,24 @@ type DB struct {
 
 type SearchResultWithMetadata struct {
 	ID            int     `json:"id"`
-	Content       string  `json:"content"`
 	Author        string  `json:"author"`
 	Title         string  `json:"title"`
 	Chapter       string  `json:"chapter"`
-	ChunkIndex    int     `json:"chunkIndex"`
-	Similarity    float64 `json:"similarity"`
 	ChapterIndex  int     `json:"chapterIndex"`
 	ChapterTitle  string  `json:"chapterTitle"`
+	ChunkIndex    int     `json:"chunkIndex"`
+	ChunkID       string  `json:"chunkID"` // Unique identifier: author_book_chapter_chunk
+	Content       string  `json:"content"`
+	Similarity    float64 `json:"similarity"`
+	WordCount     int     `json:"wordCount"`  // Words in this chunk
+	ChunkStart    int     `json:"chunkStart"` // Character offset start in chapter
+	ChunkEnd      int     `json:"chunkEnd"`   // Character offset end in chapter
 	TotalChunks   int     `json:"totalChunks"`
 	TotalChapters int     `json:"totalChapters"`
+	FilePath      string  `json:"filePath"`       // Original audio file path
+	FileChecksum  string  `json:"fileChecksum"`   // SHA256 for deduplication
+	ISBN          string  `json:"isbn,omitempty"` // Book ISBN if available
+	ASIN          string  `json:"asin,omitempty"` // Book ASIN if available
 }
 
 func New(cfg *config.Config) (*DB, error) {
@@ -426,11 +434,18 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
             c.index as chapter_index,
             c.title as chapter_title,
             (SELECT COUNT(*) FROM vectors WHERE chapter_id = c.id) as total_chunks,
-            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters
+            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters,
+            COALESCE(t.file_path, '') as file_path,
+            COALESCE(t.file_checksum, '') as file_checksum,
+            CONCAT(a.name, '_', b.title, '_', c.index, '_', vm.chunk_index) as chunk_id,
+            LENGTH(vm.content) - LENGTH(REPLACE(vm.content, ' ', '')) + 1 as word_count,
+            COALESCE(b.isbn, '') as isbn,
+            COALESCE(b.asin, '') as asin
         FROM vector_matches vm
         JOIN chapters c ON c.id = vm.chapter_id
         JOIN books b ON c.book_id = b.id
         JOIN authors a ON b.author_id = a.id
+        LEFT JOIN transcriptions t ON t.file_path LIKE '%' || b.title || '%'
         ORDER BY vm.similarity DESC
     `
 
@@ -455,6 +470,12 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 			&result.ChapterTitle,
 			&result.TotalChunks,
 			&result.TotalChapters,
+			&result.FilePath,
+			&result.FileChecksum,
+			&result.ChunkID,
+			&result.WordCount,
+			&result.ISBN,
+			&result.ASIN,
 		); err != nil {
 			return nil, err
 		}
@@ -530,11 +551,18 @@ func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]Search
             c.index as chapter_index,
             c.title as chapter_title,
             (SELECT COUNT(*) FROM vectors WHERE chapter_id = c.id) as total_chunks,
-            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters
+            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters,
+            COALESCE(t.file_path, '') as file_path,
+            COALESCE(t.file_checksum, '') as file_checksum,
+            CONCAT(a.name, '_', b.title, '_', c.index, '_', v.chunk_index) as chunk_id,
+            LENGTH(v.content) - LENGTH(REPLACE(v.content, ' ', '')) + 1 as word_count,
+            COALESCE(b.isbn, '') as isbn,
+            COALESCE(b.asin, '') as asin
         FROM vectors v
         JOIN chapters c ON v.chapter_id = c.id
         JOIN books b ON c.book_id = b.id
         JOIN authors a ON b.author_id = a.id
+        LEFT JOIN transcriptions t ON t.file_path LIKE '%' || b.title || '%'
         WHERE to_tsvector('english', v.content) @@ to_tsquery('english', $1)
         ORDER BY ts_rank(to_tsvector('english', v.content), to_tsquery('english', $1)) DESC
         LIMIT $2
@@ -561,6 +589,12 @@ func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]Search
 			&result.ChapterTitle,
 			&result.TotalChunks,
 			&result.TotalChapters,
+			&result.FilePath,
+			&result.FileChecksum,
+			&result.ChunkID,
+			&result.WordCount,
+			&result.ISBN,
+			&result.ASIN,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error scanning search result: %w", err)
@@ -771,4 +805,105 @@ func (db *DB) GetTranscription(ctx context.Context, filePath string) (*Transcrip
 	}
 
 	return &transcription, nil
+}
+
+// GetChunkContext retrieves surrounding chunks for a given chunk ID
+func (db *DB) GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]SearchResultWithMetadata, error) {
+	// Parse chunk ID (format: author_book_chapter_chunk)
+	parts := strings.Split(chunkID, "_")
+	if len(parts) < 4 {
+		return nil, fmt.Errorf("invalid chunk ID format: %s", chunkID)
+	}
+
+	chapterIndex := parts[len(parts)-2]
+	chunkIndex := parts[len(parts)-1]
+
+	sql := `
+        WITH target_chunk AS (
+            SELECT 
+                v.chapter_id,
+                v.chunk_index,
+                c.book_id
+            FROM vectors v
+            JOIN chapters c ON v.chapter_id = c.id
+            JOIN books b ON c.book_id = b.id
+            JOIN authors a ON b.author_id = a.id
+            WHERE c.index = $1::integer 
+            AND v.chunk_index = $2::integer
+            AND CONCAT(a.name, '_', b.title, '_', c.index, '_', v.chunk_index) = $3
+            LIMIT 1
+        ),
+        context_chunks AS (
+            SELECT 
+                v.id,
+                v.content,
+                v.chapter_id,
+                v.chunk_index,
+                0.0 as similarity
+            FROM vectors v, target_chunk tc
+            WHERE v.chapter_id = tc.chapter_id
+            AND v.chunk_index BETWEEN (tc.chunk_index - $4) AND (tc.chunk_index + $4)
+            ORDER BY v.chunk_index
+        )
+        SELECT 
+            cc.id,
+            cc.content,
+            a.name as author,
+            b.title,
+            c.title as chapter,
+            cc.chunk_index,
+            cc.similarity,
+            c.index as chapter_index,
+            c.title as chapter_title,
+            (SELECT COUNT(*) FROM vectors WHERE chapter_id = c.id) as total_chunks,
+            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters,
+            COALESCE(t.file_path, '') as file_path,
+            COALESCE(t.file_checksum, '') as file_checksum,
+            CONCAT(a.name, '_', b.title, '_', c.index, '_', cc.chunk_index) as chunk_id,
+            LENGTH(cc.content) - LENGTH(REPLACE(cc.content, ' ', '')) + 1 as word_count,
+            COALESCE(b.isbn, '') as isbn,
+            COALESCE(b.asin, '') as asin
+        FROM context_chunks cc
+        JOIN chapters c ON cc.chapter_id = c.id
+        JOIN books b ON c.book_id = b.id
+        JOIN authors a ON b.author_id = a.id
+        LEFT JOIN transcriptions t ON t.file_path LIKE '%' || b.title || '%'
+        ORDER BY cc.chunk_index
+    `
+
+	rows, err := db.conn.Query(ctx, sql, chapterIndex, chunkIndex, chunkID, contextWindow)
+	if err != nil {
+		return nil, fmt.Errorf("context query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var results []SearchResultWithMetadata
+	for rows.Next() {
+		var result SearchResultWithMetadata
+		err := rows.Scan(
+			&result.ID,
+			&result.Content,
+			&result.Author,
+			&result.Title,
+			&result.Chapter,
+			&result.ChunkIndex,
+			&result.Similarity,
+			&result.ChapterIndex,
+			&result.ChapterTitle,
+			&result.TotalChunks,
+			&result.TotalChapters,
+			&result.FilePath,
+			&result.FileChecksum,
+			&result.ChunkID,
+			&result.WordCount,
+			&result.ISBN,
+			&result.ASIN,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan context result: %w", err)
+		}
+		results = append(results, result)
+	}
+
+	return results, nil
 }

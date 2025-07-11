@@ -48,6 +48,38 @@ func (m *SimpleMockDB) GetHierarchicalData(ctx context.Context) ([]db.Hierarchic
 	}, nil
 }
 
+func (m *SimpleMockDB) GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error) {
+	return []db.SearchResultWithMetadata{
+		{
+			ID:         1,
+			Content:    "Previous chunk content",
+			Author:     "Christopher Paolini",
+			Title:      "Eragon",
+			Chapter:    "Chapter 1",
+			ChunkIndex: 0,
+			ChunkID:    "Christopher Paolini_Eragon_1_0",
+		},
+		{
+			ID:         2,
+			Content:    "Current chunk content",
+			Author:     "Christopher Paolini",
+			Title:      "Eragon",
+			Chapter:    "Chapter 1",
+			ChunkIndex: 1,
+			ChunkID:    "Christopher Paolini_Eragon_1_1",
+		},
+		{
+			ID:         3,
+			Content:    "Next chunk content",
+			Author:     "Christopher Paolini",
+			Title:      "Eragon",
+			Chapter:    "Chapter 1",
+			ChunkIndex: 2,
+			ChunkID:    "Christopher Paolini_Eragon_1_2",
+		},
+	}, nil
+}
+
 // TestMCPServerCreation tests that we can create an MCP server without errors
 func TestMCPServerCreation(t *testing.T) {
 	// Create simple mock database

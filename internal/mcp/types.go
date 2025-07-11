@@ -3,6 +3,7 @@ package mcp
 import (
 	"fmt"
 	"strings"
+
 	"github.com/jedwards1230/lil-whisper/internal/db"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -32,6 +33,18 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 		similarity := int(result.Similarity * 100)
 		output.WriteString(fmt.Sprintf("Chapter %d: %s (chunk %d/%d, similarity: %d%%)\n",
 			result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks, similarity))
+
+		// Enhanced citation info
+		if result.ChunkID != "" {
+			output.WriteString(fmt.Sprintf("ID: %s", result.ChunkID))
+			if result.FilePath != "" {
+				output.WriteString(fmt.Sprintf(" | File: %s", result.FilePath))
+			}
+			if result.WordCount > 0 {
+				output.WriteString(fmt.Sprintf(" | Words: %d", result.WordCount))
+			}
+			output.WriteString("\n")
+		}
 
 		// Format: > Content
 		output.WriteString(fmt.Sprintf("> %s\n", result.Content))

@@ -15,6 +15,7 @@ type DBInterface interface {
 	Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error)
 	TextSearch(ctx context.Context, query string, limit int) ([]db.SearchResultWithMetadata, error)
 	GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error)
+	GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools
@@ -105,4 +106,28 @@ func (h *ToolHandlers) handleBrowseLibrary(ctx context.Context, request mcp.Call
 
 	// Format results using the shared formatting function
 	return formatHierarchicalData(filteredData), nil
+}
+
+// handleGetContext retrieves surrounding chunks for better context
+func (h *ToolHandlers) handleGetContext(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Extract required chunk ID parameter
+	chunkID, err := request.RequireString("chunkID")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Missing or invalid chunkID parameter: %v", err)), nil
+	}
+
+	// Extract optional context window size (default 2 chunks before and after)
+	contextWindow := request.GetInt("contextWindow", 2)
+
+	h.logger.Info("Getting chunk context", "chunkID", chunkID, "contextWindow", contextWindow)
+
+	// Get context chunks
+	results, err := h.db.GetChunkContext(ctx, chunkID, contextWindow)
+	if err != nil {
+		h.logger.Error("Failed to get chunk context", "error", err)
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get context: %v", err)), nil
+	}
+
+	// Format results using the shared formatting function
+	return formatSearchResults(results), nil
 }

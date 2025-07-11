@@ -1,0 +1,17 @@
+{
+    "github.copilot.chat.agent.terminal.allowList": {
+        "go": true,
+    },
+    "github.copilot.chat.agent.terminal.denyList": {
+        "rm": true,
+        "rmdir": true,
+        "del": true,
+        "kill": true,
+        "curl": true,
+        "wget": true,
+        "eval": true,
+        "chmod": true,
+        "chown": true,
+        "go install": true,
+    }
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+
 	"github.com/jedwards1230/lil-whisper/internal/db"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -29,6 +30,11 @@ func (m *MockDBInterface) TextSearch(ctx context.Context, query string, limit in
 func (m *MockDBInterface) GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error) {
 	args := m.Called(ctx)
 	return args.Get(0).([]db.HierarchicalEntry), args.Error(1)
+}
+
+func (m *MockDBInterface) GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error) {
+	args := m.Called(ctx, chunkID, contextWindow)
+	return args.Get(0).([]db.SearchResultWithMetadata), args.Error(1)
 }
 
 func TestHandleSemanticSearch(t *testing.T) {
@@ -348,6 +354,123 @@ func TestHandleBrowseLibrary(t *testing.T) {
 				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
 			}
 
+			mockDB.AssertExpectations(t)
+		})
+	}
+}
+
+func TestHandleGetContext(t *testing.T) {
+	tests := []struct {
+		name          string
+		request       mcp.CallToolRequest
+		mockResults   []db.SearchResultWithMetadata
+		mockError     error
+		expectedError bool
+		expectedText  string
+	}{
+		{
+			name: "successful context retrieval",
+			request: mcp.CallToolRequest{
+				Params: mcp.CallToolParams{
+					Name: "get_chunk_context",
+					Arguments: map[string]interface{}{
+						"chunkID":       "Christopher Paolini_Eragon_1_5",
+						"contextWindow": 2,
+					},
+				},
+			},
+			mockResults: []db.SearchResultWithMetadata{
+				{
+					ID:         10,
+					Content:    "Context before target chunk",
+					Author:     "Christopher Paolini",
+					Title:      "Eragon",
+					ChunkIndex: 4,
+					ChunkID:    "Christopher Paolini_Eragon_1_4",
+				},
+				{
+					ID:         11,
+					Content:    "Target chunk content",
+					Author:     "Christopher Paolini",
+					Title:      "Eragon",
+					ChunkIndex: 5,
+					ChunkID:    "Christopher Paolini_Eragon_1_5",
+				},
+				{
+					ID:         12,
+					Content:    "Context after target chunk",
+					Author:     "Christopher Paolini",
+					Title:      "Eragon",
+					ChunkIndex: 6,
+					ChunkID:    "Christopher Paolini_Eragon_1_6",
+				},
+			},
+			mockError:     nil,
+			expectedError: false,
+			expectedText:  "Found 3 result(s)",
+		},
+		{
+			name: "missing chunk ID parameter",
+			request: mcp.CallToolRequest{
+				Params: mcp.CallToolParams{
+					Name: "get_chunk_context",
+					Arguments: map[string]interface{}{
+						"contextWindow": 2,
+					},
+				},
+			},
+			mockResults:   nil,
+			mockError:     nil,
+			expectedError: true,
+			expectedText:  "Missing or invalid chunkID parameter",
+		},
+		{
+			name: "database error",
+			request: mcp.CallToolRequest{
+				Params: mcp.CallToolParams{
+					Name: "get_chunk_context",
+					Arguments: map[string]interface{}{
+						"chunkID":       "Christopher Paolini_Eragon_1_5",
+						"contextWindow": 2,
+					},
+				},
+			},
+			mockResults:   nil,
+			mockError:     errors.New("database connection failed"),
+			expectedError: true,
+			expectedText:  "Failed to get context",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create mock database
+			mockDB := new(MockDBInterface)
+
+			// Set up expectations
+			if tt.mockResults != nil || tt.mockError != nil {
+				chunkID := tt.request.GetString("chunkID", "")
+				contextWindow := tt.request.GetInt("contextWindow", 2)
+				mockDB.On("GetChunkContext", mock.Anything, chunkID, contextWindow).Return(tt.mockResults, tt.mockError)
+			}
+
+			// Create tool handlers
+			handlers := NewToolHandlers(mockDB)
+
+			// Execute the handler
+			result, err := handlers.handleGetContext(context.Background(), tt.request)
+
+			// Verify results
+			if tt.expectedError {
+				assert.NotNil(t, result)
+				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
+			} else {
+				assert.Nil(t, err)
+				assert.NotNil(t, result)
+				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
+			}
+
+			// Verify mock expectations
 			mockDB.AssertExpectations(t)
 		})
 	}

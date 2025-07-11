@@ -73,6 +73,19 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		),
 	), handlers.handleBrowseLibrary)
 
+	// Add chunk context tool
+	mcpServer.AddTool(mcp.NewTool("get_chunk_context",
+		mcp.WithDescription("Get surrounding chunks for better context around a specific chunk"),
+		mcp.WithString("chunkID",
+			mcp.Description("The unique chunk ID (format: author_book_chapter_chunk)"),
+			mcp.Required(),
+		),
+		mcp.WithNumber("contextWindow",
+			mcp.Description("Number of chunks before and after to include (default: 2)"),
+			mcp.DefaultNumber(2),
+		),
+	), handlers.handleGetContext)
+
 	return &MCPServer{
 		server:   mcpServer,
 		handlers: handlers,
