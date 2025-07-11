@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"transcriber/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/config"
 )
 
 func TestComputeFileChecksum(t *testing.T) {

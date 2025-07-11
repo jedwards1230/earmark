@@ -2,7 +2,7 @@ package fetcher
 
 import (
 	"fmt"
-	"transcriber/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/log"
 
 	goisbn "github.com/abx123/go-isbn"
 	"github.com/bobbyrward/abs-importer/pkg/api/audible"

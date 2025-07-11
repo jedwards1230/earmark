@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 	"testing"
-	"transcriber/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/db"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"

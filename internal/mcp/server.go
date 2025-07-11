@@ -7,8 +7,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"transcriber/internal/config"
-	"transcriber/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/log"
 )
 
 // MCPServer wraps the MCP server functionality for the lilbro-whisper service

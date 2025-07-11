@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"transcriber/internal/config"
-	"transcriber/internal/log"
-	"transcriber/internal/meta"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/meta"
 )
 
 type Transcriber struct {

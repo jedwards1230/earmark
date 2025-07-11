@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"transcriber/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/config"
 
 	"github.com/sashabaranov/go-openai"
 )

@@ -9,12 +9,12 @@ import (
 	"sort"
 	"strings"
 
-	"transcriber/internal/chunker"
-	"transcriber/internal/config"
-	"transcriber/internal/log"
-	"transcriber/internal/meta"
-	"transcriber/internal/openai"
-	"transcriber/internal/utils"
+	"github.com/jedwards1230/lil-whisper/internal/chunker"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/meta"
+	"github.com/jedwards1230/lil-whisper/internal/openai"
+	"github.com/jedwards1230/lil-whisper/internal/utils"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"

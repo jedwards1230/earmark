@@ -3,8 +3,8 @@ package cmd
 import (
 	"fmt"
 	"log"
-	"transcriber/internal/config"
-	"transcriber/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/db"
 
 	"github.com/spf13/cobra"
 )

@@ -2,7 +2,7 @@ package queue
 
 import (
 	"sync"
-	"transcriber/internal/meta"
+	"github.com/jedwards1230/lil-whisper/internal/meta"
 )
 
 type Queue struct {

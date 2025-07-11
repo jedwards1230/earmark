@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"transcriber/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/config"
 )
 
 func TestFormatFileSize(t *testing.T) {

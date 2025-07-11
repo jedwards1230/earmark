@@ -8,12 +8,12 @@ import (
 	"os/exec"
 	"regexp"
 	"time"
-	"transcriber/internal/config"
-	"transcriber/internal/db"
-	"transcriber/internal/log"
-	"transcriber/internal/meta"
-	"transcriber/internal/queue"
-	"transcriber/internal/transcribe"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/meta"
+	"github.com/jedwards1230/lil-whisper/internal/queue"
+	"github.com/jedwards1230/lil-whisper/internal/transcribe"
 )
 
 type Worker struct {

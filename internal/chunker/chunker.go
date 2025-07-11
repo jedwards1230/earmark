@@ -2,7 +2,7 @@ package chunker
 
 import (
 	"strings"
-	"transcriber/internal/tokenizer"
+	"github.com/jedwards1230/lil-whisper/internal/tokenizer"
 )
 
 type SplitType string

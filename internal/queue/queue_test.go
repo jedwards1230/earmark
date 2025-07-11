@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"transcriber/internal/meta"
+	"github.com/jedwards1230/lil-whisper/internal/meta"
 )
 
 func TestNewQueue(t *testing.T) {

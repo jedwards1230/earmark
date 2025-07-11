@@ -8,12 +8,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"transcriber/internal/config"
-	"transcriber/internal/db"
-	"transcriber/internal/monitor"
-	"transcriber/internal/queue"
-	"transcriber/internal/server"
-	"transcriber/internal/worker"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/monitor"
+	"github.com/jedwards1230/lil-whisper/internal/queue"
+	"github.com/jedwards1230/lil-whisper/internal/server"
+	"github.com/jedwards1230/lil-whisper/internal/worker"
 
 	"github.com/spf13/cobra"
 )

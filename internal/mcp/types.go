@@ -3,7 +3,7 @@ package mcp
 import (
 	"fmt"
 	"strings"
-	"transcriber/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/db"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )

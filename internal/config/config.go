@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/joho/godotenv"
-	"transcriber/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/log"
 )
 
 var logger = log.NewLogger("config")

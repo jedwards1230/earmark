@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"transcriber/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/db"
 )
 
 func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {

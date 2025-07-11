@@ -62,7 +62,7 @@ The MCP server can run alongside the existing HTTP server:
 
 ```go
 // In your main service
-import "transcriber/internal/mcp"
+import "github.com/jedwards1230/lil-whisper/internal/mcp"
 
 // Start MCP service
 go func() {

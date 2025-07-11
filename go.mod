@@ -1,4 +1,4 @@
-module transcriber
+module github.com/jedwards1230/lil-whisper
 
 go 1.23.0
 

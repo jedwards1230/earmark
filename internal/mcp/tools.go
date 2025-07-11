@@ -6,8 +6,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
-	"transcriber/internal/db"
-	"transcriber/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/log"
 )
 
 // DBInterface defines the database operations needed by MCP tools

@@ -7,9 +7,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"transcriber/internal/config"
-	"transcriber/internal/db"
-	"transcriber/internal/mcp"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/mcp"
 )
 
 var mcpCmd = &cobra.Command{

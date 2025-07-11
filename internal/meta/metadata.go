@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"transcriber/internal/log"
-	"transcriber/internal/meta/fetcher"
+	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/meta/fetcher"
 )
 
 var logger = log.NewLogger("metadata")
