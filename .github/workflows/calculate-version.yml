@@ -137,7 +137,7 @@ jobs:
                   echo "" >> "${CHANGELOG_FILE}"
                   echo "${COMMITS}" >> "${CHANGELOG_FILE}"
                   echo "" >> "${CHANGELOG_FILE}"
-                  echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${CURRENT_VERSION}...${NEW_VERSION}" >> "${CHANGELOG_FILE}"
+                  # echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${CURRENT_VERSION}...${NEW_VERSION}" >> "${CHANGELOG_FILE}"
 
                   # Also output content for other workflows to use
                   CHANGELOG_CONTENT=$(cat "${CHANGELOG_FILE}")
