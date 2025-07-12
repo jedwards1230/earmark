@@ -124,6 +124,9 @@ LOG_VERBOSE=false
 DISABLE_VERSION_CHECK=false
 VERSION_CHECK_INTERVAL=24h
 VERSION_CHECK_TIMEOUT=5s
+
+# GitHub authentication (required for private repositories)
+GITHUB_TOKEN=your-github-token-here
 ```
 
 Key configuration options:
@@ -139,6 +142,7 @@ Key configuration options:
 *   `DISABLE_VERSION_CHECK`: Disable automatic version checking (default: false)
 *   `VERSION_CHECK_INTERVAL`: How often to check for updates (default: 24h)
 *   `VERSION_CHECK_TIMEOUT`: Timeout for version check requests (default: 5s)
+*   `GITHUB_TOKEN`: GitHub personal access token for private repository access (required for update/version checking of private repositories)
 
 ## Installation
 

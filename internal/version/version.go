@@ -258,6 +258,14 @@ func checkCommitVersionWithDebug(ctx context.Context, result *CheckResult, debug
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
+	// Add GitHub token authentication if available for private repositories
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "token "+token)
+		if debug {
+			fmt.Printf("DEBUG: Using GitHub token for private repository access\n")
+		}
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		if debug {
@@ -319,6 +327,14 @@ func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debu
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	// Add GitHub token authentication if available for private repositories
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "token "+token)
+		if debug {
+			fmt.Printf("DEBUG: Using GitHub token for private repository access\n")
+		}
 	}
 
 	resp, err := client.Do(req)

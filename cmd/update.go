@@ -163,20 +163,37 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	downloadURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/lil-whisper-%s-%s",
 		version.GitHubRepo, latestVersion, runtime.GOOS, runtime.GOARCH)
 
+	fmt.Printf("Downloading from: %s\n", downloadURL)
+
 	client := &http.Client{Timeout: 2 * time.Minute}
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("creating download request: %w", err)
 	}
 
+	// Add GitHub token authentication if available for private repositories
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "token "+token)
+		fmt.Println("Using GitHub token for private repository access")
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("downloading binary: %w", err)
+		return fmt.Errorf("downloading binary from %s: %w", downloadURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status %d", resp.StatusCode)
+		switch resp.StatusCode {
+		case 404:
+			return fmt.Errorf("download failed with status 404 - URL: %s (release binary not found - likely private repository or binary not published)", downloadURL)
+		case 403:
+			return fmt.Errorf("download failed with status 403 - URL: %s (access denied - likely private repository, try setting GITHUB_TOKEN environment variable)", downloadURL)
+		case 401:
+			return fmt.Errorf("download failed with status 401 - URL: %s (authentication required - check GITHUB_TOKEN environment variable)", downloadURL)
+		default:
+			return fmt.Errorf("download failed with status %d - URL: %s", resp.StatusCode, downloadURL)
+		}
 	}
 
 	tempFile := executable + ".tmp"
