@@ -168,10 +168,23 @@ func CheckForUpdatesWithExpiryAndDebug(ctx context.Context, useCache bool, cache
 
 	if useCache {
 		if cached := loadCache(); cached != nil && time.Since(cached.LastCheck) < cacheExpiry {
-			if debug {
-				fmt.Printf("DEBUG: Using cached result from %v\n", cached.LastCheck)
+			// Check if current state matches cached state
+			currentCommit := Commit
+			if currentCommit == "unknown" {
+				currentCommit = getRuntimeCommit()
 			}
-			return &cached.Result, nil
+			
+			if cached.Result.CurrentVersion == Version && cached.Result.CurrentCommit == currentCommit {
+				if debug {
+					fmt.Printf("DEBUG: Using cached result from %v\n", cached.LastCheck)
+				}
+				return &cached.Result, nil
+			} else {
+				if debug {
+					fmt.Printf("DEBUG: Cache invalidated - current state changed (version: %s->%s, commit: %s->%s)\n", 
+						cached.Result.CurrentVersion, Version, cached.Result.CurrentCommit, currentCommit)
+				}
+			}
 		}
 		if debug {
 			fmt.Printf("DEBUG: Cache expired or not found, performing fresh check\n")

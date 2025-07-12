@@ -65,17 +65,33 @@ func runUpdate(cmd *cobra.Command, args []string) {
 		fmt.Printf("DEBUG: Update check result: %+v\n", result)
 	}
 
-	if !result.HasUpdate && !force {
-		fmt.Println("✅ You are already running the latest version.")
-		return
-	}
-
 	if checkOnly {
 		if result.HasUpdate {
 			fmt.Printf("🎉 Update available!\n")
 			fmt.Printf("%s\n", result.UpdateMessage)
 		} else {
-			fmt.Printf("✅ No updates available.\n")
+			if result.LatestVersion != "" {
+				fmt.Printf("✅ No updates available. Latest: %s\n", result.LatestVersion)
+			} else if result.LatestCommit != "" {
+				fmt.Printf("✅ No updates available. Latest commit: %s\n", result.LatestCommit[:7])
+			} else {
+				fmt.Printf("✅ No updates available.\n")
+				fmt.Printf("💡 For private repositories, check releases manually at:\n")
+				fmt.Printf("   https://github.com/%s/releases\n", version.GitHubRepo)
+			}
+		}
+		return
+	}
+
+	if !result.HasUpdate && !force {
+		if result.LatestVersion != "" {
+			fmt.Printf("✅ You are already running the latest version (%s).\n", result.LatestVersion)
+		} else if result.LatestCommit != "" {
+			fmt.Printf("✅ You are already running the latest commit (%s).\n", result.LatestCommit[:7])
+		} else {
+			fmt.Println("✅ You are already running the latest version.")
+			fmt.Printf("💡 For private repositories, check releases manually at:\n")
+			fmt.Printf("   https://github.com/%s/releases\n", version.GitHubRepo)
 		}
 		return
 	}
