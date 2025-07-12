@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import (
 	"context"
@@ -7,26 +7,17 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
+
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/monitor"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
-	"github.com/jedwards1230/lil-whisper/internal/server"
 	"github.com/jedwards1230/lil-whisper/internal/worker"
-
-	"github.com/spf13/cobra"
 )
 
-var startCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the transcription service",
-	Run: func(cmd *cobra.Command, args []string) {
-		runService()
-	},
-}
+func main() {
+	log.Println("Starting file monitoring and transcription service...")
 
-func runService() {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -60,7 +51,7 @@ func runService() {
 	// Wait for monitor to complete initialization
 	<-monitorReady
 
-	// Then start worker and other services
+	// Start worker
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -68,9 +59,7 @@ func runService() {
 		worker.Start(cfg)
 	}()
 
-	// Initialize and start HTTP server
-	srv := server.NewServer(database, cfg)
-	httpServer := srv.Start()
+	log.Println("Monitor service started. Processing files and transcribing...")
 
 	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
@@ -83,14 +72,6 @@ func runService() {
 	fileMonitor.Stop()
 	worker.Stop()
 
-	// Shutdown HTTP server with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
-	}
-
 	// Wait for all goroutines to finish
 	log.Println("Waiting for all tasks to complete...")
 	wg.Wait()
@@ -98,5 +79,5 @@ func runService() {
 	// Close database connection
 	database.Close()
 
-	log.Println("Graceful shutdown complete")
+	log.Println("Monitor service shutdown complete")
 }

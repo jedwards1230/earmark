@@ -29,17 +29,24 @@ func main() {
 		os.Setenv("MCP_TRANSPORT", "stdio")
 	}
 
-	// Start the MCP service
+	// Print startup information
 	fmt.Println("Starting MCP server for lilbro-whisper...")
-	fmt.Println("Four tools available for AI assistant integration.")
-	fmt.Println("See internal/mcp/README.md for detailed tool documentation.")
+	fmt.Println("Available tools:")
+	fmt.Println("  - semantic_search_audiobooks: Search using semantic similarity")
+	fmt.Println("  - text_search_audiobooks: Search using full-text search")
+	fmt.Println("  - browse_audiobook_library: Browse library structure")
 	fmt.Println("")
 	fmt.Println("Transport:", os.Getenv("MCP_TRANSPORT"))
 	if os.Getenv("MCP_TRANSPORT") == "http" {
-		fmt.Println("HTTP Address:", os.Getenv("MCP_HTTP_ADDR"))
+		addr := os.Getenv("MCP_HTTP_ADDR")
+		if addr == "" {
+			addr = ":8081"
+		}
+		fmt.Println("HTTP Address:", addr)
 	}
 	fmt.Println("")
 
+	// Start the MCP service
 	if err := mcp.StartMCPService(database, cfg); err != nil {
 		log.Fatalf("Failed to start MCP service: %v", err)
 	}

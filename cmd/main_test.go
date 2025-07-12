@@ -48,9 +48,11 @@ func TestRun(t *testing.T) {
 				Use:   "lil-whisper",
 				Short: "A transcription service using Yap and MacOS native APIs",
 			}
-			rootCmd.AddCommand(startCmd)
+			rootCmd.AddCommand(monitorCmd)
+			rootCmd.AddCommand(serveCmd)
 			rootCmd.AddCommand(listCmd)
 			rootCmd.AddCommand(searchCmd)
+			rootCmd.AddCommand(mcpCmd)
 
 			// Capture output
 			oldStdout := os.Stdout
@@ -96,12 +98,14 @@ func TestCommandsExist(t *testing.T) {
 		Use:   "lil-whisper",
 		Short: "A transcription service using Yap and MacOS native APIs",
 	}
-	rootCmd.AddCommand(startCmd)
+	rootCmd.AddCommand(monitorCmd)
+	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(searchCmd)
+	rootCmd.AddCommand(mcpCmd)
 
 	// Test that all expected commands are registered
-	commands := []string{"start", "list", "search"}
+	commands := []string{"monitor", "serve", "list", "search", "mcp"}
 	
 	for _, cmdName := range commands {
 		cmd, _, err := rootCmd.Find([]string{cmdName})
