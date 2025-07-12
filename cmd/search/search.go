@@ -1,4 +1,4 @@
-package cmd
+package search
 
 import (
 	"context"
@@ -16,6 +16,19 @@ var (
 	textMatch       bool
 	searchThreshold float64
 )
+
+var SearchCmd = &cobra.Command{
+	Use:   "search [query]",
+	Short: "Search for content in the database",
+	Long:  `Search for content in the database. By default, uses semantic vector similarity search.`,
+	Run:   runSearch,
+}
+
+func init() {
+	SearchCmd.Flags().IntVarP(&searchLimit, "limit", "l", 10, "maximum number of results to return")
+	SearchCmd.Flags().BoolVarP(&textMatch, "text", "t", false, "use text-based search instead of semantic search")
+	SearchCmd.Flags().Float64VarP(&searchThreshold, "precision", "p", 0.3, "minimum similarity threshold (0..1)")
+}
 
 func runSearch(cmd *cobra.Command, args []string) {
 	if len(args) != 1 {

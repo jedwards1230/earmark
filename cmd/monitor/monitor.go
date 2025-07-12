@@ -1,4 +1,4 @@
-package cmd
+package monitor
 
 import (
 	"context"
@@ -16,6 +16,23 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/worker"
 	"github.com/spf13/cobra"
 )
+
+var MonitorCmd = &cobra.Command{
+	Use:   "monitor",
+	Short: "Start the file monitoring and transcription service",
+	Long: `Start the file monitoring service that watches for new audio files,
+transcribes them using Yap, and stores the results in the database.
+
+This service handles:
+- File system monitoring for new audio files
+- Audio transcription using Yap (Apple's speech recognition)
+- Database updates with transcription results
+- Background processing queue management
+
+The monitor service does NOT start the HTTP server. Use the 'serve' command
+to start the HTTP API server separately.`,
+	Run: runMonitor,
+}
 
 func runMonitor(cmd *cobra.Command, args []string) {
 	log.Println("Starting file monitoring and transcription service...")

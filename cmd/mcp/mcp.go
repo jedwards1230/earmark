@@ -1,4 +1,4 @@
-package cmd
+package mcp
 
 import (
 	"fmt"
@@ -10,6 +10,29 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/mcp"
 	"github.com/spf13/cobra"
 )
+
+var MCPCmd = &cobra.Command{
+	Use:   "mcp",
+	Short: "Start the Model Context Protocol (MCP) server",
+	Long: `Start the MCP server for lilbro-whisper audiobook transcription service.
+
+The MCP server provides tools for AI assistant integration with audiobook search and browsing capabilities.
+
+Environment Variables:
+  MCP_TRANSPORT: Transport type - "stdio" (default) or "http"
+  MCP_HTTP_ADDR: HTTP server address (default ":8081")
+
+Examples:
+  # Start with stdio transport (default)
+  lil-whisper mcp
+
+  # Start with HTTP transport
+  MCP_TRANSPORT=http lil-whisper mcp
+
+  # Start with custom HTTP address
+  MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 lil-whisper mcp`,
+	Run: runMCP,
+}
 
 func runMCP(cmd *cobra.Command, args []string) {
 	// Load configuration

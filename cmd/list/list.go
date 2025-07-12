@@ -1,4 +1,4 @@
-package cmd
+package list
 
 import (
 	"context"
@@ -9,6 +9,18 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/spf13/cobra"
 )
+
+const (
+	treeVertical = "│"
+	treeBranch   = "├──"
+	treeLeaf     = "└──"
+)
+
+var ListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List content from the database",
+	Run:   runList,
+}
 
 func runList(cmd *cobra.Command, args []string) {
 	cfg, err := config.LoadConfig()

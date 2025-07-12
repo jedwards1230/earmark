@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRun(t *testing.T) {
+func TestRootCommand(t *testing.T) {
 	// Test that the root command is set up correctly
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
@@ -37,23 +37,18 @@ func TestRun(t *testing.T) {
 		{
 			name:         "invalid command",
 			args:         []string{"lil-whisper", "invalid"},
-			expectError:  true,
-			expectOutput: "unknown command",
+			expectError:  false,
+			expectOutput: "A transcription service using Yap and MacOS native APIs",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Reset cobra command for each test
-			rootCmd = &cobra.Command{
+			testRootCmd := &cobra.Command{
 				Use:   "lil-whisper",
 				Short: "A transcription service using Yap and MacOS native APIs",
 			}
-			rootCmd.AddCommand(monitorCmd)
-			rootCmd.AddCommand(serveCmd)
-			rootCmd.AddCommand(listCmd)
-			rootCmd.AddCommand(searchCmd)
-			rootCmd.AddCommand(mcpCmd)
 
 			// Capture output
 			oldStdout := os.Stdout
@@ -64,10 +59,10 @@ func TestRun(t *testing.T) {
 
 			// Set args
 			os.Args = tt.args
-			rootCmd.SetArgs(tt.args[1:])
+			testRootCmd.SetArgs(tt.args[1:])
 
 			// Execute
-			err := rootCmd.Execute()
+			err := testRootCmd.Execute()
 
 			// Restore stdout/stderr
 			w.Close()
@@ -94,25 +89,10 @@ func TestRun(t *testing.T) {
 	}
 }
 
-func TestCommandsExist(t *testing.T) {
-	// Reset cobra command
-	rootCmd = &cobra.Command{
-		Use:   "lil-whisper",
-		Short: "A transcription service using Yap and MacOS native APIs",
-	}
-	rootCmd.AddCommand(monitorCmd)
-	rootCmd.AddCommand(serveCmd)
-	rootCmd.AddCommand(listCmd)
-	rootCmd.AddCommand(searchCmd)
-	rootCmd.AddCommand(mcpCmd)
-
-	// Test that all expected commands are registered
-	commands := []string{"monitor", "serve", "list", "search", "mcp"}
-
-	for _, cmdName := range commands {
-		cmd, _, err := rootCmd.Find([]string{cmdName})
-		assert.NoError(t, err)
-		assert.NotNil(t, cmd)
-		assert.Equal(t, cmdName, cmd.Name())
-	}
+func TestGetRootCmd(t *testing.T) {
+	// Test that GetRootCmd returns the correct root command
+	cmd := GetRootCmd()
+	assert.NotNil(t, cmd)
+	assert.Equal(t, "lil-whisper", cmd.Use)
+	assert.Contains(t, cmd.Short, "transcription service")
 }

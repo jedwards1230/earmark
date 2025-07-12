@@ -1,4 +1,4 @@
-package cmd
+package update
 
 import (
 	"context"
@@ -48,7 +48,7 @@ func TestGetAssetDownloadURL(t *testing.T) {
 	ctx := context.Background()
 	
 	// Test successful API call
-	url, err := getAssetDownloadURL(ctx, "v1.0.0", authManager)
+	url, err := getAssetDownloadURL(ctx, "v1.0.0", authManager, false)
 	if err != nil {
 		t.Errorf("Expected no error, got: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestErrorHandling(t *testing.T) {
 	defer cancel()
 	
 	// Test timeout scenario
-	_, err := getAssetDownloadURL(ctx, "v1.0.0", authManager)
+	_, err := getAssetDownloadURL(ctx, "v1.0.0", authManager, false)
 	if err == nil {
 		t.Log("Expected timeout error, but function completed - likely hit fallback URL")
 	}

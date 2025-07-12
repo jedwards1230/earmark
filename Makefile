@@ -107,6 +107,7 @@ clean:
 	rm -f lil-whisper
 	rm -rf dist/
 	rm -rf cmd/*/main
+	rm -f cmd/monitor/monitor cmd/serve/serve cmd/list/list cmd/search/search cmd/mcp/mcp cmd/version/version cmd/update/update
 	rm -f coverage.out coverage.html
 	@echo "✅ Clean complete"
 

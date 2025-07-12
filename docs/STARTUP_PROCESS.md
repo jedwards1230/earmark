@@ -1,13 +1,13 @@
 # Startup Process Overview
 
-## Command: `./lil-whisper start`
+## Command: `./lil-whisper monitor`
 
 This document outlines the step-by-step process that occurs when the transcription service starts up.
 
 ## Initialization Sequence
 
 ### 1. Configuration Loading
-**File**: `cmd/start.go:30`
+**File**: `cmd/monitor/monitor.go:30`
 ```go
 cfg, err := config.LoadConfig()
 ```
@@ -25,7 +25,7 @@ cfg, err := config.LoadConfig()
 - Processing parameters (chunk size, similarity thresholds)
 
 ### 2. Database Connection & Initialization
-**File**: `cmd/start.go:37-48`
+**File**: `cmd/monitor/monitor.go:37-48`
 ```go
 database, err := db.New(cfg)
 ```
@@ -42,7 +42,7 @@ database, err := db.New(cfg)
   - Reinitializes database schema from scratch
 
 ### 3. Core Component Initialization
-**File**: `cmd/start.go:50-52`
+**File**: `cmd/monitor/monitor.go:50-52`
 
 #### Work Queue Creation
 ```go
@@ -68,7 +68,7 @@ worker := worker.NewWorker(workQueue, database)
 - Initializes transcription and storage capabilities
 
 ### 4. File Monitor Startup (Sequential)
-**File**: `cmd/start.go:54-61`
+**File**: `cmd/monitor/monitor.go:54-61`
 ```go
 go func() {
     fileMonitor.Start(monitorReady)
@@ -114,7 +114,7 @@ go func() {
 **Ready Signal**: Monitor signals completion and service proceeds
 
 ### 5. Worker Startup (Concurrent)
-**File**: `cmd/start.go:64-69`
+**File**: `cmd/monitor/monitor.go:64-69`
 ```go
 go func() {
     defer wg.Done()
@@ -132,8 +132,10 @@ go func() {
   5. **Database Storage**: Stores raw transcription and vector chunks
   6. **Progress Logging**: Reports completion status and timing
 
-### 6. HTTP Server Startup (Concurrent)
-**File**: `cmd/start.go:71-73`
+### 6. HTTP Server Startup (Separate Command)
+**Note**: The HTTP server is now started separately using `./lil-whisper serve`
+
+**File**: `cmd/serve/serve.go:30-40`
 ```go
 srv := server.NewServer(database, cfg)
 httpServer := srv.Start()
@@ -146,7 +148,7 @@ httpServer := srv.Start()
 - Logs server readiness with access URL
 
 ### 7. Signal Handling Setup
-**File**: `cmd/start.go:75-78`
+**File**: `cmd/monitor/monitor.go:75-78`
 ```go
 sigChan := make(chan os.Signal, 1)
 signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -171,11 +173,12 @@ Once startup completes, the following services run concurrently:
    - Updates database with results
 
 3. **HTTP Server**: 
+   - Start separately with `./lil-whisper serve`
    - Accepts search queries on http://localhost:8080/search
    - Performs vector similarity search against processed content
    - Returns ranked results with metadata
 
-Note: Currently all services start together with `./lil-whisper start`. Planned refactor will split into separate monitor/transcribe and serve commands.
+Note: Services are now split into separate commands - use `./lil-whisper monitor` for file monitoring and transcription, and `./lil-whisper serve` for the HTTP API server.
 
 ### Processing Pipeline
 When new audio files are detected:
@@ -185,14 +188,18 @@ When new audio files are detected:
 ```
 
 ## Shutdown Process
-**File**: `cmd/start.go:80-102`
+**File**: `cmd/monitor/monitor.go:80-102`
 
-When shutdown signal received:
+When shutdown signal received (monitor command):
 1. **Service Shutdown**: Stop monitor and worker
-2. **HTTP Graceful Shutdown**: 30-second timeout for in-flight requests  
-3. **Wait for Completion**: All goroutines finish processing
-4. **Database Cleanup**: Close database connections
-5. **Exit**: Clean service termination
+2. **Wait for Completion**: All goroutines finish processing
+3. **Database Cleanup**: Close database connections
+4. **Exit**: Clean service termination
+
+When shutdown signal received (serve command):
+1. **HTTP Graceful Shutdown**: 30-second timeout for in-flight requests  
+2. **Database Cleanup**: Close database connections
+3. **Exit**: Clean service termination
 
 ## Error Handling
 

@@ -1,4 +1,4 @@
-package cmd
+package update
 
 import (
 	"context"
@@ -18,6 +18,32 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/version"
 	"github.com/spf13/cobra"
 )
+
+var UpdateCmd = &cobra.Command{
+	Use:                "update",
+	Short:              "Update lil-whisper to the latest version",
+	DisableFlagParsing: true,
+	Long: `Update lil-whisper to the latest version from GitHub.
+
+This command checks for updates and downloads the latest version, either from
+GitHub releases (when available) or by rebuilding from source.
+
+Options:
+  --force      Force update even if no newer version is available
+  --check      Only check for updates, don't perform update
+  --yes        Skip confirmation prompts
+
+Examples:
+  # Check and update if newer version is available
+  lil-whisper update
+
+  # Only check for updates
+  lil-whisper update --check
+
+  # Force update without prompts
+  lil-whisper update --force --yes`,
+	Run: runUpdate,
+}
 
 func runUpdate(cmd *cobra.Command, args []string) {
 	force := false
@@ -134,12 +160,12 @@ func runUpdate(cmd *cobra.Command, args []string) {
 	}
 
 	if result.UseReleases && result.LatestVersion != "" && shouldProceed {
-		if err := updateFromRelease(ctx, result.LatestVersion, true); err != nil {
+		if err := updateFromRelease(ctx, result.LatestVersion, true, debug); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating from release: %v\n", err)
 			os.Exit(1)
 		}
 	} else if shouldProceed {
-		if err := updateFromSource(ctx, true); err != nil {
+		if err := updateFromSource(ctx, true, debug); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating from source: %v\n", err)
 			os.Exit(1)
 		}
@@ -149,9 +175,9 @@ func runUpdate(cmd *cobra.Command, args []string) {
 	fmt.Println("Run 'lil-whisper version' to see the new version.")
 }
 
-func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool) error {
+func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool, debug bool) error {
 	// Initialize authentication manager
-	authManager := auth.NewAuthManager(true) // Enable debug mode
+	authManager := auth.NewAuthManager(debug)
 	if !noConfirm {
 		fmt.Printf("\nThis will update lil-whisper to version %s.\n", latestVersion)
 		fmt.Print("Continue? (y/N): ")
@@ -175,7 +201,7 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	}
 
 	// Get authenticated download URL from GitHub API for private repositories
-	downloadURL, err := getAssetDownloadURL(ctx, latestVersion, authManager)
+	downloadURL, err := getAssetDownloadURL(ctx, latestVersion, authManager, debug)
 	if err != nil {
 		return fmt.Errorf("getting asset download URL: %w", err)
 	}
@@ -260,7 +286,7 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	return nil
 }
 
-func updateFromSource(ctx context.Context, noConfirm bool) error {
+func updateFromSource(ctx context.Context, noConfirm bool, debug bool) error {
 	if !noConfirm {
 		fmt.Print("\nThis will rebuild lil-whisper from the latest source.\nContinue? (y/N): ")
 
@@ -380,12 +406,14 @@ type GitHubReleaseWithAssets struct {
 }
 
 // getAssetDownloadURL gets the authenticated download URL for a release asset
-func getAssetDownloadURL(ctx context.Context, releaseVersion string, authManager *auth.AuthManager) (string, error) {
+func getAssetDownloadURL(ctx context.Context, releaseVersion string, authManager *auth.AuthManager, debug bool) (string, error) {
 	// Always try GitHub API first (works for both public and private repos)
 	if url, err := getAssetDownloadURLFromAPI(ctx, releaseVersion, authManager); err == nil {
 		return url, nil
 	} else {
-		fmt.Printf("DEBUG: GitHub API failed: %v\n", err)
+		if debug {
+			fmt.Printf("DEBUG: GitHub API failed: %v\n", err)
+		}
 	}
 	
 	// Fallback to direct URL construction for public repositories

@@ -1,4 +1,4 @@
-package cmd
+package version
 
 import (
 	"context"
@@ -9,6 +9,29 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/version"
 	"github.com/spf13/cobra"
 )
+
+var VersionCmd = &cobra.Command{
+	Use:                "version",
+	Short:              "Show version information",
+	DisableFlagParsing: true,
+	Long: `Show version information for lil-whisper including version, commit hash, 
+build time, and Go version.
+
+Options:
+  --check     Check for available updates from GitHub
+  --no-cache  Skip cache and force fresh update check
+
+Examples:
+  # Show version information
+  lil-whisper version
+
+  # Check for updates
+  lil-whisper version --check
+
+  # Force fresh update check
+  lil-whisper version --check --no-cache`,
+	Run: runVersion,
+}
 
 func runVersion(cmd *cobra.Command, args []string) {
 	checkUpdate := false

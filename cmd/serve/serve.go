@@ -1,4 +1,4 @@
-package cmd
+package serve
 
 import (
 	"context"
@@ -13,6 +13,23 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/server"
 	"github.com/spf13/cobra"
 )
+
+var ServeCmd = &cobra.Command{
+	Use:   "serve",
+	Short: "Start the HTTP API server",
+	Long: `Start the HTTP API server that provides search endpoints for the
+transcribed audiobook content.
+
+This service handles:
+- HTTP API endpoints for search functionality
+- Vector similarity search using OpenAI embeddings
+- Full-text search across transcriptions
+- RESTful API responses
+
+The serve command does NOT start file monitoring or transcription. Use the
+'monitor' command to start the file monitoring and transcription service.`,
+	Run: runServe,
+}
 
 func runServe(cmd *cobra.Command, args []string) {
 	log.Println("Starting HTTP API server...")
