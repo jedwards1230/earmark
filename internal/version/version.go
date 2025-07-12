@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -72,12 +73,26 @@ type VersionCache struct {
 }
 
 func GetInfo() Info {
+	commit := Commit
+	if commit == "unknown" {
+		commit = getRuntimeCommit()
+	}
+	
 	return Info{
 		Version:   Version,
-		Commit:    Commit,
+		Commit:    commit,
 		BuildTime: BuildTime,
 		GoVersion: GoVersion,
 	}
+}
+
+func getRuntimeCommit() string {
+	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	output, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func (i Info) String() string {
@@ -93,14 +108,32 @@ func CheckForUpdates(ctx context.Context, useCache bool) (*CheckResult, error) {
 	return CheckForUpdatesWithExpiry(ctx, useCache, DefaultExpiry)
 }
 
+func CheckForUpdatesWithDebug(ctx context.Context, useCache bool, debug bool) (*CheckResult, error) {
+	return CheckForUpdatesWithExpiryAndDebug(ctx, useCache, DefaultExpiry, debug)
+}
+
 func CheckForUpdatesWithExpiry(ctx context.Context, useCache bool, cacheExpiry time.Duration) (*CheckResult, error) {
+	return CheckForUpdatesWithExpiryAndDebug(ctx, useCache, cacheExpiry, false)
+}
+
+func CheckForUpdatesWithExpiryAndDebug(ctx context.Context, useCache bool, cacheExpiry time.Duration, debug bool) (*CheckResult, error) {
+	if debug {
+		fmt.Printf("DEBUG: Starting update check, useCache=%v, cacheExpiry=%v\n", useCache, cacheExpiry)
+	}
+
 	if useCache {
 		if cached := loadCache(); cached != nil && time.Since(cached.LastCheck) < cacheExpiry {
+			if debug {
+				fmt.Printf("DEBUG: Using cached result from %v\n", cached.LastCheck)
+			}
 			return &cached.Result, nil
+		}
+		if debug {
+			fmt.Printf("DEBUG: Cache expired or not found, performing fresh check\n")
 		}
 	}
 
-	result, err := performUpdateCheck(ctx)
+	result, err := performUpdateCheckWithDebug(ctx, debug)
 	if err != nil {
 		return nil, err
 	}
@@ -110,28 +143,57 @@ func CheckForUpdatesWithExpiry(ctx context.Context, useCache bool, cacheExpiry t
 			LastCheck: time.Now(),
 			Result:    *result,
 		})
+		if debug {
+			fmt.Printf("DEBUG: Cached update result\n")
+		}
 	}
 
 	return result, nil
 }
 
 func performUpdateCheck(ctx context.Context) (*CheckResult, error) {
+	return performUpdateCheckWithDebug(ctx, false)
+}
+
+func performUpdateCheckWithDebug(ctx context.Context, debug bool) (*CheckResult, error) {
+	currentCommit := Commit
+	if currentCommit == "unknown" {
+		currentCommit = getRuntimeCommit()
+	}
+	
 	result := &CheckResult{
 		CurrentVersion: Version,
-		CurrentCommit:  Commit,
+		CurrentCommit:  currentCommit,
 		CheckedAt:      time.Now(),
 	}
 
-	return checkReleaseVersion(ctx, result)
+	if debug {
+		fmt.Printf("DEBUG: Current version: %s, Current commit: %s\n", Version, currentCommit)
+		fmt.Printf("DEBUG: GitHub repo: %s\n", GitHubRepo)
+	}
+
+	return checkReleaseVersionWithDebug(ctx, result, debug)
 }
 
 func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult, error) {
-	if Commit == "unknown" || Commit == "" {
+	return checkCommitVersionWithDebug(ctx, result, false)
+}
+
+func checkCommitVersionWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
+	currentCommit := result.CurrentCommit
+	if currentCommit == "unknown" || currentCommit == "" {
+		if debug {
+			fmt.Printf("DEBUG: Commit is unknown/empty, skipping commit check\n")
+		}
 		return result, nil
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	url := fmt.Sprintf("%s/repos/%s/commits/main", GitHubAPI, GitHubRepo)
+
+	if debug {
+		fmt.Printf("DEBUG: Checking commits at URL: %s\n", url)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -140,11 +202,21 @@ func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult,
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if debug {
+			fmt.Printf("DEBUG: Commit API request failed: %v\n", err)
+		}
 		return result, nil
 	}
 	defer resp.Body.Close()
 
+	if debug {
+		fmt.Printf("DEBUG: Commit API response status: %d\n", resp.StatusCode)
+	}
+
 	if resp.StatusCode != http.StatusOK {
+		if debug {
+			fmt.Printf("DEBUG: Commit API returned non-200 status, assuming no updates\n")
+		}
 		return result, nil
 	}
 
@@ -154,7 +226,7 @@ func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult,
 	}
 
 	result.LatestCommit = commit.SHA
-	currentCommitShort := Commit
+	currentCommitShort := currentCommit
 	if len(currentCommitShort) > 7 {
 		currentCommitShort = currentCommitShort[:7]
 	}
@@ -173,10 +245,18 @@ func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult,
 }
 
 func checkReleaseVersion(ctx context.Context, result *CheckResult) (*CheckResult, error) {
+	return checkReleaseVersionWithDebug(ctx, result, false)
+}
+
+func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
 	result.UseReleases = true
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	url := fmt.Sprintf("%s/repos/%s/releases/latest", GitHubAPI, GitHubRepo)
+
+	if debug {
+		fmt.Printf("DEBUG: Checking releases at URL: %s\n", url)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -185,16 +265,29 @@ func checkReleaseVersion(ctx context.Context, result *CheckResult) (*CheckResult
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return checkCommitVersion(ctx, result)
+		if debug {
+			fmt.Printf("DEBUG: Release API request failed: %v, falling back to commit check\n", err)
+		}
+		return checkCommitVersionWithDebug(ctx, result, debug)
 	}
 	defer resp.Body.Close()
 
+	if debug {
+		fmt.Printf("DEBUG: Release API response status: %d\n", resp.StatusCode)
+	}
+
 	if resp.StatusCode == http.StatusNotFound {
-		return checkCommitVersion(ctx, result)
+		if debug {
+			fmt.Printf("DEBUG: No releases found (404), falling back to commit check\n")
+		}
+		return checkCommitVersionWithDebug(ctx, result, debug)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return checkCommitVersion(ctx, result)
+		if debug {
+			fmt.Printf("DEBUG: Release API returned status %d, falling back to commit check\n", resp.StatusCode)
+		}
+		return checkCommitVersionWithDebug(ctx, result, debug)
 	}
 
 	var release GitHubRelease
@@ -202,14 +295,34 @@ func checkReleaseVersion(ctx context.Context, result *CheckResult) (*CheckResult
 		return nil, fmt.Errorf("decoding release response: %w", err)
 	}
 
+	if debug {
+		fmt.Printf("DEBUG: Found release: %s (draft=%v, prerelease=%v)\n", release.TagName, release.Draft, release.Prerelease)
+	}
+
 	if release.Draft || release.Prerelease {
-		return checkCommitVersion(ctx, result)
+		if debug {
+			fmt.Printf("DEBUG: Release is draft or prerelease, falling back to commit check\n")
+		}
+		return checkCommitVersionWithDebug(ctx, result, debug)
 	}
 
 	result.LatestVersion = release.TagName
-	if IsNewerVersion(Version, result.LatestVersion) {
+	isNewer := IsNewerVersion(Version, result.LatestVersion)
+	
+	if debug {
+		fmt.Printf("DEBUG: Version comparison - current: %s, latest: %s, isNewer: %v\n", Version, result.LatestVersion, isNewer)
+	}
+	
+	if isNewer {
 		result.HasUpdate = true
 		result.UpdateMessage = fmt.Sprintf("Version %s available", result.LatestVersion)
+		if debug {
+			fmt.Printf("DEBUG: Update available: %s\n", result.UpdateMessage)
+		}
+	} else {
+		if debug {
+			fmt.Printf("DEBUG: No update needed\n")
+		}
 	}
 
 	return result, nil

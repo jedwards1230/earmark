@@ -21,6 +21,7 @@ func runUpdate(cmd *cobra.Command, args []string) {
 	force := false
 	checkOnly := false
 	noConfirm := false
+	debug := false
 
 	// Parse custom flags from args
 	for _, arg := range args {
@@ -31,6 +32,8 @@ func runUpdate(cmd *cobra.Command, args []string) {
 			checkOnly = true
 		case "--yes":
 			noConfirm = true
+		case "--debug":
+			debug = true
 		case "--help", "-h":
 			fmt.Fprintf(os.Stderr, "Usage: lil-whisper update [options]\n")
 			fmt.Fprintf(os.Stderr, "Update lil-whisper to the latest version.\n\n")
@@ -38,6 +41,7 @@ func runUpdate(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "  --force      Force update even if no newer version is available\n")
 			fmt.Fprintf(os.Stderr, "  --check      Only check for updates, don't perform update\n")
 			fmt.Fprintf(os.Stderr, "  --yes        Skip confirmation prompts\n")
+			fmt.Fprintf(os.Stderr, "  --debug      Enable debug output\n")
 			return
 		}
 	}
@@ -47,10 +51,18 @@ func runUpdate(cmd *cobra.Command, args []string) {
 
 	fmt.Println("Checking for updates...")
 
-	result, err := version.CheckForUpdates(ctx, true)
+	if debug {
+		fmt.Printf("DEBUG: Current version info: %+v\n", version.GetInfo())
+	}
+
+	result, err := version.CheckForUpdatesWithDebug(ctx, true, debug)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
 		os.Exit(1)
+	}
+
+	if debug {
+		fmt.Printf("DEBUG: Update check result: %+v\n", result)
 	}
 
 	if !result.HasUpdate && !force {
