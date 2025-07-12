@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Lint (golangci-lint)",
+			"type": "shell",
+			"command": "golangci-lint",
+			"args": [
+				"run",
+				"--timeout=5m"
+			],
+			"group": "test",
+			"isBackground": false,
+			"problemMatcher": [
+				"$go"
+			]
+		}
+	]
+}

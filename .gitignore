@@ -9,3 +9,4 @@ cache/
 coverage.out
 
 lil-whisper
+dist/

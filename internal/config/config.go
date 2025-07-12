@@ -224,7 +224,7 @@ func resolveAndCreatePath(cwd, path string) string {
 		// or be created by another process
 		if _, writeErr := os.Stderr.WriteString("Warning: Could not create directory: " + err.Error() + "\n"); writeErr != nil {
 			// If we can't even write to stderr, there's not much we can do
-			// This empty branch is intentional - we've already tried our best to log the error
+			os.Stderr.WriteString("Warning: Could not create directory: " + err.Error() + "\n")
 		}
 	}
 

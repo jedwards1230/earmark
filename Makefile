@@ -61,24 +61,26 @@ release:
 	@echo "✅ Release build complete: ./lil-whisper"
 
 # =============================================================================
-# Platform-Specific Builds (macOS only - Yap requires macOS hardware)
+# Platform-Specific Builds (Apple Silicon macOS only - Yap requires Apple Silicon)
 # =============================================================================
 
-# Build for all supported platforms (alias for build-darwin)
+# Build for all supported platforms (alias for build-darwin-arm64)
 .PHONY: build-all
-build-all: build-darwin
+build-all: build-darwin-arm64
 
-# Build for macOS (both Intel and Apple Silicon)
-.PHONY: build-darwin
-build-darwin:
-	@echo "🍎 Building for macOS..."
+# Build for Apple Silicon macOS (arm64 only)
+.PHONY: build-darwin-arm64
+build-darwin-arm64:
+	@echo "🍎 Building for Apple Silicon macOS..."
 	@mkdir -p dist
-	@echo "   Building for Intel (amd64)..."
-	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/lil-whisper-darwin-amd64 .
 	@echo "   Building for Apple Silicon (arm64)..."
 	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/lil-whisper-darwin-arm64 .
-	@echo "✅ macOS builds complete:"
-	@ls -la dist/lil-whisper-darwin-*
+	@echo "✅ Apple Silicon macOS build complete:"
+	@ls -la dist/lil-whisper-darwin-arm64
+
+# Legacy alias for backwards compatibility
+.PHONY: build-darwin
+build-darwin: build-darwin-arm64
 
 # Quick development build (same as 'build' but with clearer intent)
 .PHONY: dev
@@ -180,8 +182,8 @@ help:
 	@echo "  make build       - Build the main binary (default target)"
 	@echo "  make dev         - Quick development build"
 	@echo "  make release     - Build release with version (make release VERSION=v1.0.0)"
-	@echo "  make build-all   - Build for all platforms (macOS only)"
-	@echo "  make build-darwin- Build for macOS (Intel + Apple Silicon)"
+	@echo "  make build-all   - Build for Apple Silicon macOS (arm64 only)"
+	@echo "  make build-darwin-arm64 - Build specifically for Apple Silicon macOS"
 	@echo ""
 	@echo "📦 INSTALLATION:"
 	@echo "  make install     - Install binary to /usr/local/bin (requires sudo)"
@@ -203,11 +205,12 @@ help:
 	@echo "  make                              # Build main binary"
 	@echo "  make build VERSION=v1.2.3        # Build with specific version"
 	@echo "  make release VERSION=v1.0.0      # Create release build"
+	@echo "  make build-darwin-arm64           # Build for Apple Silicon macOS"
 	@echo "  make check                        # Run all quality checks"
 	@echo ""
 	@echo "⚠️  REQUIREMENTS:"
 	@echo "  - Go 1.23+"
-	@echo "  - macOS (due to Yap speech recognition dependency)"
+	@echo "  - Apple Silicon macOS 26+ (M1/M2/M3+ due to Yap speech recognition)"
 	@echo "  - golangci-lint for linting (optional)"
 	@echo ""
 	@echo "💡 TIP: Run 'make' without arguments to build the main binary"
