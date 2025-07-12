@@ -122,11 +122,7 @@ func performUpdateCheck(ctx context.Context) (*CheckResult, error) {
 		CheckedAt:      time.Now(),
 	}
 
-	if Version != "dev" && !strings.Contains(Version, "unknown") {
-		return checkReleaseVersion(ctx, result)
-	}
-
-	return checkCommitVersion(ctx, result)
+	return checkReleaseVersion(ctx, result)
 }
 
 func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult, error) {
@@ -144,12 +140,12 @@ func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult,
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetching latest commit: %w", err)
+		return result, nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+		return result, nil
 	}
 
 	var commit GitHubCommit
@@ -189,7 +185,7 @@ func checkReleaseVersion(ctx context.Context, result *CheckResult) (*CheckResult
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetching latest release: %w", err)
+		return checkCommitVersion(ctx, result)
 	}
 	defer resp.Body.Close()
 
@@ -198,7 +194,7 @@ func checkReleaseVersion(ctx context.Context, result *CheckResult) (*CheckResult
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+		return checkCommitVersion(ctx, result)
 	}
 
 	var release GitHubRelease

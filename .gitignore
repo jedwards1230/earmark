@@ -9,4 +9,6 @@ cache/
 coverage.out
 
 lil-whisper
+lil-whisper-*
+test-build
 dist/
