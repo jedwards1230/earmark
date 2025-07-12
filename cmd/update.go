@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -160,8 +161,11 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 		return fmt.Errorf("getting current executable path: %w", err)
 	}
 
-	downloadURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/lil-whisper-%s-%s",
-		version.GitHubRepo, latestVersion, runtime.GOOS, runtime.GOARCH)
+	// Get authenticated download URL from GitHub API for private repositories
+	downloadURL, err := getAssetDownloadURL(ctx, latestVersion)
+	if err != nil {
+		return fmt.Errorf("getting asset download URL: %w", err)
+	}
 
 	fmt.Printf("Downloading from: %s\n", downloadURL)
 
@@ -338,4 +342,77 @@ func getUpdateGitCommit(ctx context.Context) string {
 		return "unknown"
 	}
 	return strings.TrimSpace(string(output))
+}
+
+// GitHubAsset represents a GitHub release asset
+type GitHubAsset struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+	URL         string `json:"url"`
+}
+
+// GitHubReleaseWithAssets represents a GitHub release with assets
+type GitHubReleaseWithAssets struct {
+	TagName string        `json:"tag_name"`
+	Assets  []GitHubAsset `json:"assets"`
+}
+
+// getAssetDownloadURL gets the authenticated download URL for a release asset
+func getAssetDownloadURL(ctx context.Context, releaseVersion string) (string, error) {
+	// Always try GitHub API first (works for both public and private repos)
+	token := os.Getenv("GITHUB_TOKEN")
+	if url, err := getAssetDownloadURLFromAPI(ctx, releaseVersion, token); err == nil {
+		return url, nil
+	} else {
+		fmt.Printf("DEBUG: GitHub API failed: %v\n", err)
+	}
+	
+	// Fallback to direct URL construction for public repositories
+	assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", version.GitHubRepo, releaseVersion, assetName), nil
+}
+
+// getAssetDownloadURLFromAPI gets the asset download URL using GitHub API
+func getAssetDownloadURLFromAPI(ctx context.Context, releaseVersion string, token string) (string, error) {
+	// Get release info from GitHub API
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", version.GitHubRepo, releaseVersion)
+	
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("creating API request: %w", err)
+	}
+	
+	// Add authentication header only if token is available
+	if token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("calling GitHub API: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	}
+	
+	var release GitHubReleaseWithAssets
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return "", fmt.Errorf("decoding GitHub API response: %w", err)
+	}
+	
+	// Find the asset for the current platform
+	assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+	for _, asset := range release.Assets {
+		if asset.Name == assetName {
+			return asset.URL, nil
+		}
+	}
+	
+	return "", fmt.Errorf("asset %s not found in release %s", assetName, releaseVersion)
 }
