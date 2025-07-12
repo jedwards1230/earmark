@@ -1,170 +1,170 @@
 name: CI
 
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
+    push:
+        branches: [main, develop]
+    pull_request:
+        branches: [main]
 
 permissions:
-  contents: read
+    contents: read
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+    test:
+        name: Test
+        runs-on: ubuntu-latest
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
 
-    - name: Cache Go modules (test)
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-test-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-test-go-
-          ${{ runner.os }}-go-
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.23"
 
-    - name: Download dependencies
-      run: |
-        # Retry logic for go mod download
-        for i in {1..3}; do
-          if go mod download; then
-            break
-          fi
-          echo "Attempt $i failed, retrying..."
-          sleep 2
-        done
+            - name: Cache Go modules (test)
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cache/go-build
+                      ~/go/pkg/mod
+                  key: ${{ runner.os }}-test-go-${{ hashFiles('**/go.sum') }}
+                  restore-keys: |
+                      ${{ runner.os }}-test-go-
+                      ${{ runner.os }}-go-
 
-    - name: Verify dependencies
-      run: go mod verify
+            - name: Download dependencies
+              run: |
+                  # Retry logic for go mod download
+                  for i in {1..3}; do
+                    if go mod download; then
+                      break
+                    fi
+                    echo "Attempt $i failed, retrying..."
+                    sleep 2
+                  done
 
-    - name: Run tests
-      run: go test -v -race -coverprofile=coverage.out ./...
+            - name: Verify dependencies
+              run: go mod verify
 
-    - name: Display coverage summary
-      run: go tool cover -func=coverage.out | tail -1
+            - name: Run tests
+              run: go test -v -race -coverprofile=coverage.out ./...
 
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+            - name: Display coverage summary
+              run: go tool cover -func=coverage.out | tail -1
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
+    lint:
+        name: Lint
+        runs-on: ubuntu-latest
 
-    - name: Cache Go modules (lint)
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-lint-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-lint-go-
-          ${{ runner.os }}-go-
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
 
-    - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v6
-      with:
-        version: latest
-        args: --timeout=5m
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.23"
 
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    needs: [test, lint]
-    
-    strategy:
-      matrix:
-        # macOS only due to Yap (Apple speech recognition) dependency
-        goos: [darwin]
-        goarch: [amd64, arm64]
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+            - name: Cache Go modules (lint)
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cache/go-build
+                      ~/go/pkg/mod
+                  key: ${{ runner.os }}-lint-go-${{ hashFiles('**/go.sum') }}
+                  restore-keys: |
+                      ${{ runner.os }}-lint-go-
+                      ${{ runner.os }}-go-
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
+            - name: Run golangci-lint
+              uses: golangci/golangci-lint-action@v6
+              with:
+                  version: latest
+                  args: --timeout=5m
 
-    - name: Cache Go modules (build-${{ matrix.goos }}-${{ matrix.goarch }})
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-build-${{ matrix.goos }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-build-${{ matrix.goos }}-${{ matrix.goarch }}-go-
-          ${{ runner.os }}-build-go-
-          ${{ runner.os }}-go-
+    build:
+        name: Build
+        runs-on: ubuntu-latest
+        needs: [test, lint]
 
-    - name: Download dependencies
-      run: go mod download
+        strategy:
+            matrix:
+                # macOS only due to Yap (Apple speech recognition) dependency
+                goos: [darwin]
+                goarch: [amd64, arm64]
 
-    - name: Build binary
-      run: |
-        output_name="lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}"
-        GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
-          OUTPUT="${output_name}" ./scripts/build.sh
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
 
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}
-        path: lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}*
-        retention-days: 7
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.23"
 
-  security:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+            - name: Cache Go modules (build-${{ matrix.goos }}-${{ matrix.goarch }})
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cache/go-build
+                      ~/go/pkg/mod
+                  key: ${{ runner.os }}-build-${{ matrix.goos }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}
+                  restore-keys: |
+                      ${{ runner.os }}-build-${{ matrix.goos }}-${{ matrix.goarch }}-go-
+                      ${{ runner.os }}-build-go-
+                      ${{ runner.os }}-go-
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
+            - name: Download dependencies
+              run: go mod download
 
-    - name: Cache Go modules (security)
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-security-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-security-go-
-          ${{ runner.os }}-go-
+            - name: Build binary
+              run: |
+                  output_name="lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}"
+                  GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+                    OUTPUT="${output_name}" ./scripts/build.sh
 
-    - name: Run Gosec Security Scanner
-      uses: securego/gosec@v2.22.5
-      with:
-        args: './...'
+            - name: Upload build artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}
+                  path: lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}*
+                  retention-days: 7
 
-    - name: Run govulncheck
-      run: |
-        go install golang.org/x/vuln/cmd/govulncheck@latest
-        govulncheck ./...
+    security:
+        name: Security Scan
+        runs-on: ubuntu-latest
+        continue-on-error: true
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.23"
+
+            - name: Cache Go modules (security)
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cache/go-build
+                      ~/go/pkg/mod
+                  key: ${{ runner.os }}-security-go-${{ hashFiles('**/go.sum') }}
+                  restore-keys: |
+                      ${{ runner.os }}-security-go-
+                      ${{ runner.os }}-go-
+
+            - name: Run Gosec Security Scanner
+              uses: securego/gosec@v2.22.5
+              with:
+                  args: "./..."
+
+            - name: Run govulncheck
+              run: |
+                  go install golang.org/x/vuln/cmd/govulncheck@latest
+                  govulncheck ./...

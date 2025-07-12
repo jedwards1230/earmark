@@ -1,116 +1,116 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version_type:
-        description: 'Version bump type'
-        required: true
-        default: 'patch'
-        type: choice
-        options:
-        - major
-        - minor
-        - patch
-      custom_version:
-        description: 'Custom version (optional, overrides version_type)'
-        required: false
-        type: string
-      draft:
-        description: 'Create as draft release'
-        required: false
-        default: false
-        type: boolean
-      prerelease:
-        description: 'Mark as prerelease'
-        required: false
-        default: false
-        type: boolean
+    workflow_dispatch:
+        inputs:
+            version_type:
+                description: "Version bump type"
+                required: true
+                default: "patch"
+                type: choice
+                options:
+                    - major
+                    - minor
+                    - patch
+            custom_version:
+                description: "Custom version (optional, overrides version_type)"
+                required: false
+                type: string
+            draft:
+                description: "Create as draft release"
+                required: false
+                default: false
+                type: boolean
+            prerelease:
+                description: "Mark as prerelease"
+                required: false
+                default: false
+                type: boolean
 
 permissions:
-  contents: write
-  pull-requests: write
+    contents: write
+    pull-requests: write
 
 jobs:
-  calculate-version:
-    uses: ./.github/workflows/calculate-version.yml
-    with:
-      version_type: ${{ github.event.inputs.version_type }}
-      custom_version: ${{ github.event.inputs.custom_version }}
-      working_directory: '.'
-    secrets: inherit
+    calculate-version:
+        uses: ./.github/workflows/calculate-version.yml
+        with:
+            version_type: ${{ github.event.inputs.version_type }}
+            custom_version: ${{ github.event.inputs.custom_version }}
+            working_directory: "."
+        secrets: inherit
 
-  build:
-    needs: calculate-version
-    runs-on: ubuntu-latest
-    outputs:
-      artifacts-built: ${{ steps.check-artifacts.outputs.artifacts-built }}
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
+    build:
+        needs: calculate-version
+        runs-on: ubuntu-latest
+        outputs:
+            artifacts-built: ${{ steps.check-artifacts.outputs.artifacts-built }}
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+                  token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build release binaries
-      env:
-        VERSION: ${{ needs.calculate-version.outputs.new_version }}
-      run: |
-        echo "Building with version: ${VERSION}"
-        
-        # Create dist directory
-        mkdir -p dist
-        
-        # Build for ARM macOS only (Yap requires macOS hardware)
-        GOOS="darwin"
-        GOARCH="arm64"
-        output_name="lil-whisper-${GOOS}-${GOARCH}"
-        
-        echo "Building for ${GOOS}/${GOARCH}..."
-        
-        GOOS="${GOOS}" GOARCH="${GOARCH}" VERSION="${VERSION}" \
-          OUTPUT="dist/${output_name}" ./scripts/build.sh
-        
-        # List built files
-        ls -la dist/
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.23"
 
-    - name: Check if artifacts were built
-      id: check-artifacts
-      run: |
-        if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
-          echo "artifacts-built=true" >> $GITHUB_OUTPUT
-          echo "✅ Artifacts built successfully"
-        else
-          echo "artifacts-built=false" >> $GITHUB_OUTPUT
-          echo "❌ No artifacts found"
-        fi
+            - name: Build release binaries
+              env:
+                  VERSION: ${{ needs.calculate-version.outputs.new_version }}
+              run: |
+                  echo "Building with version: ${VERSION}"
 
-    - name: Upload artifacts for release
-      if: steps.check-artifacts.outputs.artifacts-built == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: release-binaries
-        path: dist/
-        retention-days: 1
+                  # Create dist directory
+                  mkdir -p dist
 
-  release:
-    needs: [calculate-version, build]
-    uses: ./.github/workflows/generic-release.yml
-    with:
-      new_version: ${{ needs.calculate-version.outputs.new_version }}
-      current_version: ${{ needs.calculate-version.outputs.current_version }}
-      changelog_content: ${{ needs.calculate-version.outputs.changelog_content }}
-      changelog_artifact_name: changelog-${{ needs.calculate-version.outputs.new_version }}
-      draft: ${{ github.event.inputs.draft }}
-      prerelease: ${{ github.event.inputs.prerelease }}
-      create_release: true
-      artifacts_pattern: ${{ needs.build.outputs.artifacts-built == 'true' && 'dist/*' || '' }}
-      update_badge_file: 'README.md'
-      working_directory: '.'
-    secrets: inherit
+                  # Build for ARM macOS only (Yap requires macOS hardware)
+                  GOOS="darwin"
+                  GOARCH="arm64"
+                  output_name="lil-whisper-${GOOS}-${GOARCH}"
+
+                  echo "Building for ${GOOS}/${GOARCH}..."
+
+                  GOOS="${GOOS}" GOARCH="${GOARCH}" VERSION="${VERSION}" \
+                    OUTPUT="dist/${output_name}" ./scripts/build.sh
+
+                  # List built files
+                  ls -la dist/
+
+            - name: Check if artifacts were built
+              id: check-artifacts
+              run: |
+                  if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
+                    echo "artifacts-built=true" >> $GITHUB_OUTPUT
+                    echo "✅ Artifacts built successfully"
+                  else
+                    echo "artifacts-built=false" >> $GITHUB_OUTPUT
+                    echo "❌ No artifacts found"
+                  fi
+
+            - name: Upload artifacts for release
+              if: steps.check-artifacts.outputs.artifacts-built == 'true'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: release-binaries
+                  path: dist/
+                  retention-days: 1
+
+    release:
+        needs: [calculate-version, build]
+        uses: ./.github/workflows/generic-release.yml
+        with:
+            new_version: ${{ needs.calculate-version.outputs.new_version }}
+            current_version: ${{ needs.calculate-version.outputs.current_version }}
+            changelog_content: ${{ needs.calculate-version.outputs.changelog_content }}
+            changelog_artifact_name: changelog-${{ needs.calculate-version.outputs.new_version }}
+            draft: ${{ github.event.inputs.draft == 'true' }}
+            prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+            create_release: true
+            artifacts_pattern: ${{ needs.build.outputs.artifacts-built == 'true' && 'dist/*' || '' }}
+            update_badge_file: "README.md"
+            working_directory: "."
+        secrets: inherit
