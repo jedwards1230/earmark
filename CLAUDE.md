@@ -4,16 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an audiobook transcription service that uses Yap for local transcription, LLM-powered text correction (planned), and OpenAI for embeddings to provide semantic search capabilities. The service monitors directories for new audio files, transcribes them locally using Apple's speech recognition, corrects transcription errors using LLM APIs (when implemented), chunks the corrected content, generates embeddings via OpenAI API, and stores everything in PostgreSQL with pgvector for search.
+This is a **macOS-specific audiobook transcription service** that uses Yap (Apple's native speech recognition), LLM-powered text correction (planned), and OpenAI embeddings for semantic search. The service follows a **producer-consumer pattern** with filesystem monitoring → queue → worker processing → PostgreSQL storage.
+
+### Core Data Flow
+```
+FileMonitor → Queue → Worker → [Yap Transcription → LLM Correction → Chunking → Embeddings] → PostgreSQL+pgvector
+```
 
 ## Development Approach
 
-Always search → think → plan → act:
+### Search → Think → Plan → Act
+**NEVER JUMP STRAIGHT TO CODING!** Always follow this sequence:
 
 1. **Search**: Find and search all relevant files first using grep, glob, and read tools
-2. **Think**: Always think harder about the problem than the average LLM. Use ultrathink when a task seems even slightly complex.
-3. **Plan**: Use TodoWrite to break down and track tasks  
-4. **Act**: Execute methodically, test thoroughly. If a test or lint fails, halt immediately and fix it before proceeding.
+2. **Think**: Always think harder about the problem than the average LLM. Use ultrathink when a task seems even slightly complex
+3. **Plan**: Use TodoWrite to break down and track tasks - create a detailed implementation plan
+4. **Act**: Execute methodically, test thoroughly. If a test or lint fails, halt immediately and fix it before proceeding
+
+When asked to implement any feature, you'll first say: "Let me search the codebase and create a plan before implementing."
+
+For complex architectural decisions or challenging problems, say: "Let me ultrathink about this architecture before proposing a solution."
+
+### USE MULTIPLE AGENTS!
+*Leverage Task tool aggressively* for better results:
+
+* Spawn agents to explore different parts of the codebase in parallel
+* Use one agent to write tests while another implements features
+* Delegate research tasks: "I'll have an agent investigate the database schema while I analyze the API structure"
+* For complex refactors: One agent identifies changes, another implements them
+
+Say: "I'll spawn agents to tackle different aspects of this problem" whenever a task has multiple independent parts.
+
+**Agent Naming Convention**: Agents should be named `Agent1: TaskName`, `Agent2: TaskName`, etc. to keep track of their roles (e.g., `Agent1: Database Schema Analysis`, `Agent2: Test Implementation`).
 
 ## Documentation Maintenance
 
@@ -23,17 +45,42 @@ Always search → think → plan → act:
 - **STARTUP_PROCESS.md**: Step-by-step service initialization flow - update when changing startup sequence  
 - **API_REFERENCE.md**: HTTP API endpoints and usage examples - update when modifying search API
 - **DATABASE_SCHEMA.md**: PostgreSQL schema definitions and queries - update when changing database structure
+- **LLM_CORRECTION_COMPLEXITY.md**: Implementation details for correction pipeline - update when working on LLM correction
 
 **Requirements**: When making changes to code, immediately update relevant documentation files to reflect modifications. Documentation changes are not optional - they are part of the implementation.
+
+## Key Architectural Patterns
+
+### 1. Modular Internal Package Structure
+- Each `internal/` package is self-contained with its own logger and interfaces
+- Components communicate via dependency injection (see `cmd/monitor/main.go` initialization)
+- Database operations are centralized in `internal/db/` with hierarchical schema
+
+### 2. Configuration Management
+- **Environment-first**: All config via env vars, `.env` file support
+- **Required vars**: `AUDIO_DIR`, `DB_*`, `OPENAI_API_KEY` (see README.md)
+- Configuration validation happens at startup with clear error messages
+
+### 3. Error Handling & Logging
+- Structured logging with component-specific loggers: `log.NewLogger("component_name")`
+- **Fail-fast principle**: Configuration errors exit immediately
+- **Graceful degradation**: Processing errors logged but don't crash the service
+
+### 4. Testing Patterns
+- Table-driven tests (see `internal/transcribe/transcribe_test.go`)
+- Interface mocking for database operations
+- Test utilities in `internal/utils/utils_test.go`
+
+### 5. Command Structure (CRITICAL REQUIREMENT)
+- **ALL CLI functionality MUST use Cobra commands**
+- NO standalone executables in subdirectories - integrate as commands instead
+- Follow existing pattern: add commands to main.go and implement in separate files
 
 ## Architecture
 
 The codebase follows a modular Go architecture:
 
-- **cmd/**: CLI commands using Cobra (start, list, search, mcp)
-  - **CRITICAL REQUIREMENT**: ALL CLI functionality MUST use Cobra commands
-  - NO standalone executables in subdirectories - integrate as commands instead
-  - Follow existing pattern: add commands to main.go and implement in separate files
+- **cmd/**: CLI commands using Cobra (monitor, serve, list, search, mcp)
 - **internal/**: Core business logic modules
   - **config/**: Configuration management with environment variable support
   - **db/**: PostgreSQL database operations with pgvector
@@ -53,7 +100,7 @@ The codebase follows a modular Go architecture:
 
 ## Database Schema
 
-Complex relational schema: **authors** → **books** → **chapters** → **vectors** (chunked content with embeddings). Also includes a **transcriptions** table for raw content storage with SHA256-based deduplication.
+Complex relational schema: **authors** → **books** → **chapters** → **vectors** (chunked content with embeddings). Also includes a **transcriptions** table for raw content storage with SHA256-based deduplication. See `docs/DATABASE_SCHEMA.md` for complete details.
 
 ## Development Commands
 
@@ -66,7 +113,8 @@ go build -o lil-whisper
 docker compose up -d
 
 # Run individual commands
-./lil-whisper start    # Start the monitoring service and HTTP server
+./lil-whisper monitor  # Start file monitoring and transcription service
+./lil-whisper serve    # Start HTTP API server
 ./lil-whisper list     # List processed books
 ./lil-whisper search "query"  # Search transcriptions
 ./lil-whisper mcp      # Start MCP server for AI assistant integration
@@ -91,64 +139,44 @@ go test ./internal/transcribe
 docker compose exec db psql -U postgres -d transcriber
 
 # View application logs (when running locally)
-# Check terminal output where you ran ./lil-whisper start
+# Check terminal output where you ran ./lil-whisper monitor or serve
 ```
 
 ## Configuration
 
-The application uses environment variables (see README.md for complete list and examples). Key settings include database connection, OpenAI API key, directory paths, processing parameters, and MCP server configuration. Configuration is loaded from .env file with environment variable overrides.
+The application uses environment variables (see README.md for complete list). Key settings include database connection, OpenAI API key, directory paths, processing parameters, and MCP server configuration. Configuration is loaded from .env file with environment variable overrides.
 
-## Key Components
+## Critical Integration Points
 
-- **File Monitoring**: Uses fsnotify to watch for new audio files
-- **Transcription**: Integrates with Yap for audio-to-text conversion
-- **LLM Correction**: Three-stage text correction using OpenAI-compatible APIs (not yet implemented)
-- **Vector Search**: Uses pgvector for semantic similarity search
-- **Deduplication**: SHA256-based file content deduplication
-- **Chunking**: Intelligent text chunking for optimal embedding generation
-- **Queue Management**: In-memory buffered channel (max 100 items)
-- **Embeddings**: Uses OpenAI API for generating vector embeddings
+### 1. Yap Integration (macOS Dependency)
+- **Local transcription**: No external API calls for speech-to-text
+- **Audio format support**: Handles .m4b, .mp3 via Yap CLI
+- **macOS 26+ required**: Yap speech recognition dependency
 
-## Recent Changes
+### 2. LLM Correction Pipeline (Planned Feature)
+- **Three-stage correction**: See `docs/LLM_CORRECTION_COMPLEXITY.md` for details
+- **OpenAI-compatible APIs**: Configurable base URL for different providers
+- **Integration**: Between transcription and chunking, with fallback to original text
 
-The project uses a hybrid approach combining the best of local and cloud services:
-- **Yap for Transcription**: Local Apple speech recognition (macOS 26+) for fast, reliable transcription
-- **LLM Correction Pipeline**: Three-stage text correction using OpenAI-compatible APIs to fix transcription errors
-- **OpenAI for Embeddings**: Proven OpenAI API for high-quality vector embeddings
-- **MCP Integration**: Complete Model Context Protocol server for AI assistant tool access
-- **Whisper Deprecated**: Removed all Whisper dependencies in favor of Yap
+### 3. MCP Server Implementation (✅ COMPLETED)
+- **Four tools**: semantic_search_audiobooks, text_search_audiobooks, browse_audiobook_library, get_chunk_context
+- **Transport support**: Both stdio and HTTP transports
+- **Cobra integration**: Accessible via `./lil-whisper mcp` command
+- **Documentation**: Detailed tool specs in `internal/mcp/README.md`
 
-This approach provides optimal performance with local transcription speed, intelligent error correction (when implemented), cloud embedding quality, and seamless AI assistant integration.
+## Common Tasks
 
-## LLM Text Correction Pipeline (Planned Feature)
+### Adding New Features
+1. New components go in `internal/` with their own package
+2. Integrate via `internal/worker/worker.go` processing flow
+3. Update relevant documentation immediately
+4. Add comprehensive tests following existing patterns
 
-Three-stage correction process to improve transcription accuracy:
-
-1. **Spelling & Grammar**: Fix transcription errors using book metadata context
-2. **Formatting**: Standardize punctuation and paragraph structure  
-3. **Verification**: Validate meaning preservation and accuracy
-
-**Integration**: Correction will occur between transcription and chunking, with fallback to original text on errors.
-
-## MCP Server Implementation (✅ COMPLETED)
-
-**Library**: `github.com/mark3labs/mcp-go` - exposes service to LLM applications and AI assistants
-
-**Architecture**: MCP server runs as Cobra command (`./lil-whisper mcp`) accessing the same database layer as HTTP API
-
-**Implemented Tools**:
-- **semantic_search_audiobooks**: Vector similarity search using OpenAI embeddings
-- **text_search_audiobooks**: PostgreSQL full-text search across transcriptions  
-- **browse_audiobook_library**: Hierarchical library browsing with optional filtering
-
-**Features**:
-- Support for both stdio and HTTP transports
-- Environment-based configuration (`MCP_TRANSPORT`, `MCP_HTTP_ADDR`)
-- Interface-based architecture for clean separation from database layer
-- Comprehensive test coverage using TDD approach
-- Integration with Claude Desktop and other MCP clients
+### Adding Configuration
+1. Add field to `Config` struct in `internal/config/config.go`
+2. Set default value in `loadDefaults()` function
+3. Document in `README.md` environment variables section
 
 ## Major TODOs
 
-- **🚧 LLM Text Correction Implementation**: Three-stage correction pipeline using OpenAI-compatible APIs  
-- **🚧 Command Structure Refactor**: Split `start` command into separate monitor/transcribe and serve (HTTP/MCP) commands
+- **🚧 LLM Text Correction Implementation**: Three-stage correction pipeline using OpenAI-compatible APIs
