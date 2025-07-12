@@ -23,9 +23,18 @@ The service uses a PostgreSQL database to track processed files and avoid redund
 *   **Go:** The service is written in Go.
 *   **PostgreSQL:** Database with pgvector extension for vector operations.
 *   **Docker Compose:** For running the PostgreSQL database.
-*   **Yap:** Apple's native speech recognition for audio transcription.
+*   **Yap:** Apple's native speech recognition for audio transcription (automatically embedded during build).
 *   **OpenAI API:** For generating embeddings and LLM text correction (configurable endpoint).
 *   **macOS 26+:** Required for Yap speech recognition capabilities.
+
+### Yap Binary Embedding
+
+The application automatically downloads and embeds the Yap binary during build time, eliminating the need for manual installation:
+
+*   **Embedded Only:** Always uses embedded Yap binary for consistency
+*   **Version Control:** Pin specific Yap versions using `YAP_VERSION` environment variable
+*   **Zero Setup:** Users never need to manually install Yap
+*   **Portable:** Single binary contains everything needed for transcription
 
 ## Version Management
 
@@ -80,18 +89,29 @@ export VERSION_CHECK_TIMEOUT=3s
 ```
 
 ### Build Process
-Use the provided Makefile or build script for proper version embedding:
+Use the provided Makefile or build script for proper version embedding and Yap binary inclusion:
 
 ```bash
-# Using Makefile
-make build                    # Development build
-make release VERSION=v1.0.0  # Release build
-make build-all                # Cross-platform builds
+# Using Makefile (automatically downloads and embeds Yap)
+make build                              # Development build with latest Yap
+make build YAP_VERSION=v1.0.0         # Build with specific Yap version
+make release VERSION=v1.0.0           # Release build
+make build-all                         # Cross-platform builds
+
+# Manual Yap management
+make download-yap                      # Download latest Yap binary
+make download-yap YAP_VERSION=v1.0.0  # Download specific Yap version
+make clean-all                         # Remove everything including Yap binary
 
 # Using build script
-./scripts/build.sh            # Development build
-VERSION=v1.0.0 ./scripts/build.sh  # Release build
+./scripts/build.sh                     # Development build
+VERSION=v1.0.0 YAP_VERSION=v1.0.0 ./scripts/build.sh  # Release build with specific versions
 ```
+
+**Environment Variables for Build:**
+*   `YAP_VERSION`: Pin specific Yap version (default: `latest`)
+*   `VERSION`: Application version for release builds
+*   All builds automatically ensure Yap binary is embedded
 
 ## Configuration
 
@@ -141,6 +161,9 @@ VERSION_CHECK_TIMEOUT=5s
 # 2. GitHub CLI authentication (gh auth login)
 # 3. SSH keys (for git operations only)
 GITHUB_TOKEN=your-github-token-here
+
+# Yap binary embedding (build-time only)
+YAP_VERSION=latest  # Pin specific yap version for embedded binary
 ```
 
 Key configuration options:
@@ -161,6 +184,7 @@ Key configuration options:
     1. **Environment Variables**: `GITHUB_TOKEN`, `GITHUB_PAT`, `GH_TOKEN`, `PAT`
     2. **GitHub CLI**: Uses `gh auth token` if GitHub CLI is installed and authenticated
     3. **SSH Keys**: Available for git operations (not HTTP downloads)
+*   `YAP_VERSION`: Pin specific Yap version for embedded binary (build-time only, default: `latest`)
 
 ## Installation
 
@@ -311,8 +335,14 @@ The service uses a sophisticated PostgreSQL schema:
 - Full-text search and vector similarity search capabilities
 - Automatic deduplication based on file content and processing settings
 
-## Recent Improvements (v0.10)
+## Recent Improvements (v0.11)
 
+- ✅ **Yap Binary Embedding:** Automatic download and embedding of Yap binary during build
+- ✅ **Embedded-Only Approach:** Always uses embedded Yap binary for consistency and reliability
+- ✅ **Zero Setup Required:** Users no longer need to manually install Yap
+- ✅ **Version-Pinned Builds:** Control embedded Yap version with `YAP_VERSION` environment variable
+- ✅ **Enhanced Build Process:** Makefile and scripts automatically manage Yap binary
+- ✅ **Portable Distribution:** Single binary contains everything needed for transcription
 - ✅ **Version Management System:** Built-in version checking and automatic updates
 - ✅ **GitHub Release Integration:** Support for both commit-based and release-based updates
 - ✅ **Automated Build Process:** Makefile and scripts with version embedding
@@ -328,8 +358,9 @@ The service uses a sophisticated PostgreSQL schema:
 
 ## Current Limitations
 
-- Requires macOS 26+ for Yap speech recognition
+- Requires macOS 26+ for Yap speech recognition (binary is automatically embedded)
 - Requires OpenAI API key for embeddings generation and LLM text correction (when implemented)
+- Requires internet connection for first build to download Yap binary
 - Hybrid architecture: local transcription + cloud correction (planned) + cloud embeddings
 
 ## Roadmap to v1.0.0

@@ -9,6 +9,7 @@ VERSION="${VERSION:-dev}"
 OUTPUT="${OUTPUT:-lil-whisper}"
 GOOS="${GOOS:-$(go env GOOS)}"
 GOARCH="${GOARCH:-$(go env GOARCH)}"
+YAP_VERSION="${YAP_VERSION:-latest}"
 
 # Get build information
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -30,6 +31,15 @@ if [[ "${GOOS}" != "darwin" ]]; then
     exit 1
 fi
 
+# Ensure yap binary is available for embedding
+echo "Ensuring yap binary is available for embedding..."
+if [ ! -s internal/yap/embedded/yap ]; then
+    echo "Embedded yap binary not found or empty - downloading..."
+    YAP_VERSION="${YAP_VERSION}" ./scripts/download-yap.sh
+else
+    echo "Embedded yap binary already available"
+fi
+
 # Print build information
 echo "Building lil-whisper for macOS..."
 echo "Version: ${VERSION}"
@@ -38,6 +48,7 @@ echo "Build Time: ${BUILD_TIME}"
 echo "Go Version: ${GO_VERSION}"
 echo "Target: ${GOOS}/${GOARCH}"
 echo "Output: ${OUTPUT}"
+echo "Yap Version: ${YAP_VERSION}"
 echo
 
 # Build the binary

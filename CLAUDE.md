@@ -106,8 +106,18 @@ Complex relational schema: **authors** → **books** → **chapters** → **vect
 
 ### Build and Run
 ```bash
-# Build the application
+# Build the application (automatically downloads and embeds Yap)
+make build
+# OR with specific versions
+make build VERSION=v1.0.0 YAP_VERSION=v1.0.0
+
+# Manual build (not recommended - use Makefile instead)
 go build -o lil-whisper
+
+# Yap binary management
+make download-yap                      # Download latest Yap binary
+make download-yap YAP_VERSION=v1.0.0  # Download specific Yap version
+make clean-all                         # Remove everything including Yap binary
 
 # Start database only
 docker compose up -d
@@ -152,6 +162,10 @@ The application uses environment variables (see README.md for complete list). Ke
 - **Local transcription**: No external API calls for speech-to-text
 - **Audio format support**: Handles .m4b, .mp3 via Yap CLI
 - **macOS 26+ required**: Yap speech recognition dependency
+- **Embedded binary**: Yap binary automatically downloaded and embedded during build
+- **Embedded-only approach**: Always uses embedded Yap binary for consistency and reliability
+- **Zero setup**: Users no longer need to manually install Yap
+- **Version control**: Pin specific Yap versions using `YAP_VERSION` environment variable
 
 ### 2. LLM Correction Pipeline (Planned Feature)
 - **Three-stage correction**: See `docs/LLM_CORRECTION_COMPLEXITY.md` for details

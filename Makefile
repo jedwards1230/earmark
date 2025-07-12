@@ -26,6 +26,9 @@ BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 GO_VERSION := $(shell go version | awk '{print $$3}')
 MODULE_PATH := $(shell go run scripts/get-module-path.go)
 
+# Yap binary embedding (can be overridden: make build YAP_VERSION=v1.0.0)
+YAP_VERSION ?= latest
+
 # Build flags (embeds version info into the binary)
 LDFLAGS := -X '$(MODULE_PATH)/internal/version.Version=$(VERSION)' \
            -X '$(MODULE_PATH)/internal/version.Commit=$(COMMIT)' \
@@ -33,30 +36,53 @@ LDFLAGS := -X '$(MODULE_PATH)/internal/version.Version=$(VERSION)' \
            -X '$(MODULE_PATH)/internal/version.GoVersion=$(GO_VERSION)'
 
 # =============================================================================
+# Dependency Management
+# =============================================================================
+
+# Download and embed yap binary
+.PHONY: download-yap
+download-yap:
+	@echo "📥 Downloading yap binary for embedding..."
+	@echo "   Version: $(YAP_VERSION)"
+	@YAP_VERSION=$(YAP_VERSION) ./scripts/download-yap.sh
+
+# Check if embedded yap binary exists, download if needed
+.PHONY: ensure-yap
+ensure-yap:
+	@if [ ! -s internal/yap/embedded/yap ]; then \
+		echo "🔍 Embedded yap binary not found or empty - downloading..."; \
+		$(MAKE) download-yap; \
+	else \
+		echo "✅ Embedded yap binary already available"; \
+	fi
+
+# =============================================================================
 # Main Build Targets
 # =============================================================================
 
 # Build the main binary (default target)
 .PHONY: build
-build:
+build: ensure-yap
 	@echo "🔨 Building lil-whisper..."
 	@echo "   Version: $(VERSION)"
 	@echo "   Commit: $(COMMIT)"
 	@echo "   Build Time: $(BUILD_TIME)"
 	@echo "   Go Version: $(GO_VERSION)"
+	@echo "   Yap Version: $(YAP_VERSION)"
 	@echo ""
 	go build -ldflags "$(LDFLAGS)" -o lil-whisper .
 	@echo "✅ Build complete: ./lil-whisper"
 
 # Build for release with specific version (make release VERSION=v1.0.0)
 .PHONY: release
-release:
+release: ensure-yap
 	@if [ -z "$(VERSION)" ] || [ "$(VERSION)" = "dev" ]; then \
 		echo "❌ Error: VERSION must be set for release builds"; \
 		echo "   Usage: make release VERSION=v1.0.0"; \
 		exit 1; \
 	fi
 	@echo "🚀 Building release $(VERSION)..."
+	@echo "   Yap Version: $(YAP_VERSION)"
 	go build -ldflags "$(LDFLAGS)" -o lil-whisper .
 	@echo "✅ Release build complete: ./lil-whisper"
 
@@ -70,10 +96,11 @@ build-all: build-darwin-arm64
 
 # Build for Apple Silicon macOS (arm64 only)
 .PHONY: build-darwin-arm64
-build-darwin-arm64:
+build-darwin-arm64: ensure-yap
 	@echo "🍎 Building for Apple Silicon macOS..."
 	@mkdir -p dist
 	@echo "   Building for Apple Silicon (arm64)..."
+	@echo "   Yap Version: $(YAP_VERSION)"
 	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/lil-whisper-darwin-arm64 .
 	@echo "✅ Apple Silicon macOS build complete:"
 	@ls -la dist/lil-whisper-darwin-arm64
@@ -84,8 +111,9 @@ build-darwin: build-darwin-arm64
 
 # Quick development build (same as 'build' but with clearer intent)
 .PHONY: dev
-dev:
+dev: ensure-yap
 	@echo "⚡ Building development version..."
+	@echo "   Yap Version: $(YAP_VERSION)"
 	go build -ldflags "$(LDFLAGS)" -o lil-whisper .
 	@echo "✅ Development build complete: ./lil-whisper"
 
@@ -110,6 +138,14 @@ clean:
 	rm -f cmd/monitor/monitor cmd/serve/serve cmd/list/list cmd/search/search cmd/mcp/mcp cmd/version/version cmd/update/update
 	rm -f coverage.out coverage.html
 	@echo "✅ Clean complete"
+
+# Remove all build artifacts including embedded yap binary
+.PHONY: clean-all
+clean-all: clean
+	@echo "🧹 Cleaning embedded binaries..."
+	rm -f internal/yap/embedded/yap
+	echo "not-downloaded" > internal/yap/embedded/version.txt
+	@echo "✅ Complete clean including embedded binaries"
 
 # =============================================================================
 # Testing & Quality Assurance
@@ -172,6 +208,12 @@ version:
 	@echo "   Build Time: $(BUILD_TIME)"
 	@echo "   Go Version: $(GO_VERSION)"
 	@echo "   Module Path: $(MODULE_PATH)"
+	@echo "   Yap Version: $(YAP_VERSION)"
+	@if [ -f internal/yap/embedded/version.txt ]; then \
+		echo "   Embedded Yap: $$(cat internal/yap/embedded/version.txt)"; \
+	else \
+		echo "   Embedded Yap: not available"; \
+	fi
 
 # Show all available targets with descriptions
 .PHONY: help
@@ -186,9 +228,14 @@ help:
 	@echo "  make build-all   - Build for Apple Silicon macOS (arm64 only)"
 	@echo "  make build-darwin-arm64 - Build specifically for Apple Silicon macOS"
 	@echo ""
+	@echo "📥 DEPENDENCY MANAGEMENT:"
+	@echo "  make download-yap- Download yap binary for embedding (YAP_VERSION=latest)"
+	@echo "  make ensure-yap  - Ensure yap binary is available (auto-download if needed)"
+	@echo ""
 	@echo "📦 INSTALLATION:"
 	@echo "  make install     - Install binary to /usr/local/bin (requires sudo)"
-	@echo "  make clean       - Remove all build artifacts"
+	@echo "  make clean       - Remove build artifacts (keeps embedded binaries)"
+	@echo "  make clean-all   - Remove all artifacts including embedded binaries"
 	@echo ""
 	@echo "🧪 TESTING & QUALITY:"
 	@echo "  make test        - Run all tests"
@@ -203,15 +250,24 @@ help:
 	@echo "  make help        - Show this help message"
 	@echo ""
 	@echo "📚 EXAMPLES:"
-	@echo "  make                              # Build main binary"
+	@echo "  make                              # Build main binary (auto-downloads yap)"
 	@echo "  make build VERSION=v1.2.3        # Build with specific version"
+	@echo "  make build YAP_VERSION=v1.0.0    # Build with specific yap version"
 	@echo "  make release VERSION=v1.0.0      # Create release build"
+	@echo "  make download-yap YAP_VERSION=latest # Download latest yap binary"
 	@echo "  make build-darwin-arm64           # Build for Apple Silicon macOS"
+	@echo "  make clean-all                    # Clean everything including yap binary"
 	@echo "  make check                        # Run all quality checks"
 	@echo ""
 	@echo "⚠️  REQUIREMENTS:"
 	@echo "  - Go 1.24+"
 	@echo "  - Apple Silicon macOS 26+ (M1/M2/M3+ due to Yap speech recognition)"
+	@echo "  - Internet connection for first build (to download yap binary)"
 	@echo "  - golangci-lint for linting (optional)"
+	@echo ""
+	@echo "📋 YAP EMBEDDING:"
+	@echo "  - Yap binary is automatically downloaded and embedded during build"
+	@echo "  - Set YAP_VERSION environment variable to pin specific version"
+	@echo "  - Always uses embedded yap binary for consistency and reliability"
 	@echo ""
 	@echo "💡 TIP: Run 'make' without arguments to build the main binary"
