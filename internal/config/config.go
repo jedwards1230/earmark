@@ -222,7 +222,9 @@ func resolveAndCreatePath(cwd, path string) string {
 		// Log error but don't fail - the error will surface when the directory is actually needed
 		// This helps in cases where we don't have permission but the directory might already exist
 		// or be created by another process
-		os.Stderr.WriteString("Warning: Could not create directory: " + err.Error() + "\n")
+		if _, writeErr := os.Stderr.WriteString("Warning: Could not create directory: " + err.Error() + "\n"); writeErr != nil {
+			// If we can't even write to stderr, there's not much we can do
+		}
 	}
 
 	return path

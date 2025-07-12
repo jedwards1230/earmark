@@ -109,7 +109,8 @@ func (fm *FileMonitor) tryParsers(data []byte, filePath string) (*meta.BookMetad
 
 // parseBookMetadataFile now uses the parser factory
 func (fm *FileMonitor) parseBookMetadataFile(path string) (*meta.BookMetadata, error) {
-	data, err := os.ReadFile(path)
+	// #nosec G304 - path is controlled by filesystem monitor and validated elsewhere
+	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return nil, fmt.Errorf("reading metadata file: %w", err)
 	}

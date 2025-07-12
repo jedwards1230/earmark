@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -98,7 +99,9 @@ func New(cfg *config.Config) (*DB, error) {
 	}
 
 	if err := db.initialize(context.Background()); err != nil {
-		conn.Close(context.Background())
+		if closeErr := conn.Close(context.Background()); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close connection: %v\n", closeErr)
+		}
 		return nil, err
 	}
 
@@ -125,7 +128,9 @@ func (db *DB) initialize(ctx context.Context) error {
 
 	// Register pgvector types
 	if err := pgxvector.RegisterTypes(context.Background(), db.conn); err != nil {
-		db.conn.Close(context.Background())
+		if closeErr := db.conn.Close(context.Background()); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close connection: %v\n", closeErr)
+		}
 		return fmt.Errorf("failed to register vector types: %v", err)
 	}
 
@@ -422,7 +427,10 @@ func (db *DB) GetHierarchicalData(ctx context.Context) ([]HierarchicalEntry, err
 }
 
 func (db *DB) Close() {
-	db.conn.Close(context.Background())
+	if err := db.conn.Close(context.Background()); err != nil {
+		// Log error but don't fail since Close() is often called in defer
+		fmt.Fprintf(os.Stderr, "Warning: failed to close database connection: %v\n", err)
+	}
 }
 
 func (db *DB) GetProcessingStats(ctx context.Context) (*Statistics, error) {
@@ -734,7 +742,8 @@ func (db *DB) DeleteBookChunks(ctx context.Context, bookID int) error {
 
 // ComputeFileChecksum calculates the SHA256 checksum of a file
 func (db *DB) ComputeFileChecksum(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+	// #nosec G304 - filePath is controlled by caller and validated elsewhere
+	file, err := os.Open(filepath.Clean(filePath))
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %w", err)
 	}

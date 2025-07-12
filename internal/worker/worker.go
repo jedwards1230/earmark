@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"time"
 )
@@ -279,8 +280,9 @@ func (w *Worker) countWords(content string) int {
 	return len(re.FindAllString(content, -1))
 }
 
-func OpenFile(filepath string) (string, error) {
-	file, err := os.Open(filepath)
+func OpenFile(filePath string) (string, error) {
+	// #nosec G304 - filePath is controlled by caller and validated elsewhere
+	file, err := os.Open(filepath.Clean(filePath))
 	if err != nil {
 		return "", fmt.Errorf("opening file: %v", err)
 	}

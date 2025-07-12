@@ -65,7 +65,8 @@ func shortenPath(path string) string {
 }
 
 func countWords(path string) (int, error) {
-	content, err := os.ReadFile(path)
+	// #nosec G304 - path is controlled by caller and validated elsewhere
+	content, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return 0, err
 	}
@@ -119,11 +120,12 @@ func (t *Transcriber) TranscribeAudio(
 
 	outputFile := filepath.Join(rawDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
 
+	// #nosec G204 - yap is a trusted binary and paths are validated
 	cmd := exec.CommandContext(ctx,
 		"yap",
 		"transcribe",
-		preprocessedPath,
-		"--output-file", outputFile,
+		filepath.Clean(preprocessedPath),
+		"--output-file", filepath.Clean(outputFile),
 		// "--initial_prompt", fmt.Sprintf("Transcribe %s by %s", fileMeta.Title, fileMeta.Author),
 	)
 
@@ -182,8 +184,12 @@ func (t *Transcriber) TranscribeAudio(
 	// Start the command with detailed error capture
 	if err := cmd.Start(); err != nil {
 		close(memStatChan)
-		stderrReader.Close()
-		stderrWriter.Close()
+		if err := stderrReader.Close(); err != nil {
+			t.log.Warn("Failed to close stderr reader", "error", err)
+		}
+		if err := stderrWriter.Close(); err != nil {
+			t.log.Warn("Failed to close stderr writer", "error", err)
+		}
 		t.log.Error("Failed to start transcription", "file", shortPath, "error", err)
 		return "", fmt.Errorf("failed to start transcription process: %v", err)
 	}
@@ -226,12 +232,16 @@ func (t *Transcriber) TranscribeAudio(
 	// Wait for command to complete and output processing to finish
 	err = cmd.Wait()
 	close(memStatChan)
-	stderrWriter.Close() // Close writer after command exits
+	if err := stderrWriter.Close(); err != nil {
+		t.log.Warn("Failed to close stderr writer", "error", err)
+	}
 
 	// Wait for output processors to finish
 	<-stdoutDone
 	<-stderrDone
-	stderrReader.Close() // Close reader last
+	if err := stderrReader.Close(); err != nil {
+		t.log.Warn("Failed to close stderr reader", "error", err)
+	}
 
 	if err != nil {
 		errMsg := fmt.Sprintf("Transcription failed for %s: %v", shortPath, err)

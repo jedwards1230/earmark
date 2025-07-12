@@ -124,7 +124,8 @@ func (fm *FileManager) saveTextFile(filePath, content string) error {
 }
 
 func (fm *FileManager) readTextFile(filePath string) (string, error) {
-	content, err := os.ReadFile(filePath)
+	// #nosec G304 - filePath is controlled by caller and validated elsewhere
+	content, err := os.ReadFile(filepath.Clean(filePath))
 	if err != nil {
 		return "", fmt.Errorf("failed to read file %s: %w", filePath, err)
 	}

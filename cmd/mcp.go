@@ -27,7 +27,9 @@ func runMCP(cmd *cobra.Command, args []string) {
 
 	// Set environment variable for MCP transport (defaults to stdio)
 	if os.Getenv("MCP_TRANSPORT") == "" {
-		os.Setenv("MCP_TRANSPORT", "stdio")
+		if err := os.Setenv("MCP_TRANSPORT", "stdio"); err != nil {
+			log.Printf("Warning: failed to set MCP_TRANSPORT: %v", err)
+		}
 	}
 
 	// Print startup information

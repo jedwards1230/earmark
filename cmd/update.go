@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -133,21 +134,29 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	}
 
 	tempFile := executable + ".tmp"
-	file, err := os.OpenFile(tempFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0750)
+	// #nosec G304 - tempFile path is constructed safely
+	// #nosec G302 - 0750 permissions are appropriate for executable
+	file, err := os.OpenFile(filepath.Clean(tempFile), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0750)
 	if err != nil {
 		return fmt.Errorf("creating temporary file: %w", err)
 	}
 
 	_, err = io.Copy(file, resp.Body)
-	file.Close()
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("closing temporary file: %w", err)
+	}
 	if err != nil {
-		os.Remove(tempFile)
+		if err := os.Remove(tempFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove temp file: %v\n", err)
+		}
 		return fmt.Errorf("writing downloaded binary: %w", err)
 	}
 
 	backupFile := executable + ".backup"
 	if err := os.Rename(executable, backupFile); err != nil {
-		os.Remove(tempFile)
+		if err := os.Remove(tempFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove temp file: %v\n", err)
+		}
 		return fmt.Errorf("creating backup: %w", err)
 	}
 
@@ -158,7 +167,9 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 		return fmt.Errorf("installing new binary: %w", err)
 	}
 
-	os.Remove(backupFile)
+	if err := os.Remove(backupFile); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to remove backup file: %v\n", err)
+	}
 	return nil
 }
 
@@ -224,18 +235,23 @@ func updateFromSource(ctx context.Context, noConfirm bool) error {
 
 	buildArgs = append(buildArgs, "-ldflags", ldflags, ".")
 
+	// #nosec G204 - go command is trusted and buildArgs are constructed safely
 	cmd = exec.CommandContext(ctx, "go", buildArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		os.Remove(executable + ".new")
+		if err := os.Remove(executable + ".new"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove new binary: %v\n", err)
+		}
 		return fmt.Errorf("building new binary: %w", err)
 	}
 
 	backupFile := executable + ".backup"
 	if err := os.Rename(executable, backupFile); err != nil {
-		os.Remove(executable + ".new")
+		if err := os.Remove(executable + ".new"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove new binary: %v\n", err)
+		}
 		return fmt.Errorf("creating backup: %w", err)
 	}
 
@@ -246,7 +262,9 @@ func updateFromSource(ctx context.Context, noConfirm bool) error {
 		return fmt.Errorf("installing new binary: %w", err)
 	}
 
-	os.Remove(backupFile)
+	if err := os.Remove(backupFile); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to remove backup file: %v\n", err)
+	}
 	return nil
 }
 

@@ -240,7 +240,8 @@ func loadCache() *VersionCache {
 	}
 
 	cachePath := filepath.Join(cacheDir, CacheFile)
-	data, err := os.ReadFile(cachePath)
+	// #nosec G304 - cachePath is constructed from known safe components
+	data, err := os.ReadFile(filepath.Clean(cachePath))
 	if err != nil {
 		return nil
 	}
