@@ -69,7 +69,7 @@ func TestIsNewerVersion(t *testing.T) {
 		{"current newer", "1.1.0", "1.0.0", false},
 		{"with v prefix", "v1.0.0", "v1.0.1", true},
 		{"mixed prefix", "1.0.0", "v1.0.1", true},
-		{"dev version", "dev", "1.0.0", false},
+		{"dev version", "dev", "1.0.0", true},
 		{"latest dev", "1.0.0", "dev", false},
 	}
 
@@ -107,7 +107,7 @@ func TestCheckCommitVersion(t *testing.T) {
 	Commit = "abc1234"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lil-whisper/commits/main")
+		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lilbro-whisper/commits/main")
 
 		commit := GitHubCommit{
 			SHA: "def5678",
@@ -190,7 +190,7 @@ func TestCheckReleaseVersion(t *testing.T) {
 	Version = "1.0.0"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lil-whisper/releases/latest")
+		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lilbro-whisper/releases/latest")
 
 		release := GitHubRelease{
 			TagName:     "v1.1.0",

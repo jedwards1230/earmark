@@ -21,7 +21,7 @@ var (
 
 const (
 	DefaultGitHubAPI = "https://api.github.com"
-	GitHubRepo       = "jedwards1230/lil-whisper"
+	GitHubRepo       = "jedwards1230/lilbro-whisper"
 	CacheFile        = ".version_cache"
 	DefaultExpiry    = 24 * time.Hour
 )
@@ -211,7 +211,7 @@ func checkReleaseVersion(ctx context.Context, result *CheckResult) (*CheckResult
 	}
 
 	result.LatestVersion = release.TagName
-	if result.LatestVersion != Version {
+	if IsNewerVersion(Version, result.LatestVersion) {
 		result.HasUpdate = true
 		result.UpdateMessage = fmt.Sprintf("Version %s available", result.LatestVersion)
 	}
@@ -273,8 +273,11 @@ func saveCache(cache *VersionCache) {
 }
 
 func IsNewerVersion(current, latest string) bool {
-	if current == "dev" || latest == "dev" {
+	if latest == "dev" {
 		return false
+	}
+	if current == "dev" {
+		return true
 	}
 
 	if !strings.HasPrefix(current, "v") {

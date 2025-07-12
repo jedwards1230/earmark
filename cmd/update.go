@@ -75,13 +75,31 @@ func runUpdate(cmd *cobra.Command, args []string) {
 		fmt.Printf("⚠️ Forcing update (no newer version detected)\n")
 	}
 
-	if result.UseReleases && result.LatestVersion != "" {
-		if err := updateFromRelease(ctx, result.LatestVersion, noConfirm); err != nil {
+	shouldProceed := noConfirm
+	if !noConfirm && version.Version == "dev" && result.HasUpdate {
+		fmt.Printf("\nYou are running a development build (dev).\n")
+		fmt.Printf("Do you want to update to the latest release version %s? (y/N): ", result.LatestVersion)
+		
+		var response string
+		if _, err := fmt.Scanln(&response); err != nil {
+			response = "n"
+		}
+		shouldProceed = strings.ToLower(response) == "y"
+		if !shouldProceed {
+			fmt.Println("Update cancelled.")
+			return
+		}
+	} else if !noConfirm && version.Version != "dev" && result.HasUpdate {
+		shouldProceed = true
+	}
+
+	if result.UseReleases && result.LatestVersion != "" && shouldProceed {
+		if err := updateFromRelease(ctx, result.LatestVersion, true); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating from release: %v\n", err)
 			os.Exit(1)
 		}
-	} else {
-		if err := updateFromSource(ctx, noConfirm); err != nil {
+	} else if shouldProceed {
+		if err := updateFromSource(ctx, true); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating from source: %v\n", err)
 			os.Exit(1)
 		}
