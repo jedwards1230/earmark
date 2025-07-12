@@ -53,7 +53,17 @@ The service includes built-in version checking and update capabilities:
 
 # Force update without confirmation
 ./lil-whisper update --force --yes
+
+# Enable debug output to see authentication details
+./lil-whisper update --debug
 ```
+
+**For Private Repositories:** The updater will automatically try multiple authentication methods in this order:
+1. Environment variables (GITHUB_TOKEN, GITHUB_PAT, GH_TOKEN, PAT)
+2. GitHub CLI credentials (if `gh` is installed and authenticated)
+3. SSH keys (for git operations only)
+
+No additional configuration is required - the updater will use the first available authentication method.
 
 ### Automatic Version Checking
 The CLI automatically checks for updates in the background when commands are run. This is non-intrusive and can be configured:
@@ -126,6 +136,10 @@ VERSION_CHECK_INTERVAL=24h
 VERSION_CHECK_TIMEOUT=5s
 
 # GitHub authentication (required for private repositories)
+# The service supports multiple authentication methods in priority order:
+# 1. Environment variables (GITHUB_TOKEN, GITHUB_PAT, GH_TOKEN, PAT)
+# 2. GitHub CLI authentication (gh auth login)
+# 3. SSH keys (for git operations only)
 GITHUB_TOKEN=your-github-token-here
 ```
 
@@ -143,6 +157,10 @@ Key configuration options:
 *   `VERSION_CHECK_INTERVAL`: How often to check for updates (default: 24h)
 *   `VERSION_CHECK_TIMEOUT`: Timeout for version check requests (default: 5s)
 *   `GITHUB_TOKEN`: GitHub personal access token for private repository access (required for update/version checking of private repositories)
+*   **Authentication Priority:** The service tries authentication methods in this order:
+    1. **Environment Variables**: `GITHUB_TOKEN`, `GITHUB_PAT`, `GH_TOKEN`, `PAT`
+    2. **GitHub CLI**: Uses `gh auth token` if GitHub CLI is installed and authenticated
+    3. **SSH Keys**: Available for git operations (not HTTP downloads)
 
 ## Installation
 
@@ -181,6 +199,30 @@ lil-whisper version --check
 # Update to latest version
 lil-whisper update
 ```
+
+#### Authentication for Private Repositories
+For private repositories, the updater supports multiple authentication methods:
+
+1. **Environment Variables** (highest priority):
+   ```bash
+   export GITHUB_TOKEN=your_personal_access_token
+   # or
+   export GITHUB_PAT=your_personal_access_token
+   ```
+
+2. **GitHub CLI** (automatic if authenticated):
+   ```bash
+   gh auth login
+   # The updater will automatically use GitHub CLI credentials
+   ```
+
+3. **SSH Keys** (for git operations only):
+   ```bash
+   # SSH keys are used for git-based operations
+   # Not supported for release downloads
+   ```
+
+The updater tries these methods in order and uses the first successful authentication method.
 
 ## Usage
 

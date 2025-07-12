@@ -157,11 +157,21 @@ func CheckForUpdatesWithDebug(ctx context.Context, useCache bool, debug bool) (*
 	return CheckForUpdatesWithExpiryAndDebug(ctx, useCache, DefaultExpiry, debug)
 }
 
+// CheckForUpdatesWithAuthenticatedClient performs an update check with an authenticated HTTP client
+func CheckForUpdatesWithAuthenticatedClient(ctx context.Context, useCache bool, debug bool, client *http.Client) (*CheckResult, error) {
+	return CheckForUpdatesWithExpiryAndAuthenticatedClient(ctx, useCache, DefaultExpiry, debug, client)
+}
+
 func CheckForUpdatesWithExpiry(ctx context.Context, useCache bool, cacheExpiry time.Duration) (*CheckResult, error) {
 	return CheckForUpdatesWithExpiryAndDebug(ctx, useCache, cacheExpiry, false)
 }
 
 func CheckForUpdatesWithExpiryAndDebug(ctx context.Context, useCache bool, cacheExpiry time.Duration, debug bool) (*CheckResult, error) {
+	return CheckForUpdatesWithExpiryAndAuthenticatedClient(ctx, useCache, cacheExpiry, debug, nil)
+}
+
+// CheckForUpdatesWithExpiryAndAuthenticatedClient performs an update check with optional authenticated client
+func CheckForUpdatesWithExpiryAndAuthenticatedClient(ctx context.Context, useCache bool, cacheExpiry time.Duration, debug bool, client *http.Client) (*CheckResult, error) {
 	if debug {
 		fmt.Printf("DEBUG: Starting update check, useCache=%v, cacheExpiry=%v\n", useCache, cacheExpiry)
 	}
@@ -191,7 +201,7 @@ func CheckForUpdatesWithExpiryAndDebug(ctx context.Context, useCache bool, cache
 		}
 	}
 
-	result, err := performUpdateCheckWithDebug(ctx, debug)
+	result, err := performUpdateCheckWithAuthenticatedClient(ctx, debug, client)
 	if err != nil {
 		return nil, err
 	}
@@ -214,6 +224,11 @@ func performUpdateCheck(ctx context.Context) (*CheckResult, error) {
 }
 
 func performUpdateCheckWithDebug(ctx context.Context, debug bool) (*CheckResult, error) {
+	return performUpdateCheckWithAuthenticatedClient(ctx, debug, nil)
+}
+
+// performUpdateCheckWithAuthenticatedClient performs update check with optional authenticated client
+func performUpdateCheckWithAuthenticatedClient(ctx context.Context, debug bool, client *http.Client) (*CheckResult, error) {
 	currentCommit := Commit
 	if currentCommit == "unknown" {
 		currentCommit = getRuntimeCommit()
@@ -230,7 +245,7 @@ func performUpdateCheckWithDebug(ctx context.Context, debug bool) (*CheckResult,
 		fmt.Printf("DEBUG: GitHub repo: %s\n", GitHubRepo)
 	}
 
-	return checkReleaseVersionWithDebug(ctx, result, debug)
+	return checkReleaseVersionWithAuthenticatedClient(ctx, result, debug, client)
 }
 
 func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult, error) {
@@ -238,6 +253,11 @@ func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult,
 }
 
 func checkCommitVersionWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
+	return checkCommitVersionWithAuthenticatedClient(ctx, result, debug, nil)
+}
+
+// checkCommitVersionWithAuthenticatedClient checks for commits with optional authenticated client
+func checkCommitVersionWithAuthenticatedClient(ctx context.Context, result *CheckResult, debug bool, client *http.Client) (*CheckResult, error) {
 	currentCommit := result.CurrentCommit
 	if currentCommit == "unknown" || currentCommit == "" {
 		if debug {
@@ -246,7 +266,9 @@ func checkCommitVersionWithDebug(ctx context.Context, result *CheckResult, debug
 		return result, nil
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
 	url := fmt.Sprintf("%s/repos/%s/commits/main", GitHubAPI, GitHubRepo)
 
 	if debug {
@@ -258,7 +280,7 @@ func checkCommitVersionWithDebug(ctx context.Context, result *CheckResult, debug
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	// Add GitHub token authentication if available for private repositories
+	// Add GitHub token authentication if available for private repositories (backward compatibility)
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
 		req.Header.Set("Authorization", "token "+token)
 		if debug {
@@ -315,9 +337,16 @@ func checkReleaseVersion(ctx context.Context, result *CheckResult) (*CheckResult
 }
 
 func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
+	return checkReleaseVersionWithAuthenticatedClient(ctx, result, debug, nil)
+}
+
+// checkReleaseVersionWithAuthenticatedClient checks for releases with optional authenticated client
+func checkReleaseVersionWithAuthenticatedClient(ctx context.Context, result *CheckResult, debug bool, client *http.Client) (*CheckResult, error) {
 	result.UseReleases = true
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
 	url := fmt.Sprintf("%s/repos/%s/releases/latest", GitHubAPI, GitHubRepo)
 
 	if debug {
@@ -329,7 +358,7 @@ func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debu
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	// Add GitHub token authentication if available for private repositories
+	// Add GitHub token authentication if available for private repositories (backward compatibility)
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
 		req.Header.Set("Authorization", "token "+token)
 		if debug {
@@ -342,7 +371,7 @@ func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debu
 		if debug {
 			fmt.Printf("DEBUG: Release API request failed: %v, falling back to commit check\n", err)
 		}
-		return checkCommitVersionWithDebug(ctx, result, debug)
+		return checkCommitVersionWithAuthenticatedClient(ctx, result, debug, client)
 	}
 	defer resp.Body.Close()
 
@@ -354,14 +383,14 @@ func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debu
 		if debug {
 			fmt.Printf("DEBUG: No releases found (404) - repository may be private, trying git-based check\n")
 		}
-		return checkGitReleasesWithDebug(ctx, result, debug)
+		return checkGitReleasesWithAuthenticatedClient(ctx, result, debug, client)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		if debug {
 			fmt.Printf("DEBUG: Release API returned status %d, trying git-based check\n", resp.StatusCode)
 		}
-		return checkGitReleasesWithDebug(ctx, result, debug)
+		return checkGitReleasesWithAuthenticatedClient(ctx, result, debug, client)
 	}
 
 	var release GitHubRelease
@@ -511,8 +540,12 @@ func parseVersion(version string) []int {
 	return result
 }
 
-// checkGitReleasesWithDebug checks for releases using git commands (works with private repos)
 func checkGitReleasesWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
+	return checkGitReleasesWithAuthenticatedClient(ctx, result, debug, nil)
+}
+
+// checkGitReleasesWithAuthenticatedClient checks for releases using git commands (works with private repos)
+func checkGitReleasesWithAuthenticatedClient(ctx context.Context, result *CheckResult, debug bool, client *http.Client) (*CheckResult, error) {
 	result.UseReleases = true
 	
 	if debug {

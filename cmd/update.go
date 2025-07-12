@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedwards1230/lil-whisper/internal/auth"
 	"github.com/jedwards1230/lil-whisper/internal/build"
 	"github.com/jedwards1230/lil-whisper/internal/version"
 	"github.com/spf13/cobra"
@@ -56,7 +57,17 @@ func runUpdate(cmd *cobra.Command, args []string) {
 		fmt.Printf("DEBUG: Current version info: %+v\n", version.GetInfo())
 	}
 
-	result, err := version.CheckForUpdatesWithDebug(ctx, true, debug)
+	// Initialize authentication manager for update checks
+	authManager := auth.NewAuthManager(debug)
+	
+	// Use authenticated client for version checking
+	var result *version.CheckResult
+	var err error
+	if client := authManager.GetAuthenticatedClient(); client != nil {
+		result, err = version.CheckForUpdatesWithAuthenticatedClient(ctx, true, debug, client)
+	} else {
+		result, err = version.CheckForUpdatesWithDebug(ctx, true, debug)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
 		os.Exit(1)
@@ -139,6 +150,8 @@ func runUpdate(cmd *cobra.Command, args []string) {
 }
 
 func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool) error {
+	// Initialize authentication manager
+	authManager := auth.NewAuthManager(true) // Enable debug mode
 	if !noConfirm {
 		fmt.Printf("\nThis will update lil-whisper to version %s.\n", latestVersion)
 		fmt.Print("Continue? (y/N): ")
@@ -162,23 +175,30 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	}
 
 	// Get authenticated download URL from GitHub API for private repositories
-	downloadURL, err := getAssetDownloadURL(ctx, latestVersion)
+	downloadURL, err := getAssetDownloadURL(ctx, latestVersion, authManager)
 	if err != nil {
 		return fmt.Errorf("getting asset download URL: %w", err)
 	}
 
 	fmt.Printf("Downloading from: %s\n", downloadURL)
 
-	client := &http.Client{Timeout: 2 * time.Minute}
+	client := authManager.GetAuthenticatedClient()
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("creating download request: %w", err)
 	}
 
-	// Add GitHub token authentication if available for private repositories
-	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		req.Header.Set("Authorization", "token "+token)
-		fmt.Println("Using GitHub token for private repository access")
+	// Add GitHub token authentication for private repositories
+	if err := authManager.AddAuthHeader(req); err != nil {
+		fmt.Printf("Warning: Failed to add authentication header: %v\n", err)
+		fmt.Println("Attempting download without authentication...")
+	} else {
+		fmt.Println("Using authenticated access for private repository")
+	}
+
+	// For GitHub API asset URLs, we need to set the Accept header to get the binary
+	if strings.Contains(downloadURL, "api.github.com/repos/") && strings.Contains(downloadURL, "/releases/assets/") {
+		req.Header.Set("Accept", "application/octet-stream")
 	}
 
 	resp, err := client.Do(req)
@@ -192,9 +212,9 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 		case 404:
 			return fmt.Errorf("download failed with status 404 - URL: %s (release binary not found - likely private repository or binary not published)", downloadURL)
 		case 403:
-			return fmt.Errorf("download failed with status 403 - URL: %s (access denied - likely private repository, try setting GITHUB_TOKEN environment variable)", downloadURL)
+			return fmt.Errorf("download failed with status 403 - URL: %s (access denied - authentication failed or insufficient permissions)\n\nTry one of these authentication methods:\n  1. Set GITHUB_TOKEN environment variable\n  2. Use GitHub CLI: 'gh auth login'\n  3. Configure SSH keys for GitHub", downloadURL)
 		case 401:
-			return fmt.Errorf("download failed with status 401 - URL: %s (authentication required - check GITHUB_TOKEN environment variable)", downloadURL)
+			return fmt.Errorf("download failed with status 401 - URL: %s (authentication required)\n\nTry one of these authentication methods:\n  1. Set GITHUB_TOKEN environment variable\n  2. Use GitHub CLI: 'gh auth login'\n  3. Configure SSH keys for GitHub", downloadURL)
 		default:
 			return fmt.Errorf("download failed with status %d - URL: %s", resp.StatusCode, downloadURL)
 		}
@@ -360,10 +380,9 @@ type GitHubReleaseWithAssets struct {
 }
 
 // getAssetDownloadURL gets the authenticated download URL for a release asset
-func getAssetDownloadURL(ctx context.Context, releaseVersion string) (string, error) {
+func getAssetDownloadURL(ctx context.Context, releaseVersion string, authManager *auth.AuthManager) (string, error) {
 	// Always try GitHub API first (works for both public and private repos)
-	token := os.Getenv("GITHUB_TOKEN")
-	if url, err := getAssetDownloadURLFromAPI(ctx, releaseVersion, token); err == nil {
+	if url, err := getAssetDownloadURLFromAPI(ctx, releaseVersion, authManager); err == nil {
 		return url, nil
 	} else {
 		fmt.Printf("DEBUG: GitHub API failed: %v\n", err)
@@ -375,19 +394,19 @@ func getAssetDownloadURL(ctx context.Context, releaseVersion string) (string, er
 }
 
 // getAssetDownloadURLFromAPI gets the asset download URL using GitHub API
-func getAssetDownloadURLFromAPI(ctx context.Context, releaseVersion string, token string) (string, error) {
+func getAssetDownloadURLFromAPI(ctx context.Context, releaseVersion string, authManager *auth.AuthManager) (string, error) {
 	// Get release info from GitHub API
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", version.GitHubRepo, releaseVersion)
 	
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := authManager.GetAuthenticatedClient()
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("creating API request: %w", err)
 	}
 	
-	// Add authentication header only if token is available
-	if token != "" {
-		req.Header.Set("Authorization", "token "+token)
+	// Add authentication header
+	if err := authManager.AddAuthHeader(req); err != nil {
+		return "", fmt.Errorf("adding authentication header: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	
