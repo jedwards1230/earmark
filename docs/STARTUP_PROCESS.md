@@ -132,8 +132,8 @@ go func() {
   5. **Database Storage**: Stores raw transcription and vector chunks
   6. **Progress Logging**: Reports completion status and timing
 
-### 6. HTTP Server Startup (Separate Command)
-**Note**: The HTTP server is now started separately using `./lil-whisper serve`
+### 6. HTTP Server (Separate Command)
+**Note**: The HTTP server is started separately using `./lil-whisper serve`
 
 **File**: `cmd/serve/serve.go:30-40`
 ```go
