@@ -59,6 +59,10 @@ LLM_CORRECTION_MAX_RETRIES=3
 # Debug settings
 DEBUG=false
 RESET_STATE=false
+
+# Logging settings
+LOG_DEBUG=false
+LOG_VERBOSE=false
 ```
 
 Key configuration options:
@@ -69,6 +73,8 @@ Key configuration options:
 *   `LLM_CORRECTION_*`: Settings for the three-stage text correction pipeline (not yet implemented)
 *   `LLM_CORRECTION_ENABLED`: Toggle for enabling/disabling LLM correction
 *   `LLM_CORRECTION_MODEL`: LLM model to use for text correction
+*   `LOG_DEBUG`: Enable debug-level logging (set to `true` or `1`)
+*   `LOG_VERBOSE`: Enable verbose logging including raw transcription text (set to `true` or `1`)
 
 ## Usage
 

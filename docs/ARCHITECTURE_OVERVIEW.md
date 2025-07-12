@@ -230,9 +230,13 @@ transcriptions (id, file_path, checksum, text, word_count)
 **Purpose**: Structured logging across all components
 
 **Key Features**:
-- Component-specific loggers
-- Structured key-value logging
-- Configurable log levels
+- Component-specific loggers with module names (e.g., `[transcribe]`, `[worker]`)
+- Structured key-value logging using Go's `slog` package
+- Three configurable log levels:
+  - **Info/Warn/Error**: Always enabled (default behavior)
+  - **Debug**: Enabled via `LOG_DEBUG=1` environment variable
+  - **Verbose**: Enabled via `LOG_VERBOSE=1` environment variable (includes raw transcription text)
+- Color-coded console output with level symbols (`→` info, `•` debug, `…` verbose, `!` warn, `✗` error)
 - Performance and error tracking
 - LLM correction pipeline monitoring
 

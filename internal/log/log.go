@@ -15,12 +15,20 @@ const (
 	colorYellow = "\033[33m"
 	colorBlue   = "\033[34m"
 	colorWhite  = "\033[37m"
+	colorGray   = "\033[90m"
 )
 
-var debugEnabled bool
+// Custom log level for verbose output (between Debug and Info)
+const LevelVerbose = slog.LevelDebug + 1
+
+var (
+	debugEnabled   bool
+	verboseEnabled bool
+)
 
 func init() {
 	debugEnabled = os.Getenv("LOG_DEBUG") == "1" || os.Getenv("LOG_DEBUG") == "true"
+	verboseEnabled = os.Getenv("LOG_VERBOSE") == "1" || os.Getenv("LOG_VERBOSE") == "true"
 }
 
 // PrettyHandler provides a more readable log format
@@ -32,6 +40,11 @@ type PrettyHandler struct {
 
 type Logger struct {
 	*slog.Logger
+}
+
+// Verbose logs a message at verbose level (only shown when LOG_VERBOSE=1)
+func (l Logger) Verbose(msg string, args ...any) {
+	l.Log(context.Background(), LevelVerbose, msg, args...)
 }
 
 func NewLogger(module string) Logger {
@@ -51,6 +64,9 @@ func NewLogger(module string) Logger {
 func (h *PrettyHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	if level == slog.LevelDebug {
 		return debugEnabled
+	}
+	if level == LevelVerbose {
+		return verboseEnabled
 	}
 	return true
 }
@@ -76,6 +92,9 @@ func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
 	case slog.LevelDebug:
 		levelColor = colorBlue
 		levelSymbol = "•"
+	case LevelVerbose:
+		levelColor = colorGray
+		levelSymbol = "…"
 	case slog.LevelInfo:
 		levelColor = colorWhite
 		levelSymbol = "→"

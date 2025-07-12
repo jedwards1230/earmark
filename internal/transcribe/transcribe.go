@@ -208,7 +208,7 @@ func (t *Transcriber) TranscribeAudio(
 	go func() {
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			t.log.Info(scanner.Text())
+			t.log.Verbose(scanner.Text())
 		}
 		close(stdoutDone)
 	}()
@@ -218,7 +218,7 @@ func (t *Transcriber) TranscribeAudio(
 		tee := io.TeeReader(stderrReader, &stderr)
 		scanner := bufio.NewScanner(tee)
 		for scanner.Scan() {
-			t.log.Info(scanner.Text())
+			t.log.Verbose(scanner.Text())
 		}
 		close(stderrDone)
 	}()
