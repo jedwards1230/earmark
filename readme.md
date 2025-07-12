@@ -27,6 +27,62 @@ The service uses a PostgreSQL database to track processed files and avoid redund
 *   **OpenAI API:** For generating embeddings and LLM text correction (configurable endpoint).
 *   **macOS 26+:** Required for Yap speech recognition capabilities.
 
+## Version Management
+
+The service includes built-in version checking and update capabilities:
+
+### Version Information
+```bash
+# Show current version, commit, build time
+./lil-whisper version
+
+# Check for available updates
+./lil-whisper version --check
+
+# Force fresh update check (skip cache)
+./lil-whisper version --check --no-cache
+```
+
+### Automatic Updates
+```bash
+# Check and update if newer version available
+./lil-whisper update
+
+# Only check for updates without updating
+./lil-whisper update --check
+
+# Force update without confirmation
+./lil-whisper update --force --yes
+```
+
+### Automatic Version Checking
+The CLI automatically checks for updates in the background when commands are run. This is non-intrusive and can be configured:
+
+```bash
+# Disable automatic version checking
+export DISABLE_VERSION_CHECK=true
+
+# Configure check interval (default: 24h)
+export VERSION_CHECK_INTERVAL=12h
+
+# Configure check timeout (default: 5s)
+export VERSION_CHECK_TIMEOUT=3s
+```
+
+### Build Process
+Use the provided Makefile or build script for proper version embedding:
+
+```bash
+# Using Makefile
+make build                    # Development build
+make release VERSION=v1.0.0  # Release build
+make build-all                # Cross-platform builds
+
+# Using build script
+./scripts/build.sh            # Development build
+VERSION=v1.0.0 ./scripts/build.sh  # Release build
+```
+
 ## Configuration
 
 The service is configured using environment variables:
@@ -63,6 +119,11 @@ RESET_STATE=false
 # Logging settings
 LOG_DEBUG=false
 LOG_VERBOSE=false
+
+# Version checking settings
+DISABLE_VERSION_CHECK=false
+VERSION_CHECK_INTERVAL=24h
+VERSION_CHECK_TIMEOUT=5s
 ```
 
 Key configuration options:
@@ -75,6 +136,47 @@ Key configuration options:
 *   `LLM_CORRECTION_MODEL`: LLM model to use for text correction
 *   `LOG_DEBUG`: Enable debug-level logging (set to `true` or `1`)
 *   `LOG_VERBOSE`: Enable verbose logging including raw transcription text (set to `true` or `1`)
+*   `DISABLE_VERSION_CHECK`: Disable automatic version checking (default: false)
+*   `VERSION_CHECK_INTERVAL`: How often to check for updates (default: 24h)
+*   `VERSION_CHECK_TIMEOUT`: Timeout for version check requests (default: 5s)
+
+## Installation
+
+### Option 1: Go Install (Recommended)
+For users with Go installed:
+```bash
+# Install latest version
+go install github.com/jedwards1230/lil-whisper@latest
+
+# Install specific version  
+go install github.com/jedwards1230/lil-whisper@v1.0.0
+
+# The binary will be installed to $GOPATH/bin or $HOME/go/bin
+```
+
+### Option 2: Direct Download
+For users without Go:
+```bash
+# Download for Apple Silicon (M1/M2)
+curl -L https://github.com/jedwards1230/lil-whisper/releases/latest/download/lil-whisper-darwin-arm64 -o lil-whisper
+
+# Download for Intel Macs
+curl -L https://github.com/jedwards1230/lil-whisper/releases/latest/download/lil-whisper-darwin-amd64 -o lil-whisper
+
+# Make executable and install
+chmod +x lil-whisper
+sudo mv lil-whisper /usr/local/bin/
+```
+
+### Option 3: Built-in Updater
+Once installed, you can update using the CLI itself:
+```bash
+# Check for updates
+lil-whisper version --check
+
+# Update to latest version
+lil-whisper update
+```
 
 ## Usage
 
@@ -105,6 +207,13 @@ Key configuration options:
     
     # Start MCP server for AI assistant integration
     ./lil-whisper mcp
+    
+    # Check version and updates
+    ./lil-whisper version
+    ./lil-whisper version --check
+    
+    # Update to latest version
+    ./lil-whisper update
     ```
 
 ## MCP Integration (Model Context Protocol)
@@ -156,8 +265,14 @@ The service uses a sophisticated PostgreSQL schema:
 - Full-text search and vector similarity search capabilities
 - Automatic deduplication based on file content and processing settings
 
-## Recent Improvements (v0.9)
+## Recent Improvements (v0.10)
 
+- ✅ **Version Management System:** Built-in version checking and automatic updates
+- ✅ **GitHub Release Integration:** Support for both commit-based and release-based updates
+- ✅ **Automated Build Process:** Makefile and scripts with version embedding
+- ✅ **CI/CD Workflows:** GitHub Actions for automated testing and releases
+- ✅ **Background Update Checking:** Non-intrusive automatic version checking
+- ✅ **Configurable Update Behavior:** Environment-based configuration for update checking
 - ✅ **MCP Server Implementation:** Complete Model Context Protocol server with 4 tools for AI assistant integration
 - ✅ **Raw Transcription Storage:** Store full transcriptions alongside chunked content
 - ✅ **Settings-Based Deduplication:** Re-transcribe only when settings change

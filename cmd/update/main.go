@@ -1,0 +1,240 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/jedwards1230/lil-whisper/internal/build"
+	"github.com/jedwards1230/lil-whisper/internal/version"
+)
+
+var (
+	force      = flag.Bool("force", false, "force update even if no newer version is available")
+	checkOnly  = flag.Bool("check", false, "only check for updates, don't perform update")
+	noConfirm  = flag.Bool("yes", false, "skip confirmation prompts")
+)
+
+func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Update lil-whisper to the latest version.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	fmt.Println("Checking for updates...")
+	
+	result, err := version.CheckForUpdates(ctx, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !result.HasUpdate && !*force {
+		fmt.Println("✅ You are already running the latest version.")
+		return
+	}
+
+	if *checkOnly {
+		if result.HasUpdate {
+			fmt.Printf("🎉 Update available!\n")
+			fmt.Printf("%s\n", result.UpdateMessage)
+		} else {
+			fmt.Printf("✅ No updates available.\n")
+		}
+		return
+	}
+
+	if result.HasUpdate {
+		fmt.Printf("🎉 Update available!\n")
+		fmt.Printf("%s\n", result.UpdateMessage)
+	} else if *force {
+		fmt.Printf("⚠️ Forcing update (no newer version detected)\n")
+	}
+
+	if result.UseReleases && result.LatestVersion != "" {
+		if err := updateFromRelease(ctx, result.LatestVersion); err != nil {
+			fmt.Fprintf(os.Stderr, "Error updating from release: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		if err := updateFromSource(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error updating from source: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Println("✅ Update completed successfully!")
+	fmt.Println("Run 'lil-whisper version' to see the new version.")
+}
+
+func updateFromRelease(ctx context.Context, latestVersion string) error {
+	if !*noConfirm {
+		fmt.Printf("\nThis will update lil-whisper to version %s.\n", latestVersion)
+		fmt.Print("Continue? (y/N): ")
+		
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+			fmt.Println("Update cancelled.")
+			return nil
+		}
+	}
+
+	fmt.Printf("Downloading version %s...\n", latestVersion)
+
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("getting current executable path: %w", err)
+	}
+
+	downloadURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/lil-whisper-%s-%s", 
+		version.GitHubRepo, latestVersion, runtime.GOOS, runtime.GOARCH)
+
+	client := &http.Client{Timeout: 2 * time.Minute}
+	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating download request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("downloading binary: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status %d", resp.StatusCode)
+	}
+
+	tempFile := executable + ".tmp"
+	file, err := os.OpenFile(tempFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return fmt.Errorf("creating temporary file: %w", err)
+	}
+
+	_, err = io.Copy(file, resp.Body)
+	file.Close()
+	if err != nil {
+		os.Remove(tempFile)
+		return fmt.Errorf("writing downloaded binary: %w", err)
+	}
+
+	backupFile := executable + ".backup"
+	if err := os.Rename(executable, backupFile); err != nil {
+		os.Remove(tempFile)
+		return fmt.Errorf("creating backup: %w", err)
+	}
+
+	if err := os.Rename(tempFile, executable); err != nil {
+		os.Rename(backupFile, executable)
+		return fmt.Errorf("installing new binary: %w", err)
+	}
+
+	os.Remove(backupFile)
+	return nil
+}
+
+func updateFromSource(ctx context.Context) error {
+	if !*noConfirm {
+		fmt.Print("\nThis will rebuild lil-whisper from the latest source.\nContinue? (y/N): ")
+		
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+			fmt.Println("Update cancelled.")
+			return nil
+		}
+	}
+
+	fmt.Println("Checking if we're in a git repository...")
+	
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git is not available: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-dir")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("not in a git repository - cannot update from source")
+	}
+
+	fmt.Println("Fetching latest changes...")
+	cmd = exec.CommandContext(ctx, "git", "fetch", "origin", "main")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("fetching latest changes: %w", err)
+	}
+
+	fmt.Println("Updating to latest main...")
+	cmd = exec.CommandContext(ctx, "git", "reset", "--hard", "origin/main")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("updating to latest main: %w", err)
+	}
+
+	fmt.Println("Building new binary...")
+	
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("getting current executable path: %w", err)
+	}
+
+	buildArgs := []string{"build", "-o", executable + ".new"}
+	
+	now := time.Now().UTC().Format(time.RFC3339)
+	gitCommit := getGitCommit(ctx)
+	goVer := runtime.Version()
+	
+	// Get module path dynamically
+	modulePath, err := build.GetModulePath()
+	if err != nil {
+		return fmt.Errorf("getting module path: %w", err)
+	}
+	
+	ldflags := fmt.Sprintf("-X '%s/internal/version.Version=dev' -X '%s/internal/version.Commit=%s' -X '%s/internal/version.BuildTime=%s' -X '%s/internal/version.GoVersion=%s'", 
+		modulePath, modulePath, gitCommit, modulePath, now, modulePath, goVer)
+	
+	buildArgs = append(buildArgs, "-ldflags", ldflags, ".")
+
+	cmd = exec.CommandContext(ctx, "go", buildArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	
+	if err := cmd.Run(); err != nil {
+		os.Remove(executable + ".new")
+		return fmt.Errorf("building new binary: %w", err)
+	}
+
+	backupFile := executable + ".backup"
+	if err := os.Rename(executable, backupFile); err != nil {
+		os.Remove(executable + ".new")
+		return fmt.Errorf("creating backup: %w", err)
+	}
+
+	if err := os.Rename(executable+".new", executable); err != nil {
+		os.Rename(backupFile, executable)
+		return fmt.Errorf("installing new binary: %w", err)
+	}
+
+	os.Remove(backupFile)
+	return nil
+}
+
+func getGitCommit(ctx context.Context) string {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
+	output, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(output))
+}

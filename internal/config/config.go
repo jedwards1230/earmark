@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/jedwards1230/lil-whisper/internal/log"
@@ -48,6 +49,11 @@ type Config struct {
 	LLMCorrectionRateLimit   int     `env:"LLM_CORRECTION_RATE_LIMIT"`
 	LLMCorrectionDailyBudget float64 `env:"LLM_CORRECTION_DAILY_BUDGET"`
 	LLMCorrectionTimeoutMin  int     `env:"LLM_CORRECTION_TIMEOUT_MIN"`
+
+	// Version checking config
+	DisableVersionCheck bool          `env:"DISABLE_VERSION_CHECK"`
+	VersionCheckInterval time.Duration `env:"VERSION_CHECK_INTERVAL"`
+	VersionCheckTimeout  time.Duration `env:"VERSION_CHECK_TIMEOUT"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -159,6 +165,31 @@ func LoadConfig() (*Config, error) {
 	config.Debug = parseBoolEnv("DEBUG")
 	config.ResetState = parseBoolEnv("RESET_STATE")
 
+	// Load version checking configuration
+	config.DisableVersionCheck = parseBoolEnv("DISABLE_VERSION_CHECK")
+	
+	// Load version check interval with default (24 hours)
+	if env := os.Getenv("VERSION_CHECK_INTERVAL"); env != "" {
+		if interval, err := time.ParseDuration(env); err == nil {
+			config.VersionCheckInterval = interval
+		} else {
+			return nil, err
+		}
+	} else {
+		config.VersionCheckInterval = 24 * time.Hour
+	}
+	
+	// Load version check timeout with default (5 seconds)
+	if env := os.Getenv("VERSION_CHECK_TIMEOUT"); env != "" {
+		if timeout, err := time.ParseDuration(env); err == nil {
+			config.VersionCheckTimeout = timeout
+		} else {
+			return nil, err
+		}
+	} else {
+		config.VersionCheckTimeout = 5 * time.Second
+	}
+
 	// Resolve and create directories
 	if err := config.initializePaths(); err != nil {
 		return nil, err
@@ -243,4 +274,9 @@ func (c *Config) PrintEnvVars() {
 
 	// Other configuration
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
+	
+	// Version checking configuration
+	logger.Debug("Disable Version Check", "value", c.DisableVersionCheck)
+	logger.Debug("Version Check Interval", "value", c.VersionCheckInterval)
+	logger.Debug("Version Check Timeout", "value", c.VersionCheckTimeout)
 }

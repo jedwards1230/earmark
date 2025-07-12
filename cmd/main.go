@@ -1,11 +1,19 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
 
+	"github.com/jedwards1230/lil-whisper/internal/build"
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -18,6 +26,15 @@ const (
 var rootCmd = &cobra.Command{
 	Use:   "lil-whisper",
 	Short: "A transcription service using Yap and MacOS native APIs",
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Skip version check for version and update commands to avoid recursion
+		if cmd.Name() == "version" || cmd.Name() == "update" {
+			return
+		}
+		
+		// Check for updates in background (non-blocking)
+		go checkForUpdatesBackground()
+	},
 }
 
 var monitorCmd = &cobra.Command{
@@ -100,14 +117,82 @@ Examples:
 	},
 }
 
+var versionCmd = &cobra.Command{
+	Use:                "version",
+	Short:              "Show version information",
+	DisableFlagParsing: true,
+	Long: `Show version information for lil-whisper including version, commit hash, 
+build time, and Go version.
+
+Options:
+  --check     Check for available updates from GitHub
+  --no-cache  Skip cache and force fresh update check
+
+Examples:
+  # Show version information
+  lil-whisper version
+
+  # Check for updates
+  lil-whisper version --check
+
+  # Force fresh update check
+  lil-whisper version --check --no-cache`,
+	Run: func(cmd *cobra.Command, args []string) {
+		runSubCommand("version", args)
+	},
+}
+
+var updateCmd = &cobra.Command{
+	Use:                "update",
+	Short:              "Update lil-whisper to the latest version",
+	DisableFlagParsing: true,
+	Long: `Update lil-whisper to the latest version from GitHub.
+
+This command checks for updates and downloads the latest version, either from
+GitHub releases (when available) or by rebuilding from source.
+
+Options:
+  --force      Force update even if no newer version is available
+  --check      Only check for updates, don't perform update
+  --yes        Skip confirmation prompts
+
+Examples:
+  # Check and update if newer version is available
+  lil-whisper update
+
+  # Only check for updates
+  lil-whisper update --check
+
+  # Force update without prompts
+  lil-whisper update --force --yes`,
+	Run: func(cmd *cobra.Command, args []string) {
+		runSubCommand("update", args)
+	},
+}
+
 func runSubCommand(subCmd string, args []string) {
 	// Build the path to the sub-command binary
 	binaryPath := filepath.Join("cmd", subCmd, "main")
 	
 	// Check if the binary exists, if not try to build it
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		// Try to build the binary
-		buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/"+subCmd)
+		// Get version information for embedding
+		commit := getGitCommit()
+		buildTime := getBuildTime()
+		goVersion := getGoVersion()
+		
+		// Get module path dynamically
+		modulePath, err := build.GetModulePath()
+		if err != nil {
+			log.Fatalf("Failed to get module path: %v", err)
+		}
+		
+		// Build ldflags for version embedding
+		ldflags := fmt.Sprintf("-X '%s/internal/version.Version=%s' -X '%s/internal/version.Commit=%s' -X '%s/internal/version.BuildTime=%s' -X '%s/internal/version.GoVersion=%s'", 
+			modulePath, version.Version, modulePath, commit, modulePath, buildTime, modulePath, goVersion)
+		
+		// Try to build the binary with version embedding
+		buildCmd := exec.Command("go", "build", "-ldflags", ldflags, "-o", binaryPath, "./cmd/"+subCmd)
 		if err := buildCmd.Run(); err != nil {
 			log.Fatalf("Failed to build %s command: %v", subCmd, err)
 		}
@@ -124,12 +209,70 @@ func runSubCommand(subCmd string, args []string) {
 	}
 }
 
+func checkForUpdatesBackground() {
+	// Load configuration to check version check settings
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		// Silently fail if we can't load config
+		return
+	}
+
+	// Check if version checking is disabled
+	if cfg.DisableVersionCheck {
+		return
+	}
+
+	// Create a context with configured timeout for non-intrusive checking
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.VersionCheckTimeout)
+	defer cancel()
+
+	// Check for updates using cache with configured interval
+	result, err := version.CheckForUpdatesWithExpiry(ctx, true, cfg.VersionCheckInterval)
+	if err != nil {
+		// Silently fail - don't interrupt user's workflow
+		return
+	}
+
+	// Only show notification if there's an update available
+	if result.HasUpdate {
+		showUpdateNotification(result)
+	}
+}
+
+func showUpdateNotification(result *version.CheckResult) {
+	// Show a subtle notification about available updates
+	if result.UseReleases && result.LatestVersion != "" {
+		log.Printf("💡 New version %s is available! Run 'lil-whisper update' to upgrade.", result.LatestVersion)
+	} else if result.LatestCommit != "" {
+		log.Printf("💡 Newer version available (commit %s)! Run 'lil-whisper update' to upgrade.", result.LatestCommit[:7])
+	}
+}
+
+func getGitCommit() string {
+	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	output, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func getBuildTime() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func getGoVersion() string {
+	return runtime.Version()
+}
+
 func Run() {
 	rootCmd.AddCommand(monitorCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(mcpCmd)
+	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(updateCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Printf("Error executing command: %v", err)
