@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -78,21 +79,65 @@ func GetInfo() Info {
 		commit = getRuntimeCommit()
 	}
 	
+	buildTime := BuildTime
+	if buildTime == "unknown" {
+		buildTime = getRuntimeBuildTime()
+	}
+	
+	goVersion := GoVersion
+	if goVersion == "unknown" {
+		goVersion = getRuntimeGoVersion()
+	}
+	
 	return Info{
 		Version:   Version,
 		Commit:    commit,
-		BuildTime: BuildTime,
-		GoVersion: GoVersion,
+		BuildTime: buildTime,
+		GoVersion: goVersion,
 	}
 }
 
 func getRuntimeCommit() string {
+	// Get the current commit hash
 	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
 	output, err := cmd.Output()
 	if err != nil {
 		return "unknown"
 	}
-	return strings.TrimSpace(string(output))
+	commit := strings.TrimSpace(string(output))
+	
+	// Check if working tree is dirty (has uncommitted changes)
+	cmd = exec.Command("git", "status", "--porcelain")
+	statusOutput, err := cmd.Output()
+	if err != nil {
+		return commit
+	}
+	
+	// If there are uncommitted changes, add -dirty suffix
+	if len(strings.TrimSpace(string(statusOutput))) > 0 {
+		return commit + "-dirty"
+	}
+	
+	return commit
+}
+
+func getRuntimeBuildTime() string {
+	// Try to get the executable's modification time
+	executable, err := os.Executable()
+	if err != nil {
+		return time.Now().UTC().Format(time.RFC3339)
+	}
+	
+	stat, err := os.Stat(executable)
+	if err != nil {
+		return time.Now().UTC().Format(time.RFC3339)
+	}
+	
+	return stat.ModTime().UTC().Format(time.RFC3339)
+}
+
+func getRuntimeGoVersion() string {
+	return runtime.Version()
 }
 
 func (i Info) String() string {
@@ -215,7 +260,7 @@ func checkCommitVersionWithDebug(ctx context.Context, result *CheckResult, debug
 
 	if resp.StatusCode != http.StatusOK {
 		if debug {
-			fmt.Printf("DEBUG: Commit API returned non-200 status, assuming no updates\n")
+			fmt.Printf("DEBUG: Commit API returned status %d - repository may be private, assuming no updates\n", resp.StatusCode)
 		}
 		return result, nil
 	}
@@ -278,7 +323,7 @@ func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debu
 
 	if resp.StatusCode == http.StatusNotFound {
 		if debug {
-			fmt.Printf("DEBUG: No releases found (404), falling back to commit check\n")
+			fmt.Printf("DEBUG: No releases found (404) - repository may be private, falling back to commit check\n")
 		}
 		return checkCommitVersionWithDebug(ctx, result, debug)
 	}
@@ -348,7 +393,11 @@ func loadCache() *VersionCache {
 		return nil
 	}
 
-	cachePath := filepath.Join(cacheDir, CacheFile)
+	// Include repository name in cache filename to prevent contamination
+	repoSafe := strings.ReplaceAll(GitHubRepo, "/", "_")
+	cacheFileName := fmt.Sprintf("%s_%s", repoSafe, CacheFile)
+	cachePath := filepath.Join(cacheDir, cacheFileName)
+	
 	// #nosec G304 - cachePath is constructed from known safe components
 	data, err := os.ReadFile(filepath.Clean(cachePath))
 	if err != nil {
@@ -369,7 +418,11 @@ func saveCache(cache *VersionCache) {
 		return
 	}
 
-	cachePath := filepath.Join(cacheDir, CacheFile)
+	// Include repository name in cache filename to prevent contamination
+	repoSafe := strings.ReplaceAll(GitHubRepo, "/", "_")
+	cacheFileName := fmt.Sprintf("%s_%s", repoSafe, CacheFile)
+	cachePath := filepath.Join(cacheDir, cacheFileName)
+	
 	data, err := json.Marshal(cache)
 	if err != nil {
 		return
