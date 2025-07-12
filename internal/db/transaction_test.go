@@ -52,6 +52,7 @@ func (mt *MockTransaction) Rollback() error {
 
 // MockDB simulates database behavior for testing atomic transactions
 type MockDB struct {
+	mu           sync.Mutex
 	transactions []*MockTransaction
 	currentTx    int
 	log          MockLogger
@@ -102,12 +103,15 @@ func (mdb *MockDB) simulateProcessTranscriptionCorrection(ctx context.Context, f
 	// This simulates the atomic transaction pattern from ProcessTranscriptionCorrection
 
 	// Start first transaction for status update
+	mdb.mu.Lock()
 	if mdb.currentTx >= len(mdb.transactions) {
+		mdb.mu.Unlock()
 		return errors.New("no more mock transactions available")
 	}
 
 	tx1 := mdb.transactions[mdb.currentTx]
 	mdb.currentTx++
+	mdb.mu.Unlock()
 
 	if err := tx1.Begin(); err != nil {
 		return err
@@ -130,12 +134,15 @@ func (mdb *MockDB) simulateProcessTranscriptionCorrection(ctx context.Context, f
 	correctedText, _, correctionErr := correctionFunc()
 
 	// Start second transaction for final update
+	mdb.mu.Lock()
 	if mdb.currentTx >= len(mdb.transactions) {
+		mdb.mu.Unlock()
 		return errors.New("no more mock transactions available")
 	}
 
 	tx2 := mdb.transactions[mdb.currentTx]
 	mdb.currentTx++
+	mdb.mu.Unlock()
 
 	if err := tx2.Begin(); err != nil {
 		return err

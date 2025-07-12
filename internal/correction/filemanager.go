@@ -41,7 +41,7 @@ func (fm *FileManager) ensureDirectories() error {
 	dirs := []string{fm.rawDir, fm.correctedDir}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0750); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
@@ -110,12 +110,12 @@ func (fm *FileManager) getTextPath(baseDir, audioFilePath, suffix string) string
 func (fm *FileManager) saveTextFile(filePath, content string) error {
 	// Ensure parent directory exists
 	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
 	// Write content to file
-	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(filePath, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write file %s: %w", filePath, err)
 	}
 

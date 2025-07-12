@@ -226,7 +226,7 @@ func getCacheDir() (string, error) {
 	}
 
 	cacheDir := filepath.Join(home, ".cache", "lil-whisper")
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+	if err := os.MkdirAll(cacheDir, 0750); err != nil {
 		return "", err
 	}
 
@@ -265,7 +265,7 @@ func saveCache(cache *VersionCache) {
 		return
 	}
 
-	if err := os.WriteFile(cachePath, data, 0644); err != nil {
+	if err := os.WriteFile(cachePath, data, 0600); err != nil {
 		// Ignore cache write errors, not critical
 		_ = err
 	}

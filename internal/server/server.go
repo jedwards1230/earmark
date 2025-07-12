@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
@@ -35,8 +36,9 @@ func (s *Server) Start() *http.Server {
 	mux.HandleFunc("/search", s.SearchHandler)
 
 	srv := &http.Server{
-		Addr:    ":8080",
-		Handler: mux,
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	go func() {

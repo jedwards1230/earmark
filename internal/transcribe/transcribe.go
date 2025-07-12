@@ -105,7 +105,7 @@ func (t *Transcriber) TranscribeAudio(
 
 	// Create output directory in the raw subdirectory
 	rawDir := filepath.Join(t.config.OutputDir, "raw")
-	err = os.MkdirAll(rawDir, 0755)
+	err = os.MkdirAll(rawDir, 0750)
 	if err != nil {
 		t.log.Error("Failed to create raw output directory", "file", shortPath, "error", err)
 		return "", err
@@ -158,9 +158,19 @@ func (t *Transcriber) TranscribeAudio(
 				case <-ticker.C:
 					var mem runtime.MemStats
 					runtime.ReadMemStats(&mem)
+					// Safely convert uint64 to int64 to avoid overflow
+					allocSize := int64(mem.Alloc)
+					if mem.Alloc > 9223372036854775807 { // max int64
+						allocSize = 9223372036854775807
+					}
+					sysSize := int64(mem.Sys)
+					if mem.Sys > 9223372036854775807 { // max int64
+						sysSize = 9223372036854775807
+					}
+					
 					t.log.Debug("Memory stats",
-						"alloc", formatFileSize(int64(mem.Alloc)),
-						"sys", formatFileSize(int64(mem.Sys)),
+						"alloc", formatFileSize(allocSize),
+						"sys", formatFileSize(sysSize),
 						"num_gc", mem.NumGC)
 				case <-memStatChan:
 					return
@@ -310,7 +320,7 @@ func clearCacheDir(cacheDir string) error {
 	if err := os.RemoveAll(cacheDir); err != nil {
 		return err
 	}
-	return os.MkdirAll(cacheDir, 0755)
+	return os.MkdirAll(cacheDir, 0750)
 }
 
 func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
@@ -328,7 +338,7 @@ func (t *Transcriber) preprocessAudio(audioFilePath string) (string, error) {
 
 	// Build cached file path using the same structure but with .mp3 extension
 	cachedPath := filepath.Join(t.config.CacheDir, strings.TrimSuffix(relPath, filepath.Ext(relPath))+".mp3")
-	if err := os.MkdirAll(filepath.Dir(cachedPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cachedPath), 0750); err != nil {
 		return "", fmt.Errorf("failed to create cache directories: %w", err)
 	}
 

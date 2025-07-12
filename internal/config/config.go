@@ -217,7 +217,7 @@ func resolveAndCreatePath(cwd, path string) string {
 		path = filepath.Join(cwd, path)
 	}
 
-	err := os.MkdirAll(path, 0755)
+	err := os.MkdirAll(path, 0750)
 	if err != nil {
 		// Log error but don't fail - the error will surface when the directory is actually needed
 		// This helps in cases where we don't have permission but the directory might already exist

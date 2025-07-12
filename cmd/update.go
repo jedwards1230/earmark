@@ -133,7 +133,7 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	}
 
 	tempFile := executable + ".tmp"
-	file, err := os.OpenFile(tempFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	file, err := os.OpenFile(tempFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0750)
 	if err != nil {
 		return fmt.Errorf("creating temporary file: %w", err)
 	}
