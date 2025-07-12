@@ -40,7 +40,7 @@ func main() {
 
 	workQueue := queue.NewQueue()
 	fileMonitor := monitor.NewFileMonitor(cfg, workQueue, database)
-	worker := worker.NewWorker(workQueue, database)
+	worker := worker.NewWorker(workQueue, database, cfg)
 
 	// Start monitor first and wait for initial scan to complete
 	monitorReady := make(chan struct{})

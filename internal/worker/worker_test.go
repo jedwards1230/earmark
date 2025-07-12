@@ -424,8 +424,11 @@ func BenchmarkCountWords(b *testing.B) {
 func TestWorkerCreation(t *testing.T) {
 	queue := &queue.Queue{}
 	db := &db.DB{}
+	cfg := &config.Config{
+		LLMCorrectionEnabled: false, // Disable for tests
+	}
 
-	worker := NewWorker(queue, db)
+	worker := NewWorker(queue, db, cfg)
 
 	if worker == nil {
 		t.Error("Expected non-nil worker")

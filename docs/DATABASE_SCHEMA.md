@@ -166,6 +166,10 @@ CREATE TABLE transcriptions (
     file_size BIGINT NOT NULL,
     settings_hash VARCHAR(64) NOT NULL,
     transcription_text TEXT NOT NULL,
+    corrected_text TEXT,
+    correction_status VARCHAR(20) DEFAULT 'pending',
+    correction_error TEXT,
+    correction_metadata JSONB,
     word_count INTEGER NOT NULL,
     processing_duration_ms BIGINT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -185,9 +189,31 @@ CREATE INDEX idx_transcriptions_checksum_settings ON transcriptions(file_checksu
 - `file_checksum`: SHA256 hash of file content
 - `file_size`: File size in bytes
 - `settings_hash`: Hash of processing configuration for cache validation
-- `transcription_text`: Complete raw transcription text
+- `transcription_text`: Complete raw transcription text from Yap
+- `corrected_text`: LLM-corrected transcription text using 3-stage pipeline (nullable)
+- `correction_status`: Status of LLM correction process
+  - `'pending'`: Correction not yet attempted (default)
+  - `'in_progress'`: Currently being processed by LLM
+  - `'completed'`: Successfully corrected through all 3 stages
+  - `'failed'`: Correction failed, fallback to original text
+- `correction_error`: Detailed error message if correction failed (nullable)
+- `correction_metadata`: JSONB metadata about correction process:
+  - `model`: LLM model used for correction
+  - `stages_completed`: Number of pipeline stages completed (1-3)
+  - `total_tokens`: Total tokens used across all stages
+  - `processing_time_ms`: Time spent on LLM correction
+  - `estimated_cost`/`actual_cost`: API cost tracking
+  - `was_chunked`: Whether text required chunking for token limits
+  - `chunks_processed`: Number of text chunks processed
+  - `stages`: Detailed results from each pipeline stage
 - `word_count`: Number of words in transcription
 - `processing_duration_ms`: Transcription processing time in milliseconds
+
+**Dual Storage Strategy**:
+- Raw transcriptions preserved for audit and fallback purposes
+- Corrected text used for chunking and embedding generation
+- Atomic transaction processing prevents inconsistent correction states
+- Only corrected text (or original if correction disabled/failed) is chunked and vectorized
 
 **Deduplication Strategy**:
 - Files identified by content checksum, not path
@@ -302,13 +328,70 @@ SELECT EXISTS(
 SELECT transcription_text, word_count 
 FROM transcriptions 
 WHERE file_path = $1;
+
+-- Check correction status
+SELECT correction_status, correction_error, correction_metadata
+FROM transcriptions 
+WHERE file_path = $1;
+```
+
+### LLM Correction Operations
+
+#### Atomic Correction Processing
+```sql
+-- Set correction status to in_progress (first transaction)
+UPDATE transcriptions 
+SET correction_status = 'in_progress',
+    correction_error = NULL,
+    updated_at = NOW()
+WHERE file_path = $1;
+
+-- Update with successful correction (second transaction)
+UPDATE transcriptions 
+SET corrected_text = $2,
+    correction_status = 'completed',
+    correction_error = NULL,
+    correction_metadata = $3,
+    updated_at = NOW()
+WHERE file_path = $1;
+
+-- Update with failed correction (second transaction alternative)
+UPDATE transcriptions 
+SET correction_status = 'failed',
+    correction_error = $2,
+    updated_at = NOW()
+WHERE file_path = $1;
+```
+
+#### Correction Status Queries
+```sql
+-- Get files stuck in 'in_progress' status (potential crashes)
+SELECT file_path, updated_at
+FROM transcriptions 
+WHERE correction_status = 'in_progress'
+AND updated_at < NOW() - INTERVAL '1 hour';
+
+-- Get correction success rate
+SELECT 
+    correction_status,
+    COUNT(*) as count,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) as percentage
+FROM transcriptions
+WHERE correction_status IN ('completed', 'failed')
+GROUP BY correction_status;
+
+-- Get files needing correction retry
+SELECT file_path, correction_error, updated_at
+FROM transcriptions
+WHERE correction_status = 'failed'
+ORDER BY updated_at DESC;
 ```
 
 ### Analytics Queries
 
 #### Processing Statistics
 ```sql
--- Get comprehensive processing stats
+-- Get comprehensive processing stats including corrections
 SELECT 
     COUNT(DISTINCT a.id) as total_authors,
     COUNT(DISTINCT b.id) as total_books,
@@ -316,12 +399,46 @@ SELECT
     COUNT(v.id) as total_chunks,
     COUNT(t.id) as total_transcriptions,
     SUM(t.word_count) as total_words,
-    AVG(t.processing_duration_ms) as avg_processing_time_ms
+    AVG(t.processing_duration_ms) as avg_processing_time_ms,
+    COUNT(CASE WHEN t.correction_status = 'completed' THEN 1 END) as corrected_files,
+    COUNT(CASE WHEN t.correction_status = 'failed' THEN 1 END) as correction_failures,
+    COUNT(CASE WHEN t.correction_status = 'pending' THEN 1 END) as pending_corrections
 FROM authors a
 LEFT JOIN books b ON a.id = b.author_id
 LEFT JOIN chapters c ON b.id = c.book_id
 LEFT JOIN vectors v ON c.id = v.chapter_id
 LEFT JOIN transcriptions t ON t.file_path LIKE '%' || b.title || '%';
+```
+
+#### LLM Correction Analytics
+```sql
+-- Get detailed correction performance metrics
+SELECT 
+    (correction_metadata->>'model') as model_used,
+    (correction_metadata->>'stages_completed')::int as stages_completed,
+    AVG((correction_metadata->>'total_tokens')::int) as avg_tokens,
+    AVG((correction_metadata->>'processing_time_ms')::int) as avg_correction_time_ms,
+    AVG((correction_metadata->>'actual_cost')::numeric) as avg_cost,
+    COUNT(CASE WHEN (correction_metadata->>'was_chunked')::boolean THEN 1 END) as chunked_files,
+    COUNT(*) as total_corrections
+FROM transcriptions
+WHERE correction_status = 'completed'
+AND correction_metadata IS NOT NULL
+GROUP BY (correction_metadata->>'model'), (correction_metadata->>'stages_completed')::int
+ORDER BY avg_cost DESC;
+
+-- Daily cost tracking
+SELECT 
+    DATE(updated_at) as correction_date,
+    SUM((correction_metadata->>'actual_cost')::numeric) as daily_cost,
+    COUNT(*) as corrections_count,
+    AVG((correction_metadata->>'total_tokens')::int) as avg_tokens_per_correction
+FROM transcriptions
+WHERE correction_status = 'completed'
+AND correction_metadata IS NOT NULL
+AND updated_at >= NOW() - INTERVAL '30 days'
+GROUP BY DATE(updated_at)
+ORDER BY correction_date DESC;
 ```
 
 #### Find Books with Mismatched Chunk Sizes

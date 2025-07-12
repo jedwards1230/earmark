@@ -74,25 +74,38 @@ transcriptions (id, file_path, checksum, text, word_count)
 4. Returns raw transcription text (passed to LLM Correction)
 
 #### 5. LLM Text Correction (`internal/correction/`) 
-**Purpose**: Post-transcription text correction using OpenAI-compatible LLM APIs
+**Purpose**: Production-ready post-transcription text correction using OpenAI-compatible LLM APIs
 
-**Key Features**:
-- Three-stage correction pipeline for optimal accuracy
-- Utilizes book metadata for context-aware corrections
-- OpenAI-compatible API support with configurable endpoints
-- Template-based system prompts for each correction stage
-- Error handling and fallback to original text if corrections fail
+**Core Components**:
+- **Corrector** (`corrector.go`): Main interface with rate limiting and cost control integration
+- **Pipeline** (`pipeline.go`): Three-stage correction workflow with chunking support  
+- **Text Chunker** (`textchunker.go`): Intelligent text splitting for long transcriptions
+- **Rate Limiter** (`ratelimiter.go`): API throttling and daily budget enforcement
+- **File Manager** (`filemanager.go`): Dual storage system for raw and corrected text
+- **Context** (`context.go`): Metadata-aware correction prompts
+- **Templates** (`templates.go`): Stage-specific LLM prompts
 
-**Process Flow**:
-1. **Spelling & Grammar Pass**: Corrects transcription errors, proper nouns, and grammar
+**Production Features**:
+- **Token Limit Handling**: Automatically chunks text exceeding model limits (3000 tokens) with 200-token overlap
+- **Atomic Database Transactions**: Two-phase commit ensures correction status consistency
+- **Rate Limiting**: Configurable requests per minute with automatic throttling
+- **Cost Control**: Daily budget tracking with automatic cutoff to prevent unexpected charges
+- **Dual Text Storage**: Raw transcriptions and corrected text stored separately (database + local files)
+- **Graceful Degradation**: Falls back to original text if correction fails at any stage
+- **Comprehensive Error Handling**: Robust retry logic and detailed error reporting
+
+**Three-Stage Correction Pipeline**:
+1. **Spelling & Grammar Pass**: Corrects transcription errors, proper nouns, and basic grammar
 2. **Formatting Pass**: Ensures consistent formatting, punctuation, and paragraph structure  
-3. **Verification Pass**: Validates that meaning and content remain unchanged from original
-4. Returns final corrected text for chunking and embedding
+3. **Verification Pass**: Final quality check while preserving original meaning
+4. **Chunked Processing**: For long texts, each chunk goes through all stages before reassembly
 
-**Template System**:
-- Metadata-aware prompts including book title, author, series information
-- Stage-specific instructions optimized for each correction type
-- Context preservation to maintain original meaning and intent
+**Advanced Features**:
+- **Context-Aware Prompts**: Uses book title, author, chapter info for accurate corrections
+- **Cost Estimation**: Pre-calculation of API costs with budget checking
+- **Processing Metrics**: Token usage, timing, and success rate tracking  
+- **Configurable Models**: Support for any OpenAI-compatible API endpoint
+- **Fallback Strategies**: Multi-level fallback from stage 3 → stage 2 → stage 1 → original text
 
 #### 6. Text Processing Pipeline
 **Chunker (`internal/chunker/`)**:
@@ -184,12 +197,24 @@ transcriptions (id, file_path, checksum, text, word_count)
 **Purpose**: Centralized configuration with environment variable support
 
 **Key Settings**:
-- Database connection parameters
-- OpenAI API configuration (includes LLM correction endpoints)
-- Directory paths for audio and cache
-- Processing parameters (chunk size, thresholds)
-- LLM correction settings (model, temperature, retry logic)
-- Feature flags and operational settings
+- **Database**: Connection parameters for PostgreSQL with pgvector
+- **OpenAI API**: Base URL, API keys for both embeddings and LLM correction
+- **Directories**: Audio input, cache, output paths for raw and corrected text
+- **Processing**: Chunk sizes, similarity thresholds, token limits
+
+**LLM Correction Configuration**:
+- `LLM_CORRECTION_ENABLED`: Enable/disable LLM correction (default: false)
+- `LLM_CORRECTION_MODEL`: Model name (default: "gpt-4o-mini")
+- `LLM_CORRECTION_BASE_URL`: API endpoint URL (default: OpenAI)
+- `LLM_CORRECTION_API_KEY`: API key (default: uses OpenAI key)
+- `LLM_CORRECTION_TEMPERATURE`: Response randomness (default: 0.1)
+- `LLM_CORRECTION_MAX_RETRIES`: Retry attempts (default: 3)
+- `LLM_CORRECTION_MAX_TOKENS`: Token limit per request (default: 4000)
+- `LLM_CORRECTION_RATE_LIMIT`: Requests per minute (default: 10)
+- `LLM_CORRECTION_DAILY_BUDGET`: Daily cost limit in USD (default: $10.00)
+- `LLM_CORRECTION_TIMEOUT_MIN`: Request timeout (default: 30 minutes)
+
+**Feature Flags**: Debug mode, reset state, correction enablement
 
 #### 12. Metadata System (`internal/meta/`)
 **Purpose**: Extracts and manages book/chapter metadata
@@ -217,25 +242,42 @@ transcriptions (id, file_path, checksum, text, word_count)
 ```
 [Audio Files] → [Monitor] → [Queue] → [Worker] → [Transcriber] → [Raw Text]
                     ↓           ↑         ↓                          ↓
-                [Database] ←────┴─────[LLM Corrector] ← [Metadata Context]
+                [Database] ←────┴─────[File Manager] ←──────── [Raw Text Storage]
                     ↑                     ↓
-                    ↑              [Corrected Text]
+                    ↑              [LLM Corrector] ← [Metadata Context]
+                    ↑                     ↓
+                    ↑              [Rate Limiter] → [Cost Control]
+                    ↑                     ↓
+                    ↑              [3-Stage Pipeline]:
+                    ↑                ├─ Spelling/Grammar
+                    ↑                ├─ Formatting  
+                    ↑                └─ Verification
+                    ↑                     ↓
+                    ↑              [Text Chunker] (for long texts)
+                    ↑                     ↓
+                    ↑              [Corrected Text] → [Corrected Text Storage]
+                    ↑                     ↓                    ↓
+                    ↑              [Atomic DB Update] ← [File Manager]
                     ↑                     ↓
                     ↑              [Chunker] → [OpenAI Embeddings] → [Database]
                     ↑                                                     ↓
                     ├─────[Web Server] ←──────────────────────────────[Database]
                     ↓
-                [MCP Server] (planned)
+                [MCP Server] ✅ COMPLETED
 ```
 
 ### Service Dependencies
 1. **Monitor** depends on: Database, Queue, Meta parsers
-2. **Worker** depends on: Queue, Database, Transcriber, LLM Corrector, Chunker, OpenAI
-3. **LLM Corrector** depends on: OpenAI-compatible API, Metadata system
-4. **Web Server** depends on: Database
-5. **MCP Server** depends on: Database (same as Web Server)
-6. **Database** depends on: OpenAI (for embeddings), Chunker
-7. **Transcriber** depends on: External Yap tool
+2. **Worker** depends on: Queue, Database, Transcriber, LLM Corrector, File Manager, Chunker, OpenAI
+3. **LLM Corrector** depends on: OpenAI-compatible API, Pipeline, Rate Limiter, Text Chunker, Metadata system
+4. **Pipeline** depends on: OpenAI Client, Templates, Text Chunker
+5. **Rate Limiter** depends on: Time-based tracking, Cost estimation
+6. **File Manager** depends on: Local filesystem, Configuration
+7. **Text Chunker** depends on: Tokenizer, Sentence boundary detection
+8. **Web Server** depends on: Database
+9. **MCP Server** depends on: Database (same as Web Server)
+10. **Database** depends on: OpenAI (for embeddings), Chunker, PostgreSQL with pgvector
+11. **Transcriber** depends on: External Yap tool
 
 ### Communication Patterns
 - **Synchronous**: Direct function calls within components, LLM API calls
@@ -243,16 +285,21 @@ transcriptions (id, file_path, checksum, text, word_count)
 - **Event-driven**: Filesystem monitoring with fsnotify
 - **Request-response**: HTTP API for search queries and LLM correction calls
 
-## Planned Components
+## Production Safety & Monitoring
 
-### MCP Server (Model Context Protocol)
-**Purpose**: Expose transcription service capabilities to LLM applications and AI assistants
+### LLM Correction Safety Features
+- **Cost Control**: Daily budget limits prevent unexpected API charges
+- **Rate Limiting**: Automatic throttling prevents API quota exhaustion  
+- **Atomic Transactions**: Two-phase commit ensures data consistency
+- **Graceful Degradation**: Multiple fallback strategies maintain service availability
+- **Token Management**: Automatic chunking prevents model limit violations
+- **Error Recovery**: Comprehensive retry logic with exponential backoff
 
-**Key Features**:
-- **Tools**: search, list_books, get_book_info, get_chapter, transcription_status
-- **Resources**: book://{id}, search://{query}, stats://library  
-- **Library**: `github.com/mark3labs/mcp-go`
-- **Integration**: Parallel to HTTP server, sharing database layer
+### Monitoring & Observability
+- **Processing Metrics**: Token usage, cost tracking, timing statistics
+- **Correction Status**: Success rates, failure modes, fallback usage
+- **Database Health**: Transaction success, consistency checks
+- **API Performance**: Response times, rate limit status, error rates
 
 ## Scalability Considerations
 
@@ -270,8 +317,21 @@ transcriptions (id, file_path, checksum, text, word_count)
 - Horizontal scaling of workers
 
 ## Security Features
-- SHA256 checksums for file integrity
-- Environment variable configuration
-- Input validation in API endpoints
-- PostgreSQL prepared statements
-- No credential storage in code
+
+### Data Protection
+- **SHA256 Checksums**: File integrity verification and deduplication
+- **Dual Storage**: Raw and corrected text stored separately for audit trails
+- **Database Transactions**: ACID compliance with atomic operations
+- **Input Validation**: Comprehensive validation in all API endpoints
+
+### API Security  
+- **Rate Limiting**: Prevents API abuse and cost runaway
+- **Budget Controls**: Hard limits on daily LLM API spending
+- **Timeout Protection**: Request timeouts prevent hung operations
+- **Error Sanitization**: Sensitive information filtered from error responses
+
+### Configuration Security
+- **Environment Variables**: No hardcoded secrets or credentials
+- **PostgreSQL Prepared Statements**: SQL injection prevention
+- **API Key Management**: Separate keys for different services
+- **Secure Defaults**: Conservative default settings for production safety

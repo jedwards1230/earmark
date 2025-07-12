@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -34,16 +35,20 @@ type Statistics struct {
 }
 
 type Transcription struct {
-	ID                   int    `json:"id"`
-	FilePath             string `json:"file_path"`
-	FileChecksum         string `json:"file_checksum"`
-	FileSize             int64  `json:"file_size"`
-	SettingsHash         string `json:"settings_hash"`
-	TranscriptionText    string `json:"transcription_text"`
-	WordCount            int    `json:"word_count"`
-	ProcessingDurationMs int64  `json:"processing_duration_ms"`
-	CreatedAt            string `json:"created_at"`
-	UpdatedAt            string `json:"updated_at"`
+	ID                   int     `json:"id"`
+	FilePath             string  `json:"file_path"`
+	FileChecksum         string  `json:"file_checksum"`
+	FileSize             int64   `json:"file_size"`
+	SettingsHash         string  `json:"settings_hash"`
+	TranscriptionText    string  `json:"transcription_text"`
+	CorrectedText        *string `json:"corrected_text,omitempty"`
+	CorrectionStatus     string  `json:"correction_status"`
+	CorrectionError      *string `json:"correction_error,omitempty"`
+	CorrectionMetadata   *string `json:"correction_metadata,omitempty"`
+	WordCount            int     `json:"word_count"`
+	ProcessingDurationMs int64   `json:"processing_duration_ms"`
+	CreatedAt            string  `json:"created_at"`
+	UpdatedAt            string  `json:"updated_at"`
 }
 
 type DB struct {
@@ -164,6 +169,10 @@ func (db *DB) initialize(ctx context.Context) error {
             file_size BIGINT NOT NULL,
             settings_hash TEXT NOT NULL,
             transcription_text TEXT NOT NULL,
+            corrected_text TEXT,
+            correction_status VARCHAR(20) DEFAULT 'pending',
+            correction_error TEXT,
+            correction_metadata JSONB,
             word_count INTEGER,
             processing_duration_ms BIGINT,
             created_at TIMESTAMP DEFAULT NOW(),
@@ -186,6 +195,18 @@ func (db *DB) initialize(ctx context.Context) error {
     `); err != nil {
 		db.log.Warn("Warning: schema creation failed", "error", err)
 		return fmt.Errorf("failed creating schema: %v", err)
+	}
+
+	// Add LLM correction columns to existing transcriptions tables (migration)
+	if _, err := tx.Exec(ctx, `
+        ALTER TABLE transcriptions 
+        ADD COLUMN IF NOT EXISTS corrected_text TEXT,
+        ADD COLUMN IF NOT EXISTS correction_status VARCHAR(20) DEFAULT 'pending',
+        ADD COLUMN IF NOT EXISTS correction_error TEXT,
+        ADD COLUMN IF NOT EXISTS correction_metadata JSONB;
+    `); err != nil {
+		db.log.Warn("Warning: LLM correction column migration failed", "error", err)
+		// Don't fail initialization for migration errors
 	}
 
 	return tx.Commit(ctx)
@@ -783,8 +804,9 @@ func (db *DB) GetTranscription(ctx context.Context, filePath string) (*Transcrip
 	var transcription Transcription
 	err := db.conn.QueryRow(ctx, `
         SELECT id, file_path, file_checksum, file_size, settings_hash,
-               transcription_text, word_count, processing_duration_ms,
-               created_at, updated_at
+               transcription_text, corrected_text, correction_status, 
+               correction_error, correction_metadata, word_count, 
+               processing_duration_ms, created_at, updated_at
         FROM transcriptions
         WHERE file_path = $1
     `, filePath).Scan(
@@ -794,6 +816,10 @@ func (db *DB) GetTranscription(ctx context.Context, filePath string) (*Transcrip
 		&transcription.FileSize,
 		&transcription.SettingsHash,
 		&transcription.TranscriptionText,
+		&transcription.CorrectedText,
+		&transcription.CorrectionStatus,
+		&transcription.CorrectionError,
+		&transcription.CorrectionMetadata,
 		&transcription.WordCount,
 		&transcription.ProcessingDurationMs,
 		&transcription.CreatedAt,
@@ -805,6 +831,228 @@ func (db *DB) GetTranscription(ctx context.Context, filePath string) (*Transcrip
 	}
 
 	return &transcription, nil
+}
+
+// UpdateCorrectedText updates an existing transcription with corrected text
+func (db *DB) UpdateCorrectedText(ctx context.Context, filePath, correctedText string, metadata map[string]interface{}) error {
+	var metadataJSON *string
+	if metadata != nil {
+		jsonBytes, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal correction metadata: %w", err)
+		}
+		jsonStr := string(jsonBytes)
+		metadataJSON = &jsonStr
+	}
+
+	_, err := db.conn.Exec(ctx, `
+        UPDATE transcriptions 
+        SET corrected_text = $2,
+            correction_status = 'completed',
+            correction_error = NULL,
+            correction_metadata = $3,
+            updated_at = NOW()
+        WHERE file_path = $1
+    `, filePath, correctedText, metadataJSON)
+
+	if err != nil {
+		return fmt.Errorf("failed to update corrected text: %w", err)
+	}
+
+	db.log.Debug("Updated corrected text", "file_path", filePath)
+	return nil
+}
+
+// UpdateCorrectionStatus updates the correction status for a transcription
+func (db *DB) UpdateCorrectionStatus(ctx context.Context, filePath, status string, errorMsg *string) error {
+	_, err := db.conn.Exec(ctx, `
+        UPDATE transcriptions 
+        SET correction_status = $2,
+            correction_error = $3,
+            updated_at = NOW()
+        WHERE file_path = $1
+    `, filePath, status, errorMsg)
+
+	if err != nil {
+		return fmt.Errorf("failed to update correction status: %w", err)
+	}
+
+	db.log.Debug("Updated correction status", "file_path", filePath, "status", status)
+	return nil
+}
+
+// GetTranscriptionsForCorrection retrieves transcriptions that need LLM correction
+func (db *DB) GetTranscriptionsForCorrection(ctx context.Context, limit int) ([]*Transcription, error) {
+	rows, err := db.conn.Query(ctx, `
+        SELECT id, file_path, file_checksum, file_size, settings_hash,
+               transcription_text, corrected_text, correction_status,
+               correction_error, correction_metadata, word_count,
+               processing_duration_ms, created_at, updated_at
+        FROM transcriptions
+        WHERE correction_status = 'pending' OR corrected_text IS NULL
+        ORDER BY created_at ASC
+        LIMIT $1
+    `, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query transcriptions for correction: %w", err)
+	}
+	defer rows.Close()
+
+	var transcriptions []*Transcription
+	for rows.Next() {
+		var t Transcription
+		err := rows.Scan(
+			&t.ID,
+			&t.FilePath,
+			&t.FileChecksum,
+			&t.FileSize,
+			&t.SettingsHash,
+			&t.TranscriptionText,
+			&t.CorrectedText,
+			&t.CorrectionStatus,
+			&t.CorrectionError,
+			&t.CorrectionMetadata,
+			&t.WordCount,
+			&t.ProcessingDurationMs,
+			&t.CreatedAt,
+			&t.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan transcription: %w", err)
+		}
+		transcriptions = append(transcriptions, &t)
+	}
+
+	return transcriptions, nil
+}
+
+// ProcessTranscriptionCorrection handles the entire correction process atomically
+func (db *DB) ProcessTranscriptionCorrection(ctx context.Context, filePath string, correctionFunc func() (string, map[string]interface{}, error)) error {
+	// Start transaction for atomic correction processing
+	tx, err := db.conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin correction transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Set status to in_progress
+	_, err = tx.Exec(ctx, `
+        UPDATE transcriptions 
+        SET correction_status = 'in_progress',
+            correction_error = NULL,
+            updated_at = NOW()
+        WHERE file_path = $1
+    `, filePath)
+	
+	if err != nil {
+		return fmt.Errorf("failed to update correction status: %w", err)
+	}
+
+	// Commit the status update first
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit status update: %w", err)
+	}
+
+	// Perform the correction (this may take a long time)
+	correctedText, metadata, correctionErr := correctionFunc()
+
+	// Start new transaction for final update
+	tx, err = db.conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin final transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if correctionErr != nil {
+		// Update with error status
+		errorMsg := correctionErr.Error()
+		_, err = tx.Exec(ctx, `
+            UPDATE transcriptions 
+            SET correction_status = 'failed',
+                correction_error = $2,
+                updated_at = NOW()
+            WHERE file_path = $1
+        `, filePath, errorMsg)
+		
+		if err != nil {
+			db.log.Error("Failed to update failed correction status", "error", err)
+		} else {
+			tx.Commit(ctx)
+		}
+		
+		return fmt.Errorf("correction failed: %w", correctionErr)
+	}
+
+	// Update with successful correction
+	var metadataJSON *string
+	if metadata != nil {
+		jsonBytes, err := json.Marshal(metadata)
+		if err != nil {
+			db.log.Warn("Failed to marshal correction metadata", "error", err)
+		} else {
+			jsonStr := string(jsonBytes)
+			metadataJSON = &jsonStr
+		}
+	}
+
+	_, err = tx.Exec(ctx, `
+        UPDATE transcriptions 
+        SET corrected_text = $2,
+            correction_status = 'completed',
+            correction_error = NULL,
+            correction_metadata = $3,
+            updated_at = NOW()
+        WHERE file_path = $1
+    `, filePath, correctedText, metadataJSON)
+
+	if err != nil {
+		return fmt.Errorf("failed to update corrected text: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit correction: %w", err)
+	}
+
+	db.log.Debug("Correction processed atomically", "file_path", filePath)
+	return nil
+}
+
+// GetCorrectionStatus returns the current correction status for a file
+func (db *DB) GetCorrectionStatus(ctx context.Context, filePath string) (status string, err error) {
+	err = db.conn.QueryRow(ctx, `
+        SELECT COALESCE(correction_status, 'pending')
+        FROM transcriptions
+        WHERE file_path = $1
+    `, filePath).Scan(&status)
+	
+	if err != nil {
+		return "", fmt.Errorf("failed to get correction status: %w", err)
+	}
+	
+	return status, nil
+}
+
+// CleanupStaleCorrections resets any corrections that have been in_progress for too long
+func (db *DB) CleanupStaleCorrections(ctx context.Context, timeoutMinutes int) (int, error) {
+	result, err := db.conn.Exec(ctx, `
+        UPDATE transcriptions 
+        SET correction_status = 'pending',
+            correction_error = 'Reset due to timeout',
+            updated_at = NOW()
+        WHERE correction_status = 'in_progress'
+        AND updated_at < NOW() - INTERVAL '%d minutes'
+    `, timeoutMinutes)
+	
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup stale corrections: %w", err)
+	}
+	
+	rowsAffected := result.RowsAffected()
+	if rowsAffected > 0 {
+		db.log.Info("Cleaned up stale corrections", "count", rowsAffected)
+	}
+	
+	return int(rowsAffected), nil
 }
 
 // GetChunkContext retrieves surrounding chunks for a given chunk ID

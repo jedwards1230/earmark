@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"time"
 	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/correction"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/log"
 	"github.com/jedwards1230/lil-whisper/internal/meta"
@@ -17,24 +18,35 @@ import (
 )
 
 type Worker struct {
-	queue  *queue.Queue
-	done   chan struct{}
-	ctx    context.Context
-	cancel context.CancelFunc
-	db     *db.DB
-	log    log.Logger
+	queue       *queue.Queue
+	done        chan struct{}
+	ctx         context.Context
+	cancel      context.CancelFunc
+	db          *db.DB
+	corrector   correction.Corrector
+	fileManager *correction.FileManager
+	log         log.Logger
 }
 
-func NewWorker(q *queue.Queue, db *db.DB) *Worker {
+func NewWorker(q *queue.Queue, db *db.DB, cfg *config.Config) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := log.NewLogger("worker")
+	
+	// Initialize LLM corrector
+	corrector := correction.New(cfg)
+	
+	// Initialize file manager for dual text storage
+	fileManager := correction.NewFileManager(cfg)
+	
 	return &Worker{
-		queue:  q,
-		done:   make(chan struct{}),
-		ctx:    ctx,
-		cancel: cancel,
-		db:     db,
-		log:    logger,
+		queue:       q,
+		done:        make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
+		db:          db,
+		corrector:   corrector,
+		fileManager: fileManager,
+		log:         logger,
 	}
 }
 
@@ -99,7 +111,65 @@ func (w *Worker) Start(cfg *config.Config) {
 				"title", queueItem.Metadata.Title,
 				"duration", duration)
 
-			if err := w.db.InsertContentWithMetadata(w.ctx, content, fileMeta); err != nil {
+			// Save raw transcription text to local file
+			if err := w.fileManager.SaveRawText(queueItem.FilePath, content); err != nil {
+				w.log.Warn("Failed to save raw text file", "error", err)
+				// Don't fail the entire process for file save errors
+			}
+
+			// LLM Text Correction step
+			correctionStart := time.Now()
+			finalContent := content // Default to original content
+			
+			if w.corrector.IsEnabled() {
+				w.log.Debug("Starting LLM text correction", 
+					"file", queueItem.FilePath, 
+					"chapter", fileMeta.Chapter)
+				
+				// Use atomic correction processing
+				err := w.db.ProcessTranscriptionCorrection(w.ctx, queueItem.FilePath, func() (string, map[string]interface{}, error) {
+					// This function runs the actual correction
+					correctionResult, err := w.corrector.CorrectText(w.ctx, content, fileMeta)
+					if err != nil {
+						return "", nil, err
+					}
+					return correctionResult.CorrectedText, correctionResult.Metadata, nil
+				})
+				
+				if err != nil {
+					w.log.Error("LLM correction failed, using original text",
+						"chapter", fileMeta.Chapter,
+						"title", queueItem.Metadata.Title,
+						"error", err)
+					// finalContent remains as original content
+				} else {
+					// Get the corrected text from database
+					transcription, err := w.db.GetTranscription(w.ctx, queueItem.FilePath)
+					if err != nil {
+						w.log.Error("Failed to retrieve corrected text", "error", err)
+						// Use original content as fallback
+					} else if transcription.CorrectedText != nil && *transcription.CorrectedText != "" {
+						finalContent = *transcription.CorrectedText
+						correctionDuration := time.Since(correctionStart).Round(time.Millisecond)
+						
+						w.log.Info("LLM correction completed",
+							"chapter", fileMeta.Chapter,
+							"title", queueItem.Metadata.Title,
+							"correction_duration", correctionDuration)
+						
+						// Save corrected text to local file
+						if err := w.fileManager.SaveCorrectedText(queueItem.FilePath, finalContent); err != nil {
+							w.log.Warn("Failed to save corrected text file", "error", err)
+							// Don't fail the entire process for file save errors
+						}
+					}
+				}
+			} else {
+				w.log.Debug("LLM correction disabled, using original text")
+			}
+
+			// Use corrected content (or original if correction failed/disabled) for chunking and embedding
+			if err := w.db.InsertContentWithMetadata(w.ctx, finalContent, fileMeta); err != nil {
 				w.log.Error("Failed to store chapter",
 					"chapter", fileMeta.Chapter,
 					"title", queueItem.Metadata.Title,

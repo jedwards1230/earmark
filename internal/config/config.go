@@ -34,6 +34,20 @@ type Config struct {
 	// OpenAI API config
 	OpenAIAPIKey  string `env:"OPENAI_API_KEY"`
 	OpenAIBaseURL string `env:"OPENAI_BASE_URL"`
+
+	// LLM Correction config
+	LLMCorrectionEnabled     bool    `env:"LLM_CORRECTION_ENABLED"`
+	LLMCorrectionModel       string  `env:"LLM_CORRECTION_MODEL"`
+	LLMCorrectionBaseURL     string  `env:"LLM_CORRECTION_BASE_URL"`
+	LLMCorrectionAPIKey      string  `env:"LLM_CORRECTION_API_KEY"`
+	LLMCorrectionTemperature float32 `env:"LLM_CORRECTION_TEMPERATURE"`
+	LLMCorrectionMaxRetries  int     `env:"LLM_CORRECTION_MAX_RETRIES"`
+	LLMCorrectionMaxTokens   int     `env:"LLM_CORRECTION_MAX_TOKENS"`
+
+	// Rate limiting and cost control
+	LLMCorrectionRateLimit   int     `env:"LLM_CORRECTION_RATE_LIMIT"`
+	LLMCorrectionDailyBudget float64 `env:"LLM_CORRECTION_DAILY_BUDGET"`
+	LLMCorrectionTimeoutMin  int     `env:"LLM_CORRECTION_TIMEOUT_MIN"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -73,6 +87,73 @@ func LoadConfig() (*Config, error) {
 	// Load OpenAI configuration
 	config.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
 	config.OpenAIBaseURL = getEnvOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+	// Load LLM Correction configuration
+	config.LLMCorrectionEnabled = parseBoolEnv("LLM_CORRECTION_ENABLED")
+	config.LLMCorrectionModel = getEnvOrDefault("LLM_CORRECTION_MODEL", "gpt-4o-mini")
+	config.LLMCorrectionBaseURL = getEnvOrDefault("LLM_CORRECTION_BASE_URL", config.OpenAIBaseURL)
+	config.LLMCorrectionAPIKey = getEnvOrDefault("LLM_CORRECTION_API_KEY", config.OpenAIAPIKey)
+	
+	if env := os.Getenv("LLM_CORRECTION_TEMPERATURE"); env != "" {
+		if temp, err := strconv.ParseFloat(env, 32); err == nil {
+			config.LLMCorrectionTemperature = float32(temp)
+		} else {
+			return nil, err
+		}
+	} else {
+		config.LLMCorrectionTemperature = 0.1
+	}
+
+	if env := os.Getenv("LLM_CORRECTION_MAX_RETRIES"); env != "" {
+		if retries, err := strconv.Atoi(env); err == nil {
+			config.LLMCorrectionMaxRetries = retries
+		} else {
+			return nil, err
+		}
+	} else {
+		config.LLMCorrectionMaxRetries = 3
+	}
+
+	if env := os.Getenv("LLM_CORRECTION_MAX_TOKENS"); env != "" {
+		if tokens, err := strconv.Atoi(env); err == nil {
+			config.LLMCorrectionMaxTokens = tokens
+		} else {
+			return nil, err
+		}
+	} else {
+		config.LLMCorrectionMaxTokens = 4000
+	}
+
+	// Load rate limiting and cost control
+	if env := os.Getenv("LLM_CORRECTION_RATE_LIMIT"); env != "" {
+		if limit, err := strconv.Atoi(env); err == nil {
+			config.LLMCorrectionRateLimit = limit
+		} else {
+			return nil, err
+		}
+	} else {
+		config.LLMCorrectionRateLimit = 10 // 10 requests per minute
+	}
+
+	if env := os.Getenv("LLM_CORRECTION_DAILY_BUDGET"); env != "" {
+		if budget, err := strconv.ParseFloat(env, 64); err == nil {
+			config.LLMCorrectionDailyBudget = budget
+		} else {
+			return nil, err
+		}
+	} else {
+		config.LLMCorrectionDailyBudget = 10.0 // $10 per day default
+	}
+
+	if env := os.Getenv("LLM_CORRECTION_TIMEOUT_MIN"); env != "" {
+		if timeout, err := strconv.Atoi(env); err == nil {
+			config.LLMCorrectionTimeoutMin = timeout
+		} else {
+			return nil, err
+		}
+	} else {
+		config.LLMCorrectionTimeoutMin = 30 // 30 minutes default
+	}
 
 	// Load boolean flags
 	config.Debug = parseBoolEnv("DEBUG")

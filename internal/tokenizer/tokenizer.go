@@ -44,3 +44,12 @@ func DecodeTokens(tokens []int) (string, error) {
 
 	return content, nil
 }
+
+// CountTokens returns the number of tokens in the given text
+func CountTokens(content string) (int, error) {
+	tokens, err := GetTokens(content)
+	if err != nil {
+		return 0, err
+	}
+	return len(tokens), nil
+}
