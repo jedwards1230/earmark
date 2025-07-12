@@ -32,8 +32,19 @@ permissions:
   pull-requests: write
 
 jobs:
-  release:
+  calculate-version:
+    uses: ./.github/workflows/calculate-version.yml
+    with:
+      version_type: ${{ github.event.inputs.version_type }}
+      custom_version: ${{ github.event.inputs.custom_version }}
+      working_directory: '.'
+    secrets: inherit
+
+  build:
+    needs: calculate-version
     runs-on: ubuntu-latest
+    outputs:
+      artifacts-built: ${{ steps.check-artifacts.outputs.artifacts-built }}
     
     steps:
     - name: Checkout code
@@ -47,184 +58,59 @@ jobs:
       with:
         go-version: '1.23'
 
-    - name: Configure Git
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-
-    - name: Get current version
-      id: current_version
-      run: |
-        # Get the latest tag, or default to v0.0.0 if no tags exist
-        CURRENT_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-        echo "current_version=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
-        echo "Current version: ${CURRENT_VERSION}"
-
-    - name: Calculate new version
-      id: new_version
-      run: |
-        CURRENT_VERSION="${{ steps.current_version.outputs.current_version }}"
-        CUSTOM_VERSION="${{ github.event.inputs.custom_version }}"
-        VERSION_TYPE="${{ github.event.inputs.version_type }}"
-        
-        if [ -n "${CUSTOM_VERSION}" ]; then
-          # Use custom version if provided
-          NEW_VERSION="${CUSTOM_VERSION}"
-          # Ensure it starts with 'v'
-          if [[ ! "${NEW_VERSION}" =~ ^v ]]; then
-            NEW_VERSION="v${NEW_VERSION}"
-          fi
-        else
-          # Parse current version (remove 'v' prefix)
-          VERSION_NUMBERS=${CURRENT_VERSION#v}
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION_NUMBERS}"
-          
-          # Default to 0 if parsing fails
-          MAJOR=${MAJOR:-0}
-          MINOR=${MINOR:-0}
-          PATCH=${PATCH:-0}
-          
-          # Increment based on type
-          case "${VERSION_TYPE}" in
-            major)
-              MAJOR=$((MAJOR + 1))
-              MINOR=0
-              PATCH=0
-              ;;
-            minor)
-              MINOR=$((MINOR + 1))
-              PATCH=0
-              ;;
-            patch)
-              PATCH=$((PATCH + 1))
-              ;;
-          esac
-          
-          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
-        fi
-        
-        echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
-        echo "New version: ${NEW_VERSION}"
-
-    - name: Generate changelog
-      id: changelog
-      env:
-        GITHUB_REPOSITORY: ${{ github.repository }}
-      run: |
-        CURRENT_VERSION="${{ steps.current_version.outputs.current_version }}"
-        NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
-        
-        echo "Generating changelog from ${CURRENT_VERSION} to ${NEW_VERSION}"
-        
-        # Get commits since last tag
-        if [ "${CURRENT_VERSION}" = "v0.0.0" ]; then
-          # First release - get all commits
-          COMMITS=$(git log --pretty=format:"- %s" --no-merges)
-        else
-          # Get commits since last tag
-          COMMITS=$(git log ${CURRENT_VERSION}..HEAD --pretty=format:"- %s" --no-merges)
-        fi
-        
-        # Create changelog
-        echo "## What's Changed" > changelog.md
-        echo "" >> changelog.md
-        echo "${COMMITS}" >> changelog.md
-        echo "" >> changelog.md
-        echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${CURRENT_VERSION}...${NEW_VERSION}" >> changelog.md
-        
-        echo "changelog_file=changelog.md" >> $GITHUB_OUTPUT
-
-    - name: Create and push tag
-      run: |
-        NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
-        git tag -a "${NEW_VERSION}" -m "Release ${NEW_VERSION}"
-        git push origin "${NEW_VERSION}"
-
-    - name: Create and push moving version tags
-      run: |
-        NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
-        
-        # Extract version components (remove 'v' prefix if present)
-        VERSION_NUMBERS=${NEW_VERSION#v}
-        IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION_NUMBERS}"
-        
-        # Create major version tag (e.g., v0 for v0.1.9)
-        MAJOR_TAG="v${MAJOR}"
-        echo "Creating/updating major version tag: ${MAJOR_TAG}"
-        git tag -f -a "${MAJOR_TAG}" -m "Latest ${MAJOR}.x.x release: ${NEW_VERSION}"
-        git push -f origin "${MAJOR_TAG}"
-        
-        # Create minor version tag (e.g., v0.1 for v0.1.9)
-        MINOR_TAG="v${MAJOR}.${MINOR}"
-        echo "Creating/updating minor version tag: ${MINOR_TAG}"
-        git tag -f -a "${MINOR_TAG}" -m "Latest ${MAJOR}.${MINOR}.x release: ${NEW_VERSION}"
-        git push -f origin "${MINOR_TAG}"
-        
-        echo "✅ Created moving version tags:"
-        echo "  - ${NEW_VERSION} (specific version)"
-        echo "  - ${MINOR_TAG} (latest ${MAJOR}.${MINOR}.x)"
-        echo "  - ${MAJOR_TAG} (latest ${MAJOR}.x.x)"
-
     - name: Build release binaries
+      env:
+        VERSION: ${{ needs.calculate-version.outputs.new_version }}
       run: |
-        NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
+        echo "Building with version: ${VERSION}"
         
         # Create dist directory
         mkdir -p dist
         
-        # Build for macOS only (Yap requires macOS hardware)
-        platforms=(
-          "darwin/amd64"
-          "darwin/arm64"
-        )
+        # Build for ARM macOS only (Yap requires macOS hardware)
+        GOOS="darwin"
+        GOARCH="arm64"
+        output_name="lil-whisper-${GOOS}-${GOARCH}"
         
-        for platform in "${platforms[@]}"; do
-          IFS='/' read -r GOOS GOARCH <<< "${platform}"
-          
-          output_name="lil-whisper-${GOOS}-${GOARCH}"
-          
-          echo "Building for ${GOOS}/${GOARCH}..."
-          
-          GOOS="${GOOS}" GOARCH="${GOARCH}" VERSION="${NEW_VERSION}" \
-            OUTPUT="dist/${output_name}" ./scripts/build.sh
-        done
+        echo "Building for ${GOOS}/${GOARCH}..."
+        
+        GOOS="${GOOS}" GOARCH="${GOARCH}" VERSION="${VERSION}" \
+          OUTPUT="dist/${output_name}" ./scripts/build.sh
         
         # List built files
         ls -la dist/
 
-    - name: Create release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.new_version.outputs.new_version }}
-        name: Release ${{ steps.new_version.outputs.new_version }}
-        body_path: ${{ steps.changelog.outputs.changelog_file }}
-        files: dist/*
-        draft: ${{ github.event.inputs.draft }}
-        prerelease: ${{ github.event.inputs.prerelease }}
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Update README
+    - name: Check if artifacts were built
+      id: check-artifacts
       run: |
-        NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
-        
-        # Update version badge in README if it exists
-        if [ -f README.md ] && grep -q "version-.*-blue" README.md; then
-          sed -i "s/version-.*-blue/version-${NEW_VERSION#v}-blue/g" README.md
-          
-          # Commit and push if changes were made
-          if git diff --quiet README.md; then
-            echo "No changes to README.md"
-          else
-            git add README.md
-            git commit -m "docs: update version badge to ${NEW_VERSION}"
-            git push origin main
-          fi
+        if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
+          echo "artifacts-built=true" >> $GITHUB_OUTPUT
+          echo "✅ Artifacts built successfully"
+        else
+          echo "artifacts-built=false" >> $GITHUB_OUTPUT
+          echo "❌ No artifacts found"
         fi
 
-    - name: Summary
-      run: |
-        NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
-        echo "🎉 Successfully released ${NEW_VERSION}!"
-        echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${NEW_VERSION}"
+    - name: Upload artifacts for release
+      if: steps.check-artifacts.outputs.artifacts-built == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-binaries
+        path: dist/
+        retention-days: 1
+
+  release:
+    needs: [calculate-version, build]
+    uses: ./.github/workflows/generic-release.yml
+    with:
+      new_version: ${{ needs.calculate-version.outputs.new_version }}
+      current_version: ${{ needs.calculate-version.outputs.current_version }}
+      changelog_content: ${{ needs.calculate-version.outputs.changelog_content }}
+      changelog_artifact_name: changelog-${{ needs.calculate-version.outputs.new_version }}
+      draft: ${{ github.event.inputs.draft }}
+      prerelease: ${{ github.event.inputs.prerelease }}
+      create_release: true
+      artifacts_pattern: ${{ needs.build.outputs.artifacts-built == 'true' && 'dist/*' || '' }}
+      update_badge_file: 'README.md'
+      working_directory: '.'
+    secrets: inherit
