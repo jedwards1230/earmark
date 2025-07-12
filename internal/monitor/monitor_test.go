@@ -329,7 +329,7 @@ func TestMockMonitorDB(t *testing.T) {
 	// Test error handling
 	testErr := fmt.Errorf("test error")
 	mockDB.SetError("/test/error.mp3", testErr)
-	processed, err = mockDB.IsProcessed(ctx, "/test/error.mp3")
+	_, err = mockDB.IsProcessed(ctx, "/test/error.mp3")
 	if err != testErr {
 		t.Errorf("Expected error %v, got %v", testErr, err)
 	}

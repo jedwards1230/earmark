@@ -65,9 +65,7 @@ func TestPipelineResultStructure(t *testing.T) {
 		StageResults: make([]StageResult, 0, 3),
 	}
 
-	if result == nil {
-		t.Error("PipelineResult should be creatable")
-	}
+	// result is created successfully above
 
 	if len(result.StageResults) != 0 {
 		t.Error("New PipelineResult should have empty stage results")

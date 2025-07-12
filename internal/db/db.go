@@ -111,7 +111,12 @@ func (db *DB) initialize(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil {
+			// Ignore rollback errors in defer - they're not critical
+			_ = err
+		}
+	}()
 
 	// Enable vector extension
 	if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
@@ -218,7 +223,12 @@ func (db *DB) InsertContentWithMetadata(ctx context.Context, content string, met
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil {
+			// Ignore rollback errors in defer - they're not critical
+			_ = err
+		}
+	}()
 
 	// Insert or get author
 	var authorID int
@@ -513,7 +523,12 @@ func (db *DB) Reset(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil {
+			// Ignore rollback errors in defer - they're not critical
+			_ = err
+		}
+	}()
 
 	// Drop all tables in the public schema
 	if _, err := tx.Exec(ctx, `
@@ -934,7 +949,12 @@ func (db *DB) ProcessTranscriptionCorrection(ctx context.Context, filePath strin
 	if err != nil {
 		return fmt.Errorf("failed to begin correction transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil {
+			// Ignore rollback errors in defer - they're not critical
+			_ = err
+		}
+	}()
 
 	// Set status to in_progress
 	_, err = tx.Exec(ctx, `
@@ -962,7 +982,12 @@ func (db *DB) ProcessTranscriptionCorrection(ctx context.Context, filePath strin
 	if err != nil {
 		return fmt.Errorf("failed to begin final transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil {
+			// Ignore rollback errors in defer - they're not critical
+			_ = err
+		}
+	}()
 
 	if correctionErr != nil {
 		// Update with error status
@@ -978,7 +1003,9 @@ func (db *DB) ProcessTranscriptionCorrection(ctx context.Context, filePath strin
 		if err != nil {
 			db.log.Error("Failed to update failed correction status", "error", err)
 		} else {
-			tx.Commit(ctx)
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				db.log.Error("Failed to commit correction status update", "error", commitErr)
+			}
 		}
 
 		return fmt.Errorf("correction failed: %w", correctionErr)

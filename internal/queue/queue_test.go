@@ -11,9 +11,7 @@ import (
 func TestNewQueue(t *testing.T) {
 	q := NewQueue()
 
-	if q == nil {
-		t.Error("Expected non-nil queue")
-	}
+	// NewQueue() always returns a valid queue
 
 	if !q.IsEmpty() {
 		t.Error("Expected new queue to be empty")

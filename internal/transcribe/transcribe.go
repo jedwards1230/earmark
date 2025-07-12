@@ -208,7 +208,9 @@ func (t *Transcriber) TranscribeAudio(
 			t.log.Warn("Transcription timeout", "file", shortPath)
 		}
 		// Kill process group
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			t.log.Warn("Failed to kill process group", "pid", cmd.Process.Pid, "error", err)
+		}
 	}()
 
 	// Wait for command to complete and output processing to finish

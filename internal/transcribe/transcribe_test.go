@@ -317,11 +317,15 @@ func BenchmarkCountWords(b *testing.B) {
 
 	// Write test content with known word count
 	content := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 1000)
-	tmpFile.WriteString(content)
+	if _, err := tmpFile.WriteString(content); err != nil {
+		b.Fatalf("Failed to write test content: %v", err)
+	}
 	tmpFile.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		countWords(tmpFile.Name())
+		if _, err := countWords(tmpFile.Name()); err != nil {
+			b.Fatalf("Failed to count words: %v", err)
+		}
 	}
 }

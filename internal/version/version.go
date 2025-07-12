@@ -265,7 +265,9 @@ func saveCache(cache *VersionCache) {
 		return
 	}
 
-	os.WriteFile(cachePath, data, 0644)
+	if err := os.WriteFile(cachePath, data, 0644); err != nil {
+		// Ignore cache write errors, not critical
+	}
 }
 
 func IsNewerVersion(current, latest string) bool {

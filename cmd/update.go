@@ -96,7 +96,10 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 		fmt.Print("Continue? (y/N): ")
 
 		var response string
-		fmt.Scanln(&response)
+		if _, err := fmt.Scanln(&response); err != nil {
+			// Treat scan error as 'no'
+			response = "n"
+		}
 		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
 			fmt.Println("Update cancelled.")
 			return nil
@@ -149,7 +152,9 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	}
 
 	if err := os.Rename(tempFile, executable); err != nil {
-		os.Rename(backupFile, executable)
+		if restoreErr := os.Rename(backupFile, executable); restoreErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to restore backup: %v\n", restoreErr)
+		}
 		return fmt.Errorf("installing new binary: %w", err)
 	}
 
@@ -162,7 +167,10 @@ func updateFromSource(ctx context.Context, noConfirm bool) error {
 		fmt.Print("\nThis will rebuild lil-whisper from the latest source.\nContinue? (y/N): ")
 
 		var response string
-		fmt.Scanln(&response)
+		if _, err := fmt.Scanln(&response); err != nil {
+			// Treat scan error as 'no'
+			response = "n"
+		}
 		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
 			fmt.Println("Update cancelled.")
 			return nil
@@ -232,7 +240,9 @@ func updateFromSource(ctx context.Context, noConfirm bool) error {
 	}
 
 	if err := os.Rename(executable+".new", executable); err != nil {
-		os.Rename(backupFile, executable)
+		if restoreErr := os.Rename(backupFile, executable); restoreErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to restore backup: %v\n", restoreErr)
+		}
 		return fmt.Errorf("installing new binary: %w", err)
 	}
 

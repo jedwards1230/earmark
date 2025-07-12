@@ -82,5 +82,7 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Write(resp)
+	if _, err := w.Write(resp); err != nil {
+		s.log.Error("Failed to write response", "error", err)
+	}
 }

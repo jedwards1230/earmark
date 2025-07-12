@@ -124,14 +124,14 @@ jobs:
         fi
         
         # Create changelog
-        CHANGELOG="## What's Changed
-        
+        cat > changelog.md << EOF
+## What's Changed
+
 ${COMMITS}
 
-**Full Changelog**: https://github.com/${{ github.repository }}/compare/${CURRENT_VERSION}...${NEW_VERSION}"
+**Full Changelog**: https://github.com/${{ github.repository }}/compare/${CURRENT_VERSION}...${NEW_VERSION}
+EOF
         
-        # Save changelog to file for multiline output
-        echo "${CHANGELOG}" > changelog.md
         echo "changelog_file=changelog.md" >> $GITHUB_OUTPUT
 
     - name: Create and push tag
