@@ -209,7 +209,7 @@ help:
 	@echo "  make check                        # Run all quality checks"
 	@echo ""
 	@echo "⚠️  REQUIREMENTS:"
-	@echo "  - Go 1.23+"
+	@echo "  - Go 1.24+"
 	@echo "  - Apple Silicon macOS 26+ (M1/M2/M3+ due to Yap speech recognition)"
 	@echo "  - golangci-lint for linting (optional)"
 	@echo ""

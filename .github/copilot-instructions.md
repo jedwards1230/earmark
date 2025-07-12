@@ -116,7 +116,7 @@ go test ./...
 - **macOS 26+ required**: Yap speech recognition dependency
 - **PostgreSQL + pgvector**: Database with vector extension
 - **OpenAI API**: For embeddings and planned LLM correction
-- **Go 1.23+**: Module uses modern Go features
+- **Go 1.24+**: Module uses modern Go features
 
 ## Common Tasks
 

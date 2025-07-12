@@ -74,7 +74,7 @@ The CI workflow includes security scanning:
 - **CI Runner**: Uses `ubuntu-latest` (cross-compilation)
 
 ### Go Version
-- **Version**: Go 1.23+ (configured in workflows)
+- **Version**: Go 1.24+ (configured in workflows)
 - **Modules**: All dependencies in go.mod/go.sum
 
 ## 🎯 **Manual Release Process**
