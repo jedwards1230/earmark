@@ -108,6 +108,8 @@ jobs:
 
     - name: Generate changelog
       id: changelog
+      env:
+        GITHUB_REPOSITORY: ${{ github.repository }}
       run: |
         CURRENT_VERSION="${{ steps.current_version.outputs.current_version }}"
         NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
@@ -124,15 +126,11 @@ jobs:
         fi
         
         # Create changelog
-        cat > changelog.md << 'EOF'
-## What's Changed
-
-EOF
+        echo "## What's Changed" > changelog.md
+        echo "" >> changelog.md
         echo "${COMMITS}" >> changelog.md
-        cat >> changelog.md << 'EOF'
-
-**Full Changelog**: https://github.com/${{ github.repository }}/compare/${CURRENT_VERSION}...${NEW_VERSION}
-EOF
+        echo "" >> changelog.md
+        echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${CURRENT_VERSION}...${NEW_VERSION}" >> changelog.md
         
         echo "changelog_file=changelog.md" >> $GITHUB_OUTPUT
 
