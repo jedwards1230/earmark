@@ -119,16 +119,18 @@ func (rl *RateLimiter) CheckDailyBudget(estimatedCost float64) error {
 func (rl *RateLimiter) RecordRequest(actualCost float64) {
 	rl.requestsMutex.Lock()
 	rl.requests = append(rl.requests, time.Now())
+	requestCount := len(rl.requests)
 	rl.requestsMutex.Unlock()
 
 	rl.costMutex.Lock()
 	rl.dailyCost += actualCost
+	dailyTotal := rl.dailyCost
 	rl.costMutex.Unlock()
 
 	rl.log.Debug("Recorded API request",
 		"cost", actualCost,
-		"daily_total", rl.dailyCost,
-		"requests_in_minute", len(rl.requests))
+		"daily_total", dailyTotal,
+		"requests_in_minute", requestCount)
 }
 
 func (rl *RateLimiter) EstimateCost(tokenCount int) CostEstimate {

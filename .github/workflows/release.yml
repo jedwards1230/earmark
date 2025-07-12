@@ -140,6 +140,31 @@ jobs:
         git tag -a "${NEW_VERSION}" -m "Release ${NEW_VERSION}"
         git push origin "${NEW_VERSION}"
 
+    - name: Create and push moving version tags
+      run: |
+        NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
+        
+        # Extract version components (remove 'v' prefix if present)
+        VERSION_NUMBERS=${NEW_VERSION#v}
+        IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION_NUMBERS}"
+        
+        # Create major version tag (e.g., v0 for v0.1.9)
+        MAJOR_TAG="v${MAJOR}"
+        echo "Creating/updating major version tag: ${MAJOR_TAG}"
+        git tag -f -a "${MAJOR_TAG}" -m "Latest ${MAJOR}.x.x release: ${NEW_VERSION}"
+        git push -f origin "${MAJOR_TAG}"
+        
+        # Create minor version tag (e.g., v0.1 for v0.1.9)
+        MINOR_TAG="v${MAJOR}.${MINOR}"
+        echo "Creating/updating minor version tag: ${MINOR_TAG}"
+        git tag -f -a "${MINOR_TAG}" -m "Latest ${MAJOR}.${MINOR}.x release: ${NEW_VERSION}"
+        git push -f origin "${MINOR_TAG}"
+        
+        echo "✅ Created moving version tags:"
+        echo "  - ${NEW_VERSION} (specific version)"
+        echo "  - ${MINOR_TAG} (latest ${MAJOR}.${MINOR}.x)"
+        echo "  - ${MAJOR_TAG} (latest ${MAJOR}.x.x)"
+
     - name: Build release binaries
       run: |
         NEW_VERSION="${{ steps.new_version.outputs.new_version }}"
