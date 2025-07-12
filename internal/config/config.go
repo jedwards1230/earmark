@@ -20,8 +20,8 @@ type Config struct {
 	OutputDir string `env:"OUTPUT_DIR"`
 
 	// Service config
-	Debug      bool `env:"DEBUG"`
-	ResetState bool `env:"RESET_STATE"`
+	Debug        bool `env:"DEBUG"`
+	DebugDBReset bool `env:"DEBUG_DB_RESET"`
 
 	// Postgres with PGVector config
 	DBHost     string `env:"DB_HOST"`
@@ -70,7 +70,7 @@ func LoadConfig() (*Config, error) {
 
 	// Load directory configuration with defaults
 	config.AudioDir = getEnvOrDefault("AUDIO_DIR", "media/audiobooks")
-	config.CacheDir = getEnvOrDefault("CACHE_DIR", "cache")
+	config.CacheDir = getEnvOrDefault("CACHE_DIR", "/tmp/lil-whisper-cache")
 	config.OutputDir = getEnvOrDefault("OUTPUT_DIR", "media/transcriptions")
 
 	// Load database configuration
@@ -163,7 +163,7 @@ func LoadConfig() (*Config, error) {
 
 	// Load boolean flags
 	config.Debug = parseBoolEnv("DEBUG")
-	config.ResetState = parseBoolEnv("RESET_STATE")
+	config.DebugDBReset = parseBoolEnv("DEBUG_DB_RESET")
 
 	// Load version checking configuration
 	config.DisableVersionCheck = parseBoolEnv("DISABLE_VERSION_CHECK")
@@ -258,7 +258,7 @@ func parseBoolEnv(key string) bool {
 func (c *Config) PrintEnvVars() {
 	logger.Debug("=== Current Configuration ===")
 	logger.Debug("Debug", "value", c.Debug)
-	logger.Debug("Reset State", "value", c.ResetState)
+	logger.Debug("Debug DB Reset", "value", c.DebugDBReset)
 
 	// Database configuration
 	logger.Debug("DB Host", "value", c.DBHost)

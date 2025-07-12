@@ -16,7 +16,7 @@ func TestLoadConfig(t *testing.T) {
 		"AUDIO_DIR", "CACHE_DIR", "OUTPUT_DIR",
 		"DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME",
 		"CHUNK_SIZE", "OPENAI_API_KEY", "OPENAI_BASE_URL",
-		"DEBUG", "RESET_STATE",
+		"DEBUG", "DEBUG_DB_RESET",
 	}
 	for _, key := range envVars {
 		originalEnv[key] = os.Getenv(key)
@@ -41,12 +41,12 @@ func TestLoadConfig(t *testing.T) {
 		// Check default values
 		// The paths are resolved to absolute paths, so check the last part
 		assert.Contains(t, cfg.AudioDir, "audiobooks")
-		assert.Contains(t, cfg.CacheDir, "cache")
+		assert.Contains(t, cfg.CacheDir, "/tmp/lil-whisper-cache")
 		assert.Contains(t, cfg.OutputDir, "transcriptions")
 		assert.Equal(t, 1024, cfg.ChunkSize)
 		assert.Equal(t, "https://api.openai.com/v1", cfg.OpenAIBaseURL)
 		assert.False(t, cfg.Debug)
-		assert.False(t, cfg.ResetState)
+		assert.False(t, cfg.DebugDBReset)
 	})
 
 	t.Run("environment variables override", func(t *testing.T) {
@@ -63,7 +63,7 @@ func TestLoadConfig(t *testing.T) {
 			"OPENAI_API_KEY":  "test-key",
 			"OPENAI_BASE_URL": "https://test.openai.com/v1",
 			"DEBUG":           "true",
-			"RESET_STATE":     "1",
+			"DEBUG_DB_RESET":  "1",
 		}
 
 		for key, value := range testEnv {
@@ -85,7 +85,7 @@ func TestLoadConfig(t *testing.T) {
 		assert.Equal(t, "test-key", cfg.OpenAIAPIKey)
 		assert.Equal(t, "https://test.openai.com/v1", cfg.OpenAIBaseURL)
 		assert.True(t, cfg.Debug)
-		assert.True(t, cfg.ResetState)
+		assert.True(t, cfg.DebugDBReset)
 
 		// Clean up
 		for key := range testEnv {
@@ -130,16 +130,16 @@ func TestLoadConfig(t *testing.T) {
 				os.Unsetenv("DEBUG")
 			})
 
-			t.Run("RESET_STATE="+tt.envValue, func(t *testing.T) {
+			t.Run("DEBUG_DB_RESET="+tt.envValue, func(t *testing.T) {
 				if tt.shouldSet {
-					os.Setenv("RESET_STATE", tt.envValue)
+					os.Setenv("DEBUG_DB_RESET", tt.envValue)
 				}
 
 				cfg, err := LoadConfig()
 				require.NoError(t, err)
-				assert.Equal(t, tt.expected, cfg.ResetState)
+				assert.Equal(t, tt.expected, cfg.DebugDBReset)
 
-				os.Unsetenv("RESET_STATE")
+				os.Unsetenv("DEBUG_DB_RESET")
 			})
 		}
 	})
@@ -236,7 +236,7 @@ func TestConfigPrintEnvVars(t *testing.T) {
 	// and properly masks sensitive information
 	cfg := &Config{
 		Debug:         true,
-		ResetState:    false,
+		DebugDBReset:  false,
 		DBHost:        "localhost",
 		DBUser:        "testuser",
 		DBPassword:    "verysecretpassword",

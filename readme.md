@@ -114,7 +114,7 @@ LLM_CORRECTION_MAX_RETRIES=3
 
 # Debug settings
 DEBUG=false
-RESET_STATE=false
+DEBUG_DB_RESET=false  # WARNING: Destructive! Deletes ALL database tables and transcription files
 
 # Logging settings
 LOG_DEBUG=false

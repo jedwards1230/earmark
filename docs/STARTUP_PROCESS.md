@@ -36,7 +36,10 @@ database, err := db.New(cfg)
   - Creates tables: `authors`, `books`, `chapters`, `vectors`, `transcriptions`
   - Sets up pgvector extension for similarity search
   - Creates indexes for performance optimization
-- Optionally resets database state if `cfg.ResetState` is true
+- Optionally performs destructive debug reset if `cfg.DebugDBReset` is true:
+  - ⚠️ **WARNING**: Deletes ALL database tables and transcription text files
+  - Clears `OutputDir/raw/` and `OutputDir/corrected/` directories
+  - Reinitializes database schema from scratch
 
 ### 3. Core Component Initialization
 **File**: `cmd/start.go:50-52`

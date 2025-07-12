@@ -190,3 +190,50 @@ func (fm *FileManager) cleanupDirectory(dir string, validPaths map[string]bool) 
 
 	return nil
 }
+
+// ClearAllFiles removes all transcription text files (both raw and corrected)
+// This is a destructive operation used for debug database resets
+func (fm *FileManager) ClearAllFiles() error {
+	dirs := []string{fm.rawDir, fm.correctedDir}
+
+	for _, dir := range dirs {
+		if err := fm.clearDirectory(dir); err != nil {
+			return fmt.Errorf("failed to clear directory %s: %w", dir, err)
+		}
+	}
+
+	return nil
+}
+
+func (fm *FileManager) clearDirectory(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Directory doesn't exist, nothing to clear
+		}
+		return fmt.Errorf("failed to read directory %s: %w", dir, err)
+	}
+
+	var deletedCount int
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue // Skip subdirectories
+		}
+
+		filePath := filepath.Join(dir, entry.Name())
+
+		if err := os.Remove(filePath); err != nil {
+			fm.log.Warn("Failed to remove transcription file", "path", filePath, "error", err)
+		} else {
+			fm.log.Debug("Removed transcription file", "path", filePath)
+			deletedCount++
+		}
+	}
+
+	if deletedCount > 0 {
+		fm.log.Info("Cleared transcription files", "directory", dir, "count", deletedCount)
+	}
+
+	return nil
+}

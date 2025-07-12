@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/correction"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/monitor"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
@@ -32,11 +33,23 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	}
 	defer database.Close()
 
-	if cfg.ResetState {
+	if cfg.DebugDBReset {
+		log.Println("🚨 WARNING: DEBUG_DB_RESET=true - This will DESTROY ALL DATA!")
+		log.Println("🚨 WARNING: Deleting all database tables and transcription text files...")
+		
+		// Clear all transcription text files
+		fileManager := correction.NewFileManager(cfg)
+		if err := fileManager.ClearAllFiles(); err != nil {
+			log.Printf("Warning: Failed to clear transcription files: %v", err)
+		}
+		
+		// Reset database
 		if err := database.Reset(context.Background()); err != nil {
 			database.Close()
 			log.Fatalf("Failed to reset database: %v", err)
 		}
+		
+		log.Println("✅ Debug reset completed - All data cleared")
 	}
 
 	workQueue := queue.NewQueue()
