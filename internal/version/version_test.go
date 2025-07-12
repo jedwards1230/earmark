@@ -258,11 +258,24 @@ func TestCheckForUpdatesWithCache(t *testing.T) {
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
 
+	// Save original values
+	originalVersion := Version
+	originalCommit := Commit
+	defer func() {
+		Version = originalVersion
+		Commit = originalCommit
+	}()
+
+	// Set version variables to match cache
+	Version = "1.0.0"
+	Commit = "abc123"
+
 	cache := &VersionCache{
 		LastCheck: time.Now().Add(-1 * time.Hour),
 		Result: CheckResult{
 			HasUpdate:      true,
 			CurrentVersion: "1.0.0",
+			CurrentCommit:  "abc123",
 			LatestVersion:  "1.1.0",
 			CheckedAt:      time.Now().Add(-1 * time.Hour),
 		},
