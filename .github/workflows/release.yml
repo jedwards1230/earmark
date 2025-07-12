@@ -33,7 +33,7 @@ permissions:
 
 jobs:
     calculate-version:
-        uses: ./.github/workflows/calculate-version.yml
+        uses: jedwards1230/release-workflows/.github/workflows/calculate-version.yml@v0
         with:
             version_type: ${{ github.event.inputs.version_type }}
             custom_version: ${{ github.event.inputs.custom_version }}
@@ -101,7 +101,7 @@ jobs:
 
     release:
         needs: [calculate-version, build]
-        uses: ./.github/workflows/generic-release.yml
+        uses: jedwards1230/release-workflows/.github/workflows/generic-release.yml@v0
         with:
             new_version: ${{ needs.calculate-version.outputs.new_version }}
             current_version: ${{ needs.calculate-version.outputs.current_version }}
