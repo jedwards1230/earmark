@@ -336,16 +336,16 @@ func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debu
 
 	if resp.StatusCode == http.StatusNotFound {
 		if debug {
-			fmt.Printf("DEBUG: No releases found (404) - repository may be private, falling back to commit check\n")
+			fmt.Printf("DEBUG: No releases found (404) - repository may be private, trying git-based check\n")
 		}
-		return checkCommitVersionWithDebug(ctx, result, debug)
+		return checkGitReleasesWithDebug(ctx, result, debug)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		if debug {
-			fmt.Printf("DEBUG: Release API returned status %d, falling back to commit check\n", resp.StatusCode)
+			fmt.Printf("DEBUG: Release API returned status %d, trying git-based check\n", resp.StatusCode)
 		}
-		return checkCommitVersionWithDebug(ctx, result, debug)
+		return checkGitReleasesWithDebug(ctx, result, debug)
 	}
 
 	var release GitHubRelease
@@ -359,9 +359,9 @@ func checkReleaseVersionWithDebug(ctx context.Context, result *CheckResult, debu
 
 	if release.Draft || release.Prerelease {
 		if debug {
-			fmt.Printf("DEBUG: Release is draft or prerelease, falling back to commit check\n")
+			fmt.Printf("DEBUG: Release is draft or prerelease, trying git-based check\n")
 		}
-		return checkCommitVersionWithDebug(ctx, result, debug)
+		return checkGitCommitsWithDebug(ctx, result, debug)
 	}
 
 	result.LatestVersion = release.TagName
@@ -493,4 +493,182 @@ func parseVersion(version string) []int {
 	}
 
 	return result
+}
+
+// checkGitReleasesWithDebug checks for releases using git commands (works with private repos)
+func checkGitReleasesWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
+	result.UseReleases = true
+	
+	if debug {
+		fmt.Printf("DEBUG: Checking releases using git ls-remote for private repository access\n")
+	}
+	
+	// Try to get tags from remote repository using git
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--tags", "--sort=-version:refname", "origin")
+	output, err := cmd.Output()
+	if err != nil {
+		if debug {
+			fmt.Printf("DEBUG: Git ls-remote failed: %v, falling back to commit check\n", err)
+		}
+		return checkGitCommitsWithDebug(ctx, result, debug)
+	}
+	
+	if debug {
+		fmt.Printf("DEBUG: Git ls-remote tags output: %s\n", string(output))
+	}
+	
+	// Parse the output to find the latest semantic version tag
+	latestVersion := parseGitTags(string(output), debug)
+	if latestVersion == "" {
+		if debug {
+			fmt.Printf("DEBUG: No valid semantic version tags found, falling back to commit check\n")
+		}
+		return checkGitCommitsWithDebug(ctx, result, debug)
+	}
+	
+	result.LatestVersion = latestVersion
+	if IsNewerVersion(Version, result.LatestVersion) {
+		result.HasUpdate = true
+		result.UpdateMessage = fmt.Sprintf("Version %s available", result.LatestVersion)
+		if debug {
+			fmt.Printf("DEBUG: Update available via git: %s\n", result.UpdateMessage)
+		}
+	} else {
+		if debug {
+			fmt.Printf("DEBUG: No update needed via git - current: %s, latest: %s\n", Version, result.LatestVersion)
+		}
+	}
+	
+	return result, nil
+}
+
+// checkGitCommitsWithDebug checks for commits using git commands (works with private repos)
+func checkGitCommitsWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
+	currentCommit := result.CurrentCommit
+	if currentCommit == "unknown" || currentCommit == "" {
+		if debug {
+			fmt.Printf("DEBUG: Current commit unknown, skipping git commit check\n")
+		}
+		return result, nil
+	}
+	
+	if debug {
+		fmt.Printf("DEBUG: Checking commits using git ls-remote for private repository access\n")
+	}
+	
+	// Get the latest commit from the remote main branch
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "origin", "main")
+	output, err := cmd.Output()
+	if err != nil {
+		if debug {
+			fmt.Printf("DEBUG: Git ls-remote for commits failed: %v\n", err)
+		}
+		return result, nil
+	}
+	
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 0 {
+		if debug {
+			fmt.Printf("DEBUG: No commit information from git ls-remote\n")
+		}
+		return result, nil
+	}
+	
+	// Parse the commit hash (first part before whitespace)
+	parts := strings.Fields(lines[0])
+	if len(parts) == 0 {
+		if debug {
+			fmt.Printf("DEBUG: Could not parse commit from git output\n")
+		}
+		return result, nil
+	}
+	
+	latestCommit := parts[0]
+	result.LatestCommit = latestCommit
+	
+	// Compare commit hashes (use first 7 characters)
+	currentCommitShort := currentCommit
+	if len(currentCommitShort) > 7 {
+		currentCommitShort = currentCommitShort[:7]
+	}
+	
+	latestCommitShort := latestCommit
+	if len(latestCommitShort) > 7 {
+		latestCommitShort = latestCommitShort[:7]
+	}
+	
+	if debug {
+		fmt.Printf("DEBUG: Comparing commits - current: %s, latest: %s\n", currentCommitShort, latestCommitShort)
+	}
+	
+	if currentCommitShort != latestCommitShort {
+		result.HasUpdate = true
+		result.UpdateMessage = fmt.Sprintf("Newer commit available: %s", latestCommitShort)
+		if debug {
+			fmt.Printf("DEBUG: Update available via git commits: %s\n", result.UpdateMessage)
+		}
+	}
+	
+	return result, nil
+}
+
+// parseGitTags extracts the latest semantic version from git ls-remote tags output
+func parseGitTags(output string, debug bool) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	var latestVersion string
+	
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		
+		// Extract tag name from refs/tags/tagname
+		tagRef := parts[1]
+		if !strings.HasPrefix(tagRef, "refs/tags/") {
+			continue
+		}
+		
+		tag := strings.TrimPrefix(tagRef, "refs/tags/")
+		
+		// Skip tags ending with ^{} (annotated tag objects)
+		if strings.HasSuffix(tag, "^{}") {
+			continue
+		}
+		
+		// Check if it's a semantic version tag (starts with v or is just numbers.numbers.numbers)
+		if isSemanticVersion(tag) {
+			if debug {
+				fmt.Printf("DEBUG: Found semantic version tag: %s\n", tag)
+			}
+			// Since git ls-remote --sort=-version:refname gives us tags in descending order,
+			// the first valid semantic version we find is the latest
+			if latestVersion == "" {
+				latestVersion = tag
+			}
+		}
+	}
+	
+	return latestVersion
+}
+
+// isSemanticVersion checks if a string looks like a semantic version
+func isSemanticVersion(tag string) bool {
+	// Remove 'v' prefix if present
+	version := strings.TrimPrefix(tag, "v")
+	
+	// Check if it matches basic semantic version pattern (x.y.z)
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 || len(parts) > 4 {
+		return false
+	}
+	
+	// Check if all parts are numbers
+	for _, part := range parts {
+		if _, err := strconv.Atoi(part); err != nil {
+			return false
+		}
+	}
+	
+	return true
 }
