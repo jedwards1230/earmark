@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -57,20 +58,34 @@ type MockDB struct {
 }
 
 type MockLogger struct {
+	mu            sync.Mutex
 	debugMessages []string
 	errorMessages []string
 }
 
 func (ml *MockLogger) Debug(msg string, args ...interface{}) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
 	ml.debugMessages = append(ml.debugMessages, msg)
 }
 
 func (ml *MockLogger) Error(msg string, args ...interface{}) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
 	ml.errorMessages = append(ml.errorMessages, msg)
 }
 
 func (ml *MockLogger) Info(msg string, args ...interface{}) {}
 func (ml *MockLogger) Warn(msg string, args ...interface{}) {}
+
+func (ml *MockLogger) GetDebugMessages() []string {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	// Return a copy to avoid race conditions
+	messages := make([]string, len(ml.debugMessages))
+	copy(messages, ml.debugMessages)
+	return messages
+}
 
 func NewMockDB() *MockDB {
 	return &MockDB{
@@ -100,7 +115,9 @@ func (mdb *MockDB) simulateProcessTranscriptionCorrection(ctx context.Context, f
 
 	// Set status to in_progress
 	if err := tx1.Exec("UPDATE transcriptions SET correction_status = 'in_progress' WHERE file_path = $1", filePath); err != nil {
-		tx1.Rollback()
+		if rollbackErr := tx1.Rollback(); rollbackErr != nil {
+			mdb.log.Error("Failed to rollback transaction: %v", rollbackErr)
+		}
 		return err
 	}
 
@@ -129,14 +146,18 @@ func (mdb *MockDB) simulateProcessTranscriptionCorrection(ctx context.Context, f
 		if err := tx2.Exec("UPDATE transcriptions SET correction_status = 'failed' WHERE file_path = $1", filePath); err != nil {
 			mdb.log.Error("Failed to update failed correction status")
 		} else {
-			tx2.Commit()
+			if commitErr := tx2.Commit(); commitErr != nil {
+				mdb.log.Error("Failed to commit transaction: %v", commitErr)
+			}
 		}
 		return correctionErr
 	}
 
 	// Update with successful correction
 	if err := tx2.Exec("UPDATE transcriptions SET corrected_text = $2, correction_status = 'completed' WHERE file_path = $1", filePath, correctedText); err != nil {
-		tx2.Rollback()
+		if rollbackErr := tx2.Rollback(); rollbackErr != nil {
+			mdb.log.Error("Failed to rollback transaction: %v", rollbackErr)
+		}
 		return err
 	}
 
@@ -197,7 +218,7 @@ func TestAtomicTransactionSuccess(t *testing.T) {
 	}
 
 	// Verify debug message was logged
-	if len(mockDB.log.debugMessages) == 0 {
+	if len(mockDB.log.GetDebugMessages()) == 0 {
 		t.Error("Expected debug message about atomic processing")
 	}
 }

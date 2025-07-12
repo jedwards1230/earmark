@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestCountWords(t *testing.T) {
@@ -236,7 +238,8 @@ func TestWorkerDeduplicationLogic(t *testing.T) {
 	defer os.Remove(tmpFile.Name())
 
 	testContent := "Test audio file content"
-	tmpFile.WriteString(testContent)
+	_, err = tmpFile.WriteString(testContent)
+	require.NoError(t, err)
 	tmpFile.Close()
 
 	// Get file info

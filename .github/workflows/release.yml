@@ -124,10 +124,12 @@ jobs:
         fi
         
         # Create changelog
-        cat > changelog.md << EOF
+        cat > changelog.md << 'EOF'
 ## What's Changed
 
-${COMMITS}
+EOF
+        echo "${COMMITS}" >> changelog.md
+        cat >> changelog.md << 'EOF'
 
 **Full Changelog**: https://github.com/${{ github.repository }}/compare/${CURRENT_VERSION}...${NEW_VERSION}
 EOF

@@ -267,6 +267,7 @@ func saveCache(cache *VersionCache) {
 
 	if err := os.WriteFile(cachePath, data, 0644); err != nil {
 		// Ignore cache write errors, not critical
+		_ = err
 	}
 }
 

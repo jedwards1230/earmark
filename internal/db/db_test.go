@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestComputeFileChecksum(t *testing.T) {
@@ -91,9 +93,11 @@ func TestComputeFileChecksum_DifferentFiles(t *testing.T) {
 	defer os.Remove(tmpFile2.Name())
 
 	// Write different content to each file
-	tmpFile1.WriteString("Content A")
+	_, err = tmpFile1.WriteString("Content A")
+	require.NoError(t, err)
 	tmpFile1.Close()
-	tmpFile2.WriteString("Content B")
+	_, err = tmpFile2.WriteString("Content B")
+	require.NoError(t, err)
 	tmpFile2.Close()
 
 	db := &DB{}
@@ -328,7 +332,8 @@ func BenchmarkComputeFileChecksum(b *testing.B) {
 
 	// Write some content
 	content := strings.Repeat("Hello, World! ", 1000) // ~13KB
-	tmpFile.WriteString(content)
+	_, err = tmpFile.WriteString(content)
+	require.NoError(b, err)
 	tmpFile.Close()
 
 	db := &DB{}

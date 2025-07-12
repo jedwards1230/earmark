@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRun(t *testing.T) {
@@ -75,7 +76,8 @@ func TestRun(t *testing.T) {
 
 			// Read captured output
 			var buf bytes.Buffer
-			io.Copy(&buf, r)
+			_, copyErr := io.Copy(&buf, r)
+			require.NoError(t, copyErr)
 			output := buf.String()
 
 			// Check expectations

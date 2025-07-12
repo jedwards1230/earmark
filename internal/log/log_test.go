@@ -476,7 +476,8 @@ func TestLoggerVerboseMethod(t *testing.T) {
 
 	// Read captured output
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, err := buf.ReadFrom(r)
+	assert.NoError(t, err)
 	output := buf.String()
 
 	// Verify verbose message was logged
@@ -511,7 +512,8 @@ func TestLoggerIntegration(t *testing.T) {
 
 	// Read captured output
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, err := buf.ReadFrom(r)
+	assert.NoError(t, err)
 	output := buf.String()
 
 	// Verify all messages were logged
@@ -551,6 +553,9 @@ func BenchmarkPrettyHandlerHandle(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		handler.Handle(context.Background(), record)
+		err := handler.Handle(context.Background(), record)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

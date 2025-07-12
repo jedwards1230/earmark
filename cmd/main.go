@@ -4,10 +4,6 @@ import (
 	"context"
 	"log"
 	"os"
-	"os/exec"
-	"runtime"
-	"strings"
-	"time"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/version"
@@ -199,22 +195,6 @@ func showUpdateNotification(result *version.CheckResult) {
 	}
 }
 
-func getGitCommit() string {
-	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
-	output, err := cmd.Output()
-	if err != nil {
-		return "unknown"
-	}
-	return strings.TrimSpace(string(output))
-}
-
-func getBuildTime() string {
-	return time.Now().UTC().Format(time.RFC3339)
-}
-
-func getGoVersion() string {
-	return runtime.Version()
-}
 
 func Run() {
 	rootCmd.AddCommand(monitorCmd)

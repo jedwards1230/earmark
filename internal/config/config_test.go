@@ -263,7 +263,10 @@ func TestConfigInitializePaths(t *testing.T) {
 	originalWd, _ := os.Getwd()
 	err := os.Chdir(tempDir)
 	require.NoError(t, err)
-	defer os.Chdir(originalWd)
+	defer func() {
+		err := os.Chdir(originalWd)
+		require.NoError(t, err)
+	}()
 
 	cfg := &Config{
 		AudioDir:  "test_audio",
