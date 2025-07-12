@@ -529,7 +529,7 @@ func checkGitReleasesWithDebug(ctx context.Context, result *CheckResult, debug b
 		return checkGitCommitsWithDebug(ctx, result, debug)
 	}
 	
-	if debug {
+	if debug && os.Getenv("LOG_VERBOSE") == "1" {
 		fmt.Printf("DEBUG: Git ls-remote tags output: %s\n", string(output))
 	}
 	
