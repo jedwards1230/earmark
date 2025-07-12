@@ -167,17 +167,26 @@ func TestTextChunkerWhitespaceText(t *testing.T) {
 func TestTextChunkerVeryLongSentence(t *testing.T) {
 	tc := NewTextChunker()
 
-	// Create a very long sentence without periods (edge case)
+	// Create a very long sentence without periods that actually exceeds token limit
+	// This will create a sentence with 4000+ tokens, well over the 3000 limit
 	longSentence := "This is a very long sentence without any periods that goes on and on and on " +
-					strings.Repeat("and on ", 500) + "and should be chunked even without sentence boundaries"
+					strings.Repeat("and on ", 2000) + "and should be chunked even without sentence boundaries"
 
 	chunks, err := tc.ChunkText(longSentence)
 	if err != nil {
 		t.Errorf("Error chunking very long sentence: %v", err)
 	}
 
+	// Log actual token count for debugging
+	totalTokens := 0
+	for i, chunk := range chunks {
+		totalTokens += chunk.TokenCount
+		t.Logf("Chunk %d: %d tokens", i, chunk.TokenCount)
+	}
+	t.Logf("Total chunks: %d, Total tokens: %d", len(chunks), totalTokens)
+
 	if len(chunks) <= 1 {
-		t.Errorf("Expected multiple chunks for very long sentence, got %d", len(chunks))
+		t.Errorf("Expected multiple chunks for very long sentence (should exceed 3000 tokens), got %d", len(chunks))
 	}
 
 	// Verify all chunks together contain the original text (approximately)
@@ -186,9 +195,17 @@ func TestTextChunkerVeryLongSentence(t *testing.T) {
 		totalLength += len(chunk.Text)
 	}
 
-	// Due to overlap, total length should be >= original length
-	if totalLength < len(longSentence) {
-		t.Errorf("Total chunk length %d is less than original %d", totalLength, len(longSentence))
+	// Due to word-based splitting, there might be minor differences in length
+	// The total should be within a reasonable range of the original
+	if abs(totalLength - len(longSentence)) > 10 {
+		t.Errorf("Total chunk length %d differs significantly from original %d", totalLength, len(longSentence))
+	}
+	
+	// Each chunk should respect token limits
+	for i, chunk := range chunks {
+		if chunk.TokenCount > MaxTokensPerChunk {
+			t.Errorf("Chunk %d exceeds token limit: %d > %d", i, chunk.TokenCount, MaxTokensPerChunk)
+		}
 	}
 }
 
@@ -259,15 +276,19 @@ func TestTextChunkerTokenCounting(t *testing.T) {
 
 	// Verify each chunk is within reasonable token limits
 	for i, chunk := range chunks {
-		// Simple word-based token approximation (1 token ≈ 0.75 words)
-		wordCount := len(strings.Fields(chunk.Text))
-		approximateTokens := int(float64(wordCount) / 0.75)
-
+		// Use the actual token count reported by the chunker
+		actualTokens := chunk.TokenCount
+		
 		// Should be well under the max token limit
-		if approximateTokens > MaxTokensPerChunk {
-			t.Errorf("Chunk %d has approximately %d tokens, exceeds limit of %d", 
-				i, approximateTokens, MaxTokensPerChunk)
+		if actualTokens > MaxTokensPerChunk {
+			t.Errorf("Chunk %d has %d actual tokens, exceeds limit of %d", 
+				i, actualTokens, MaxTokensPerChunk)
 		}
+		
+		// For debugging: show word count vs token count
+		wordCount := len(strings.Fields(chunk.Text))
+		t.Logf("Chunk %d: %d words, %d actual tokens (ratio: %.2f words/token)", 
+			i, wordCount, actualTokens, float64(wordCount)/float64(actualTokens))
 	}
 }
 
@@ -340,4 +361,11 @@ func TestTextChunkerEdgeCases(t *testing.T) {
 			}
 		})
 	}
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

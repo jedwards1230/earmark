@@ -2,27 +2,34 @@ package tokenizer
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/pkoukk/tiktoken-go"
 	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
 )
 
-func initTokenizer() (*tiktoken.Tiktoken, error) {
-	encoding := "cl100k_base"
-	tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
-	tkm, err := tiktoken.GetEncoding(encoding)
-	if err != nil {
-		err = fmt.Errorf("getEncoding: %v", err)
-		return tkm, err
-	}
-	return tkm, err
+var (
+	tokenizer     *tiktoken.Tiktoken
+	tokenizerOnce sync.Once
+	tokenizerErr  error
+)
+
+func getTokenizer() (*tiktoken.Tiktoken, error) {
+	tokenizerOnce.Do(func() {
+		encoding := "cl100k_base"
+		tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
+		tokenizer, tokenizerErr = tiktoken.GetEncoding(encoding)
+		if tokenizerErr != nil {
+			tokenizerErr = fmt.Errorf("getEncoding: %v", tokenizerErr)
+		}
+	})
+	return tokenizer, tokenizerErr
 }
 
 // GetTokens returns raw tokens (probably not what you want for similarity search)
 func GetTokens(content string) ([]int, error) {
-	tkm, err := initTokenizer()
+	tkm, err := getTokenizer()
 	if err != nil {
-		err = fmt.Errorf("getEncoding: %v", err)
 		return nil, err
 	}
 
@@ -33,9 +40,8 @@ func GetTokens(content string) ([]int, error) {
 }
 
 func DecodeTokens(tokens []int) (string, error) {
-	tkm, err := initTokenizer()
+	tkm, err := getTokenizer()
 	if err != nil {
-		err = fmt.Errorf("getEncoding: %v", err)
 		return "", err
 	}
 

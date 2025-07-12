@@ -177,20 +177,23 @@ func TestTokenizeRoundTrip(t *testing.T) {
 
 func TestInitTokenizer(t *testing.T) {
 	t.Run("initialization_succeeds", func(t *testing.T) {
-		tkm, err := initTokenizer()
+		tkm, err := getTokenizer()
 		require.NoError(t, err, "tokenizer initialization should succeed")
 		assert.NotNil(t, tkm, "tokenizer should not be nil")
 	})
 
 	t.Run("multiple_initializations", func(t *testing.T) {
-		// Test that multiple initializations work (important for concurrent usage)
-		tkm1, err1 := initTokenizer()
-		require.NoError(t, err1, "first initialization should succeed")
+		// Test that multiple calls to getTokenizer work (important for concurrent usage)
+		tkm1, err1 := getTokenizer()
+		require.NoError(t, err1, "first call should succeed")
 		assert.NotNil(t, tkm1, "first tokenizer should not be nil")
 
-		tkm2, err2 := initTokenizer()
-		require.NoError(t, err2, "second initialization should succeed")
+		tkm2, err2 := getTokenizer()
+		require.NoError(t, err2, "second call should succeed")
 		assert.NotNil(t, tkm2, "second tokenizer should not be nil")
+		
+		// Should return the same instance (singleton pattern)
+		assert.Equal(t, tkm1, tkm2, "should return the same tokenizer instance")
 	})
 }
 

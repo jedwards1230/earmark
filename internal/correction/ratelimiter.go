@@ -49,6 +49,11 @@ func (rl *RateLimiter) CheckRateLimit(ctx context.Context) error {
 	rl.requestsMutex.Lock()
 	defer rl.requestsMutex.Unlock()
 	
+	// Zero rate limit means no requests allowed
+	if rl.requestsPerMinute == 0 {
+		return fmt.Errorf("rate limit is zero: no requests allowed")
+	}
+	
 	now := time.Now()
 	cutoff := now.Add(-time.Minute)
 	
@@ -62,7 +67,7 @@ func (rl *RateLimiter) CheckRateLimit(ctx context.Context) error {
 	rl.requests = recentRequests
 	
 	// Check if we're at the rate limit
-	if len(rl.requests) >= rl.requestsPerMinute && len(rl.requests) > 0 {
+	if len(rl.requests) >= rl.requestsPerMinute {
 		oldestRequest := rl.requests[0]
 		waitTime := oldestRequest.Add(time.Minute).Sub(now)
 		
@@ -158,6 +163,14 @@ func (rl *RateLimiter) EstimateCost(tokenCount int) CostEstimate {
 	
 	// Check rate limit
 	rl.requestsMutex.Lock()
+	
+	// Zero rate limit means no requests allowed
+	if rl.requestsPerMinute == 0 {
+		estimate.WouldExceedRate = true
+		rl.requestsMutex.Unlock()
+		return estimate
+	}
+	
 	now := time.Now()
 	cutoff := now.Add(-time.Minute)
 	
@@ -220,7 +233,7 @@ func (rl *RateLimiter) WaitForRateLimit(ctx context.Context) error {
 		}
 		
 		oldestRequest := rl.requests[0]
-		waitTime := oldestRequest.Add(time.Minute).Sub(time.Now())
+		waitTime := time.Until(oldestRequest.Add(time.Minute))
 		rl.requestsMutex.Unlock()
 		
 		if waitTime <= 0 {
