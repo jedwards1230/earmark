@@ -9,11 +9,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const (
-	treeVertical = "│"
-	treeBranch   = "├──"
-	treeLeaf     = "└──"
-)
 
 var rootCmd = &cobra.Command{
 	Use:   "lil-whisper",

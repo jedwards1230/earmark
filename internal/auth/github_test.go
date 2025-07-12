@@ -276,6 +276,7 @@ func TestAuthManager_GetAuthenticatedClient(t *testing.T) {
 	client := am.GetAuthenticatedClient()
 	if client == nil {
 		t.Error("GetAuthenticatedClient returned nil")
+		return
 	}
 	
 	if client.Timeout != 30*time.Second {

@@ -173,6 +173,7 @@ func TestUpdateIntegration(t *testing.T) {
 	client := authManager.GetAuthenticatedClient()
 	if client == nil {
 		t.Error("Failed to get authenticated client")
+		return
 	}
 	
 	// Test that timeout is set correctly

@@ -219,13 +219,6 @@ func CheckForUpdatesWithExpiryAndAuthenticatedClient(ctx context.Context, useCac
 	return result, nil
 }
 
-func performUpdateCheck(ctx context.Context) (*CheckResult, error) {
-	return performUpdateCheckWithDebug(ctx, false)
-}
-
-func performUpdateCheckWithDebug(ctx context.Context, debug bool) (*CheckResult, error) {
-	return performUpdateCheckWithAuthenticatedClient(ctx, debug, nil)
-}
 
 // performUpdateCheckWithAuthenticatedClient performs update check with optional authenticated client
 func performUpdateCheckWithAuthenticatedClient(ctx context.Context, debug bool, client *http.Client) (*CheckResult, error) {
@@ -540,9 +533,6 @@ func parseVersion(version string) []int {
 	return result
 }
 
-func checkGitReleasesWithDebug(ctx context.Context, result *CheckResult, debug bool) (*CheckResult, error) {
-	return checkGitReleasesWithAuthenticatedClient(ctx, result, debug, nil)
-}
 
 // checkGitReleasesWithAuthenticatedClient checks for releases using git commands (works with private repos)
 func checkGitReleasesWithAuthenticatedClient(ctx context.Context, result *CheckResult, debug bool, client *http.Client) (*CheckResult, error) {
