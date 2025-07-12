@@ -255,55 +255,12 @@ MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 ./lil-whisper mcp
 
 ### Available Tools
 
-#### 1. semantic_search_audiobooks
+1. **semantic_search_audiobooks**: Search using semantic similarity
+2. **text_search_audiobooks**: Full-text search across transcriptions
+3. **browse_audiobook_library**: Browse library structure  
+4. **get_chunk_context**: Get surrounding chunks for context
 
-**Purpose**: Search audiobook transcriptions using semantic similarity.
-
-**Parameters**:
-- `query` (string, required): Search query text
-- `threshold` (number, optional, default: 0.3): Similarity threshold (0.0-1.0)
-- `limit` (number, optional, default: 10): Maximum results to return
-
-**Example Usage**:
-```json
-{
-  "query": "dragons and magic spells",
-  "threshold": 0.4,
-  "limit": 5
-}
-```
-
-#### 2. text_search_audiobooks
-
-**Purpose**: Search audiobook transcriptions using PostgreSQL full-text search.
-
-**Parameters**:
-- `query` (string, required): Search query text
-- `limit` (number, optional, default: 10): Maximum results to return
-
-**Example Usage**:
-```json
-{
-  "query": "Eragon spoke to Saphira",
-  "limit": 10
-}
-```
-
-#### 3. browse_audiobook_library
-
-**Purpose**: Browse the audiobook library structure with hierarchical display.
-
-**Parameters**:
-- `author` (string, optional): Filter by author name (case-insensitive)
-- `book` (string, optional): Filter by book title (case-insensitive)
-
-**Example Usage**:
-```json
-{
-  "author": "Paolini",
-  "book": "Inheritance"
-}
-```
+*For detailed tool documentation, parameters, and examples, see `internal/mcp/README.md`.*
 
 ### Integration Examples
 
@@ -339,10 +296,12 @@ Found 2 result(s):
 
 **The Inheritance Cycle** by Christopher Paolini
 Chapter 5: Eldest (chunk 15/120, similarity: 85%)
+ID: Christopher Paolini_The Inheritance Cycle_5_15 | File: /media/audiobooks/libation/Christopher Paolini/Eldest.m4b | Words: 247
 > Eragon felt the dragon's mind touch his own, a warm presence...
 
 **The Inheritance Cycle** by Christopher Paolini  
 Chapter 12: Brisingr (chunk 8/95, similarity: 78%)
+ID: Christopher Paolini_The Inheritance Cycle_12_8 | File: /media/audiobooks/libation/Christopher Paolini/Brisingr.m4b | Words: 189
 > The ancient language flowed through him as he spoke...
 ```
 

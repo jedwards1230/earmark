@@ -37,6 +37,7 @@ FileMonitor → Queue → Worker → [Yap Transcription → LLM Correction → C
 - NO standalone executables in `cmd/subdirectories/` - integrate as commands instead
 - Follow existing pattern: add commands to `cmd/main.go` and implement in separate files
 - Example: MCP server is `./lil-whisper mcp`, not a separate binary
+- **Command Metadata Updates**: When changes are made to internal packages that affect functionality, impacted commands MUST be updated to reflect the latest usage and state of the repo (help text, tool lists, descriptions, etc.)
 
 ## Development Workflows
 
@@ -86,10 +87,11 @@ go test ./...
 
 ### 4. MCP Server Implementation (COMPLETED)
 - **Complete implementation**: Located in `internal/mcp/` package with full test coverage
-- **Three tools**: semantic_search_audiobooks, text_search_audiobooks, browse_audiobook_library
+- **Four tools**: semantic_search_audiobooks, text_search_audiobooks, browse_audiobook_library, get_chunk_context
 - **Transport support**: Both stdio (default) and HTTP transports via environment configuration
 - **Cobra integration**: Accessible via `./lil-whisper mcp` command (not standalone binary)
 - **AI assistant compatibility**: Works with Claude Desktop and other MCP clients
+- **Documentation**: Detailed tool specs in `internal/mcp/README.md` (single source of truth)
 
 ## Project-Specific Conventions
 
@@ -134,4 +136,12 @@ go test ./...
 1. New components go in `internal/` with their own package
 2. Integrate via `internal/worker/worker.go` processing flow
 3. Update `docs/ARCHITECTURE_OVERVIEW.md` with new component
+4. Add comprehensive tests following existing patterns
+
+### Updating Command Interfaces
+1. When modifying `internal/` packages that affect user-facing functionality, update related commands
+2. Update help text and descriptions in `cmd/` files (avoid duplicating detailed tool lists)
+3. Update any standalone command files (like `cmd/mcp-server/main.go`) to reflect changes
+4. Ensure documentation consistency - detailed MCP tool info only in `internal/mcp/README.md`
+5. Other files should have brief descriptions and reference the MCP README for details
 4. Add comprehensive tests following existing patterns

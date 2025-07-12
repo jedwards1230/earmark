@@ -4,11 +4,12 @@ This directory contains the Model Context Protocol (MCP) server implementation f
 
 ## Overview
 
-The MCP server provides three main tools for interacting with the audiobook transcription database:
+The MCP server provides four main tools for interacting with the audiobook transcription database:
 
 1. **semantic_search_audiobooks** - Search using semantic similarity
 2. **text_search_audiobooks** - Search using full-text search  
 3. **browse_audiobook_library** - Browse the library structure
+4. **get_chunk_context** - Get surrounding chunks for better context
 
 ## Architecture
 
@@ -121,6 +122,22 @@ Browse the audiobook library structure with optional filtering.
 {
   "author": "Paolini",
   "book": "Eragon"
+}
+```
+
+### get_chunk_context
+
+Get surrounding chunks for better context around a specific chunk.
+
+**Parameters:**
+- `chunkID` (string, required) - Unique chunk identifier (format: author_book_chapter_chunk)
+- `contextWindow` (number, optional, default: 2) - Number of chunks before and after to include
+
+**Example:**
+```json
+{
+  "chunkID": "Christopher Paolini_Eragon_5_12",
+  "contextWindow": 3
 }
 ```
 

@@ -31,10 +31,8 @@ func main() {
 
 	// Start the MCP service
 	fmt.Println("Starting MCP server for lilbro-whisper...")
-	fmt.Println("Available tools:")
-	fmt.Println("  - semantic_search_audiobooks: Search using semantic similarity")
-	fmt.Println("  - text_search_audiobooks: Search using full-text search")
-	fmt.Println("  - browse_audiobook_library: Browse library structure")
+	fmt.Println("Four tools available for AI assistant integration.")
+	fmt.Println("See internal/mcp/README.md for detailed tool documentation.")
 	fmt.Println("")
 	fmt.Println("Transport:", os.Getenv("MCP_TRANSPORT"))
 	if os.Getenv("MCP_TRANSPORT") == "http" {

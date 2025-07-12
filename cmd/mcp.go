@@ -17,10 +17,9 @@ var mcpCmd = &cobra.Command{
 	Short: "Start the Model Context Protocol (MCP) server",
 	Long: `Start the MCP server for lilbro-whisper audiobook transcription service.
 
-The MCP server provides three tools for AI assistants:
-  - semantic_search_audiobooks: Search using semantic similarity
-  - text_search_audiobooks: Search using full-text search  
-  - browse_audiobook_library: Browse library structure
+The MCP server provides four tools for AI assistant integration with audiobook search and browsing capabilities.
+
+*See internal/mcp/README.md for detailed tool documentation.*
 
 Environment Variables:
   MCP_TRANSPORT: Transport type - "stdio" (default) or "http"

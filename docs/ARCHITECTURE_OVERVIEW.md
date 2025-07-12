@@ -146,7 +146,7 @@ transcriptions (id, file_path, checksum, text, word_count)
 **Purpose**: Model Context Protocol server for AI assistant integration
 
 **Key Features**:
-- Three integrated tools for audiobook search and browsing
+- Four integrated tools for audiobook search and browsing
 - Support for both stdio and HTTP transports
 - Interface-based architecture for clean separation from database layer
 - Comprehensive formatting for AI assistant display
@@ -159,9 +159,12 @@ transcriptions (id, file_path, checksum, text, word_count)
 - Complete test coverage using TDD approach
 
 **Available Tools**:
-1. **semantic_search_audiobooks**: Vector similarity search using OpenAI embeddings
-2. **text_search_audiobooks**: PostgreSQL full-text search across transcriptions
-3. **browse_audiobook_library**: Hierarchical library browsing with optional filtering
+1. **semantic_search_audiobooks**: Vector similarity search
+2. **text_search_audiobooks**: PostgreSQL full-text search
+3. **browse_audiobook_library**: Hierarchical library browsing
+4. **get_chunk_context**: Retrieve surrounding chunks for context
+
+*See `internal/mcp/README.md` for detailed tool documentation.*
 
 **Integration**:
 - Integrated as Cobra command (`./lil-whisper mcp`)

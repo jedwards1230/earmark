@@ -107,9 +107,12 @@ The service now includes a complete MCP server implementation for integration wi
 
 ### Available Tools
 
-- **semantic_search_audiobooks**: Search using semantic similarity with OpenAI embeddings
-- **text_search_audiobooks**: Full-text search across all transcriptions
-- **browse_audiobook_library**: Browse library structure with hierarchical display
+- **semantic_search_audiobooks**: Search using semantic similarity
+- **text_search_audiobooks**: Full-text search across transcriptions  
+- **browse_audiobook_library**: Browse library structure
+- **get_chunk_context**: Get surrounding chunks for context
+
+*See `internal/mcp/README.md` for detailed tool documentation and examples.*
 
 ### Usage
 
@@ -149,7 +152,7 @@ The service uses a sophisticated PostgreSQL schema:
 
 ## Recent Improvements (v0.9)
 
-- ✅ **MCP Server Implementation:** Complete Model Context Protocol server with 3 tools for AI assistant integration
+- ✅ **MCP Server Implementation:** Complete Model Context Protocol server with 4 tools for AI assistant integration
 - ✅ **Raw Transcription Storage:** Store full transcriptions alongside chunked content
 - ✅ **Settings-Based Deduplication:** Re-transcribe only when settings change
 - ✅ **File Checksum Validation:** Use SHA256 checksums for reliable deduplication

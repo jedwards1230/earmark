@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"testing"
+
 	"github.com/jedwards1230/lil-whisper/internal/db"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -29,6 +30,12 @@ func TestFormatSearchResults(t *testing.T) {
 					ChapterTitle:  "An Unexpected Party",
 					TotalChunks:   50,
 					TotalChapters: 19,
+					FilePath:      "/media/audiobooks/tolkien/the-hobbit.m4b",
+					FileChecksum:  "abc123def456",
+					ChunkID:       "J.R.R. Tolkien_The Hobbit_1_5",
+					WordCount:     8,
+					ISBN:          "9780547928227",
+					ASIN:          "B0099RNJB2",
 				},
 			},
 			expected: &mcp.CallToolResult{
@@ -39,6 +46,7 @@ func TestFormatSearchResults(t *testing.T) {
 
 **The Hobbit** by J.R.R. Tolkien
 Chapter 1: An Unexpected Party (chunk 6/50, similarity: 85%)
+ID: J.R.R. Tolkien_The Hobbit_1_5 | File: /media/audiobooks/tolkien/the-hobbit.m4b | Words: 8
 > The dragon soared through the sky
 `,
 					},
@@ -72,6 +80,10 @@ Chapter 1: An Unexpected Party (chunk 6/50, similarity: 85%)
 					ChapterTitle:  "Chapter 1",
 					TotalChunks:   10,
 					TotalChapters: 5,
+					FilePath:      "/media/audiobooks/author-one/book-one.m4b",
+					FileChecksum:  "def789ghi012",
+					ChunkID:       "Author One_Book One_1_0",
+					WordCount:     4,
 				},
 				{
 					ID:            2,
@@ -85,6 +97,10 @@ Chapter 1: An Unexpected Party (chunk 6/50, similarity: 85%)
 					ChapterTitle:  "Chapter 2",
 					TotalChunks:   20,
 					TotalChapters: 8,
+					FilePath:      "/media/audiobooks/author-two/book-two.m4b",
+					FileChecksum:  "ghi345jkl678",
+					ChunkID:       "Author Two_Book Two_2_1",
+					WordCount:     5,
 				},
 			},
 			expected: &mcp.CallToolResult{
@@ -95,10 +111,12 @@ Chapter 1: An Unexpected Party (chunk 6/50, similarity: 85%)
 
 **Book One** by Author One
 Chapter 1: Chapter 1 (chunk 1/10, similarity: 90%)
+ID: Author One_Book One_1_0 | File: /media/audiobooks/author-one/book-one.m4b | Words: 4
 > First result content
 
 **Book Two** by Author Two
 Chapter 2: Chapter 2 (chunk 2/20, similarity: 70%)
+ID: Author Two_Book Two_2_1 | File: /media/audiobooks/author-two/book-two.m4b | Words: 5
 > Second result content
 `,
 					},
