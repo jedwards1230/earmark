@@ -56,14 +56,14 @@ type GitHubRelease struct {
 }
 
 type CheckResult struct {
-	HasUpdate        bool      `json:"has_update"`
-	CurrentVersion   string    `json:"current_version"`
-	CurrentCommit    string    `json:"current_commit"`
-	LatestCommit     string    `json:"latest_commit,omitempty"`
-	LatestVersion    string    `json:"latest_version,omitempty"`
-	UpdateMessage    string    `json:"update_message,omitempty"`
-	CheckedAt        time.Time `json:"checked_at"`
-	UseReleases      bool      `json:"use_releases"`
+	HasUpdate      bool      `json:"has_update"`
+	CurrentVersion string    `json:"current_version"`
+	CurrentCommit  string    `json:"current_commit"`
+	LatestCommit   string    `json:"latest_commit,omitempty"`
+	LatestVersion  string    `json:"latest_version,omitempty"`
+	UpdateMessage  string    `json:"update_message,omitempty"`
+	CheckedAt      time.Time `json:"checked_at"`
+	UseReleases    bool      `json:"use_releases"`
 }
 
 type VersionCache struct {
@@ -162,7 +162,7 @@ func checkCommitVersion(ctx context.Context, result *CheckResult) (*CheckResult,
 	if len(currentCommitShort) > 7 {
 		currentCommitShort = currentCommitShort[:7]
 	}
-	
+
 	latestCommitShort := commit.SHA
 	if len(latestCommitShort) > 7 {
 		latestCommitShort = latestCommitShort[:7]
@@ -224,12 +224,12 @@ func getCacheDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	cacheDir := filepath.Join(home, ".cache", "lil-whisper")
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return "", err
 	}
-	
+
 	return cacheDir, nil
 }
 
@@ -238,7 +238,7 @@ func loadCache() *VersionCache {
 	if err != nil {
 		return nil
 	}
-	
+
 	cachePath := filepath.Join(cacheDir, CacheFile)
 	data, err := os.ReadFile(cachePath)
 	if err != nil {
@@ -258,7 +258,7 @@ func saveCache(cache *VersionCache) {
 	if err != nil {
 		return
 	}
-	
+
 	cachePath := filepath.Join(cacheDir, CacheFile)
 	data, err := json.Marshal(cache)
 	if err != nil {
@@ -272,21 +272,21 @@ func IsNewerVersion(current, latest string) bool {
 	if current == "dev" || latest == "dev" {
 		return false
 	}
-	
+
 	if !strings.HasPrefix(current, "v") {
 		current = "v" + current
 	}
 	if !strings.HasPrefix(latest, "v") {
 		latest = "v" + latest
 	}
-	
+
 	currentParts := parseVersion(current)
 	latestParts := parseVersion(latest)
-	
+
 	if len(currentParts) != 3 || len(latestParts) != 3 {
 		return current != latest
 	}
-	
+
 	for i := 0; i < 3; i++ {
 		if latestParts[i] > currentParts[i] {
 			return true
@@ -295,7 +295,7 @@ func IsNewerVersion(current, latest string) bool {
 			return false
 		}
 	}
-	
+
 	return false
 }
 
@@ -303,12 +303,12 @@ func parseVersion(version string) []int {
 	version = strings.TrimPrefix(version, "v")
 	parts := strings.Split(version, ".")
 	result := make([]int, len(parts))
-	
+
 	for i, part := range parts {
 		if num, err := strconv.Atoi(part); err == nil {
 			result[i] = num
 		}
 	}
-	
+
 	return result
 }

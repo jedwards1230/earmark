@@ -2,10 +2,10 @@ package queue
 
 import (
 	"fmt"
+	"github.com/jedwards1230/lil-whisper/internal/meta"
 	"sync"
 	"testing"
 	"time"
-	"github.com/jedwards1230/lil-whisper/internal/meta"
 )
 
 func TestNewQueue(t *testing.T) {

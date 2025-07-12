@@ -3,9 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"github.com/jedwards1230/lil-whisper/internal/db"
 	"net/http"
 	"strconv"
-	"github.com/jedwards1230/lil-whisper/internal/db"
 )
 
 func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {

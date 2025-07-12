@@ -16,28 +16,28 @@ func TestRun(t *testing.T) {
 	defer func() { os.Args = oldArgs }()
 
 	tests := []struct {
-		name          string
-		args          []string
-		expectError   bool
-		expectOutput  string
+		name         string
+		args         []string
+		expectError  bool
+		expectOutput string
 	}{
 		{
-			name:          "no arguments shows help",
-			args:          []string{"lil-whisper"},
-			expectError:   false,
-			expectOutput:  "A transcription service using Yap and MacOS native APIs",
+			name:         "no arguments shows help",
+			args:         []string{"lil-whisper"},
+			expectError:  false,
+			expectOutput: "A transcription service using Yap and MacOS native APIs",
 		},
 		{
-			name:          "help flag",
-			args:          []string{"lil-whisper", "--help"},
-			expectError:   false,
-			expectOutput:  "A transcription service using Yap and MacOS native APIs",
+			name:         "help flag",
+			args:         []string{"lil-whisper", "--help"},
+			expectError:  false,
+			expectOutput: "A transcription service using Yap and MacOS native APIs",
 		},
 		{
-			name:          "invalid command",
-			args:          []string{"lil-whisper", "invalid"},
-			expectError:   true,
-			expectOutput:  "unknown command",
+			name:         "invalid command",
+			args:         []string{"lil-whisper", "invalid"},
+			expectError:  true,
+			expectOutput: "unknown command",
 		},
 	}
 
@@ -106,7 +106,7 @@ func TestCommandsExist(t *testing.T) {
 
 	// Test that all expected commands are registered
 	commands := []string{"monitor", "serve", "list", "search", "mcp"}
-	
+
 	for _, cmdName := range commands {
 		cmd, _, err := rootCmd.Find([]string{cmdName})
 		assert.NoError(t, err)

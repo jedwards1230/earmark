@@ -1,8 +1,8 @@
 package queue
 
 import (
-	"sync"
 	"github.com/jedwards1230/lil-whisper/internal/meta"
+	"sync"
 )
 
 type Queue struct {

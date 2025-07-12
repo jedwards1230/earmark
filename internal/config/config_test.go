@@ -95,7 +95,7 @@ func TestLoadConfig(t *testing.T) {
 
 	t.Run("invalid chunk size", func(t *testing.T) {
 		os.Setenv("CHUNK_SIZE", "invalid")
-		
+
 		_, err := LoadConfig()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid syntax")
@@ -105,9 +105,9 @@ func TestLoadConfig(t *testing.T) {
 
 	t.Run("boolean parsing", func(t *testing.T) {
 		tests := []struct {
-			envValue   string
-			expected   bool
-			shouldSet  bool
+			envValue  string
+			expected  bool
+			shouldSet bool
 		}{
 			{"true", true, true},
 			{"1", true, true},
@@ -122,7 +122,7 @@ func TestLoadConfig(t *testing.T) {
 				if tt.shouldSet {
 					os.Setenv("DEBUG", tt.envValue)
 				}
-				
+
 				cfg, err := LoadConfig()
 				require.NoError(t, err)
 				assert.Equal(t, tt.expected, cfg.Debug)
@@ -134,7 +134,7 @@ func TestLoadConfig(t *testing.T) {
 				if tt.shouldSet {
 					os.Setenv("RESET_STATE", tt.envValue)
 				}
-				
+
 				cfg, err := LoadConfig()
 				require.NoError(t, err)
 				assert.Equal(t, tt.expected, cfg.ResetState)
@@ -184,7 +184,7 @@ func TestMaskSecret(t *testing.T) {
 func TestResolveAndCreatePath(t *testing.T) {
 	// Create a temporary directory for testing
 	tempDir := t.TempDir()
-	
+
 	tests := []struct {
 		name         string
 		cwd          string
@@ -218,10 +218,10 @@ func TestResolveAndCreatePath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := resolveAndCreatePath(tt.cwd, tt.path)
-			
+
 			// Check if path is absolute
 			assert.True(t, filepath.IsAbs(result))
-			
+
 			// Check if path was created
 			if tt.expectCreate {
 				_, err := os.Stat(result)
@@ -258,7 +258,7 @@ func TestConfigPrintEnvVars(t *testing.T) {
 func TestConfigInitializePaths(t *testing.T) {
 	// Create a temporary directory for testing
 	tempDir := t.TempDir()
-	
+
 	// Change to temp directory
 	originalWd, _ := os.Getwd()
 	err := os.Chdir(tempDir)
@@ -440,7 +440,7 @@ func BenchmarkLoadConfig(b *testing.B) {
 
 func BenchmarkMaskSecret(b *testing.B) {
 	secret := "verylongsecretkey123456789"
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = MaskSecret(secret)

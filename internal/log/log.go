@@ -119,10 +119,10 @@ func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
 		if a.Key == slog.TimeKey || a.Key == "module" {
 			return true
 		}
-		
+
 		key := a.Key
 		value := a.Value.Any()
-		
+
 		// Format specific keys for better readability
 		switch key {
 		case "error":
@@ -141,13 +141,13 @@ func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
 
 	// Build the log line with improved formatting
 	var logLine strings.Builder
-	
+
 	// Component name with subtle styling
 	logLine.WriteString(fmt.Sprintf("%s[%s]%s", colorBlue, component, colorReset))
-	
+
 	// Main message
 	logLine.WriteString(fmt.Sprintf(" %s", r.Message))
-	
+
 	// Attributes if present
 	if len(attrs) > 0 {
 		logLine.WriteString(" ")

@@ -2,16 +2,13 @@ package cmd
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/build"
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/version"
 	"github.com/spf13/cobra"
@@ -31,7 +28,7 @@ var rootCmd = &cobra.Command{
 		if cmd.Name() == "version" || cmd.Name() == "update" {
 			return
 		}
-		
+
 		// Check for updates in background (non-blocking)
 		go checkForUpdatesBackground()
 	},
@@ -51,9 +48,7 @@ This service handles:
 
 The monitor service does NOT start the HTTP server. Use the 'serve' command
 to start the HTTP API server separately.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runSubCommand("monitor", args)
-	},
+	Run: runMonitor,
 }
 
 var serveCmd = &cobra.Command{
@@ -70,26 +65,20 @@ This service handles:
 
 The serve command does NOT start file monitoring or transcription. Use the
 'monitor' command to start the file monitoring and transcription service.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runSubCommand("serve", args)
-	},
+	Run: runServe,
 }
 
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List content from the database",
-	Run: func(cmd *cobra.Command, args []string) {
-		runSubCommand("list", args)
-	},
+	Run:   runList,
 }
 
 var searchCmd = &cobra.Command{
 	Use:   "search [query]",
 	Short: "Search for content in the database",
 	Long:  `Search for content in the database. By default, uses semantic vector similarity search.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runSubCommand("search", args)
-	},
+	Run:   runSearch,
 }
 
 var mcpCmd = &cobra.Command{
@@ -112,9 +101,7 @@ Examples:
 
   # Start with custom HTTP address
   MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 lil-whisper mcp`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runSubCommand("mcp", args)
-	},
+	Run: runMCP,
 }
 
 var versionCmd = &cobra.Command{
@@ -137,9 +124,7 @@ Examples:
 
   # Force fresh update check
   lil-whisper version --check --no-cache`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runSubCommand("version", args)
-	},
+	Run: runVersion,
 }
 
 var updateCmd = &cobra.Command{
@@ -165,48 +150,14 @@ Examples:
 
   # Force update without prompts
   lil-whisper update --force --yes`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runSubCommand("update", args)
-	},
+	Run: runUpdate,
 }
 
-func runSubCommand(subCmd string, args []string) {
-	// Build the path to the sub-command binary
-	binaryPath := filepath.Join("cmd", subCmd, "main")
-	
-	// Check if the binary exists, if not try to build it
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		// Get version information for embedding
-		commit := getGitCommit()
-		buildTime := getBuildTime()
-		goVersion := getGoVersion()
-		
-		// Get module path dynamically
-		modulePath, err := build.GetModulePath()
-		if err != nil {
-			log.Fatalf("Failed to get module path: %v", err)
-		}
-		
-		// Build ldflags for version embedding
-		ldflags := fmt.Sprintf("-X '%s/internal/version.Version=%s' -X '%s/internal/version.Commit=%s' -X '%s/internal/version.BuildTime=%s' -X '%s/internal/version.GoVersion=%s'", 
-			modulePath, version.Version, modulePath, commit, modulePath, buildTime, modulePath, goVersion)
-		
-		// Try to build the binary with version embedding
-		buildCmd := exec.Command("go", "build", "-ldflags", ldflags, "-o", binaryPath, "./cmd/"+subCmd)
-		if err := buildCmd.Run(); err != nil {
-			log.Fatalf("Failed to build %s command: %v", subCmd, err)
-		}
-	}
-	
-	// Execute the sub-command
-	cmd := exec.Command(binaryPath, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("Error running %s command: %v", subCmd, err)
-	}
+func init() {
+	// Add flags to search command
+	searchCmd.Flags().IntVarP(&searchLimit, "limit", "l", 10, "maximum number of results to return")
+	searchCmd.Flags().BoolVarP(&textMatch, "text", "t", false, "use text-based search instead of semantic search")
+	searchCmd.Flags().Float64VarP(&searchThreshold, "precision", "p", 0.3, "minimum similarity threshold (0..1)")
 }
 
 func checkForUpdatesBackground() {

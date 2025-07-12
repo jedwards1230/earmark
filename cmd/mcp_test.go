@@ -2,23 +2,27 @@ package cmd
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func TestMCPCommand(t *testing.T) {
-	// Test that the MCP command is properly configured
-	if mcpCmd.Use != "mcp" {
-		t.Errorf("Expected command use to be 'mcp', got %s", mcpCmd.Use)
-	}
+func TestMCPCommandDefinition(t *testing.T) {
+	// Test that the MCP command is properly defined
+	assert.NotNil(t, mcpCmd, "MCP command should be defined")
+	assert.Equal(t, "mcp", mcpCmd.Use, "Expected command use to be 'mcp'")
+	assert.NotEmpty(t, mcpCmd.Short, "Expected command to have a short description")
+	assert.NotEmpty(t, mcpCmd.Long, "Expected command to have a long description")
+	assert.NotNil(t, mcpCmd.Run, "Expected command to have a run function")
+}
 
-	if mcpCmd.Short == "" {
-		t.Error("Expected command to have a short description")
+func TestMCPCommandRegistration(t *testing.T) {
+	// Test that the MCP command is registered with the root command
+	found := false
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Use == "mcp" {
+			found = true
+			break
+		}
 	}
-
-	if mcpCmd.Long == "" {
-		t.Error("Expected command to have a long description")
-	}
-
-	if mcpCmd.Run == nil {
-		t.Error("Expected command to have a run function")
-	}
+	assert.True(t, found, "MCP command should be registered with root command")
 }

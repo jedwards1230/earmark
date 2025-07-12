@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/joho/godotenv"
 )
 
 var logger = log.NewLogger("config")
@@ -51,7 +51,7 @@ type Config struct {
 	LLMCorrectionTimeoutMin  int     `env:"LLM_CORRECTION_TIMEOUT_MIN"`
 
 	// Version checking config
-	DisableVersionCheck bool          `env:"DISABLE_VERSION_CHECK"`
+	DisableVersionCheck  bool          `env:"DISABLE_VERSION_CHECK"`
 	VersionCheckInterval time.Duration `env:"VERSION_CHECK_INTERVAL"`
 	VersionCheckTimeout  time.Duration `env:"VERSION_CHECK_TIMEOUT"`
 }
@@ -99,7 +99,7 @@ func LoadConfig() (*Config, error) {
 	config.LLMCorrectionModel = getEnvOrDefault("LLM_CORRECTION_MODEL", "gpt-4o-mini")
 	config.LLMCorrectionBaseURL = getEnvOrDefault("LLM_CORRECTION_BASE_URL", config.OpenAIBaseURL)
 	config.LLMCorrectionAPIKey = getEnvOrDefault("LLM_CORRECTION_API_KEY", config.OpenAIAPIKey)
-	
+
 	if env := os.Getenv("LLM_CORRECTION_TEMPERATURE"); env != "" {
 		if temp, err := strconv.ParseFloat(env, 32); err == nil {
 			config.LLMCorrectionTemperature = float32(temp)
@@ -167,7 +167,7 @@ func LoadConfig() (*Config, error) {
 
 	// Load version checking configuration
 	config.DisableVersionCheck = parseBoolEnv("DISABLE_VERSION_CHECK")
-	
+
 	// Load version check interval with default (24 hours)
 	if env := os.Getenv("VERSION_CHECK_INTERVAL"); env != "" {
 		if interval, err := time.ParseDuration(env); err == nil {
@@ -178,7 +178,7 @@ func LoadConfig() (*Config, error) {
 	} else {
 		config.VersionCheckInterval = 24 * time.Hour
 	}
-	
+
 	// Load version check timeout with default (5 seconds)
 	if env := os.Getenv("VERSION_CHECK_TIMEOUT"); env != "" {
 		if timeout, err := time.ParseDuration(env); err == nil {
@@ -274,7 +274,7 @@ func (c *Config) PrintEnvVars() {
 
 	// Other configuration
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
-	
+
 	// Version checking configuration
 	logger.Debug("Disable Version Check", "value", c.DisableVersionCheck)
 	logger.Debug("Version Check Interval", "value", c.VersionCheckInterval)

@@ -1,37 +1,30 @@
-package main
+package cmd
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"os"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/spf13/cobra"
 )
 
 var (
-	limit     = flag.Int("limit", 10, "maximum number of results to return")
-	textMatch = flag.Bool("text", false, "use text-based search instead of semantic search")
-	threshold = flag.Float64("precision", 0.3, "minimum similarity threshold (0..1)")
+	searchLimit     int
+	textMatch       bool
+	searchThreshold float64
 )
 
-func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <query>\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Search for content in the database. By default, uses semantic vector similarity search.\n\n")
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-
-	if flag.NArg() != 1 {
-		flag.Usage()
+func runSearch(cmd *cobra.Command, args []string) {
+	if len(args) != 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s search [options] <query>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Search for content in the database. By default, uses semantic vector similarity search.\n")
 		os.Exit(1)
 	}
 
-	query := flag.Arg(0)
+	query := args[0]
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -47,21 +40,21 @@ func main() {
 
 	ctx := context.Background()
 
-	if *textMatch {
-		results, err := database.TextSearch(ctx, query, *limit)
+	if textMatch {
+		results, err := database.TextSearch(ctx, query, searchLimit)
 		if err != nil {
 			fmt.Printf("Error searching database: %v\n", err)
 			return
 		}
-		printResults(results)
+		printSearchResults(results)
 		return
 	}
 
-	if *threshold == 0 {
-		*threshold = 0.3 // default threshold
+	if searchThreshold == 0 {
+		searchThreshold = 0.3 // default threshold
 	}
 
-	results, err := database.Search(ctx, query, *limit, *threshold)
+	results, err := database.Search(ctx, query, searchLimit, searchThreshold)
 	if err != nil {
 		fmt.Printf("Error searching database: %v\n", err)
 		return
@@ -88,7 +81,7 @@ func main() {
 	}
 }
 
-func printResults(results []db.SearchResultWithMetadata) {
+func printSearchResults(results []db.SearchResultWithMetadata) {
 	if len(results) == 0 {
 		fmt.Println("No results found")
 		return

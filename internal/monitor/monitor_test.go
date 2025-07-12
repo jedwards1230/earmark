@@ -3,13 +3,13 @@ package monitor
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"testing"
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/meta"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
+	"os"
+	"path/filepath"
+	"testing"
 )
 
 // MonitorDB interface defines the database methods used by FileMonitor

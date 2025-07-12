@@ -3,12 +3,12 @@ package db
 import (
 	"crypto/sha256"
 	"fmt"
+	"github.com/jedwards1230/lil-whisper/internal/config"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"github.com/jedwards1230/lil-whisper/internal/config"
 )
 
 func TestComputeFileChecksum(t *testing.T) {

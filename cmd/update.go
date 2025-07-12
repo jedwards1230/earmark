@@ -1,8 +1,7 @@
-package main
+package cmd
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,40 +13,51 @@ import (
 
 	"github.com/jedwards1230/lil-whisper/internal/build"
 	"github.com/jedwards1230/lil-whisper/internal/version"
+	"github.com/spf13/cobra"
 )
 
-var (
-	force      = flag.Bool("force", false, "force update even if no newer version is available")
-	checkOnly  = flag.Bool("check", false, "only check for updates, don't perform update")
-	noConfirm  = flag.Bool("yes", false, "skip confirmation prompts")
-)
+func runUpdate(cmd *cobra.Command, args []string) {
+	force := false
+	checkOnly := false
+	noConfirm := false
 
-func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Update lil-whisper to the latest version.\n\n")
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
+	// Parse custom flags from args
+	for _, arg := range args {
+		switch arg {
+		case "--force":
+			force = true
+		case "--check":
+			checkOnly = true
+		case "--yes":
+			noConfirm = true
+		case "--help", "-h":
+			fmt.Fprintf(os.Stderr, "Usage: lil-whisper update [options]\n")
+			fmt.Fprintf(os.Stderr, "Update lil-whisper to the latest version.\n\n")
+			fmt.Fprintf(os.Stderr, "Options:\n")
+			fmt.Fprintf(os.Stderr, "  --force      Force update even if no newer version is available\n")
+			fmt.Fprintf(os.Stderr, "  --check      Only check for updates, don't perform update\n")
+			fmt.Fprintf(os.Stderr, "  --yes        Skip confirmation prompts\n")
+			return
+		}
 	}
-	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	fmt.Println("Checking for updates...")
-	
+
 	result, err := version.CheckForUpdates(ctx, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
 		os.Exit(1)
 	}
 
-	if !result.HasUpdate && !*force {
+	if !result.HasUpdate && !force {
 		fmt.Println("✅ You are already running the latest version.")
 		return
 	}
 
-	if *checkOnly {
+	if checkOnly {
 		if result.HasUpdate {
 			fmt.Printf("🎉 Update available!\n")
 			fmt.Printf("%s\n", result.UpdateMessage)
@@ -60,17 +70,17 @@ func main() {
 	if result.HasUpdate {
 		fmt.Printf("🎉 Update available!\n")
 		fmt.Printf("%s\n", result.UpdateMessage)
-	} else if *force {
+	} else if force {
 		fmt.Printf("⚠️ Forcing update (no newer version detected)\n")
 	}
 
 	if result.UseReleases && result.LatestVersion != "" {
-		if err := updateFromRelease(ctx, result.LatestVersion); err != nil {
+		if err := updateFromRelease(ctx, result.LatestVersion, noConfirm); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating from release: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
-		if err := updateFromSource(ctx); err != nil {
+		if err := updateFromSource(ctx, noConfirm); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating from source: %v\n", err)
 			os.Exit(1)
 		}
@@ -80,11 +90,11 @@ func main() {
 	fmt.Println("Run 'lil-whisper version' to see the new version.")
 }
 
-func updateFromRelease(ctx context.Context, latestVersion string) error {
-	if !*noConfirm {
+func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool) error {
+	if !noConfirm {
 		fmt.Printf("\nThis will update lil-whisper to version %s.\n", latestVersion)
 		fmt.Print("Continue? (y/N): ")
-		
+
 		var response string
 		fmt.Scanln(&response)
 		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
@@ -100,7 +110,7 @@ func updateFromRelease(ctx context.Context, latestVersion string) error {
 		return fmt.Errorf("getting current executable path: %w", err)
 	}
 
-	downloadURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/lil-whisper-%s-%s", 
+	downloadURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/lil-whisper-%s-%s",
 		version.GitHubRepo, latestVersion, runtime.GOOS, runtime.GOARCH)
 
 	client := &http.Client{Timeout: 2 * time.Minute}
@@ -147,10 +157,10 @@ func updateFromRelease(ctx context.Context, latestVersion string) error {
 	return nil
 }
 
-func updateFromSource(ctx context.Context) error {
-	if !*noConfirm {
+func updateFromSource(ctx context.Context, noConfirm bool) error {
+	if !noConfirm {
 		fmt.Print("\nThis will rebuild lil-whisper from the latest source.\nContinue? (y/N): ")
-		
+
 		var response string
 		fmt.Scanln(&response)
 		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
@@ -160,7 +170,7 @@ func updateFromSource(ctx context.Context) error {
 	}
 
 	fmt.Println("Checking if we're in a git repository...")
-	
+
 	if _, err := exec.LookPath("git"); err != nil {
 		return fmt.Errorf("git is not available: %w", err)
 	}
@@ -183,33 +193,33 @@ func updateFromSource(ctx context.Context) error {
 	}
 
 	fmt.Println("Building new binary...")
-	
+
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("getting current executable path: %w", err)
 	}
 
 	buildArgs := []string{"build", "-o", executable + ".new"}
-	
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	gitCommit := getGitCommit(ctx)
+	gitCommit := getUpdateGitCommit(ctx)
 	goVer := runtime.Version()
-	
+
 	// Get module path dynamically
 	modulePath, err := build.GetModulePath()
 	if err != nil {
 		return fmt.Errorf("getting module path: %w", err)
 	}
-	
-	ldflags := fmt.Sprintf("-X '%s/internal/version.Version=dev' -X '%s/internal/version.Commit=%s' -X '%s/internal/version.BuildTime=%s' -X '%s/internal/version.GoVersion=%s'", 
+
+	ldflags := fmt.Sprintf("-X '%s/internal/version.Version=dev' -X '%s/internal/version.Commit=%s' -X '%s/internal/version.BuildTime=%s' -X '%s/internal/version.GoVersion=%s'",
 		modulePath, modulePath, gitCommit, modulePath, now, modulePath, goVer)
-	
+
 	buildArgs = append(buildArgs, "-ldflags", ldflags, ".")
 
 	cmd = exec.CommandContext(ctx, "go", buildArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	if err := cmd.Run(); err != nil {
 		os.Remove(executable + ".new")
 		return fmt.Errorf("building new binary: %w", err)
@@ -230,7 +240,7 @@ func updateFromSource(ctx context.Context) error {
 	return nil
 }
 
-func getGitCommit(ctx context.Context) string {
+func getUpdateGitCommit(ctx context.Context) string {
 	cmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
 	output, err := cmd.Output()
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jedwards1230/lil-whisper/internal/chunker"
 	"github.com/jedwards1230/lil-whisper/internal/config"
@@ -35,20 +36,20 @@ type Statistics struct {
 }
 
 type Transcription struct {
-	ID                   int     `json:"id"`
-	FilePath             string  `json:"file_path"`
-	FileChecksum         string  `json:"file_checksum"`
-	FileSize             int64   `json:"file_size"`
-	SettingsHash         string  `json:"settings_hash"`
-	TranscriptionText    string  `json:"transcription_text"`
-	CorrectedText        *string `json:"corrected_text,omitempty"`
-	CorrectionStatus     string  `json:"correction_status"`
-	CorrectionError      *string `json:"correction_error,omitempty"`
-	CorrectionMetadata   *string `json:"correction_metadata,omitempty"`
-	WordCount            int     `json:"word_count"`
-	ProcessingDurationMs int64   `json:"processing_duration_ms"`
-	CreatedAt            string  `json:"created_at"`
-	UpdatedAt            string  `json:"updated_at"`
+	ID                   int       `json:"id"`
+	FilePath             string    `json:"file_path"`
+	FileChecksum         string    `json:"file_checksum"`
+	FileSize             int64     `json:"file_size"`
+	SettingsHash         string    `json:"settings_hash"`
+	TranscriptionText    string    `json:"transcription_text"`
+	CorrectedText        *string   `json:"corrected_text,omitempty"`
+	CorrectionStatus     string    `json:"correction_status"`
+	CorrectionError      *string   `json:"correction_error,omitempty"`
+	CorrectionMetadata   *string   `json:"correction_metadata,omitempty"`
+	WordCount            int       `json:"word_count"`
+	ProcessingDurationMs int64     `json:"processing_duration_ms"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 type DB struct {
@@ -943,7 +944,7 @@ func (db *DB) ProcessTranscriptionCorrection(ctx context.Context, filePath strin
             updated_at = NOW()
         WHERE file_path = $1
     `, filePath)
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to update correction status: %w", err)
 	}
@@ -973,13 +974,13 @@ func (db *DB) ProcessTranscriptionCorrection(ctx context.Context, filePath strin
                 updated_at = NOW()
             WHERE file_path = $1
         `, filePath, errorMsg)
-		
+
 		if err != nil {
 			db.log.Error("Failed to update failed correction status", "error", err)
 		} else {
 			tx.Commit(ctx)
 		}
-		
+
 		return fmt.Errorf("correction failed: %w", correctionErr)
 	}
 
@@ -1024,11 +1025,11 @@ func (db *DB) GetCorrectionStatus(ctx context.Context, filePath string) (status 
         FROM transcriptions
         WHERE file_path = $1
     `, filePath).Scan(&status)
-	
+
 	if err != nil {
 		return "", fmt.Errorf("failed to get correction status: %w", err)
 	}
-	
+
 	return status, nil
 }
 
@@ -1042,16 +1043,16 @@ func (db *DB) CleanupStaleCorrections(ctx context.Context, timeoutMinutes int) (
         WHERE correction_status = 'in_progress'
         AND updated_at < NOW() - INTERVAL '%d minutes'
     `, timeoutMinutes)
-	
+
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup stale corrections: %w", err)
 	}
-	
+
 	rowsAffected := result.RowsAffected()
 	if rowsAffected > 0 {
 		db.log.Info("Cleaned up stale corrections", "count", rowsAffected)
 	}
-	
+
 	return int(rowsAffected), nil
 }
 

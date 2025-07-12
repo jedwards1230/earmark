@@ -81,7 +81,7 @@ func TestRateLimiterCostEstimation(t *testing.T) {
 
 			// Check that estimate is reasonable (within 50% of expected)
 			if estimate.EstimatedCost < tt.expectCost*0.5 || estimate.EstimatedCost > tt.expectCost*1.5 {
-				t.Errorf("Cost estimate %f not in reasonable range around %f", 
+				t.Errorf("Cost estimate %f not in reasonable range around %f",
 					estimate.EstimatedCost, tt.expectCost)
 			}
 
@@ -97,7 +97,7 @@ func TestRateLimiterBudgetExceeded(t *testing.T) {
 
 	// Test large request that would exceed budget
 	estimate := rl.EstimateCost(10000) // Large token count should exceed tiny budget
-	
+
 	if !estimate.WouldExceedBudget {
 		t.Errorf("Large request should exceed budget, estimated cost: %f, budget: %f", estimate.EstimatedCost, 0.001)
 	}
@@ -112,7 +112,7 @@ func TestRateLimiterRateExceeded(t *testing.T) {
 	// Estimate for next requests should indicate rate limit exceeded
 	// (3-stage pipeline would need 3 requests)
 	estimate := rl.EstimateCost(100)
-	
+
 	if !estimate.WouldExceedRate {
 		t.Error("Should indicate rate limit would be exceeded")
 	}
@@ -218,11 +218,11 @@ func TestRateLimiterConcurrentAccess(t *testing.T) {
 
 	// Run multiple goroutines concurrently
 	done := make(chan bool, 10)
-	
+
 	for i := 0; i < 10; i++ {
 		go func() {
 			defer func() { done <- true }()
-			
+
 			for j := 0; j < 10; j++ {
 				rl.RecordRequest(0.01)
 				rl.EstimateCost(100)
@@ -239,7 +239,7 @@ func TestRateLimiterConcurrentAccess(t *testing.T) {
 
 	// Verify final state is reasonable
 	dailyCost, _ := rl.GetDailyUsage()
-	expectedCost := 1.0 // 10 goroutines * 10 requests * $0.01
+	expectedCost := 1.0                                                   // 10 goroutines * 10 requests * $0.01
 	if dailyCost < expectedCost-0.001 || dailyCost > expectedCost+0.001 { // Allow small floating point differences
 		t.Errorf("Expected daily cost ~%.3f after concurrent access, got %f", expectedCost, dailyCost)
 	}
@@ -253,16 +253,16 @@ func TestRateLimiterConcurrentAccess(t *testing.T) {
 func TestRateLimiterEdgeCases(t *testing.T) {
 	// Test with zero rate limit
 	rl := NewRateLimiter(0, 0, 0)
-	
+
 	ctx := context.Background()
-	
+
 	// Should always fail with zero rate limit (0 >= 0 is true, so it fails)
 	err := rl.CheckRateLimit(ctx)
 	if err == nil {
 		t.Error("Zero rate limit should always fail")
 	}
 
-	// Should always fail with zero budget  
+	// Should always fail with zero budget
 	err = rl.CheckDailyBudget(0.01)
 	if err == nil {
 		t.Error("Zero budget should fail any positive cost")

@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"context"
@@ -13,9 +13,10 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/monitor"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
 	"github.com/jedwards1230/lil-whisper/internal/worker"
+	"github.com/spf13/cobra"
 )
 
-func main() {
+func runMonitor(cmd *cobra.Command, args []string) {
 	log.Println("Starting file monitoring and transcription service...")
 
 	cfg, err := config.LoadConfig()

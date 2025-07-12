@@ -8,16 +8,16 @@ import (
 )
 
 const (
-	// Conservative token limits to leave room for prompt templates
-	MaxTokensPerChunk = 3000  // For models with 4k context
-	ChunkOverlap      = 200   // Overlap between chunks for continuity
+	// Modern LLM token limits for 100k+ context models
+	MaxTokensPerChunk = 100000 // For modern models with 100k+ context
+	ChunkOverlap      = 200    // Overlap between chunks for continuity
 )
 
 type TextChunk struct {
-	Text       string
-	Index      int
+	Text        string
+	Index       int
 	TotalChunks int
-	TokenCount int
+	TokenCount  int
 }
 
 type TextChunker struct {
@@ -57,7 +57,7 @@ func (tc *TextChunker) ChunkText(text string) ([]TextChunk, error) {
 
 	// Split text into sentences for better chunking boundaries
 	sentences := tc.splitIntoSentences(text)
-	
+
 	// If text fits in one chunk AND has multiple sentences, return it as-is
 	if totalTokens <= tc.maxTokens && len(sentences) > 1 {
 		return []TextChunk{
@@ -90,7 +90,7 @@ func (tc *TextChunker) ChunkText(text string) ([]TextChunk, error) {
 			}
 			return chunks, nil
 		}
-		
+
 		// Single short sentence, return as-is
 		return []TextChunk{
 			{
@@ -127,13 +127,13 @@ func (tc *TextChunker) ChunkText(text string) ([]TextChunk, error) {
 						Index:      chunkIndex,
 						TokenCount: currentTokens,
 					})
-					
+
 					// Start new chunk
 					currentChunk.Reset()
 					currentTokens = 0
 					chunkIndex++
 				}
-				
+
 				// Add the word chunk to current chunk
 				if currentChunk.Len() > 0 {
 					currentChunk.WriteString(" ")
@@ -151,12 +151,12 @@ func (tc *TextChunker) ChunkText(text string) ([]TextChunk, error) {
 				Index:      chunkIndex,
 				TokenCount: currentTokens,
 			})
-			
+
 			// Start new chunk with overlap from previous chunk
 			currentChunk.Reset()
 			currentTokens = 0
 			chunkIndex++
-			
+
 			// Add overlap from previous chunk if it exists
 			if chunkIndex > 0 && len(chunks) > 0 {
 				overlapText := tc.getOverlapText(chunks[len(chunks)-1].Text)
@@ -165,9 +165,9 @@ func (tc *TextChunker) ChunkText(text string) ([]TextChunk, error) {
 					if err != nil {
 						overlapTokens = len(strings.Fields(overlapText)) // fallback estimate
 					}
-					
+
 					// Only add overlap if it won't cause us to exceed the limit with the next sentence
-					if currentTokens + overlapTokens + sentenceTokens <= tc.maxTokens {
+					if currentTokens+overlapTokens+sentenceTokens <= tc.maxTokens {
 						currentChunk.WriteString(overlapText)
 						currentChunk.WriteString(" ")
 						currentTokens += overlapTokens
@@ -192,7 +192,7 @@ func (tc *TextChunker) ChunkText(text string) ([]TextChunk, error) {
 		if err != nil {
 			actualTokens = currentTokens // fallback to accumulated count
 		}
-		
+
 		chunks = append(chunks, TextChunk{
 			Text:       finalText,
 			Index:      chunkIndex,
@@ -204,7 +204,7 @@ func (tc *TextChunker) ChunkText(text string) ([]TextChunk, error) {
 	totalChunks := len(chunks)
 	for i := range chunks {
 		chunks[i].TotalChunks = totalChunks
-		
+
 		// Double-check that no chunk exceeds the token limit
 		if chunks[i].TokenCount > tc.maxTokens {
 			// If a chunk exceeds the limit, recount its tokens for accuracy
@@ -222,15 +222,15 @@ func (tc *TextChunker) splitIntoSentences(text string) []string {
 	// Simple sentence splitting - could be improved with more sophisticated NLP
 	text = strings.ReplaceAll(text, "\n", " ")
 	text = strings.ReplaceAll(text, "\r", " ")
-	
+
 	// Split on sentence terminators
 	sentences := []string{}
 	current := ""
-	
+
 	runes := []rune(text)
 	for i, r := range runes {
 		current += string(r)
-		
+
 		// Check for sentence ending
 		if r == '.' || r == '!' || r == '?' {
 			// Look ahead to see if this is really the end
@@ -252,12 +252,12 @@ func (tc *TextChunker) splitIntoSentences(text string) []string {
 			}
 		}
 	}
-	
+
 	// Add any remaining text
 	if strings.TrimSpace(current) != "" {
 		sentences = append(sentences, strings.TrimSpace(current))
 	}
-	
+
 	// Filter out very short sentences (likely not real sentences)
 	var filtered []string
 	for _, sentence := range sentences {
@@ -271,7 +271,7 @@ func (tc *TextChunker) splitIntoSentences(text string) []string {
 			filtered = append(filtered, sentence)
 		}
 	}
-	
+
 	return filtered
 }
 
@@ -280,21 +280,21 @@ func (tc *TextChunker) splitSentenceByWords(sentence string) []string {
 	if len(words) == 0 {
 		return []string{}
 	}
-	
+
 	var chunks []string
 	var currentChunk []string
-	
+
 	for _, word := range words {
 		// Test if adding this word would exceed the token limit
 		testChunk := append(currentChunk, word)
 		testText := strings.Join(testChunk, " ")
-		
+
 		tokenCount, err := tokenizer.CountTokens(testText)
 		if err != nil {
 			// If we can't count tokens, use word-based estimation
 			tokenCount = int(float64(len(testChunk)) / 0.75) // Rough estimate
 		}
-		
+
 		if tokenCount > tc.maxTokens && len(currentChunk) > 0 {
 			// Save current chunk and start new one
 			chunks = append(chunks, strings.Join(currentChunk, " "))
@@ -303,12 +303,12 @@ func (tc *TextChunker) splitSentenceByWords(sentence string) []string {
 			currentChunk = append(currentChunk, word)
 		}
 	}
-	
+
 	// Add the final chunk if it has content
 	if len(currentChunk) > 0 {
 		chunks = append(chunks, strings.Join(currentChunk, " "))
 	}
-	
+
 	return chunks
 }
 
@@ -317,13 +317,13 @@ func (tc *TextChunker) getOverlapText(text string) string {
 	if len(words) <= tc.overlap/4 { // Rough estimate: 4 words per token
 		return text
 	}
-	
+
 	// Take the last N words for overlap
 	overlapWords := tc.overlap / 4
 	if overlapWords > len(words) {
 		overlapWords = len(words)
 	}
-	
+
 	return strings.Join(words[len(words)-overlapWords:], " ")
 }
 
@@ -331,17 +331,17 @@ func (tc *TextChunker) ReassembleChunks(chunks []string) string {
 	if len(chunks) == 0 {
 		return ""
 	}
-	
+
 	if len(chunks) == 1 {
 		return chunks[0]
 	}
-	
+
 	// For multiple chunks, we need to remove overlap when reassembling
 	result := chunks[0]
-	
+
 	for i := 1; i < len(chunks); i++ {
 		chunk := chunks[i]
-		
+
 		// Try to detect and remove overlap at the beginning of this chunk
 		words := strings.Fields(chunk)
 		if len(words) > tc.overlap/4 {
@@ -351,9 +351,9 @@ func (tc *TextChunker) ReassembleChunks(chunks []string) string {
 				chunk = strings.Join(words[skipWords:], " ")
 			}
 		}
-		
+
 		result += " " + chunk
 	}
-	
+
 	return strings.TrimSpace(result)
 }

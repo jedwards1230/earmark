@@ -108,7 +108,7 @@ func TestCheckCommitVersion(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lil-whisper/commits/main")
-		
+
 		commit := GitHubCommit{
 			SHA: "def5678",
 			Commit: struct {
@@ -120,7 +120,7 @@ func TestCheckCommitVersion(t *testing.T) {
 				Message: "Latest commit",
 			},
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(commit)
 	}))
@@ -128,7 +128,7 @@ func TestCheckCommitVersion(t *testing.T) {
 
 	originalGitHubAPI := GitHubAPI
 	defer func() { GitHubAPI = originalGitHubAPI }()
-	
+
 	GitHubAPI = server.URL
 
 	result := &CheckResult{
@@ -138,7 +138,7 @@ func TestCheckCommitVersion(t *testing.T) {
 
 	updatedResult, err := checkCommitVersion(context.Background(), result)
 	require.NoError(t, err)
-	
+
 	assert.True(t, updatedResult.HasUpdate)
 	assert.Equal(t, "def5678", updatedResult.LatestCommit)
 	assert.Contains(t, updatedResult.UpdateMessage, "Newer commit available")
@@ -154,7 +154,7 @@ func TestCheckCommitVersionNoUpdate(t *testing.T) {
 		commit := GitHubCommit{
 			SHA: "abc1234",
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(commit)
 	}))
@@ -162,7 +162,7 @@ func TestCheckCommitVersionNoUpdate(t *testing.T) {
 
 	originalGitHubAPI := GitHubAPI
 	defer func() { GitHubAPI = originalGitHubAPI }()
-	
+
 	GitHubAPI = server.URL
 
 	result := &CheckResult{
@@ -172,7 +172,7 @@ func TestCheckCommitVersionNoUpdate(t *testing.T) {
 
 	updatedResult, err := checkCommitVersion(context.Background(), result)
 	require.NoError(t, err)
-	
+
 	assert.False(t, updatedResult.HasUpdate)
 	assert.Equal(t, "abc1234", updatedResult.LatestCommit)
 }
@@ -185,7 +185,7 @@ func TestCheckReleaseVersion(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lil-whisper/releases/latest")
-		
+
 		release := GitHubRelease{
 			TagName:     "v1.1.0",
 			Name:        "Release 1.1.0",
@@ -193,7 +193,7 @@ func TestCheckReleaseVersion(t *testing.T) {
 			Prerelease:  false,
 			Draft:       false,
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(release)
 	}))
@@ -201,7 +201,7 @@ func TestCheckReleaseVersion(t *testing.T) {
 
 	originalGitHubAPI := GitHubAPI
 	defer func() { GitHubAPI = originalGitHubAPI }()
-	
+
 	GitHubAPI = server.URL
 
 	result := &CheckResult{
@@ -211,7 +211,7 @@ func TestCheckReleaseVersion(t *testing.T) {
 
 	updatedResult, err := checkReleaseVersion(context.Background(), result)
 	require.NoError(t, err)
-	
+
 	assert.True(t, updatedResult.HasUpdate)
 	assert.True(t, updatedResult.UseReleases)
 	assert.Equal(t, "v1.1.0", updatedResult.LatestVersion)
@@ -262,7 +262,7 @@ func TestCheckForUpdatesWithCache(t *testing.T) {
 
 	result, err := CheckForUpdates(context.Background(), true)
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, cache.Result.HasUpdate, result.HasUpdate)
 	assert.Equal(t, cache.Result.CurrentVersion, result.CurrentVersion)
 	assert.Equal(t, cache.Result.LatestVersion, result.LatestVersion)
@@ -276,10 +276,10 @@ func TestGetCacheDir(t *testing.T) {
 
 	cacheDir, err := getCacheDir()
 	require.NoError(t, err)
-	
+
 	expectedDir := filepath.Join(tmpDir, ".cache", "lil-whisper")
 	assert.Equal(t, expectedDir, cacheDir)
-	
+
 	info, err := os.Stat(cacheDir)
 	require.NoError(t, err)
 	assert.True(t, info.IsDir())

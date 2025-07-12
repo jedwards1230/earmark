@@ -2,12 +2,12 @@ package transcribe
 
 import (
 	"fmt"
+	"github.com/jedwards1230/lil-whisper/internal/config"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-	"github.com/jedwards1230/lil-whisper/internal/config"
 )
 
 func TestFormatFileSize(t *testing.T) {
@@ -163,127 +163,6 @@ func TestNewTranscriber(t *testing.T) {
 
 	if transcriber.config != cfg {
 		t.Error("Expected transcriber to have correct config")
-	}
-}
-
-func TestGetRelativePath(t *testing.T) {
-	cfg := &config.Config{
-		AudioDir: "/audiobooks",
-	}
-
-	transcriber := &Transcriber{
-		config: cfg,
-	}
-
-	tests := []struct {
-		name      string
-		audioPath string
-		expected  string
-	}{
-		{
-			name:      "direct_child",
-			audioPath: "/audiobooks/file.mp3",
-			expected:  ".",
-		},
-		{
-			name:      "nested_path",
-			audioPath: "/audiobooks/author/book/chapter.mp3",
-			expected:  "author/book",
-		},
-		{
-			name:      "deep_nesting",
-			audioPath: "/audiobooks/fiction/author/series/book/chapter01.mp3",
-			expected:  "fiction/author/series/book",
-		},
-		{
-			name:      "outside_audio_dir",
-			audioPath: "/other/path/file.mp3",
-			expected:  "../other/path",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := transcriber.getRelativePath(tt.audioPath)
-			if result != tt.expected {
-				t.Errorf("getRelativePath(%s) = %s, expected %s", tt.audioPath, result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestEnsureOutputDir(t *testing.T) {
-	// Create temporary base directory
-	tmpBaseDir, err := os.MkdirTemp("", "transcribe_output_test_*")
-	if err != nil {
-		t.Fatalf("Failed to create temp base dir: %v", err)
-	}
-	defer os.RemoveAll(tmpBaseDir)
-
-	cfg := &config.Config{
-		OutputDir: tmpBaseDir,
-	}
-
-	transcriber := &Transcriber{
-		config: cfg,
-	}
-
-	tests := []struct {
-		name         string
-		relativePath string
-		expectError  bool
-	}{
-		{
-			name:         "empty_relative_path",
-			relativePath: "",
-			expectError:  false,
-		},
-		{
-			name:         "simple_relative_path",
-			relativePath: "author",
-			expectError:  false,
-		},
-		{
-			name:         "nested_relative_path",
-			relativePath: "author/book",
-			expectError:  false,
-		},
-		{
-			name:         "deep_nested_path",
-			relativePath: "fiction/author/series/book",
-			expectError:  false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := transcriber.ensureOutputDir(tt.relativePath)
-
-			if tt.expectError && err == nil {
-				t.Error("Expected error but got none")
-			}
-
-			if !tt.expectError && err != nil {
-				t.Errorf("Unexpected error: %v", err)
-			}
-
-			if !tt.expectError {
-				// Verify directory was created
-				if _, statErr := os.Stat(result); os.IsNotExist(statErr) {
-					t.Errorf("Expected directory %s to be created", result)
-				}
-
-				// Verify path structure
-				expectedPath := tmpBaseDir
-				if tt.relativePath != "" {
-					expectedPath = filepath.Join(tmpBaseDir, tt.relativePath)
-				}
-
-				if result != expectedPath {
-					t.Errorf("Expected path %s, got %s", expectedPath, result)
-				}
-			}
-		})
 	}
 }
 

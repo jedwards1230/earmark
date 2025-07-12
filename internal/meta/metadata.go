@@ -3,9 +3,9 @@ package meta
 import (
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"github.com/jedwards1230/lil-whisper/internal/log"
 	"github.com/jedwards1230/lil-whisper/internal/meta/fetcher"
+	"path/filepath"
 )
 
 var logger = log.NewLogger("metadata")

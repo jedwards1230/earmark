@@ -46,28 +46,6 @@ func NewTranscriber(cfg *config.Config) *Transcriber {
 	}
 }
 
-func (t *Transcriber) getRelativePath(audioFilePath string) string {
-	// Get relative path from configured AudioDir
-	relPath, err := filepath.Rel(t.config.AudioDir, audioFilePath)
-	if err != nil {
-		return "" // Return empty if we can't determine relative path
-	}
-	return filepath.Dir(relPath)
-}
-
-func (t *Transcriber) ensureOutputDir(relativePath string) (string, error) {
-	fullOutputDir := t.config.OutputDir
-	if relativePath != "" {
-		fullOutputDir = filepath.Join(t.config.OutputDir, relativePath)
-	}
-
-	err := os.MkdirAll(fullOutputDir, 0755)
-	if err != nil {
-		return "", fmt.Errorf("failed to create output directory: %v", err)
-	}
-	return fullOutputDir, nil
-}
-
 func formatFileSize(size int64) string {
 	const unit = 1024
 	if size < unit {
@@ -125,11 +103,11 @@ func (t *Transcriber) TranscribeAudio(
 		return "", err
 	}
 
-	// Get the relative path and create output directory
-	relativePath := t.getRelativePath(audioFilePath)
-	outputDir, err := t.ensureOutputDir(relativePath)
+	// Create output directory in the raw subdirectory
+	rawDir := filepath.Join(t.config.OutputDir, "raw")
+	err = os.MkdirAll(rawDir, 0755)
 	if err != nil {
-		t.log.Error("Failed to create output directory", "file", shortPath, "error", err)
+		t.log.Error("Failed to create raw output directory", "file", shortPath, "error", err)
 		return "", err
 	}
 
@@ -139,7 +117,7 @@ func (t *Transcriber) TranscribeAudio(
 
 	t.log.Info("Starting transcription")
 
-	outputFile := filepath.Join(outputDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
+	outputFile := filepath.Join(rawDir, strings.TrimSuffix(filepath.Base(preprocessedPath), filepath.Ext(preprocessedPath))+".txt")
 
 	cmd := exec.CommandContext(ctx,
 		"yap",

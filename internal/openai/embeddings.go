@@ -3,8 +3,8 @@ package openai
 import (
 	"context"
 	"fmt"
-	"log"
 	"github.com/jedwards1230/lil-whisper/internal/config"
+	"log"
 
 	"github.com/sashabaranov/go-openai"
 )

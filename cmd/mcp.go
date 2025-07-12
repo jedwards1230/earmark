@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"fmt"
@@ -8,9 +8,10 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/mcp"
+	"github.com/spf13/cobra"
 )
 
-func main() {
+func runMCP(cmd *cobra.Command, args []string) {
 	// Load configuration
 	cfg, err := config.LoadConfig()
 	if err != nil {

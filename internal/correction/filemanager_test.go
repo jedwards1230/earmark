@@ -90,27 +90,27 @@ func TestFileManagerPaths(t *testing.T) {
 	fm := NewFileManager(cfg)
 
 	tests := []struct {
-		name          string
-		audioPath     string
-		expectedRaw   string
+		name              string
+		audioPath         string
+		expectedRaw       string
 		expectedCorrected string
 	}{
 		{
-			name:          "simple_filename",
-			audioPath:     "/path/to/file.m4b",
-			expectedRaw:   filepath.Join(tempDir, "raw", "file.raw.txt"),
+			name:              "simple_filename",
+			audioPath:         "/path/to/file.m4b",
+			expectedRaw:       filepath.Join(tempDir, "raw", "file.raw.txt"),
 			expectedCorrected: filepath.Join(tempDir, "corrected", "file.corrected.txt"),
 		},
 		{
-			name:          "complex_filename",
-			audioPath:     "/path/to/book_chapter_01.mp3",
-			expectedRaw:   filepath.Join(tempDir, "raw", "book_chapter_01.raw.txt"),
+			name:              "complex_filename",
+			audioPath:         "/path/to/book_chapter_01.mp3",
+			expectedRaw:       filepath.Join(tempDir, "raw", "book_chapter_01.raw.txt"),
 			expectedCorrected: filepath.Join(tempDir, "corrected", "book_chapter_01.corrected.txt"),
 		},
 		{
-			name:          "no_extension",
-			audioPath:     "/path/to/audiofile",
-			expectedRaw:   filepath.Join(tempDir, "raw", "audiofile.raw.txt"),
+			name:              "no_extension",
+			audioPath:         "/path/to/audiofile",
+			expectedRaw:       filepath.Join(tempDir, "raw", "audiofile.raw.txt"),
 			expectedCorrected: filepath.Join(tempDir, "corrected", "audiofile.corrected.txt"),
 		},
 	}

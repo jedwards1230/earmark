@@ -21,7 +21,7 @@ func NewTemplates() *Templates {
 
 func (t *Templates) GetPrompt(stageName string, ctx *CorrectionContext, inputText string) (string, error) {
 	var template string
-	
+
 	switch stageName {
 	case "spelling_grammar":
 		template = t.spellingGrammarTemplate
@@ -32,13 +32,13 @@ func (t *Templates) GetPrompt(stageName string, ctx *CorrectionContext, inputTex
 	default:
 		return "", fmt.Errorf("unknown stage: %s", stageName)
 	}
-	
+
 	// Replace context variables in the template
 	prompt := strings.ReplaceAll(template, "{{.ContextSummary}}", ctx.GetContextSummary())
 	prompt = strings.ReplaceAll(prompt, "{{.FormattedMetadata}}", ctx.GetFormattedMetadata())
 	prompt = strings.ReplaceAll(prompt, "{{.ContentType}}", ctx.GetContentType())
 	prompt = strings.ReplaceAll(prompt, "{{.TranscriptionText}}", inputText)
-	
+
 	return prompt, nil
 }
 

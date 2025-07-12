@@ -111,7 +111,7 @@ func TestPrettyHandlerEnabled(t *testing.T) {
 			// Save original state
 			originalDebug := debugEnabled
 			originalVerbose := verboseEnabled
-			defer func() { 
+			defer func() {
 				debugEnabled = originalDebug
 				verboseEnabled = originalVerbose
 			}()

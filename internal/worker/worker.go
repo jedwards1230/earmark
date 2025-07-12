@@ -3,11 +3,6 @@ package worker
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
-	"os/exec"
-	"regexp"
-	"time"
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/correction"
 	"github.com/jedwards1230/lil-whisper/internal/db"
@@ -15,6 +10,11 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/meta"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
 	"github.com/jedwards1230/lil-whisper/internal/transcribe"
+	"io"
+	"os"
+	"os/exec"
+	"regexp"
+	"time"
 )
 
 type Worker struct {
@@ -31,13 +31,13 @@ type Worker struct {
 func NewWorker(q *queue.Queue, db *db.DB, cfg *config.Config) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := log.NewLogger("worker")
-	
+
 	// Initialize LLM corrector
 	corrector := correction.New(cfg)
-	
+
 	// Initialize file manager for dual text storage
 	fileManager := correction.NewFileManager(cfg)
-	
+
 	return &Worker{
 		queue:       q,
 		done:        make(chan struct{}),
@@ -120,12 +120,12 @@ func (w *Worker) Start(cfg *config.Config) {
 			// LLM Text Correction step
 			correctionStart := time.Now()
 			finalContent := content // Default to original content
-			
+
 			if w.corrector.IsEnabled() {
-				w.log.Debug("Starting LLM text correction", 
-					"file", queueItem.FilePath, 
+				w.log.Debug("Starting LLM text correction",
+					"file", queueItem.FilePath,
 					"chapter", fileMeta.Chapter)
-				
+
 				// Use atomic correction processing
 				err := w.db.ProcessTranscriptionCorrection(w.ctx, queueItem.FilePath, func() (string, map[string]interface{}, error) {
 					// This function runs the actual correction
@@ -135,7 +135,7 @@ func (w *Worker) Start(cfg *config.Config) {
 					}
 					return correctionResult.CorrectedText, correctionResult.Metadata, nil
 				})
-				
+
 				if err != nil {
 					w.log.Error("LLM correction failed, using original text",
 						"chapter", fileMeta.Chapter,
@@ -151,12 +151,12 @@ func (w *Worker) Start(cfg *config.Config) {
 					} else if transcription.CorrectedText != nil && *transcription.CorrectedText != "" {
 						finalContent = *transcription.CorrectedText
 						correctionDuration := time.Since(correctionStart).Round(time.Millisecond)
-						
+
 						w.log.Info("LLM correction completed",
 							"chapter", fileMeta.Chapter,
 							"title", queueItem.Metadata.Title,
 							"correction_duration", correctionDuration)
-						
+
 						// Save corrected text to local file
 						if err := w.fileManager.SaveCorrectedText(queueItem.FilePath, finalContent); err != nil {
 							w.log.Warn("Failed to save corrected text file", "error", err)
@@ -230,6 +230,14 @@ func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, f
 			"title", queueItem.Metadata.Title,
 			"error", err)
 		return "", fmt.Errorf("failed to read output file %q: %w", textFilePath, err)
+	}
+
+	// Clean up the temporary Yap output file since we now save raw text via FileManager
+	if err := os.Remove(textFilePath); err != nil {
+		w.log.Warn("Failed to clean up temporary transcription file", "file", textFilePath, "error", err)
+		// Don't fail the entire process for cleanup errors
+	} else {
+		w.log.Debug("Cleaned up temporary transcription file", "file", textFilePath)
 	}
 
 	// Calculate processing duration

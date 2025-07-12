@@ -33,7 +33,7 @@ type LLMCorrector struct {
 
 func New(cfg *config.Config) *LLMCorrector {
 	logger := log.NewLogger("correction")
-	
+
 	// Check if LLM correction is enabled
 	enabled := cfg.LLMCorrectionEnabled
 	if !enabled {
@@ -47,7 +47,7 @@ func New(cfg *config.Config) *LLMCorrector {
 
 	// Initialize OpenAI client for LLM correction
 	client := openai.NewClient(cfg)
-	
+
 	// Initialize the three-stage pipeline
 	pipeline := NewPipeline(client, logger)
 
@@ -58,7 +58,7 @@ func New(cfg *config.Config) *LLMCorrector {
 		cfg.LLMCorrectionDailyBudget,
 	)
 
-	logger.Info("LLM correction enabled", 
+	logger.Info("LLM correction enabled",
 		"model", cfg.LLMCorrectionModel,
 		"base_url", cfg.LLMCorrectionBaseURL,
 		"max_retries", cfg.LLMCorrectionMaxRetries,
@@ -100,7 +100,7 @@ func (c *LLMCorrector) CorrectText(ctx context.Context, rawText string, fileMeta
 	// Estimate cost and check limits
 	tokenCount, _ := tokenizer.CountTokens(rawText)
 	estimate := c.rateLimiter.EstimateCost(tokenCount)
-	
+
 	// Check if we would exceed budget
 	if estimate.WouldExceedBudget {
 		dailyCost, budget := c.rateLimiter.GetDailyUsage()
@@ -109,7 +109,7 @@ func (c *LLMCorrector) CorrectText(ctx context.Context, rawText string, fileMeta
 			"estimated_cost", estimate.EstimatedCost,
 			"daily_cost", dailyCost,
 			"budget", budget)
-		
+
 		return &CorrectionResult{
 			CorrectedText: rawText,
 			Metadata: map[string]interface{}{
@@ -121,13 +121,13 @@ func (c *LLMCorrector) CorrectText(ctx context.Context, rawText string, fileMeta
 			},
 		}, nil
 	}
-	
+
 	// Check rate limit and wait if necessary
 	if estimate.WouldExceedRate {
 		c.log.Info("Rate limit would be exceeded, waiting",
 			"file", fileMeta.FilePath,
 			"suggested_delay", estimate.SuggestedDelay)
-		
+
 		if err := c.rateLimiter.WaitForRateLimit(ctx); err != nil {
 			return &CorrectionResult{
 				CorrectedText: rawText,
@@ -162,7 +162,7 @@ func (c *LLMCorrector) CorrectText(ctx context.Context, rawText string, fileMeta
 	actualCost := float64(result.TotalTokens) * 0.00006 // Rough cost per token
 	c.rateLimiter.RecordRequest(actualCost)
 
-	c.log.Debug("LLM text correction completed", 
+	c.log.Debug("LLM text correction completed",
 		"file", fileMeta.FilePath,
 		"stages_completed", result.StagesCompleted,
 		"original_length", len(rawText),

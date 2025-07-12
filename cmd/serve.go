@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"context"
@@ -11,9 +11,10 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/server"
+	"github.com/spf13/cobra"
 )
 
-func main() {
+func runServe(cmd *cobra.Command, args []string) {
 	log.Println("Starting HTTP API server...")
 
 	cfg, err := config.LoadConfig()

@@ -50,7 +50,7 @@ func TestPipelineStructuralIntegrity(t *testing.T) {
 
 	// Test that templates can be retrieved for each stage
 	correctionCtx := NewCorrectionContext(&meta.FileMetadata{}, "test")
-	
+
 	for _, stage := range []string{"spelling_grammar", "formatting", "verification"} {
 		_, err := pipeline.templates.GetPrompt(stage, correctionCtx, "test input")
 		if err != nil {

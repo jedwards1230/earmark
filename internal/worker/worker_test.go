@@ -4,14 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"testing"
-	"time"
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/meta"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
 )
 
 func TestCountWords(t *testing.T) {

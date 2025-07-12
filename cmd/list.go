@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"context"
@@ -7,15 +7,10 @@ import (
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/spf13/cobra"
 )
 
-const (
-	treeVertical = "│"
-	treeBranch   = "├──"
-	treeLeaf     = "└──"
-)
-
-func main() {
+func runList(cmd *cobra.Command, args []string) {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)

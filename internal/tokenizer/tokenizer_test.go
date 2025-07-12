@@ -191,7 +191,7 @@ func TestInitTokenizer(t *testing.T) {
 		tkm2, err2 := getTokenizer()
 		require.NoError(t, err2, "second call should succeed")
 		assert.NotNil(t, tkm2, "second tokenizer should not be nil")
-		
+
 		// Should return the same instance (singleton pattern)
 		assert.Equal(t, tkm1, tkm2, "should return the same tokenizer instance")
 	})
