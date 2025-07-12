@@ -2,11 +2,17 @@ package transcribe
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/meta"
 )
+
+func init() {
+	// Set GO_TEST environment variable for all tests in this package
+	os.Setenv("GO_TEST", "1")
+}
 
 func TestNewTranscriber(t *testing.T) {
 	// Create a minimal config

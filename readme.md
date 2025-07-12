@@ -24,6 +24,7 @@ The service uses a PostgreSQL database to track processed files and avoid redund
 *   **PostgreSQL:** Database with pgvector extension for vector operations.
 *   **Docker Compose:** For running the PostgreSQL database.
 *   **Yap:** Apple's native speech recognition for audio transcription (automatically embedded during build).
+*   **ffmpeg:** Required for audio preprocessing and format conversion (must be installed separately).
 *   **OpenAI API:** For generating embeddings and LLM text correction (configurable endpoint).
 *   **macOS 26+:** Required for Yap speech recognition capabilities.
 

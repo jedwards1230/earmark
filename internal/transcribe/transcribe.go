@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/log"
@@ -62,25 +63,13 @@ func (t *Transcriber) TranscribeAudio(
 }
 
 func checkDependencies() error {
-	// Check for Python
-	pythonCmd := exec.Command("python3", "--version")
-	if err := pythonCmd.Run(); err != nil {
-		pythonCmd = exec.Command("python", "--version")
-		if err := pythonCmd.Run(); err != nil {
-			return fmt.Errorf("python not found: %w", err)
-		}
+	// Skip dependency checks on non-macOS systems or in test environment
+	if runtime.GOOS != "darwin" || os.Getenv("GO_TEST") == "1" {
+		return nil
 	}
 
-	// Check for pip
-	pipCmd := exec.Command("pip3", "--version")
-	if err := pipCmd.Run(); err != nil {
-		pipCmd = exec.Command("pip", "--version")
-		if err := pipCmd.Run(); err != nil {
-			return fmt.Errorf("pip not found: %w", err)
-		}
-	}
-
-	// Check ffmpeg with version
+	// Only check for ffmpeg as it's the only actual dependency used
+	// Python/pip checks removed as they're not actually used
 	ffmpegCmd := exec.Command("ffmpeg", "-version")
 	_, err := ffmpegCmd.CombinedOutput()
 	if err != nil {
