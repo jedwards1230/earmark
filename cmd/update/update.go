@@ -85,7 +85,7 @@ func runUpdate(cmd *cobra.Command, args []string) {
 
 	// Initialize authentication manager for update checks
 	authManager := auth.NewAuthManager(debug)
-	
+
 	// Use authenticated client for version checking
 	var result *version.CheckResult
 	var err error
@@ -145,7 +145,7 @@ func runUpdate(cmd *cobra.Command, args []string) {
 	if !noConfirm && version.Version == "dev" && result.HasUpdate {
 		fmt.Printf("\nYou are running a development build (dev).\n")
 		fmt.Printf("Do you want to update to the latest release version %s? (y/N): ", result.LatestVersion)
-		
+
 		var response string
 		if _, err := fmt.Scanln(&response); err != nil {
 			response = "n"
@@ -231,7 +231,7 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 	if err != nil {
 		return fmt.Errorf("downloading binary from %s: %w", downloadURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		switch resp.StatusCode {
@@ -415,7 +415,7 @@ func getAssetDownloadURL(ctx context.Context, releaseVersion string, authManager
 			fmt.Printf("DEBUG: GitHub API failed: %v\n", err)
 		}
 	}
-	
+
 	// Fallback to direct URL construction for public repositories
 	assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
 	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", version.GitHubRepo, releaseVersion, assetName), nil
@@ -425,34 +425,34 @@ func getAssetDownloadURL(ctx context.Context, releaseVersion string, authManager
 func getAssetDownloadURLFromAPI(ctx context.Context, releaseVersion string, authManager *auth.AuthManager) (string, error) {
 	// Get release info from GitHub API
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", version.GitHubRepo, releaseVersion)
-	
+
 	client := authManager.GetAuthenticatedClient()
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("creating API request: %w", err)
 	}
-	
+
 	// Add authentication header
 	if err := authManager.AddAuthHeader(req); err != nil {
 		return "", fmt.Errorf("adding authentication header: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("calling GitHub API: %w", err)
 	}
-	defer resp.Body.Close()
-	
+	defer func() { _ = resp.Body.Close() }()
+
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
 	}
-	
+
 	var release GitHubReleaseWithAssets
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return "", fmt.Errorf("decoding GitHub API response: %w", err)
 	}
-	
+
 	// Find the asset for the current platform
 	assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
 	for _, asset := range release.Assets {
@@ -460,6 +460,6 @@ func getAssetDownloadURLFromAPI(ctx context.Context, releaseVersion string, auth
 			return asset.URL, nil
 		}
 	}
-	
+
 	return "", fmt.Errorf("asset %s not found in release %s", assetName, releaseVersion)
 }

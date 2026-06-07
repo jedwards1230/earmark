@@ -18,11 +18,11 @@ type GitHubAuth interface {
 }
 
 type AuthManager struct {
-	strategies    []GitHubAuth
-	cachedToken   string
-	cachedMethod  string
-	debugMode     bool
-	httpClient    *http.Client
+	strategies   []GitHubAuth
+	cachedToken  string
+	cachedMethod string
+	debugMode    bool
+	httpClient   *http.Client
 }
 
 func NewAuthManager(debugMode bool) *AuthManager {
@@ -117,7 +117,7 @@ func (e *EnvTokenAuth) Name() string {
 
 func (e *EnvTokenAuth) GetToken() (string, error) {
 	envVars := []string{"GITHUB_TOKEN", "GITHUB_PAT", "GH_TOKEN", "PAT"}
-	
+
 	for _, envVar := range envVars {
 		if token := os.Getenv(envVar); token != "" {
 			if e.debugMode {
@@ -212,11 +212,11 @@ func (s *SSHAuth) IsSSHConfigured() bool {
 
 	cmd := exec.CommandContext(ctx, "ssh", "-T", "git@github.com")
 	err := cmd.Run()
-	
+
 	if exitError, ok := err.(*exec.ExitError); ok {
 		return exitError.ExitCode() == 1
 	}
-	
+
 	return err == nil
 }
 
@@ -226,7 +226,7 @@ func validateGitHubToken(token string, debugMode bool) error {
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	
+
 	req, err := http.NewRequest("GET", "https://api.github.com/user", nil)
 	if err != nil {
 		return fmt.Errorf("failed to create validation request: %w", err)
@@ -239,7 +239,7 @@ func validateGitHubToken(token string, debugMode bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to validate token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == 200 {
 		var user map[string]interface{}

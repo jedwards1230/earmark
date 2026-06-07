@@ -1,1194 +1,666 @@
+// Package db provides PostgreSQL access for the lilbro-whisper service.
+//
+// Schema (see CONTRACT.md):
+//   - transcription_jobs  — job queue; producer: Go monitor, consumer: Python runner
+//   - transcripts         — completed transcripts with JSONB segments
+//   - transcript_chunks   — pgvector embeddings of chunked transcript text
 package db
 
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/chunker"
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/meta"
-	"github.com/jedwards1230/lil-whisper/internal/openai"
-	"github.com/jedwards1230/lil-whisper/internal/utils"
-
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
+
+	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/openai"
 )
 
+// ─── Domain types ────────────────────────────────────────────────────────────
+
+// Job represents a row from transcription_jobs.
+type Job struct {
+	ID        string
+	FilePath  string
+	Checksum  string
+	Status    string // pending | claimed | done | failed
+	ClaimedBy *string
+	ClaimedAt *time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Error     *string
+	Attempts  int
+}
+
+// Word is a single word token from a transcript segment (CONTRACT §1.2.1).
+type Word struct {
+	Word    string   `json:"word"`
+	Start   float64  `json:"start"`
+	End     float64  `json:"end"`
+	Score   *float64 `json:"score"`
+	Speaker *string  `json:"speaker"`
+}
+
+// Segment is one transcript segment (CONTRACT §1.2.1).
+type Segment struct {
+	ID      int     `json:"id"`
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
+	Text    string  `json:"text"`
+	Speaker *string `json:"speaker"`
+	Words   []Word  `json:"words"`
+}
+
+// Transcript represents a completed transcript row.
+type Transcript struct {
+	ID              string
+	JobID           string
+	FilePath        string
+	Checksum        string
+	Language        string
+	DurationSeconds float64
+	SpeakerCount    *int
+	Segments        []Segment
+	RawText         string
+	ModelName       string
+	CreatedAt       time.Time
+}
+
+// Chunk is a row from transcript_chunks (after embedding).
+type Chunk struct {
+	ID           string
+	TranscriptID string
+	FilePath     string
+	ChunkIndex   int
+	StartSec     float64
+	EndSec       float64
+	Text         string
+	Speaker      *string
+	Embedding    []float32
+	CreatedAt    time.Time
+}
+
+// SearchResult is a chunk match from a vector or FTS query.
+type SearchResult struct {
+	ChunkID      string
+	TranscriptID string
+	FilePath     string
+	ChunkIndex   int
+	StartSec     float64
+	EndSec       float64
+	Text         string
+	Speaker      *string
+	Similarity   float64
+}
+
+// HierarchicalEntry groups chunks by file for the browse-library tool.
 type HierarchicalEntry struct {
-	Author   string
-	Title    string
-	Chapters []string
+	FilePath   string
+	ChunkCount int
 }
 
-type Statistics struct {
-	ProcessedBooks    int
-	ProcessedChapters int
-	ReprocessingBooks int
+// SearchResultWithMetadata extends SearchResult with extra fields for the MCP
+// layer so the existing MCP tool formatters keep working.
+type SearchResultWithMetadata struct {
+	ID         string  `json:"id"`
+	Content    string  `json:"content"`
+	FilePath   string  `json:"filePath"`
+	ChunkIndex int     `json:"chunkIndex"`
+	StartSec   float64 `json:"startSec"`
+	EndSec     float64 `json:"endSec"`
+	Speaker    *string `json:"speaker,omitempty"`
+	Similarity float64 `json:"similarity"`
+	// Legacy fields kept so the MCP formatter compiles unchanged.
+	Author        string `json:"author"`
+	Title         string `json:"title"`
+	Chapter       string `json:"chapter"`
+	ChapterIndex  int    `json:"chapterIndex"`
+	ChapterTitle  string `json:"chapterTitle"`
+	TotalChunks   int    `json:"totalChunks"`
+	TotalChapters int    `json:"totalChapters"`
+	ChunkID       string `json:"chunkID"`
+	WordCount     int    `json:"wordCount"`
+	ChunkStart    int    `json:"chunkStart"`
+	ChunkEnd      int    `json:"chunkEnd"`
+	FileChecksum  string `json:"fileChecksum"`
+	ISBN          string `json:"isbn,omitempty"`
+	ASIN          string `json:"asin,omitempty"`
 }
 
-type Transcription struct {
-	ID                   int       `json:"id"`
-	FilePath             string    `json:"file_path"`
-	FileChecksum         string    `json:"file_checksum"`
-	FileSize             int64     `json:"file_size"`
-	SettingsHash         string    `json:"settings_hash"`
-	TranscriptionText    string    `json:"transcription_text"`
-	CorrectedText        *string   `json:"corrected_text,omitempty"`
-	CorrectionStatus     string    `json:"correction_status"`
-	CorrectionError      *string   `json:"correction_error,omitempty"`
-	CorrectionMetadata   *string   `json:"correction_metadata,omitempty"`
-	WordCount            int       `json:"word_count"`
-	ProcessingDurationMs int64     `json:"processing_duration_ms"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
-}
+// ─── DB ──────────────────────────────────────────────────────────────────────
 
+// DB is the service's database handle.
+// pool is a *pgxpool.Pool (goroutine-safe) replacing the former single *pgx.Conn.
 type DB struct {
-	conn *pgx.Conn
+	pool *pgxpool.Pool
 	e    *openai.Embeddings
 	cfg  *config.Config
 	log  log.Logger
 }
 
-type SearchResultWithMetadata struct {
-	ID            int     `json:"id"`
-	Author        string  `json:"author"`
-	Title         string  `json:"title"`
-	Chapter       string  `json:"chapter"`
-	ChapterIndex  int     `json:"chapterIndex"`
-	ChapterTitle  string  `json:"chapterTitle"`
-	ChunkIndex    int     `json:"chunkIndex"`
-	ChunkID       string  `json:"chunkID"` // Unique identifier: author_book_chapter_chunk
-	Content       string  `json:"content"`
-	Similarity    float64 `json:"similarity"`
-	WordCount     int     `json:"wordCount"`  // Words in this chunk
-	ChunkStart    int     `json:"chunkStart"` // Character offset start in chapter
-	ChunkEnd      int     `json:"chunkEnd"`   // Character offset end in chapter
-	TotalChunks   int     `json:"totalChunks"`
-	TotalChapters int     `json:"totalChapters"`
-	FilePath      string  `json:"filePath"`       // Original audio file path
-	FileChecksum  string  `json:"fileChecksum"`   // SHA256 for deduplication
-	ISBN          string  `json:"isbn,omitempty"` // Book ISBN if available
-	ASIN          string  `json:"asin,omitempty"` // Book ASIN if available
-}
-
+// New opens a PostgreSQL connection pool and runs schema migrations.
 func New(cfg *config.Config) (*DB, error) {
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:5432/%s", cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBName)
-	conn, err := pgx.Connect(context.Background(), dsn)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse database URL: %w", err)
+	}
+
+	// Register pgvector types for every connection in the pool.
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		return pgxvector.RegisterTypes(ctx, conn)
+	}
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to database: %w", err)
 	}
 
 	logger := log.NewLogger("db")
-
 	db := &DB{
-		conn: conn,
+		pool: pool,
 		e:    openai.NewEmbeddings(cfg),
 		cfg:  cfg,
 		log:  logger,
 	}
 
 	if err := db.initialize(context.Background()); err != nil {
-		if closeErr := conn.Close(context.Background()); closeErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to close connection: %v\n", closeErr)
-		}
+		pool.Close()
 		return nil, err
 	}
 
-	db.log.Info(fmt.Sprintf("Database initialized at %s", cfg.DBHost))
+	logger.Info("database initialized")
 	return db, nil
 }
 
+// Close closes the underlying connection pool.
+func (db *DB) Close() {
+	db.pool.Close()
+}
+
+// initialize creates the CONTRACT schema and indexes in a single transaction.
 func (db *DB) initialize(ctx context.Context) error {
-	tx, err := db.conn.Begin(ctx)
+	tx, err := db.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		return fmt.Errorf("begin init tx: %w", err)
 	}
-	defer func() {
-		if err := tx.Rollback(ctx); err != nil {
-			// Ignore rollback errors in defer - they're not critical
-			_ = err
-		}
-	}()
+	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Enable vector extension
-	if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
-		return fmt.Errorf("failed to create vector extension: %v", err)
-	}
-
-	// Register pgvector types
-	if err := pgxvector.RegisterTypes(context.Background(), db.conn); err != nil {
-		if closeErr := db.conn.Close(context.Background()); closeErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to close connection: %v\n", closeErr)
-		}
-		return fmt.Errorf("failed to register vector types: %v", err)
-	}
-
-	// Create tables and indexes in one transaction
 	if _, err := tx.Exec(ctx, `
-        -- Authors table
-        CREATE TABLE IF NOT EXISTS authors (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE
-        );
-
-        -- Books table
-        CREATE TABLE IF NOT EXISTS books (
-            id SERIAL PRIMARY KEY,
-            author_id INTEGER REFERENCES authors(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            isbn TEXT DEFAULT '',
-            asin TEXT DEFAULT '',
-            UNIQUE(author_id, title)
-        );
-
-        -- Chapters table
-        CREATE TABLE IF NOT EXISTS chapters (
-            id SERIAL PRIMARY KEY,
-            book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            index INTEGER NOT NULL,
-            UNIQUE(book_id, index)
-        );
-
-        -- Vectors table
-        CREATE TABLE IF NOT EXISTS vectors (
-            id SERIAL PRIMARY KEY,
-            chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE,
-            chunk_index INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            embedding vector(1536),
-            chunk_size INTEGER NOT NULL,
-            UNIQUE(chapter_id, chunk_index)
-        );
-
-        -- Transcriptions table (raw transcription storage)
-        CREATE TABLE IF NOT EXISTS transcriptions (
-            id SERIAL PRIMARY KEY,
-            file_path TEXT NOT NULL UNIQUE,
-            file_checksum TEXT NOT NULL,
-            file_size BIGINT NOT NULL,
-            settings_hash TEXT NOT NULL,
-            transcription_text TEXT NOT NULL,
-            corrected_text TEXT,
-            correction_status VARCHAR(20) DEFAULT 'pending',
-            correction_error TEXT,
-            correction_metadata JSONB,
-            word_count INTEGER,
-            processing_duration_ms BIGINT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        );
-
-        -- Standard indexes
-        CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name);
-        CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
-        CREATE INDEX IF NOT EXISTS idx_chapters_book_id ON chapters(book_id);
-        CREATE INDEX IF NOT EXISTS idx_vectors_chapter_id ON vectors(chapter_id);
-        CREATE INDEX IF NOT EXISTS idx_transcriptions_checksum_settings 
-            ON transcriptions(file_checksum, settings_hash);
-        CREATE INDEX IF NOT EXISTS idx_transcriptions_file_path ON transcriptions(file_path);
-
-        -- HNSW index for vector similarity
-        CREATE INDEX IF NOT EXISTS vectors_embedding_idx 
-            ON vectors USING hnsw (embedding vector_cosine_ops)
-            WITH (m = 16, ef_construction = 64);
-    `); err != nil {
-		db.log.Warn("Warning: schema creation failed", "error", err)
-		return fmt.Errorf("failed creating schema: %v", err)
+		CREATE EXTENSION IF NOT EXISTS vector;
+		CREATE EXTENSION IF NOT EXISTS pg_trgm;
+	`); err != nil {
+		return fmt.Errorf("create extensions: %w", err)
 	}
 
-	// Add LLM correction columns to existing transcriptions tables (migration)
 	if _, err := tx.Exec(ctx, `
-        ALTER TABLE transcriptions 
-        ADD COLUMN IF NOT EXISTS corrected_text TEXT,
-        ADD COLUMN IF NOT EXISTS correction_status VARCHAR(20) DEFAULT 'pending',
-        ADD COLUMN IF NOT EXISTS correction_error TEXT,
-        ADD COLUMN IF NOT EXISTS correction_metadata JSONB;
-    `); err != nil {
-		db.log.Warn("Warning: LLM correction column migration failed", "error", err)
-		// Don't fail initialization for migration errors
+		-- transcription_jobs: job queue (CONTRACT §1.1)
+		CREATE TABLE IF NOT EXISTS transcription_jobs (
+			id           UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+			file_path    TEXT        NOT NULL,
+			checksum     TEXT        NOT NULL,
+			status       TEXT        NOT NULL DEFAULT 'pending'
+			             CHECK (status IN ('pending','claimed','done','failed')),
+			claimed_by   TEXT,
+			claimed_at   TIMESTAMPTZ,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			error        TEXT,
+			attempts     INTEGER     NOT NULL DEFAULT 0,
+			CONSTRAINT transcription_jobs_checksum_unique UNIQUE (checksum)
+		);
+
+		CREATE INDEX IF NOT EXISTS transcription_jobs_status_idx
+			ON transcription_jobs (status, created_at);
+		CREATE INDEX IF NOT EXISTS transcription_jobs_file_path_idx
+			ON transcription_jobs (file_path);
+
+		-- transcripts: completed transcript storage (CONTRACT §1.2)
+		CREATE TABLE IF NOT EXISTS transcripts (
+			id                  UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+			job_id              UUID        NOT NULL REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+			file_path           TEXT        NOT NULL,
+			checksum            TEXT        NOT NULL,
+			language            TEXT        NOT NULL,
+			duration_seconds    FLOAT8      NOT NULL,
+			speaker_count       INTEGER,
+			segments            JSONB       NOT NULL,
+			raw_text            TEXT        NOT NULL,
+			model_name          TEXT        NOT NULL,
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+			CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
+		);
+
+		CREATE INDEX IF NOT EXISTS transcripts_file_path_idx
+			ON transcripts (file_path);
+		CREATE INDEX IF NOT EXISTS transcripts_raw_text_trgm_idx
+			ON transcripts USING gin (raw_text gin_trgm_ops);
+
+		-- transcript_chunks: pgvector embeddings (CONTRACT §3)
+		CREATE TABLE IF NOT EXISTS transcript_chunks (
+			id            UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+			transcript_id UUID        NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+			file_path     TEXT        NOT NULL,
+			chunk_index   INTEGER     NOT NULL,
+			start_sec     FLOAT8      NOT NULL,
+			end_sec       FLOAT8      NOT NULL,
+			text          TEXT        NOT NULL,
+			speaker       TEXT,
+			embedding     VECTOR(768) NOT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+			CONSTRAINT transcript_chunks_transcript_chunk_unique UNIQUE (transcript_id, chunk_index)
+		);
+
+		CREATE INDEX IF NOT EXISTS transcript_chunks_embedding_idx
+			ON transcript_chunks USING hnsw (embedding vector_cosine_ops);
+		CREATE INDEX IF NOT EXISTS transcript_chunks_file_path_idx
+			ON transcript_chunks (file_path);
+		CREATE INDEX IF NOT EXISTS transcript_chunks_text_trgm_idx
+			ON transcript_chunks USING gin (text gin_trgm_ops);
+
+		-- updated_at trigger for transcription_jobs
+		CREATE OR REPLACE FUNCTION transcription_jobs_set_updated_at()
+		RETURNS TRIGGER LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.updated_at = now();
+			RETURN NEW;
+		END;
+		$$;
+
+		DROP TRIGGER IF EXISTS transcription_jobs_updated_at ON transcription_jobs;
+		CREATE TRIGGER transcription_jobs_updated_at
+			BEFORE UPDATE ON transcription_jobs
+			FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_updated_at();
+	`); err != nil {
+		return fmt.Errorf("create schema: %w", err)
 	}
 
 	return tx.Commit(ctx)
 }
 
-func (db *DB) InsertContentWithMetadata(ctx context.Context, content string, meta *meta.FileMetadata) error {
-	tx, err := db.conn.Begin(ctx)
+// ─── Job queue ───────────────────────────────────────────────────────────────
+
+// InsertJobIfAbsent inserts a pending job row if no row with the same checksum
+// exists. Satisfies the transcribe.JobInserter interface.
+//
+// Returns (jobID, true, nil) on insert, or (existingID, false, nil) if present.
+func (db *DB) InsertJobIfAbsent(ctx context.Context, filePath, checksum string) (string, bool, error) {
+	// Use INSERT … ON CONFLICT DO NOTHING and check rows affected.
+	id := uuid.New().String()
+	tag, err := db.pool.Exec(ctx, `
+		INSERT INTO transcription_jobs (id, file_path, checksum)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (checksum) DO NOTHING
+	`, id, filePath, checksum)
 	if err != nil {
-		return err
+		return "", false, fmt.Errorf("insert job: %w", err)
 	}
-	defer func() {
-		if err := tx.Rollback(ctx); err != nil {
-			// Ignore rollback errors in defer - they're not critical
-			_ = err
+
+	if tag.RowsAffected() == 1 {
+		return id, true, nil
+	}
+
+	// Row already exists — return its id.
+	var existingID string
+	err = db.pool.QueryRow(ctx, `SELECT id FROM transcription_jobs WHERE checksum = $1`, checksum).Scan(&existingID)
+	if err != nil {
+		return "", false, fmt.Errorf("fetch existing job id: %w", err)
+	}
+	return existingID, false, nil
+}
+
+// GetCompletedTranscripts returns transcripts that have been completed by the
+// runner but not yet embedded (i.e. no rows in transcript_chunks for that transcript_id).
+func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT t.id, t.job_id, t.file_path, t.checksum,
+		       t.language, t.duration_seconds, t.speaker_count,
+		       t.segments, t.raw_text, t.model_name, t.created_at
+		FROM transcripts t
+		WHERE NOT EXISTS (
+			SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
+		)
+		ORDER BY t.created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query completed transcripts: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*Transcript
+	for rows.Next() {
+		var t Transcript
+		var segJSON []byte
+		if err := rows.Scan(
+			&t.ID, &t.JobID, &t.FilePath, &t.Checksum,
+			&t.Language, &t.DurationSeconds, &t.SpeakerCount,
+			&segJSON, &t.RawText, &t.ModelName, &t.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan transcript: %w", err)
 		}
-	}()
+		if err := json.Unmarshal(segJSON, &t.Segments); err != nil {
+			return nil, fmt.Errorf("unmarshal segments: %w", err)
+		}
+		results = append(results, &t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (completed transcripts): %w", err)
+	}
+	return results, nil
+}
 
-	// Insert or get author
-	var authorID int
-	err = tx.QueryRow(ctx, `
-        INSERT INTO authors (name) 
-        VALUES ($1)
-        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-        RETURNING id
-    `, meta.Author).Scan(&authorID)
-	if err != nil {
-		return fmt.Errorf("failed to insert author: %v", err)
+// RecoverStaleJobs resets jobs stuck in "claimed" state longer than the
+// configured stale timeout. Jobs that have reached max attempts are marked
+// failed. (CONTRACT §1.3 — stale-claim recovery.)
+func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error {
+	// Use an integer-seconds interval to avoid PostgreSQL misreading Go duration
+	// strings (e.g. "30m0s" where bare 'm' means months in Postgres).
+	secs := int(timeout.Seconds())
+
+	// Reset below-max-attempts jobs to pending.
+	if _, err := db.pool.Exec(ctx, `
+		UPDATE transcription_jobs
+		SET    status     = 'pending',
+		       claimed_by = NULL,
+		       claimed_at = NULL
+		WHERE  status     = 'claimed'
+		  AND  updated_at < now() - ($1 * interval '1 second')
+		  AND  attempts   < 3
+	`, secs); err != nil {
+		return fmt.Errorf("reset stale jobs: %w", err)
 	}
 
-	// Insert or get book
-	var bookID int
-	err = tx.QueryRow(ctx, `
-        INSERT INTO books (author_id, title, isbn, asin) 
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (author_id, title) DO UPDATE 
-        SET isbn = EXCLUDED.isbn, asin = EXCLUDED.asin
-        RETURNING id
-    `, authorID, meta.Title, meta.ISBN, meta.ASIN).Scan(&bookID)
-	if err != nil {
-		return fmt.Errorf("failed to insert book: %v", err)
+	// Mark max-attempts jobs failed.
+	if _, err := db.pool.Exec(ctx, `
+		UPDATE transcription_jobs
+		SET    status = 'failed',
+		       error  = 'max attempts reached'
+		WHERE  status     = 'claimed'
+		  AND  updated_at < now() - ($1 * interval '1 second')
+		  AND  attempts   >= 3
+	`, secs); err != nil {
+		return fmt.Errorf("fail max-attempts jobs: %w", err)
 	}
+	return nil
+}
 
-	// Insert chapter
-	var chapterID int
-	err = tx.QueryRow(ctx, `
-        INSERT INTO chapters (book_id, title, index)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (book_id, index) DO UPDATE SET title = EXCLUDED.title
-        RETURNING id
-    `, bookID, meta.Chapter, meta.ChapterIndex).Scan(&chapterID)
+// ─── Embedding pipeline ───────────────────────────────────────────────────────
+
+// InsertChunks stores pre-computed chunks with embeddings for a transcript.
+func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
+	tx, err := db.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to insert chapter: %v", err)
+		return fmt.Errorf("begin chunk tx: %w", err)
 	}
+	defer func() { _ = tx.Rollback(ctx) }()
 
-	chunks, allEmbeddings, err := db.chunkAndEmbed(content, db.cfg.ChunkSize)
-	if err != nil {
-		return fmt.Errorf("failed to chunk and embed content: %v", err)
-	}
-
-	// Insert vector chunks
-	for i, emb := range allEmbeddings {
-		_, err = tx.Exec(ctx, `
-            INSERT INTO vectors (chapter_id, chunk_index, content, embedding, chunk_size)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (chapter_id, chunk_index) DO UPDATE 
-            SET content = EXCLUDED.content, 
-                embedding = EXCLUDED.embedding,
-                chunk_size = EXCLUDED.chunk_size
-        `, chapterID, i, chunks[i], pgvector.NewVector(emb), db.cfg.ChunkSize)
-		if err != nil {
-			return fmt.Errorf("failed to insert vector chunk: %v", err)
+	for _, c := range chunks {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO transcript_chunks
+			       (transcript_id, file_path, chunk_index, start_sec, end_sec,
+			        text, speaker, embedding)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (transcript_id, chunk_index) DO UPDATE
+			SET text      = EXCLUDED.text,
+			    embedding = EXCLUDED.embedding
+		`, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
+			c.Text, c.Speaker, pgvector.NewVector(c.Embedding),
+		); err != nil {
+			return fmt.Errorf("insert chunk %d: %w", c.ChunkIndex, err)
 		}
 	}
-
 	return tx.Commit(ctx)
 }
 
-func (db *DB) chunkAndEmbed(content string, chunkSize int) (chunks []string, embeddings [][]float32, err error) {
-	if content == "" {
-		return nil, nil, fmt.Errorf("empty content")
-	}
-
-	chunks = chunker.Chunker(content, chunkSize, chunker.SplitTypeToken)
-	if len(chunks) == 0 {
-		return nil, nil, fmt.Errorf("no chunks found")
-	}
-
-	db.log.Debug("Splitting content into chunks", "count", len(chunks))
-
-	allEmbeddings, err := db.e.GetEmbeddings(chunks)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate embeddings: %v", err)
-	}
-
-	if len(allEmbeddings) != len(chunks) {
-		return nil, nil, fmt.Errorf("mismatched embeddings and chunks: %d vs %d", len(allEmbeddings), len(chunks))
-	}
-
-	return chunks, allEmbeddings, nil
+// GetEmbeddings delegates to the openai.Embeddings client.
+func (db *DB) GetEmbeddings(texts []string) ([][]float32, error) {
+	return db.e.GetEmbeddings(texts)
 }
 
-func (db *DB) GetMetadataByVectorID(ctx context.Context, vectorID int) (*meta.FileMetadata, error) {
-	var meta meta.FileMetadata
-	err := db.conn.QueryRow(ctx, `
-        SELECT a.name, b.title, c.title, b.isbn, b.asin, c.index
-        FROM vectors v
-        JOIN chapters c ON v.chapter_id = c.id
-        JOIN books b ON c.book_id = b.id
-        JOIN authors a ON b.author_id = a.id
-        WHERE v.id = $1
-    `, vectorID).Scan(&meta.Author, &meta.Title, &meta.Chapter, &meta.ISBN, &meta.ASIN, &meta.ChapterIndex)
-	if err != nil {
-		return nil, err
-	}
-	return &meta, nil
-}
+// ─── Search ──────────────────────────────────────────────────────────────────
 
-func (db *DB) IsProcessed(ctx context.Context, filePath string) (bool, error) {
-	// Use the new transcriptions table with checksum and settings validation
-	fileChecksum, err := db.ComputeFileChecksum(filePath)
-	if err != nil {
-		// If we can't compute checksum, fall back to old method
-		db.log.Warn("Failed to compute file checksum, using legacy check", "file", filePath, "error", err)
-		return db.isProcessedLegacy(ctx, filePath)
-	}
-
-	settingsHash := db.ComputeSettingsHash(db.cfg)
-
-	needsTranscription, err := db.NeedsTranscription(ctx, filePath, fileChecksum, settingsHash)
-	if err != nil {
-		return false, fmt.Errorf("error checking transcription status: %w", err)
-	}
-
-	// Return true if already processed (doesn't need transcription)
-	return !needsTranscription, nil
-}
-
-// isProcessedLegacy is the original implementation for fallback
-func (db *DB) isProcessedLegacy(ctx context.Context, filePath string) (bool, error) {
-	// Extract chapter info from the filepath directly to use in check
-	_, _, chapterIndex, chapterTitle := utils.ParseFilePath(filePath)
-
-	var exists bool
-	err := db.conn.QueryRow(ctx, `
-        SELECT EXISTS(
-            SELECT 1 FROM vectors v
-            JOIN chapters c ON v.chapter_id = c.id
-            JOIN books b ON c.book_id = b.id
-            JOIN authors a ON b.author_id = a.id
-            WHERE c.title = $1 AND c.index = $2
-        )
-    `, chapterTitle, chapterIndex).Scan(&exists)
-
-	if err != nil {
-		return false, fmt.Errorf("error checking if file is processed: %w", err)
-	}
-
-	return exists, nil
-}
-
+// Search performs a vector-similarity search over transcript_chunks.
 func (db *DB) Search(ctx context.Context, query string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	db.log.Debug("Performing search", "query", query, "limit", limit, "threshold", threshold)
-	_, allEmbeddings, err := db.chunkAndEmbed(query, db.cfg.ChunkSize)
+	vecs, err := db.e.GetEmbeddings([]string{query})
 	if err != nil {
-		return nil, fmt.Errorf("failed to chunk and embed content: %v", err)
+		return nil, fmt.Errorf("embed query: %w", err)
 	}
-
-	// Collect combined results from each embedding
-	var combined []SearchResultWithMetadata
-	for _, emb := range allEmbeddings {
-		partial, err := db.findSimilar(ctx, emb, limit, threshold)
-		if err != nil {
-			return nil, err
-		}
-		combined = append(combined, partial...)
+	if len(vecs) == 0 {
+		return nil, fmt.Errorf("no embedding returned for query")
 	}
-	return combined, nil
+	return db.findSimilar(ctx, vecs[0], limit, threshold)
 }
 
-func (db *DB) GetHierarchicalData(ctx context.Context) ([]HierarchicalEntry, error) {
-	rows, err := db.conn.Query(ctx, `
-        SELECT 
-            a.name as author,
-            b.title,
-            array_agg(c.title ORDER BY c.index) as chapters
-        FROM authors a
-        JOIN books b ON b.author_id = a.id
-        JOIN chapters c ON c.book_id = b.id
-        GROUP BY a.name, b.title
-        ORDER BY a.name, b.title
-    `)
+func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT
+			c.id,
+			c.text,
+			c.file_path,
+			c.chunk_index,
+			c.start_sec,
+			c.end_sec,
+			c.speaker,
+			1 - (c.embedding <=> $1) AS similarity,
+			(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
+		FROM transcript_chunks c
+		WHERE ($3 = 0 OR 1 - (c.embedding <=> $1) >= $3)
+		ORDER BY c.embedding <=> $1
+		LIMIT $2
+	`, pgvector.NewVector(vec), limit, threshold)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query hierarchical data: %v", err)
+		return nil, fmt.Errorf("similarity query: %w", err)
+	}
+	defer rows.Close()
+
+	return scanResults(rows)
+}
+
+// TextSearch performs a trigram full-text search over transcript_chunks.
+// Filtering at the chunk level (c.text ILIKE) makes LIMIT meaningful.
+func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]SearchResultWithMetadata, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT
+			c.id,
+			c.text,
+			c.file_path,
+			c.chunk_index,
+			c.start_sec,
+			c.end_sec,
+			c.speaker,
+			0.0 AS similarity,
+			(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
+		FROM transcript_chunks c
+		WHERE c.text ILIKE '%' || $1 || '%'
+		ORDER BY c.chunk_index ASC
+		LIMIT $2
+	`, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("text search query: %w", err)
+	}
+	defer rows.Close()
+
+	return scanResults(rows)
+}
+
+func scanResults(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
+	var results []SearchResultWithMetadata
+	for rows.Next() {
+		var r SearchResultWithMetadata
+		var speaker *string
+		if err := rows.Scan(
+			&r.ID, &r.Content, &r.FilePath,
+			&r.ChunkIndex, &r.StartSec, &r.EndSec,
+			&speaker, &r.Similarity, &r.TotalChunks,
+		); err != nil {
+			return nil, fmt.Errorf("scan result: %w", err)
+		}
+		r.Speaker = speaker
+		r.ChunkID = r.ID
+		// Populate legacy fields from file path for the MCP formatter.
+		r.Title = filepath.Base(filepath.Dir(r.FilePath))
+		r.Author = filepath.Base(filepath.Dir(filepath.Dir(r.FilePath)))
+		r.Chapter = filepath.Base(r.FilePath)
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (scan results): %w", err)
+	}
+	return results, nil
+}
+
+// GetHierarchicalData returns a list of files with their chunk counts for the
+// browse_audiobook_library MCP tool.
+func (db *DB) GetHierarchicalData(ctx context.Context) ([]HierarchicalEntry, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT file_path, COUNT(*) AS chunk_count
+		FROM transcript_chunks
+		GROUP BY file_path
+		ORDER BY file_path
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("hierarchical query: %w", err)
 	}
 	defer rows.Close()
 
 	var entries []HierarchicalEntry
 	for rows.Next() {
-		var entry HierarchicalEntry
-		if err := rows.Scan(&entry.Author, &entry.Title, &entry.Chapters); err != nil {
-			return nil, fmt.Errorf("failed to scan entry: %v", err)
+		var e HierarchicalEntry
+		if err := rows.Scan(&e.FilePath, &e.ChunkCount); err != nil {
+			return nil, fmt.Errorf("scan hierarchical: %w", err)
 		}
-		entries = append(entries, entry)
+		entries = append(entries, e)
 	}
-
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (hierarchical): %w", err)
+	}
 	return entries, nil
 }
 
-func (db *DB) Close() {
-	if err := db.conn.Close(context.Background()); err != nil {
-		// Log error but don't fail since Close() is often called in defer
-		fmt.Fprintf(os.Stderr, "Warning: failed to close database connection: %v\n", err)
-	}
-}
-
-func (db *DB) GetProcessingStats(ctx context.Context) (*Statistics, error) {
-	stats := &Statistics{}
-	err := db.conn.QueryRow(ctx, `
-        SELECT 
-            COUNT(DISTINCT b.id),
-            COUNT(DISTINCT c.id)
-        FROM books b
-        LEFT JOIN chapters c ON c.book_id = b.id
-    `).Scan(&stats.ProcessedBooks, &stats.ProcessedChapters)
-
-	if err != nil {
-		return nil, err
-	}
-	return stats, nil
-}
-
-func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	query := `
-        WITH vector_matches AS (
-            SELECT 
-                v.id,
-                v.content,
-                v.chapter_id,
-                v.chunk_index,
-                1 - (v.embedding <=> $1) as similarity
-            FROM vectors v
-            WHERE ($3 = 0 OR 1 - (v.embedding <=> $1) >= $3)
-            ORDER BY v.embedding <=> $1
-            LIMIT $2
-        )
-        SELECT 
-            vm.id,
-            vm.content,
-            a.name as author,
-            b.title,
-            c.title as chapter,
-            vm.chunk_index,
-            vm.similarity,
-            c.index as chapter_index,
-            c.title as chapter_title,
-            (SELECT COUNT(*) FROM vectors WHERE chapter_id = c.id) as total_chunks,
-            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters,
-            COALESCE(t.file_path, '') as file_path,
-            COALESCE(t.file_checksum, '') as file_checksum,
-            CONCAT(a.name, '_', b.title, '_', c.index, '_', vm.chunk_index) as chunk_id,
-            LENGTH(vm.content) - LENGTH(REPLACE(vm.content, ' ', '')) + 1 as word_count,
-            COALESCE(b.isbn, '') as isbn,
-            COALESCE(b.asin, '') as asin
-        FROM vector_matches vm
-        JOIN chapters c ON c.id = vm.chapter_id
-        JOIN books b ON c.book_id = b.id
-        JOIN authors a ON b.author_id = a.id
-        LEFT JOIN transcriptions t ON t.file_path LIKE '%' || b.title || '%'
-        ORDER BY vm.similarity DESC
-    `
-
-	rows, err := db.conn.Query(ctx, query, pgvector.NewVector(vec), limit, threshold)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []SearchResultWithMetadata
-	for rows.Next() {
-		var result SearchResultWithMetadata
-		if err := rows.Scan(
-			&result.ID,
-			&result.Content,
-			&result.Author,
-			&result.Title,
-			&result.Chapter,
-			&result.ChunkIndex,
-			&result.Similarity,
-			&result.ChapterIndex,
-			&result.ChapterTitle,
-			&result.TotalChunks,
-			&result.TotalChapters,
-			&result.FilePath,
-			&result.FileChecksum,
-			&result.ChunkID,
-			&result.WordCount,
-			&result.ISBN,
-			&result.ASIN,
-		); err != nil {
-			return nil, err
-		}
-		results = append(results, result)
-	}
-	return results, nil
-}
-
-func (db *DB) Reset(ctx context.Context) error {
-	db.log.Warn("Performing complete database reset...")
-
-	tx, err := db.conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
-	}
-	defer func() {
-		if err := tx.Rollback(ctx); err != nil {
-			// Ignore rollback errors in defer - they're not critical
-			_ = err
-		}
-	}()
-
-	// Drop all tables in the public schema
-	if _, err := tx.Exec(ctx, `
-        DO $$ DECLARE
-            r RECORD;
-        BEGIN
-            -- Drop all tables in the current schema
-            FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
-                EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
-            END LOOP;
-
-            -- Drop all sequences
-            FOR r IN (SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'public') LOOP
-                EXECUTE 'DROP SEQUENCE IF EXISTS ' || quote_ident(r.sequence_name) || ' CASCADE';
-            END LOOP;
-
-            -- Drop all custom types
-            FOR r IN (SELECT typname FROM pg_type 
-                     WHERE typnamespace = 'public'::regnamespace 
-                     AND typtype = 'c'
-                     AND typname != 'vector') LOOP
-                EXECUTE 'DROP TYPE IF EXISTS ' || quote_ident(r.typname) || ' CASCADE';
-            END LOOP;
-        END $$;
-    `); err != nil {
-		return fmt.Errorf("failed to drop schema objects: %v", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit schema drop: %v", err)
-	}
-
-	// Reinitialize the database
-	if err := db.initialize(ctx); err != nil {
-		return fmt.Errorf("failed to reinitialize database: %v", err)
-	}
-
-	db.log.Info("Database reset completed successfully")
-	return nil
-}
-
-// TextSearch performs a PostgreSQL full-text search on the content
-func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]SearchResultWithMetadata, error) {
-	// Convert the query to a tsquery format and escape special characters
-	tsQuery := strings.Replace(query, "'", "''", -1)
-	tsQuery = strings.Replace(tsQuery, " ", " & ", -1)
-
-	sql := `
-        SELECT 
-            v.id,
-            v.content,
-            a.name as author,
-            b.title,
-            c.title as chapter,
-            v.chunk_index,
-            0.0 as similarity,
-            c.index as chapter_index,
-            c.title as chapter_title,
-            (SELECT COUNT(*) FROM vectors WHERE chapter_id = c.id) as total_chunks,
-            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters,
-            COALESCE(t.file_path, '') as file_path,
-            COALESCE(t.file_checksum, '') as file_checksum,
-            CONCAT(a.name, '_', b.title, '_', c.index, '_', v.chunk_index) as chunk_id,
-            LENGTH(v.content) - LENGTH(REPLACE(v.content, ' ', '')) + 1 as word_count,
-            COALESCE(b.isbn, '') as isbn,
-            COALESCE(b.asin, '') as asin
-        FROM vectors v
-        JOIN chapters c ON v.chapter_id = c.id
-        JOIN books b ON c.book_id = b.id
-        JOIN authors a ON b.author_id = a.id
-        LEFT JOIN transcriptions t ON t.file_path LIKE '%' || b.title || '%'
-        WHERE to_tsvector('english', v.content) @@ to_tsquery('english', $1)
-        ORDER BY ts_rank(to_tsvector('english', v.content), to_tsquery('english', $1)) DESC
-        LIMIT $2
-    `
-
-	rows, err := db.conn.Query(ctx, sql, tsQuery, limit)
-	if err != nil {
-		return nil, fmt.Errorf("text search query failed: %w", err)
-	}
-	defer rows.Close()
-
-	var results []SearchResultWithMetadata
-	for rows.Next() {
-		var result SearchResultWithMetadata
-		err := rows.Scan(
-			&result.ID,
-			&result.Content,
-			&result.Author,
-			&result.Title,
-			&result.Chapter,
-			&result.ChunkIndex,
-			&result.Similarity,
-			&result.ChapterIndex,
-			&result.ChapterTitle,
-			&result.TotalChunks,
-			&result.TotalChapters,
-			&result.FilePath,
-			&result.FileChecksum,
-			&result.ChunkID,
-			&result.WordCount,
-			&result.ISBN,
-			&result.ASIN,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error scanning search result: %w", err)
-		}
-		results = append(results, result)
-	}
-
-	return results, nil
-}
-
-// CheckForMismatchedChunks finds books that have chunks with different sizes than current config
-func (db *DB) CheckForMismatchedChunks(ctx context.Context, configuredChunkSize int) ([]meta.BookMetadata, error) {
-	// Get all mismatched books in one query without a transaction
-	rows, err := db.conn.Query(ctx, `
-        WITH mismatched_chunks AS (
-            SELECT DISTINCT c.book_id
-            FROM vectors v
-            JOIN chapters c ON v.chapter_id = c.id
-            WHERE v.chunk_size != $1
-        )
-        SELECT DISTINCT
-            b.id,
-            b.title,
-            b.isbn,
-            b.asin,
-            a.name as author
-        FROM mismatched_chunks mc
-        JOIN books b ON b.id = mc.book_id
-        JOIN authors a ON a.id = b.author_id
-    `, configuredChunkSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check for mismatched chunks: %w", err)
-	}
-	defer rows.Close()
-
-	var books []meta.BookMetadata
-	for rows.Next() {
-		var book meta.BookMetadata
-		if err := rows.Scan(&book.ID, &book.Title, &book.ISBN, &book.ASIN, &book.Author); err != nil {
-			return nil, fmt.Errorf("failed to scan book data: %w", err)
-		}
-		books = append(books, book)
-	}
-
-	// Now get chapters for each book in separate queries
-	for i := range books {
-		chapters, err := db.getChaptersForBook(ctx, books[i].ID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get chapters for book %d: %w", books[i].ID, err)
-		}
-		books[i].FileMetas = chapters
-	}
-
-	return books, nil
-}
-
-func (db *DB) getChaptersForBook(ctx context.Context, bookID int) ([]meta.FileMetadata, error) {
-	rows, err := db.conn.Query(ctx, `
-        SELECT c.id, c.title, c.index, b.title, b.isbn, b.asin, a.name
-        FROM chapters c
-        JOIN books b ON c.book_id = b.id
-        JOIN authors a ON b.author_id = a.id
-        WHERE c.book_id = $1
-        ORDER BY c.index
-    `, bookID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var chapters []meta.FileMetadata
-	for rows.Next() {
-		var chapter meta.FileMetadata
-		if err := rows.Scan(
-			&chapter.ID,
-			&chapter.Chapter,
-			&chapter.ChapterIndex,
-			&chapter.Title,
-			&chapter.ISBN,
-			&chapter.ASIN,
-			&chapter.Author,
-		); err != nil {
-			return nil, err
-		}
-		chapters = append(chapters, chapter)
-	}
-
-	return chapters, nil
-}
-
-func (db *DB) DeleteBookChunks(ctx context.Context, bookID int) error {
-	_, err := db.conn.Exec(ctx, `
-        DELETE FROM vectors
-        WHERE chapter_id IN (
-            SELECT id FROM chapters WHERE book_id = $1
-        )
-    `, bookID)
-	return err
-}
-
-// ComputeFileChecksum calculates the SHA256 checksum of a file
-func (db *DB) ComputeFileChecksum(filePath string) (string, error) {
-	// #nosec G304 - filePath is controlled by caller and validated elsewhere
-	file, err := os.Open(filepath.Clean(filePath))
-	if err != nil {
-		return "", fmt.Errorf("failed to open file: %w", err)
-	}
-	defer file.Close()
-
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", fmt.Errorf("failed to compute checksum: %w", err)
-	}
-
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil
-}
-
-// ComputeSettingsHash generates a hash from transcription settings for deduplication
-func (db *DB) ComputeSettingsHash(cfg *config.Config) string {
-	// Collect all transcription-relevant settings
-	settings := map[string]string{
-		"chunk_size": fmt.Sprintf("%d", cfg.ChunkSize),
-	}
-
-	// Create a deterministic string from settings
-	var keys []string
-	for k := range settings {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys) // Ensure consistent ordering
-
-	var parts []string
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%s", k, settings[k]))
-	}
-
-	settingsString := strings.Join(parts, "|")
-	hash := sha256.Sum256([]byte(settingsString))
-	return fmt.Sprintf("%x", hash[:8]) // Use first 8 bytes for shorter hash
-}
-
-// NeedsTranscription checks if a file needs to be transcribed based on checksum and settings
-func (db *DB) NeedsTranscription(ctx context.Context, filePath string, fileChecksum, settingsHash string) (bool, error) {
-	var exists bool
-	err := db.conn.QueryRow(ctx, `
-        SELECT EXISTS(
-            SELECT 1 FROM transcriptions
-            WHERE file_path = $1 AND file_checksum = $2 AND settings_hash = $3
-        )
-    `, filePath, fileChecksum, settingsHash).Scan(&exists)
-
-	if err != nil {
-		return false, fmt.Errorf("error checking transcription status: %w", err)
-	}
-
-	// Return true if transcription is needed (doesn't exist)
-	return !exists, nil
-}
-
-// StoreTranscription stores raw transcription text and metadata in the database
-func (db *DB) StoreTranscription(ctx context.Context, filePath, fileChecksum, settingsHash, transcriptionText string, fileSize int64, wordCount int, processingDurationMs int64) error {
-	_, err := db.conn.Exec(ctx, `
-        INSERT INTO transcriptions (
-            file_path, file_checksum, file_size, settings_hash, 
-            transcription_text, word_count, processing_duration_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (file_path) DO UPDATE SET
-            file_checksum = EXCLUDED.file_checksum,
-            file_size = EXCLUDED.file_size,
-            settings_hash = EXCLUDED.settings_hash,
-            transcription_text = EXCLUDED.transcription_text,
-            word_count = EXCLUDED.word_count,
-            processing_duration_ms = EXCLUDED.processing_duration_ms,
-            updated_at = NOW()
-    `, filePath, fileChecksum, fileSize, settingsHash, transcriptionText, wordCount, processingDurationMs)
-
-	if err != nil {
-		return fmt.Errorf("failed to store transcription: %w", err)
-	}
-
-	db.log.Debug("Stored transcription", "file_path", filePath, "word_count", wordCount)
-	return nil
-}
-
-// GetTranscription retrieves transcription data for a file
-func (db *DB) GetTranscription(ctx context.Context, filePath string) (*Transcription, error) {
-	var transcription Transcription
-	err := db.conn.QueryRow(ctx, `
-        SELECT id, file_path, file_checksum, file_size, settings_hash,
-               transcription_text, corrected_text, correction_status, 
-               correction_error, correction_metadata, word_count, 
-               processing_duration_ms, created_at, updated_at
-        FROM transcriptions
-        WHERE file_path = $1
-    `, filePath).Scan(
-		&transcription.ID,
-		&transcription.FilePath,
-		&transcription.FileChecksum,
-		&transcription.FileSize,
-		&transcription.SettingsHash,
-		&transcription.TranscriptionText,
-		&transcription.CorrectedText,
-		&transcription.CorrectionStatus,
-		&transcription.CorrectionError,
-		&transcription.CorrectionMetadata,
-		&transcription.WordCount,
-		&transcription.ProcessingDurationMs,
-		&transcription.CreatedAt,
-		&transcription.UpdatedAt,
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to get transcription: %w", err)
-	}
-
-	return &transcription, nil
-}
-
-// UpdateCorrectedText updates an existing transcription with corrected text
-func (db *DB) UpdateCorrectedText(ctx context.Context, filePath, correctedText string, metadata map[string]interface{}) error {
-	var metadataJSON *string
-	if metadata != nil {
-		jsonBytes, err := json.Marshal(metadata)
-		if err != nil {
-			return fmt.Errorf("failed to marshal correction metadata: %w", err)
-		}
-		jsonStr := string(jsonBytes)
-		metadataJSON = &jsonStr
-	}
-
-	_, err := db.conn.Exec(ctx, `
-        UPDATE transcriptions 
-        SET corrected_text = $2,
-            correction_status = 'completed',
-            correction_error = NULL,
-            correction_metadata = $3,
-            updated_at = NOW()
-        WHERE file_path = $1
-    `, filePath, correctedText, metadataJSON)
-
-	if err != nil {
-		return fmt.Errorf("failed to update corrected text: %w", err)
-	}
-
-	db.log.Debug("Updated corrected text", "file_path", filePath)
-	return nil
-}
-
-// UpdateCorrectionStatus updates the correction status for a transcription
-func (db *DB) UpdateCorrectionStatus(ctx context.Context, filePath, status string, errorMsg *string) error {
-	_, err := db.conn.Exec(ctx, `
-        UPDATE transcriptions 
-        SET correction_status = $2,
-            correction_error = $3,
-            updated_at = NOW()
-        WHERE file_path = $1
-    `, filePath, status, errorMsg)
-
-	if err != nil {
-		return fmt.Errorf("failed to update correction status: %w", err)
-	}
-
-	db.log.Debug("Updated correction status", "file_path", filePath, "status", status)
-	return nil
-}
-
-// GetTranscriptionsForCorrection retrieves transcriptions that need LLM correction
-func (db *DB) GetTranscriptionsForCorrection(ctx context.Context, limit int) ([]*Transcription, error) {
-	rows, err := db.conn.Query(ctx, `
-        SELECT id, file_path, file_checksum, file_size, settings_hash,
-               transcription_text, corrected_text, correction_status,
-               correction_error, correction_metadata, word_count,
-               processing_duration_ms, created_at, updated_at
-        FROM transcriptions
-        WHERE correction_status = 'pending' OR corrected_text IS NULL
-        ORDER BY created_at ASC
-        LIMIT $1
-    `, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query transcriptions for correction: %w", err)
-	}
-	defer rows.Close()
-
-	var transcriptions []*Transcription
-	for rows.Next() {
-		var t Transcription
-		err := rows.Scan(
-			&t.ID,
-			&t.FilePath,
-			&t.FileChecksum,
-			&t.FileSize,
-			&t.SettingsHash,
-			&t.TranscriptionText,
-			&t.CorrectedText,
-			&t.CorrectionStatus,
-			&t.CorrectionError,
-			&t.CorrectionMetadata,
-			&t.WordCount,
-			&t.ProcessingDurationMs,
-			&t.CreatedAt,
-			&t.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan transcription: %w", err)
-		}
-		transcriptions = append(transcriptions, &t)
-	}
-
-	return transcriptions, nil
-}
-
-// ProcessTranscriptionCorrection handles the entire correction process atomically
-func (db *DB) ProcessTranscriptionCorrection(ctx context.Context, filePath string, correctionFunc func() (string, map[string]interface{}, error)) error {
-	// Start transaction for atomic correction processing
-	tx, err := db.conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin correction transaction: %w", err)
-	}
-	defer func() {
-		if err := tx.Rollback(ctx); err != nil {
-			// Ignore rollback errors in defer - they're not critical
-			_ = err
-		}
-	}()
-
-	// Set status to in_progress
-	_, err = tx.Exec(ctx, `
-        UPDATE transcriptions 
-        SET correction_status = 'in_progress',
-            correction_error = NULL,
-            updated_at = NOW()
-        WHERE file_path = $1
-    `, filePath)
-
-	if err != nil {
-		return fmt.Errorf("failed to update correction status: %w", err)
-	}
-
-	// Commit the status update first
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit status update: %w", err)
-	}
-
-	// Perform the correction (this may take a long time)
-	correctedText, metadata, correctionErr := correctionFunc()
-
-	// Start new transaction for final update
-	tx, err = db.conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin final transaction: %w", err)
-	}
-	defer func() {
-		if err := tx.Rollback(ctx); err != nil {
-			// Ignore rollback errors in defer - they're not critical
-			_ = err
-		}
-	}()
-
-	if correctionErr != nil {
-		// Update with error status
-		errorMsg := correctionErr.Error()
-		_, err = tx.Exec(ctx, `
-            UPDATE transcriptions 
-            SET correction_status = 'failed',
-                correction_error = $2,
-                updated_at = NOW()
-            WHERE file_path = $1
-        `, filePath, errorMsg)
-
-		if err != nil {
-			db.log.Error("Failed to update failed correction status", "error", err)
-		} else {
-			if commitErr := tx.Commit(ctx); commitErr != nil {
-				db.log.Error("Failed to commit correction status update", "error", commitErr)
-			}
-		}
-
-		return fmt.Errorf("correction failed: %w", correctionErr)
-	}
-
-	// Update with successful correction
-	var metadataJSON *string
-	if metadata != nil {
-		jsonBytes, err := json.Marshal(metadata)
-		if err != nil {
-			db.log.Warn("Failed to marshal correction metadata", "error", err)
-		} else {
-			jsonStr := string(jsonBytes)
-			metadataJSON = &jsonStr
-		}
-	}
-
-	_, err = tx.Exec(ctx, `
-        UPDATE transcriptions 
-        SET corrected_text = $2,
-            correction_status = 'completed',
-            correction_error = NULL,
-            correction_metadata = $3,
-            updated_at = NOW()
-        WHERE file_path = $1
-    `, filePath, correctedText, metadataJSON)
-
-	if err != nil {
-		return fmt.Errorf("failed to update corrected text: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit correction: %w", err)
-	}
-
-	db.log.Debug("Correction processed atomically", "file_path", filePath)
-	return nil
-}
-
-// GetCorrectionStatus returns the current correction status for a file
-func (db *DB) GetCorrectionStatus(ctx context.Context, filePath string) (status string, err error) {
-	err = db.conn.QueryRow(ctx, `
-        SELECT COALESCE(correction_status, 'pending')
-        FROM transcriptions
-        WHERE file_path = $1
-    `, filePath).Scan(&status)
-
-	if err != nil {
-		return "", fmt.Errorf("failed to get correction status: %w", err)
-	}
-
-	return status, nil
-}
-
-// CleanupStaleCorrections resets any corrections that have been in_progress for too long
-func (db *DB) CleanupStaleCorrections(ctx context.Context, timeoutMinutes int) (int, error) {
-	result, err := db.conn.Exec(ctx, `
-        UPDATE transcriptions 
-        SET correction_status = 'pending',
-            correction_error = 'Reset due to timeout',
-            updated_at = NOW()
-        WHERE correction_status = 'in_progress'
-        AND updated_at < NOW() - INTERVAL '%d minutes'
-    `, timeoutMinutes)
-
-	if err != nil {
-		return 0, fmt.Errorf("failed to cleanup stale corrections: %w", err)
-	}
-
-	rowsAffected := result.RowsAffected()
-	if rowsAffected > 0 {
-		db.log.Info("Cleaned up stale corrections", "count", rowsAffected)
-	}
-
-	return int(rowsAffected), nil
-}
-
-// GetChunkContext retrieves surrounding chunks for a given chunk ID
+// GetChunkContext returns surrounding chunks for a given chunk ID string.
 func (db *DB) GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]SearchResultWithMetadata, error) {
-	// Parse chunk ID (format: author_book_chapter_chunk)
-	parts := strings.Split(chunkID, "_")
-	if len(parts) < 4 {
-		return nil, fmt.Errorf("invalid chunk ID format: %s", chunkID)
+	// Resolve the target chunk's transcript_id and chunk_index.
+	var transcriptID string
+	var chunkIndex int
+	err := db.pool.QueryRow(ctx, `
+		SELECT transcript_id, chunk_index FROM transcript_chunks WHERE id = $1
+	`, chunkID).Scan(&transcriptID, &chunkIndex)
+	if err != nil {
+		return nil, fmt.Errorf("find chunk %q: %w", chunkID, err)
 	}
 
-	chapterIndex := parts[len(parts)-2]
-	chunkIndex := parts[len(parts)-1]
+	lo := chunkIndex - contextWindow
+	if lo < 0 {
+		lo = 0
+	}
+	hi := chunkIndex + contextWindow
 
-	sql := `
-        WITH target_chunk AS (
-            SELECT 
-                v.chapter_id,
-                v.chunk_index,
-                c.book_id
-            FROM vectors v
-            JOIN chapters c ON v.chapter_id = c.id
-            JOIN books b ON c.book_id = b.id
-            JOIN authors a ON b.author_id = a.id
-            WHERE c.index = $1::integer 
-            AND v.chunk_index = $2::integer
-            AND CONCAT(a.name, '_', b.title, '_', c.index, '_', v.chunk_index) = $3
-            LIMIT 1
-        ),
-        context_chunks AS (
-            SELECT 
-                v.id,
-                v.content,
-                v.chapter_id,
-                v.chunk_index,
-                0.0 as similarity
-            FROM vectors v, target_chunk tc
-            WHERE v.chapter_id = tc.chapter_id
-            AND v.chunk_index BETWEEN (tc.chunk_index - $4) AND (tc.chunk_index + $4)
-            ORDER BY v.chunk_index
-        )
-        SELECT 
-            cc.id,
-            cc.content,
-            a.name as author,
-            b.title,
-            c.title as chapter,
-            cc.chunk_index,
-            cc.similarity,
-            c.index as chapter_index,
-            c.title as chapter_title,
-            (SELECT COUNT(*) FROM vectors WHERE chapter_id = c.id) as total_chunks,
-            (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as total_chapters,
-            COALESCE(t.file_path, '') as file_path,
-            COALESCE(t.file_checksum, '') as file_checksum,
-            CONCAT(a.name, '_', b.title, '_', c.index, '_', cc.chunk_index) as chunk_id,
-            LENGTH(cc.content) - LENGTH(REPLACE(cc.content, ' ', '')) + 1 as word_count,
-            COALESCE(b.isbn, '') as isbn,
-            COALESCE(b.asin, '') as asin
-        FROM context_chunks cc
-        JOIN chapters c ON cc.chapter_id = c.id
-        JOIN books b ON c.book_id = b.id
-        JOIN authors a ON b.author_id = a.id
-        LEFT JOIN transcriptions t ON t.file_path LIKE '%' || b.title || '%'
-        ORDER BY cc.chunk_index
-    `
-
-	rows, err := db.conn.Query(ctx, sql, chapterIndex, chunkIndex, chunkID, contextWindow)
+	rows, err := db.pool.Query(ctx, `
+		SELECT
+			c.id,
+			c.text,
+			c.file_path,
+			c.chunk_index,
+			c.start_sec,
+			c.end_sec,
+			c.speaker,
+			0.0 AS similarity,
+			(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
+		FROM transcript_chunks c
+		WHERE c.transcript_id = $1
+		  AND c.chunk_index BETWEEN $2 AND $3
+		ORDER BY c.chunk_index
+	`, transcriptID, lo, hi)
 	if err != nil {
-		return nil, fmt.Errorf("context query failed: %w", err)
+		return nil, fmt.Errorf("context query: %w", err)
 	}
 	defer rows.Close()
 
-	var results []SearchResultWithMetadata
-	for rows.Next() {
-		var result SearchResultWithMetadata
-		err := rows.Scan(
-			&result.ID,
-			&result.Content,
-			&result.Author,
-			&result.Title,
-			&result.Chapter,
-			&result.ChunkIndex,
-			&result.Similarity,
-			&result.ChapterIndex,
-			&result.ChapterTitle,
-			&result.TotalChunks,
-			&result.TotalChapters,
-			&result.FilePath,
-			&result.FileChecksum,
-			&result.ChunkID,
-			&result.WordCount,
-			&result.ISBN,
-			&result.ASIN,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan context result: %w", err)
-		}
-		results = append(results, result)
-	}
+	return scanResults(rows)
+}
 
-	return results, nil
+// ─── Processing stats ────────────────────────────────────────────────────────
+
+// Statistics holds aggregate counts for the monitor's startup log.
+type Statistics struct {
+	PendingJobs    int
+	CompletedJobs  int
+	EmbeddedChunks int
+}
+
+// GetProcessingStats returns aggregate counts.
+func (db *DB) GetProcessingStats(ctx context.Context) (*Statistics, error) {
+	s := &Statistics{}
+	err := db.pool.QueryRow(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE status IN ('pending','claimed')) AS pending,
+			COUNT(*) FILTER (WHERE status = 'done')                AS done
+		FROM transcription_jobs
+	`).Scan(&s.PendingJobs, &s.CompletedJobs)
+	if err != nil {
+		return nil, err
+	}
+	err = db.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transcript_chunks`).Scan(&s.EmbeddedChunks)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// ─── Checksum helper ─────────────────────────────────────────────────────────
+
+// ComputeFileChecksum returns the SHA-256 hex digest of a file.
+func (db *DB) ComputeFileChecksum(filePath string) (string, error) {
+	// #nosec G304 — path validated by caller
+	f, err := os.Open(filepath.Clean(filePath))
+	if err != nil {
+		return "", fmt.Errorf("open: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hash: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// IsJobQueued returns true if a transcription_jobs row already exists for the
+// given checksum (in any status).
+func (db *DB) IsJobQueued(ctx context.Context, checksum string) (bool, error) {
+	var exists bool
+	err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM transcription_jobs WHERE checksum = $1)
+	`, checksum).Scan(&exists)
+	return exists, err
+}
+
+// Reset drops all tables and re-initialises the schema (DEBUG_DB_RESET only).
+// A second confirmation env var DEBUG_DB_RESET_CONFIRM=yes-delete-everything
+// is required to prevent accidental data destruction.
+func (db *DB) Reset(ctx context.Context) error {
+	confirm := os.Getenv("DEBUG_DB_RESET_CONFIRM")
+	if confirm != "yes-delete-everything" {
+		db.log.Error("Reset() refused: set DEBUG_DB_RESET_CONFIRM=yes-delete-everything to confirm")
+		return fmt.Errorf("reset refused: DEBUG_DB_RESET_CONFIRM not set to 'yes-delete-everything'")
+	}
+	db.log.Warn("performing complete database reset")
+	if _, err := db.pool.Exec(ctx, `
+		DROP TABLE IF EXISTS transcript_chunks   CASCADE;
+		DROP TABLE IF EXISTS transcripts         CASCADE;
+		DROP TABLE IF EXISTS transcription_jobs  CASCADE;
+	`); err != nil {
+		return fmt.Errorf("drop tables: %w", err)
+	}
+	return db.initialize(ctx)
 }

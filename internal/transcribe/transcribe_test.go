@@ -4,95 +4,103 @@ import (
 	"context"
 	"os"
 	"testing"
-
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/meta"
 )
 
-func init() {
-	// Set GO_TEST environment variable for all tests in this package
-	os.Setenv("GO_TEST", "1")
+// fakeInserter implements JobInserter for unit tests.
+type fakeInserter struct {
+	inserted map[string]bool // checksum -> present
+	nextID   string
 }
 
-func TestNewTranscriber(t *testing.T) {
-	// Create a minimal config
-	cfg := &config.Config{
-		CacheDir:  "/tmp/test-cache",
-		OutputDir: "/tmp/test-output",
-		AudioDir:  "/tmp/test-audio",
+func (f *fakeInserter) InsertJobIfAbsent(_ context.Context, _, checksum string) (string, bool, error) {
+	if f.inserted[checksum] {
+		return f.nextID, false, nil
 	}
-
-	// Test creating a new transcriber
-	transcriber := NewTranscriber(cfg)
-	
-	if transcriber == nil {
-		t.Fatal("NewTranscriber returned nil")
-	}
-	
-	if transcriber.config != cfg {
-		t.Error("Transcriber config not set correctly")
-	}
-	
-	if transcriber.engine == nil {
-		t.Error("Transcriber engine not initialized")
-	}
-	
-	// Logger is a value type, so just check that transcriber was created successfully
+	f.inserted[checksum] = true
+	return f.nextID, true, nil
 }
 
-func TestTranscriberInterface(t *testing.T) {
-	// Create a minimal config
-	cfg := &config.Config{
-		CacheDir:  "/tmp/test-cache",
-		OutputDir: "/tmp/test-output",
-		AudioDir:  "/tmp/test-audio",
+func TestComputeChecksum(t *testing.T) {
+	tmp, err := os.CreateTemp("", "transcribe_test_*.bin")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+
+	content := []byte("hello world")
+	if _, err := tmp.Write(content); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	_ = tmp.Close()
+
+	sum1, err := ComputeChecksum(tmp.Name())
+	if err != nil {
+		t.Fatalf("ComputeChecksum: %v", err)
+	}
+	if sum1 == "" {
+		t.Fatal("expected non-empty checksum")
 	}
 
-	transcriber := NewTranscriber(cfg)
-	
-	// Test that the transcriber implements the expected interface
-	ctx := context.Background()
-	fileMeta := &meta.FileMetadata{
-		Title:  "Test Book",
-		Author: "Test Author",
+	// Idempotent
+	sum2, err := ComputeChecksum(tmp.Name())
+	if err != nil {
+		t.Fatalf("ComputeChecksum (2nd): %v", err)
 	}
-	
-	// This should not panic - we're just testing the interface delegation
-	// The actual transcription will fail because we don't have a real audio file,
-	// but we're testing that the method exists and delegates correctly
-	_, err := transcriber.TranscribeAudio(ctx, "nonexistent.mp3", fileMeta)
-	
-	// We expect an error because the file doesn't exist, but the method should be callable
-	if err == nil {
-		t.Error("Expected error for nonexistent file, but got nil")
+	if sum1 != sum2 {
+		t.Errorf("checksums differ: %q vs %q", sum1, sum2)
 	}
 }
 
-func TestEngineManager(t *testing.T) {
-	// Test that we can create an engine manager with nil engine
-	manager := NewEngineManager(nil)
-	
-	if manager == nil {
-		t.Fatal("NewEngineManager returned nil")
-	}
-	
-	// Test behavior with nil engine
-	version := manager.GetVersion()
-	if version != "unknown" {
-		t.Errorf("Expected 'unknown' version for nil engine, got %s", version)
-	}
-	
-	// Test GetInfo with nil engine
-	_, err := manager.GetInfo()
+func TestComputeChecksum_Nonexistent(t *testing.T) {
+	_, err := ComputeChecksum("/nonexistent/path/file.m4b")
 	if err == nil {
-		t.Error("Expected error for GetInfo with nil engine")
+		t.Fatal("expected error for nonexistent file")
 	}
-	
-	// Test Transcribe with nil engine
-	ctx := context.Background()
-	fileMeta := &meta.FileMetadata{}
-	_, err = manager.Transcribe(ctx, "test.mp3", fileMeta)
-	if err == nil {
-		t.Error("Expected error for Transcribe with nil engine")
+}
+
+func TestEnqueueJob_Created(t *testing.T) {
+	tmp, err := os.CreateTemp("", "enqueue_test_*.bin")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.WriteString("data"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = tmp.Close()
+
+	ins := &fakeInserter{inserted: make(map[string]bool), nextID: "job-uuid-1"}
+	id, created, err := EnqueueJob(context.Background(), tmp.Name(), ins)
+	if err != nil {
+		t.Fatalf("EnqueueJob: %v", err)
+	}
+	if !created {
+		t.Error("expected job to be created")
+	}
+	if id != "job-uuid-1" {
+		t.Errorf("unexpected job id: %q", id)
+	}
+}
+
+func TestEnqueueJob_AlreadyExists(t *testing.T) {
+	tmp, err := os.CreateTemp("", "enqueue_existing_*.bin")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.WriteString("data"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = tmp.Close()
+
+	// Pre-populate the fake inserter
+	sum, _ := ComputeChecksum(tmp.Name())
+	ins := &fakeInserter{inserted: map[string]bool{sum: true}, nextID: "job-uuid-2"}
+	_, created, err := EnqueueJob(context.Background(), tmp.Name(), ins)
+	if err != nil {
+		t.Fatalf("EnqueueJob: %v", err)
+	}
+	if created {
+		t.Error("expected job to already exist")
 	}
 }

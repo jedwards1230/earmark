@@ -48,29 +48,38 @@ func runMCP(cmd *cobra.Command, args []string) {
 	}
 	defer database.Close()
 
-	// Set environment variable for MCP transport (defaults to stdio)
-	if os.Getenv("MCP_TRANSPORT") == "" {
-		if err := os.Setenv("MCP_TRANSPORT", "stdio"); err != nil {
-			log.Printf("Warning: failed to set MCP_TRANSPORT: %v", err)
+	// Determine transport from env; default to stdio.
+	// Do NOT set the env var globally — read it once and pass it through.
+	transport := os.Getenv("MCP_TRANSPORT")
+	if transport == "" {
+		transport = "stdio"
+	}
+
+	// Startup diagnostics: write to stderr for stdio transport so we don't
+	// corrupt the JSON-RPC framing on stdout; write to stdout for http.
+	diag := func(format string, a ...interface{}) {
+		if transport == "stdio" {
+			fmt.Fprintf(os.Stderr, format+"\n", a...)
+		} else {
+			fmt.Printf(format+"\n", a...)
 		}
 	}
 
-	// Print startup information
-	fmt.Println("Starting MCP server for lilbro-whisper...")
-	fmt.Println("Available tools:")
-	fmt.Println("  - semantic_search_audiobooks: Search using semantic similarity")
-	fmt.Println("  - text_search_audiobooks: Search using full-text search")
-	fmt.Println("  - browse_audiobook_library: Browse library structure")
-	fmt.Println("")
-	fmt.Println("Transport:", os.Getenv("MCP_TRANSPORT"))
-	if os.Getenv("MCP_TRANSPORT") == "http" {
-		addr := os.Getenv("MCP_HTTP_ADDR")
+	diag("Starting MCP server for lilbro-whisper...")
+	diag("Available tools:")
+	diag("  - semantic_search_audiobooks: Search using semantic similarity")
+	diag("  - text_search_audiobooks: Search using full-text search")
+	diag("  - browse_audiobook_library: Browse library structure")
+	diag("")
+	diag("Transport: %s", transport)
+	if transport == "http" {
+		addr := cfg.MCPHTTPAddr
 		if addr == "" {
 			addr = ":8081"
 		}
-		fmt.Println("HTTP Address:", addr)
+		diag("HTTP Address: %s", addr)
 	}
-	fmt.Println("")
+	diag("")
 
 	// Start the MCP service
 	if err := mcp.StartMCPService(database, cfg); err != nil {

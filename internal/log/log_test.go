@@ -385,10 +385,10 @@ func TestDebugEnvironmentVariable(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Save original environment
 			originalEnv := os.Getenv("LOG_DEBUG")
-			defer os.Setenv("LOG_DEBUG", originalEnv)
+			defer func() { _ = os.Setenv("LOG_DEBUG", originalEnv) }()
 
 			// Set test environment
-			os.Setenv("LOG_DEBUG", tt.envValue)
+			_ = os.Setenv("LOG_DEBUG", tt.envValue)
 
 			// Re-initialize the debug flag (simulate package init)
 			debugEnabled = os.Getenv("LOG_DEBUG") == "1" || os.Getenv("LOG_DEBUG") == "true"
@@ -440,10 +440,10 @@ func TestVerboseEnvironmentVariable(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Save original environment
 			originalEnv := os.Getenv("LOG_VERBOSE")
-			defer os.Setenv("LOG_VERBOSE", originalEnv)
+			defer func() { _ = os.Setenv("LOG_VERBOSE", originalEnv) }()
 
 			// Set test environment
-			os.Setenv("LOG_VERBOSE", tt.envValue)
+			_ = os.Setenv("LOG_VERBOSE", tt.envValue)
 
 			// Re-initialize the verbose flag (simulate package init)
 			verboseEnabled = os.Getenv("LOG_VERBOSE") == "1" || os.Getenv("LOG_VERBOSE") == "true"
@@ -471,7 +471,7 @@ func TestLoggerVerboseMethod(t *testing.T) {
 	logger.Verbose("verbose test message", "key", "value")
 
 	// Restore stdout
-	w.Close()
+	_ = w.Close()
 	os.Stdout = originalStdout
 
 	// Read captured output
@@ -507,7 +507,7 @@ func TestLoggerIntegration(t *testing.T) {
 	logger.Error("error message", "error", "test error")
 
 	// Restore stdout
-	w.Close()
+	_ = w.Close()
 	os.Stdout = originalStdout
 
 	// Read captured output

@@ -1,11 +1,11 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
-	"github.com/jedwards1230/lil-whisper/internal/db"
 	"net/http"
 	"strconv"
+
+	"github.com/jedwards1230/lil-whisper/internal/db"
 )
 
 func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +54,7 @@ func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {
 		"threshold", threshold,
 		"limit", itemLimit)
 
-	results, err := s.db.Search(context.Background(), query, itemLimit, threshold)
+	results, err := s.db.Search(r.Context(), query, itemLimit, threshold)
 	if err != nil {
 		s.log.Error("Search error", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -1,87 +1,73 @@
+// Package transcribe implements the job-queue producer for transcription jobs.
+//
+// The Go service no longer performs transcription itself. Instead it:
+//  1. Enqueues new audio files into transcription_jobs (dedup by SHA-256 checksum).
+//  2. Polls for completed transcripts (status="done") and feeds them into the
+//     chunk → embed → pgvector pipeline.
+//
+// The actual transcription is done by the Python WhisperX runner on desktop-1.
 package transcribe
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
-	"runtime"
+	"path/filepath"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/meta"
-	"github.com/jedwards1230/lil-whisper/internal/yap"
 )
 
-type Transcriber struct {
-	config  *config.Config
-	log     log.Logger
-	engine  *EngineManager
-}
+var logger = log.NewLogger("transcribe")
 
-func NewTranscriber(cfg *config.Config) *Transcriber {
-	logger := log.NewLogger("transcribe")
-
-	if err := checkDependencies(); err != nil {
-		logger.Error("Failed checking dependencies", "error", err)
-		os.Exit(1)
-	}
-
-	// Initialize Yap speech engine
-	yapEngine := yap.NewEngine(cfg)
-	engineManager := NewEngineManager(yapEngine)
-
-	// Log speech engine info at startup
-	if info, err := engineManager.GetInfo(); err == nil {
-		logger.Info("Initialized speech transcription", 
-			"engine", info["engine"],
-			"version", info["version"],
-			"platform", info["platform"])
-	}
-
-	// Clear cache directory on startup
-	if err := clearCacheDir(cfg.CacheDir); err != nil {
-		logger.Error("Failed clearing cache directory", "error", err)
-		os.Exit(1)
-	}
-
-	return &Transcriber{
-		config: cfg,
-		log:    logger,
-		engine: engineManager,
-	}
-}
-
-
-func (t *Transcriber) TranscribeAudio(
-	ctx context.Context,
-	audioFilePath string,
-	fileMeta *meta.FileMetadata,
-) (string, error) {
-	// Delegate transcription to the configured speech engine
-	return t.engine.Transcribe(ctx, audioFilePath, fileMeta)
-}
-
-func checkDependencies() error {
-	// Skip dependency checks on non-macOS systems or in test environment
-	if runtime.GOOS != "darwin" || os.Getenv("GO_TEST") == "1" {
-		return nil
-	}
-
-	// Only check for ffmpeg as it's the only actual dependency used
-	// Python/pip checks removed as they're not actually used
-	ffmpegCmd := exec.Command("ffmpeg", "-version")
-	_, err := ffmpegCmd.CombinedOutput()
+// ComputeChecksum returns the SHA-256 hex digest of the file at filePath.
+// This is the dedup key used in transcription_jobs.
+func ComputeChecksum(filePath string) (string, error) {
+	// #nosec G304 — path is from the filesystem monitor, validated by the caller
+	f, err := os.Open(filepath.Clean(filePath))
 	if err != nil {
-		return fmt.Errorf("ffmpeg is not installed: %w", err)
+		return "", fmt.Errorf("opening file for checksum: %w", err)
 	}
+	defer func() { _ = f.Close() }()
 
-	return nil
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("computing checksum: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func clearCacheDir(cacheDir string) error {
-	if err := os.RemoveAll(cacheDir); err != nil {
-		return err
+// EnqueueJob inserts a new transcription_jobs row for filePath if no row with
+// the same checksum already exists (status-agnostic dedup). Returns the job ID,
+// or an empty string if the job was already present.
+//
+// The actual INSERT is delegated to the DB layer to keep SQL in one place.
+// This function validates the checksum and delegates to the provided inserter.
+func EnqueueJob(ctx context.Context, filePath string, inserter JobInserter) (jobID string, created bool, err error) {
+	checksum, err := ComputeChecksum(filePath)
+	if err != nil {
+		return "", false, fmt.Errorf("checksum %q: %w", filePath, err)
 	}
-	return os.MkdirAll(cacheDir, 0750)
+
+	jobID, created, err = inserter.InsertJobIfAbsent(ctx, filePath, checksum)
+	if err != nil {
+		return "", false, fmt.Errorf("insert job for %q: %w", filePath, err)
+	}
+
+	if created {
+		logger.Info("enqueued transcription job", "file", filePath, "job_id", jobID)
+	} else {
+		logger.Debug("transcription job already exists", "file", filePath, "checksum", checksum)
+	}
+	return jobID, created, nil
+}
+
+// JobInserter is satisfied by the DB layer.
+type JobInserter interface {
+	// InsertJobIfAbsent inserts a pending transcription_jobs row if no row
+	// with checksum already exists. Returns (jobID, true, nil) on insert or
+	// (existingJobID, false, nil) if already present.
+	InsertJobIfAbsent(ctx context.Context, filePath, checksum string) (jobID string, created bool, err error)
 }

@@ -19,7 +19,7 @@ func TestFormatSearchResults(t *testing.T) {
 			name: "single search result",
 			results: []db.SearchResultWithMetadata{
 				{
-					ID:            1,
+					ID:            "chunk-uuid-1",
 					Content:       "The dragon soared through the sky",
 					Author:        "J.R.R. Tolkien",
 					Title:         "The Hobbit",
@@ -69,7 +69,7 @@ ID: J.R.R. Tolkien_The Hobbit_1_5 | File: /media/audiobooks/tolkien/the-hobbit.m
 			name: "multiple results",
 			results: []db.SearchResultWithMetadata{
 				{
-					ID:            1,
+					ID:            "chunk-uuid-2",
 					Content:       "First result content",
 					Author:        "Author One",
 					Title:         "Book One",
@@ -86,7 +86,7 @@ ID: J.R.R. Tolkien_The Hobbit_1_5 | File: /media/audiobooks/tolkien/the-hobbit.m
 					WordCount:     4,
 				},
 				{
-					ID:            2,
+					ID:            "chunk-uuid-3",
 					Content:       "Second result content",
 					Author:        "Author Two",
 					Title:         "Book Two",
@@ -136,151 +136,64 @@ ID: Author Two_Book Two_2_1 | File: /media/audiobooks/author-two/book-two.m4b | 
 
 func TestFormatHierarchicalData(t *testing.T) {
 	tests := []struct {
-		name     string
-		entries  []db.HierarchicalEntry
-		expected *mcp.CallToolResult
+		name         string
+		entries      []db.HierarchicalEntry
+		expectedText string
 	}{
 		{
-			name: "single author with books",
+			name: "single file entry",
 			entries: []db.HierarchicalEntry{
-				{
-					Author: "J.R.R. Tolkien",
-					Title:  "The Hobbit",
-					Chapters: []string{
-						"An Unexpected Party",
-						"Roast Mutton",
-					},
-				},
-				{
-					Author: "J.R.R. Tolkien",
-					Title:  "The Fellowship of the Ring",
-					Chapters: []string{
-						"A Long-expected Party",
-					},
-				},
+				{FilePath: "/books/Tolkien/The Hobbit/ch1.mp3", ChunkCount: 42},
 			},
-			expected: &mcp.CallToolResult{
-				Content: []mcp.Content{
-					mcp.TextContent{
-						Type: "text",
-						Text: `📚 **Audiobook Library**
-
-**J.R.R. Tolkien**
-├── The Hobbit (2 chapters)
-│   ├── An Unexpected Party
-│   └── Roast Mutton
-└── The Fellowship of the Ring (1 chapter)
-    └── A Long-expected Party
-`,
-					},
-				},
-			},
+			expectedText: "📚 **Audiobook Library**\n\n└── ch1.mp3 (42 chunks)\n",
 		},
 		{
-			name:    "empty library",
-			entries: []db.HierarchicalEntry{},
-			expected: &mcp.CallToolResult{
-				Content: []mcp.Content{
-					mcp.TextContent{
-						Type: "text",
-						Text: "📚 **Audiobook Library**\n\nNo audiobooks found.",
-					},
-				},
+			name:         "empty library",
+			entries:      []db.HierarchicalEntry{},
+			expectedText: "📚 **Audiobook Library**\n\nNo audiobooks found.",
+		},
+		{
+			name: "multiple entries",
+			entries: []db.HierarchicalEntry{
+				{FilePath: "/books/A/Book/ch1.mp3", ChunkCount: 10},
+				{FilePath: "/books/B/Book/ch2.mp3", ChunkCount: 20},
 			},
+			expectedText: "📚 **Audiobook Library**\n\n├── ch1.mp3 (10 chunks)\n└── ch2.mp3 (20 chunks)\n",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := formatHierarchicalData(tt.entries)
-			assert.Equal(t, tt.expected.Content[0].(mcp.TextContent).Text,
-				result.Content[0].(mcp.TextContent).Text)
+			assert.Equal(t, tt.expectedText, result.Content[0].(mcp.TextContent).Text)
 		})
 	}
 }
 
 func TestFilterHierarchicalData(t *testing.T) {
 	entries := []db.HierarchicalEntry{
-		{
-			Author:   "J.R.R. Tolkien",
-			Title:    "The Hobbit",
-			Chapters: []string{"Chapter 1", "Chapter 2"},
-		},
-		{
-			Author:   "J.R.R. Tolkien",
-			Title:    "The Fellowship of the Ring",
-			Chapters: []string{"Chapter 1"},
-		},
-		{
-			Author:   "Brandon Sanderson",
-			Title:    "The Way of Kings",
-			Chapters: []string{"Prelude", "Chapter 1"},
-		},
+		{FilePath: "/books/J.R.R. Tolkien/The Hobbit/ch1.mp3", ChunkCount: 5},
+		{FilePath: "/books/J.R.R. Tolkien/The Fellowship/ch1.mp3", ChunkCount: 8},
+		{FilePath: "/books/Brandon Sanderson/The Way of Kings/ch1.mp3", ChunkCount: 12},
 	}
 
 	tests := []struct {
-		name           string
-		authorFilter   string
-		bookFilter     string
-		expectedCount  int
-		expectedAuthor string
-		expectedTitle  string
+		name          string
+		authorFilter  string
+		bookFilter    string
+		expectedCount int
 	}{
-		{
-			name:           "filter by author partial match",
-			authorFilter:   "tolkien",
-			bookFilter:     "",
-			expectedCount:  2,
-			expectedAuthor: "J.R.R. Tolkien",
-		},
-		{
-			name:          "filter by book partial match",
-			authorFilter:  "",
-			bookFilter:    "hobbit",
-			expectedCount: 1,
-			expectedTitle: "The Hobbit",
-		},
-		{
-			name:          "filter by both author and book",
-			authorFilter:  "tolkien",
-			bookFilter:    "fellowship",
-			expectedCount: 1,
-			expectedTitle: "The Fellowship of the Ring",
-		},
-		{
-			name:          "no filters",
-			authorFilter:  "",
-			bookFilter:    "",
-			expectedCount: 3,
-		},
-		{
-			name:          "no matches",
-			authorFilter:  "nonexistent",
-			bookFilter:    "",
-			expectedCount: 0,
-		},
+		{"no filters", "", "", 3},
+		{"filter by tolkien", "tolkien", "", 2},
+		{"filter by hobbit", "", "hobbit", 1},
+		{"combined filter", "tolkien", "fellowship", 1},
+		{"no matches", "nonexistent", "", 0},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			filtered := filterHierarchicalData(entries, tt.authorFilter, tt.bookFilter)
 			assert.Len(t, filtered, tt.expectedCount)
-
-			if tt.expectedCount > 0 {
-				if tt.expectedAuthor != "" {
-					assert.Equal(t, tt.expectedAuthor, filtered[0].Author)
-				}
-				if tt.expectedTitle != "" {
-					found := false
-					for _, entry := range filtered {
-						if entry.Title == tt.expectedTitle {
-							found = true
-							break
-						}
-					}
-					assert.True(t, found, "Expected title not found in filtered results")
-				}
-			}
 		})
 	}
 }

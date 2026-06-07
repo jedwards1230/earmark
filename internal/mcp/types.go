@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
@@ -23,31 +24,31 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 	}
 
 	var output strings.Builder
-	output.WriteString(fmt.Sprintf("Found %d result(s):\n\n", len(results)))
+	fmt.Fprintf(&output, "Found %d result(s):\n\n", len(results))
 
 	for _, result := range results {
 		// Format: **Title** by Author
-		output.WriteString(fmt.Sprintf("**%s** by %s\n", result.Title, result.Author))
+		fmt.Fprintf(&output, "**%s** by %s\n", result.Title, result.Author)
 
 		// Format: Chapter X: Title (chunk Y/Z, similarity: XX%)
 		similarity := int(result.Similarity * 100)
-		output.WriteString(fmt.Sprintf("Chapter %d: %s (chunk %d/%d, similarity: %d%%)\n",
-			result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks, similarity))
+		fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d, similarity: %d%%)\n",
+			result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks, similarity)
 
 		// Enhanced citation info
 		if result.ChunkID != "" {
-			output.WriteString(fmt.Sprintf("ID: %s", result.ChunkID))
+			fmt.Fprintf(&output, "ID: %s", result.ChunkID)
 			if result.FilePath != "" {
-				output.WriteString(fmt.Sprintf(" | File: %s", result.FilePath))
+				fmt.Fprintf(&output, " | File: %s", result.FilePath)
 			}
 			if result.WordCount > 0 {
-				output.WriteString(fmt.Sprintf(" | Words: %d", result.WordCount))
+				fmt.Fprintf(&output, " | Words: %d", result.WordCount)
 			}
 			output.WriteString("\n")
 		}
 
 		// Format: > Content
-		output.WriteString(fmt.Sprintf("> %s\n", result.Content))
+		fmt.Fprintf(&output, "> %s\n", result.Content)
 
 		// Add spacing between results
 		if result.ID != results[len(results)-1].ID {
@@ -65,7 +66,9 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 	}
 }
 
-// formatHierarchicalData converts hierarchical library data to MCP text content
+// formatHierarchicalData converts hierarchical library data to MCP text content.
+// Each HierarchicalEntry has a FilePath and ChunkCount; we derive a display
+// name from the file path.
 func formatHierarchicalData(entries []db.HierarchicalEntry) *mcp.CallToolResult {
 	var output strings.Builder
 	output.WriteString("📚 **Audiobook Library**\n\n")
@@ -73,57 +76,13 @@ func formatHierarchicalData(entries []db.HierarchicalEntry) *mcp.CallToolResult 
 	if len(entries) == 0 {
 		output.WriteString("No audiobooks found.")
 	} else {
-		// Group by author
-		authorBooks := make(map[string][]db.HierarchicalEntry)
-		for _, entry := range entries {
-			authorBooks[entry.Author] = append(authorBooks[entry.Author], entry)
-		}
-
-		authorIndex := 0
-		for author, books := range authorBooks {
-			output.WriteString(fmt.Sprintf("**%s**\n", author))
-
-			for bookIndex, book := range books {
-				var bookPrefix string
-				if bookIndex == len(books)-1 {
-					bookPrefix = "└──"
-				} else {
-					bookPrefix = "├──"
-				}
-
-				chapterCount := len(book.Chapters)
-				chapterWord := "chapters"
-				if chapterCount == 1 {
-					chapterWord = "chapter"
-				}
-
-				output.WriteString(fmt.Sprintf("%s %s (%d %s)\n",
-					bookPrefix, book.Title, chapterCount, chapterWord))
-
-				// List chapters
-				for chapterIndex, chapter := range book.Chapters {
-					var chapterIndent, chapterPrefix string
-					if bookIndex == len(books)-1 {
-						chapterIndent = "    "
-					} else {
-						chapterIndent = "│   "
-					}
-
-					if chapterIndex == len(book.Chapters)-1 {
-						chapterPrefix = "└──"
-					} else {
-						chapterPrefix = "├──"
-					}
-
-					output.WriteString(fmt.Sprintf("%s%s %s\n",
-						chapterIndent, chapterPrefix, chapter))
-				}
+		for i, entry := range entries {
+			prefix := "├──"
+			if i == len(entries)-1 {
+				prefix = "└──"
 			}
-
-			authorIndex++
-			if authorIndex < len(authorBooks) {
-				output.WriteString("\n")
-			}
+			name := filepath.Base(entry.FilePath)
+			fmt.Fprintf(&output, "%s %s (%d chunks)\n", prefix, name, entry.ChunkCount)
 		}
 	}
 
@@ -137,24 +96,26 @@ func formatHierarchicalData(entries []db.HierarchicalEntry) *mcp.CallToolResult 
 	}
 }
 
-// filterHierarchicalData filters entries by author and book name (case-insensitive partial match)
+// filterHierarchicalData filters entries by path substring matches
+// (case-insensitive). Both authorFilter and bookFilter must match
+// independently — an entry is included only if the file path contains
+// both substrings (when non-empty).
 func filterHierarchicalData(entries []db.HierarchicalEntry, authorFilter, bookFilter string) []db.HierarchicalEntry {
 	if authorFilter == "" && bookFilter == "" {
 		return entries
 	}
 
-	var filtered []db.HierarchicalEntry
 	authorFilter = strings.ToLower(authorFilter)
 	bookFilter = strings.ToLower(bookFilter)
 
+	var filtered []db.HierarchicalEntry
 	for _, entry := range entries {
-		authorMatch := authorFilter == "" || strings.Contains(strings.ToLower(entry.Author), authorFilter)
-		bookMatch := bookFilter == "" || strings.Contains(strings.ToLower(entry.Title), bookFilter)
-
+		path := strings.ToLower(entry.FilePath)
+		authorMatch := authorFilter == "" || strings.Contains(path, authorFilter)
+		bookMatch := bookFilter == "" || strings.Contains(path, bookFilter)
 		if authorMatch && bookMatch {
 			filtered = append(filtered, entry)
 		}
 	}
-
 	return filtered
 }

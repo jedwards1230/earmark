@@ -2,450 +2,148 @@ package config
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestLoadConfig(t *testing.T) {
-	// Save current environment
-	originalEnv := make(map[string]string)
-	envVars := []string{
-		"AUDIO_DIR", "CACHE_DIR", "OUTPUT_DIR",
-		"DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME",
-		"CHUNK_SIZE", "OPENAI_API_KEY", "OPENAI_BASE_URL",
-		"DEBUG", "DEBUG_DB_RESET",
+// clearContractEnvVars unsets all CONTRACT-defined env vars so tests start clean.
+func clearContractEnvVars(t *testing.T) {
+	t.Helper()
+	vars := []string{
+		"DATABASE_URL", "BOOKS_DIR",
+		"EMBEDDINGS_BASE_URL", "EMBEDDINGS_MODEL",
+		"MCP_HTTP_ADDR", "STALE_JOB_TIMEOUT",
+		"CHUNK_SIZE", "DEBUG", "DEBUG_DB_RESET",
 	}
-	for _, key := range envVars {
-		originalEnv[key] = os.Getenv(key)
-		os.Unsetenv(key)
+	for _, k := range vars {
+		t.Setenv(k, "") // t.Setenv restores on cleanup
 	}
+}
 
-	// Restore environment after test
-	defer func() {
-		for key, value := range originalEnv {
-			if value != "" {
-				os.Setenv(key, value)
-			} else {
-				os.Unsetenv(key)
-			}
-		}
-	}()
+func TestLoadConfig_Defaults(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@host:5432/db")
 
-	t.Run("default values", func(t *testing.T) {
-		cfg, err := LoadConfig()
-		require.NoError(t, err)
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
 
-		// Check default values
-		// The paths are resolved to absolute paths, so check the last part
-		assert.Contains(t, cfg.AudioDir, "audiobooks")
-		assert.Contains(t, cfg.CacheDir, "/tmp/lil-whisper-cache")
-		assert.Contains(t, cfg.OutputDir, "transcriptions")
-		assert.Equal(t, 1024, cfg.ChunkSize)
-		assert.Equal(t, "https://api.openai.com/v1", cfg.OpenAIBaseURL)
-		assert.False(t, cfg.Debug)
-		assert.False(t, cfg.DebugDBReset)
-	})
+	assert.Equal(t, "postgres://user:pass@host:5432/db", cfg.DatabaseURL)
+	assert.Equal(t, "/books", cfg.BooksDir)
+	assert.Equal(t, "http://ollama.external-services:11434/v1", cfg.EmbeddingsBaseURL)
+	assert.Equal(t, "nomic-embed-text", cfg.EmbeddingsModel)
+	assert.Equal(t, ":8081", cfg.MCPHTTPAddr)
+	assert.Equal(t, 30*time.Minute, cfg.StaleJobTimeout)
+	assert.Equal(t, 512, cfg.ChunkSize)
+	assert.False(t, cfg.Debug)
+	assert.False(t, cfg.DebugDBReset)
+}
 
-	t.Run("environment variables override", func(t *testing.T) {
-		// Set test environment variables
-		testEnv := map[string]string{
-			"AUDIO_DIR":       "/test/audio",
-			"CACHE_DIR":       "/test/cache",
-			"OUTPUT_DIR":      "/test/output",
-			"DB_HOST":         "test-host",
-			"DB_USER":         "test-user",
-			"DB_PASSWORD":     "test-password",
-			"DB_NAME":         "test-db",
-			"CHUNK_SIZE":      "2048",
-			"OPENAI_API_KEY":  "test-key",
-			"OPENAI_BASE_URL": "https://test.openai.com/v1",
-			"DEBUG":           "true",
-			"DEBUG_DB_RESET":  "1",
-		}
+func TestLoadConfig_MissingDatabaseURL(t *testing.T) {
+	clearContractEnvVars(t)
+	// DATABASE_URL not set
+	_, err := LoadConfig()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "DATABASE_URL")
+}
 
-		for key, value := range testEnv {
-			os.Setenv(key, value)
-		}
+func TestLoadConfig_EnvOverrides(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@host:5432/lilbro_whisper")
+	t.Setenv("BOOKS_DIR", "/mnt/books")
+	t.Setenv("EMBEDDINGS_BASE_URL", "http://custom-ollama:11434/v1")
+	t.Setenv("EMBEDDINGS_MODEL", "mxbai-embed-large")
+	t.Setenv("MCP_HTTP_ADDR", ":9000")
+	t.Setenv("STALE_JOB_TIMEOUT", "1h")
+	t.Setenv("CHUNK_SIZE", "256")
+	t.Setenv("DEBUG", "true")
+	t.Setenv("DEBUG_DB_RESET", "1")
 
-		cfg, err := LoadConfig()
-		require.NoError(t, err)
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
 
-		// Check overridden values
-		assert.Contains(t, cfg.AudioDir, "audio")
-		assert.Contains(t, cfg.CacheDir, "cache")
-		assert.Contains(t, cfg.OutputDir, "output")
-		assert.Equal(t, "test-host", cfg.DBHost)
-		assert.Equal(t, "test-user", cfg.DBUser)
-		assert.Equal(t, "test-password", cfg.DBPassword)
-		assert.Equal(t, "test-db", cfg.DBName)
-		assert.Equal(t, 2048, cfg.ChunkSize)
-		assert.Equal(t, "test-key", cfg.OpenAIAPIKey)
-		assert.Equal(t, "https://test.openai.com/v1", cfg.OpenAIBaseURL)
-		assert.True(t, cfg.Debug)
-		assert.True(t, cfg.DebugDBReset)
+	assert.Equal(t, "/mnt/books", cfg.BooksDir)
+	assert.Equal(t, "http://custom-ollama:11434/v1", cfg.EmbeddingsBaseURL)
+	assert.Equal(t, "mxbai-embed-large", cfg.EmbeddingsModel)
+	assert.Equal(t, ":9000", cfg.MCPHTTPAddr)
+	assert.Equal(t, time.Hour, cfg.StaleJobTimeout)
+	assert.Equal(t, 256, cfg.ChunkSize)
+	assert.True(t, cfg.Debug)
+	assert.True(t, cfg.DebugDBReset)
+}
 
-		// Clean up
-		for key := range testEnv {
-			os.Unsetenv(key)
-		}
-	})
+func TestLoadConfig_InvalidStaleJobTimeout(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("STALE_JOB_TIMEOUT", "not-a-duration")
 
-	t.Run("invalid chunk size", func(t *testing.T) {
-		os.Setenv("CHUNK_SIZE", "invalid")
+	_, err := LoadConfig()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "STALE_JOB_TIMEOUT")
+}
 
-		_, err := LoadConfig()
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid syntax")
+func TestLoadConfig_InvalidChunkSize(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("CHUNK_SIZE", "abc")
 
-		os.Unsetenv("CHUNK_SIZE")
-	})
-
-	t.Run("boolean parsing", func(t *testing.T) {
-		tests := []struct {
-			envValue  string
-			expected  bool
-			shouldSet bool
-		}{
-			{"true", true, true},
-			{"1", true, true},
-			{"false", false, true},
-			{"0", false, true},
-			{"", false, false},
-			{"invalid", false, true},
-		}
-
-		for _, tt := range tests {
-			t.Run("DEBUG="+tt.envValue, func(t *testing.T) {
-				if tt.shouldSet {
-					os.Setenv("DEBUG", tt.envValue)
-				}
-
-				cfg, err := LoadConfig()
-				require.NoError(t, err)
-				assert.Equal(t, tt.expected, cfg.Debug)
-
-				os.Unsetenv("DEBUG")
-			})
-
-			t.Run("DEBUG_DB_RESET="+tt.envValue, func(t *testing.T) {
-				if tt.shouldSet {
-					os.Setenv("DEBUG_DB_RESET", tt.envValue)
-				}
-
-				cfg, err := LoadConfig()
-				require.NoError(t, err)
-				assert.Equal(t, tt.expected, cfg.DebugDBReset)
-
-				os.Unsetenv("DEBUG_DB_RESET")
-			})
-		}
-	})
+	_, err := LoadConfig()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "CHUNK_SIZE")
 }
 
 func TestMaskSecret(t *testing.T) {
 	tests := []struct {
-		name     string
 		input    string
 		expected string
 	}{
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "short secret",
-			input:    "abc",
-			expected: "***",
-		},
-		{
-			name:     "8 character secret",
-			input:    "12345678",
-			expected: "********",
-		},
-		{
-			name:     "long secret",
-			input:    "verylongsecretkey123",
-			expected: "********",
-		},
+		{"", ""},
+		{"abc", "***"},
+		{"12345678", "********"},
+		{"verylongsecretkey123", "********"},
 	}
-
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := MaskSecret(tt.input)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-func TestResolveAndCreatePath(t *testing.T) {
-	// Create a temporary directory for testing
-	tempDir := t.TempDir()
-
-	tests := []struct {
-		name         string
-		cwd          string
-		path         string
-		expectAbs    bool
-		expectCreate bool
-	}{
-		{
-			name:         "relative path",
-			cwd:          tempDir,
-			path:         "relative/path",
-			expectAbs:    true,
-			expectCreate: true,
-		},
-		{
-			name:         "absolute path",
-			cwd:          tempDir,
-			path:         filepath.Join(tempDir, "absolute/path"),
-			expectAbs:    true,
-			expectCreate: true,
-		},
-		{
-			name:         "current directory",
-			cwd:          tempDir,
-			path:         ".",
-			expectAbs:    true,
-			expectCreate: false, // Already exists
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := resolveAndCreatePath(tt.cwd, tt.path)
-
-			// Check if path is absolute
-			assert.True(t, filepath.IsAbs(result))
-
-			// Check if path was created
-			if tt.expectCreate {
-				_, err := os.Stat(result)
-				assert.NoError(t, err, "Expected path to be created")
-			}
-		})
-	}
-}
-
-func TestConfigPrintEnvVars(t *testing.T) {
-	// This test verifies that PrintEnvVars doesn't panic
-	// and properly masks sensitive information
-	cfg := &Config{
-		Debug:         true,
-		DebugDBReset:  false,
-		DBHost:        "localhost",
-		DBUser:        "testuser",
-		DBPassword:    "verysecretpassword",
-		DBName:        "testdb",
-		AudioDir:      "/test/audio",
-		CacheDir:      "/test/cache",
-		OutputDir:     "/test/output",
-		OpenAIBaseURL: "https://api.openai.com/v1",
-		OpenAIAPIKey:  "sk-verylongapikey",
-		ChunkSize:     1024,
-	}
-
-	// Should not panic
-	assert.NotPanics(t, func() {
-		cfg.PrintEnvVars()
-	})
-}
-
-func TestConfigInitializePaths(t *testing.T) {
-	// Create a temporary directory for testing
-	tempDir := t.TempDir()
-
-	// Change to temp directory
-	originalWd, _ := os.Getwd()
-	err := os.Chdir(tempDir)
-	require.NoError(t, err)
-	defer func() {
-		err := os.Chdir(originalWd)
-		require.NoError(t, err)
-	}()
-
-	cfg := &Config{
-		AudioDir:  "test_audio",
-		CacheDir:  "test_cache",
-		OutputDir: "test_output",
-	}
-
-	err = cfg.initializePaths()
-	assert.NoError(t, err)
-
-	// Check that paths are absolute
-	assert.True(t, filepath.IsAbs(cfg.AudioDir))
-	assert.True(t, filepath.IsAbs(cfg.CacheDir))
-	assert.True(t, filepath.IsAbs(cfg.OutputDir))
-
-	// Check that directories were created
-	for _, dir := range []string{cfg.AudioDir, cfg.CacheDir, cfg.OutputDir} {
-		_, err := os.Stat(dir)
-		assert.NoError(t, err, "Directory should exist: %s", dir)
+		got := MaskSecret(tt.input)
+		assert.Equal(t, tt.expected, got, "input=%q", tt.input)
 	}
 }
 
 func TestGetEnvOrDefault(t *testing.T) {
-	tests := []struct {
-		name         string
-		envKey       string
-		envValue     string
-		defaultValue string
-		expected     string
-		setEnv       bool
-	}{
-		{
-			name:         "environment variable set",
-			envKey:       "TEST_VAR",
-			envValue:     "env-value",
-			defaultValue: "default-value",
-			expected:     "env-value",
-			setEnv:       true,
-		},
-		{
-			name:         "environment variable not set",
-			envKey:       "TEST_VAR",
-			envValue:     "",
-			defaultValue: "default-value",
-			expected:     "default-value",
-			setEnv:       false,
-		},
-		{
-			name:         "environment variable empty",
-			envKey:       "TEST_VAR",
-			envValue:     "",
-			defaultValue: "default-value",
-			expected:     "default-value",
-			setEnv:       true,
-		},
-	}
+	const key = "TEST_GET_ENV_OR_DEFAULT"
+	_ = os.Unsetenv(key)
+	assert.Equal(t, "default", getEnvOrDefault(key, "default"))
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Save original value
-			original := os.Getenv(tt.envKey)
-			defer func() {
-				if original != "" {
-					os.Setenv(tt.envKey, original)
-				} else {
-					os.Unsetenv(tt.envKey)
-				}
-			}()
-
-			if tt.setEnv {
-				os.Setenv(tt.envKey, tt.envValue)
-			} else {
-				os.Unsetenv(tt.envKey)
-			}
-
-			result := getEnvOrDefault(tt.envKey, tt.defaultValue)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
+	t.Setenv(key, "custom")
+	assert.Equal(t, "custom", getEnvOrDefault(key, "default"))
 }
 
 func TestParseBoolEnv(t *testing.T) {
-	tests := []struct {
-		name     string
-		envKey   string
-		envValue string
-		expected bool
-		setEnv   bool
-	}{
-		{
-			name:     "true string",
-			envKey:   "TEST_BOOL",
-			envValue: "true",
-			expected: true,
-			setEnv:   true,
-		},
-		{
-			name:     "1 string",
-			envKey:   "TEST_BOOL",
-			envValue: "1",
-			expected: true,
-			setEnv:   true,
-		},
-		{
-			name:     "false string",
-			envKey:   "TEST_BOOL",
-			envValue: "false",
-			expected: false,
-			setEnv:   true,
-		},
-		{
-			name:     "0 string",
-			envKey:   "TEST_BOOL",
-			envValue: "0",
-			expected: false,
-			setEnv:   true,
-		},
-		{
-			name:     "empty string",
-			envKey:   "TEST_BOOL",
-			envValue: "",
-			expected: false,
-			setEnv:   true,
-		},
-		{
-			name:     "not set",
-			envKey:   "TEST_BOOL",
-			envValue: "",
-			expected: false,
-			setEnv:   false,
-		},
-		{
-			name:     "invalid value",
-			envKey:   "TEST_BOOL",
-			envValue: "invalid",
-			expected: false,
-			setEnv:   true,
-		},
+	const key = "TEST_PARSE_BOOL_ENV"
+
+	for _, v := range []string{"true", "1"} {
+		t.Setenv(key, v)
+		assert.True(t, parseBoolEnv(key), "expected true for %q", v)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Save original value
-			original := os.Getenv(tt.envKey)
-			defer func() {
-				if original != "" {
-					os.Setenv(tt.envKey, original)
-				} else {
-					os.Unsetenv(tt.envKey)
-				}
-			}()
-
-			if tt.setEnv {
-				os.Setenv(tt.envKey, tt.envValue)
-			} else {
-				os.Unsetenv(tt.envKey)
-			}
-
-			result := parseBoolEnv(tt.envKey)
-			assert.Equal(t, tt.expected, result)
-		})
+	for _, v := range []string{"false", "0", "invalid", ""} {
+		t.Setenv(key, v)
+		assert.False(t, parseBoolEnv(key), "expected false for %q", v)
 	}
 }
 
-func BenchmarkLoadConfig(b *testing.B) {
-	// Benchmark config loading
-	for i := 0; i < b.N; i++ {
-		_, err := LoadConfig()
-		if err != nil {
-			b.Fatal(err)
-		}
+func TestConfigPrintEnvVars(t *testing.T) {
+	cfg := &Config{
+		DatabaseURL:       "postgres://user:pass@host:5432/db",
+		BooksDir:          "/books",
+		EmbeddingsBaseURL: "http://ollama:11434/v1",
+		EmbeddingsModel:   "nomic-embed-text",
+		MCPHTTPAddr:       ":8081",
+		StaleJobTimeout:   30 * time.Minute,
+		ChunkSize:         512,
+		Debug:             true,
+		DebugDBReset:      false,
 	}
-}
-
-func BenchmarkMaskSecret(b *testing.B) {
-	secret := "verylongsecretkey123456789"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = MaskSecret(secret)
-	}
+	// Should not panic.
+	assert.NotPanics(t, func() { cfg.PrintEnvVars() })
 }

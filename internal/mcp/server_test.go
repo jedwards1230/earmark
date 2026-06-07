@@ -14,7 +14,7 @@ type SimpleMockDB struct{}
 func (m *SimpleMockDB) Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error) {
 	return []db.SearchResultWithMetadata{
 		{
-			ID:         1,
+			ID:         "chunk-1",
 			Content:    "Test content about dragons",
 			Author:     "Christopher Paolini",
 			Title:      "Eragon",
@@ -28,7 +28,7 @@ func (m *SimpleMockDB) Search(ctx context.Context, query string, limit int, thre
 func (m *SimpleMockDB) TextSearch(ctx context.Context, query string, limit int) ([]db.SearchResultWithMetadata, error) {
 	return []db.SearchResultWithMetadata{
 		{
-			ID:         1,
+			ID:         "chunk-2",
 			Content:    "Text search result about dragons",
 			Author:     "Christopher Paolini",
 			Title:      "Eragon",
@@ -41,9 +41,8 @@ func (m *SimpleMockDB) TextSearch(ctx context.Context, query string, limit int) 
 func (m *SimpleMockDB) GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error) {
 	return []db.HierarchicalEntry{
 		{
-			Author:   "Christopher Paolini",
-			Title:    "Eragon",
-			Chapters: []string{"Chapter 1", "Chapter 2"},
+			FilePath:   "/books/Christopher Paolini/Eragon/chapter1.mp3",
+			ChunkCount: 42,
 		},
 	}, nil
 }
@@ -51,50 +50,45 @@ func (m *SimpleMockDB) GetHierarchicalData(ctx context.Context) ([]db.Hierarchic
 func (m *SimpleMockDB) GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error) {
 	return []db.SearchResultWithMetadata{
 		{
-			ID:         1,
+			ID:         "chunk-3",
 			Content:    "Previous chunk content",
 			Author:     "Christopher Paolini",
 			Title:      "Eragon",
 			Chapter:    "Chapter 1",
 			ChunkIndex: 0,
-			ChunkID:    "Christopher Paolini_Eragon_1_0",
+			ChunkID:    "chunk-3",
 		},
 		{
-			ID:         2,
+			ID:         "chunk-4",
 			Content:    "Current chunk content",
 			Author:     "Christopher Paolini",
 			Title:      "Eragon",
 			Chapter:    "Chapter 1",
 			ChunkIndex: 1,
-			ChunkID:    "Christopher Paolini_Eragon_1_1",
+			ChunkID:    "chunk-4",
 		},
 		{
-			ID:         3,
+			ID:         "chunk-5",
 			Content:    "Next chunk content",
 			Author:     "Christopher Paolini",
 			Title:      "Eragon",
 			Chapter:    "Chapter 1",
 			ChunkIndex: 2,
-			ChunkID:    "Christopher Paolini_Eragon_1_2",
+			ChunkID:    "chunk-5",
 		},
 	}, nil
 }
 
 // TestMCPServerCreation tests that we can create an MCP server without errors
 func TestMCPServerCreation(t *testing.T) {
-	// Create simple mock database
 	mockDB := &SimpleMockDB{}
-
-	// Create config
 	cfg := &config.Config{}
 
-	// Test server creation
 	server := NewMCPServer(mockDB, cfg)
 	if server == nil {
 		t.Fatal("Expected server to be created, got nil")
 	}
 
-	// Test server info
 	name, version := server.GetServerInfo()
 	expectedName := "lilbro-whisper"
 	expectedVersion := "1.0.0"
@@ -106,7 +100,6 @@ func TestMCPServerCreation(t *testing.T) {
 		t.Errorf("Expected server version %s, got %s", expectedVersion, version)
 	}
 
-	// Test graceful shutdown
 	err := server.Close()
 	if err != nil {
 		t.Errorf("Expected no error on close, got %v", err)
@@ -115,24 +108,18 @@ func TestMCPServerCreation(t *testing.T) {
 
 // TestMCPServerTools tests that tools are properly registered
 func TestMCPServerTools(t *testing.T) {
-	// Create simple mock database
 	mockDB := &SimpleMockDB{}
-
-	// Create config
 	cfg := &config.Config{}
 
-	// Test server creation
 	server := NewMCPServer(mockDB, cfg)
 	if server == nil {
 		t.Fatal("Expected server to be created, got nil")
 	}
 
-	// Verify that the server has handlers
 	if server.handlers == nil {
 		t.Error("Expected handlers to be initialized")
 	}
 
-	// Verify database interface is set
 	if server.handlers.db == nil {
 		t.Error("Expected database interface to be set in handlers")
 	}
@@ -140,17 +127,11 @@ func TestMCPServerTools(t *testing.T) {
 
 // TestStartMCPServiceConfiguration tests environment variable handling
 func TestStartMCPServiceConfiguration(t *testing.T) {
-	// This test verifies the configuration logic without actually starting servers
-	// We'll test the error case for unsupported transport
-
-	// Create simple mock database
 	mockDB := &SimpleMockDB{}
 	cfg := &config.Config{}
 
-	// Set an unsupported transport
 	t.Setenv("MCP_TRANSPORT", "unsupported")
 
-	// This should return an error
 	err := StartMCPService(mockDB, cfg)
 	if err == nil {
 		t.Error("Expected error for unsupported transport, got nil")

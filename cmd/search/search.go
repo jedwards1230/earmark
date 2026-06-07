@@ -64,7 +64,7 @@ func runSearch(cmd *cobra.Command, args []string) {
 	}
 
 	if searchThreshold == 0 {
-		searchThreshold = 0.3 // default threshold
+		searchThreshold = 0.3
 	}
 
 	results, err := database.Search(ctx, query, searchLimit, searchThreshold)
@@ -72,26 +72,7 @@ func runSearch(cmd *cobra.Command, args []string) {
 		fmt.Printf("Error searching database: %v\n", err)
 		return
 	}
-	if len(results) == 0 {
-		fmt.Println("No results found")
-		return
-	}
-
-	fmt.Printf("Found %d results:\n\n", len(results))
-	for i, result := range results {
-		metadata, err := database.GetMetadataByVectorID(ctx, result.ID)
-		if err != nil {
-			fmt.Printf("Error getting metadata for result %d: %v\n", i+1, err)
-			continue
-		}
-		fmt.Printf("%d. Author: %s\n", i+1, metadata.Author)
-		fmt.Printf("   Title: %s\n", metadata.Title)
-		if metadata.Chapter != "" {
-			fmt.Printf("   Chapter %d/%d: %s\n", result.ChapterIndex, result.TotalChapters, result.Chapter)
-		}
-		fmt.Printf("   Chunk %d/%d (similarity: %.2f)\n", result.ChunkIndex+1, result.TotalChunks, result.Similarity)
-		fmt.Printf("   Content: %s\n\n", result.Content)
-	}
+	printSearchResults(results)
 }
 
 func printSearchResults(results []db.SearchResultWithMetadata) {
@@ -102,12 +83,17 @@ func printSearchResults(results []db.SearchResultWithMetadata) {
 
 	fmt.Printf("Found %d results:\n\n", len(results))
 	for i, result := range results {
-		fmt.Printf("%d. Author: %s\n", i+1, result.Author)
-		fmt.Printf("   Title: %s\n", result.Title)
-		if result.Chapter != "" {
-			fmt.Printf("   Chapter %d/%d: %s\n", result.ChapterIndex, result.TotalChapters, result.Chapter)
+		fmt.Printf("%d. File: %s\n", i+1, result.FilePath)
+		if result.Author != "" {
+			fmt.Printf("   Author: %s\n", result.Author)
+		}
+		if result.Title != "" {
+			fmt.Printf("   Title: %s\n", result.Title)
 		}
 		fmt.Printf("   Chunk %d/%d (similarity: %.2f)\n", result.ChunkIndex+1, result.TotalChunks, result.Similarity)
+		if result.StartSec > 0 || result.EndSec > 0 {
+			fmt.Printf("   Time: %.1fs – %.1fs\n", result.StartSec, result.EndSec)
+		}
 		fmt.Printf("   Content: %s\n\n", result.Content)
 	}
 }

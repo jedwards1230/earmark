@@ -230,8 +230,8 @@ func TestCheckReleaseVersion(t *testing.T) {
 func TestCacheOperations(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpDir)
-	defer os.Setenv("HOME", originalHome)
+	_ = os.Setenv("HOME", tmpDir)
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
 
 	cache := &VersionCache{
 		LastCheck: time.Now(),
@@ -255,8 +255,8 @@ func TestCacheOperations(t *testing.T) {
 func TestCheckForUpdatesWithCache(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpDir)
-	defer os.Setenv("HOME", originalHome)
+	_ = os.Setenv("HOME", tmpDir)
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
 
 	// Save original values
 	originalVersion := Version
@@ -293,8 +293,8 @@ func TestCheckForUpdatesWithCache(t *testing.T) {
 func TestGetCacheDir(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpDir)
-	defer os.Setenv("HOME", originalHome)
+	_ = os.Setenv("HOME", tmpDir)
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
 
 	cacheDir, err := getCacheDir()
 	require.NoError(t, err)

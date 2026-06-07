@@ -133,9 +133,9 @@ func StartMCPService(database DBInterface, cfg *config.Config) error {
 	case "stdio":
 		return mcpServer.StartStdio()
 	case "http":
-		addr := os.Getenv("MCP_HTTP_ADDR")
+		addr := cfg.MCPHTTPAddr // use config value (populated from MCP_HTTP_ADDR) rather than re-reading env
 		if addr == "" {
-			addr = ":8081" // Default MCP HTTP port (different from main HTTP server)
+			addr = ":8081"
 		}
 		return mcpServer.StartHTTP(addr)
 	default:

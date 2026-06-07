@@ -78,17 +78,17 @@ func GetInfo() Info {
 	if commit == "unknown" {
 		commit = getRuntimeCommit()
 	}
-	
+
 	buildTime := BuildTime
 	if buildTime == "unknown" {
 		buildTime = getRuntimeBuildTime()
 	}
-	
+
 	goVersion := GoVersion
 	if goVersion == "unknown" {
 		goVersion = getRuntimeGoVersion()
 	}
-	
+
 	return Info{
 		Version:   Version,
 		Commit:    commit,
@@ -105,19 +105,19 @@ func getRuntimeCommit() string {
 		return "unknown"
 	}
 	commit := strings.TrimSpace(string(output))
-	
+
 	// Check if working tree is dirty (has uncommitted changes)
 	cmd = exec.Command("git", "status", "--porcelain")
 	statusOutput, err := cmd.Output()
 	if err != nil {
 		return commit
 	}
-	
+
 	// If there are uncommitted changes, add -dirty suffix
 	if len(strings.TrimSpace(string(statusOutput))) > 0 {
 		return commit + "-dirty"
 	}
-	
+
 	return commit
 }
 
@@ -127,12 +127,12 @@ func getRuntimeBuildTime() string {
 	if err != nil {
 		return time.Now().UTC().Format(time.RFC3339)
 	}
-	
+
 	stat, err := os.Stat(executable)
 	if err != nil {
 		return time.Now().UTC().Format(time.RFC3339)
 	}
-	
+
 	return stat.ModTime().UTC().Format(time.RFC3339)
 }
 
@@ -142,10 +142,10 @@ func getRuntimeGoVersion() string {
 
 func (i Info) String() string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Version: %s\n", i.Version))
-	sb.WriteString(fmt.Sprintf("Commit: %s\n", i.Commit))
-	sb.WriteString(fmt.Sprintf("Build Time: %s\n", i.BuildTime))
-	sb.WriteString(fmt.Sprintf("Go Version: %s\n", i.GoVersion))
+	fmt.Fprintf(&sb, "Version: %s\n", i.Version)
+	fmt.Fprintf(&sb, "Commit: %s\n", i.Commit)
+	fmt.Fprintf(&sb, "Build Time: %s\n", i.BuildTime)
+	fmt.Fprintf(&sb, "Go Version: %s\n", i.GoVersion)
 	return sb.String()
 }
 
@@ -183,7 +183,7 @@ func CheckForUpdatesWithExpiryAndAuthenticatedClient(ctx context.Context, useCac
 			if currentCommit == "unknown" {
 				currentCommit = getRuntimeCommit()
 			}
-			
+
 			if cached.Result.CurrentVersion == Version && cached.Result.CurrentCommit == currentCommit {
 				if debug {
 					fmt.Printf("DEBUG: Using cached result from %v\n", cached.LastCheck)
@@ -191,7 +191,7 @@ func CheckForUpdatesWithExpiryAndAuthenticatedClient(ctx context.Context, useCac
 				return &cached.Result, nil
 			} else {
 				if debug {
-					fmt.Printf("DEBUG: Cache invalidated - current state changed (version: %s->%s, commit: %s->%s)\n", 
+					fmt.Printf("DEBUG: Cache invalidated - current state changed (version: %s->%s, commit: %s->%s)\n",
 						cached.Result.CurrentVersion, Version, cached.Result.CurrentCommit, currentCommit)
 				}
 			}
@@ -219,14 +219,13 @@ func CheckForUpdatesWithExpiryAndAuthenticatedClient(ctx context.Context, useCac
 	return result, nil
 }
 
-
 // performUpdateCheckWithAuthenticatedClient performs update check with optional authenticated client
 func performUpdateCheckWithAuthenticatedClient(ctx context.Context, debug bool, client *http.Client) (*CheckResult, error) {
 	currentCommit := Commit
 	if currentCommit == "unknown" {
 		currentCommit = getRuntimeCommit()
 	}
-	
+
 	result := &CheckResult{
 		CurrentVersion: Version,
 		CurrentCommit:  currentCommit,
@@ -288,7 +287,7 @@ func checkCommitVersionWithAuthenticatedClient(ctx context.Context, result *Chec
 		}
 		return result, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if debug {
 		fmt.Printf("DEBUG: Commit API response status: %d\n", resp.StatusCode)
@@ -366,7 +365,7 @@ func checkReleaseVersionWithAuthenticatedClient(ctx context.Context, result *Che
 		}
 		return checkCommitVersionWithAuthenticatedClient(ctx, result, debug, client)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if debug {
 		fmt.Printf("DEBUG: Release API response status: %d\n", resp.StatusCode)
@@ -404,11 +403,11 @@ func checkReleaseVersionWithAuthenticatedClient(ctx context.Context, result *Che
 
 	result.LatestVersion = release.TagName
 	isNewer := IsNewerVersion(Version, result.LatestVersion)
-	
+
 	if debug {
 		fmt.Printf("DEBUG: Version comparison - current: %s, latest: %s, isNewer: %v\n", Version, result.LatestVersion, isNewer)
 	}
-	
+
 	if isNewer {
 		result.HasUpdate = true
 		result.UpdateMessage = fmt.Sprintf("Version %s available", result.LatestVersion)
@@ -448,7 +447,7 @@ func loadCache() *VersionCache {
 	repoSafe := strings.ReplaceAll(GitHubRepo, "/", "_")
 	cacheFileName := fmt.Sprintf("%s_%s", repoSafe, CacheFile)
 	cachePath := filepath.Join(cacheDir, cacheFileName)
-	
+
 	// #nosec G304 - cachePath is constructed from known safe components
 	data, err := os.ReadFile(filepath.Clean(cachePath))
 	if err != nil {
@@ -473,7 +472,7 @@ func saveCache(cache *VersionCache) {
 	repoSafe := strings.ReplaceAll(GitHubRepo, "/", "_")
 	cacheFileName := fmt.Sprintf("%s_%s", repoSafe, CacheFile)
 	cachePath := filepath.Join(cacheDir, cacheFileName)
-	
+
 	data, err := json.Marshal(cache)
 	if err != nil {
 		return
@@ -533,15 +532,14 @@ func parseVersion(version string) []int {
 	return result
 }
 
-
 // checkGitReleasesWithAuthenticatedClient checks for releases using git commands (works with private repos)
 func checkGitReleasesWithAuthenticatedClient(ctx context.Context, result *CheckResult, debug bool, client *http.Client) (*CheckResult, error) {
 	result.UseReleases = true
-	
+
 	if debug {
 		fmt.Printf("DEBUG: Checking releases using git ls-remote for private repository access\n")
 	}
-	
+
 	// Try to get tags from remote repository using git
 	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--tags", "--sort=-version:refname", "origin")
 	output, err := cmd.Output()
@@ -551,11 +549,11 @@ func checkGitReleasesWithAuthenticatedClient(ctx context.Context, result *CheckR
 		}
 		return checkGitCommitsWithDebug(ctx, result, debug)
 	}
-	
+
 	if debug && os.Getenv("LOG_VERBOSE") == "1" {
 		fmt.Printf("DEBUG: Git ls-remote tags output: %s\n", string(output))
 	}
-	
+
 	// Parse the output to find the latest semantic version tag
 	latestVersion := parseGitTags(string(output), debug)
 	if latestVersion == "" {
@@ -564,7 +562,7 @@ func checkGitReleasesWithAuthenticatedClient(ctx context.Context, result *CheckR
 		}
 		return checkGitCommitsWithDebug(ctx, result, debug)
 	}
-	
+
 	result.LatestVersion = latestVersion
 	if IsNewerVersion(Version, result.LatestVersion) {
 		result.HasUpdate = true
@@ -577,7 +575,7 @@ func checkGitReleasesWithAuthenticatedClient(ctx context.Context, result *CheckR
 			fmt.Printf("DEBUG: No update needed via git - current: %s, latest: %s\n", Version, result.LatestVersion)
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -590,11 +588,11 @@ func checkGitCommitsWithDebug(ctx context.Context, result *CheckResult, debug bo
 		}
 		return result, nil
 	}
-	
+
 	if debug {
 		fmt.Printf("DEBUG: Checking commits using git ls-remote for private repository access\n")
 	}
-	
+
 	// Get the latest commit from the remote main branch
 	cmd := exec.CommandContext(ctx, "git", "ls-remote", "origin", "main")
 	output, err := cmd.Output()
@@ -604,7 +602,7 @@ func checkGitCommitsWithDebug(ctx context.Context, result *CheckResult, debug bo
 		}
 		return result, nil
 	}
-	
+
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(lines) == 0 {
 		if debug {
@@ -612,7 +610,7 @@ func checkGitCommitsWithDebug(ctx context.Context, result *CheckResult, debug bo
 		}
 		return result, nil
 	}
-	
+
 	// Parse the commit hash (first part before whitespace)
 	parts := strings.Fields(lines[0])
 	if len(parts) == 0 {
@@ -621,25 +619,25 @@ func checkGitCommitsWithDebug(ctx context.Context, result *CheckResult, debug bo
 		}
 		return result, nil
 	}
-	
+
 	latestCommit := parts[0]
 	result.LatestCommit = latestCommit
-	
+
 	// Compare commit hashes (use first 7 characters)
 	currentCommitShort := currentCommit
 	if len(currentCommitShort) > 7 {
 		currentCommitShort = currentCommitShort[:7]
 	}
-	
+
 	latestCommitShort := latestCommit
 	if len(latestCommitShort) > 7 {
 		latestCommitShort = latestCommitShort[:7]
 	}
-	
+
 	if debug {
 		fmt.Printf("DEBUG: Comparing commits - current: %s, latest: %s\n", currentCommitShort, latestCommitShort)
 	}
-	
+
 	if currentCommitShort != latestCommitShort {
 		result.HasUpdate = true
 		result.UpdateMessage = fmt.Sprintf("Newer commit available: %s", latestCommitShort)
@@ -647,7 +645,7 @@ func checkGitCommitsWithDebug(ctx context.Context, result *CheckResult, debug bo
 			fmt.Printf("DEBUG: Update available via git commits: %s\n", result.UpdateMessage)
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -655,26 +653,26 @@ func checkGitCommitsWithDebug(ctx context.Context, result *CheckResult, debug bo
 func parseGitTags(output string, debug bool) string {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	var latestVersion string
-	
+
 	for _, line := range lines {
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
 			continue
 		}
-		
+
 		// Extract tag name from refs/tags/tagname
 		tagRef := parts[1]
 		if !strings.HasPrefix(tagRef, "refs/tags/") {
 			continue
 		}
-		
+
 		tag := strings.TrimPrefix(tagRef, "refs/tags/")
-		
+
 		// Skip tags ending with ^{} (annotated tag objects)
 		if strings.HasSuffix(tag, "^{}") {
 			continue
 		}
-		
+
 		// Check if it's a semantic version tag (starts with v or is just numbers.numbers.numbers)
 		if isSemanticVersion(tag) {
 			if debug {
@@ -687,7 +685,7 @@ func parseGitTags(output string, debug bool) string {
 			}
 		}
 	}
-	
+
 	return latestVersion
 }
 
@@ -695,19 +693,19 @@ func parseGitTags(output string, debug bool) string {
 func isSemanticVersion(tag string) bool {
 	// Remove 'v' prefix if present
 	version := strings.TrimPrefix(tag, "v")
-	
+
 	// Check if it matches basic semantic version pattern (x.y.z)
 	parts := strings.Split(version, ".")
 	if len(parts) < 2 || len(parts) > 4 {
 		return false
 	}
-	
+
 	// Check if all parts are numbers
 	for _, part := range parts {
 		if _, err := strconv.Atoi(part); err != nil {
 			return false
 		}
 	}
-	
+
 	return true
 }
