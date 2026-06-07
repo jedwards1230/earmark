@@ -66,9 +66,12 @@ jobs:
           go-version-file: go.mod
 
       - name: Run Gosec Security Scanner
-        uses: securego/gosec@v2.22.5
-        with:
-          args: "./..."
+        # Install + run via the workflow's Go toolchain rather than the gosec
+        # Docker action, whose bundled Go (1.24.x, GOTOOLCHAIN=local) cannot load
+        # a module that requires Go 1.25.11.
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.5
+          gosec ./...
 
       - name: Run govulncheck
         env:
