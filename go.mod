@@ -1,8 +1,6 @@
 module github.com/jedwards1230/lil-whisper
 
-go 1.24
-
-toolchain go1.24.4
+go 1.25.11
 
 require (
 	github.com/abx123/go-isbn v0.0.0-20210809152938-059f94f930cd
