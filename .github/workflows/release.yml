@@ -1,106 +1,261 @@
-# Release orchestrator — dispatched manually with a semver label or via push to main.
-# Calls release-go.yml and/or release-chart.yml based on inputs.
+# Auto-version and release on push to main.
+# Detects bump type from PR labels (defaults to patch), then delegates the
+# version/tag/Chart.yaml-bump/AI-release-notes pipeline to the shared
+# jedwards1230/release-workflows/.github/workflows/ai-release.yml workflow,
+# builds the Docker image + publishes the Helm chart, and creates the GitHub
+# Release with install snippets prepended to the AI-generated body.
+#
+# Modeled on jedwards1230/my-wiki's release.yml (same Go-service + Helm-chart
+# shape). lilbro-whisper is amd64-only, so the image build is single-arch.
 
 name: Release
 
 run-name: >-
-  Release${{ inputs.release_go && ' Go' || '' }}${{ inputs.release_chart && ' Chart' || '' }}
+  ${{
+    github.event_name == 'workflow_dispatch'
+      && format('Release: {0}{1}',
+           inputs.dry_run && 'dry-run ' || '',
+           inputs.bump_type)
+      || format('Release: {0}', github.event.head_commit.message || github.sha)
+  }}
 
 on:
-  # Auto-trigger: PR merged to main with a semver:* label calls this workflow.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
-      # ── Go Server ────────────────────────────────────────────────
-      release_go:
-        description: "Release Go server image"
-        type: boolean
-        default: false
-      go_bump_type:
-        description: "Go version bump"
+      bump_type:
+        description: "Version bump type"
+        required: true
         type: choice
         options:
           - patch
           - minor
           - major
-      go_version_override:
-        description: "Go version override (e.g. 1.2.3)"
-        required: false
-        type: string
-
-      # ── Helm Chart ───────────────────────────────────────────────
-      release_chart:
-        description: "Release Helm chart"
-        type: boolean
-        default: false
-      chart_bump_type:
-        description: "Chart version bump"
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
-      chart_version_override:
-        description: "Chart version override (e.g. 0.2.0)"
-        required: false
-        type: string
-
-  # Callable by auto-release.yml when a PR merged to main carries a semver:*
-  # label. workflow_call does not support `type: choice`, so bump types are
-  # plain strings here (validated downstream by release-go/release-chart).
-  workflow_call:
-    inputs:
-      release_go:
-        type: boolean
-        default: false
-      go_bump_type:
-        type: string
         default: patch
-      go_version_override:
-        type: string
-        default: ""
-      release_chart:
+      dry_run:
+        description: "Dry run — compute version and preview notes without tagging or publishing"
+        required: false
         type: boolean
         default: false
-      chart_bump_type:
-        type: string
-        default: patch
-      chart_version_override:
-        type: string
-        default: ""
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
   packages: write
-  id-token: write
+  pull-requests: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Go release runs first; chart waits so it can auto-detect the new go-v* tag
-  # for appVersion.  If Go is skipped, chart runs immediately.
-  release-go:
-    if: ${{ inputs.release_go }}
-    uses: ./.github/workflows/release-go.yml
-    with:
-      bump_type: ${{ inputs.go_bump_type }}
-      version_override: ${{ inputs.go_version_override }}
-
-  release-chart:
-    if: ${{ !failure() && !cancelled() && inputs.release_chart }}
-    needs: [release-go]
-    uses: ./.github/workflows/release-chart.yml
-    with:
-      bump_type: ${{ inputs.chart_bump_type }}
-      version_override: ${{ inputs.chart_version_override }}
-
-  summary:
-    if: ${{ always() && !cancelled() }}
-    needs: [release-go, release-chart]
+  detect:
+    name: Detect bump type
     runs-on: ubuntu-latest
+    outputs:
+      bump_type: ${{ steps.bump.outputs.type }}
+      dry_run: ${{ steps.bump.outputs.dry_run }}
     steps:
+      - name: Determine bump type
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # workflow_dispatch: use provided inputs
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "type=${{ inputs.bump_type }}" >> $GITHUB_OUTPUT
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "dry_run=true" >> $GITHUB_OUTPUT
+              echo "::notice::Dry run: previewing release with bump_type=${{ inputs.bump_type }}"
+            else
+              echo "dry_run=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+
+          # push event: read the merged PR's semver:* label, default to patch.
+          # Retry — the GitHub API may not have the merge commit indexed yet.
+          LABELS=""
+          for attempt in 1 2 3; do
+            LABELS=$(gh pr list --state merged --base main --limit 100 \
+              --json labels,mergeCommit \
+              | jq -r --arg sha "$GITHUB_SHA" \
+                '.[] | select(.mergeCommit.oid == $sha) | .labels[].name' 2>/dev/null || echo "")
+            if [ -n "$LABELS" ]; then
+              break
+            fi
+            echo "Attempt ${attempt}: no labels found for ${GITHUB_SHA}, retrying in 5s..."
+            sleep 5
+          done
+
+          echo "Labels for commit ${GITHUB_SHA}: ${LABELS:-<none>}"
+
+          if echo "$LABELS" | grep -q 'semver:major'; then
+            echo "type=major" >> $GITHUB_OUTPUT
+          elif echo "$LABELS" | grep -q 'semver:minor'; then
+            echo "type=minor" >> $GITHUB_OUTPUT
+          else
+            echo "type=patch" >> $GITHUB_OUTPUT
+          fi
+          echo "dry_run=false" >> $GITHUB_OUTPUT
+
+  prepare:
+    name: Tag & Generate Notes
+    needs: [detect]
+    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0
+    with:
+      service_name: lilbro-whisper
+      service_description: "a Go service that indexes audiobook transcripts and serves semantic search over MCP"
+      bump_type: ${{ needs.detect.outputs.bump_type }}
+      chart_path: deploy/helm/lilbro-whisper/Chart.yaml
+      dry_run: ${{ needs.detect.outputs.dry_run == 'true' }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  build:
+    name: Build and Push Image
+    needs: [detect, prepare]
+    if: needs.detect.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            COMMIT=${{ github.sha }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm:
+    name: Publish Helm Chart
+    needs: [detect, prepare]
+    if: needs.detect.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: azure/setup-helm@v5
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package and push
+        run: |
+          helm package deploy/helm/lilbro-whisper/
+          helm push lilbro-whisper-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
       - name: Write summary
         run: |
-          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          CHART_VERSION=$(grep '^version:' deploy/helm/lilbro-whisper/Chart.yaml | awk '{print $2}')
+          echo "## Helm Chart Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Package | Requested | Result |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Go Server | ${{ inputs.release_go && '✅' || '—' }} | ${{ needs.release-go.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Helm Chart | ${{ inputs.release_chart && '✅' || '—' }} | ${{ needs.release-chart.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Chart Version | ${CHART_VERSION} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry | \`oci://ghcr.io/${{ github.repository_owner }}/charts/lilbro-whisper\` |" >> $GITHUB_STEP_SUMMARY
+
+  release:
+    name: Create GitHub Release
+    needs: [detect, prepare, build, helm]
+    if: needs.detect.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Compose release body (install snippets + AI notes)
+        env:
+          BODY_B64: ${{ needs.prepare.outputs.release_body }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # ai-release.yml emits a base64-encoded body; decode before use.
+          echo "$BODY_B64" | base64 -d > /tmp/ai_body.md
+
+          # Prepend install snippets so consumers see "how do I get this?"
+          # before the AI summary + commit list.
+          {
+            echo "## Install"
+            echo ""
+            echo "### Docker"
+            echo ""
+            echo '```bash'
+            echo "docker pull ${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+            echo '```'
+            echo ""
+            echo "### Helm"
+            echo ""
+            echo '```bash'
+            echo "helm install lilbro-whisper oci://ghcr.io/${REPO_OWNER}/charts/lilbro-whisper --version ${VERSION}"
+            echo '```'
+            echo ""
+            echo "---"
+            echo ""
+          } > /tmp/release_body.md
+          cat /tmp/ai_body.md >> /tmp/release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          body_path: /tmp/release_body.md
+          make_latest: true
+
+      - name: Write workflow summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUMP_TYPE: ${{ needs.detect.outputs.bump_type }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          {
+            echo "## Release ${TAG}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Version | ${VERSION} |"
+            echo "| Image | \`${REGISTRY}/${IMAGE_NAME}:${VERSION}\` |"
+            echo "| Chart | \`oci://ghcr.io/${REPO_OWNER}/charts/lilbro-whisper:${VERSION}\` |"
+            echo "| Bump | ${BUMP_TYPE} |"
+          } >> $GITHUB_STEP_SUMMARY
