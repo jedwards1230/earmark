@@ -10,7 +10,7 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/db"
 )
 
-//go:embed dashboard.html
+//go:embed dashboard.html htmx.min.js
 var dashboardFS embed.FS
 
 // dashboardPage is parsed once at init time; the file is embedded so there is
@@ -18,6 +18,25 @@ var dashboardFS embed.FS
 var dashboardPage = template.Must(
 	template.ParseFS(dashboardFS, "dashboard.html"),
 )
+
+// htmxJS is the vendored, version-pinned htmx library (htmx.org v2.0.4).
+// Serving it from the binary instead of a CDN keeps the dashboard working
+// offline / air-gapped and avoids a third-party runtime dependency.
+var htmxJS = func() []byte {
+	b, err := dashboardFS.ReadFile("htmx.min.js")
+	if err != nil {
+		panic("embedded htmx.min.js missing: " + err.Error())
+	}
+	return b
+}()
+
+// handleHTMX serves the embedded htmx library (GET /static/htmx.min.js).
+func (s *MCPServer) handleHTMX(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(htmxJS)
+}
 
 // fragmentTmpl is the htmx-refreshed inner fragment (no <html>/<head> wrapper).
 // It is defined inline to avoid a second embedded file.

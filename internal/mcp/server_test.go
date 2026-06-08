@@ -256,13 +256,35 @@ func TestDashboardPage(t *testing.T) {
 	body := w.Body.String()
 	for _, marker := range []string{
 		"lilbro-whisper",
-		"htmx.org",
+		`src="/static/htmx.min.js"`, // vendored, not a CDN
 		`hx-get="/status/data"`,
 		`hx-trigger="load, every 3s"`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("GET /: body missing expected marker %q", marker)
 		}
+	}
+	if strings.Contains(body, "unpkg.com") || strings.Contains(body, "//cdn") {
+		t.Error("GET /: dashboard must not reference an external CDN")
+	}
+}
+
+// TestHTMXAssetServed verifies the vendored htmx library is served locally with
+// a JS content-type, so the dashboard has no runtime CDN dependency.
+func TestHTMXAssetServed(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/static/htmx.min.js", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /static/htmx.min.js: want 200, got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Errorf("want javascript content-type, got %q", ct)
+	}
+	if !strings.Contains(w.Body.String(), "htmx") || w.Body.Len() < 1000 {
+		t.Errorf("htmx asset looks wrong: %d bytes", w.Body.Len())
 	}
 }
 

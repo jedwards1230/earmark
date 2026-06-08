@@ -144,6 +144,10 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/", getOnly(s.handleDashboardPage))
 	mux.HandleFunc("/status/data", getOnly(s.handleStatusData))
 
+	// Vendored htmx (pinned), served from the binary so the dashboard needs no
+	// external CDN at runtime.
+	mux.HandleFunc("/static/htmx.min.js", getOnly(s.handleHTMX))
+
 	// Liveness — no external deps.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
