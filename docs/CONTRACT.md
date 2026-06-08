@@ -214,6 +214,22 @@ writes this file when the host should not accept new jobs and removes it when
 the host is available again. The runner checks the flag at the top of each poll
 cycle before issuing the claim UPDATE.
 
+#### Operator requeue (out-of-band, `lil-whisper requeue`)
+
+In addition to the runner/service transitions above, an operator may move a job
+**back** to `pending` to redo it. This is the only sanctioned way a `done` or
+`failed` job returns to `pending`. It is always operator-initiated (never the
+runner) and is transactional:
+
+- **Re-transcribe**: delete the job's row in `transcripts` (which cascades to
+  `transcript_chunks`) and `UPDATE … SET status='pending', attempts=0,
+  error=NULL, claimed_by=NULL, claimed_at=NULL`. The runner then re-processes it
+  like any pending job.
+- **Re-embed only**: delete the matching rows in `transcript_chunks` and leave
+  `transcripts`/`transcription_jobs` untouched. The Go worker re-embeds on its
+  next poll (it selects transcripts with no chunks). Use after an embedding
+  model or `CHUNK_SIZE` change — no re-transcription.
+
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT

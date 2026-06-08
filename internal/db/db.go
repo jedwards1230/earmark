@@ -651,6 +651,197 @@ func (db *DB) IsJobQueued(ctx context.Context, checksum string) (bool, error) {
 	return exists, err
 }
 
+// ─── Requeue / redo operations ─────────────────────────────────────────────────
+
+// JobMatch is a lightweight view of a job used for requeue previews.
+type JobMatch struct {
+	ID       string
+	FilePath string
+	Status   string
+}
+
+// likePattern wraps a user substring for a case-insensitive ILIKE match.
+func likePattern(substr string) string { return "%" + substr + "%" }
+
+// FindJobs returns jobs whose file_path contains substr (case-insensitive),
+// for previewing a requeue before it runs.
+func (db *DB) FindJobs(ctx context.Context, substr string) ([]JobMatch, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT id, file_path, status
+		FROM   transcription_jobs
+		WHERE  file_path ILIKE $1
+		ORDER BY file_path
+	`, likePattern(substr))
+	if err != nil {
+		return nil, fmt.Errorf("find jobs: %w", err)
+	}
+	defer rows.Close()
+	return scanJobMatches(rows)
+}
+
+// FindFailedJobs returns all jobs currently in the 'failed' state.
+func (db *DB) FindFailedJobs(ctx context.Context) ([]JobMatch, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT id, file_path, status
+		FROM   transcription_jobs
+		WHERE  status = 'failed'
+		ORDER BY file_path
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("find failed jobs: %w", err)
+	}
+	defer rows.Close()
+	return scanJobMatches(rows)
+}
+
+func scanJobMatches(rows pgx.Rows) ([]JobMatch, error) {
+	var matches []JobMatch
+	for rows.Next() {
+		var m JobMatch
+		if err := rows.Scan(&m.ID, &m.FilePath, &m.Status); err != nil {
+			return nil, fmt.Errorf("scan job match: %w", err)
+		}
+		matches = append(matches, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (job matches): %w", err)
+	}
+	return matches, nil
+}
+
+// RequeueJobs re-runs the full pipeline for jobs whose file_path contains substr:
+// it deletes their transcripts (cascading to chunks) and resets the jobs to
+// 'pending' with attempts cleared. Returns the file paths that were reset.
+func (db *DB) RequeueJobs(ctx context.Context, substr string) ([]string, error) {
+	return db.requeue(ctx, requeueByPath, likePattern(substr))
+}
+
+// RequeueFailed re-runs the pipeline for every job in the 'failed' state.
+// Returns the file paths that were reset.
+func (db *DB) RequeueFailed(ctx context.Context) ([]string, error) {
+	return db.requeue(ctx, requeueFailed)
+}
+
+// requeuePlan is a pair of fully-formed, static SQL statements for one requeue
+// selector. The statements are package constants — nothing is concatenated at
+// runtime, so the only dynamic input is the bound $1 parameter (when present).
+type requeuePlan struct {
+	deleteTranscripts string // delete transcripts for the selected jobs (chunks cascade)
+	resetJobs         string // reset those jobs to pending; RETURNING file_path
+}
+
+var (
+	// requeueByPath selects jobs by a case-insensitive file_path match ($1).
+	requeueByPath = requeuePlan{
+		deleteTranscripts: `DELETE FROM transcripts
+			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE file_path ILIKE $1)`,
+		resetJobs: `UPDATE transcription_jobs
+			SET    status = 'pending', attempts = 0, error = NULL,
+			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
+			WHERE  file_path ILIKE $1
+			RETURNING file_path`,
+	}
+	// requeueFailed selects every job in the 'failed' state (no parameters).
+	requeueFailed = requeuePlan{
+		deleteTranscripts: `DELETE FROM transcripts
+			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE status = 'failed')`,
+		resetJobs: `UPDATE transcription_jobs
+			SET    status = 'pending', attempts = 0, error = NULL,
+			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
+			WHERE  status = 'failed'
+			RETURNING file_path`,
+	}
+)
+
+// requeue runs a requeuePlan's two static statements in one transaction: delete
+// the selected transcripts (chunks cascade) and reset the jobs to pending. args
+// are the bound parameters for the plan's $N placeholders (one for by-path,
+// none for failed).
+func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]string, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin requeue tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, plan.deleteTranscripts, args...); err != nil {
+		return nil, fmt.Errorf("delete transcripts: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, plan.resetJobs, args...)
+	if err != nil {
+		return nil, fmt.Errorf("reset jobs: %w", err)
+	}
+	paths, err := scanPaths(rows)
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit requeue tx: %w", err)
+	}
+	return paths, nil
+}
+
+// ReembedJobs deletes the embedded chunks for transcripts whose file_path
+// contains substr, so the worker re-embeds them on its next poll (the transcript
+// and job are left untouched — no re-transcription). Use this after changing the
+// embedding model or chunk size. Returns the transcript file paths affected.
+func (db *DB) ReembedJobs(ctx context.Context, substr string) ([]string, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin reembed tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `SELECT id, file_path FROM transcripts WHERE file_path ILIKE $1`, likePattern(substr))
+	if err != nil {
+		return nil, fmt.Errorf("find transcripts: %w", err)
+	}
+	var ids, paths []string
+	for rows.Next() {
+		var id, path string
+		if err := rows.Scan(&id, &path); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan transcript: %w", err)
+		}
+		ids = append(ids, id)
+		paths = append(paths, path)
+	}
+	rerr := rows.Err()
+	rows.Close()
+	if rerr != nil {
+		return nil, fmt.Errorf("rows error (transcripts): %w", rerr)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM transcript_chunks WHERE transcript_id = ANY($1)`, ids); err != nil {
+		return nil, fmt.Errorf("delete chunks: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit reembed tx: %w", err)
+	}
+	return paths, nil
+}
+
+func scanPaths(rows pgx.Rows) ([]string, error) {
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("scan path: %w", err)
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (paths): %w", err)
+	}
+	return paths, nil
+}
+
 // Reset drops all tables and re-initialises the schema (DEBUG_DB_RESET only).
 // A second confirmation env var DEBUG_DB_RESET_CONFIRM=yes-delete-everything
 // is required to prevent accidental data destruction.
