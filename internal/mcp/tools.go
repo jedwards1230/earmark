@@ -18,6 +18,16 @@ type DBInterface interface {
 	GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error)
 	// Ping checks that the database is reachable; used by /readyz.
 	Ping(ctx context.Context) error
+	// GetServiceStatus returns aggregate queue/transcript/chunk counts for the
+	// status dashboard.
+	GetServiceStatus(ctx context.Context) (*db.QueueStats, error)
+	// GetRecentJobs returns the most-recently-updated jobs for the dashboard
+	// activity table.
+	GetRecentJobs(ctx context.Context, limit int) ([]db.RecentJob, error)
+	// RequeueByID re-transcribes a single job by UUID (dashboard requeue button).
+	RequeueByID(ctx context.Context, id string) (string, error)
+	// RequeueFailed re-transcribes all failed jobs (dashboard "retry all" button).
+	RequeueFailed(ctx context.Context) ([]string, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

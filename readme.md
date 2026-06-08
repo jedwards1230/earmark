@@ -90,29 +90,27 @@ export VERSION_CHECK_TIMEOUT=3s
 ```
 
 ### Build Process
-Use the provided Makefile or build script for proper version embedding and Yap binary inclusion:
+
+The service is a single Go binary with no native dependencies — it builds and
+runs anywhere Go does. Use the Makefile for version embedding:
 
 ```bash
-# Using Makefile (automatically downloads and embeds Yap)
-make build                              # Development build with latest Yap
-make build YAP_VERSION=v1.0.0         # Build with specific Yap version
-make release VERSION=v1.0.0           # Release build
-make build-all                         # Cross-platform builds
-
-# Manual Yap management
-make download-yap                      # Download latest Yap binary
-make download-yap YAP_VERSION=v1.0.0  # Download specific Yap version
-make clean-all                         # Remove everything including Yap binary
-
-# Using build script
-./scripts/build.sh                     # Development build
-VERSION=v1.0.0 YAP_VERSION=v1.0.0 ./scripts/build.sh  # Release build with specific versions
+make build                  # Build ./lil-whisper
+make release VERSION=v1.0.0 # Release build with an explicit version
+make docker                 # Build the container image
+make check                  # fmt + vet + lint + test
 ```
 
-**Environment Variables for Build:**
-*   `YAP_VERSION`: Pin specific Yap version (default: `latest`)
-*   `VERSION`: Application version for release builds
-*   All builds automatically ensure Yap binary is embedded
+**Status dashboard (no database required):**
+
+```bash
+make dashboard              # serves http://localhost:8081/ with synthetic data
+# equivalently: go run . mcp --demo
+```
+
+This is the accessible dev server for UI work and AI-agent visual verification
+(Playwright is wired via `.claude/mcp.json`). See `CLAUDE.md` →
+"Visual Verification".
 
 ## Configuration
 

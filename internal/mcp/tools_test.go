@@ -43,6 +43,26 @@ func (m *MockDBInterface) Ping(ctx context.Context) error {
 	return args.Error(0)
 }
 
+func (m *MockDBInterface) GetServiceStatus(ctx context.Context) (*db.QueueStats, error) {
+	args := m.Called(ctx)
+	return args.Get(0).(*db.QueueStats), args.Error(1)
+}
+
+func (m *MockDBInterface) GetRecentJobs(ctx context.Context, limit int) ([]db.RecentJob, error) {
+	args := m.Called(ctx, limit)
+	return args.Get(0).([]db.RecentJob), args.Error(1)
+}
+
+func (m *MockDBInterface) RequeueByID(ctx context.Context, id string) (string, error) {
+	args := m.Called(ctx, id)
+	return args.String(0), args.Error(1)
+}
+
+func (m *MockDBInterface) RequeueFailed(ctx context.Context) ([]string, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]string), args.Error(1)
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

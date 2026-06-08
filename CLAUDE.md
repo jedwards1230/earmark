@@ -62,6 +62,35 @@ MCP_TRANSPORT=http ./lil-whisper mcp  # HTTP transport on :8081
 ./lil-whisper requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
 ```
 
+The status dashboard also exposes requeue as buttons: a per-row **requeue** on
+each done/failed job and a **retry all failed** button. They POST to
+`/actions/requeue?id=…` / `/actions/retry-failed` (htmx-guarded via the
+`HX-Request` header) and re-render the status fragment.
+
+## Visual Verification
+
+The `mcp` HTTP transport serves a status dashboard at `/` (htmx, auto-refreshing
+the `/status/data` fragment every 3s). For UI changes, verify it visually before
+opening a PR — no database required:
+
+```bash
+go run . mcp --demo     # serves http://localhost:8081/ with synthetic data
+# or: make dashboard
+```
+
+`--demo` backs the dashboard with an in-memory fixture (`internal/mcp/demo.go`)
+so the page renders fully with no Postgres, no DATABASE_URL, and no ASR runner.
+Set `DEMO_SCENARIO` to render a specific state: `active` (default), `empty`
+(fresh install), `stale` (crashed runner — old heartbeat), or `failed` (failures
+incl. a long multi-line error). To see the connection-lost banner, open the page
+then stop the server — htmx flags the data stale instead of freezing silently.
+
+Playwright is wired for AI agents via `.claude/mcp.json` (the `playwright` MCP
+server). With the demo server running, use Playwright (MCP) to navigate to
+`http://localhost:8081/`, then `browser_snapshot` / `browser_take_screenshot`.
+Drive the htmx refresh by waiting, or fetch the fragment directly at
+`http://localhost:8081/status/data`.
+
 ## Environment Variables
 
 See `.env.example` and `docs/CONTRACT.md §2.4` for the canonical list.

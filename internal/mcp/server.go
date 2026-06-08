@@ -20,11 +20,21 @@ type MCPServer struct {
 	handlers *ToolHandlers
 	logger   log.Logger
 	db       DBInterface // kept for /readyz probe
+
+	// runnerStaleAfter is how old the runner's last heartbeat may be before the
+	// dashboard reports it as "stale" instead of "active". A claimed job alone
+	// doesn't prove the runner is alive — a crashed runner keeps a job claimed.
+	runnerStaleAfter time.Duration
 }
 
 // NewMCPServer creates a new MCP server instance
 func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	logger := log.NewLogger("mcp-server")
+
+	staleAfter := cfg.StaleJobTimeout
+	if staleAfter <= 0 {
+		staleAfter = 30 * time.Minute
+	}
 
 	// Create MCP server with all capabilities enabled
 	mcpServer := server.NewMCPServer("lilbro-whisper", "1.0.0",
@@ -91,10 +101,11 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	), handlers.handleGetContext)
 
 	return &MCPServer{
-		server:   mcpServer,
-		handlers: handlers,
-		logger:   logger,
-		db:       database,
+		server:           mcpServer,
+		handlers:         handlers,
+		logger:           logger,
+		db:               database,
+		runnerStaleAfter: staleAfter,
 	}
 }
 
@@ -105,22 +116,57 @@ func (s *MCPServer) StartStdio() error {
 	return server.ServeStdio(s.server)
 }
 
-// StartHTTP starts the MCP server using HTTP transport on the specified address.
-//
-// The mux layout:
-//
-//	GET  /health  — liveness probe (always 200 "ok")
-//	GET  /readyz  — readiness probe (200 if DB ping OK, 503 otherwise)
-//	*    /mcp     — MCP streamable-HTTP handler
-func (s *MCPServer) StartHTTP(addr string) error {
-	s.logger.Info("Starting MCP server with HTTP transport", "address", addr)
+// getOnly wraps a handler so non-GET requests get 405 Method Not Allowed.
+// Used for the dashboard routes (which are read-only) in place of a "GET /"
+// ServeMux method pattern, which would conflict with the method-less /mcp and
+// /health routes and panic at registration.
+func getOnly(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
+	}
+}
 
-	// Build the MCP handler. NewStreamableHTTPServer implements http.Handler via
-	// ServeHTTP; the default endpoint path exposed by Start() is "/mcp", and we
-	// preserve that by mounting it explicitly at "/mcp" in the mux.
+// buildMux constructs the HTTP mux used by the HTTP transport.
+//
+// Routes:
+//
+//	GET  /                     — status dashboard (full HTML shell)
+//	GET  /status/data          — htmx-refreshed fragment (counts + recent jobs)
+//	GET  /static/htmx.min.js   — vendored htmx library
+//	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
+//	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)
+//	GET  /health               — liveness probe (always 200 "ok")
+//	GET  /readyz               — readiness probe (200 if DB ping OK, 503 otherwise)
+//	*    /mcp                  — MCP streamable-HTTP handler
+//
+// Extracted so that tests can wire the same mux without binding a port.
+func (s *MCPServer) buildMux() *http.ServeMux {
 	mcpHandler := server.NewStreamableHTTPServer(s.server)
 
 	mux := http.NewServeMux()
+
+	// Status dashboard — full HTML shell (/) and htmx fragment (/status/data),
+	// both GET-only. We enforce GET with a wrapper rather than a "GET /" method
+	// pattern: the method-less "/mcp" and "/health" routes would conflict with
+	// it and make ServeMux panic (method-vs-path-specificity ambiguity).
+	// Only reachable under HTTP transport.
+	mux.HandleFunc("/", getOnly(s.handleDashboardPage))
+	mux.HandleFunc("/status/data", getOnly(s.handleStatusData))
+
+	// Vendored htmx (pinned), served from the binary so the dashboard needs no
+	// external CDN at runtime.
+	mux.HandleFunc("/static/htmx.min.js", getOnly(s.handleHTMX))
+
+	// Mutating actions — POST-only (method pattern is safe here: these are
+	// specific paths, unlike the "/" catch-all). htmx-guarded inside the handler.
+	// Each re-renders the status fragment so the table updates immediately.
+	mux.HandleFunc("POST /actions/requeue", s.handleRequeueJob)
+	mux.HandleFunc("POST /actions/retry-failed", s.handleRetryFailed)
 
 	// Liveness — no external deps.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -147,9 +193,16 @@ func (s *MCPServer) StartHTTP(addr string) error {
 	// routing is done internally by mcp-go when used as an http.Handler).
 	mux.Handle("/mcp", mcpHandler)
 
+	return mux
+}
+
+// StartHTTP starts the MCP server using HTTP transport on the specified address.
+func (s *MCPServer) StartHTTP(addr string) error {
+	s.logger.Info("Starting MCP server with HTTP transport", "address", addr)
+
 	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           s.buildMux(),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	return httpSrv.ListenAndServe()

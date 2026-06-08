@@ -1,6 +1,5 @@
 # CI — build + test + lint on every push and PR.
-# Runs on linux/amd64; the darwin-only guard in scripts/build.sh is bypassed
-# here because we use a pure CGO_ENABLED=0 go build, not the Makefile path.
+# Runs on linux/amd64 with a pure CGO_ENABLED=0 go build.
 
 name: CI
 

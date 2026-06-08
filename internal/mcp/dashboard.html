@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>lilbro-whisper — status</title>
+<script src="/static/htmx.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e2e4ed;
+    --muted: #7c7f94;
+    --green: #4ade80;
+    --yellow: #facc15;
+    --red: #f87171;
+    --blue: #60a5fa;
+    --purple: #c084fc;
+    --amber: #fb923c;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+    font-size: 14px;
+    line-height: 1.6;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 12px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .card-value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .card-value.green  { color: var(--green); }
+  .card-value.yellow { color: var(--yellow); }
+  .card-value.red    { color: var(--red); }
+  .card-value.blue   { color: var(--blue); }
+  .card-value.purple { color: var(--purple); }
+  .section { margin-bottom: 24px; }
+  .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 10px; }
+  .runner-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 24px;
+  }
+  .runner-row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .runner-item { }
+  .runner-key { color: var(--muted); font-size: 11px; }
+  .runner-val { margin-top: 2px; }
+  .dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .dot.green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+  .dot.yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+  .dot.amber  { background: var(--amber);  box-shadow: 0 0 6px var(--amber); }
+  .dot.red    { background: var(--red);    box-shadow: 0 0 6px var(--red); }
+  .dot.grey   { background: var(--muted);  }
+  /* table-wrap: rounded card that scrolls horizontally instead of clipping the
+     actions column on narrow screens (overflow-x wins over the y:hidden). */
+  .table-wrap { padding: 0; overflow: hidden; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge.pending  { background: #2a2a3a; color: var(--blue); }
+  .badge.claimed  { background: #2a2a1a; color: var(--yellow); }
+  .badge.done     { background: #0a2a1a; color: var(--green); }
+  .badge.failed   { background: #2a0a0a; color: var(--red); }
+  .file-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 360px; }
+  .time-muted { color: var(--muted); font-size: 12px; }
+  .error-row {
+    color: var(--red); font-size: 12px; margin-top: 4px;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 3.2em; overflow: hidden;
+  }
+  .updated { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
+  .actions { text-align: right; white-space: nowrap; }
+  .btn {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--blue); color: var(--blue); }
+  .btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .btn.htmx-request { opacity: 0.5; pointer-events: none; }
+  .btn-warn:hover { border-color: var(--amber); color: var(--amber); }
+  .failed-callout {
+    margin-top: 10px; color: var(--red); font-size: 12px;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .htmx-indicator { color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+  #data-region { min-height: 200px; }
+  .conn-lost {
+    background: #2a0a0a; color: var(--red);
+    border: 1px solid var(--red); border-radius: 6px;
+    padding: 8px 14px; margin-bottom: 16px; font-size: 13px;
+  }
+  /* action-err: transient banner for a failed requeue/retry. Self-dismisses so
+     it never lingers; a fresh failure replaces the node and restarts the fade. */
+  #action-error:empty { display: none; }
+  .action-err {
+    background: #2a0a0a; color: var(--red);
+    border: 1px solid var(--red); border-radius: 6px;
+    padding: 8px 14px; margin-bottom: 16px; font-size: 13px;
+    animation: action-err-fade 0.5s ease 6s forwards;
+  }
+  @keyframes action-err-fade {
+    to { opacity: 0; height: 0; padding: 0; margin: 0; border-width: 0; overflow: hidden; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .action-err { animation: none; }
+  }
+  @media (max-width: 480px) {
+    body { padding: 12px; font-size: 13px; }
+    /* Tighten the table so the actions column fits without horizontal scroll:
+       narrower filename + slimmer cell padding close the ~40px overflow that the
+       relative timestamps left. table-wrap still scrolls as a safety net. */
+    .file-name { max-width: 42vw; }
+    th, td { padding: 7px 6px; }
+    /* roomier tap targets on touch screens (desktop keeps the compact size) */
+    .btn { padding: 8px 12px; min-height: 36px; }
+  }
+</style>
+</head>
+<!--
+  Connection-lost handling: htmx does NOT swap the fragment on a non-2xx
+  response or a network/timeout error, so without this the dashboard would
+  silently freeze on stale data. Show a banner on error, hide it on the next
+  successful refresh.
+-->
+<body
+    hx-on::response-error="document.getElementById('conn').hidden = false"
+    hx-on::send-error="document.getElementById('conn').hidden = false"
+    hx-on::timeout="document.getElementById('conn').hidden = false"
+    hx-on::after-request="if (event.detail.successful) document.getElementById('conn').hidden = true">
+<h1>lilbro-whisper</h1>
+<p class="subtitle">pipeline status dashboard &nbsp;·&nbsp; auto-refreshes every 3 s</p>
+
+<div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
+
+<!-- live region for failed requeue/retry actions (populated via HX-Retarget) -->
+<div id="action-error" aria-live="assertive"></div>
+
+<div id="data-region"
+     hx-get="/status/data"
+     hx-trigger="load, every 3s"
+     hx-swap="innerHTML"
+     hx-sync="this:replace"
+     hx-request='{"timeout": 5000}'>
+  <p class="htmx-indicator">loading…</p>
+</div>
+</body>
+</html>
