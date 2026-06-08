@@ -2,7 +2,7 @@
 # Multi-stage build for lilbro-whisper Go service (linux/amd64 only)
 
 # ── Builder ────────────────────────────────────────────────────────────────────
-FROM golang:1.25.11-alpine AS builder
+FROM golang:1.26.4-alpine AS builder
 
 RUN apk add --no-cache ca-certificates git
 
