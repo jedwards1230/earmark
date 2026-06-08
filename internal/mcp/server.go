@@ -105,22 +105,26 @@ func (s *MCPServer) StartStdio() error {
 	return server.ServeStdio(s.server)
 }
 
-// StartHTTP starts the MCP server using HTTP transport on the specified address.
+// buildMux constructs the HTTP mux used by the HTTP transport.
 //
-// The mux layout:
+// Routes:
 //
-//	GET  /health  — liveness probe (always 200 "ok")
-//	GET  /readyz  — readiness probe (200 if DB ping OK, 503 otherwise)
-//	*    /mcp     — MCP streamable-HTTP handler
-func (s *MCPServer) StartHTTP(addr string) error {
-	s.logger.Info("Starting MCP server with HTTP transport", "address", addr)
-
-	// Build the MCP handler. NewStreamableHTTPServer implements http.Handler via
-	// ServeHTTP; the default endpoint path exposed by Start() is "/mcp", and we
-	// preserve that by mounting it explicitly at "/mcp" in the mux.
+//	GET  /             — status dashboard (full HTML shell)
+//	GET  /status/data  — htmx-refreshed fragment (counts + recent jobs)
+//	GET  /health       — liveness probe (always 200 "ok")
+//	GET  /readyz       — readiness probe (200 if DB ping OK, 503 otherwise)
+//	*    /mcp          — MCP streamable-HTTP handler
+//
+// Extracted so that tests can wire the same mux without binding a port.
+func (s *MCPServer) buildMux() *http.ServeMux {
 	mcpHandler := server.NewStreamableHTTPServer(s.server)
 
 	mux := http.NewServeMux()
+
+	// Status dashboard — full HTML shell (GET /) and htmx fragment (GET /status/data).
+	// Only registered when running under HTTP transport.
+	mux.HandleFunc("/", s.handleDashboardPage)
+	mux.HandleFunc("/status/data", s.handleStatusData)
 
 	// Liveness — no external deps.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -147,9 +151,16 @@ func (s *MCPServer) StartHTTP(addr string) error {
 	// routing is done internally by mcp-go when used as an http.Handler).
 	mux.Handle("/mcp", mcpHandler)
 
+	return mux
+}
+
+// StartHTTP starts the MCP server using HTTP transport on the specified address.
+func (s *MCPServer) StartHTTP(addr string) error {
+	s.logger.Info("Starting MCP server with HTTP transport", "address", addr)
+
 	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           s.buildMux(),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	return httpSrv.ListenAndServe()

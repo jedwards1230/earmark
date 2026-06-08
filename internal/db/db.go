@@ -624,6 +624,133 @@ func (db *DB) GetProcessingStats(ctx context.Context) (*Statistics, error) {
 	return s, nil
 }
 
+// ─── Dashboard stats ─────────────────────────────────────────────────────────
+
+// QueueStats holds per-status job counts and related counters for the status
+// dashboard.
+type QueueStats struct {
+	Pending     int
+	Claimed     int
+	Done        int
+	Failed      int
+	Transcripts int
+	Chunks      int
+	// Runner fields — populated when at least one job has status='claimed'.
+	RunnerActive  bool
+	RunnerID      string     // claimed_by of the most-recently-updated claimed job
+	LastHeartbeat *time.Time // updated_at of that job
+}
+
+// GetServiceStatus returns a single aggregate snapshot used by the status
+// dashboard. It issues two queries: one GROUP BY for job counts plus transcript
+// and chunk totals, one for the active runner heartbeat.
+func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
+	q := &QueueStats{}
+
+	// Job counts by status in one pass.
+	rows, err := db.pool.Query(ctx, `
+		SELECT status, COUNT(*) AS n
+		FROM transcription_jobs
+		GROUP BY status
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("queue stats query: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, fmt.Errorf("scan queue stats: %w", err)
+		}
+		switch status {
+		case "pending":
+			q.Pending = n
+		case "claimed":
+			q.Claimed = n
+		case "done":
+			q.Done = n
+		case "failed":
+			q.Failed = n
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (queue stats): %w", err)
+	}
+
+	// Transcript count.
+	if err := db.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transcripts`).Scan(&q.Transcripts); err != nil {
+		return nil, fmt.Errorf("transcript count: %w", err)
+	}
+
+	// Chunk count.
+	if err := db.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transcript_chunks`).Scan(&q.Chunks); err != nil {
+		return nil, fmt.Errorf("chunk count: %w", err)
+	}
+
+	// Active runner: most-recently-updated claimed job.
+	var claimedBy *string
+	var updatedAt *time.Time
+	err = db.pool.QueryRow(ctx, `
+		SELECT claimed_by, updated_at
+		FROM transcription_jobs
+		WHERE status = 'claimed'
+		ORDER BY updated_at DESC
+		LIMIT 1
+	`).Scan(&claimedBy, &updatedAt)
+	if err != nil && err.Error() != "no rows in result set" {
+		// pgx returns pgx.ErrNoRows — check string to avoid importing pgx here.
+		return nil, fmt.Errorf("runner heartbeat query: %w", err)
+	}
+	if claimedBy != nil {
+		q.RunnerActive = true
+		q.RunnerID = *claimedBy
+		q.LastHeartbeat = updatedAt
+	}
+
+	return q, nil
+}
+
+// RecentJob is a lightweight view of a transcription_jobs row for the recent-
+// activity table on the status dashboard.
+type RecentJob struct {
+	ID        string
+	FilePath  string
+	Status    string
+	UpdatedAt time.Time
+	Error     *string
+}
+
+// GetRecentJobs returns the most-recently-updated jobs, newest first.
+func (db *DB) GetRecentJobs(ctx context.Context, limit int) ([]RecentJob, error) {
+	if limit <= 0 {
+		limit = 15
+	}
+	rows, err := db.pool.Query(ctx, `
+		SELECT id, file_path, status, updated_at, error
+		FROM transcription_jobs
+		ORDER BY updated_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent jobs query: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []RecentJob
+	for rows.Next() {
+		var j RecentJob
+		if err := rows.Scan(&j.ID, &j.FilePath, &j.Status, &j.UpdatedAt, &j.Error); err != nil {
+			return nil, fmt.Errorf("scan recent job: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (recent jobs): %w", err)
+	}
+	return jobs, nil
+}
+
 // ─── Checksum helper ─────────────────────────────────────────────────────────
 
 // ComputeFileChecksum returns the SHA-256 hex digest of a file.
