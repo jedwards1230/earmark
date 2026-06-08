@@ -62,6 +62,11 @@ MCP_TRANSPORT=http ./lil-whisper mcp  # HTTP transport on :8081
 ./lil-whisper requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
 ```
 
+The status dashboard also exposes requeue as buttons: a per-row **requeue** on
+each done/failed job and a **retry all failed** button. They POST to
+`/actions/requeue?id=…` / `/actions/retry-failed` (htmx-guarded via the
+`HX-Request` header) and re-render the status fragment.
+
 ## Visual Verification
 
 The `mcp` HTTP transport serves a status dashboard at `/` (htmx, auto-refreshing

@@ -105,6 +105,19 @@
     max-height: 3.2em; overflow: hidden;
   }
   .updated { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
+  .actions { text-align: right; white-space: nowrap; }
+  .btn {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--blue); color: var(--blue); }
+  .btn.htmx-request { opacity: 0.5; pointer-events: none; }
+  .btn-warn:hover { border-color: var(--amber); color: var(--amber); }
+  .failed-callout {
+    margin-top: 10px; color: var(--red); font-size: 12px;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
   .htmx-indicator { color: var(--muted); font-size: 11px; margin-bottom: 8px; }
   #data-region { min-height: 200px; }
   .conn-lost {

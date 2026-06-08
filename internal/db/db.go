@@ -849,6 +849,20 @@ func (db *DB) RequeueFailed(ctx context.Context) ([]string, error) {
 	return db.requeue(ctx, requeueFailed)
 }
 
+// RequeueByID re-runs the pipeline for a single job, identified by its UUID
+// (used by the dashboard's per-row requeue button). Returns the job's file path,
+// or an error if no job has that id.
+func (db *DB) RequeueByID(ctx context.Context, id string) (string, error) {
+	paths, err := db.requeue(ctx, requeueByID, id)
+	if err != nil {
+		return "", err
+	}
+	if len(paths) == 0 {
+		return "", fmt.Errorf("no job with id %s", id)
+	}
+	return paths[0], nil
+}
+
 // requeuePlan is a pair of fully-formed, static SQL statements for one requeue
 // selector. The statements are package constants — nothing is concatenated at
 // runtime, so the only dynamic input is the bound $1 parameter (when present).
@@ -876,6 +890,16 @@ var (
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
 			WHERE  status = 'failed'
+			RETURNING file_path`,
+	}
+	// requeueByID selects a single job by its UUID ($1, cast for safety).
+	requeueByID = requeuePlan{
+		deleteTranscripts: `DELETE FROM transcripts
+			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE id = $1::uuid)`,
+		resetJobs: `UPDATE transcription_jobs
+			SET    status = 'pending', attempts = 0, error = NULL,
+			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
+			WHERE  id = $1::uuid
 			RETURNING file_path`,
 	}
 )

@@ -17,7 +17,19 @@ import (
 // SimpleMockDB implements DBInterface for simple testing.
 // pingErr controls whether Ping returns an error (nil = healthy).
 type SimpleMockDB struct {
-	pingErr error
+	pingErr       error
+	requeuedID    string // last id passed to RequeueByID
+	retriedFailed bool   // RequeueFailed was called
+}
+
+func (m *SimpleMockDB) RequeueByID(_ context.Context, id string) (string, error) {
+	m.requeuedID = id
+	return "/books/Author/Book/" + id + ".m4b", nil
+}
+
+func (m *SimpleMockDB) RequeueFailed(_ context.Context) ([]string, error) {
+	m.retriedFailed = true
+	return []string{"/books/Author/Book/chapter03.m4b"}, nil
 }
 
 func (m *SimpleMockDB) Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error) {
@@ -278,6 +290,80 @@ func TestUnmatchedPathIs404(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("GET /favicon.ico: want 404, got %d", w.Code)
+	}
+}
+
+// TestRequeueAction verifies POST /actions/requeue calls RequeueByID and returns
+// the refreshed fragment, and that the htmx guard + id validation hold.
+func TestRequeueAction(t *testing.T) {
+	mock := &SimpleMockDB{}
+	h := buildTestMux(mock)
+
+	// Happy path: htmx header + id → 200, RequeueByID called with the id.
+	req := httptest.NewRequest(http.MethodPost, "/actions/requeue?id=job-1", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("requeue: want 200, got %d", w.Code)
+	}
+	if mock.requeuedID != "job-1" {
+		t.Errorf("RequeueByID called with %q, want job-1", mock.requeuedID)
+	}
+	if !strings.Contains(w.Body.String(), "Recent Activity") {
+		t.Error("requeue should return the refreshed status fragment")
+	}
+
+	// Missing HX-Request header → 403 (CSRF guard).
+	mock2 := &SimpleMockDB{}
+	req = httptest.NewRequest(http.MethodPost, "/actions/requeue?id=job-1", nil)
+	w = httptest.NewRecorder()
+	buildTestMux(mock2).ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("non-htmx requeue: want 403, got %d", w.Code)
+	}
+	if mock2.requeuedID != "" {
+		t.Error("non-htmx request must not mutate")
+	}
+
+	// Missing id → 400.
+	req = httptest.NewRequest(http.MethodPost, "/actions/requeue", nil)
+	req.Header.Set("HX-Request", "true")
+	w = httptest.NewRecorder()
+	buildTestMux(&SimpleMockDB{}).ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("requeue without id: want 400, got %d", w.Code)
+	}
+}
+
+// TestRetryFailedAction verifies POST /actions/retry-failed calls RequeueFailed.
+func TestRetryFailedAction(t *testing.T) {
+	mock := &SimpleMockDB{}
+	req := httptest.NewRequest(http.MethodPost, "/actions/retry-failed", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry-failed: want 200, got %d", w.Code)
+	}
+	if !mock.retriedFailed {
+		t.Error("RequeueFailed was not called")
+	}
+}
+
+// TestRequeueButtonRendersForDoneFailedOnly verifies the per-row requeue button
+// appears for done/failed jobs (SimpleMockDB returns a done + a claimed job).
+func TestRequeueButtonRendersForDoneFailedOnly(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, "/actions/requeue?id=job-1") { // job-1 is 'done'
+		t.Error("expected a requeue button for the done job")
+	}
+	if strings.Contains(body, "/actions/requeue?id=job-2") { // job-2 is 'claimed'
+		t.Error("claimed job should not get a requeue button")
 	}
 }
 

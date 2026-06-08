@@ -41,6 +41,12 @@ func (demoDB) GetChunkContext(context.Context, string, int) ([]db.SearchResultWi
 	return nil, nil
 }
 
+// Requeue actions are no-ops in demo mode (no real DB) but succeed so the
+// dashboard buttons are exercisable; the fixture data is unchanged on refresh.
+func (demoDB) RequeueByID(_ context.Context, id string) (string, error) { return id, nil }
+
+func (demoDB) RequeueFailed(context.Context) ([]string, error) { return []string{"demo"}, nil }
+
 // GetServiceStatus returns a synthetic snapshot for the selected scenario.
 func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 	now := time.Now()

@@ -138,8 +138,12 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
     </div>
     {{end}}
     {{if gt .Stats.Failed 0}}
-    <div style="margin-top:10px;color:var(--red);font-size:12px;">
-      &#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} — check recent activity below
+    <div class="failed-callout">
+      <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} — check recent activity below</span>
+      <button class="btn btn-warn"
+              hx-post="/actions/retry-failed"
+              hx-target="#data-region" hx-swap="innerHTML"
+              hx-confirm="Retry all {{.Stats.Failed}} failed job(s)? Each is reset to pending and re-transcribed.">retry all failed</button>
     </div>
     {{end}}
   </div>
@@ -156,6 +160,7 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
         <th>File</th>
         <th>Status</th>
         <th>Updated</th>
+        <th></th>
       </tr>
     </thead>
     <tbody>
@@ -167,6 +172,14 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
         </td>
         <td><span class="badge {{.Status}}">{{.Status}}</span></td>
         <td class="time-muted">{{formatTime .UpdatedAt}}</td>
+        <td class="actions">
+          {{if or (eq .Status "done") (eq .Status "failed")}}
+          <button class="btn"
+                  hx-post="/actions/requeue?id={{.ID}}"
+                  hx-target="#data-region" hx-swap="innerHTML"
+                  hx-confirm="Re-transcribe {{shortName .FilePath}}? This deletes its transcript + embeddings and re-runs the runner.">requeue</button>
+          {{end}}
+        </td>
       </tr>
     {{end}}
     </tbody>
@@ -266,6 +279,13 @@ func (s *MCPServer) handleDashboardPage(w http.ResponseWriter, r *http.Request) 
 
 // handleStatusData serves the htmx-refreshed inner fragment (GET /status/data).
 func (s *MCPServer) handleStatusData(w http.ResponseWriter, r *http.Request) {
+	s.renderStatusFragment(w, r)
+}
+
+// renderStatusFragment queries the live status and renders the htmx fragment.
+// Shared by the periodic refresh and by the action handlers (which re-render the
+// fragment after mutating so the table updates immediately).
+func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	stats, err := s.db.GetServiceStatus(ctx)
@@ -289,4 +309,50 @@ func (s *MCPServer) handleStatusData(w http.ResponseWriter, r *http.Request) {
 	if err := fragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("fragment render error", "error", err)
 	}
+}
+
+// isHTMX reports whether the request came from htmx (which sets HX-Request:
+// true). The mutating action endpoints require it — a lightweight guard against
+// drive-by/CSRF form posts, which cannot set custom headers cross-origin without
+// a CORS preflight the dashboard never grants.
+func isHTMX(r *http.Request) bool {
+	return r.Header.Get("HX-Request") == "true"
+}
+
+// handleRequeueJob re-transcribes a single job (POST /actions/requeue?id=…) and
+// returns the refreshed status fragment so htmx swaps in the updated table.
+func (s *MCPServer) handleRequeueJob(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.db.RequeueByID(r.Context(), id); err != nil {
+		s.logger.Error("requeue job error", "id", id, "error", err)
+		http.Error(w, "requeue failed", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("requeued job via dashboard", "id", id)
+	s.renderStatusFragment(w, r)
+}
+
+// handleRetryFailed re-transcribes every failed job (POST /actions/retry-failed)
+// and returns the refreshed status fragment.
+func (s *MCPServer) handleRetryFailed(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	paths, err := s.db.RequeueFailed(r.Context())
+	if err != nil {
+		s.logger.Error("retry failed error", "error", err)
+		http.Error(w, "retry failed", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("retried failed jobs via dashboard", "count", len(paths))
+	s.renderStatusFragment(w, r)
 }

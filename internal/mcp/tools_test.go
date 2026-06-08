@@ -53,6 +53,16 @@ func (m *MockDBInterface) GetRecentJobs(ctx context.Context, limit int) ([]db.Re
 	return args.Get(0).([]db.RecentJob), args.Error(1)
 }
 
+func (m *MockDBInterface) RequeueByID(ctx context.Context, id string) (string, error) {
+	args := m.Called(ctx, id)
+	return args.String(0), args.Error(1)
+}
+
+func (m *MockDBInterface) RequeueFailed(ctx context.Context) ([]string, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]string), args.Error(1)
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

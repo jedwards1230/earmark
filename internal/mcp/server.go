@@ -135,11 +135,14 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //
 // Routes:
 //
-//	GET  /             — status dashboard (full HTML shell)
-//	GET  /status/data  — htmx-refreshed fragment (counts + recent jobs)
-//	GET  /health       — liveness probe (always 200 "ok")
-//	GET  /readyz       — readiness probe (200 if DB ping OK, 503 otherwise)
-//	*    /mcp          — MCP streamable-HTTP handler
+//	GET  /                     — status dashboard (full HTML shell)
+//	GET  /status/data          — htmx-refreshed fragment (counts + recent jobs)
+//	GET  /static/htmx.min.js   — vendored htmx library
+//	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
+//	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)
+//	GET  /health               — liveness probe (always 200 "ok")
+//	GET  /readyz               — readiness probe (200 if DB ping OK, 503 otherwise)
+//	*    /mcp                  — MCP streamable-HTTP handler
 //
 // Extracted so that tests can wire the same mux without binding a port.
 func (s *MCPServer) buildMux() *http.ServeMux {
@@ -158,6 +161,12 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	// Vendored htmx (pinned), served from the binary so the dashboard needs no
 	// external CDN at runtime.
 	mux.HandleFunc("/static/htmx.min.js", getOnly(s.handleHTMX))
+
+	// Mutating actions — POST-only (method pattern is safe here: these are
+	// specific paths, unlike the "/" catch-all). htmx-guarded inside the handler.
+	// Each re-renders the status fragment so the table updates immediately.
+	mux.HandleFunc("POST /actions/requeue", s.handleRequeueJob)
+	mux.HandleFunc("POST /actions/retry-failed", s.handleRetryFailed)
 
 	// Liveness — no external deps.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
