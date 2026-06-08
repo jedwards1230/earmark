@@ -265,6 +265,23 @@ func TestDashboardPage(t *testing.T) {
 	}
 }
 
+// TestDashboardRoutesGETOnly verifies that the dashboard routes reject non-GET
+// methods with 405 (they are read-only) while /mcp keeps accepting other methods.
+func TestDashboardRoutesGETOnly(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	for _, path := range []string{"/", "/status/data"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("POST %s: want 405, got %d", path, w.Code)
+		}
+		if allow := w.Header().Get("Allow"); allow != "GET" {
+			t.Errorf("POST %s: want Allow: GET, got %q", path, allow)
+		}
+	}
+}
+
 // TestStatusDataFragment verifies that GET /status/data returns 200 with the
 // counts rendered by the fake DB.
 func TestStatusDataFragment(t *testing.T) {

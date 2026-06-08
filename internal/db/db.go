@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -698,8 +699,7 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		ORDER BY updated_at DESC
 		LIMIT 1
 	`).Scan(&claimedBy, &updatedAt)
-	if err != nil && err.Error() != "no rows in result set" {
-		// pgx returns pgx.ErrNoRows — check string to avoid importing pgx here.
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("runner heartbeat query: %w", err)
 	}
 	if claimedBy != nil {

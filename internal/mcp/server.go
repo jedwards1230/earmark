@@ -105,6 +105,21 @@ func (s *MCPServer) StartStdio() error {
 	return server.ServeStdio(s.server)
 }
 
+// getOnly wraps a handler so non-GET requests get 405 Method Not Allowed.
+// Used for the dashboard routes (which are read-only) in place of a "GET /"
+// ServeMux method pattern, which would conflict with the method-less /mcp and
+// /health routes and panic at registration.
+func getOnly(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
+	}
+}
+
 // buildMux constructs the HTTP mux used by the HTTP transport.
 //
 // Routes:
@@ -121,10 +136,13 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 
 	mux := http.NewServeMux()
 
-	// Status dashboard — full HTML shell (GET /) and htmx fragment (GET /status/data).
-	// Only registered when running under HTTP transport.
-	mux.HandleFunc("/", s.handleDashboardPage)
-	mux.HandleFunc("/status/data", s.handleStatusData)
+	// Status dashboard — full HTML shell (/) and htmx fragment (/status/data),
+	// both GET-only. We enforce GET with a wrapper rather than a "GET /" method
+	// pattern: the method-less "/mcp" and "/health" routes would conflict with
+	// it and make ServeMux panic (method-vs-path-specificity ambiguity).
+	// Only reachable under HTTP transport.
+	mux.HandleFunc("/", getOnly(s.handleDashboardPage))
+	mux.HandleFunc("/status/data", getOnly(s.handleStatusData))
 
 	// Liveness — no external deps.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
