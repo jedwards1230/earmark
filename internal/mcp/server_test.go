@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -279,6 +280,31 @@ func TestDashboardRoutesGETOnly(t *testing.T) {
 		if allow := w.Header().Get("Allow"); allow != "GET" {
 			t.Errorf("POST %s: want Allow: GET, got %q", path, allow)
 		}
+	}
+}
+
+// TestFragmentEscapesJobError guards the claim that a job's error text is
+// HTML-escaped on the dashboard: derefStr returns a plain string, so
+// html/template auto-escapes it. A regression that returns template.HTML (or
+// otherwise marks it safe) would render the raw markup and fail this test.
+func TestFragmentEscapesJobError(t *testing.T) {
+	evil := `<script>alert(1)</script>`
+	var buf bytes.Buffer
+	err := fragmentTmpl.Execute(&buf, dashboardData{
+		Stats: &db.QueueStats{},
+		Jobs: []db.RecentJob{
+			{ID: "x", FilePath: "/books/a/b.m4b", Status: "failed", Error: &evil},
+		},
+	})
+	if err != nil {
+		t.Fatalf("fragment execute: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, evil) {
+		t.Error("job error rendered unescaped — XSS risk")
+	}
+	if !strings.Contains(out, "&lt;script&gt;") {
+		t.Errorf("expected escaped error text in output; got:\n%s", out)
 	}
 }
 
