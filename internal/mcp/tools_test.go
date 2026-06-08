@@ -38,6 +38,11 @@ func (m *MockDBInterface) GetChunkContext(ctx context.Context, chunkID string, c
 	return args.Get(0).([]db.SearchResultWithMetadata), args.Error(1)
 }
 
+func (m *MockDBInterface) Ping(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

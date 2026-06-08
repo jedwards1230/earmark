@@ -2,14 +2,20 @@ package mcp
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 )
 
-// SimpleMockDB implements DBInterface for simple testing
-type SimpleMockDB struct{}
+// SimpleMockDB implements DBInterface for simple testing.
+// pingErr controls whether Ping returns an error (nil = healthy).
+type SimpleMockDB struct {
+	pingErr error
+}
 
 func (m *SimpleMockDB) Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error) {
 	return []db.SearchResultWithMetadata{
@@ -77,6 +83,75 @@ func (m *SimpleMockDB) GetChunkContext(ctx context.Context, chunkID string, cont
 			ChunkID:    "chunk-5",
 		},
 	}, nil
+}
+
+// Ping satisfies DBInterface; returns m.pingErr so tests can inject failures.
+func (m *SimpleMockDB) Ping(_ context.Context) error {
+	return m.pingErr
+}
+
+// buildTestMux returns the http.Handler that StartHTTP would listen on, wired to
+// the given mock DB.  It lets us test /health and /readyz without binding a port.
+func buildTestMux(mockDB DBInterface) http.Handler {
+	s := NewMCPServer(mockDB, &config.Config{})
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if err := s.db.Ping(ctx); err != nil {
+			http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	return mux
+}
+
+// TestHealthEndpoint verifies that GET /health always returns 200 "ok".
+func TestHealthEndpoint(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("GET /health: want 200, got %d", w.Code)
+	}
+	if got := w.Body.String(); got != "ok" {
+		t.Errorf("GET /health body: want %q, got %q", "ok", got)
+	}
+}
+
+// TestReadyzEndpoint_Healthy verifies that /readyz returns 200 when the DB pings OK.
+func TestReadyzEndpoint_Healthy(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{pingErr: nil})
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("GET /readyz (healthy): want 200, got %d", w.Code)
+	}
+}
+
+// TestReadyzEndpoint_Unhealthy verifies that /readyz returns 503 when the DB is down.
+func TestReadyzEndpoint_Unhealthy(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{pingErr: fmt.Errorf("connection refused")})
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("GET /readyz (unhealthy): want 503, got %d", w.Code)
+	}
 }
 
 // TestMCPServerCreation tests that we can create an MCP server without errors

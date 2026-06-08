@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -16,6 +19,7 @@ type MCPServer struct {
 	server   *server.MCPServer
 	handlers *ToolHandlers
 	logger   log.Logger
+	db       DBInterface // kept for /readyz probe
 }
 
 // NewMCPServer creates a new MCP server instance
@@ -90,6 +94,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		server:   mcpServer,
 		handlers: handlers,
 		logger:   logger,
+		db:       database,
 	}
 }
 
@@ -100,12 +105,54 @@ func (s *MCPServer) StartStdio() error {
 	return server.ServeStdio(s.server)
 }
 
-// StartHTTP starts the MCP server using HTTP transport on the specified address
+// StartHTTP starts the MCP server using HTTP transport on the specified address.
+//
+// The mux layout:
+//
+//	GET  /health  — liveness probe (always 200 "ok")
+//	GET  /readyz  — readiness probe (200 if DB ping OK, 503 otherwise)
+//	*    /mcp     — MCP streamable-HTTP handler
 func (s *MCPServer) StartHTTP(addr string) error {
 	s.logger.Info("Starting MCP server with HTTP transport", "address", addr)
 
-	httpServer := server.NewStreamableHTTPServer(s.server)
-	return httpServer.Start(addr)
+	// Build the MCP handler. NewStreamableHTTPServer implements http.Handler via
+	// ServeHTTP; the default endpoint path exposed by Start() is "/mcp", and we
+	// preserve that by mounting it explicitly at "/mcp" in the mux.
+	mcpHandler := server.NewStreamableHTTPServer(s.server)
+
+	mux := http.NewServeMux()
+
+	// Liveness — no external deps.
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Readiness — confirms the DB pool is reachable before accepting traffic.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if err := s.db.Ping(ctx); err != nil {
+			s.logger.Warn("readyz: DB ping failed", "error", err)
+			http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// MCP protocol handler at /mcp (ServeHTTP handles all methods; path-based
+	// routing is done internally by mcp-go when used as an http.Handler).
+	mux.Handle("/mcp", mcpHandler)
+
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+	return httpSrv.ListenAndServe()
 }
 
 // GetServerInfo returns server information for introspection

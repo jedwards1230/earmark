@@ -1,18 +1,45 @@
 lilbro-whisper deployed successfully.
 
-Service:  {{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}
-MCP path: http://{{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp
+━━━ MCP server ────────────────────────────────────────────────────────────────
+In-cluster:  http://{{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp
 {{- if .Values.ingress.enabled }}
-Ingress:  https://{{ .Values.ingress.host }}
+External:    https://{{ .Values.ingress.host }}/mcp
 {{- end }}
 
-Prerequisites (must exist in namespace {{ .Release.Namespace }}):
-  - Secret "{{ .Values.databaseSecret.name }}" with key "{{ .Values.databaseSecret.key }}"
-    (created by the 1Password operator from k8s-lilbro-whisper-pg-credentials)
-  - PVC "{{ .Values.booksPvcName }}" (ReadOnlyMany, bound to NFS books export)
-
-mcp-proxy configmap entry:
+Add to mcp-proxy configmap:
   "audiobooks": {
     "url": "http://{{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp",
     "transportType": "streamable-http"
   }
+
+━━━ Health endpoints (mcp pod only) ──────────────────────────────────────────
+Liveness:   GET :{{ .Values.service.port }}/health  → 200 "ok"
+Readiness:  GET :{{ .Values.service.port }}/readyz  → 200 if DB ping ok, 503 otherwise
+
+━━━ Pod status ────────────────────────────────────────────────────────────────
+kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "lilbro-whisper.name" . }}
+
+# Watch just the mcp server:
+kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=mcp-server
+
+# Watch the ingest worker:
+kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=ingest
+
+━━━ Prerequisites in namespace {{ .Release.Namespace }} ───────────────────────
+{{- if .Values.secrets.enabled }}
+  ✓ OnePasswordItems will be created by this chart (1Password operator required)
+{{- else }}
+  ! secrets.enabled=false — manually create:
+    - Secret "{{ .Values.databaseSecret.name }}" with key "{{ .Values.databaseSecret.key }}"
+    - Secret "{{ .Values.secrets.garageSecret.name }}" with ACCESS_KEY_ID / ACCESS_SECRET_KEY
+{{- end }}
+  - PVC "{{ .Values.booksPvcName }}" (ReadOnlyMany, bound to NFS books export at 192.168.8.36:/mnt/tank-hdd/media/books)
+{{- if .Values.cnpg.enabled }}
+  ✓ CNPG Cluster "lilbro-whisper-pg" will be created by this chart (CNPG operator required)
+{{- end }}
+
+━━━ Image note ────────────────────────────────────────────────────────────────
+CNPG image: {{ .Values.cnpg.imageName }}
+pgvector is bundled in the standard-bookworm variant and activated via postInitSQL.
+Verify the image tag resolves before the first deploy:
+  docker pull {{ .Values.cnpg.imageName }}

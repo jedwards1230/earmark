@@ -189,6 +189,12 @@ func (db *DB) Close() {
 	db.pool.Close()
 }
 
+// Ping checks that the database connection pool is healthy.
+// It is used by the /readyz health endpoint.
+func (db *DB) Ping(ctx context.Context) error {
+	return db.pool.Ping(ctx)
+}
+
 // initialize creates the CONTRACT schema and indexes in a single transaction.
 func (db *DB) initialize(ctx context.Context) error {
 	tx, err := db.pool.Begin(ctx)

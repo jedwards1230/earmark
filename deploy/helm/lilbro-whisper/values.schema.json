@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "lilbro-whisper Helm values",
+  "type": "object",
+  "required": [
+    "image",
+    "databaseSecret",
+    "booksPvcName",
+    "config",
+    "mcp",
+    "service",
+    "ingress",
+    "cnpg",
+    "secrets"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag":        { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "required": ["host", "tlsSecretName"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled":       { "type": "boolean" },
+        "annotations":   { "type": "object" },
+        "host":          { "type": "string", "minLength": 1 },
+        "tlsSecretName": { "type": "string", "minLength": 1 }
+      }
+    },
+    "databaseSecret": {
+      "type": "object",
+      "required": ["name", "key"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "key":  { "type": "string", "minLength": 1 }
+      }
+    },
+    "booksPvcName": { "type": "string", "minLength": 1 },
+    "config": {
+      "type": "object",
+      "required": ["embeddingsBaseURL"],
+      "additionalProperties": false,
+      "properties": {
+        "embeddingsBaseURL": { "type": "string", "minLength": 1 },
+        "embeddingsModel":   { "type": "string" },
+        "booksDir":          { "type": "string" },
+        "mcpHttpAddr":       { "type": "string" },
+        "staleJobTimeout":   { "type": "string" },
+        "chunkSize":         { "type": "string" }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu":    { "type": "string" },
+            "memory": { "type": "string" }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu":    { "type": "string" },
+            "memory": { "type": "string" }
+          }
+        }
+      }
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "cnpg": {
+      "type": "object",
+      "required": ["imageName", "instances", "storage", "backup"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled":   { "type": "boolean" },
+        "imageName": { "type": "string", "minLength": 1 },
+        "instances": { "type": "integer", "minimum": 1 },
+        "storage": {
+          "type": "object",
+          "required": ["size", "storageClass"],
+          "additionalProperties": false,
+          "properties": {
+            "size":         { "type": "string", "minLength": 1 },
+            "storageClass": { "type": "string", "minLength": 1 }
+          }
+        },
+        "backup": {
+          "type": "object",
+          "required": ["garageEndpoint", "bucket", "retention", "schedule"],
+          "additionalProperties": false,
+          "properties": {
+            "garageEndpoint": { "type": "string", "minLength": 1 },
+            "bucket":         { "type": "string", "minLength": 1 },
+            "retention":      { "type": "string", "minLength": 1 },
+            "schedule":       { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "required": ["dbCredentials", "garageSecret"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "dbCredentials": {
+          "type": "object",
+          "required": ["itemPath"],
+          "additionalProperties": false,
+          "properties": {
+            "itemPath": { "type": "string", "minLength": 1 }
+          }
+        },
+        "garageSecret": {
+          "type": "object",
+          "required": ["name", "itemPath"],
+          "additionalProperties": false,
+          "properties": {
+            "name":     { "type": "string", "minLength": 1 },
+            "itemPath": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

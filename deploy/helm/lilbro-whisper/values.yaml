@@ -1,10 +1,14 @@
-replicaCount: 1
-
 image:
   repository: ghcr.io/jedwards1230/lilbro-whisper
   # tag defaults to Chart.appVersion when unset
   tag: ""
   pullPolicy: IfNotPresent
+
+# ── MCP server ─────────────────────────────────────────────────────────────────
+# Replica count for the MCP HTTP deployment only.
+# The ingest worker is always 1 replica (Recreate strategy).
+mcp:
+  replicaCount: 1
 
 service:
   type: ClusterIP
@@ -19,19 +23,21 @@ ingress:
   host: audiobooks-kb.lilbro.cloud
   tlsSecretName: audiobooks-kb-tls
 
-# Existing secret containing DATABASE_URL (created by CNPG OnePasswordItem sync).
+# ── Credentials ────────────────────────────────────────────────────────────────
+# Existing Secret containing DATABASE_URL (created by the CNPG OnePasswordItem).
 # The chart references this secret by name; it does not create it.
-# Default matches the CNPG-generated credentials secret for lilbro-whisper-pg.
 databaseSecret:
   # Name of the K8s Secret that holds the DATABASE_URL key.
   name: lilbro-whisper-pg-credentials
   # Key within the secret that contains the PostgreSQL DSN.
   key: DATABASE_URL
 
-# NFS books PVC (ReadOnlyMany) — must already exist in this namespace.
+# ── Books NFS PVC ──────────────────────────────────────────────────────────────
+# ReadOnlyMany PVC that must already exist in this namespace.
 # See CONTRACT.md §2.6 for the static PV + PVC pattern.
 booksPvcName: books-ro
 
+# ── Application config ─────────────────────────────────────────────────────────
 config:
   embeddingsBaseURL: "http://ollama.external-services:11434/v1"
   embeddingsModel: "nomic-embed-text"
@@ -53,3 +59,46 @@ nodeSelector:
   kubernetes.io/arch: amd64
 
 tolerations: []
+
+# ── CNPG PostgreSQL cluster ─────────────────────────────────────────────────────
+cnpg:
+  enabled: true
+
+  # Image: ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm
+  # The "standard" flavour ships pgvector (and pgaudit, pg_failover_slots, etc.)
+  # on top of the minimal base.  It is the official CNPG upstream recommendation
+  # for PG16 clusters that need bundled community extensions.
+  #
+  # VERIFY before deploy:
+  #   docker pull ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm
+  # and confirm the operator version in the cluster still supports this imageName.
+  # The ImageVolume/spec.postgresql.extensions approach (CNPG Recipe 23) requires
+  # PostgreSQL 18 + Kubernetes 1.35 and is NOT used here.
+  imageName: ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm
+
+  instances: 1
+
+  storage:
+    size: 20Gi
+    storageClass: nfs-databases
+
+  # Garage S3 backup store (same ObjectStore name used across all namespaces).
+  backup:
+    garageEndpoint: "http://192.168.8.36:30188"
+    bucket: "postgres-backups"
+    retention: "30d"
+    # Six-field cron: daily at 03:00 (CONTRACT §2.5)
+    schedule: "0 0 3 * * *"
+
+# ── 1Password OnePasswordItems ──────────────────────────────────────────────────
+secrets:
+  enabled: true
+
+  # DB credentials for the CNPG cluster (CONTRACT §2.5)
+  dbCredentials:
+    itemPath: "vaults/homelab/items/k8s-lilbro-whisper-pg-credentials"
+
+  # Shared Garage S3 secret for CNPG backups (CONTRACT §2.5)
+  garageSecret:
+    name: cnpg-garage-secret
+    itemPath: "vaults/homelab/items/k8s-lilbro-whisper-cnpg-garage-secret"
