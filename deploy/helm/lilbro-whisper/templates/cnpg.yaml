@@ -10,7 +10,7 @@
 #
 #   Chosen image: ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm
 #     - Floating tag tracks the latest PG 16.x standard-bookworm build.
-#     - pgvector activated via postInitSQL: CREATE EXTENSION IF NOT EXISTS vector.
+#     - pgvector activated via postInitApplicationSQL (runs on the app DB).
 #
 #   VERIFY BEFORE DEPLOY:
 #     docker pull ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm
@@ -44,8 +44,12 @@ spec:
       secret:
         # Secret name matches the OnePasswordItem below (k8s-lilbro-whisper-pg-credentials).
         name: lilbro-whisper-pg-credentials
-      postInitSQL:
-        # Activate bundled extensions in the database.
+      # postInitApplicationSQL runs against the APPLICATION database (lilbro_whisper).
+      # postInitSQL runs against the `postgres` database — so the extensions would
+      # land where the app never connects. Verified on the live cluster (2026-06-08):
+      # with postInitSQL, the app failed with "vector type not found in the database".
+      postInitApplicationSQL:
+        # Activate bundled extensions in the application database.
         # vector: pgvector for VECTOR(768) column + HNSW index (CONTRACT §3)
         # pg_trgm: trigram FTS index on raw_text / chunk text (CONTRACT §1.2)
         - "CREATE EXTENSION IF NOT EXISTS vector;"
