@@ -17,7 +17,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- trigram full-text search
 
 ### 1. `transcription_jobs` — Job Queue (CONTRACT §1.1)
 
-Producer: Go monitor. Consumer: Python WhisperX runner on desktop-1.
+Producer: Go monitor. Consumer: Python ASR runner on the GPU/ASR host.
 
 ```sql
 CREATE TABLE transcription_jobs (

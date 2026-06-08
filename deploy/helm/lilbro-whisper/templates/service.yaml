@@ -1,3 +1,7 @@
+{{/*
+Service — routes traffic to the mcp-server Deployment only.
+The ingest worker has no HTTP port and is not selected.
+*/}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -14,4 +18,4 @@ spec:
       protocol: TCP
       name: http
   selector:
-    {{- include "lilbro-whisper.selectorLabels" . | nindent 4 }}
+    {{- include "lilbro-whisper.mcp.selectorLabels" . | nindent 4 }}

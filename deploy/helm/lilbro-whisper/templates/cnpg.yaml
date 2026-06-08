@@ -1,0 +1,124 @@
+# CNPG PostgreSQL cluster, ObjectStore, and ScheduledBackup.
+#
+# Gated by cnpg.enabled (default true).
+#
+# Image strategy: pgvector on CNPG 1.27 / PostgreSQL 16
+#   The ImageVolume approach (CNPG Recipe 23, spec.postgresql.extensions) requires
+#   PostgreSQL 18 AND Kubernetes 1.35+ and is NOT used here.
+#   Instead, use the official "standard-bookworm" image variant, which bundles
+#   pgvector (postgresql-16-pgvector Debian package) on top of the minimal base.
+#
+#   Chosen image: ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm
+#     - Floating tag tracks the latest PG 16.x standard-bookworm build.
+#     - pgvector activated via postInitSQL: CREATE EXTENSION IF NOT EXISTS vector.
+#
+#   VERIFY BEFORE DEPLOY:
+#     docker pull ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm
+#     docker run --rm ghcr.io/cloudnative-pg/postgresql:16-standard-bookworm \
+#       sh -c 'ls /usr/share/postgresql/16/extension/vector.control'
+#   Confirm the tag exists and vector.control is present before applying.
+#
+# See CONTRACT.md section 2.5 for cluster name, database, owner, and backup spec.
+{{- if .Values.cnpg.enabled }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: lilbro-whisper-pg
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  instances: {{ .Values.cnpg.instances }}
+
+  # Standard image ships pgvector — verified via docker run (see comment above).
+  # For CNPG 1.27 on PG16, this is the correct mechanism; do NOT use
+  # spec.postgresql.extensions (requires PG18 + K8s 1.35).
+  imageName: {{ required "cnpg.imageName is required" .Values.cnpg.imageName | quote }}
+
+  bootstrap:
+    initdb:
+      database: lilbro_whisper
+      owner: lilbro_whisper
+      secret:
+        # Secret name matches the OnePasswordItem below (k8s-lilbro-whisper-pg-credentials).
+        name: lilbro-whisper-pg-credentials
+      postInitSQL:
+        # Activate bundled extensions in the database.
+        # vector: pgvector for VECTOR(768) column + HNSW index (CONTRACT §3)
+        # pg_trgm: trigram FTS index on raw_text / chunk text (CONTRACT §1.2)
+        - "CREATE EXTENSION IF NOT EXISTS vector;"
+        - "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+
+  storage:
+    size: {{ required "cnpg.storage.size is required" .Values.cnpg.storage.size | quote }}
+    storageClass: {{ required "cnpg.storage.storageClass is required" .Values.cnpg.storage.storageClass | quote }}
+
+  enablePDB: true
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  # Barman Cloud Plugin — WAL archiving + base backups to Garage S3.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      enabled: true
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: garage-backup-store
+        serverName: lilbro-whisper-pg
+        retentionPolicy: {{ required "cnpg.backup.retention is required" .Values.cnpg.backup.retention | quote }}
+        backupTarget: "prefer-standby"
+
+  monitoring:
+    enablePodMonitor: true
+---
+# ObjectStore — S3-compatible backup endpoint.
+# Must be in the same namespace as the Cluster (CONTRACT section 2.5).
+# The cnpg-garage-secret is created by the OnePasswordItem below.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: garage-backup-store
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  configuration:
+    destinationPath: {{ printf "s3://%s/" (required "cnpg.backup.bucket is required" .Values.cnpg.backup.bucket) | quote }}
+    endpointURL: {{ required "cnpg.backup.garageEndpoint is required" .Values.cnpg.backup.garageEndpoint | quote }}
+    s3Credentials:
+      accessKeyId:
+        name: {{ .Values.secrets.garageSecret.name | quote }}
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: {{ .Values.secrets.garageSecret.name | quote }}
+        key: ACCESS_SECRET_KEY
+    wal:
+      compression: gzip
+      maxParallel: 2
+---
+# ScheduledBackup — daily at 03:00 (six-field cron per CONTRACT section 2.5).
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: lilbro-whisper-pg-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  schedule: {{ required "cnpg.backup.schedule is required" .Values.cnpg.backup.schedule | quote }}
+  cluster:
+    name: lilbro-whisper-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+{{- end }}

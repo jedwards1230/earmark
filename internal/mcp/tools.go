@@ -16,6 +16,8 @@ type DBInterface interface {
 	TextSearch(ctx context.Context, query string, limit int) ([]db.SearchResultWithMetadata, error)
 	GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error)
 	GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error)
+	// Ping checks that the database is reachable; used by /readyz.
+	Ping(ctx context.Context) error
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

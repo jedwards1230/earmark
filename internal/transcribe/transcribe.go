@@ -5,7 +5,7 @@
 //  2. Polls for completed transcripts (status="done") and feeds them into the
 //     chunk → embed → pgvector pipeline.
 //
-// The actual transcription is done by the Python WhisperX runner on desktop-1.
+// The actual transcription is done by the external Python ASR runner (on the GPU/ASR host).
 package transcribe
 
 import (

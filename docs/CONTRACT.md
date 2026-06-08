@@ -12,7 +12,7 @@
 ### 1.1 Transcription Job Queue — `transcription_jobs` table
 
 Producer: **Go** (enqueues new files, reads completed results).
-Consumer/runner: **Python WhisperX on desktop-1** (claims jobs, writes results).
+Consumer/runner: **Python ASR runner on the GPU/ASR host** (claims jobs, writes results).
 
 ```sql
 CREATE TABLE transcription_jobs (
@@ -21,7 +21,7 @@ CREATE TABLE transcription_jobs (
     checksum     TEXT        NOT NULL,           -- SHA-256 hex of the audio file (dedup key)
     status       TEXT        NOT NULL DEFAULT 'pending'
                              CHECK (status IN ('pending', 'claimed', 'done', 'failed')),
-    claimed_by   TEXT,                           -- runner identity string, e.g. "desktop-1-runner-pid-1234"
+    claimed_by   TEXT,                           -- runner identity string, e.g. "asr-runner-pid-1234"
     claimed_at   TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -205,13 +205,14 @@ SET    status = 'failed',
 WHERE  id     = $1;
 ```
 
-#### desktop-1 busy gate
+#### GPU/ASR host busy gate
 
 The runner honors a `RUNNER_BUSY_FLAG_PATH` environment variable (default
 `/tmp/lilbro-whisper-busy`). When this file exists, the runner skips claiming
-new jobs (finishes any in-flight job first, then pauses). The gaming session
-daemon writes this file on session start and removes it on exit. The runner
-checks the flag at the top of each poll cycle before issuing the claim UPDATE.
+new jobs (finishes any in-flight job first, then pauses). An external process
+writes this file when the host should not accept new jobs and removes it when
+the host is available again. The runner checks the flag at the top of each poll
+cycle before issuing the claim UPDATE.
 
 ---
 
@@ -224,10 +225,10 @@ checks the flag at the top of each poll cycle before issuing the claim UPDATE.
 | Namespace | `lilbro-whisper` |
 | Go binary image | `ghcr.io/jedwards1230/lilbro-whisper` |
 | Helm chart OCI ref | `oci://ghcr.io/jedwards1230/charts/lilbro-whisper` |
-| Ingress hostname | `audiobooks-kb.lilbro.cloud` |
+| Ingress hostname | `audiobooks-kb.example.com` |
 | CNPG cluster name | `lilbro-whisper-pg` |
 
-`audiobooks.lilbro.cloud` is taken by Audiobookshelf. Do NOT use it here.
+`audiobooks.example.com` may be taken by an existing Audiobookshelf instance. Do NOT use it here.
 
 ### 2.2 MCP Transport
 
@@ -252,7 +253,7 @@ The mcp-proxy configmap entry (add to `mcpServers` object):
 
 | Property | Value |
 |----------|-------|
-| Default base URL | `http://ollama.external-services:11434/v1` |
+| Default base URL | `http://ollama:11434/v1` |
 | Embedding model | `nomic-embed-text` |
 | Vector dimension | **768** |
 
@@ -275,19 +276,19 @@ All env var names are fixed. No synonyms, no alternatives.
 | `PGUSER` | no | Convenience alias |
 | `PGPASSWORD` | no | Convenience alias |
 | `PGDATABASE` | no | Convenience alias |
-| `EMBEDDINGS_BASE_URL` | no | `http://ollama.external-services:11434/v1` |
+| `EMBEDDINGS_BASE_URL` | no | `http://ollama:11434/v1` |
 | `EMBEDDINGS_MODEL` | no | `nomic-embed-text` |
 | `BOOKS_DIR` | no | `/books` (read-only NFS mount inside container) |
 | `MCP_HTTP_ADDR` | no | `:8081` |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 
-#### Python ASR runner — NeMo Parakeet-TDT (desktop-1 native service)
+#### Python ASR runner — NeMo Parakeet-TDT (GPU/ASR host native service)
 
 | Variable | Required | Default / Notes |
 |----------|----------|-----------------|
 | `DATABASE_URL` | yes | Same DSN as Go service — runner connects directly to CNPG rw endpoint |
-| `RUNNER_IDENTITY` | no | `desktop-1-runner` (included in `claimed_by`) |
+| `RUNNER_IDENTITY` | no | `asr-runner` (included in `claimed_by`) |
 | `RUNNER_POLL_INTERVAL_SECONDS` | no | `30` |
 | `RUNNER_HEARTBEAT_SECONDS` | no | `60` |
 | `RUNNER_BUSY_FLAG_PATH` | no | `/tmp/lilbro-whisper-busy` |
@@ -295,7 +296,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `ASR_DIARIZE` | no | `false` (default). Set `true` to run NeMo Sortformer speaker diarization for multi-voice/full-cast titles |
 | `ASR_COMPUTE_TYPE` | no | `bfloat16` (native on RTX 5090 / Blackwell) |
 | `ASR_CHUNK_THRESHOLD_SECONDS` | no | `3600` — single-pass below this duration; chunked/buffered inference above |
-| `BOOKS_MOUNT` | no | `/mnt/tank-hdd/media/books` (NFS path on desktop-1) |
+| `BOOKS_MOUNT` | no | `/srv/audiobooks` (NFS export path on the storage host) |
 
 ### 2.5 CNPG Cluster
 
@@ -310,30 +311,29 @@ All env var names are fixed. No synonyms, no alternatives.
 | Database name | `lilbro_whisper` |
 | Database owner | `lilbro_whisper` |
 | PostInitSQL extensions | `CREATE EXTENSION IF NOT EXISTS vector;` `CREATE EXTENSION IF NOT EXISTS pg_trgm;` |
-| Backup destination | `s3://postgres-backups/` via Garage S3 (nas-1:30188) |
+| Backup destination | `s3://postgres-backups/` via an S3-compatible object store (e.g. Garage at `http://s3.example.com:3900`) |
 | Backup plugin | `barman-cloud.cloudnative-pg.io` |
 | Backup retention | `30d` |
 | Backup schedule | `0 0 3 * * *` (daily 3 AM, six-field cron) |
-| ObjectStore name | `garage-backup-store` (same name used in every namespace) |
+| ObjectStore name | `garage-backup-store` |
 
 #### 1Password item paths (follow `k8s-<ns>-<service>-<type>` convention)
 
 | Secret | 1Password item path |
 |--------|---------------------|
-| DB credentials (CNPG) | `vaults/homelab/items/k8s-lilbro-whisper-pg-credentials` |
-| Garage S3 for CNPG | `vaults/homelab/items/k8s-lilbro-whisper-cnpg-garage-secret` |
-| HuggingFace token (runner) | Stored in Ansible vault (not a K8s secret — runner is a desktop-1 native service) |
+| DB credentials (CNPG) | `vaults/example/items/k8s-lilbro-whisper-pg-credentials` |
+| S3 credentials for CNPG | `vaults/example/items/k8s-lilbro-whisper-cnpg-garage-secret` |
+| HuggingFace token (runner) | Stored in a secrets manager (not a K8s secret — runner is a GPU/ASR host native service) |
 
-The `cnpg-garage-secret` OnePasswordItem provides `ACCESS_KEY_ID`,
-`ACCESS_SECRET_KEY`, and `REGION` keys (matching the pattern used in every
-other namespace, e.g. `paperless`).
+The `cnpg-garage-secret` secret provides `ACCESS_KEY_ID`,
+`ACCESS_SECRET_KEY`, and `REGION` keys for the S3-compatible object store.
 
 ### 2.6 Audiobook Library NFS Mount
 
 | Property | Value |
 |----------|-------|
-| NFS server | `nas-1` (`192.168.8.36`) |
-| NFS export path | `/mnt/tank-hdd/media/books` |
+| NFS server | `<nfs-server-ip>` (e.g. `192.0.2.10`) |
+| NFS export path | `/srv/audiobooks` |
 | PVC name | `books` (existing PVC in `media` namespace — re-used read-only) |
 | StorageClass | `nfs-static-media` |
 | Access mode in Deployment | `ReadOnlyMany` — declare `readOnly: true` in the volumeMount |
@@ -358,8 +358,8 @@ spec:
   storageClassName: nfs-static-media
   persistentVolumeReclaimPolicy: Retain
   nfs:
-    server: 192.168.8.36
-    path: /mnt/tank-hdd/media/books
+    server: 192.0.2.10
+    path: /srv/audiobooks
   claimRef:
     name: books-ro
     namespace: lilbro-whisper
@@ -414,8 +414,8 @@ nodeSelector:
   kubernetes.io/arch: amd64
 ```
 
-No `role` selector is needed — the service is stateless and any AMD64 node
-(linux-1/2/3/4) is acceptable.
+No `role` selector is needed — the service is stateless and any available AMD64 node
+is acceptable.
 
 ### 2.10 Required Labels
 
