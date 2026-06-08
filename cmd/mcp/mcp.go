@@ -30,11 +30,37 @@ Examples:
   MCP_TRANSPORT=http lil-whisper mcp
 
   # Start with custom HTTP address
-  MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 lil-whisper mcp`,
+  MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 lil-whisper mcp
+
+  # Serve only the status dashboard with synthetic data and NO database
+  # (for local UI work / visual verification — see CLAUDE.md)
+  lil-whisper mcp --demo`,
 	Run: runMCP,
 }
 
+var demoMode bool
+
+func init() {
+	MCPCmd.Flags().BoolVar(&demoMode, "demo", false,
+		"Serve the status dashboard with synthetic data and no database connection")
+}
+
 func runMCP(cmd *cobra.Command, args []string) {
+	// Demo mode: serve the dashboard over HTTP with synthetic data, no DB.
+	// Useful for iterating on the UI and for AI-agent visual verification.
+	if demoMode {
+		addr := os.Getenv("MCP_HTTP_ADDR")
+		if addr == "" {
+			addr = ":8081"
+		}
+		fmt.Printf("Starting lilbro-whisper DEMO dashboard on %s (synthetic data, no database)\n", addr)
+		fmt.Printf("  Dashboard: http://localhost%s/\n", addr)
+		if err := mcp.StartDemoDashboard(addr); err != nil {
+			log.Fatalf("Failed to start demo dashboard: %v", err)
+		}
+		return
+	}
+
 	// Load configuration
 	cfg, err := config.LoadConfig()
 	if err != nil {

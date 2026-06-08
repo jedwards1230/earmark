@@ -12,3 +12,7 @@ lil-whisper
 lil-whisper-*
 test-build
 dist/
+coverage.html
+
+# Playwright MCP screenshot/output dir (AI-agent visual verification)
+.playwright-mcp/

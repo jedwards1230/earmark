@@ -62,6 +62,27 @@ MCP_TRANSPORT=http ./lil-whisper mcp  # HTTP transport on :8081
 ./lil-whisper requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
 ```
 
+## Visual Verification
+
+The `mcp` HTTP transport serves a status dashboard at `/` (htmx, auto-refreshing
+the `/status/data` fragment every 3s). For UI changes, verify it visually before
+opening a PR — no database required:
+
+```bash
+go run . mcp --demo     # serves http://localhost:8081/ with synthetic data
+# or: make dashboard
+```
+
+`--demo` backs the dashboard with an in-memory fixture (`internal/mcp/demo.go`)
+that exercises every state — active runner, pending backlog, a failed job — so
+the page renders fully with no Postgres, no DATABASE_URL, and no ASR runner.
+
+Playwright is wired for AI agents via `.claude/mcp.json` (the `playwright` MCP
+server). With the demo server running, use Playwright (MCP) to navigate to
+`http://localhost:8081/`, then `browser_snapshot` / `browser_take_screenshot`.
+Drive the htmx refresh by waiting, or fetch the fragment directly at
+`http://localhost:8081/status/data`.
+
 ## Environment Variables
 
 See `.env.example` and `docs/CONTRACT.md §2.4` for the canonical list.
