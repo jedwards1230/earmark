@@ -107,10 +107,10 @@ is required unless marked optional.
 ```
 
 Rules:
-- `speaker` at both segment and word level is `null` when pyannote diarization
-  is disabled or the runner flag `WHISPERX_DIARIZE=false` is set.
-- `words` array is always present (never `null`); it may be empty if WhisperX
-  word alignment fails for a segment.
+- `speaker` at both segment and word level is `null` when diarization is
+  disabled or the runner flag `ASR_DIARIZE=false` is set (the default).
+- `words` array is always present (never `null`); it may be empty if the ASR
+  model emits no word-level timestamps for a segment.
 - `score` in word objects is `null` when the alignment model does not produce a
   confidence value.
 - All timestamps are float64 seconds, not milliseconds.
@@ -282,7 +282,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 
-#### Python WhisperX runner (desktop-1 native service)
+#### Python ASR runner — NeMo Parakeet-TDT (desktop-1 native service)
 
 | Variable | Required | Default / Notes |
 |----------|----------|-----------------|
@@ -291,11 +291,10 @@ All env var names are fixed. No synonyms, no alternatives.
 | `RUNNER_POLL_INTERVAL_SECONDS` | no | `30` |
 | `RUNNER_HEARTBEAT_SECONDS` | no | `60` |
 | `RUNNER_BUSY_FLAG_PATH` | no | `/tmp/lilbro-whisper-busy` |
-| `WHISPERX_MODEL` | no | `large-v3` |
-| `WHISPERX_LANGUAGE` | no | `en` (pass `auto` to enable auto-detect) |
-| `WHISPERX_DIARIZE` | no | `true` — set `false` to skip pyannote speaker diarization |
-| `WHISPERX_COMPUTE_TYPE` | no | `float16` (RTX 5090 supports bfloat16 — keep float16 for compat) |
-| `HF_TOKEN` | yes (if `WHISPERX_DIARIZE=true`) | HuggingFace token for pyannote gated model; sourced from Ansible vault |
+| `ASR_MODEL` | no | `nvidia/parakeet-tdt-0.6b-v3` (NeMo model id) |
+| `ASR_DIARIZE` | no | `false` (default). Set `true` to run NeMo Sortformer speaker diarization for multi-voice/full-cast titles |
+| `ASR_COMPUTE_TYPE` | no | `bfloat16` (native on RTX 5090 / Blackwell) |
+| `ASR_CHUNK_THRESHOLD_SECONDS` | no | `3600` — single-pass below this duration; chunked/buffered inference above |
 | `BOOKS_MOUNT` | no | `/mnt/tank-hdd/media/books` (NFS path on desktop-1) |
 
 ### 2.5 CNPG Cluster
