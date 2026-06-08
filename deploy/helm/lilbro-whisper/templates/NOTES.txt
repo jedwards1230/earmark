@@ -33,7 +33,7 @@ kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=inge
     - Secret "{{ .Values.databaseSecret.name }}" with key "{{ .Values.databaseSecret.key }}"
     - Secret "{{ .Values.secrets.garageSecret.name }}" with ACCESS_KEY_ID / ACCESS_SECRET_KEY
 {{- end }}
-  - PVC "{{ .Values.booksPvcName }}" (ReadOnlyMany, bound to NFS books export at 192.168.8.36:/mnt/tank-hdd/media/books)
+  - PVC "{{ .Values.booksPvcName }}" (ReadOnlyMany, bound to your NFS books export)
 {{- if .Values.cnpg.enabled }}
   ✓ CNPG Cluster "lilbro-whisper-pg" will be created by this chart (CNPG operator required)
 {{- end }}

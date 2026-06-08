@@ -20,7 +20,7 @@ ingress:
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
     traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
     traefik.ingress.kubernetes.io/router.middlewares: kube-system-redirect-lan@kubernetescrd
-  host: audiobooks-kb.lilbro.cloud
+  host: audiobooks-kb.example.com
   tlsSecretName: audiobooks-kb-tls
 
 # ── Credentials ────────────────────────────────────────────────────────────────
@@ -39,7 +39,7 @@ booksPvcName: books-ro
 
 # ── Application config ─────────────────────────────────────────────────────────
 config:
-  embeddingsBaseURL: "http://ollama.external-services:11434/v1"
+  embeddingsBaseURL: "http://ollama:11434/v1"
   embeddingsModel: "nomic-embed-text"
   booksDir: "/books"
   mcpHttpAddr: ":8081"
@@ -54,7 +54,7 @@ resources:
     cpu: 500m
     memory: 512Mi
 
-# AMD64 nodes only (linux-1/2/3/4 all qualify; no role selector needed).
+# Schedule on amd64 nodes only.
 nodeSelector:
   kubernetes.io/arch: amd64
 
@@ -82,9 +82,10 @@ cnpg:
     size: 20Gi
     storageClass: nfs-databases
 
-  # Garage S3 backup store (same ObjectStore name used across all namespaces).
+  # S3-compatible backup store; the real endpoint is supplied by the
+  # deploying environment's values (placeholder default below).
   backup:
-    garageEndpoint: "http://192.168.8.36:30188"
+    garageEndpoint: "http://s3.example.com:3900"
     bucket: "postgres-backups"
     retention: "30d"
     # Six-field cron: daily at 03:00 (CONTRACT §2.5)
@@ -96,9 +97,9 @@ secrets:
 
   # DB credentials for the CNPG cluster (CONTRACT §2.5)
   dbCredentials:
-    itemPath: "vaults/homelab/items/k8s-lilbro-whisper-pg-credentials"
+    itemPath: "vaults/example/items/lilbro-whisper-pg-credentials"
 
   # Shared Garage S3 secret for CNPG backups (CONTRACT §2.5)
   garageSecret:
     name: cnpg-garage-secret
-    itemPath: "vaults/homelab/items/k8s-lilbro-whisper-cnpg-garage-secret"
+    itemPath: "vaults/example/items/cnpg-garage-secret"

@@ -79,7 +79,7 @@ spec:
   monitoring:
     enablePodMonitor: true
 ---
-# ObjectStore — Garage S3 endpoint on nas-1.
+# ObjectStore — S3-compatible backup endpoint.
 # Must be in the same namespace as the Cluster (CONTRACT section 2.5).
 # The cnpg-garage-secret is created by the OnePasswordItem below.
 apiVersion: barmancloud.cnpg.io/v1
