@@ -18,17 +18,24 @@ import (
 // pingErr controls whether Ping returns an error (nil = healthy).
 type SimpleMockDB struct {
 	pingErr       error
+	requeueErr    error  // if set, RequeueByID/RequeueFailed return it
 	requeuedID    string // last id passed to RequeueByID
 	retriedFailed bool   // RequeueFailed was called
 }
 
 func (m *SimpleMockDB) RequeueByID(_ context.Context, id string) (string, error) {
 	m.requeuedID = id
+	if m.requeueErr != nil {
+		return "", m.requeueErr
+	}
 	return "/books/Author/Book/" + id + ".m4b", nil
 }
 
 func (m *SimpleMockDB) RequeueFailed(_ context.Context) ([]string, error) {
 	m.retriedFailed = true
+	if m.requeueErr != nil {
+		return nil, m.requeueErr
+	}
 	return []string{"/books/Author/Book/chapter03.m4b"}, nil
 }
 
@@ -348,6 +355,27 @@ func TestRetryFailedAction(t *testing.T) {
 	}
 	if !mock.retriedFailed {
 		t.Error("RequeueFailed was not called")
+	}
+}
+
+// TestRequeueActionErrorSurfaces verifies a failed requeue does not vanish
+// silently: the handler returns 200 with HX-Retarget so htmx swaps a visible
+// error banner into #action-error (htmx ignores the body of a non-2xx response).
+func TestRequeueActionErrorSurfaces(t *testing.T) {
+	mock := &SimpleMockDB{requeueErr: fmt.Errorf("boom")}
+	req := httptest.NewRequest(http.MethodPost, "/actions/requeue?id=job-1", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed requeue: want 200 (so htmx swaps), got %d", w.Code)
+	}
+	if got := w.Header().Get("HX-Retarget"); got != "#action-error" {
+		t.Errorf("HX-Retarget = %q, want #action-error", got)
+	}
+	if !strings.Contains(w.Body.String(), "action-err") {
+		t.Errorf("expected an error banner in body, got %q", w.Body.String())
 	}
 }
 

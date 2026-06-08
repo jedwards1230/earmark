@@ -50,6 +50,9 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
 	"formatTime": func(t time.Time) string {
 		return t.UTC().Format("2006-01-02 15:04:05 UTC")
 	},
+	"relTime": func(t time.Time) string {
+		return humanizeSince(time.Since(t))
+	},
 	"formatTimePtr": func(t *time.Time) string {
 		if t == nil {
 			return "—"
@@ -153,7 +156,9 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
 <div class="section">
   <div class="section-title">Recent Activity (last {{len .Jobs}})</div>
   {{if .Jobs}}
-  <div class="card" style="padding:0;overflow:hidden;">
+  <!-- table-wrap scrolls horizontally on narrow viewports so the actions
+       column is never clipped (the card's rounded corners still clip the y). -->
+  <div class="card table-wrap">
   <table>
     <thead>
       <tr>
@@ -171,7 +176,7 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
           {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}
         </td>
         <td><span class="badge {{.Status}}">{{.Status}}</span></td>
-        <td class="time-muted">{{formatTime .UpdatedAt}}</td>
+        <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
         <td class="actions">
           {{if or (eq .Status "done") (eq .Status "failed")}}
           <button class="btn"
@@ -311,6 +316,20 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// writeActionError surfaces a failed mutation to the user instead of letting it
+// vanish silently: htmx does not swap the target on a non-2xx response, so a bare
+// http.Error would leave the dashboard looking like nothing happened. We return
+// 200 with HX-Retarget so htmx swaps a dismissible banner into #action-error,
+// while the periodic poll still refreshes #data-region on its own.
+func writeActionError(w http.ResponseWriter, msg string) {
+	w.Header().Set("HX-Retarget", "#action-error")
+	w.Header().Set("HX-Reswap", "innerHTML")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, `<div class="action-err">&#9888;&#xFE0F;&nbsp;%s</div>`,
+		template.HTMLEscapeString(msg))
+}
+
 // isHTMX reports whether the request came from htmx (which sets HX-Request:
 // true). The mutating action endpoints require it — a lightweight guard against
 // drive-by/CSRF form posts, which cannot set custom headers cross-origin without
@@ -333,7 +352,7 @@ func (s *MCPServer) handleRequeueJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := s.db.RequeueByID(r.Context(), id); err != nil {
 		s.logger.Error("requeue job error", "id", id, "error", err)
-		http.Error(w, "requeue failed", http.StatusInternalServerError)
+		writeActionError(w, "requeue failed — see server logs")
 		return
 	}
 	s.logger.Info("requeued job via dashboard", "id", id)
@@ -350,7 +369,7 @@ func (s *MCPServer) handleRetryFailed(w http.ResponseWriter, r *http.Request) {
 	paths, err := s.db.RequeueFailed(r.Context())
 	if err != nil {
 		s.logger.Error("retry failed error", "error", err)
-		http.Error(w, "retry failed", http.StatusInternalServerError)
+		writeActionError(w, "retry-all-failed failed — see server logs")
 		return
 	}
 	s.logger.Info("retried failed jobs via dashboard", "count", len(paths))

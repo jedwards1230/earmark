@@ -72,8 +72,11 @@
   .dot.green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
   .dot.yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
   .dot.amber  { background: var(--amber);  box-shadow: 0 0 6px var(--amber); }
-  .dot.red    { background: var(--red);    }
+  .dot.red    { background: var(--red);    box-shadow: 0 0 6px var(--red); }
   .dot.grey   { background: var(--muted);  }
+  /* table-wrap: rounded card that scrolls horizontally instead of clipping the
+     actions column on narrow screens (overflow-x wins over the y:hidden). */
+  .table-wrap { padding: 0; overflow: hidden; overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; }
   th {
     text-align: left;
@@ -112,6 +115,7 @@
     padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer;
   }
   .btn:hover { border-color: var(--blue); color: var(--blue); }
+  .btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   .btn.htmx-request { opacity: 0.5; pointer-events: none; }
   .btn-warn:hover { border-color: var(--amber); color: var(--amber); }
   .failed-callout {
@@ -125,9 +129,30 @@
     border: 1px solid var(--red); border-radius: 6px;
     padding: 8px 14px; margin-bottom: 16px; font-size: 13px;
   }
+  /* action-err: transient banner for a failed requeue/retry. Self-dismisses so
+     it never lingers; a fresh failure replaces the node and restarts the fade. */
+  #action-error:empty { display: none; }
+  .action-err {
+    background: #2a0a0a; color: var(--red);
+    border: 1px solid var(--red); border-radius: 6px;
+    padding: 8px 14px; margin-bottom: 16px; font-size: 13px;
+    animation: action-err-fade 0.5s ease 6s forwards;
+  }
+  @keyframes action-err-fade {
+    to { opacity: 0; height: 0; padding: 0; margin: 0; border-width: 0; overflow: hidden; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .action-err { animation: none; }
+  }
   @media (max-width: 480px) {
     body { padding: 12px; font-size: 13px; }
-    .file-name { max-width: 55vw; }
+    /* Tighten the table so the actions column fits without horizontal scroll:
+       narrower filename + slimmer cell padding close the ~40px overflow that the
+       relative timestamps left. table-wrap still scrolls as a safety net. */
+    .file-name { max-width: 42vw; }
+    th, td { padding: 7px 6px; }
+    /* roomier tap targets on touch screens (desktop keeps the compact size) */
+    .btn { padding: 8px 12px; min-height: 36px; }
   }
 </style>
 </head>
@@ -145,7 +170,10 @@
 <h1>lilbro-whisper</h1>
 <p class="subtitle">pipeline status dashboard &nbsp;·&nbsp; auto-refreshes every 3 s</p>
 
-<div id="conn" class="conn-lost" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
+<div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
+
+<!-- live region for failed requeue/retry actions (populated via HX-Retarget) -->
+<div id="action-error" aria-live="assertive"></div>
 
 <div id="data-region"
      hx-get="/status/data"
