@@ -1,299 +1,283 @@
+// Package worker polls for completed transcripts (from the external WhisperX
+// runner) and runs the chunk → embed → pgvector pipeline for each one.
 package worker
 
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"github.com/jedwards1230/lil-whisper/internal/chunker"
 	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/correction"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/meta"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
-	"github.com/jedwards1230/lil-whisper/internal/transcribe"
-	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"time"
 )
 
-type Worker struct {
-	queue       *queue.Queue
-	done        chan struct{}
-	ctx         context.Context
-	cancel      context.CancelFunc
-	db          *db.DB
-	corrector   correction.Corrector
-	fileManager *correction.FileManager
-	log         log.Logger
+// DBInterface is the subset of db.DB used by the worker.
+type DBInterface interface {
+	GetCompletedTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	InsertChunks(ctx context.Context, chunks []db.Chunk) error
+	GetEmbeddings(texts []string) ([][]float32, error)
+	RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 }
 
-func NewWorker(q *queue.Queue, db *db.DB, cfg *config.Config) *Worker {
+// Worker polls for completed transcripts and embeds them.
+type Worker struct {
+	queue  *queue.Queue
+	done   chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	db     DBInterface
+	log    log.Logger
+}
+
+// NewWorker creates a Worker. The queue parameter is accepted for API
+// compatibility with the monitor wiring but is not used by the embed loop.
+func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
-	logger := log.NewLogger("worker")
-
-	// Initialize LLM corrector
-	corrector := correction.New(cfg)
-
-	// Initialize file manager for dual text storage
-	fileManager := correction.NewFileManager(cfg)
-
 	return &Worker{
-		queue:       q,
-		done:        make(chan struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
-		db:          db,
-		corrector:   corrector,
-		fileManager: fileManager,
-		log:         logger,
+		queue:  q,
+		done:   make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
+		db:     database,
+		log:    log.NewLogger("worker"),
 	}
 }
 
+// Start runs the embed loop until Stop is called.
 func (w *Worker) Start(cfg *config.Config) {
-	w.log.Info("Worker started", "status", "started")
+	w.log.Info("worker started")
+	defer close(w.done)
+
+	const pollInterval = 30 * time.Second
+	const staleRecoveryInterval = 5 * time.Minute
+
+	lastStale := time.Now()
+
 	for {
 		select {
 		case <-w.ctx.Done():
-			w.log.Info("Worker received shutdown signal", "status", "shutdown")
-			close(w.done)
+			w.log.Info("worker shutting down")
 			return
 		default:
-			queueItem, ok := w.queue.Dequeue()
-			if !ok || queueItem.FilePath == "" {
-				time.Sleep(time.Second)
-				continue
+		}
+
+		// Recover stale jobs periodically.
+		if time.Since(lastStale) >= staleRecoveryInterval {
+			if err := w.db.RecoverStaleJobs(w.ctx, cfg.StaleJobTimeout); err != nil {
+				w.log.Error("stale job recovery failed", "error", err)
 			}
+			lastStale = time.Now()
+		}
 
-			// Find matching FileMetadata
-			var fileMeta *meta.FileMetadata
-			for _, fm := range queueItem.Metadata.FileMetas {
-				if fm.FilePath == queueItem.FilePath {
-					fileMeta = &fm
-					break
-				}
+		transcripts, err := w.db.GetCompletedTranscripts(w.ctx)
+		if err != nil {
+			w.log.Error("poll for completed transcripts failed", "error", err)
+			w.sleep(pollInterval)
+			continue
+		}
+
+		if len(transcripts) == 0 {
+			w.sleep(pollInterval)
+			continue
+		}
+
+		for _, t := range transcripts {
+			if w.ctx.Err() != nil {
+				return
 			}
-
-			if fileMeta == nil {
-				w.log.Debug("No metadata found for file", "path", queueItem.FilePath)
-				continue
-			}
-
-			w.log.Info("Processing chapter",
-				"title", queueItem.Metadata.Title,
-				"author", queueItem.Metadata.Author,
-				"chapter_index", fileMeta.ChapterIndex,
-				"chapter_name", fileMeta.Chapter)
-
-			startTime := time.Now()
-
-			// Get file info for transcription storage
-			fileInfo, err := os.Stat(queueItem.FilePath)
-			if err != nil {
-				w.log.Error("Failed to get file info",
-					"file", queueItem.FilePath,
+			if err := w.processTranscript(cfg, t); err != nil {
+				w.log.Error("failed to process transcript",
+					"transcript_id", t.ID,
+					"file", t.FilePath,
 					"error", err)
-				continue
 			}
-
-			content, err := w.transcribeFile(cfg, queueItem, fileMeta, startTime, fileInfo.Size())
-			if err != nil {
-				w.log.Error("Failed to transcribe chapter",
-					"chapter", fileMeta.Chapter,
-					"title", queueItem.Metadata.Title,
-					"error", err)
-				continue
-			}
-			endTime := time.Now()
-			duration := endTime.Sub(startTime).Round(time.Second)
-			w.log.Info("Transcription completed",
-				"chapter", fileMeta.Chapter,
-				"title", queueItem.Metadata.Title,
-				"duration", duration)
-
-			// Save raw transcription text to local file
-			if err := w.fileManager.SaveRawText(queueItem.FilePath, content); err != nil {
-				w.log.Warn("Failed to save raw text file", "error", err)
-				// Don't fail the entire process for file save errors
-			}
-
-			// LLM Text Correction step
-			correctionStart := time.Now()
-			finalContent := content // Default to original content
-
-			if w.corrector.IsEnabled() {
-				w.log.Debug("Starting LLM text correction",
-					"file", queueItem.FilePath,
-					"chapter", fileMeta.Chapter)
-
-				// Use atomic correction processing
-				err := w.db.ProcessTranscriptionCorrection(w.ctx, queueItem.FilePath, func() (string, map[string]interface{}, error) {
-					// This function runs the actual correction
-					correctionResult, err := w.corrector.CorrectText(w.ctx, content, fileMeta)
-					if err != nil {
-						return "", nil, err
-					}
-					return correctionResult.CorrectedText, correctionResult.Metadata, nil
-				})
-
-				if err != nil {
-					w.log.Error("LLM correction failed, using original text",
-						"chapter", fileMeta.Chapter,
-						"title", queueItem.Metadata.Title,
-						"error", err)
-					// finalContent remains as original content
-				} else {
-					// Get the corrected text from database
-					transcription, err := w.db.GetTranscription(w.ctx, queueItem.FilePath)
-					if err != nil {
-						w.log.Error("Failed to retrieve corrected text", "error", err)
-						// Use original content as fallback
-					} else if transcription.CorrectedText != nil && *transcription.CorrectedText != "" {
-						finalContent = *transcription.CorrectedText
-						correctionDuration := time.Since(correctionStart).Round(time.Millisecond)
-
-						w.log.Info("LLM correction completed",
-							"chapter", fileMeta.Chapter,
-							"title", queueItem.Metadata.Title,
-							"correction_duration", correctionDuration)
-
-						// Save corrected text to local file
-						if err := w.fileManager.SaveCorrectedText(queueItem.FilePath, finalContent); err != nil {
-							w.log.Warn("Failed to save corrected text file", "error", err)
-							// Don't fail the entire process for file save errors
-						}
-					}
-				}
-			} else {
-				w.log.Debug("LLM correction disabled, using original text")
-			}
-
-			// Use corrected content (or original if correction failed/disabled) for chunking and embedding
-			if err := w.db.InsertContentWithMetadata(w.ctx, finalContent, fileMeta); err != nil {
-				w.log.Error("Failed to store chapter",
-					"chapter", fileMeta.Chapter,
-					"title", queueItem.Metadata.Title,
-					"error", err)
-				continue
-			}
-
-			w.log.Info("Chapter completed",
-				"chapter", fileMeta.Chapter,
-				"title", queueItem.Metadata.Title)
 		}
 	}
 }
 
-func (w *Worker) transcribeFile(cfg *config.Config, queueItem queue.QueueItem, fileMeta *meta.FileMetadata, startTime time.Time, fileSize int64) (string, error) {
-	// Check if transcription already exists and is up to date
-	fileChecksum, err := w.db.ComputeFileChecksum(queueItem.FilePath)
-	if err != nil {
-		w.log.Warn("Failed to compute file checksum, proceeding with transcription", "file", queueItem.FilePath, "error", err)
-	} else {
-		settingsHash := w.db.ComputeSettingsHash(cfg)
-		needsTranscription, err := w.db.NeedsTranscription(w.ctx, queueItem.FilePath, fileChecksum, settingsHash)
-		if err != nil {
-			w.log.Warn("Failed to check transcription status, proceeding with transcription", "file", queueItem.FilePath, "error", err)
-		} else if !needsTranscription {
-			// Transcription exists and is up to date, retrieve it
-			transcription, err := w.db.GetTranscription(w.ctx, queueItem.FilePath)
-			if err != nil {
-				w.log.Warn("Failed to retrieve existing transcription, proceeding with new transcription", "file", queueItem.FilePath, "error", err)
-			} else {
-				w.log.Info("Using existing transcription", "file", queueItem.FilePath, "word_count", transcription.WordCount)
-				return transcription.TranscriptionText, nil
+// processTranscript chunks a transcript, obtains embeddings, and stores them
+// as transcript_chunks rows.
+//
+// Chunking strategy:
+//   - If the transcript has segments (WhisperX output), accumulate whole
+//     segments until the token budget (cfg.ChunkSize) is reached. The chunk
+//     gets Chunk.StartSec/EndSec from the first/last segment in the window
+//     and Speaker set to the dominant speaker across those segments.
+//   - If Segments is empty (legacy or missing diarization data), fall back
+//     to raw-text token chunking with zero timestamps and no speaker.
+func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
+	if t.RawText == "" {
+		return fmt.Errorf("transcript %s has empty raw text, skipping", t.ID)
+	}
+
+	w.log.Info("embedding transcript", "file", t.FilePath, "transcript_id", t.ID)
+	start := time.Now()
+
+	chunkSize := cfg.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 512
+	}
+
+	var chunks []db.Chunk
+
+	if len(t.Segments) == 0 {
+		// Fallback: raw-text chunking with zero timestamps.
+		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
+			"transcript_id", t.ID)
+		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
+		if len(texts) == 0 {
+			return fmt.Errorf("no chunks produced for transcript %s", t.ID)
+		}
+		chunks = make([]db.Chunk, len(texts))
+		for i, text := range texts {
+			chunks[i] = db.Chunk{
+				TranscriptID: t.ID,
+				FilePath:     t.FilePath,
+				ChunkIndex:   i,
+				StartSec:     0,
+				EndSec:       0,
+				Text:         text,
+				// Speaker remains nil
 			}
 		}
-	}
-
-	transcriber := transcribe.NewTranscriber(cfg)
-	textFilePath, err := transcriber.TranscribeAudio(w.ctx, queueItem.FilePath, fileMeta)
-	if err != nil {
-		baseErr := fmt.Sprintf("Transcription failed for %q (Chapter %q)",
-			queueItem.FilePath, fileMeta.Chapter)
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			w.log.Error("Transcription process error",
-				"file", queueItem.FilePath,
-				"chapter", fileMeta.Chapter,
-				"exit_code", exitErr.ExitCode(),
-				"system_error", exitErr.Sys(),
-				"error", err)
-		}
-		return "", fmt.Errorf("%s: %w", baseErr, err)
-	}
-
-	content, err := OpenFile(textFilePath)
-	if err != nil {
-		w.log.Error("Failed to read output file",
-			"file", textFilePath,
-			"chapter", fileMeta.Chapter,
-			"title", queueItem.Metadata.Title,
-			"error", err)
-		return "", fmt.Errorf("failed to read output file %q: %w", textFilePath, err)
-	}
-
-	// Clean up the temporary Yap output file since we now save raw text via FileManager
-	if err := os.Remove(textFilePath); err != nil {
-		w.log.Warn("Failed to clean up temporary transcription file", "file", textFilePath, "error", err)
-		// Don't fail the entire process for cleanup errors
 	} else {
-		w.log.Debug("Cleaned up temporary transcription file", "file", textFilePath)
-	}
-
-	// Calculate processing duration
-	endTime := time.Now()
-	processingDuration := endTime.Sub(startTime)
-	processingDurationMs := processingDuration.Milliseconds()
-
-	// Count words in transcription
-	wordCount := w.countWords(content)
-
-	// Store raw transcription in database
-	if fileChecksum != "" {
-		settingsHash := w.db.ComputeSettingsHash(cfg)
-		err = w.db.StoreTranscription(w.ctx, queueItem.FilePath, fileChecksum, settingsHash, content, fileSize, wordCount, processingDurationMs)
-		if err != nil {
-			w.log.Error("Failed to store transcription in database",
-				"file", queueItem.FilePath,
-				"error", err)
-			// Don't fail the entire process, just log the error
-		} else {
-			w.log.Debug("Stored raw transcription",
-				"file", queueItem.FilePath,
-				"word_count", wordCount,
-				"duration_ms", processingDurationMs)
+		// Preferred path: accumulate whole segments until the token budget is
+		// exhausted, then emit a chunk with accurate timestamps and speaker.
+		chunks = buildChunksFromSegments(t, chunkSize)
+		if len(chunks) == 0 {
+			return fmt.Errorf("no chunks produced from segments for transcript %s", t.ID)
 		}
 	}
 
-	return content, nil
+	// Collect texts for batch embedding.
+	texts := make([]string, len(chunks))
+	for i, c := range chunks {
+		texts[i] = c.Text
+	}
+
+	embeddings, err := w.db.GetEmbeddings(texts)
+	if err != nil {
+		return fmt.Errorf("get embeddings: %w", err)
+	}
+	if len(embeddings) != len(texts) {
+		return fmt.Errorf("embedding count mismatch: got %d for %d chunks", len(embeddings), len(texts))
+	}
+
+	for i := range chunks {
+		chunks[i].Embedding = embeddings[i]
+	}
+
+	if err := w.db.InsertChunks(w.ctx, chunks); err != nil {
+		return fmt.Errorf("insert chunks: %w", err)
+	}
+
+	w.log.Info("transcript embedded",
+		"file", t.FilePath,
+		"transcript_id", t.ID,
+		"chunks", len(chunks),
+		"duration", time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
+// buildChunksFromSegments accumulates WhisperX segments into token-budgeted
+// chunks, preserving start/end timestamps and dominant speaker.
+func buildChunksFromSegments(t *db.Transcript, chunkSize int) []db.Chunk {
+	var chunks []db.Chunk
+	chunkIdx := 0
+
+	// We accumulate segment texts until the estimated token count reaches chunkSize.
+	// We use a rough word-based approximation (≈ 1.3 tokens/word) to avoid importing
+	// the full tiktoken library inside the segment loop.
+	var (
+		accText      string
+		accStart     float64
+		accEnd       float64
+		speakerCount map[string]int
+	)
+
+	resetAcc := func(seg db.Segment) {
+		accText = seg.Text
+		accStart = seg.Start
+		accEnd = seg.End
+		speakerCount = make(map[string]int)
+		if seg.Speaker != nil {
+			speakerCount[*seg.Speaker]++
+		}
+	}
+
+	flushChunk := func() {
+		if accText == "" {
+			return
+		}
+		var dominant *string
+		if len(speakerCount) > 0 {
+			best := ""
+			bestN := 0
+			for sp, n := range speakerCount {
+				if n > bestN || (n == bestN && sp > best) {
+					best = sp
+					bestN = n
+				}
+			}
+			cp := best
+			dominant = &cp
+		}
+		chunks = append(chunks, db.Chunk{
+			TranscriptID: t.ID,
+			FilePath:     t.FilePath,
+			ChunkIndex:   chunkIdx,
+			StartSec:     accStart,
+			EndSec:       accEnd,
+			Text:         accText,
+			Speaker:      dominant,
+		})
+		chunkIdx++
+	}
+
+	first := true
+	for _, seg := range t.Segments {
+		if first {
+			resetAcc(seg)
+			first = false
+			continue
+		}
+
+		// Check whether the combined text would exceed the token budget.
+		// If the chunker splits the combined text into >1 chunk it is over budget.
+		combined := accText + " " + seg.Text
+		overBudget := len(chunker.Chunker(combined, chunkSize, chunker.SplitTypeToken)) > 1
+
+		if overBudget {
+			flushChunk()
+			resetAcc(seg)
+			continue
+		}
+
+		// Accumulate.
+		accText = combined
+		accEnd = seg.End
+		if seg.Speaker != nil {
+			speakerCount[*seg.Speaker]++
+		}
+	}
+	flushChunk()
+
+	return chunks
+}
+
+// Stop signals the worker to shut down and waits for it to finish.
 func (w *Worker) Stop() {
 	w.cancel()
 	<-w.done
 }
 
-// countWords counts the number of words in a string
-func (w *Worker) countWords(content string) int {
-	re := regexp.MustCompile(`\S+`)
-	return len(re.FindAllString(content, -1))
-}
-
-func OpenFile(filePath string) (string, error) {
-	// #nosec G304 - filePath is controlled by caller and validated elsewhere
-	file, err := os.Open(filepath.Clean(filePath))
-	if err != nil {
-		return "", fmt.Errorf("opening file: %v", err)
+// sleep sleeps for d while respecting ctx cancellation.
+func (w *Worker) sleep(d time.Duration) {
+	select {
+	case <-time.After(d):
+	case <-w.ctx.Done():
 	}
-	defer file.Close()
-
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return "", fmt.Errorf("reading file: %v", err)
-	}
-
-	content := string(data)
-
-	return content, nil
 }

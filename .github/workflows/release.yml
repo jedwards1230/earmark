@@ -1,116 +1,82 @@
+# Release orchestrator — dispatched manually with a semver label or via push to main.
+# Calls release-go.yml and/or release-chart.yml based on inputs.
+
 name: Release
 
+run-name: >-
+  Release${{ inputs.release_go && ' Go' || '' }}${{ inputs.release_chart && ' Chart' || '' }}
+
 on:
-    workflow_dispatch:
-        inputs:
-            version_type:
-                description: "Version bump type"
-                required: true
-                default: "patch"
-                type: choice
-                options:
-                    - major
-                    - minor
-                    - patch
-            custom_version:
-                description: "Custom version (optional, overrides version_type)"
-                required: false
-                type: string
-            draft:
-                description: "Create as draft release"
-                required: false
-                default: false
-                type: boolean
-            prerelease:
-                description: "Mark as prerelease"
-                required: false
-                default: false
-                type: boolean
+  # Auto-trigger: PR merged to main with a semver:* label calls this workflow.
+  workflow_dispatch:
+    inputs:
+      # ── Go Server ────────────────────────────────────────────────
+      release_go:
+        description: "Release Go server image"
+        type: boolean
+        default: false
+      go_bump_type:
+        description: "Go version bump"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      go_version_override:
+        description: "Go version override (e.g. 1.2.3)"
+        required: false
+        type: string
+
+      # ── Helm Chart ───────────────────────────────────────────────
+      release_chart:
+        description: "Release Helm chart"
+        type: boolean
+        default: false
+      chart_bump_type:
+        description: "Chart version bump"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      chart_version_override:
+        description: "Chart version override (e.g. 0.2.0)"
+        required: false
+        type: string
 
 permissions:
-    contents: write
-    pull-requests: write
+  contents: write
+  packages: write
+  id-token: write
 
 jobs:
-    calculate-version:
-        uses: jedwards1230/release-workflows/.github/workflows/calculate-version.yml@v0
-        with:
-            version_type: ${{ github.event.inputs.version_type }}
-            custom_version: ${{ github.event.inputs.custom_version }}
-            working_directory: "."
-        secrets: inherit
+  # Go release runs first; chart waits so it can auto-detect the new go-v* tag
+  # for appVersion.  If Go is skipped, chart runs immediately.
+  release-go:
+    if: ${{ inputs.release_go }}
+    uses: ./.github/workflows/release-go.yml
+    with:
+      bump_type: ${{ inputs.go_bump_type }}
+      version_override: ${{ inputs.go_version_override }}
 
-    build:
-        needs: calculate-version
-        runs-on: ubuntu-latest
-        outputs:
-            artifacts-built: ${{ steps.check-artifacts.outputs.artifacts-built }}
+  release-chart:
+    if: ${{ !failure() && !cancelled() && inputs.release_chart }}
+    needs: [release-go]
+    uses: ./.github/workflows/release-chart.yml
+    with:
+      bump_type: ${{ inputs.chart_bump_type }}
+      version_override: ${{ inputs.chart_version_override }}
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
-              with:
-                  fetch-depth: 0
-                  token: ${{ secrets.GITHUB_TOKEN }}
-
-            - name: Set up Go
-              uses: actions/setup-go@v5
-              with:
-                  go-version: "1.24"
-
-            - name: Build release binaries
-              env:
-                  VERSION: ${{ needs.calculate-version.outputs.new_version }}
-              run: |
-                  echo "Building with version: ${VERSION}"
-
-                  # Create dist directory
-                  mkdir -p dist
-
-                  # Build for ARM macOS only (Yap requires macOS hardware)
-                  GOOS="darwin"
-                  GOARCH="arm64"
-                  output_name="lil-whisper-${GOOS}-${GOARCH}"
-
-                  echo "Building for ${GOOS}/${GOARCH}..."
-
-                  GOOS="${GOOS}" GOARCH="${GOARCH}" VERSION="${VERSION}" \
-                    OUTPUT="dist/${output_name}" ./scripts/build.sh
-
-                  # List built files
-                  ls -la dist/
-
-            - name: Check if artifacts were built
-              id: check-artifacts
-              run: |
-                  if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
-                    echo "artifacts-built=true" >> $GITHUB_OUTPUT
-                    echo "✅ Artifacts built successfully"
-                  else
-                    echo "artifacts-built=false" >> $GITHUB_OUTPUT
-                    echo "❌ No artifacts found"
-                  fi
-
-            - name: Upload artifacts for release
-              if: steps.check-artifacts.outputs.artifacts-built == 'true'
-              uses: actions/upload-artifact@v4
-              with:
-                  name: release-binaries
-                  path: dist/
-                  retention-days: 1
-
-    release:
-        needs: [calculate-version, build]
-        uses: jedwards1230/release-workflows/.github/workflows/generic-release.yml@v0
-        with:
-            new_version: ${{ needs.calculate-version.outputs.new_version }}
-            current_version: ${{ needs.calculate-version.outputs.current_version }}
-            changelog_content: ${{ needs.calculate-version.outputs.changelog_content }}
-            changelog_artifact_name: changelog-${{ needs.calculate-version.outputs.new_version }}
-            draft: ${{ github.event.inputs.draft == 'true' }}
-            prerelease: ${{ github.event.inputs.prerelease == 'true' }}
-            create_release: true
-            artifacts_pattern: ${{ needs.build.outputs.artifacts-built == 'true' && 'dist/*' || '' }}
-            update_badge_file: "README.md"
-            working_directory: "."
-        secrets: inherit
+  summary:
+    if: ${{ always() && !cancelled() }}
+    needs: [release-go, release-chart]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Requested | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Go Server | ${{ inputs.release_go && '✅' || '—' }} | ${{ needs.release-go.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Helm Chart | ${{ inputs.release_chart && '✅' || '—' }} | ${{ needs.release-chart.result }} |" >> $GITHUB_STEP_SUMMARY

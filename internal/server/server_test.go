@@ -34,7 +34,7 @@ func generateSearchResults(count int) []db.SearchResultWithMetadata {
 	results := make([]db.SearchResultWithMetadata, count)
 	for i := 0; i < count; i++ {
 		results[i] = db.SearchResultWithMetadata{
-			ID:            i + 1,
+			ID:            fmt.Sprintf("chunk-%d", i+1),
 			Content:       fmt.Sprintf("Test content %d", i+1),
 			Author:        fmt.Sprintf("Author %d", i+1),
 			Title:         fmt.Sprintf("Book %d", i+1),
@@ -501,7 +501,7 @@ func TestStart(t *testing.T) {
 
 	// Start the server
 	srv := server.Start()
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	// Verify server configuration
 	assert.Equal(t, ":8080", srv.Addr)
@@ -583,7 +583,7 @@ func TestSearchHandlerIntegration(t *testing.T) {
 	// Make actual HTTP request
 	resp, err := http.Get(ts.URL + "?q=" + url.QueryEscape("integration test"))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Verify response
 	assert.Equal(t, http.StatusOK, resp.StatusCode)

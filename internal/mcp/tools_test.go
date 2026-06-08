@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
@@ -60,7 +61,7 @@ func TestHandleSemanticSearch(t *testing.T) {
 			},
 			mockResults: []db.SearchResultWithMetadata{
 				{
-					ID:            1,
+					ID:            "chunk-1",
 					Content:       "The dragon soared majestically",
 					Author:        "Fantasy Author",
 					Title:         "Dragon Tales",
@@ -102,7 +103,8 @@ func TestHandleSemanticSearch(t *testing.T) {
 					},
 				},
 			},
-			mockResults: []db.SearchResultWithMetadata{}, mockError: errors.New("database connection failed"),
+			mockResults:   []db.SearchResultWithMetadata{},
+			mockError:     errors.New("database connection failed"),
 			expectedError: true,
 			expectedText:  "Search failed: database connection failed",
 		},
@@ -113,7 +115,8 @@ func TestHandleSemanticSearch(t *testing.T) {
 					Name:      "semantic_search_audiobooks",
 					Arguments: map[string]interface{}{},
 				},
-			}, mockResults: nil,
+			},
+			mockResults:   nil,
 			mockError:     nil,
 			expectedError: true,
 			expectedText:  "Missing or invalid query parameter:",
@@ -124,7 +127,6 @@ func TestHandleSemanticSearch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mockDB := &MockDBInterface{}
 
-			// Only set up mock expectation if we have a valid query
 			args := tt.request.Params.Arguments.(map[string]interface{})
 			if query, ok := args["query"].(string); ok && query != "" {
 				expectedThreshold := 0.3 // default
@@ -181,7 +183,8 @@ func TestHandleTextSearch(t *testing.T) {
 			name: "successful text search",
 			request: mcp.CallToolRequest{
 				Params: mcp.CallToolParams{
-					Name: "text_search_audiobooks", Arguments: map[string]interface{}{
+					Name: "text_search_audiobooks",
+					Arguments: map[string]interface{}{
 						"query": "exact phrase",
 						"limit": 15.0,
 					},
@@ -189,7 +192,7 @@ func TestHandleTextSearch(t *testing.T) {
 			},
 			mockResults: []db.SearchResultWithMetadata{
 				{
-					ID:            1,
+					ID:            "chunk-2",
 					Content:       "This contains the exact phrase we're looking for",
 					Author:        "Text Author",
 					Title:         "Text Book",
@@ -197,7 +200,7 @@ func TestHandleTextSearch(t *testing.T) {
 					ChapterIndex:  1,
 					ChapterTitle:  "Chapter 1",
 					ChunkIndex:    2,
-					Similarity:    0.0, // Text search doesn't use similarity
+					Similarity:    0.0,
 					TotalChunks:   20,
 					TotalChapters: 3,
 				},
@@ -282,9 +285,8 @@ func TestHandleBrowseLibrary(t *testing.T) {
 			},
 			mockEntries: []db.HierarchicalEntry{
 				{
-					Author:   "Test Author",
-					Title:    "Test Book",
-					Chapters: []string{"Chapter 1", "Chapter 2"},
+					FilePath:   "/books/Test Author/Test Book/chapter1.mp3",
+					ChunkCount: 10,
 				},
 			},
 			mockError:     nil,
@@ -303,19 +305,17 @@ func TestHandleBrowseLibrary(t *testing.T) {
 			},
 			mockEntries: []db.HierarchicalEntry{
 				{
-					Author:   "J.R.R. Tolkien",
-					Title:    "The Hobbit",
-					Chapters: []string{"An Unexpected Party"},
+					FilePath:   "/books/J.R.R. Tolkien/The Hobbit/ch1.mp3",
+					ChunkCount: 5,
 				},
 				{
-					Author:   "Brandon Sanderson",
-					Title:    "The Way of Kings",
-					Chapters: []string{"Prelude"},
+					FilePath:   "/books/Brandon Sanderson/The Way of Kings/ch1.mp3",
+					ChunkCount: 8,
 				},
 			},
 			mockError:     nil,
 			expectedError: false,
-			expectedText:  "J.R.R. Tolkien",
+			expectedText:  "📚 **Audiobook Library**",
 		},
 		{
 			name: "database error",
@@ -324,7 +324,8 @@ func TestHandleBrowseLibrary(t *testing.T) {
 					Name:      "browse_audiobook_library",
 					Arguments: map[string]interface{}{},
 				},
-			}, mockEntries: []db.HierarchicalEntry{},
+			},
+			mockEntries:   []db.HierarchicalEntry{},
 			mockError:     errors.New("database error"),
 			expectedError: true,
 			expectedText:  "Failed to browse library: database error",
@@ -374,35 +375,35 @@ func TestHandleGetContext(t *testing.T) {
 				Params: mcp.CallToolParams{
 					Name: "get_chunk_context",
 					Arguments: map[string]interface{}{
-						"chunkID":       "Christopher Paolini_Eragon_1_5",
+						"chunkID":       "chunk-5",
 						"contextWindow": 2,
 					},
 				},
 			},
 			mockResults: []db.SearchResultWithMetadata{
 				{
-					ID:         10,
+					ID:         fmt.Sprintf("chunk-%d", 10),
 					Content:    "Context before target chunk",
 					Author:     "Christopher Paolini",
 					Title:      "Eragon",
 					ChunkIndex: 4,
-					ChunkID:    "Christopher Paolini_Eragon_1_4",
+					ChunkID:    "chunk-10",
 				},
 				{
-					ID:         11,
+					ID:         fmt.Sprintf("chunk-%d", 11),
 					Content:    "Target chunk content",
 					Author:     "Christopher Paolini",
 					Title:      "Eragon",
 					ChunkIndex: 5,
-					ChunkID:    "Christopher Paolini_Eragon_1_5",
+					ChunkID:    "chunk-11",
 				},
 				{
-					ID:         12,
+					ID:         fmt.Sprintf("chunk-%d", 12),
 					Content:    "Context after target chunk",
 					Author:     "Christopher Paolini",
 					Title:      "Eragon",
 					ChunkIndex: 6,
-					ChunkID:    "Christopher Paolini_Eragon_1_6",
+					ChunkID:    "chunk-12",
 				},
 			},
 			mockError:     nil,
@@ -430,7 +431,7 @@ func TestHandleGetContext(t *testing.T) {
 				Params: mcp.CallToolParams{
 					Name: "get_chunk_context",
 					Arguments: map[string]interface{}{
-						"chunkID":       "Christopher Paolini_Eragon_1_5",
+						"chunkID":       "chunk-5",
 						"contextWindow": 2,
 					},
 				},
@@ -444,23 +445,17 @@ func TestHandleGetContext(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create mock database
 			mockDB := new(MockDBInterface)
 
-			// Set up expectations
 			if tt.mockResults != nil || tt.mockError != nil {
 				chunkID := tt.request.GetString("chunkID", "")
 				contextWindow := tt.request.GetInt("contextWindow", 2)
 				mockDB.On("GetChunkContext", mock.Anything, chunkID, contextWindow).Return(tt.mockResults, tt.mockError)
 			}
 
-			// Create tool handlers
 			handlers := NewToolHandlers(mockDB)
-
-			// Execute the handler
 			result, err := handlers.handleGetContext(context.Background(), tt.request)
 
-			// Verify results
 			if tt.expectedError {
 				assert.NotNil(t, result)
 				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
@@ -470,7 +465,6 @@ func TestHandleGetContext(t *testing.T) {
 				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
 			}
 
-			// Verify mock expectations
 			mockDB.AssertExpectations(t)
 		})
 	}

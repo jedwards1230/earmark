@@ -1,0 +1,55 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/jedwards1230/lilbro-whisper
+  # tag defaults to Chart.appVersion when unset
+  tag: ""
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8081
+
+ingress:
+  enabled: true
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-redirect-lan@kubernetescrd
+  host: audiobooks-kb.lilbro.cloud
+  tlsSecretName: audiobooks-kb-tls
+
+# Existing secret containing DATABASE_URL (created by CNPG OnePasswordItem sync).
+# The chart references this secret by name; it does not create it.
+# Default matches the CNPG-generated credentials secret for lilbro-whisper-pg.
+databaseSecret:
+  # Name of the K8s Secret that holds the DATABASE_URL key.
+  name: lilbro-whisper-pg-credentials
+  # Key within the secret that contains the PostgreSQL DSN.
+  key: DATABASE_URL
+
+# NFS books PVC (ReadOnlyMany) — must already exist in this namespace.
+# See CONTRACT.md §2.6 for the static PV + PVC pattern.
+booksPvcName: books-ro
+
+config:
+  embeddingsBaseURL: "http://ollama.external-services:11434/v1"
+  embeddingsModel: "nomic-embed-text"
+  booksDir: "/books"
+  mcpHttpAddr: ":8081"
+  staleJobTimeout: "30m"
+  chunkSize: "512"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# AMD64 nodes only (linux-1/2/3/4 all qualify; no role selector needed).
+nodeSelector:
+  kubernetes.io/arch: amd64
+
+tolerations: []

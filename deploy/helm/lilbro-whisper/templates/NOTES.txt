@@ -1,0 +1,18 @@
+lilbro-whisper deployed successfully.
+
+Service:  {{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}
+MCP path: http://{{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp
+{{- if .Values.ingress.enabled }}
+Ingress:  https://{{ .Values.ingress.host }}
+{{- end }}
+
+Prerequisites (must exist in namespace {{ .Release.Namespace }}):
+  - Secret "{{ .Values.databaseSecret.name }}" with key "{{ .Values.databaseSecret.key }}"
+    (created by the 1Password operator from k8s-lilbro-whisper-pg-credentials)
+  - PVC "{{ .Values.booksPvcName }}" (ReadOnlyMany, bound to NFS books export)
+
+mcp-proxy configmap entry:
+  "audiobooks": {
+    "url": "http://{{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp",
+    "transportType": "streamable-http"
+  }

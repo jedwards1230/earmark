@@ -1,0 +1,17 @@
+deploy/
+.git/
+.github/
+.vscode/
+*.md
+docs/
+scripts/
+worktrees/
+compose.yaml
+Makefile
+.env
+.env.*
+*.test
+*.out
+lil-whisper
+lil-whisper-*
+dist/

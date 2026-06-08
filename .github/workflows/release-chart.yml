@@ -1,0 +1,159 @@
+# Release Helm Chart — packages deploy/helm/lilbro-whisper and pushes it to
+# oci://ghcr.io/jedwards1230/charts/lilbro-whisper.
+# Called by release.yml or dispatched directly.
+
+name: Release Helm Chart
+
+run-name: "Release Chart ${{ inputs.version_override || format('{0} bump', inputs.bump_type) }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Chart version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      version_override:
+        description: "Override chart version (e.g. 0.2.0) — ignores bump_type"
+        required: false
+        type: string
+      go_version_override:
+        description: "Override appVersion (default: auto-detect latest go-v* tag)"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      bump_type:
+        type: string
+        default: "patch"
+      version_override:
+        type: string
+        default: ""
+      go_version_override:
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  release:
+    name: Release Chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute next chart version
+        id: version
+        run: |
+          LATEST_TAG=$(git tag -l 'chart-v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1 || true)
+
+          if [ -z "$LATEST_TAG" ]; then
+            MAJOR=0; MINOR=0; PATCH=0
+            echo "No existing chart-v tags, starting from 0.0.0"
+          else
+            LATEST_VERSION="${LATEST_TAG#chart-v}"
+            MAJOR=$(echo "$LATEST_VERSION" | cut -d. -f1)
+            MINOR=$(echo "$LATEST_VERSION" | cut -d. -f2)
+            PATCH=$(echo "$LATEST_VERSION" | cut -d. -f3)
+            echo "Latest chart tag: $LATEST_TAG"
+          fi
+
+          OVERRIDE="${{ inputs.version_override }}"
+          if [ -n "$OVERRIDE" ]; then
+            if ! echo "$OVERRIDE" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Invalid version format '$OVERRIDE'. Expected: X.Y.Z"
+              exit 1
+            fi
+            NEXT_VERSION="$OVERRIDE"
+          else
+            case "${{ inputs.bump_type }}" in
+              major) NEXT_VERSION="$((MAJOR + 1)).0.0" ;;
+              minor) NEXT_VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+              patch) NEXT_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            esac
+          fi
+
+          NEXT_TAG="chart-v${NEXT_VERSION}"
+
+          if git rev-parse "$NEXT_TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $NEXT_TAG already exists"
+            exit 1
+          fi
+
+          echo "version=${NEXT_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${NEXT_TAG}" >> $GITHUB_OUTPUT
+          echo "Next chart: $NEXT_VERSION (tag: $NEXT_TAG)"
+
+      - name: Detect Go server appVersion
+        id: appversion
+        run: |
+          OVERRIDE="${{ inputs.go_version_override }}"
+          if [ -n "$OVERRIDE" ]; then
+            echo "app_version=${OVERRIDE}" >> $GITHUB_OUTPUT
+            echo "Using override appVersion: $OVERRIDE"
+          else
+            LATEST_GO_TAG=$(git tag -l 'go-v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1 || true)
+            if [ -n "$LATEST_GO_TAG" ]; then
+              APP_VERSION="${LATEST_GO_TAG#go-v}"
+              echo "app_version=${APP_VERSION}" >> $GITHUB_OUTPUT
+              echo "Auto-detected appVersion from $LATEST_GO_TAG: $APP_VERSION"
+            else
+              echo "app_version=0.0.0" >> $GITHUB_OUTPUT
+              echo "No go-v tags found, using appVersion: 0.0.0"
+            fi
+          fi
+
+      - name: Update Chart.yaml
+        run: |
+          yq -i ".version = \"${{ steps.version.outputs.version }}\"" deploy/helm/lilbro-whisper/Chart.yaml
+          yq -i ".appVersion = \"${{ steps.appversion.outputs.app_version }}\"" deploy/helm/lilbro-whisper/Chart.yaml
+          echo "Updated Chart.yaml:"
+          cat deploy/helm/lilbro-whisper/Chart.yaml
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deploy/helm/lilbro-whisper/Chart.yaml
+          git commit -m "chore(chart): release ${{ steps.version.outputs.version }} [skip ci]"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Chart ${{ steps.version.outputs.version }}"
+          git push origin main "${{ steps.version.outputs.tag }}"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package and push
+        run: |
+          helm package deploy/helm/lilbro-whisper/
+          helm push lilbro-whisper-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "Chart ${{ steps.version.outputs.version }}" \
+            --notes "Helm chart version ${{ steps.version.outputs.version }} with appVersion ${{ steps.appversion.outputs.app_version }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Write summary
+        run: |
+          echo "## Released Chart ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Chart Version | \`${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Version | \`${{ steps.appversion.outputs.app_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ steps.version.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| OCI | \`oci://ghcr.io/${{ github.repository_owner }}/charts/lilbro-whisper:${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY

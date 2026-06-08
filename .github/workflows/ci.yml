@@ -1,170 +1,127 @@
+# CI — build + test + lint on every push and PR.
+# Runs on linux/amd64; the darwin-only guard in scripts/build.sh is bypassed
+# here because we use a pure CGO_ENABLED=0 go build, not the Makefile path.
+
 name: CI
 
 on:
-    push:
-        branches: [main, develop]
-    pull_request:
-        branches: [main]
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
 
 permissions:
-    contents: read
+  contents: read
 
 jobs:
-    test:
-        name: Test
-        runs-on: ubuntu-latest
+  test:
+    name: Test
+    runs-on: ubuntu-latest
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
+    steps:
+      - uses: actions/checkout@v6
 
-            - name: Set up Go
-              uses: actions/setup-go@v5
-              with:
-                  go-version: "1.24"
+      - uses: actions/setup-go@v6.2.0
+        with:
+          go-version-file: go.mod
 
-            - name: Cache Go modules (test)
-              uses: actions/cache@v4
-              with:
-                  path: |
-                      ~/.cache/go-build
-                      ~/go/pkg/mod
-                  key: ${{ runner.os }}-test-go-${{ hashFiles('**/go.sum') }}
-                  restore-keys: |
-                      ${{ runner.os }}-test-go-
-                      ${{ runner.os }}-go-
+      - name: Download dependencies
+        run: go mod download
 
-            - name: Download dependencies
-              run: |
-                  # Retry logic for go mod download
-                  for i in {1..3}; do
-                    if go mod download; then
-                      break
-                    fi
-                    echo "Attempt $i failed, retrying..."
-                    sleep 2
-                  done
+      - name: Verify dependencies
+        run: go mod verify
 
-            - name: Verify dependencies
-              run: go mod verify
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
 
-            - name: Run tests
-              run: go test -v -race -coverprofile=coverage.out ./...
+      - name: Display coverage summary
+        run: go tool cover -func=coverage.out | tail -1
 
-            - name: Display coverage summary
-              run: go tool cover -func=coverage.out | tail -1
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
 
-    lint:
-        name: Lint
-        runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
+      - uses: actions/setup-go@v6.2.0
+        with:
+          go-version-file: go.mod
 
-            - name: Set up Go
-              uses: actions/setup-go@v5
-              with:
-                  go-version: "1.24"
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          args: --timeout=5m
 
-            - name: Cache Go modules (lint)
-              uses: actions/cache@v4
-              with:
-                  path: |
-                      ~/.cache/go-build
-                      ~/go/pkg/mod
-                  key: ${{ runner.os }}-lint-go-${{ hashFiles('**/go.sum') }}
-                  restore-keys: |
-                      ${{ runner.os }}-lint-go-
-                      ${{ runner.os }}-go-
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
 
-            - name: Run golangci-lint
-              uses: golangci/golangci-lint-action@v6
-              with:
-                  version: latest
-                  args: --timeout=5m
+    steps:
+      - uses: actions/checkout@v6
 
-    build:
-        name: Build
-        runs-on: ubuntu-latest
-        needs: [test, lint]
+      - uses: actions/setup-go@v6.2.0
+        with:
+          go-version-file: go.mod
 
-        strategy:
-            matrix:
-                # macOS only due to Yap (Apple speech recognition) dependency
-                goos: [darwin]
-                goarch: [amd64, arm64]
+      - name: Run Gosec Security Scanner
+        # Install + run via the workflow's Go toolchain rather than the gosec
+        # Docker action, whose bundled Go (1.24.x, GOTOOLCHAIN=local) cannot load
+        # a module that requires Go 1.25.11.
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.5
+          gosec ./...
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
-              with:
-                  fetch-depth: 0
+      - name: Run govulncheck
+        env:
+          # govulncheck@latest is built with a newer Go than this module pins
+          # (go.mod toolchain). Allow fetching the toolchain to build the tool;
+          # the scan itself still analyzes the module at its own Go version.
+          GOTOOLCHAIN: auto
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
-            - name: Set up Go
-              uses: actions/setup-go@v5
-              with:
-                  go-version: "1.24"
+  build:
+    name: Build (linux/amd64)
+    runs-on: ubuntu-latest
+    needs: [test, lint]
 
-            - name: Cache Go modules (build-${{ matrix.goos }}-${{ matrix.goarch }})
-              uses: actions/cache@v4
-              with:
-                  path: |
-                      ~/.cache/go-build
-                      ~/go/pkg/mod
-                  key: ${{ runner.os }}-build-${{ matrix.goos }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}
-                  restore-keys: |
-                      ${{ runner.os }}-build-${{ matrix.goos }}-${{ matrix.goarch }}-go-
-                      ${{ runner.os }}-build-go-
-                      ${{ runner.os }}-go-
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-            - name: Download dependencies
-              run: go mod download
+      - uses: actions/setup-go@v6.2.0
+        with:
+          go-version-file: go.mod
 
-            - name: Build binary
-              run: |
-                  output_name="lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}"
-                  GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
-                    OUTPUT="${output_name}" ./scripts/build.sh
+      - name: Build binary (linux/amd64)
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-s -w \
+              -X 'github.com/jedwards1230/lil-whisper/internal/version.Version=dev' \
+              -X 'github.com/jedwards1230/lil-whisper/internal/version.Commit=${COMMIT}' \
+              -X 'github.com/jedwards1230/lil-whisper/internal/version.BuildTime=${BUILD_TIME}'" \
+            -o lil-whisper-linux-amd64 \
+            .
 
-            - name: Upload build artifacts
-              uses: actions/upload-artifact@v4
-              with:
-                  name: lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}
-                  path: lil-whisper-${{ matrix.goos }}-${{ matrix.goarch }}*
-                  retention-days: 7
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lil-whisper-linux-amd64
+          path: lil-whisper-linux-amd64
+          retention-days: 7
 
-    security:
-        name: Security Scan
-        runs-on: ubuntu-latest
-        continue-on-error: true
-
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
-
-            - name: Set up Go
-              uses: actions/setup-go@v5
-              with:
-                  go-version: "1.24"
-
-            - name: Cache Go modules (security)
-              uses: actions/cache@v4
-              with:
-                  path: |
-                      ~/.cache/go-build
-                      ~/go/pkg/mod
-                  key: ${{ runner.os }}-security-go-${{ hashFiles('**/go.sum') }}
-                  restore-keys: |
-                      ${{ runner.os }}-security-go-
-                      ${{ runner.os }}-go-
-
-            - name: Run Gosec Security Scanner
-              uses: securego/gosec@v2.22.5
-              with:
-                  args: "./..."
-
-            - name: Run govulncheck
-              run: |
-                  go install golang.org/x/vuln/cmd/govulncheck@latest
-                  govulncheck ./...
+      - name: Write summary
+        run: |
+          echo "## CI Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build (linux/amd64) | passed |" >> $GITHUB_STEP_SUMMARY

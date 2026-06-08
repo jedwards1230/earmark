@@ -65,7 +65,7 @@ func TestRootCommand(t *testing.T) {
 			err := testRootCmd.Execute()
 
 			// Restore stdout/stderr
-			w.Close()
+			_ = w.Close()
 			os.Stdout = oldStdout
 			os.Stderr = oldStderr
 

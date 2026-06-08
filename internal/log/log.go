@@ -143,10 +143,10 @@ func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
 	var logLine strings.Builder
 
 	// Component name with subtle styling
-	logLine.WriteString(fmt.Sprintf("%s[%s]%s", colorBlue, component, colorReset))
+	fmt.Fprintf(&logLine, "%s[%s]%s", colorBlue, component, colorReset)
 
 	// Main message
-	logLine.WriteString(fmt.Sprintf(" %s", r.Message))
+	fmt.Fprintf(&logLine, " %s", r.Message)
 
 	// Attributes if present
 	if len(attrs) > 0 {

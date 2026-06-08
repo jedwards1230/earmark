@@ -34,7 +34,7 @@ func TestGetAssetDownloadURL(t *testing.T) {
 			}`, assetName)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, response)
+			_, _ = fmt.Fprint(w, response)
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -46,15 +46,15 @@ func TestGetAssetDownloadURL(t *testing.T) {
 	// Note: We can't easily mock internal state, so this test may not work as expected
 
 	ctx := context.Background()
-	
+
 	// Test successful API call
 	url, err := getAssetDownloadURL(ctx, "v1.0.0", authManager, false)
 	if err != nil {
 		t.Errorf("Expected no error, got: %v", err)
 	}
-	
+
 	// Since we can't easily mock the GitHub API URL, this will fall back to direct URL
-	expectedFallback := fmt.Sprintf("https://github.com/%s/releases/download/v1.0.0/lil-whisper-%s-%s", 
+	expectedFallback := fmt.Sprintf("https://github.com/%s/releases/download/v1.0.0/lil-whisper-%s-%s",
 		version.GitHubRepo, runtime.GOOS, runtime.GOARCH)
 	if url != expectedFallback {
 		t.Logf("Got URL: %s", url)
@@ -71,14 +71,14 @@ func TestGetAssetDownloadURLFromAPI(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		
+
 		// Check Accept header
 		acceptHeader := r.Header.Get("Accept")
 		if acceptHeader != "application/vnd.github.v3+json" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		
+
 		if r.URL.Path == "/repos/test-owner/test-repo/releases/tags/v1.0.0" {
 			assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
 			response := fmt.Sprintf(`{
@@ -95,7 +95,7 @@ func TestGetAssetDownloadURLFromAPI(t *testing.T) {
 			}`, assetName)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, response)
+			_, _ = fmt.Fprint(w, response)
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -107,7 +107,7 @@ func TestGetAssetDownloadURLFromAPI(t *testing.T) {
 	// Note: We can't easily mock internal state, so this test may not work as expected
 
 	ctx := context.Background()
-	
+
 	// Test with mocked server (will fail because we can't change the actual GitHub API URL)
 	_, err := getAssetDownloadURLFromAPI(ctx, "v1.0.0", authManager)
 	if err == nil {
@@ -124,7 +124,7 @@ func TestGitHubAssetStruct(t *testing.T) {
 		Size:        1024,
 		URL:         "https://api.github.com/repos/test/test/releases/assets/12345",
 	}
-	
+
 	if asset.ID != 12345 {
 		t.Errorf("Expected ID 12345, got %d", asset.ID)
 	}
@@ -153,7 +153,7 @@ func TestGitHubReleaseWithAssetsStruct(t *testing.T) {
 			},
 		},
 	}
-	
+
 	if release.TagName != "v1.0.0" {
 		t.Errorf("Expected tag name 'v1.0.0', got %s", release.TagName)
 	}
@@ -168,25 +168,25 @@ func TestGitHubReleaseWithAssetsStruct(t *testing.T) {
 func TestUpdateIntegration(t *testing.T) {
 	// Test the integration between auth manager and update logic
 	authManager := auth.NewAuthManager(false)
-	
+
 	// Test that auth manager can be created and used
 	client := authManager.GetAuthenticatedClient()
 	if client == nil {
 		t.Error("Failed to get authenticated client")
 		return
 	}
-	
+
 	// Test that timeout is set correctly
 	if client.Timeout != 30*time.Second {
 		t.Errorf("Expected timeout of 30s, got %v", client.Timeout)
 	}
-	
+
 	// Test that we can create a request and add headers
 	req, err := http.NewRequest("GET", "https://api.github.com/test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// This should fail gracefully if no auth is available
 	err = authManager.AddAuthHeader(req)
 	if err != nil {
@@ -197,24 +197,24 @@ func TestUpdateIntegration(t *testing.T) {
 func TestAssetNameGeneration(t *testing.T) {
 	// Test that asset names are generated correctly
 	expectedName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
-	
+
 	// This is what the code should generate
 	actualName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
-	
+
 	if actualName != expectedName {
 		t.Errorf("Expected asset name %s, got %s", expectedName, actualName)
 	}
-	
+
 	// Test that the asset name is reasonable
 	if len(actualName) < 10 {
 		t.Errorf("Asset name seems too short: %s", actualName)
 	}
-	
+
 	// Test that it contains the expected components
 	if runtime.GOOS == "darwin" && !strings.Contains(actualName, "darwin") {
 		t.Errorf("Asset name should contain OS: %s", actualName)
 	}
-	
+
 	if runtime.GOARCH == "arm64" && !strings.Contains(actualName, "arm64") {
 		t.Errorf("Asset name should contain architecture: %s", actualName)
 	}
@@ -223,10 +223,10 @@ func TestAssetNameGeneration(t *testing.T) {
 func TestErrorHandling(t *testing.T) {
 	// Test error scenarios
 	authManager := auth.NewAuthManager(false)
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 	defer cancel()
-	
+
 	// Test timeout scenario
 	_, err := getAssetDownloadURL(ctx, "v1.0.0", authManager, false)
 	if err == nil {
@@ -263,7 +263,7 @@ func TestUpdateCommandFlags(t *testing.T) {
 			expected: map[string]bool{"force": true, "debug": true},
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("args_%v", tc.args), func(t *testing.T) {
 			// Parse flags similar to runUpdate function
@@ -271,7 +271,7 @@ func TestUpdateCommandFlags(t *testing.T) {
 			checkOnly := false
 			noConfirm := false
 			debug := false
-			
+
 			for _, arg := range tc.args {
 				switch arg {
 				case "--force":
@@ -284,7 +284,7 @@ func TestUpdateCommandFlags(t *testing.T) {
 					debug = true
 				}
 			}
-			
+
 			// Check results
 			if expected, ok := tc.expected["force"]; ok && force != expected {
 				t.Errorf("Expected force=%v, got %v", expected, force)
