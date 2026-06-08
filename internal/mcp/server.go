@@ -20,11 +20,21 @@ type MCPServer struct {
 	handlers *ToolHandlers
 	logger   log.Logger
 	db       DBInterface // kept for /readyz probe
+
+	// runnerStaleAfter is how old the runner's last heartbeat may be before the
+	// dashboard reports it as "stale" instead of "active". A claimed job alone
+	// doesn't prove the runner is alive — a crashed runner keeps a job claimed.
+	runnerStaleAfter time.Duration
 }
 
 // NewMCPServer creates a new MCP server instance
 func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	logger := log.NewLogger("mcp-server")
+
+	staleAfter := cfg.StaleJobTimeout
+	if staleAfter <= 0 {
+		staleAfter = 30 * time.Minute
+	}
 
 	// Create MCP server with all capabilities enabled
 	mcpServer := server.NewMCPServer("lilbro-whisper", "1.0.0",
@@ -91,10 +101,11 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	), handlers.handleGetContext)
 
 	return &MCPServer{
-		server:   mcpServer,
-		handlers: handlers,
-		logger:   logger,
-		db:       database,
+		server:           mcpServer,
+		handlers:         handlers,
+		logger:           logger,
+		db:               database,
+		runnerStaleAfter: staleAfter,
 	}
 }
 

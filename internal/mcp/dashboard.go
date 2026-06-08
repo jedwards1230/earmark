@@ -2,9 +2,12 @@ package mcp
 
 import (
 	"embed"
+	"fmt"
 	"html/template"
 	"net/http"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
@@ -59,32 +62,36 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
 		}
 		return *s
 	},
+	"commafy": commafy,
 }).Parse(`
+<!-- updated stamp: server-rendered so even a successful refresh shows recency -->
+<div class="updated">updated {{.RenderedAt}}</div>
+
 <!-- stat cards -->
 <div class="grid">
   <div class="card">
     <div class="card-label">Pending</div>
-    <div class="card-value blue">{{.Stats.Pending}}</div>
+    <div class="card-value blue">{{commafy .Stats.Pending}}</div>
   </div>
   <div class="card">
     <div class="card-label">Claimed</div>
-    <div class="card-value yellow">{{.Stats.Claimed}}</div>
+    <div class="card-value yellow">{{commafy .Stats.Claimed}}</div>
   </div>
   <div class="card">
     <div class="card-label">Done</div>
-    <div class="card-value green">{{.Stats.Done}}</div>
+    <div class="card-value green">{{commafy .Stats.Done}}</div>
   </div>
   <div class="card">
     <div class="card-label">Failed</div>
-    <div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{.Stats.Failed}}</div>
+    <div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{commafy .Stats.Failed}}</div>
   </div>
   <div class="card">
     <div class="card-label">Transcripts</div>
-    <div class="card-value purple">{{.Stats.Transcripts}}</div>
+    <div class="card-value purple">{{commafy .Stats.Transcripts}}</div>
   </div>
   <div class="card">
     <div class="card-label">Chunks</div>
-    <div class="card-value">{{.Stats.Chunks}}</div>
+    <div class="card-value">{{commafy .Stats.Chunks}}</div>
   </div>
 </div>
 
@@ -92,7 +99,7 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
 <div class="section">
   <div class="section-title">ASR Runner</div>
   <div class="runner-box">
-    {{if .Stats.RunnerActive}}
+    {{if and .Stats.RunnerActive (not .RunnerStale)}}
     <div class="runner-row">
       <div class="runner-item">
         <div class="runner-key">Status</div>
@@ -104,20 +111,35 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
       </div>
       <div class="runner-item">
         <div class="runner-key">Last heartbeat</div>
-        <div class="runner-val">{{formatTimePtr .Stats.LastHeartbeat}}</div>
+        <div class="runner-val" title="{{formatTimePtr .Stats.LastHeartbeat}}">{{.HeartbeatRel}}</div>
+      </div>
+    </div>
+    {{else if .RunnerStale}}
+    <div class="runner-row">
+      <div class="runner-item">
+        <div class="runner-key">Status</div>
+        <div class="runner-val"><span class="dot amber"></span>stale — last seen {{.HeartbeatRel}}</div>
+      </div>
+      <div class="runner-item">
+        <div class="runner-key">Runner ID</div>
+        <div class="runner-val">{{.Stats.RunnerID}}</div>
+      </div>
+      <div class="runner-item">
+        <div class="runner-key">Last heartbeat</div>
+        <div class="runner-val" title="{{formatTimePtr .Stats.LastHeartbeat}}">{{.HeartbeatRel}}</div>
       </div>
     </div>
     {{else}}
     <div class="runner-row">
       <div class="runner-item">
         <div class="runner-key">Status</div>
-        <div class="runner-val"><span class="dot {{if gt .Stats.Pending 0}}yellow{{else}}red{{end}}"></span>idle / not running</div>
+        <div class="runner-val"><span class="dot {{if .Empty}}grey{{else if gt .Stats.Pending 0}}yellow{{else}}red{{end}}"></span>{{if .Empty}}no jobs queued yet{{else}}idle / not running{{end}}</div>
       </div>
     </div>
     {{end}}
     {{if gt .Stats.Failed 0}}
     <div style="margin-top:10px;color:var(--red);font-size:12px;">
-      &#9888;&#xFE0F;&nbsp;{{.Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} — check recent activity below
+      &#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} — check recent activity below
     </div>
     {{end}}
   </div>
@@ -156,10 +178,75 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
 </div>
 `))
 
-// dashboardData is the template model for the refreshed fragment.
+// dashboardData is the template model for the refreshed fragment. The derived
+// fields (RunnerStale/HeartbeatRel/RenderedAt/Empty) are computed in the handler
+// since html/template can't call time.Now() to judge freshness itself.
 type dashboardData struct {
 	Stats *db.QueueStats
 	Jobs  []db.RecentJob
+
+	RunnerStale  bool   // RunnerActive but heartbeat older than runnerStaleAfter
+	HeartbeatRel string // e.g. "12s ago" / "2h ago" / "—"
+	RenderedAt   string // server render time, so a successful refresh shows recency
+	Empty        bool   // no jobs at all and no runner ever seen (fresh install)
+}
+
+// newDashboardData builds the template model, deriving freshness fields from the
+// current time so the view can distinguish a live runner from a crashed one.
+func newDashboardData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, staleAfter time.Duration) dashboardData {
+	d := dashboardData{
+		Stats:        stats,
+		Jobs:         jobs,
+		HeartbeatRel: "—",
+		RenderedAt:   now.UTC().Format("15:04:05 UTC"),
+		Empty: !stats.RunnerActive && stats.LastHeartbeat == nil &&
+			stats.Pending == 0 && stats.Claimed == 0 &&
+			stats.Done == 0 && stats.Failed == 0,
+	}
+	if stats.LastHeartbeat != nil {
+		age := now.Sub(*stats.LastHeartbeat)
+		d.HeartbeatRel = humanizeSince(age)
+		if stats.RunnerActive && age > staleAfter {
+			d.RunnerStale = true
+		}
+	}
+	return d
+}
+
+// commafy renders an integer with thousands separators (18452 -> "18,452").
+func commafy(n int) string {
+	s := strconv.Itoa(n)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte(s[i])
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
+}
+
+// humanizeSince renders a coarse, glanceable relative duration ("12s ago").
+func humanizeSince(d time.Duration) string {
+	switch {
+	case d < 0:
+		return "just now"
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours())/24)
+	}
 }
 
 // handleDashboardPage serves the full HTML shell (GET /). The "/" route is a
@@ -195,9 +282,11 @@ func (s *MCPServer) handleStatusData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	data := newDashboardData(stats, jobs, time.Now(), s.runnerStaleAfter)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	if err := fragmentTmpl.Execute(w, dashboardData{Stats: stats, Jobs: jobs}); err != nil {
+	if err := fragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("fragment render error", "error", err)
 	}
 }

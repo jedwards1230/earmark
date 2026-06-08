@@ -17,6 +17,7 @@
     --red: #f87171;
     --blue: #60a5fa;
     --purple: #c084fc;
+    --amber: #fb923c;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -70,7 +71,9 @@
   }
   .dot.green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
   .dot.yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+  .dot.amber  { background: var(--amber);  box-shadow: 0 0 6px var(--amber); }
   .dot.red    { background: var(--red);    }
+  .dot.grey   { background: var(--muted);  }
   table { width: 100%; border-collapse: collapse; }
   th {
     text-align: left;
@@ -96,19 +99,47 @@
   .badge.failed   { background: #2a0a0a; color: var(--red); }
   .file-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 360px; }
   .time-muted { color: var(--muted); font-size: 12px; }
-  .error-row { color: var(--red); font-size: 12px; }
+  .error-row {
+    color: var(--red); font-size: 12px; margin-top: 4px;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 3.2em; overflow: hidden;
+  }
+  .updated { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
   .htmx-indicator { color: var(--muted); font-size: 11px; margin-bottom: 8px; }
   #data-region { min-height: 200px; }
+  .conn-lost {
+    background: #2a0a0a; color: var(--red);
+    border: 1px solid var(--red); border-radius: 6px;
+    padding: 8px 14px; margin-bottom: 16px; font-size: 13px;
+  }
+  @media (max-width: 480px) {
+    body { padding: 12px; font-size: 13px; }
+    .file-name { max-width: 55vw; }
+  }
 </style>
 </head>
-<body>
+<!--
+  Connection-lost handling: htmx does NOT swap the fragment on a non-2xx
+  response or a network/timeout error, so without this the dashboard would
+  silently freeze on stale data. Show a banner on error, hide it on the next
+  successful refresh.
+-->
+<body
+    hx-on::response-error="document.getElementById('conn').hidden = false"
+    hx-on::send-error="document.getElementById('conn').hidden = false"
+    hx-on::timeout="document.getElementById('conn').hidden = false"
+    hx-on::after-request="if (event.detail.successful) document.getElementById('conn').hidden = true">
 <h1>lilbro-whisper</h1>
 <p class="subtitle">pipeline status dashboard &nbsp;·&nbsp; auto-refreshes every 3 s</p>
+
+<div id="conn" class="conn-lost" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 
 <div id="data-region"
      hx-get="/status/data"
      hx-trigger="load, every 3s"
-     hx-swap="innerHTML">
+     hx-swap="innerHTML"
+     hx-sync="this:replace"
+     hx-request='{"timeout": 5000}'>
   <p class="htmx-indicator">loading…</p>
 </div>
 </body>

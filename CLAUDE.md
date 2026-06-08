@@ -74,8 +74,11 @@ go run . mcp --demo     # serves http://localhost:8081/ with synthetic data
 ```
 
 `--demo` backs the dashboard with an in-memory fixture (`internal/mcp/demo.go`)
-that exercises every state — active runner, pending backlog, a failed job — so
-the page renders fully with no Postgres, no DATABASE_URL, and no ASR runner.
+so the page renders fully with no Postgres, no DATABASE_URL, and no ASR runner.
+Set `DEMO_SCENARIO` to render a specific state: `active` (default), `empty`
+(fresh install), `stale` (crashed runner — old heartbeat), or `failed` (failures
+incl. a long multi-line error). To see the connection-lost banner, open the page
+then stop the server — htmx flags the data stale instead of freezing silently.
 
 Playwright is wired for AI agents via `.claude/mcp.json` (the `playwright` MCP
 server). With the demo server running, use Playwright (MCP) to navigate to
