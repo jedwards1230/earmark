@@ -44,6 +44,30 @@ on:
         required: false
         type: string
 
+  # Callable by auto-release.yml when a PR merged to main carries a semver:*
+  # label. workflow_call does not support `type: choice`, so bump types are
+  # plain strings here (validated downstream by release-go/release-chart).
+  workflow_call:
+    inputs:
+      release_go:
+        type: boolean
+        default: false
+      go_bump_type:
+        type: string
+        default: patch
+      go_version_override:
+        type: string
+        default: ""
+      release_chart:
+        type: boolean
+        default: false
+      chart_bump_type:
+        type: string
+        default: patch
+      chart_version_override:
+        type: string
+        default: ""
+
 permissions:
   contents: write
   packages: write
