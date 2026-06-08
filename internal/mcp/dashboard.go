@@ -162,8 +162,14 @@ type dashboardData struct {
 	Jobs  []db.RecentJob
 }
 
-// handleDashboardPage serves the full HTML shell (GET /).
-func (s *MCPServer) handleDashboardPage(w http.ResponseWriter, _ *http.Request) {
+// handleDashboardPage serves the full HTML shell (GET /). The "/" route is a
+// ServeMux catch-all, so reject any non-root path with 404 instead of serving
+// the dashboard for e.g. /favicon.ico or a mistyped path.
+func (s *MCPServer) handleDashboardPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := dashboardPage.Execute(w, nil); err != nil {

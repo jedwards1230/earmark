@@ -269,6 +269,18 @@ func TestDashboardPage(t *testing.T) {
 	}
 }
 
+// TestUnmatchedPathIs404 verifies the "/" catch-all doesn't serve the dashboard
+// for unmatched paths (e.g. /favicon.ico) — they get a 404, not a 200 page.
+func TestUnmatchedPathIs404(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/favicon.ico", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("GET /favicon.ico: want 404, got %d", w.Code)
+	}
+}
+
 // TestHTMXAssetServed verifies the vendored htmx library is served locally with
 // a JS content-type, so the dashboard has no runtime CDN dependency.
 func TestHTMXAssetServed(t *testing.T) {
