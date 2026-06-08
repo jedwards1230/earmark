@@ -32,7 +32,7 @@ func TestLoadConfig_Defaults(t *testing.T) {
 
 	assert.Equal(t, "postgres://user:pass@host:5432/db", cfg.DatabaseURL)
 	assert.Equal(t, "/books", cfg.BooksDir)
-	assert.Equal(t, "http://ollama.external-services:11434/v1", cfg.EmbeddingsBaseURL)
+	assert.Equal(t, "http://ollama:11434/v1", cfg.EmbeddingsBaseURL)
 	assert.Equal(t, "nomic-embed-text", cfg.EmbeddingsModel)
 	assert.Equal(t, ":8081", cfg.MCPHTTPAddr)
 	assert.Equal(t, 30*time.Minute, cfg.StaleJobTimeout)

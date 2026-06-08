@@ -15,7 +15,7 @@ const EmbeddingDimension = 768
 
 // Embeddings wraps the OpenAI-compatible embeddings client.
 // The base URL is configurable so we can point at Ollama
-// (http://ollama.external-services:11434/v1) instead of api.openai.com.
+// (http://ollama:11434/v1) instead of api.openai.com.
 type Embeddings struct {
 	c     *openai.Client
 	model string

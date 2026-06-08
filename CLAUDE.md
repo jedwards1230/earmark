@@ -5,13 +5,13 @@ This file provides guidance to Claude Code when working with the lilbro-whisper 
 ## Project Overview
 
 **lilbro-whisper** is a Go service that indexes audiobook transcriptions produced by an
-external WhisperX runner (Python, running on desktop-1) and exposes them for semantic
+external ASR runner (Python, running on the GPU/ASR host) and exposes them for semantic
 search via an MCP server. It runs as a Linux container in Kubernetes.
 
 ### Architecture
 
 ```
-desktop-1 (Python WhisperX runner)
+GPU/ASR host (Python ASR runner)
     │ writes transcription_jobs + transcripts via CNPG Postgres
     ▼
 PostgreSQL (CNPG cluster lilbro-whisper-pg, pgvector + pg_trgm)

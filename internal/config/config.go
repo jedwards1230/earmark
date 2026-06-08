@@ -27,7 +27,7 @@ type Config struct {
 	BooksDir string
 
 	// EMBEDDINGS_BASE_URL — OpenAI-compatible base URL for the embeddings
-	// endpoint (Ollama). Default: http://ollama.external-services:11434/v1
+	// endpoint (Ollama). Default: http://ollama:11434/v1
 	EmbeddingsBaseURL string
 
 	// EMBEDDINGS_MODEL — embedding model to use. Must produce 768-dim vectors.
@@ -75,7 +75,7 @@ func LoadConfig() (*Config, error) {
 
 	// Optional with defaults
 	cfg.BooksDir = getEnvOrDefault("BOOKS_DIR", "/books")
-	cfg.EmbeddingsBaseURL = getEnvOrDefault("EMBEDDINGS_BASE_URL", "http://ollama.external-services:11434/v1")
+	cfg.EmbeddingsBaseURL = getEnvOrDefault("EMBEDDINGS_BASE_URL", "http://ollama:11434/v1")
 	cfg.EmbeddingsModel = getEnvOrDefault("EMBEDDINGS_MODEL", "nomic-embed-text")
 	cfg.MCPHTTPAddr = getEnvOrDefault("MCP_HTTP_ADDR", ":8081")
 

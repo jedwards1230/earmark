@@ -17,7 +17,7 @@ func TestEmbeddingDimensionConstant(t *testing.T) {
 
 func TestNewEmbeddings(t *testing.T) {
 	cfg := &config.Config{
-		EmbeddingsBaseURL: "http://ollama.external-services:11434/v1",
+		EmbeddingsBaseURL: "http://ollama:11434/v1",
 		EmbeddingsModel:   "nomic-embed-text",
 	}
 	e := NewEmbeddings(cfg)
@@ -31,7 +31,7 @@ func TestNewEmbeddings(t *testing.T) {
 
 func TestGetEmbeddings_EmptyInput(t *testing.T) {
 	cfg := &config.Config{
-		EmbeddingsBaseURL: "http://ollama.external-services:11434/v1",
+		EmbeddingsBaseURL: "http://ollama:11434/v1",
 		EmbeddingsModel:   "nomic-embed-text",
 	}
 	e := NewEmbeddings(cfg)
