@@ -54,6 +54,12 @@ MCP_TRANSPORT=http ./lil-whisper mcp  # HTTP transport on :8081
 ./lil-whisper serve     # HTTP search API
 ./lil-whisper list      # list embedded books
 ./lil-whisper search "query"
+
+# Redo work without DEBUG_DB_RESET (dry-run unless --yes):
+./lil-whisper requeue "Project Hail Mary"          # preview matches
+./lil-whisper requeue "Project Hail Mary" --yes    # re-transcribe (drops transcript+chunks, job→pending)
+./lil-whisper requeue --failed --yes               # retry all failed jobs
+./lil-whisper requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
 ```
 
 ## Environment Variables
