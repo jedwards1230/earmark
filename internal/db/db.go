@@ -713,45 +713,62 @@ func scanJobMatches(rows pgx.Rows) ([]JobMatch, error) {
 // it deletes their transcripts (cascading to chunks) and resets the jobs to
 // 'pending' with attempts cleared. Returns the file paths that were reset.
 func (db *DB) RequeueJobs(ctx context.Context, substr string) ([]string, error) {
-	return db.requeue(ctx, `file_path ILIKE $1`, likePattern(substr))
+	return db.requeue(ctx, requeueByPath, likePattern(substr))
 }
 
 // RequeueFailed re-runs the pipeline for every job in the 'failed' state.
 // Returns the file paths that were reset.
 func (db *DB) RequeueFailed(ctx context.Context) ([]string, error) {
-	return db.requeue(ctx, `status = 'failed'`, nil)
+	return db.requeue(ctx, requeueFailed)
 }
 
-// requeue deletes transcripts for the matched jobs (chunks cascade) and resets
-// those jobs to pending, all in one transaction. cond is a WHERE fragment over
-// transcription_jobs; arg is its single bound parameter ($1) or nil.
-func (db *DB) requeue(ctx context.Context, cond string, arg any) ([]string, error) {
-	var args []any
-	if arg != nil {
-		args = append(args, arg)
-	}
+// requeuePlan is a pair of fully-formed, static SQL statements for one requeue
+// selector. The statements are package constants — nothing is concatenated at
+// runtime, so the only dynamic input is the bound $1 parameter (when present).
+type requeuePlan struct {
+	deleteTranscripts string // delete transcripts for the selected jobs (chunks cascade)
+	resetJobs         string // reset those jobs to pending; RETURNING file_path
+}
 
+var (
+	// requeueByPath selects jobs by a case-insensitive file_path match ($1).
+	requeueByPath = requeuePlan{
+		deleteTranscripts: `DELETE FROM transcripts
+			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE file_path ILIKE $1)`,
+		resetJobs: `UPDATE transcription_jobs
+			SET    status = 'pending', attempts = 0, error = NULL,
+			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
+			WHERE  file_path ILIKE $1
+			RETURNING file_path`,
+	}
+	// requeueFailed selects every job in the 'failed' state (no parameters).
+	requeueFailed = requeuePlan{
+		deleteTranscripts: `DELETE FROM transcripts
+			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE status = 'failed')`,
+		resetJobs: `UPDATE transcription_jobs
+			SET    status = 'pending', attempts = 0, error = NULL,
+			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
+			WHERE  status = 'failed'
+			RETURNING file_path`,
+	}
+)
+
+// requeue runs a requeuePlan's two static statements in one transaction: delete
+// the selected transcripts (chunks cascade) and reset the jobs to pending. args
+// are the bound parameters for the plan's $N placeholders (one for by-path,
+// none for failed).
+func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]string, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin requeue tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Delete transcripts for the matched jobs; transcript_chunks cascade.
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM transcripts
-		WHERE job_id IN (SELECT id FROM transcription_jobs WHERE `+cond+`)
-	`, args...); err != nil {
+	if _, err := tx.Exec(ctx, plan.deleteTranscripts, args...); err != nil {
 		return nil, fmt.Errorf("delete transcripts: %w", err)
 	}
 
-	rows, err := tx.Query(ctx, `
-		UPDATE transcription_jobs
-		SET    status = 'pending', attempts = 0, error = NULL,
-		       claimed_by = NULL, claimed_at = NULL, updated_at = now()
-		WHERE  `+cond+`
-		RETURNING file_path
-	`, args...)
+	rows, err := tx.Query(ctx, plan.resetJobs, args...)
 	if err != nil {
 		return nil, fmt.Errorf("reset jobs: %w", err)
 	}
