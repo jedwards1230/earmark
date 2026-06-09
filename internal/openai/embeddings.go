@@ -17,8 +17,9 @@ const EmbeddingDimension = 768
 // The base URL is configurable so we can point at Ollama
 // (http://ollama:11434/v1) instead of api.openai.com.
 type Embeddings struct {
-	c     *openai.Client
-	model string
+	c       *openai.Client
+	model   string
+	baseURL string
 }
 
 // NewEmbeddings creates an Embeddings client pointed at the Ollama-compatible
@@ -28,10 +29,14 @@ func NewEmbeddings(cfg *config.Config) *Embeddings {
 	oaiCfg.BaseURL = cfg.EmbeddingsBaseURL
 	client := openai.NewClientWithConfig(oaiCfg)
 	return &Embeddings{
-		c:     client,
-		model: cfg.EmbeddingsModel,
+		c:       client,
+		model:   cfg.EmbeddingsModel,
+		baseURL: cfg.EmbeddingsBaseURL,
 	}
 }
+
+// BaseURL returns the configured embeddings endpoint, for diagnostics/logging.
+func (e *Embeddings) BaseURL() string { return e.baseURL }
 
 // GetEmbeddings returns one 768-float32 vector per chunk.
 // Callers must ensure the result length equals len(chunks).
@@ -48,7 +53,9 @@ func (e *Embeddings) GetEmbeddings(chunks []string) ([][]float32, error) {
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("creating embeddings via %s: %w", e.model, err)
+		// Include the endpoint URL: an unreachable Ollama or an un-pulled model
+		// both surface here, and the URL is what an operator needs to act on.
+		return nil, fmt.Errorf("creating embeddings via model %q at %s: %w", e.model, e.baseURL, err)
 	}
 
 	if len(resp.Data) == 0 {

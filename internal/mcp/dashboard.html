@@ -49,6 +49,63 @@
   .card-value.red    { color: var(--red); }
   .card-value.blue   { color: var(--blue); }
   .card-value.purple { color: var(--purple); }
+  .card-value.amber  { color: var(--amber); }
+  /* clickable status cards jump to the filtered library below */
+  .card-click { cursor: pointer; transition: border-color 0.12s; }
+  .card-click:hover { border-color: var(--blue); }
+  /* pipeline pause/resume control */
+  .pipeline-control {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    flex-wrap: wrap;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px; margin-bottom: 24px;
+  }
+  .pipeline-control.is-paused { border-color: var(--amber); }
+  .pc-state { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .pc-label { font-weight: 700; letter-spacing: 0.06em; }
+  .is-running .pc-label { color: var(--green); }
+  .is-paused  .pc-label { color: var(--amber); }
+  .pc-sub { color: var(--muted); font-size: 12px; }
+  .btn-go { font-weight: 600; }
+  .btn-go:hover { border-color: var(--green); color: var(--green); }
+  /* embeddings-stall callout */
+  .stall-callout {
+    background: #2a1c08; color: var(--amber);
+    border: 1px solid var(--amber); border-radius: 6px;
+    padding: 8px 14px; margin-bottom: 24px; font-size: 13px; line-height: 1.5;
+  }
+  /* library controls */
+  .lib-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+  .lib-search { display: flex; align-items: center; gap: 8px; }
+  .lib-search input[type=search] {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 6px 10px; font: inherit; font-size: 13px; min-width: 220px;
+  }
+  .lib-search input[type=search]:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .lib-clear { color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; }
+  .lib-clear:hover { color: var(--text); }
+  .lib-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    cursor: pointer; font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); user-select: none;
+  }
+  .chip:hover { border-color: var(--blue); color: var(--text); }
+  .chip.active { border-color: var(--blue); color: var(--blue); background: #15233a; }
+  .progress { display: inline-block; vertical-align: middle; width: 90px; height: 7px; background: #2a2a3a; border-radius: 4px; overflow: hidden; }
+  .progress-bar { height: 100%; background: var(--green); }
+  .progress-bar.has-failed { background: linear-gradient(90deg, var(--green), var(--amber)); }
+  .progress-text { color: var(--muted); font-size: 12px; margin-left: 8px; }
+  .mini-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+  .mini-badges .badge { font-size: 10px; }
+  .track-detail > td { padding: 0; border-bottom: 1px solid var(--border); }
+  .track-detail-inner:empty { display: none; }
+  .track-detail-inner { padding: 0 10px; background: #12141c; }
+  .tracks-table { width: 100%; }
+  .tracks-table td { padding: 5px 8px; border-bottom: 1px solid #20232e; font-size: 12px; }
+  .lib-pager { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
+  .lib-meta { color: var(--muted); font-size: 12px; }
+  .lib-empty { color: var(--muted); padding: 12px 2px; }
   .section { margin-bottom: 24px; }
   .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 10px; }
   .runner-box {
@@ -182,6 +239,16 @@
      hx-sync="this:replace"
      hx-request='{"timeout": 5000}'>
   <p class="htmx-indicator">loading…</p>
+</div>
+
+<!-- Library: complete, book-grouped, filterable list of every audiobook.
+     Loaded once and then driven only by the user (search / filter / paginate),
+     deliberately NOT on the 3s timer so the chosen view is never clobbered. -->
+<div class="section">
+  <div class="section-title">Library — all books</div>
+  <div id="library-region" hx-get="/library" hx-trigger="load" hx-swap="innerHTML">
+    <p class="htmx-indicator">loading library…</p>
+  </div>
 </div>
 </body>
 </html>
