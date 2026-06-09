@@ -71,7 +71,19 @@
         "booksDir":          { "type": "string" },
         "mcpHttpAddr":       { "type": "string" },
         "staleJobTimeout":   { "type": "string" },
-        "chunkSize":         { "type": "string" }
+        "chunkSize":         { "type": "string" },
+        "libraryCollections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["root", "layout"],
+            "properties": {
+              "root":   { "type": "string", "minLength": 1 },
+              "layout": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
       }
     },
     "resources": {

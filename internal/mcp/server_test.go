@@ -21,6 +21,7 @@ type SimpleMockDB struct {
 	pingErr       error
 	requeueErr    error  // if set, RequeueByID/RequeueFailed return it
 	requeuedID    string // last id passed to RequeueByID
+	requeuedDir   string // last dir passed to RequeueByDir
 	retriedFailed bool   // RequeueFailed was called
 	paused        bool   // current pause flag (mutated by SetPaused)
 	pausedSetTo   *bool  // last value passed to SetPaused
@@ -74,6 +75,14 @@ func (m *SimpleMockDB) RequeueFailed(_ context.Context) ([]string, error) {
 		return nil, m.requeueErr
 	}
 	return []string{"/books/Author/Book/chapter03.m4b"}, nil
+}
+
+func (m *SimpleMockDB) RequeueByDir(_ context.Context, dir string) ([]string, error) {
+	m.requeuedDir = dir
+	if m.requeueErr != nil {
+		return nil, m.requeueErr
+	}
+	return []string{dir + "/01.mp3", dir + "/02.mp3"}, nil
 }
 
 func (m *SimpleMockDB) Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error) {
@@ -477,13 +486,10 @@ func TestDashboardRoutesGETOnly(t *testing.T) {
 func TestFragmentEscapesJobError(t *testing.T) {
 	evil := `<script>alert(1)</script>`
 	var buf bytes.Buffer
-	err := fragmentTmpl.Execute(&buf, dashboardData{
-		Stats: &db.QueueStats{},
-		Jobs: []db.RecentJob{
-			{ID: "x", FilePath: "/books/a/b.m4b", Status: "failed", Error: &evil},
-		},
-	})
-	if err != nil {
+	data := newStatusData(&db.QueueStats{}, []db.RecentJob{
+		{ID: "x", FilePath: "/books/a/b.m4b", Status: "failed", Error: &evil},
+	}, time.Now(), 30*time.Minute, "")
+	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
 		t.Fatalf("fragment execute: %v", err)
 	}
 	out := buf.String()
@@ -621,27 +627,29 @@ func TestEmbedStallWarning(t *testing.T) {
 	}
 }
 
-// TestLibraryEndpoint verifies the library fragment lists books, honors the
-// status filter, and rejects nothing unexpectedly.
-func TestLibraryEndpoint(t *testing.T) {
+// TestLibraryDataEndpoint verifies the library fragment lists books with
+// resolver-derived author/title, honors the status filter, and links to book
+// detail pages.
+func TestLibraryDataEndpoint(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
 
-	// Unfiltered: both books present.
-	req := httptest.NewRequest(http.MethodGet, "/library", nil)
+	// Unfiltered: both books present, with author/title from the resolver and a
+	// link to the book detail page.
+	req := httptest.NewRequest(http.MethodGet, "/library/data", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("GET /library: want 200, got %d", w.Code)
+		t.Fatalf("GET /library/data: want 200, got %d", w.Code)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"Book A", "Book B", "Author One", "book-row", "tracks"} {
+	for _, want := range []string{"Book A", "Book B", "Author One", "Author Two", "/book?dir=", "open"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("GET /library: missing %q", want)
+			t.Errorf("GET /library/data: missing %q", want)
 		}
 	}
 
 	// Status filter narrows to the pending book and marks the chip active.
-	req = httptest.NewRequest(http.MethodGet, "/library?status=pending", nil)
+	req = httptest.NewRequest(http.MethodGet, "/library/data?status=pending", nil)
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	body = w.Body.String()
@@ -653,32 +661,102 @@ func TestLibraryEndpoint(t *testing.T) {
 	}
 }
 
-// TestLibraryTracksEndpoint verifies the expand-to-tracks fragment returns the
-// per-track rows for a book directory.
-func TestLibraryTracksEndpoint(t *testing.T) {
+// TestBookDataEndpoint verifies the book-detail fragment returns the per-track
+// rows plus the resolver-derived author/title and a whole-book requeue action.
+func TestBookDataEndpoint(t *testing.T) {
 	mock := &SimpleMockDB{}
 	dir := "/books/Author One/Book A"
-	req := httptest.NewRequest(http.MethodGet, "/library/tracks?dir="+url.QueryEscape(dir), nil)
+	req := httptest.NewRequest(http.MethodGet, "/book/data?dir="+url.QueryEscape(dir), nil)
 	w := httptest.NewRecorder()
 	buildTestMux(mock).ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("GET /library/tracks: want 200, got %d", w.Code)
+		t.Fatalf("GET /book/data: want 200, got %d", w.Code)
 	}
 	if mock.lastBookDir != dir {
 		t.Errorf("dir not decoded: got %q want %q", mock.lastBookDir, dir)
 	}
-	if !strings.Contains(w.Body.String(), "Track 1.mp3") {
-		t.Errorf("expected track rows in body:\n%s", w.Body.String())
+	body := w.Body.String()
+	for _, want := range []string{"Book A", "Author One", "Track 1.mp3", "requeue entire book"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("GET /book/data: missing %q\nbody:\n%s", want, body)
+		}
 	}
 }
 
-// TestLibraryTracksRequiresDir verifies the tracks endpoint 400s without a dir.
-func TestLibraryTracksRequiresDir(t *testing.T) {
+// TestBookDataRequiresDir verifies the book fragment 400s without a dir.
+func TestBookDataRequiresDir(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
-	req := httptest.NewRequest(http.MethodGet, "/library/tracks", nil)
+	req := httptest.NewRequest(http.MethodGet, "/book/data", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("GET /library/tracks without dir: want 400, got %d", w.Code)
+		t.Fatalf("GET /book/data without dir: want 400, got %d", w.Code)
+	}
+}
+
+// TestBookPageShell verifies the book detail page shell renders and 400s without
+// a dir.
+func TestBookPageShell(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/book?dir="+url.QueryEscape("/books/Author One/Book A"), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /book: want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "book-region") {
+		t.Error("book page shell should contain the book-region container")
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/book", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET /book without dir: want 400, got %d", w.Code)
+	}
+}
+
+// TestBookRequeueAction verifies the whole-book requeue posts the dir and
+// re-renders the book fragment (htmx-guarded).
+func TestBookRequeueAction(t *testing.T) {
+	mock := &SimpleMockDB{}
+	dir := "/books/Author One/Book A"
+	req := httptest.NewRequest(http.MethodPost, "/actions/book-requeue?dir="+url.QueryEscape(dir), nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("book-requeue: want 200, got %d", w.Code)
+	}
+	if mock.requeuedDir != dir {
+		t.Errorf("RequeueByDir got %q, want %q", mock.requeuedDir, dir)
+	}
+	if !strings.Contains(w.Body.String(), "requeue entire book") {
+		t.Error("expected the book fragment to be re-rendered after requeue")
+	}
+
+	// Without the htmx header → forbidden.
+	req = httptest.NewRequest(http.MethodPost, "/actions/book-requeue?dir="+url.QueryEscape(dir), nil)
+	w = httptest.NewRecorder()
+	buildTestMux(&SimpleMockDB{}).ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("book-requeue without HX-Request: want 403, got %d", w.Code)
+	}
+}
+
+// TestRequeueTrackFromBookPage verifies a per-track requeue carrying a book dir
+// re-renders the book fragment instead of the status fragment.
+func TestRequeueTrackFromBookPage(t *testing.T) {
+	mock := &SimpleMockDB{}
+	dir := "/books/Author One/Book A"
+	req := httptest.NewRequest(http.MethodPost, "/actions/requeue?id=job-1&book="+url.QueryEscape(dir), nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("track requeue: want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "requeue entire book") {
+		t.Error("track requeue with a book param should re-render the book fragment")
 	}
 }

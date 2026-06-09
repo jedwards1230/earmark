@@ -333,6 +333,20 @@ All env var names are fixed. No synonyms, no alternatives.
 | `MCP_HTTP_ADDR` | no | `:8081` |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
+| `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
+
+`LIBRARY_COLLECTIONS` is a JSON array of `{"root","layout"}` objects. `root` is a
+path prefix (absolute, or relative to `BOOKS_DIR`); `layout` is a slash-delimited
+list of segment roles (`author`/`title`/`series`/`_`) for the directories below
+the root. If `title` is not one of the directory roles, the title is parsed from
+the filename. The longest-matching root wins; unmatched paths fall back to a
+generic author/title split. Labels are cosmetic — a malformed value logs a
+warning and falls back, never failing startup. Example:
+
+```json
+[{"root":"audio-libation","layout":"author/title"},
+ {"root":"audio-libro","layout":"author"}]
+```
 
 #### Python ASR runner — NeMo Parakeet-TDT (GPU/ASR host native service)
 

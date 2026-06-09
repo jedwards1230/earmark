@@ -35,6 +35,8 @@ type DBInterface interface {
 	GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error)
 	// GetBookTracks returns the individual track jobs for one book directory.
 	GetBookTracks(ctx context.Context, dir string) ([]db.RecentJob, error)
+	// RequeueByDir re-transcribes every track in one book directory (book page).
+	RequeueByDir(ctx context.Context, dir string) ([]string, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

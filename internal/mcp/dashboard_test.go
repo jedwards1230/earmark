@@ -36,59 +36,68 @@ func TestHumanizeSince(t *testing.T) {
 	}
 }
 
-func TestNewDashboardData_RunnerStaleness(t *testing.T) {
+// TestPipelineStateDerivation verifies the unified pipeline state never
+// contradicts itself: RUNNING only when a fresh runner is connected, IDLE when
+// enabled-but-no/stale-runner, PAUSED when the flag is set.
+func TestPipelineStateDerivation(t *testing.T) {
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	stale := 30 * time.Minute
 
-	// Fresh heartbeat → active, not stale.
+	// Fresh heartbeat, not paused → RUNNING (green).
 	recent := now.Add(-10 * time.Second)
-	d := newDashboardData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &recent}, nil, now, stale, "")
-	if d.RunnerStale {
-		t.Error("recent heartbeat should not be stale")
-	}
-	if d.HeartbeatRel != "10s ago" {
-		t.Errorf("HeartbeatRel = %q, want %q", d.HeartbeatRel, "10s ago")
+	d := newStatusData(&db.QueueStats{RunnerActive: true, RunnerID: "r1", LastHeartbeat: &recent}, nil, now, stale, "")
+	if d.StateLabel != "RUNNING" || d.DotClass != "green" {
+		t.Errorf("fresh runner = (%q,%q), want (RUNNING,green)", d.StateLabel, d.DotClass)
 	}
 
-	// Old heartbeat + still 'claimed' → stale (the crashed-runner case).
+	// Old heartbeat + still RunnerActive → IDLE (stale), not RUNNING.
 	old := now.Add(-2 * time.Hour)
-	d = newDashboardData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old}, nil, now, stale, "")
-	if !d.RunnerStale {
-		t.Error("2h-old heartbeat with RunnerActive should be stale")
+	d = newStatusData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old}, nil, now, stale, "")
+	if d.StateLabel != "IDLE" {
+		t.Errorf("stale runner StateLabel = %q, want IDLE", d.StateLabel)
+	}
+	if !strings.Contains(d.SubText, "stale") {
+		t.Errorf("stale runner SubText = %q, want it to mention stale", d.SubText)
 	}
 
-	// Fresh install → Empty.
-	d = newDashboardData(&db.QueueStats{}, nil, now, stale, "")
-	if !d.Empty {
-		t.Error("zero stats with no runner should be Empty")
+	// Not paused, no runner ever seen → IDLE "no runner connected".
+	d = newStatusData(&db.QueueStats{Pending: 4069}, nil, now, stale, "")
+	if d.StateLabel != "IDLE" || d.DotClass != "blue" {
+		t.Errorf("no-runner = (%q,%q), want (IDLE,blue)", d.StateLabel, d.DotClass)
 	}
-	if d.RunnerStale {
-		t.Error("empty state should not be stale")
+	if !strings.Contains(d.SubText, "no runner") {
+		t.Errorf("no-runner SubText = %q, want it to mention no runner", d.SubText)
+	}
+
+	// Paused wins regardless of runner liveness.
+	d = newStatusData(&db.QueueStats{Paused: true, RunnerActive: true, LastHeartbeat: &recent}, nil, now, stale, "")
+	if d.StateLabel != "PAUSED" || d.DotClass != "amber" {
+		t.Errorf("paused = (%q,%q), want (PAUSED,amber)", d.StateLabel, d.DotClass)
 	}
 }
 
-// TestFragmentRendersStaleRunner asserts the stale-runner path renders the
-// "stale" label (not a green "active" dot) — the misleading-output case.
-func TestFragmentRendersStaleRunner(t *testing.T) {
+// TestStatusFragmentRendersIdleNotRunning is the regression guard for the
+// reported contradiction: an enabled pipeline with no live runner must render
+// IDLE (not "RUNNING — claiming jobs").
+func TestStatusFragmentRendersIdleNotRunning(t *testing.T) {
 	now := time.Now()
-	old := now.Add(-90 * time.Minute)
-	data := newDashboardData(
-		&db.QueueStats{RunnerActive: true, RunnerID: "r1", LastHeartbeat: &old, Chunks: 12345},
+	data := newStatusData(
+		&db.QueueStats{Pending: 4069, Chunks: 12345}, // not paused, no runner
 		nil, now, 30*time.Minute, "",
 	)
 	var buf bytes.Buffer
-	if err := fragmentTmpl.Execute(&buf, data); err != nil {
+	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "stale — last seen") {
-		t.Errorf("stale runner not rendered:\n%s", out)
+	if !strings.Contains(out, "IDLE") {
+		t.Errorf("expected IDLE state:\n%s", out)
 	}
-	if !strings.Contains(out, "dot amber") {
-		t.Error("stale runner should use the amber dot, not green")
+	if strings.Contains(out, "RUNNING") {
+		t.Error("must NOT claim RUNNING when no runner is connected")
 	}
 	if !strings.Contains(out, "12,345") {
-		t.Error("counts should be rendered with thousands separators")
+		t.Error("counts should render with thousands separators")
 	}
 	if !strings.Contains(out, "updated ") {
 		t.Error("fragment should carry an 'updated' recency stamp")

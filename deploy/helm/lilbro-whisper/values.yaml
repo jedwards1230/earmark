@@ -45,6 +45,16 @@ config:
   mcpHttpAddr: ":8081"
   staleJobTimeout: "30m"
   chunkSize: "512"
+  # libraryCollections declares how each library root is shaped so the dashboard
+  # derives author/title from configuration rather than a hardcoded path layout.
+  # Serialized to the LIBRARY_COLLECTIONS env var (JSON). Empty → generic
+  # fallback. Each entry: {root, layout}; layout is slash-delimited segment roles
+  # (author/title/series/_) for the directories below root; if "title" is absent,
+  # it is parsed from the filename. Example:
+  #   libraryCollections:
+  #     - {root: audio-libation, layout: author/title}
+  #     - {root: audio-libro, layout: author}
+  libraryCollections: []
 
 resources:
   requests:
