@@ -50,14 +50,20 @@ func TestPipelineStateDerivation(t *testing.T) {
 		t.Errorf("fresh runner = (%q,%q), want (RUNNING,green)", d.StateLabel, d.DotClass)
 	}
 
-	// Old heartbeat + still RunnerActive → IDLE (stale), not RUNNING.
+	// Old heartbeat, RunnerActive, but NO work waiting → IDLE (drained), not RUNNING.
 	old := now.Add(-2 * time.Hour)
 	d = newStatusData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old}, nil, now, stale, "")
 	if d.StateLabel != "IDLE" {
-		t.Errorf("stale runner StateLabel = %q, want IDLE", d.StateLabel)
+		t.Errorf("stale runner, no work = StateLabel %q, want IDLE", d.StateLabel)
 	}
 	if !strings.Contains(d.SubText, "stale") {
 		t.Errorf("stale runner SubText = %q, want it to mention stale", d.SubText)
+	}
+
+	// Old heartbeat, RunnerActive, AND work waiting → STALLED (red) — an incident.
+	d = newStatusData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old, Pending: 5, Claimed: 1}, nil, now, stale, "")
+	if d.StateLabel != "STALLED" || d.DotClass != "red" {
+		t.Errorf("stale runner with work = (%q,%q), want (STALLED,red)", d.StateLabel, d.DotClass)
 	}
 
 	// Not paused, no runner ever seen → IDLE "no runner connected".
@@ -101,5 +107,24 @@ func TestStatusFragmentRendersIdleNotRunning(t *testing.T) {
 	}
 	if !strings.Contains(out, "updated ") {
 		t.Error("fragment should carry an 'updated' recency stamp")
+	}
+}
+
+// TestStatusFragmentRendersStalled verifies a crashed runner with work waiting
+// renders the loud STALLED state, not a calm IDLE.
+func TestStatusFragmentRendersStalled(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	data := newStatusData(
+		&db.QueueStats{RunnerActive: true, LastHeartbeat: &old, Pending: 5, Claimed: 1},
+		nil, now, 30*time.Minute, "",
+	)
+	var buf bytes.Buffer
+	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "STALLED") || !strings.Contains(out, "state-stalled") {
+		t.Errorf("expected a STALLED banner:\n%s", out)
 	}
 }

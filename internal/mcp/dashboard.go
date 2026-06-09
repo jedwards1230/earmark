@@ -391,11 +391,17 @@ func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, sta
 		} else {
 			d.SubText = "runner is transcribing"
 		}
+	case stats.RunnerActive && (stats.Pending+stats.Claimed) > 0:
+		// A runner claimed work but its heartbeat went stale while jobs are still
+		// waiting — that's a crashed/wedged runner, an incident, not idleness.
+		d.StateLabel, d.StateClass, d.DotClass = "STALLED", "state-stalled", "red"
+		d.SubText = "runner heartbeat is stale and work is waiting — runner may have crashed"
 	default:
-		// Not paused, but no fresh runner heartbeat — enabled yet idle.
+		// Not paused, no fresh runner, and nothing waiting — genuinely idle
+		// (queue drained) or a runner was never seen.
 		d.StateLabel, d.StateClass, d.DotClass = "IDLE", "state-idle", "blue"
 		if stats.RunnerActive {
-			d.SubText = "enabled — runner heartbeat is stale (crashed?)"
+			d.SubText = "enabled — runner heartbeat is stale (no work waiting)"
 		} else {
 			d.SubText = "enabled — no runner is currently connected"
 		}
