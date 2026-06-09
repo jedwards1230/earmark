@@ -25,6 +25,9 @@ import (
 // DBInterface is the subset of db.DB used by the monitor.
 type DBInterface interface {
 	transcribe.JobInserter
+	// PruneAppleDoubleJobs removes junk AppleDouble (._*) jobs enqueued before
+	// the audio-file filter learned to skip them. Returns the count removed.
+	PruneAppleDoubleJobs(ctx context.Context) (int, error)
 }
 
 // FileMonitor watches the books directory and enqueues new audio files.
@@ -55,6 +58,14 @@ func NewFileMonitor(cfg *config.Config, db DBInterface) *FileMonitor {
 func (fm *FileMonitor) Start(ready chan<- struct{}) {
 	defer close(fm.done)
 	fm.log.Info("starting file monitor", "books_dir", fm.cfg.BooksDir)
+
+	// Self-heal: remove any AppleDouble (._*) junk jobs enqueued before the
+	// audio-file filter skipped them. Idempotent — a no-op once the queue is clean.
+	if n, err := fm.db.PruneAppleDoubleJobs(fm.ctx); err != nil {
+		fm.log.Error("prune AppleDouble jobs failed", "error", err)
+	} else if n > 0 {
+		fm.log.Info("pruned AppleDouble (._*) junk jobs", "count", n)
+	}
 
 	if err := fm.scan(); err != nil {
 		fm.log.Error("initial scan failed", "error", err)
@@ -177,6 +188,15 @@ var supportedAudioExtensions = map[string]bool{
 }
 
 func isAudioFile(filename string) bool {
+	base := filepath.Base(filename)
+	// macOS AppleDouble sidecar files (._name.ext) are created on non-HFS
+	// filesystems (NFS/SMB) and keep the real file's extension, so they would
+	// otherwise pass the extension check. They are metadata, not audio — and
+	// because "._" sorts before letters/digits, one would also become a book's
+	// MIN(file_path) sample and corrupt the derived title.
+	if strings.HasPrefix(base, "._") {
+		return false
+	}
 	ext := strings.ToLower(filepath.Ext(filename))
 	return supportedAudioExtensions[ext]
 }

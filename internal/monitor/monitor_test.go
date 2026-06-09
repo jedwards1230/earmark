@@ -31,6 +31,11 @@ func TestIsAudioFile(t *testing.T) {
 		{"", false},
 		{"noextension", false},
 		{".mp3", true},
+		// macOS AppleDouble sidecars keep the real extension but are junk.
+		{"._chapter01.mp3", false},
+		{"._Thinking Fast and Slow - Track 1.mp3", false},
+		{"/books/audio-libro/Andy Clark/._The Experience Machine.mp3", false},
+		{".DS_Store", false},
 	}
 
 	for _, tt := range tests {
@@ -46,6 +51,7 @@ func TestIsAudioFile(t *testing.T) {
 // fakeDB implements DBInterface for unit tests — no real DB needed.
 type fakeDB struct {
 	inserted map[string]string // checksum -> jobID
+	pruned   int               // times PruneAppleDoubleJobs was called
 }
 
 func (f *fakeDB) InsertJobIfAbsent(_ context.Context, _, checksum string) (string, bool, error) {
@@ -55,6 +61,11 @@ func (f *fakeDB) InsertJobIfAbsent(_ context.Context, _, checksum string) (strin
 	id := "job-" + checksum[:8]
 	f.inserted[checksum] = id
 	return id, true, nil
+}
+
+func (f *fakeDB) PruneAppleDoubleJobs(context.Context) (int, error) {
+	f.pruned++
+	return 0, nil
 }
 
 func newTestMonitor(dir string, db DBInterface) *FileMonitor {
@@ -123,6 +134,10 @@ func TestMonitorScan(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "cover.jpg"), []byte("image data"), 0600); err != nil {
 		t.Fatalf("create cover.jpg: %v", err)
 	}
+	// macOS AppleDouble sidecar with a real audio extension — must be skipped.
+	if err := os.WriteFile(filepath.Join(dir, "._ch01.mp3"), []byte("apple metadata"), 0600); err != nil {
+		t.Fatalf("create AppleDouble: %v", err)
+	}
 
 	db := &fakeDB{inserted: make(map[string]string)}
 	fm := newTestMonitor(dir, db)
@@ -130,6 +145,6 @@ func TestMonitorScan(t *testing.T) {
 		t.Fatalf("scan: %v", err)
 	}
 	if len(db.inserted) != 2 {
-		t.Errorf("expected 2 jobs after scan, got %d", len(db.inserted))
+		t.Errorf("expected 2 jobs after scan (AppleDouble skipped), got %d", len(db.inserted))
 	}
 }

@@ -980,6 +980,21 @@ func (db *DB) IsJobQueued(ctx context.Context, checksum string) (bool, error) {
 	return exists, err
 }
 
+// PruneAppleDoubleJobs deletes any jobs whose filename is a macOS AppleDouble
+// sidecar (basename begins with "._"). These are metadata files that were
+// enqueued before the monitor learned to skip them; their transcripts and
+// chunks cascade-delete. Returns the number of rows removed. Idempotent.
+func (db *DB) PruneAppleDoubleJobs(ctx context.Context) (int, error) {
+	tag, err := db.pool.Exec(ctx, `
+		DELETE FROM transcription_jobs
+		WHERE file_path ~ '(^|/)\._[^/]*$'
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("prune appledouble jobs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // ─── Requeue / redo operations ─────────────────────────────────────────────────
 
 // JobMatch is a lightweight view of a job used for requeue previews.
