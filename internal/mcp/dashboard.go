@@ -54,14 +54,11 @@ var tmplFuncs = template.FuncMap{
 		return *s
 	},
 	"commafy": commafy,
-	// bookHref builds the book-detail URL for a track file path. Returned as
-	// template.URL so html/template emits the pre-encoded query verbatim.
-	"bookHref":    func(fp string) template.URL { return bookURL(path.Dir(fp)) },
-	"bookHrefDir": func(dir string) template.URL { return bookURL(dir) },
-}
-
-func bookURL(dir string) template.URL {
-	return template.URL("/book?dir=" + url.QueryEscape(dir)) //nolint:gosec // dir is server-derived and query-escaped
+	// bookDir is the book directory for a track path. Used to build the
+	// book-detail href: passed as a plain string into an href="…?dir={{…}}"
+	// URL-context interpolation, which html/template auto-escapes (no template.URL
+	// taint, no gosec G203).
+	"bookDir": func(fp string) string { return path.Dir(fp) },
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.
@@ -166,7 +163,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
     {{range .Jobs}}
       <tr>
         <td>
-          <a class="file-name" href="{{bookHref .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
+          <a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}
         </td>
         <td><span class="badge {{.Status}}">{{.Status}}</span></td>
@@ -211,8 +208,8 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
   <thead><tr><th>Book</th><th>Author</th><th>Progress</th><th>Breakdown</th><th>Updated</th><th></th></tr></thead>
   <tbody>
   {{range .Books}}
-    <tr class="clickable" onclick="window.location='{{.Href}}'">
-      <td><a class="file-name" href="{{.Href}}" title="{{.Dir}}">{{.Title}}</a></td>
+    <tr class="clickable" onclick="window.location=this.querySelector('a.file-name').href">
+      <td><a class="file-name" href="/book?dir={{.Dir}}" title="{{.Dir}}">{{.Title}}</a></td>
       <td class="time-muted">{{if .Author}}{{.Author}}{{else}}—{{end}}</td>
       <td>
         <div class="progress" title="{{.Done}}/{{.Total}} tracks done">
@@ -227,7 +224,7 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
         {{if gt .Failed 0}}<span class="badge failed">{{commafy .Failed}} fail</span>{{end}}
       </td>
       <td class="time-muted" title="{{formatTime .LastUpdated}}">{{relTime .LastUpdated}}</td>
-      <td class="actions"><a class="btn" href="{{.Href}}">open&nbsp;&#8250;</a></td>
+      <td class="actions"><a class="btn" href="/book?dir={{.Dir}}">open&nbsp;&#8250;</a></td>
     </tr>
   {{end}}
   </tbody>
@@ -317,7 +314,6 @@ type bookRow struct {
 	Dir         string
 	Title       string
 	Author      string
-	Href        template.URL
 	DonePct     int
 	Total       int
 	Pending     int
@@ -552,7 +548,7 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 			pct = b.Done * 100 / b.Total
 		}
 		rows = append(rows, bookRow{
-			Dir: b.Dir, Title: title, Author: author, Href: bookURL(b.Dir), DonePct: pct,
+			Dir: b.Dir, Title: title, Author: author, DonePct: pct,
 			Total: b.Total, Pending: b.Pending, Claimed: b.Claimed, Done: b.Done, Failed: b.Failed,
 			LastUpdated: b.LastUpdated,
 		})
