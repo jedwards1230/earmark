@@ -107,7 +107,7 @@ jobs:
   prepare:
     name: Tag & Generate Notes
     needs: [detect]
-    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0
+    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v1
     with:
       service_name: lilbro-whisper
       service_description: "a Go service that indexes audiobook transcripts and serves semantic search over MCP"
