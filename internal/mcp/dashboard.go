@@ -125,6 +125,17 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   {{end}}
 </div>
 
+{{if .ShowProgress}}
+<div class="overview-progress">
+  <div class="op-bar"><div class="op-fill" style="width:{{.DonePct}}%"></div></div>
+  <div class="op-meta">
+    <span class="op-main">{{.ProgressText}}</span>
+    <span>{{.ThroughputText}}</span>
+    <span>{{.ETAText}}</span>
+  </div>
+</div>
+{{end}}
+
 <div class="card-group">
   <div class="group-label">transcription</div>
   <div class="grid">
@@ -175,7 +186,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
       <tr>
         <td>
           <a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
-          {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}
+          {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}
         </td>
         <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
         <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
@@ -280,7 +291,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
   {{range .Tracks}}
     <tr>
       <td><div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div>
-          {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}</td>
+          {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}</td>
       <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
       <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
       <td class="actions">
@@ -313,6 +324,13 @@ type statusData struct {
 	RenderedAt string
 	EmbedStall bool
 	EmbedURL   string
+
+	// Backfill progress (derived).
+	DonePct        int
+	ProgressText   string // "317 / 4,069 (8%)"
+	ThroughputText string // "~22 done in the last hour"
+	ETAText        string // "~6.9 days left" / "—"
+	ShowProgress   bool   // false on a fresh/empty install
 
 	// Unified pipeline state (derived from paused + runner liveness).
 	StateLabel string
@@ -371,6 +389,22 @@ func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, sta
 		RenderedAt: now.UTC().Format("15:04:05 UTC"),
 		EmbedURL:   embedURL,
 		EmbedStall: stats.EmbedBacklog >= embedStallThreshold,
+	}
+
+	// Backfill progress / throughput / ETA.
+	if stats.TotalJobs > 0 {
+		d.ShowProgress = true
+		d.DonePct = stats.Done * 100 / stats.TotalJobs
+		d.ProgressText = fmt.Sprintf("%s / %s (%d%%)", commafy(stats.Done), commafy(stats.TotalJobs), d.DonePct)
+		remaining := stats.Pending + stats.Claimed
+		if stats.DoneLastHour > 0 {
+			d.ThroughputText = fmt.Sprintf("~%s done in the last hour", commafy(stats.DoneLastHour))
+			etaHours := float64(remaining) / float64(stats.DoneLastHour)
+			d.ETAText = humanizeETA(etaHours)
+		} else {
+			d.ThroughputText = "no completions in the last hour"
+			d.ETAText = "—"
+		}
 	}
 
 	fresh := false
@@ -438,6 +472,20 @@ func commafy(n int) string {
 		return "-" + b.String()
 	}
 	return b.String()
+}
+
+// humanizeETA renders a rough remaining-time estimate from a count of hours.
+func humanizeETA(hours float64) string {
+	switch {
+	case hours <= 0:
+		return "—"
+	case hours < 1:
+		return "<1h left"
+	case hours < 48:
+		return fmt.Sprintf("~%dh left", int(hours+0.5))
+	default:
+		return fmt.Sprintf("~%.1f days left", hours/24)
+	}
 }
 
 func humanizeSince(d time.Duration) string {

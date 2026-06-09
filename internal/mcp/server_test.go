@@ -170,6 +170,8 @@ func (m *SimpleMockDB) GetServiceStatus(_ context.Context) (*db.QueueStats, erro
 		Transcripts:   10,
 		Chunks:        450,
 		EmbedBacklog:  m.embedBacklog,
+		TotalJobs:     13,
+		DoneLastHour:  3,
 		Paused:        m.paused,
 		RunnerActive:  true,
 		RunnerID:      runnerID,

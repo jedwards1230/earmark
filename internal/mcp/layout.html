@@ -134,8 +134,19 @@
   .badge.failed   { background: #2a0a0a; color: var(--red); }
   .file-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
   .time-muted { color: var(--muted); font-size: 12px; }
-  .error-row { color: var(--red); font-size: 12px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; max-height: 3.2em; overflow: hidden; }
+  /* error-row: a <details> expander so the full traceback is readable on demand
+     instead of being clamped and hidden. */
+  .error-row { margin-top: 4px; font-size: 12px; }
+  .error-row > summary { color: var(--red); cursor: pointer; list-style: revert; }
+  .error-row > pre { color: var(--red); white-space: pre-wrap; word-break: break-word; margin-top: 4px; font: inherit; font-size: 12px; }
   .actions { text-align: right; white-space: nowrap; }
+
+  /* overview backfill progress bar */
+  .overview-progress { margin-bottom: 20px; }
+  .op-bar { height: 8px; background: #2a2a3a; border-radius: 4px; overflow: hidden; }
+  .op-fill { height: 100%; background: var(--green); }
+  .op-meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 12px; }
+  .op-main { color: var(--text); font-weight: 600; }
 
   /* ── callouts ──────────────────────────────────────────────────── */
   .stall-callout { background: #2a1c08; color: var(--amber); border: 1px solid var(--amber); border-radius: 6px; padding: 8px 14px; margin-bottom: 20px; font-size: 13px; line-height: 1.5; }
