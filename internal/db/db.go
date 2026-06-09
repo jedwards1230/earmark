@@ -289,6 +289,20 @@ func (db *DB) initialize(ctx context.Context) error {
 		CREATE TRIGGER transcription_jobs_updated_at
 			BEFORE UPDATE ON transcription_jobs
 			FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_updated_at();
+
+		-- runner_control: singleton row holding the global pause flag (CONTRACT §1.4).
+		-- The ASR runner reads runner_control.paused before each claim; the Go
+		-- service's dashboard writes it. A DB row is the only channel the (separate-
+		-- host) runner and service share, and it is durable across reboots — unlike
+		-- the gaming busy-flag file, which lives in tmpfs on the GPU host.
+		CREATE TABLE IF NOT EXISTS runner_control (
+			id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+			paused     BOOLEAN     NOT NULL DEFAULT false,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_by TEXT
+		);
+		INSERT INTO runner_control (id, paused) VALUES (1, false)
+			ON CONFLICT (id) DO NOTHING;
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -636,6 +650,15 @@ type QueueStats struct {
 	Failed      int
 	Transcripts int
 	Chunks      int
+	// EmbedBacklog counts completed transcripts that have no chunks yet — i.e.
+	// the worker's "needs embedding" set. A healthy pipeline drains this to ~0
+	// quickly; a large, non-draining value means embedding is stalling (Ollama
+	// down or model missing), which is otherwise invisible because the job rows
+	// stay 'done' and never flip to 'failed'.
+	EmbedBacklog int
+	// Paused mirrors runner_control.paused — true means the runner is declining
+	// to claim new work (set via the dashboard pause toggle).
+	Paused bool
 	// Runner fields — populated when at least one job has status='claimed'.
 	RunnerActive  bool
 	RunnerID      string     // claimed_by of the most-recently-updated claimed job
@@ -687,6 +710,26 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 	// Chunk count.
 	if err := db.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transcript_chunks`).Scan(&q.Chunks); err != nil {
 		return nil, fmt.Errorf("chunk count: %w", err)
+	}
+
+	// Embed backlog: completed transcripts with no chunks yet (mirrors the
+	// worker's GetCompletedTranscripts selection). Surfaces a silent embedding
+	// stall that never shows up in the job-status counts.
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM transcripts t
+		WHERE NOT EXISTS (
+			SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
+		)
+	`).Scan(&q.EmbedBacklog); err != nil {
+		return nil, fmt.Errorf("embed backlog count: %w", err)
+	}
+
+	// Global pause flag (runner_control singleton). Tolerate a missing row by
+	// defaulting to not-paused; the init seed normally guarantees it exists.
+	if err := db.pool.QueryRow(ctx,
+		`SELECT paused FROM runner_control WHERE id = 1`,
+	).Scan(&q.Paused); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("paused flag query: %w", err)
 	}
 
 	// Active runner: most-recently-updated claimed job.
@@ -747,6 +790,163 @@ func (db *DB) GetRecentJobs(ctx context.Context, limit int) ([]RecentJob, error)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows error (recent jobs): %w", err)
+	}
+	return jobs, nil
+}
+
+// ─── Pause control ───────────────────────────────────────────────────────────
+
+// GetPaused returns the global pause flag from runner_control. A missing row
+// (which init normally seeds) is treated as not-paused.
+func (db *DB) GetPaused(ctx context.Context) (bool, error) {
+	var paused bool
+	err := db.pool.QueryRow(ctx, `SELECT paused FROM runner_control WHERE id = 1`).Scan(&paused)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get paused: %w", err)
+	}
+	return paused, nil
+}
+
+// SetPaused writes the global pause flag. by records who toggled it (e.g.
+// "dashboard") for the audit column. Upserts the singleton row so it works even
+// if the seed insert was somehow skipped.
+func (db *DB) SetPaused(ctx context.Context, paused bool, by string) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO runner_control (id, paused, updated_at, updated_by)
+		VALUES (1, $1, now(), $2)
+		ON CONFLICT (id) DO UPDATE
+			SET paused = EXCLUDED.paused,
+			    updated_at = EXCLUDED.updated_at,
+			    updated_by = EXCLUDED.updated_by
+	`, paused, by)
+	if err != nil {
+		return fmt.Errorf("set paused: %w", err)
+	}
+	return nil
+}
+
+// ─── Library (book-grouped jobs) ─────────────────────────────────────────────
+
+// BookSummary aggregates all track jobs that share a book directory (the parent
+// directory of the audio file). Title/Author are derived from the path in Go.
+type BookSummary struct {
+	Dir         string // book directory (group key): dirname(file_path)
+	Title       string // base(Dir)
+	Author      string // base(dirname(Dir))
+	Total       int
+	Pending     int
+	Claimed     int
+	Done        int
+	Failed      int
+	LastUpdated time.Time
+}
+
+// BookFilter narrows and paginates GetBookSummaries.
+type BookFilter struct {
+	Status string // "", "pending", "claimed", "done", "failed" — books having ≥1 track in this status
+	Query  string // case-insensitive substring match on file_path (author/title/track)
+	Limit  int    // page size (defaulted if ≤ 0)
+	Offset int    // page offset
+}
+
+// GetBookSummaries returns one row per book directory, aggregating track-job
+// counts, plus the total number of matching books (for pagination). Books are
+// ordered by most-recently-updated so active work surfaces first.
+func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary, int, error) {
+	if f.Limit <= 0 {
+		f.Limit = 20
+	}
+	// status is validated against an allow-list so it can be interpolated into
+	// the HAVING filter safely; everything else is a bound parameter.
+	statusHaving := ""
+	switch f.Status {
+	case "":
+		// no status filter
+	case "pending", "claimed", "done", "failed":
+		statusHaving = fmt.Sprintf(
+			"HAVING COUNT(*) FILTER (WHERE status = '%s') > 0", f.Status)
+	default:
+		return nil, 0, fmt.Errorf("invalid status filter: %q", f.Status)
+	}
+
+	// COUNT(*) OVER() yields the total matching-book count alongside the page so
+	// pagination needs only one round-trip. $1=query, $2=limit, $3=offset.
+	query := fmt.Sprintf(`
+		WITH books AS (
+			SELECT
+				regexp_replace(file_path, '/[^/]+$', '')        AS book_dir,
+				COUNT(*)                                          AS total,
+				COUNT(*) FILTER (WHERE status = 'pending')        AS pending,
+				COUNT(*) FILTER (WHERE status = 'claimed')        AS claimed,
+				COUNT(*) FILTER (WHERE status = 'done')           AS done,
+				COUNT(*) FILTER (WHERE status = 'failed')         AS failed,
+				MAX(updated_at)                                   AS last_updated
+			FROM transcription_jobs
+			WHERE ($1 = '' OR file_path ILIKE '%%' || $1 || '%%')
+			GROUP BY book_dir
+			%s
+		)
+		SELECT book_dir, total, pending, claimed, done, failed, last_updated,
+		       COUNT(*) OVER() AS total_books
+		FROM books
+		ORDER BY last_updated DESC, book_dir
+		LIMIT $2 OFFSET $3
+	`, statusHaving)
+
+	rows, err := db.pool.Query(ctx, query, f.Query, f.Limit, f.Offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("book summaries query: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		out   []BookSummary
+		total int
+	)
+	for rows.Next() {
+		var b BookSummary
+		if err := rows.Scan(&b.Dir, &b.Total, &b.Pending, &b.Claimed, &b.Done,
+			&b.Failed, &b.LastUpdated, &total); err != nil {
+			return nil, 0, fmt.Errorf("scan book summary: %w", err)
+		}
+		b.Title = filepath.Base(b.Dir)
+		b.Author = filepath.Base(filepath.Dir(b.Dir))
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("rows error (book summaries): %w", err)
+	}
+	return out, total, nil
+}
+
+// GetBookTracks returns the individual track jobs for one book directory,
+// ordered by file path, for the expand-to-tracks view. dir must be an exact
+// book_dir as returned by GetBookSummaries.
+func (db *DB) GetBookTracks(ctx context.Context, dir string) ([]RecentJob, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT id, file_path, status, updated_at, error
+		FROM transcription_jobs
+		WHERE regexp_replace(file_path, '/[^/]+$', '') = $1
+		ORDER BY file_path
+	`, dir)
+	if err != nil {
+		return nil, fmt.Errorf("book tracks query: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []RecentJob
+	for rows.Next() {
+		var j RecentJob
+		if err := rows.Scan(&j.ID, &j.FilePath, &j.Status, &j.UpdatedAt, &j.Error); err != nil {
+			return nil, fmt.Errorf("scan book track: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (book tracks): %w", err)
 	}
 	return jobs, nil
 }

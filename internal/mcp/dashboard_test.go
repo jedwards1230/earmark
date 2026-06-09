@@ -42,7 +42,7 @@ func TestNewDashboardData_RunnerStaleness(t *testing.T) {
 
 	// Fresh heartbeat → active, not stale.
 	recent := now.Add(-10 * time.Second)
-	d := newDashboardData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &recent}, nil, now, stale)
+	d := newDashboardData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &recent}, nil, now, stale, "")
 	if d.RunnerStale {
 		t.Error("recent heartbeat should not be stale")
 	}
@@ -52,13 +52,13 @@ func TestNewDashboardData_RunnerStaleness(t *testing.T) {
 
 	// Old heartbeat + still 'claimed' → stale (the crashed-runner case).
 	old := now.Add(-2 * time.Hour)
-	d = newDashboardData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old}, nil, now, stale)
+	d = newDashboardData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old}, nil, now, stale, "")
 	if !d.RunnerStale {
 		t.Error("2h-old heartbeat with RunnerActive should be stale")
 	}
 
 	// Fresh install → Empty.
-	d = newDashboardData(&db.QueueStats{}, nil, now, stale)
+	d = newDashboardData(&db.QueueStats{}, nil, now, stale, "")
 	if !d.Empty {
 		t.Error("zero stats with no runner should be Empty")
 	}
@@ -74,7 +74,7 @@ func TestFragmentRendersStaleRunner(t *testing.T) {
 	old := now.Add(-90 * time.Minute)
 	data := newDashboardData(
 		&db.QueueStats{RunnerActive: true, RunnerID: "r1", LastHeartbeat: &old, Chunks: 12345},
-		nil, now, 30*time.Minute,
+		nil, now, 30*time.Minute, "",
 	)
 	var buf bytes.Buffer
 	if err := fragmentTmpl.Execute(&buf, data); err != nil {
