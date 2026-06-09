@@ -214,6 +214,41 @@ writes this file when the host should not accept new jobs and removes it when
 the host is available again. The runner checks the flag at the top of each poll
 cycle before issuing the claim UPDATE.
 
+The busy flag is **host-local and ephemeral** (tmpfs): it is the right channel
+for a transient, host-side GPU-contention gate (e.g. gaming), but it does NOT
+survive a host reboot and is invisible to the in-cluster Go service. For a
+durable, operator-controlled pause use the pause-control table below.
+
+#### Pause control — `runner_control` table
+
+A singleton row holds the global pause flag. The Go service (dashboard) writes
+it; the runner reads it. Because it lives in the shared database it is durable
+across reboots and visible to both the off-host runner and the in-cluster
+service (unlike the busy flag).
+
+```sql
+CREATE TABLE IF NOT EXISTS runner_control (
+    id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    paused     BOOLEAN     NOT NULL DEFAULT false,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by TEXT
+);
+-- seeded once by the Go service on init:
+INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NOTHING;
+```
+
+The runner MUST check this flag at the top of each poll cycle, before the claim
+UPDATE (alongside the busy-flag check). When `paused` is true it finishes any
+in-flight job, then skips claiming new work:
+
+```sql
+SELECT paused FROM runner_control WHERE id = 1;
+```
+
+A missing row (the Go service not yet initialized) MUST be treated as
+**not paused** so the runner degrades safely. The flag gates new claims only; an
+in-flight transcription always runs to completion.
+
 #### Operator requeue (out-of-band, `lil-whisper requeue`)
 
 In addition to the runner/service transitions above, an operator may move a job

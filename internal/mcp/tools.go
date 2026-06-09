@@ -28,6 +28,13 @@ type DBInterface interface {
 	RequeueByID(ctx context.Context, id string) (string, error)
 	// RequeueFailed re-transcribes all failed jobs (dashboard "retry all" button).
 	RequeueFailed(ctx context.Context) ([]string, error)
+	// SetPaused writes the global runner pause flag (dashboard pause/resume).
+	SetPaused(ctx context.Context, paused bool, by string) error
+	// GetBookSummaries returns one row per book directory (the library view),
+	// plus the total matching-book count for pagination.
+	GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error)
+	// GetBookTracks returns the individual track jobs for one book directory.
+	GetBookTracks(ctx context.Context, dir string) ([]db.RecentJob, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

@@ -25,6 +25,10 @@ type MCPServer struct {
 	// dashboard reports it as "stale" instead of "active". A claimed job alone
 	// doesn't prove the runner is alive — a crashed runner keeps a job claimed.
 	runnerStaleAfter time.Duration
+
+	// embedURL is the configured embeddings endpoint, shown in the embed-stall
+	// warning so an operator knows which Ollama to check.
+	embedURL string
 }
 
 // NewMCPServer creates a new MCP server instance
@@ -106,6 +110,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		logger:           logger,
 		db:               database,
 		runnerStaleAfter: staleAfter,
+		embedURL:         cfg.EmbeddingsBaseURL,
 	}
 }
 
@@ -158,6 +163,11 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/", getOnly(s.handleDashboardPage))
 	mux.HandleFunc("/status/data", getOnly(s.handleStatusData))
 
+	// Library — the complete, book-grouped, filterable/paginated job list. Driven
+	// by the user (not the 3s poll) so filter/search/page state is never clobbered.
+	mux.HandleFunc("/library", getOnly(s.handleLibrary))
+	mux.HandleFunc("/library/tracks", getOnly(s.handleBookTracks))
+
 	// Vendored htmx (pinned), served from the binary so the dashboard needs no
 	// external CDN at runtime.
 	mux.HandleFunc("/static/htmx.min.js", getOnly(s.handleHTMX))
@@ -167,6 +177,8 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	// Each re-renders the status fragment so the table updates immediately.
 	mux.HandleFunc("POST /actions/requeue", s.handleRequeueJob)
 	mux.HandleFunc("POST /actions/retry-failed", s.handleRetryFailed)
+	mux.HandleFunc("POST /actions/pause", s.handlePause)
+	mux.HandleFunc("POST /actions/resume", s.handleResume)
 
 	// Liveness — no external deps.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

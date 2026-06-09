@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,42 @@ type SimpleMockDB struct {
 	requeueErr    error  // if set, RequeueByID/RequeueFailed return it
 	requeuedID    string // last id passed to RequeueByID
 	retriedFailed bool   // RequeueFailed was called
+	paused        bool   // current pause flag (mutated by SetPaused)
+	pausedSetTo   *bool  // last value passed to SetPaused
+	setPausedErr  error  // if set, SetPaused returns it
+	embedBacklog  int    // EmbedBacklog reported by GetServiceStatus
+	lastBookDir   string // last dir passed to GetBookTracks
+}
+
+func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error {
+	if m.setPausedErr != nil {
+		return m.setPausedErr
+	}
+	m.paused = paused
+	m.pausedSetTo = &paused
+	return nil
+}
+
+func (m *SimpleMockDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookSummary, int, error) {
+	books := []db.BookSummary{
+		{Dir: "/books/Author One/Book A", Title: "Book A", Author: "Author One",
+			Total: 3, Done: 1, Pending: 2, LastUpdated: time.Now().UTC()},
+		{Dir: "/books/Author Two/Book B", Title: "Book B", Author: "Author Two",
+			Total: 2, Done: 2, LastUpdated: time.Now().UTC().Add(-time.Hour)},
+	}
+	// Honor the status filter minimally so the filter path is exercised in tests.
+	if f.Status == "pending" {
+		books = books[:1]
+	}
+	return books, len(books), nil
+}
+
+func (m *SimpleMockDB) GetBookTracks(_ context.Context, dir string) ([]db.RecentJob, error) {
+	m.lastBookDir = dir
+	return []db.RecentJob{
+		{ID: "t1", FilePath: dir + "/Track 1.mp3", Status: "done", UpdatedAt: time.Now().UTC()},
+		{ID: "t2", FilePath: dir + "/Track 2.mp3", Status: "pending", UpdatedAt: time.Now().UTC()},
+	}, nil
 }
 
 func (m *SimpleMockDB) RequeueByID(_ context.Context, id string) (string, error) {
@@ -123,6 +160,8 @@ func (m *SimpleMockDB) GetServiceStatus(_ context.Context) (*db.QueueStats, erro
 		Failed:        0,
 		Transcripts:   10,
 		Chunks:        450,
+		EmbedBacklog:  m.embedBacklog,
+		Paused:        m.paused,
 		RunnerActive:  true,
 		RunnerID:      runnerID,
 		LastHeartbeat: &now,
@@ -484,5 +523,162 @@ func TestStatusDataFragment(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("GET /status/data: body missing %q\nbody:\n%s", want, body)
 		}
+	}
+}
+
+// TestPauseResumeActions verifies the pause/resume buttons toggle the DB pause
+// flag and the fragment reflects the new state (htmx-guarded).
+func TestPauseResumeActions(t *testing.T) {
+	mock := &SimpleMockDB{}
+
+	// Pause: POST /actions/pause with the htmx header.
+	req := httptest.NewRequest(http.MethodPost, "/actions/pause", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("pause: want 200, got %d", w.Code)
+	}
+	if mock.pausedSetTo == nil || !*mock.pausedSetTo {
+		t.Error("pause did not SetPaused(true)")
+	}
+	if !strings.Contains(w.Body.String(), "PAUSED") ||
+		!strings.Contains(w.Body.String(), "/actions/resume") {
+		t.Errorf("paused fragment missing PAUSED state / resume button:\n%s", w.Body.String())
+	}
+
+	// Resume: POST /actions/resume clears it.
+	req = httptest.NewRequest(http.MethodPost, "/actions/resume", nil)
+	req.Header.Set("HX-Request", "true")
+	w = httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("resume: want 200, got %d", w.Code)
+	}
+	if mock.pausedSetTo == nil || *mock.pausedSetTo {
+		t.Error("resume did not SetPaused(false)")
+	}
+	if !strings.Contains(w.Body.String(), "RUNNING") ||
+		!strings.Contains(w.Body.String(), "/actions/pause") {
+		t.Errorf("running fragment missing RUNNING state / pause button:\n%s", w.Body.String())
+	}
+}
+
+// TestPauseRequiresHTMX verifies the pause action rejects non-htmx posts (CSRF
+// guard), like the other mutating actions.
+func TestPauseRequiresHTMX(t *testing.T) {
+	mock := &SimpleMockDB{}
+	req := httptest.NewRequest(http.MethodPost, "/actions/pause", nil) // no HX-Request
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("pause without HX-Request: want 403, got %d", w.Code)
+	}
+	if mock.pausedSetTo != nil {
+		t.Error("SetPaused must not be called on a forbidden request")
+	}
+}
+
+// TestPauseErrorSurfaces verifies a failed pause surfaces a visible banner
+// (200 + HX-Retarget) rather than vanishing.
+func TestPauseErrorSurfaces(t *testing.T) {
+	mock := &SimpleMockDB{setPausedErr: fmt.Errorf("boom")}
+	req := httptest.NewRequest(http.MethodPost, "/actions/pause", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed pause: want 200 (so htmx swaps), got %d", w.Code)
+	}
+	if got := w.Header().Get("HX-Retarget"); got != "#action-error" {
+		t.Errorf("HX-Retarget = %q, want #action-error", got)
+	}
+	if !strings.Contains(w.Body.String(), "action-err") {
+		t.Errorf("expected an error banner, got %q", w.Body.String())
+	}
+}
+
+// TestEmbedStallWarning verifies a large embed backlog raises the stall callout
+// (and the Unembedded card), which is the only place a silent embedding stall is
+// visible (job rows stay 'done').
+func TestEmbedStallWarning(t *testing.T) {
+	// Below threshold: no callout.
+	h := buildTestMux(&SimpleMockDB{embedBacklog: embedStallThreshold - 1})
+	req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), "stall-callout") {
+		t.Error("did not expect a stall callout below threshold")
+	}
+
+	// At/above threshold: callout appears.
+	h = buildTestMux(&SimpleMockDB{embedBacklog: embedStallThreshold})
+	req = httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), "stall-callout") {
+		t.Errorf("expected a stall callout at/above threshold:\n%s", w.Body.String())
+	}
+}
+
+// TestLibraryEndpoint verifies the library fragment lists books, honors the
+// status filter, and rejects nothing unexpectedly.
+func TestLibraryEndpoint(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+
+	// Unfiltered: both books present.
+	req := httptest.NewRequest(http.MethodGet, "/library", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /library: want 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"Book A", "Book B", "Author One", "book-row", "tracks"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("GET /library: missing %q", want)
+		}
+	}
+
+	// Status filter narrows to the pending book and marks the chip active.
+	req = httptest.NewRequest(http.MethodGet, "/library?status=pending", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body = w.Body.String()
+	if strings.Contains(body, "Book B") {
+		t.Error("status=pending should have filtered out the fully-done Book B")
+	}
+	if !strings.Contains(body, `chip active`) {
+		t.Error("expected the active filter chip to be marked")
+	}
+}
+
+// TestLibraryTracksEndpoint verifies the expand-to-tracks fragment returns the
+// per-track rows for a book directory.
+func TestLibraryTracksEndpoint(t *testing.T) {
+	mock := &SimpleMockDB{}
+	dir := "/books/Author One/Book A"
+	req := httptest.NewRequest(http.MethodGet, "/library/tracks?dir="+url.QueryEscape(dir), nil)
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /library/tracks: want 200, got %d", w.Code)
+	}
+	if mock.lastBookDir != dir {
+		t.Errorf("dir not decoded: got %q want %q", mock.lastBookDir, dir)
+	}
+	if !strings.Contains(w.Body.String(), "Track 1.mp3") {
+		t.Errorf("expected track rows in body:\n%s", w.Body.String())
+	}
+}
+
+// TestLibraryTracksRequiresDir verifies the tracks endpoint 400s without a dir.
+func TestLibraryTracksRequiresDir(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/library/tracks", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET /library/tracks without dir: want 400, got %d", w.Code)
 	}
 }
