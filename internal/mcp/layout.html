@@ -87,11 +87,13 @@
   .pipeline.state-paused  { border-color: var(--amber); }
   .pipeline.state-idle    { border-color: var(--border); }
   .pipeline.state-running { border-color: var(--green); }
+  .pipeline.state-stalled { border-color: var(--red); }
   .pipe-main { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
   .pipe-label { font-weight: 700; letter-spacing: 0.06em; font-size: 15px; }
   .state-running .pipe-label { color: var(--green); }
   .state-paused  .pipe-label { color: var(--amber); }
   .state-idle    .pipe-label { color: var(--blue); }
+  .state-stalled .pipe-label { color: var(--red); }
   .pipe-sub { color: var(--muted); font-size: 12px; }
   .pipe-meta { color: var(--muted); font-size: 11px; margin-top: 4px; width: 100%; }
 

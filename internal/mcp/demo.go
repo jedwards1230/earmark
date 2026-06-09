@@ -21,7 +21,7 @@ import (
 //
 //	active (default) — live runner, healthy backlog, a couple of failures
 //	empty            — fresh install: zero counts, runner never seen
-//	stale            — runner claimed a job but its heartbeat is hours old
+//	stale            — runner heartbeat hours old with work waiting → STALLED
 //	failed           — failures including a long multi-line error string
 type demoDB struct {
 	scenario string
