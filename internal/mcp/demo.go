@@ -78,6 +78,7 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		q = &db.QueueStats{
 			Pending: 5, Claimed: 1, Done: 120, Failed: 0,
 			Transcripts: 120, Chunks: 7431, EmbedBacklog: 0,
+			TotalJobs: 126, DoneLastHour: 0, // stalled → no recent completions → ETA "—"
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 		}
 	case "failed":
@@ -85,6 +86,7 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		q = &db.QueueStats{
 			Pending: 3, Claimed: 1, Done: 88, Failed: 7,
 			Transcripts: 88, Chunks: 5120, EmbedBacklog: 14, // large → exercises the stall warning
+			TotalJobs: 99, DoneLastHour: 4,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 		}
 	default: // active
@@ -92,6 +94,7 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		q = &db.QueueStats{
 			Pending: 42, Claimed: 1, Done: 317, Failed: 2,
 			Transcripts: 317, Chunks: 18452, EmbedBacklog: 3,
+			TotalJobs: 362, DoneLastHour: 22,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 		}
 	}

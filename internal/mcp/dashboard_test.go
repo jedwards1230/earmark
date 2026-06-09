@@ -128,3 +128,78 @@ func TestStatusFragmentRendersStalled(t *testing.T) {
 		t.Errorf("expected a STALLED banner:\n%s", out)
 	}
 }
+
+func TestBackfillProgressDerivation(t *testing.T) {
+	now := time.Now()
+	// Active backfill: 317/362 done, 22/hr → finite ETA.
+	d := newStatusData(&db.QueueStats{
+		Pending: 42, Claimed: 1, Done: 317, Failed: 2, TotalJobs: 362, DoneLastHour: 22,
+	}, nil, now, 30*time.Minute, "")
+	if !d.ShowProgress {
+		t.Fatal("ShowProgress should be true when TotalJobs > 0")
+	}
+	if d.DonePct != 87 {
+		t.Errorf("DonePct = %d, want 87 (317*100/362)", d.DonePct)
+	}
+	for _, want := range []string{"317", "362", "87%"} {
+		if !strings.Contains(d.ProgressText, want) {
+			t.Errorf("ProgressText %q missing %q", d.ProgressText, want)
+		}
+	}
+	if !strings.Contains(d.ThroughputText, "22") {
+		t.Errorf("ThroughputText = %q, want it to mention 22", d.ThroughputText)
+	}
+	if d.ETAText == "" || d.ETAText == "—" {
+		t.Errorf("ETAText = %q, want a finite estimate", d.ETAText)
+	}
+
+	// Zero throughput → ETA "—", no panic.
+	d = newStatusData(&db.QueueStats{Pending: 100, Done: 10, TotalJobs: 110, DoneLastHour: 0}, nil, now, 30*time.Minute, "")
+	if d.ETAText != "—" {
+		t.Errorf("zero-throughput ETAText = %q, want —", d.ETAText)
+	}
+
+	// Empty install → no progress shown, no divide-by-zero.
+	d = newStatusData(&db.QueueStats{}, nil, now, 30*time.Minute, "")
+	if d.ShowProgress {
+		t.Error("ShowProgress should be false on an empty install")
+	}
+}
+
+func TestHumanizeETA(t *testing.T) {
+	if got := humanizeETA(0); got != "—" {
+		t.Errorf("humanizeETA(0) = %q, want —", got)
+	}
+	if got := humanizeETA(0.5); got != "<1h left" {
+		t.Errorf("humanizeETA(0.5) = %q, want <1h left", got)
+	}
+	if got := humanizeETA(5); got != "~5h left" {
+		t.Errorf("humanizeETA(5) = %q, want ~5h left", got)
+	}
+	if got := humanizeETA(168); got != "~7.0 days left" {
+		t.Errorf("humanizeETA(168) = %q, want ~7.0 days left", got)
+	}
+}
+
+// TestErrorRowIsExpandable verifies a job error renders inside a <details>
+// expander (the full traceback is reachable), and is still HTML-escaped.
+func TestErrorRowIsExpandable(t *testing.T) {
+	evil := "Traceback line 1\n<script>alert(1)</script>\nRuntimeError: boom"
+	data := newStatusData(&db.QueueStats{TotalJobs: 1, Failed: 1}, []db.RecentJob{
+		{ID: "x", FilePath: "/books/a/b.m4b", Status: "failed", Error: &evil},
+	}, time.Now(), 30*time.Minute, "")
+	var buf bytes.Buffer
+	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "<details class=\"error-row\"") || !strings.Contains(out, "<summary>") {
+		t.Errorf("error should render in a <details> expander:\n%s", out)
+	}
+	if strings.Contains(out, "<script>alert(1)</script>") {
+		t.Error("error text must be HTML-escaped, not raw")
+	}
+	if !strings.Contains(out, "RuntimeError: boom") {
+		t.Error("the full error text should be present (not clamped away)")
+	}
+}

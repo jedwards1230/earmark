@@ -656,6 +656,14 @@ type QueueStats struct {
 	// down or model missing), which is otherwise invisible because the job rows
 	// stay 'done' and never flip to 'failed'.
 	EmbedBacklog int
+	// TotalJobs is Pending+Claimed+Done+Failed — the full backlog denominator.
+	TotalJobs int
+	// DoneLastHour is the number of jobs whose row entered 'done' in the last
+	// hour, a throughput proxy. (A 'done' row's updated_at is its completion
+	// time: the runner's mark-done UPDATE fires the updated_at trigger, and a
+	// requeue moves the row out of 'done' rather than re-stamping it. A future
+	// completed_at column would make this exact.)
+	DoneLastHour int
 	// Paused mirrors runner_control.paused — true means the runner is declining
 	// to claim new work (set via the dashboard pause toggle).
 	Paused bool
@@ -722,6 +730,15 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		)
 	`).Scan(&q.EmbedBacklog); err != nil {
 		return nil, fmt.Errorf("embed backlog count: %w", err)
+	}
+
+	// Backfill progress + throughput.
+	q.TotalJobs = q.Pending + q.Claimed + q.Done + q.Failed
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM transcription_jobs
+		WHERE status = 'done' AND updated_at > now() - interval '1 hour'
+	`).Scan(&q.DoneLastHour); err != nil {
+		return nil, fmt.Errorf("done-last-hour count: %w", err)
 	}
 
 	// Global pause flag (runner_control singleton). Tolerate a missing row by
