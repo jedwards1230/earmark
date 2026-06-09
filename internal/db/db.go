@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
@@ -307,38 +308,87 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("create schema: %w", err)
 	}
 
+	// Path-level dedup migration: the original dedup was checksum-only, so a file
+	// hashed mid-copy (over NFS) and again when complete produced two jobs for one
+	// file_path. Collapse any such duplicates (keep the most-advanced, else oldest
+	// — never discard a 'done' transcript) then enforce one job per file_path. The
+	// DELETE is a no-op on a clean DB; the ADD CONSTRAINT is idempotent.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM transcription_jobs t
+		USING (
+			SELECT file_path,
+			       (array_agg(id ORDER BY
+			           CASE status WHEN 'done' THEN 0 WHEN 'claimed' THEN 1
+			                       WHEN 'pending' THEN 2 ELSE 3 END,
+			           created_at ASC))[1] AS keep_id
+			FROM transcription_jobs
+			GROUP BY file_path
+			HAVING COUNT(*) > 1
+		) d
+		WHERE t.file_path = d.file_path AND t.id <> d.keep_id;
+
+		DO $$ BEGIN
+			ALTER TABLE transcription_jobs
+				ADD CONSTRAINT transcription_jobs_file_path_unique UNIQUE (file_path);
+		EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+	`); err != nil {
+		return fmt.Errorf("file_path dedup migration: %w", err)
+	}
+
 	return tx.Commit(ctx)
 }
 
 // ─── Job queue ───────────────────────────────────────────────────────────────
 
-// InsertJobIfAbsent inserts a pending job row if no row with the same checksum
-// exists. Satisfies the transcribe.JobInserter interface.
+// InsertJobIfAbsent inserts a pending job row unless one already exists for the
+// same checksum OR the same file_path. Satisfies the transcribe.JobInserter
+// interface.
+//
+// Dedup is enforced by two UNIQUE constraints (checksum, file_path); a plain
+// INSERT that violates either raises 23505, which we treat as "already present"
+// and resolve to the existing id. Catching the error (rather than ON CONFLICT
+// on a single column) is what closes the race where a file copied over NFS is
+// hashed mid-copy and again when complete: the two differing checksums share one
+// file_path, so the file_path constraint blocks the duplicate regardless of
+// caller timing.
 //
 // Returns (jobID, true, nil) on insert, or (existingID, false, nil) if present.
 func (db *DB) InsertJobIfAbsent(ctx context.Context, filePath, checksum string) (string, bool, error) {
-	// Use INSERT … ON CONFLICT DO NOTHING and check rows affected.
 	id := uuid.New().String()
-	tag, err := db.pool.Exec(ctx, `
+	_, err := db.pool.Exec(ctx, `
 		INSERT INTO transcription_jobs (id, file_path, checksum)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (checksum) DO NOTHING
 	`, id, filePath, checksum)
-	if err != nil {
-		return "", false, fmt.Errorf("insert job: %w", err)
-	}
-
-	if tag.RowsAffected() == 1 {
+	if err == nil {
 		return id, true, nil
 	}
 
-	// Row already exists — return its id.
-	var existingID string
-	err = db.pool.QueryRow(ctx, `SELECT id FROM transcription_jobs WHERE checksum = $1`, checksum).Scan(&existingID)
-	if err != nil {
-		return "", false, fmt.Errorf("fetch existing job id: %w", err)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation (checksum or file_path)
+		var existingID string
+		qerr := db.pool.QueryRow(ctx, `
+			SELECT id FROM transcription_jobs
+			WHERE file_path = $1 OR checksum = $2
+			LIMIT 1
+		`, filePath, checksum).Scan(&existingID)
+		if qerr != nil {
+			return "", false, fmt.Errorf("fetch existing job id: %w", qerr)
+		}
+		return existingID, false, nil
 	}
-	return existingID, false, nil
+	return "", false, fmt.Errorf("insert job: %w", err)
+}
+
+// IsPathQueued reports whether a transcription_jobs row already exists for the
+// given file_path (in any status). The monitor uses it to skip re-hashing
+// already-known files on startup, turning a full-library rescan into a
+// metadata-only scan.
+func (db *DB) IsPathQueued(ctx context.Context, filePath string) (bool, error) {
+	var exists bool
+	err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM transcription_jobs WHERE file_path = $1)
+	`, filePath).Scan(&exists)
+	return exists, err
 }
 
 // GetCompletedTranscripts returns transcripts that have been completed by the

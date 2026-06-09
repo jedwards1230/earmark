@@ -28,7 +28,8 @@ CREATE TABLE transcription_jobs (
     error        TEXT,                           -- last error message when status='failed'
     attempts     INTEGER     NOT NULL DEFAULT 0,
 
-    CONSTRAINT transcription_jobs_checksum_unique UNIQUE (checksum)
+    CONSTRAINT transcription_jobs_checksum_unique  UNIQUE (checksum),
+    CONSTRAINT transcription_jobs_file_path_unique UNIQUE (file_path)  -- one job per file
 );
 
 CREATE INDEX transcription_jobs_status_idx ON transcription_jobs (status, created_at);
