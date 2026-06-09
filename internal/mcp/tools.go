@@ -37,6 +37,8 @@ type DBInterface interface {
 	GetBookTracks(ctx context.Context, dir string) ([]db.RecentJob, error)
 	// RequeueByDir re-transcribes every track in one book directory (book page).
 	RequeueByDir(ctx context.Context, dir string) ([]string, error)
+	// GetFailedJobs returns failed jobs with full triage detail (failures view).
+	GetFailedJobs(ctx context.Context) ([]db.FailedJob, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

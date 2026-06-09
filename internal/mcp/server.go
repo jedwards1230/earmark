@@ -180,6 +180,8 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/library/data", getOnly(s.handleLibraryData))
 	mux.HandleFunc("/book", getOnly(s.handleBookPage))
 	mux.HandleFunc("/book/data", getOnly(s.handleBookData))
+	mux.HandleFunc("/failed", getOnly(s.handleFailedPage))
+	mux.HandleFunc("/failed/data", getOnly(s.handleFailedData))
 
 	// Vendored htmx (pinned), served from the binary so the dashboard needs no
 	// external CDN at runtime.

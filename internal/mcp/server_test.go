@@ -85,6 +85,14 @@ func (m *SimpleMockDB) RequeueByDir(_ context.Context, dir string) ([]string, er
 	return []string{dir + "/01.mp3", dir + "/02.mp3"}, nil
 }
 
+func (m *SimpleMockDB) GetFailedJobs(_ context.Context) ([]db.FailedJob, error) {
+	err := "RuntimeError: CUDA out of memory"
+	runner := "asr-runner-test"
+	return []db.FailedJob{
+		{ID: "f1", FilePath: "/books/Author/Book/ch03.m4b", Error: &err, Attempts: 2, ClaimedBy: &runner, UpdatedAt: time.Now().UTC()},
+	}, nil
+}
+
 func (m *SimpleMockDB) Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error) {
 	return []db.SearchResultWithMetadata{
 		{
@@ -814,5 +822,60 @@ func TestLibraryPageThreadsStatusFilter(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if !strings.Contains(w.Body.String(), `hx-get="/library/data"`) {
 		t.Errorf("invalid status should yield an unfiltered /library/data load:\n%s", w.Body.String())
+	}
+}
+
+// TestFailedPageShell verifies the /failed page shell renders + nav.
+func TestFailedPageShell(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/failed", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /failed: want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "failed-region") {
+		t.Error("failed page shell should contain the failed-region container")
+	}
+}
+
+// TestFailedDataEndpoint verifies the failures fragment renders track-level
+// detail: full error (expandable), attempts, claimed_by, requeue.
+func TestFailedDataEndpoint(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/failed/data", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /failed/data: want 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"ch03.m4b",                      // track
+		"CUDA out of memory",            // full error
+		"<details class=\"error-row\"",  // expandable
+		"2/3",                           // attempts
+		"asr-runner-test",               // claimed_by
+		"/actions/requeue?id=f1&failed=1", // per-row requeue targets the failed view
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("GET /failed/data: missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
+// TestRequeueFromFailedView verifies a requeue carrying failed=1 re-renders the
+// failures fragment.
+func TestRequeueFromFailedView(t *testing.T) {
+	mock := &SimpleMockDB{}
+	req := httptest.NewRequest(http.MethodPost, "/actions/requeue?id=f1&failed=1", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed-view requeue: want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Failed jobs") {
+		t.Error("requeue with failed=1 should re-render the failures fragment")
 	}
 }

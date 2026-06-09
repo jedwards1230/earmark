@@ -79,6 +79,10 @@ func (m *MockDBInterface) RequeueByDir(context.Context, string) ([]string, error
 	return nil, nil
 }
 
+func (m *MockDBInterface) GetFailedJobs(context.Context) ([]db.FailedJob, error) {
+	return nil, nil
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

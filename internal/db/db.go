@@ -1105,6 +1105,45 @@ func (db *DB) FindFailedJobs(ctx context.Context) ([]JobMatch, error) {
 	return scanJobMatches(rows)
 }
 
+// FailedJob is a rich view of a failed job for the dashboard failures view —
+// includes the full error, retry count, and which runner last claimed it.
+type FailedJob struct {
+	ID        string
+	FilePath  string
+	Error     *string
+	Attempts  int
+	ClaimedBy *string
+	UpdatedAt time.Time
+}
+
+// GetFailedJobs returns every job in the 'failed' state with full triage detail,
+// newest failure first.
+func (db *DB) GetFailedJobs(ctx context.Context) ([]FailedJob, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT id, file_path, error, attempts, claimed_by, updated_at
+		FROM   transcription_jobs
+		WHERE  status = 'failed'
+		ORDER BY updated_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("get failed jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []FailedJob
+	for rows.Next() {
+		var f FailedJob
+		if err := rows.Scan(&f.ID, &f.FilePath, &f.Error, &f.Attempts, &f.ClaimedBy, &f.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan failed job: %w", err)
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (failed jobs): %w", err)
+	}
+	return out, nil
+}
+
 func scanJobMatches(rows pgx.Rows) ([]JobMatch, error) {
 	var matches []JobMatch
 	for rows.Next() {
