@@ -831,11 +831,14 @@ func (db *DB) SetPaused(ctx context.Context, paused bool, by string) error {
 // ─── Library (book-grouped jobs) ─────────────────────────────────────────────
 
 // BookSummary aggregates all track jobs that share a book directory (the parent
-// directory of the audio file). Title/Author are derived from the path in Go.
+// directory of the audio file). Author/Title are NOT derived here — the caller
+// applies a library.Resolver (config-driven) to Dir + SamplePath, since the
+// right author/title split depends on each collection's directory shape.
 type BookSummary struct {
 	Dir         string // book directory (group key): dirname(file_path)
-	Title       string // base(Dir)
-	Author      string // base(dirname(Dir))
+	SamplePath  string // one file_path within the book (for filename-based title parsing)
+	Author      string // populated by the caller via library.Resolver
+	Title       string // populated by the caller via library.Resolver
 	Total       int
 	Pending     int
 	Claimed     int
@@ -878,6 +881,7 @@ func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary
 		WITH books AS (
 			SELECT
 				regexp_replace(file_path, '/[^/]+$', '')        AS book_dir,
+				MIN(file_path)                                    AS sample_path,
 				COUNT(*)                                          AS total,
 				COUNT(*) FILTER (WHERE status = 'pending')        AS pending,
 				COUNT(*) FILTER (WHERE status = 'claimed')        AS claimed,
@@ -889,7 +893,7 @@ func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary
 			GROUP BY book_dir
 			%s
 		)
-		SELECT book_dir, total, pending, claimed, done, failed, last_updated,
+		SELECT book_dir, sample_path, total, pending, claimed, done, failed, last_updated,
 		       COUNT(*) OVER() AS total_books
 		FROM books
 		ORDER BY last_updated DESC, book_dir
@@ -908,12 +912,10 @@ func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary
 	)
 	for rows.Next() {
 		var b BookSummary
-		if err := rows.Scan(&b.Dir, &b.Total, &b.Pending, &b.Claimed, &b.Done,
+		if err := rows.Scan(&b.Dir, &b.SamplePath, &b.Total, &b.Pending, &b.Claimed, &b.Done,
 			&b.Failed, &b.LastUpdated, &total); err != nil {
 			return nil, 0, fmt.Errorf("scan book summary: %w", err)
 		}
-		b.Title = filepath.Base(b.Dir)
-		b.Author = filepath.Base(filepath.Dir(b.Dir))
 		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {
@@ -1063,6 +1065,12 @@ func (db *DB) RequeueByID(ctx context.Context, id string) (string, error) {
 	return paths[0], nil
 }
 
+// RequeueByDir re-runs the full pipeline for every track in one book directory
+// (exact dirname match). Returns the file paths that were reset.
+func (db *DB) RequeueByDir(ctx context.Context, dir string) ([]string, error) {
+	return db.requeue(ctx, requeueByDir, dir)
+}
+
 // requeuePlan is a pair of fully-formed, static SQL statements for one requeue
 // selector. The statements are package constants — nothing is concatenated at
 // runtime, so the only dynamic input is the bound $1 parameter (when present).
@@ -1100,6 +1108,19 @@ var (
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
 			WHERE  id = $1::uuid
+			RETURNING file_path`,
+	}
+	// requeueByDir selects every track job in one book directory: an exact match
+	// on dirname(file_path) ($1). Used by the per-book "requeue book" action.
+	requeueByDir = requeuePlan{
+		deleteTranscripts: `DELETE FROM transcripts
+			WHERE job_id IN (
+				SELECT id FROM transcription_jobs
+				WHERE regexp_replace(file_path, '/[^/]+$', '') = $1)`,
+		resetJobs: `UPDATE transcription_jobs
+			SET    status = 'pending', attempts = 0, error = NULL,
+			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
+			WHERE  regexp_replace(file_path, '/[^/]+$', '') = $1
 			RETURNING file_path`,
 	}
 )

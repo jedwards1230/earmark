@@ -6,7 +6,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -14,18 +14,11 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/db"
 )
 
-//go:embed dashboard.html htmx.min.js
+//go:embed layout.html htmx.min.js
 var dashboardFS embed.FS
 
-// dashboardPage is parsed once at init time; the file is embedded so there is
-// no runtime filesystem dependency.
-var dashboardPage = template.Must(
-	template.ParseFS(dashboardFS, "dashboard.html"),
-)
-
-// htmxJS is the vendored, version-pinned htmx library (htmx.org v2.0.4).
-// Serving it from the binary instead of a CDN keeps the dashboard working
-// offline / air-gapped and avoids a third-party runtime dependency.
+// htmxJS is the vendored, version-pinned htmx library (htmx.org v2.0.4), served
+// from the binary so the dashboard needs no external CDN at runtime.
 var htmxJS = func() []byte {
 	b, err := dashboardFS.ReadFile("htmx.min.js")
 	if err != nil {
@@ -34,26 +27,20 @@ var htmxJS = func() []byte {
 	return b
 }()
 
-// handleHTMX serves the embedded htmx library (GET /static/htmx.min.js).
-func (s *MCPServer) handleHTMX(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(htmxJS)
-}
+// libraryPageSize is the number of books per page in the library list.
+const libraryPageSize = 20
 
-// fragmentTmpl is the htmx-refreshed inner fragment (no <html>/<head> wrapper).
-// It is defined inline to avoid a second embedded file.
-var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap{
-	"shortName": func(fp string) string {
-		return filepath.Base(fp)
-	},
-	"formatTime": func(t time.Time) string {
-		return t.UTC().Format("2006-01-02 15:04:05 UTC")
-	},
-	"relTime": func(t time.Time) string {
-		return humanizeSince(time.Since(t))
-	},
+// embedStallThreshold is the embed backlog above which the dashboard warns that
+// embeddings are not draining. A few transcripts always sit briefly between
+// transcription and the worker's 30s embed poll, so a small backlog is normal;
+// a sustained large one means Ollama is down or the model isn't pulled.
+const embedStallThreshold = 10
+
+// tmplFuncs are shared across every dashboard template.
+var tmplFuncs = template.FuncMap{
+	"shortName":  func(fp string) string { return path.Base(fp) },
+	"relTime":    func(t time.Time) string { return humanizeSince(time.Since(t)) },
+	"formatTime": func(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05 UTC") },
 	"formatTimePtr": func(t *time.Time) string {
 		if t == nil {
 			return "—"
@@ -67,64 +54,87 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
 		return *s
 	},
 	"commafy": commafy,
-}).Parse(`
-<!-- updated stamp: server-rendered so even a successful refresh shows recency -->
+	// bookDir is the book directory for a track path. Used to build the
+	// book-detail href: passed as a plain string into an href="…?dir={{…}}"
+	// URL-context interpolation, which html/template auto-escapes (no template.URL
+	// taint, no gosec G203).
+	"bookDir": func(fp string) string { return path.Dir(fp) },
+}
+
+// mustPage parses the shared layout plus a page-specific {{define "content"}}.
+func mustPage(content string) *template.Template {
+	t := template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFS(dashboardFS, "layout.html"))
+	return template.Must(t.Parse(content))
+}
+
+// ─── Page shells (layout + content) ──────────────────────────────────────────
+
+var overviewPage = mustPage(`{{define "content"}}
+<p class="subtitle">pipeline status &nbsp;·&nbsp; auto-refreshes every 3 s</p>
+<div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
+<div id="action-error" aria-live="assertive"></div>
+<div id="data-region"
+     hx-get="/status/data" hx-trigger="load, every 3s" hx-swap="innerHTML"
+     hx-sync="this:replace" hx-request='{"timeout": 5000}'
+     hx-on::response-error="document.getElementById('conn').hidden = false"
+     hx-on::send-error="document.getElementById('conn').hidden = false"
+     hx-on::timeout="document.getElementById('conn').hidden = false"
+     hx-on::after-request="if (event.detail.successful) document.getElementById('conn').hidden = true">
+  <p class="htmx-indicator">loading…</p>
+</div>
+{{end}}`)
+
+var libraryPage = mustPage(`{{define "content"}}
+<div id="action-error" aria-live="assertive"></div>
+<div id="library-region" hx-get="/library/data" hx-trigger="load" hx-swap="innerHTML">
+  <p class="htmx-indicator">loading library…</p>
+</div>
+{{end}}`)
+
+var bookPage = mustPage(`{{define "content"}}
+<a class="back-link" href="/library">&#8592;&nbsp;Library</a>
+<div id="action-error" aria-live="assertive"></div>
+<div id="book-region" hx-get="/book/data?dir={{.DirQuery}}" hx-trigger="load" hx-swap="innerHTML">
+  <p class="htmx-indicator">loading…</p>
+</div>
+{{end}}`)
+
+// ─── Status fragment (Overview) ──────────────────────────────────────────────
+
+var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).Parse(`
 <div class="updated">updated {{.RenderedAt}}</div>
 
-<!-- pipeline control: pause/resume the whole runner. The flag lives in the DB
-     (runner_control) so it is durable across reboots and read by the off-host
-     ASR runner before each claim. -->
-<div class="pipeline-control {{if .Stats.Paused}}is-paused{{else}}is-running{{end}}">
-  <div class="pc-state">
-    <span class="dot {{if .Stats.Paused}}amber{{else}}green{{end}}"></span>
-    <span class="pc-label">{{if .Stats.Paused}}PAUSED{{else}}RUNNING{{end}}</span>
-    <span class="pc-sub">{{if .Stats.Paused}}runner is not claiming new work{{else}}runner is claiming pending jobs{{end}}</span>
+<!-- unified pipeline state: combines the pause flag AND runner liveness into one
+     honest line, so it can never say "running" while no runner is connected. -->
+<div class="pipeline {{.StateClass}}">
+  <div class="pipe-main">
+    <span class="dot {{.DotClass}}"></span>
+    <span class="pipe-label">{{.StateLabel}}</span>
+    <span class="pipe-sub">{{.SubText}}</span>
+    {{if .MetaText}}<div class="pipe-meta">{{.MetaText}}</div>{{end}}
   </div>
   {{if .Stats.Paused}}
-  <button class="btn btn-go"
-          hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
+  <button class="btn btn-go" hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Resume the pipeline? The runner will start claiming pending jobs.">&#9654;&nbsp;Resume pipeline</button>
   {{else}}
-  <button class="btn btn-warn"
-          hx-post="/actions/pause" hx-target="#data-region" hx-swap="innerHTML"
+  <button class="btn btn-warn" hx-post="/actions/pause" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Pause the pipeline? The runner finishes its current job, then stops claiming new work.">&#10073;&#10073;&nbsp;Pause pipeline</button>
   {{end}}
 </div>
 
-<!-- stat cards (status cards are clickable → filter the library below) -->
 <div class="grid">
-  <div class="card card-click" title="show pending books"
-       hx-get="/library?status=pending" hx-target="#library-region" hx-swap="innerHTML">
-    <div class="card-label">Pending</div>
-    <div class="card-value blue">{{commafy .Stats.Pending}}</div>
-  </div>
-  <div class="card card-click" title="show in-progress books"
-       hx-get="/library?status=claimed" hx-target="#library-region" hx-swap="innerHTML">
-    <div class="card-label">Claimed</div>
-    <div class="card-value yellow">{{commafy .Stats.Claimed}}</div>
-  </div>
-  <div class="card card-click" title="show completed books"
-       hx-get="/library?status=done" hx-target="#library-region" hx-swap="innerHTML">
-    <div class="card-label">Done</div>
-    <div class="card-value green">{{commafy .Stats.Done}}</div>
-  </div>
-  <div class="card card-click" title="show books with failures"
-       hx-get="/library?status=failed" hx-target="#library-region" hx-swap="innerHTML">
-    <div class="card-label">Failed</div>
-    <div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{commafy .Stats.Failed}}</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Transcripts</div>
-    <div class="card-value purple">{{commafy .Stats.Transcripts}}</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Chunks</div>
-    <div class="card-value">{{commafy .Stats.Chunks}}</div>
-  </div>
+  <a class="card card-click" href="/library?status=pending" title="show pending books">
+    <div class="card-label">Pending</div><div class="card-value blue">{{commafy .Stats.Pending}}</div></a>
+  <a class="card card-click" href="/library?status=claimed" title="show in-progress books">
+    <div class="card-label">Claimed</div><div class="card-value yellow">{{commafy .Stats.Claimed}}</div></a>
+  <a class="card card-click" href="/library?status=done" title="show completed books">
+    <div class="card-label">Done</div><div class="card-value green">{{commafy .Stats.Done}}</div></a>
+  <a class="card card-click" href="/library?status=failed" title="show books with failures">
+    <div class="card-label">Failed</div><div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{commafy .Stats.Failed}}</div></a>
+  <div class="card"><div class="card-label">Transcripts</div><div class="card-value purple">{{commafy .Stats.Transcripts}}</div></div>
+  <div class="card"><div class="card-label">Chunks</div><div class="card-value">{{commafy .Stats.Chunks}}</div></div>
   <div class="card" title="completed transcripts not yet embedded (worker backlog)">
-    <div class="card-label">Unembedded</div>
-    <div class="card-value{{if .EmbedStall}} amber{{end}}">{{commafy .Stats.EmbedBacklog}}</div>
-  </div>
+    <div class="card-label">Unembedded</div><div class="card-value{{if .EmbedStall}} amber{{end}}">{{commafy .Stats.EmbedBacklog}}</div></div>
 </div>
 
 {{if .EmbedStall}}
@@ -135,90 +145,32 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
 </div>
 {{end}}
 
-<!-- runner status -->
-<div class="section">
-  <div class="section-title">ASR Runner</div>
-  <div class="runner-box">
-    {{if and .Stats.RunnerActive (not .RunnerStale)}}
-    <div class="runner-row">
-      <div class="runner-item">
-        <div class="runner-key">Status</div>
-        <div class="runner-val"><span class="dot green"></span>active</div>
-      </div>
-      <div class="runner-item">
-        <div class="runner-key">Runner ID</div>
-        <div class="runner-val">{{.Stats.RunnerID}}</div>
-      </div>
-      <div class="runner-item">
-        <div class="runner-key">Last heartbeat</div>
-        <div class="runner-val" title="{{formatTimePtr .Stats.LastHeartbeat}}">{{.HeartbeatRel}}</div>
-      </div>
-    </div>
-    {{else if .RunnerStale}}
-    <div class="runner-row">
-      <div class="runner-item">
-        <div class="runner-key">Status</div>
-        <div class="runner-val"><span class="dot amber"></span>stale — last seen {{.HeartbeatRel}}</div>
-      </div>
-      <div class="runner-item">
-        <div class="runner-key">Runner ID</div>
-        <div class="runner-val">{{.Stats.RunnerID}}</div>
-      </div>
-      <div class="runner-item">
-        <div class="runner-key">Last heartbeat</div>
-        <div class="runner-val" title="{{formatTimePtr .Stats.LastHeartbeat}}">{{.HeartbeatRel}}</div>
-      </div>
-    </div>
-    {{else}}
-    <div class="runner-row">
-      <div class="runner-item">
-        <div class="runner-key">Status</div>
-        <div class="runner-val"><span class="dot {{if .Empty}}grey{{else if gt .Stats.Pending 0}}yellow{{else}}red{{end}}"></span>{{if .Empty}}no jobs queued yet{{else}}idle / not running{{end}}</div>
-      </div>
-    </div>
-    {{end}}
-    {{if gt .Stats.Failed 0}}
-    <div class="failed-callout">
-      <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} — check recent activity below</span>
-      <button class="btn btn-warn"
-              hx-post="/actions/retry-failed"
-              hx-target="#data-region" hx-swap="innerHTML"
-              hx-confirm="Retry all {{.Stats.Failed}} failed job(s)? Each is reset to pending and re-transcribed.">retry all failed</button>
-    </div>
-    {{end}}
-  </div>
+{{if gt .Stats.Failed 0}}
+<div class="failed-callout">
+  <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}}</span>
+  <button class="btn btn-warn" hx-post="/actions/retry-failed" hx-target="#data-region" hx-swap="innerHTML"
+          hx-confirm="Retry all {{.Stats.Failed}} failed job(s)? Each is reset to pending and re-transcribed.">retry all failed</button>
 </div>
+{{end}}
 
-<!-- recent activity -->
 <div class="section">
   <div class="section-title">Recent Activity (last {{len .Jobs}})</div>
   {{if .Jobs}}
-  <!-- table-wrap scrolls horizontally on narrow viewports so the actions
-       column is never clipped (the card's rounded corners still clip the y). -->
-  <div class="card table-wrap">
+  <div class="table-wrap">
   <table>
-    <thead>
-      <tr>
-        <th>File</th>
-        <th>Status</th>
-        <th>Updated</th>
-        <th></th>
-      </tr>
-    </thead>
+    <thead><tr><th>File</th><th>Status</th><th>Updated</th><th></th></tr></thead>
     <tbody>
     {{range .Jobs}}
       <tr>
         <td>
-          <div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div>
+          <a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}
         </td>
         <td><span class="badge {{.Status}}">{{.Status}}</span></td>
         <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
         <td class="actions">
           {{if or (eq .Status "done") (eq .Status "failed")}}
-          <button class="btn"
-                  hx-post="/actions/requeue?id={{.ID}}"
-                  hx-target="#data-region" hx-swap="innerHTML"
+          <button class="btn" hx-post="/actions/requeue?id={{.ID}}" hx-target="#data-region" hx-swap="innerHTML"
                   hx-confirm="Re-transcribe {{shortName .FilePath}}? This deletes its transcript + embeddings and re-runs the runner.">requeue</button>
           {{end}}
         </td>
@@ -227,58 +179,220 @@ var fragmentTmpl = template.Must(template.New("fragment").Funcs(template.FuncMap
     </tbody>
   </table>
   </div>
-  {{else}}
-  <p style="color:var(--muted)">No jobs yet.</p>
-  {{end}}
+  {{else}}<p class="lib-empty">No jobs yet.</p>{{end}}
 </div>
 `))
 
-// dashboardData is the template model for the refreshed fragment. The derived
-// fields (RunnerStale/HeartbeatRel/RenderedAt/Empty) are computed in the handler
-// since html/template can't call time.Now() to judge freshness itself.
-type dashboardData struct {
+// ─── Library fragment ────────────────────────────────────────────────────────
+
+var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs).Parse(`
+<div class="lib-bar">
+  <form class="lib-search" hx-get="/library/data" hx-target="#library-region" hx-swap="innerHTML">
+    <input type="hidden" name="status" value="{{.Status}}">
+    <input type="search" name="q" value="{{.Query}}" placeholder="search author / title / track…" autocomplete="off">
+    <button type="submit" class="btn">search</button>
+    {{if or .Query .Status}}<a class="lib-clear" hx-get="/library/data" hx-target="#library-region" hx-swap="innerHTML">clear</a>{{end}}
+  </form>
+  <div class="lib-chips">
+    <a class="chip{{if eq .Status ""}} active{{end}}"        hx-get="/library/data?q={{.QueryEscaped}}"                hx-target="#library-region" hx-swap="innerHTML">all</a>
+    <a class="chip{{if eq .Status "pending"}} active{{end}}" hx-get="/library/data?status=pending&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">pending</a>
+    <a class="chip{{if eq .Status "claimed"}} active{{end}}" hx-get="/library/data?status=claimed&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">claimed</a>
+    <a class="chip{{if eq .Status "done"}} active{{end}}"    hx-get="/library/data?status=done&q={{.QueryEscaped}}"    hx-target="#library-region" hx-swap="innerHTML">done</a>
+    <a class="chip{{if eq .Status "failed"}} active{{end}}"  hx-get="/library/data?status=failed&q={{.QueryEscaped}}"  hx-target="#library-region" hx-swap="innerHTML">failed</a>
+  </div>
+</div>
+
+{{if .Books}}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Book</th><th>Author</th><th>Progress</th><th>Breakdown</th><th>Updated</th><th></th></tr></thead>
+  <tbody>
+  {{range .Books}}
+    <tr class="clickable" onclick="window.location=this.querySelector('a.file-name').href">
+      <td><a class="file-name" href="/book?dir={{.Dir}}" title="{{.Dir}}">{{.Title}}</a></td>
+      <td class="time-muted">{{if .Author}}{{.Author}}{{else}}—{{end}}</td>
+      <td>
+        <div class="progress" title="{{.Done}}/{{.Total}} tracks done">
+          <div class="progress-bar{{if gt .Failed 0}} has-failed{{end}}" style="width:{{.DonePct}}%"></div>
+        </div>
+        <span class="progress-text">{{commafy .Done}}/{{commafy .Total}}</span>
+      </td>
+      <td class="mini-badges">
+        {{if gt .Pending 0}}<span class="badge pending">{{commafy .Pending}} pend</span>{{end}}
+        {{if gt .Claimed 0}}<span class="badge claimed">{{commafy .Claimed}} run</span>{{end}}
+        {{if gt .Done 0}}<span class="badge done">{{commafy .Done}} done</span>{{end}}
+        {{if gt .Failed 0}}<span class="badge failed">{{commafy .Failed}} fail</span>{{end}}
+      </td>
+      <td class="time-muted" title="{{formatTime .LastUpdated}}">{{relTime .LastUpdated}}</td>
+      <td class="actions"><a class="btn" href="/book?dir={{.Dir}}">open&nbsp;&#8250;</a></td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+<div class="lib-pager">
+  {{if .HasPrev}}<a class="btn" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}&offset={{.PrevOffset}}" hx-target="#library-region" hx-swap="innerHTML">&#8592;&nbsp;prev</a>{{end}}
+  <span class="lib-meta">{{commafy .TotalBooks}} book{{if ne .TotalBooks 1}}s{{end}} &nbsp;·&nbsp; page {{.Page}} / {{.TotalPages}}</span>
+  {{if .HasNext}}<a class="btn" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}&offset={{.NextOffset}}" hx-target="#library-region" hx-swap="innerHTML">next&nbsp;&#8594;</a>{{end}}
+</div>
+{{else}}
+<p class="lib-empty">No books match this filter{{if .Query}} for &ldquo;{{.Query}}&rdquo;{{end}}.</p>
+{{end}}
+`))
+
+// ─── Book detail fragment ────────────────────────────────────────────────────
+
+var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse(`
+<div class="book-head">
+  <div class="book-title">{{.Title}}</div>
+  {{if .Author}}<div class="book-author">{{.Author}}</div>{{end}}
+  <div class="book-stats">
+    <span>{{commafy .Total}} track{{if ne .Total 1}}s{{end}}</span>
+    <span class="time-muted">{{commafy .Done}} done</span>
+    {{if gt .Pending 0}}<span class="time-muted">{{commafy .Pending}} pending</span>{{end}}
+    {{if gt .Claimed 0}}<span class="time-muted">{{commafy .Claimed}} in progress</span>{{end}}
+    {{if gt .Failed 0}}<span style="color:var(--red)">{{commafy .Failed}} failed</span>{{end}}
+  </div>
+  <div class="book-path">{{.Dir}}</div>
+  <div class="book-actions">
+    <button class="btn btn-warn" hx-post="/actions/book-requeue?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
+            hx-confirm="Re-transcribe all {{.Total}} track(s) of this book? Deletes their transcripts + embeddings and re-runs the runner.">requeue entire book</button>
+  </div>
+</div>
+
+{{if .Tracks}}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Track</th><th>Status</th><th>Updated</th><th></th></tr></thead>
+  <tbody>
+  {{range .Tracks}}
+    <tr>
+      <td><div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div>
+          {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}</td>
+      <td><span class="badge {{.Status}}">{{.Status}}</span></td>
+      <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
+      <td class="actions">
+        {{if or (eq .Status "done") (eq .Status "failed")}}
+        <button class="btn" hx-post="/actions/requeue?id={{.ID}}&book={{$.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
+                hx-confirm="Re-transcribe this track?">requeue</button>
+        {{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{else}}<p class="lib-empty">No tracks found for this book.</p>{{end}}
+`))
+
+// ─── Template models ─────────────────────────────────────────────────────────
+
+type pageShell struct {
+	Title    string
+	Nav      string
+	DirQuery string // book page only
+}
+
+type statusData struct {
 	Stats *db.QueueStats
 	Jobs  []db.RecentJob
 
-	RunnerStale  bool   // RunnerActive but heartbeat older than runnerStaleAfter
-	HeartbeatRel string // e.g. "12s ago" / "2h ago" / "—"
-	RenderedAt   string // server render time, so a successful refresh shows recency
-	Empty        bool   // no jobs at all and no runner ever seen (fresh install)
-	EmbedStall   bool   // EmbedBacklog past the warning threshold (embeddings not draining)
-	EmbedURL     string // configured embeddings endpoint, shown in the stall warning
+	RenderedAt string
+	EmbedStall bool
+	EmbedURL   string
+
+	// Unified pipeline state (derived from paused + runner liveness).
+	StateLabel string
+	StateClass string
+	DotClass   string
+	SubText    string
+	MetaText   string
 }
 
-// embedStallThreshold is the embed backlog above which the dashboard warns that
-// embeddings are not draining. A few transcripts always sit briefly between
-// transcription and the worker's 30s embed poll, so a small backlog is normal;
-// a sustained large one means Ollama is down or the model isn't pulled.
-const embedStallThreshold = 10
+type bookRow struct {
+	Dir         string
+	Title       string
+	Author      string
+	DonePct     int
+	Total       int
+	Pending     int
+	Claimed     int
+	Done        int
+	Failed      int
+	LastUpdated time.Time
+}
 
-// newDashboardData builds the template model, deriving freshness fields from the
-// current time so the view can distinguish a live runner from a crashed one.
-func newDashboardData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, staleAfter time.Duration, embedURL string) dashboardData {
-	d := dashboardData{
-		Stats:        stats,
-		Jobs:         jobs,
-		HeartbeatRel: "—",
-		RenderedAt:   now.UTC().Format("15:04:05 UTC"),
-		EmbedURL:     embedURL,
-		EmbedStall:   stats.EmbedBacklog >= embedStallThreshold,
-		Empty: !stats.RunnerActive && stats.LastHeartbeat == nil &&
-			stats.Pending == 0 && stats.Claimed == 0 &&
-			stats.Done == 0 && stats.Failed == 0,
+type libraryData struct {
+	Books        []bookRow
+	Status       string
+	Query        string
+	QueryEscaped string
+	Page         int
+	TotalPages   int
+	TotalBooks   int
+	HasPrev      bool
+	HasNext      bool
+	PrevOffset   int
+	NextOffset   int
+}
+
+type bookData struct {
+	Dir      string
+	DirQuery string
+	Title    string
+	Author   string
+	Total    int
+	Pending  int
+	Claimed  int
+	Done     int
+	Failed   int
+	Tracks   []db.RecentJob
+}
+
+// newStatusData derives the unified pipeline state from the pause flag and the
+// runner heartbeat freshness, so the banner is never self-contradictory.
+func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, staleAfter time.Duration, embedURL string) statusData {
+	d := statusData{
+		Stats:      stats,
+		Jobs:       jobs,
+		RenderedAt: now.UTC().Format("15:04:05 UTC"),
+		EmbedURL:   embedURL,
+		EmbedStall: stats.EmbedBacklog >= embedStallThreshold,
 	}
+
+	fresh := false
 	if stats.LastHeartbeat != nil {
 		age := now.Sub(*stats.LastHeartbeat)
-		d.HeartbeatRel = humanizeSince(age)
-		if stats.RunnerActive && age > staleAfter {
-			d.RunnerStale = true
+		d.MetaText = "last heartbeat " + humanizeSince(age)
+		fresh = age <= staleAfter
+	}
+
+	switch {
+	case stats.Paused:
+		d.StateLabel, d.StateClass, d.DotClass = "PAUSED", "state-paused", "amber"
+		d.SubText = "runner is not claiming new work"
+	case stats.RunnerActive && fresh:
+		d.StateLabel, d.StateClass, d.DotClass = "RUNNING", "state-running", "green"
+		if stats.RunnerID != "" {
+			d.SubText = "runner " + stats.RunnerID + " is transcribing"
+		} else {
+			d.SubText = "runner is transcribing"
+		}
+	default:
+		// Not paused, but no fresh runner heartbeat — enabled yet idle.
+		d.StateLabel, d.StateClass, d.DotClass = "IDLE", "state-idle", "blue"
+		if stats.RunnerActive {
+			d.SubText = "enabled — runner heartbeat is stale (crashed?)"
+		} else {
+			d.SubText = "enabled — no runner is currently connected"
 		}
 	}
 	return d
 }
 
-// commafy renders an integer with thousands separators (18452 -> "18,452").
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 func commafy(n int) string {
 	s := strconv.Itoa(n)
 	neg := strings.HasPrefix(s, "-")
@@ -298,7 +412,6 @@ func commafy(n int) string {
 	return b.String()
 }
 
-// humanizeSince renders a coarse, glanceable relative duration ("12s ago").
 func humanizeSince(d time.Duration) string {
 	switch {
 	case d < 0:
@@ -314,271 +427,8 @@ func humanizeSince(d time.Duration) string {
 	}
 }
 
-// handleDashboardPage serves the full HTML shell (GET /). The "/" route is a
-// ServeMux catch-all, so reject any non-root path with 404 instead of serving
-// the dashboard for e.g. /favicon.ico or a mistyped path.
-func (s *MCPServer) handleDashboardPage(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	if err := dashboardPage.Execute(w, nil); err != nil {
-		s.logger.Error("dashboard page render error", "error", err)
-	}
-}
-
-// handleStatusData serves the htmx-refreshed inner fragment (GET /status/data).
-func (s *MCPServer) handleStatusData(w http.ResponseWriter, r *http.Request) {
-	s.renderStatusFragment(w, r)
-}
-
-// renderStatusFragment queries the live status and renders the htmx fragment.
-// Shared by the periodic refresh and by the action handlers (which re-render the
-// fragment after mutating so the table updates immediately).
-func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	stats, err := s.db.GetServiceStatus(ctx)
-	if err != nil {
-		s.logger.Error("GetServiceStatus error", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	jobs, err := s.db.GetRecentJobs(ctx, 15)
-	if err != nil {
-		s.logger.Error("GetRecentJobs error", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	data := newDashboardData(stats, jobs, time.Now(), s.runnerStaleAfter, s.embedURL)
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	if err := fragmentTmpl.Execute(w, data); err != nil {
-		s.logger.Error("fragment render error", "error", err)
-	}
-}
-
-// writeActionError surfaces a failed mutation to the user instead of letting it
-// vanish silently: htmx does not swap the target on a non-2xx response, so a bare
-// http.Error would leave the dashboard looking like nothing happened. We return
-// 200 with HX-Retarget so htmx swaps a dismissible banner into #action-error,
-// while the periodic poll still refreshes #data-region on its own.
-func writeActionError(w http.ResponseWriter, msg string) {
-	w.Header().Set("HX-Retarget", "#action-error")
-	w.Header().Set("HX-Reswap", "innerHTML")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, `<div class="action-err">&#9888;&#xFE0F;&nbsp;%s</div>`,
-		template.HTMLEscapeString(msg))
-}
-
-// isHTMX reports whether the request came from htmx (which sets HX-Request:
-// true). The mutating action endpoints require it — a lightweight guard against
-// drive-by/CSRF form posts, which cannot set custom headers cross-origin without
-// a CORS preflight the dashboard never grants.
-func isHTMX(r *http.Request) bool {
-	return r.Header.Get("HX-Request") == "true"
-}
-
-// handleRequeueJob re-transcribes a single job (POST /actions/requeue?id=…) and
-// returns the refreshed status fragment so htmx swaps in the updated table.
-func (s *MCPServer) handleRequeueJob(w http.ResponseWriter, r *http.Request) {
-	if !isHTMX(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
-		return
-	}
-	if _, err := s.db.RequeueByID(r.Context(), id); err != nil {
-		s.logger.Error("requeue job error", "id", id, "error", err)
-		writeActionError(w, "requeue failed — see server logs")
-		return
-	}
-	s.logger.Info("requeued job via dashboard", "id", id)
-	s.renderStatusFragment(w, r)
-}
-
-// handleRetryFailed re-transcribes every failed job (POST /actions/retry-failed)
-// and returns the refreshed status fragment.
-func (s *MCPServer) handleRetryFailed(w http.ResponseWriter, r *http.Request) {
-	if !isHTMX(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	paths, err := s.db.RequeueFailed(r.Context())
-	if err != nil {
-		s.logger.Error("retry failed error", "error", err)
-		writeActionError(w, "retry-all-failed failed — see server logs")
-		return
-	}
-	s.logger.Info("retried failed jobs via dashboard", "count", len(paths))
-	s.renderStatusFragment(w, r)
-}
-
-// handlePause sets the global pause flag (POST /actions/pause) so the runner
-// stops claiming new work, then re-renders the status fragment. Durable: the
-// flag is a DB row, so it survives a runner/host reboot.
-func (s *MCPServer) handlePause(w http.ResponseWriter, r *http.Request) {
-	if !isHTMX(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	if err := s.db.SetPaused(r.Context(), true, "dashboard"); err != nil {
-		s.logger.Error("pause error", "error", err)
-		writeActionError(w, "pause failed — see server logs")
-		return
-	}
-	s.logger.Info("pipeline paused via dashboard")
-	s.renderStatusFragment(w, r)
-}
-
-// handleResume clears the global pause flag (POST /actions/resume) and re-renders
-// the status fragment.
-func (s *MCPServer) handleResume(w http.ResponseWriter, r *http.Request) {
-	if !isHTMX(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	if err := s.db.SetPaused(r.Context(), false, "dashboard"); err != nil {
-		s.logger.Error("resume error", "error", err)
-		writeActionError(w, "resume failed — see server logs")
-		return
-	}
-	s.logger.Info("pipeline resumed via dashboard")
-	s.renderStatusFragment(w, r)
-}
-
-// ─── Library view (complete, book-grouped, filterable job list) ──────────────
-
-const libraryPageSize = 20
-
-// libraryFuncs are shared by the library and tracks templates.
-var libraryFuncs = template.FuncMap{
-	"shortName":  func(fp string) string { return filepath.Base(fp) },
-	"relTime":    func(t time.Time) string { return humanizeSince(time.Since(t)) },
-	"formatTime": func(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05 UTC") },
-	"derefStr": func(s *string) string {
-		if s == nil {
-			return ""
-		}
-		return *s
-	},
-	"commafy": commafy,
-}
-
-// bookRow decorates a BookSummary with view-only fields (URL-escaped dir for the
-// expand link, completion percent for the progress bar).
-type bookRow struct {
-	db.BookSummary
-	DirQuery string // url.QueryEscape(Dir) — safe to embed in the hx-get query string
-	DonePct  int
-}
-
-// libraryData is the template model for the library fragment.
-type libraryData struct {
-	Books        []bookRow
-	Status       string // active status filter ("" = all)
-	Query        string // raw search string (echoed into the input)
-	QueryEscaped string // url.QueryEscape(Query) for building control links
-	Page         int
-	TotalPages   int
-	TotalBooks   int
-	HasPrev      bool
-	HasNext      bool
-	PrevOffset   int
-	NextOffset   int
-}
-
-var libraryTmpl = template.Must(template.New("library").Funcs(libraryFuncs).Parse(`
-<div class="lib-bar">
-  <form class="lib-search" hx-get="/library" hx-target="#library-region" hx-swap="innerHTML">
-    <input type="hidden" name="status" value="{{.Status}}">
-    <input type="search" name="q" value="{{.Query}}" placeholder="search author / title / track…" autocomplete="off">
-    <button type="submit" class="btn">search</button>
-    {{if or .Query .Status}}<a class="lib-clear" hx-get="/library" hx-target="#library-region" hx-swap="innerHTML">clear</a>{{end}}
-  </form>
-  <div class="lib-chips">
-    <a class="chip{{if eq .Status ""}} active{{end}}"        hx-get="/library?q={{.QueryEscaped}}"                hx-target="#library-region" hx-swap="innerHTML">all</a>
-    <a class="chip{{if eq .Status "pending"}} active{{end}}" hx-get="/library?status=pending&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">pending</a>
-    <a class="chip{{if eq .Status "claimed"}} active{{end}}" hx-get="/library?status=claimed&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">claimed</a>
-    <a class="chip{{if eq .Status "done"}} active{{end}}"    hx-get="/library?status=done&q={{.QueryEscaped}}"    hx-target="#library-region" hx-swap="innerHTML">done</a>
-    <a class="chip{{if eq .Status "failed"}} active{{end}}"  hx-get="/library?status=failed&q={{.QueryEscaped}}"  hx-target="#library-region" hx-swap="innerHTML">failed</a>
-  </div>
-</div>
-
-{{if .Books}}
-<div class="card table-wrap">
-<table>
-  <thead>
-    <tr><th>Book</th><th>Author</th><th>Progress</th><th>Breakdown</th><th>Updated</th><th></th></tr>
-  </thead>
-  <tbody>
-  {{range $i, $b := .Books}}
-    <tr class="book-row">
-      <td><div class="file-name" title="{{$b.Dir}}">{{$b.Title}}</div></td>
-      <td class="time-muted">{{$b.Author}}</td>
-      <td>
-        <div class="progress" title="{{$b.Done}}/{{$b.Total}} tracks done">
-          <div class="progress-bar{{if gt $b.Failed 0}} has-failed{{end}}" style="width:{{$b.DonePct}}%"></div>
-        </div>
-        <span class="progress-text">{{commafy $b.Done}}/{{commafy $b.Total}}</span>
-      </td>
-      <td class="mini-badges">
-        {{if gt $b.Pending 0}}<span class="badge pending">{{commafy $b.Pending}} pend</span>{{end}}
-        {{if gt $b.Claimed 0}}<span class="badge claimed">{{commafy $b.Claimed}} run</span>{{end}}
-        {{if gt $b.Done 0}}<span class="badge done">{{commafy $b.Done}} done</span>{{end}}
-        {{if gt $b.Failed 0}}<span class="badge failed">{{commafy $b.Failed}} fail</span>{{end}}
-      </td>
-      <td class="time-muted" title="{{formatTime $b.LastUpdated}}">{{relTime $b.LastUpdated}}</td>
-      <td class="actions">
-        <button class="btn" hx-get="/library/tracks?dir={{$b.DirQuery}}" hx-target="#bt-{{$i}}" hx-swap="innerHTML">tracks</button>
-      </td>
-    </tr>
-    <tr class="track-detail"><td colspan="6"><div id="bt-{{$i}}" class="track-detail-inner"></div></td></tr>
-  {{end}}
-  </tbody>
-</table>
-</div>
-
-<div class="lib-pager">
-  {{if .HasPrev}}<a class="btn" hx-get="/library?status={{.Status}}&q={{.QueryEscaped}}&offset={{.PrevOffset}}" hx-target="#library-region" hx-swap="innerHTML">&#8592;&nbsp;prev</a>{{end}}
-  <span class="lib-meta">{{commafy .TotalBooks}} book{{if ne .TotalBooks 1}}s{{end}} &nbsp;·&nbsp; page {{.Page}} / {{.TotalPages}}</span>
-  {{if .HasNext}}<a class="btn" hx-get="/library?status={{.Status}}&q={{.QueryEscaped}}&offset={{.NextOffset}}" hx-target="#library-region" hx-swap="innerHTML">next&nbsp;&#8594;</a>{{end}}
-</div>
-{{else}}
-<p class="lib-empty">No books match this filter{{if .Query}} for &ldquo;{{.Query}}&rdquo;{{end}}.</p>
-{{end}}
-`))
-
-var tracksTmpl = template.Must(template.New("tracks").Funcs(libraryFuncs).Parse(`
-{{if .}}
-<table class="tracks-table">
-  <tbody>
-  {{range .}}
-    <tr>
-      <td><div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div>
-          {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}</td>
-      <td><span class="badge {{.Status}}">{{.Status}}</span></td>
-      <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
-    </tr>
-  {{end}}
-  </tbody>
-</table>
-{{else}}
-<p class="lib-empty">No tracks.</p>
-{{end}}
-`))
-
 // validStatus is the allow-list for the library status filter; anything else is
-// treated as "no filter" (the DB layer also rejects unknown values defensively).
+// treated as "no filter".
 func validStatus(s string) string {
 	switch s {
 	case "pending", "claimed", "done", "failed":
@@ -588,10 +438,92 @@ func validStatus(s string) string {
 	}
 }
 
-// handleLibrary renders the complete book-grouped job list (GET /library) with
-// optional status/search filters and pagination. Driven by the user, not the 3s
-// poll, so the chosen filter/page survives between status refreshes.
-func (s *MCPServer) handleLibrary(w http.ResponseWriter, r *http.Request) {
+// isHTMX guards mutating endpoints against drive-by/CSRF posts (htmx sets the
+// HX-Request header, which cross-origin forms cannot without a CORS preflight).
+func isHTMX(r *http.Request) bool { return r.Header.Get("HX-Request") == "true" }
+
+// writeActionError surfaces a failed mutation: htmx ignores the body of a
+// non-2xx response, so return 200 + HX-Retarget to swap a dismissible banner
+// into #action-error.
+func writeActionError(w http.ResponseWriter, msg string) {
+	w.Header().Set("HX-Retarget", "#action-error")
+	w.Header().Set("HX-Reswap", "innerHTML")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, `<div class="action-err">&#9888;&#xFE0F;&nbsp;%s</div>`, template.HTMLEscapeString(msg))
+}
+
+// ─── Static + page handlers ──────────────────────────────────────────────────
+
+func (s *MCPServer) handleHTMX(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(htmxJS)
+}
+
+// handleOverviewPage serves the Overview page shell (GET /). The "/" route is a
+// catch-all, so 404 any other path.
+func (s *MCPServer) handleOverviewPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	s.renderPage(w, overviewPage, pageShell{Title: "overview", Nav: "overview"})
+}
+
+func (s *MCPServer) handleLibraryPage(w http.ResponseWriter, _ *http.Request) {
+	s.renderPage(w, libraryPage, pageShell{Title: "library", Nav: "library"})
+}
+
+func (s *MCPServer) handleBookPage(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		http.Error(w, "missing dir", http.StatusBadRequest)
+		return
+	}
+	s.renderPage(w, bookPage, pageShell{Title: "book", Nav: "library", DirQuery: url.QueryEscape(dir)})
+}
+
+func (s *MCPServer) renderPage(w http.ResponseWriter, tmpl *template.Template, data pageShell) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := tmpl.Execute(w, data); err != nil {
+		s.logger.Error("page render error", "error", err)
+	}
+}
+
+// ─── Status fragment handler ─────────────────────────────────────────────────
+
+func (s *MCPServer) handleStatusData(w http.ResponseWriter, r *http.Request) {
+	s.renderStatusFragment(w, r)
+}
+
+func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	stats, err := s.db.GetServiceStatus(ctx)
+	if err != nil {
+		s.logger.Error("GetServiceStatus error", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	jobs, err := s.db.GetRecentJobs(ctx, 15)
+	if err != nil {
+		s.logger.Error("GetRecentJobs error", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	data := newStatusData(stats, jobs, time.Now(), s.runnerStaleAfter, s.embedURL)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := statusFragmentTmpl.Execute(w, data); err != nil {
+		s.logger.Error("status fragment render error", "error", err)
+	}
+}
+
+// ─── Library data handler ────────────────────────────────────────────────────
+
+func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 	status := validStatus(r.URL.Query().Get("status"))
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
@@ -610,11 +542,16 @@ func (s *MCPServer) handleLibrary(w http.ResponseWriter, r *http.Request) {
 
 	rows := make([]bookRow, 0, len(books))
 	for _, b := range books {
+		author, title := s.resolver.Resolve(b.Dir, b.SamplePath)
 		pct := 0
 		if b.Total > 0 {
 			pct = b.Done * 100 / b.Total
 		}
-		rows = append(rows, bookRow{BookSummary: b, DirQuery: url.QueryEscape(b.Dir), DonePct: pct})
+		rows = append(rows, bookRow{
+			Dir: b.Dir, Title: title, Author: author, DonePct: pct,
+			Total: b.Total, Pending: b.Pending, Claimed: b.Claimed, Done: b.Done, Failed: b.Failed,
+			LastUpdated: b.LastUpdated,
+		})
 	}
 
 	totalPages := (total + libraryPageSize - 1) / libraryPageSize
@@ -622,43 +559,153 @@ func (s *MCPServer) handleLibrary(w http.ResponseWriter, r *http.Request) {
 		totalPages = 1
 	}
 	data := libraryData{
-		Books:        rows,
-		Status:       status,
-		Query:        query,
-		QueryEscaped: url.QueryEscape(query),
-		Page:         offset/libraryPageSize + 1,
-		TotalPages:   totalPages,
-		TotalBooks:   total,
-		HasPrev:      offset > 0,
-		HasNext:      offset+libraryPageSize < total,
-		PrevOffset:   max(0, offset-libraryPageSize),
-		NextOffset:   offset + libraryPageSize,
+		Books: rows, Status: status, Query: query, QueryEscaped: url.QueryEscape(query),
+		Page: offset/libraryPageSize + 1, TotalPages: totalPages, TotalBooks: total,
+		HasPrev: offset > 0, HasNext: offset+libraryPageSize < total,
+		PrevOffset: max(0, offset-libraryPageSize), NextOffset: offset + libraryPageSize,
 	}
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	if err := libraryTmpl.Execute(w, data); err != nil {
+	if err := libraryFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("library render error", "error", err)
 	}
 }
 
-// handleBookTracks renders the individual track rows for one book directory
-// (GET /library/tracks?dir=…), used by the expand-to-tracks button.
-func (s *MCPServer) handleBookTracks(w http.ResponseWriter, r *http.Request) {
+// ─── Book data handler ───────────────────────────────────────────────────────
+
+func (s *MCPServer) handleBookData(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("dir")
 	if dir == "" {
 		http.Error(w, "missing dir", http.StatusBadRequest)
 		return
 	}
+	s.renderBookFragment(w, r, dir)
+}
+
+func (s *MCPServer) renderBookFragment(w http.ResponseWriter, r *http.Request, dir string) {
 	tracks, err := s.db.GetBookTracks(r.Context(), dir)
 	if err != nil {
 		s.logger.Error("GetBookTracks error", "dir", dir, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+
+	d := bookData{Dir: dir, DirQuery: url.QueryEscape(dir), Tracks: tracks, Total: len(tracks)}
+	for _, t := range tracks {
+		switch t.Status {
+		case "pending":
+			d.Pending++
+		case "claimed":
+			d.Claimed++
+		case "done":
+			d.Done++
+		case "failed":
+			d.Failed++
+		}
+	}
+	sample := dir
+	if len(tracks) > 0 {
+		sample = tracks[0].FilePath
+	}
+	d.Author, d.Title = s.resolver.Resolve(dir, sample)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	if err := tracksTmpl.Execute(w, tracks); err != nil {
-		s.logger.Error("tracks render error", "error", err)
+	if err := bookFragmentTmpl.Execute(w, d); err != nil {
+		s.logger.Error("book fragment render error", "error", err)
 	}
+}
+
+// ─── Mutating action handlers ────────────────────────────────────────────────
+
+// handleRequeueJob re-transcribes a single job (POST /actions/requeue?id=…).
+// When a "book" dir param is present (the book-detail page), it re-renders the
+// book fragment; otherwise it re-renders the Overview status fragment.
+func (s *MCPServer) handleRequeueJob(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.db.RequeueByID(r.Context(), id); err != nil {
+		s.logger.Error("requeue job error", "id", id, "error", err)
+		writeActionError(w, "requeue failed — see server logs")
+		return
+	}
+	s.logger.Info("requeued job via dashboard", "id", id)
+	if book := r.URL.Query().Get("book"); book != "" {
+		s.renderBookFragment(w, r, book)
+		return
+	}
+	s.renderStatusFragment(w, r)
+}
+
+// handleRetryFailed re-transcribes every failed job (POST /actions/retry-failed).
+func (s *MCPServer) handleRetryFailed(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	paths, err := s.db.RequeueFailed(r.Context())
+	if err != nil {
+		s.logger.Error("retry failed error", "error", err)
+		writeActionError(w, "retry-all-failed failed — see server logs")
+		return
+	}
+	s.logger.Info("retried failed jobs via dashboard", "count", len(paths))
+	s.renderStatusFragment(w, r)
+}
+
+// handleBookRequeue re-transcribes every track in one book (POST
+// /actions/book-requeue?dir=…) and re-renders the book fragment.
+func (s *MCPServer) handleBookRequeue(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		http.Error(w, "missing dir", http.StatusBadRequest)
+		return
+	}
+	paths, err := s.db.RequeueByDir(r.Context(), dir)
+	if err != nil {
+		s.logger.Error("book requeue error", "dir", dir, "error", err)
+		writeActionError(w, "requeue book failed — see server logs")
+		return
+	}
+	s.logger.Info("requeued book via dashboard", "dir", dir, "count", len(paths))
+	s.renderBookFragment(w, r, dir)
+}
+
+func (s *MCPServer) handlePause(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := s.db.SetPaused(r.Context(), true, "dashboard"); err != nil {
+		s.logger.Error("pause error", "error", err)
+		writeActionError(w, "pause failed — see server logs")
+		return
+	}
+	s.logger.Info("pipeline paused via dashboard")
+	s.renderStatusFragment(w, r)
+}
+
+func (s *MCPServer) handleResume(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := s.db.SetPaused(r.Context(), false, "dashboard"); err != nil {
+		s.logger.Error("resume error", "error", err)
+		writeActionError(w, "resume failed — see server logs")
+		return
+	}
+	s.logger.Info("pipeline resumed via dashboard")
+	s.renderStatusFragment(w, r)
 }

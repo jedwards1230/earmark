@@ -52,6 +52,10 @@ func (demoDB) RequeueByID(_ context.Context, id string) (string, error) { return
 
 func (demoDB) RequeueFailed(context.Context) ([]string, error) { return []string{"demo"}, nil }
 
+func (demoDB) RequeueByDir(_ context.Context, dir string) ([]string, error) {
+	return []string{dir}, nil
+}
+
 // SetPaused flips the in-memory demo pause flag so the toggle is exercisable.
 func (d demoDB) SetPaused(_ context.Context, paused bool, _ string) error {
 	if d.paused != nil {
@@ -133,19 +137,41 @@ func (d demoDB) GetRecentJobs(_ context.Context, limit int) ([]db.RecentJob, err
 }
 
 // demoBooks is a fixed synthetic library used by the library view in demo mode.
+// The dirs and sample paths intentionally mix two collection shapes — an
+// author/title layout (audio-libation) and an author-only layout where the
+// title lives in the filename (audio-libro) — so the config-driven resolver is
+// visibly exercised (matching demoCollections below).
 func demoBooks() []db.BookSummary {
 	now := time.Now()
 	return []db.BookSummary{
-		{Dir: "/books/Daniel Kahneman/Thinking Fast and Slow", Title: "Thinking Fast and Slow", Author: "Daniel Kahneman",
-			Total: 202, Pending: 202, LastUpdated: now.Add(-21 * time.Hour)},
-		{Dir: "/books/Andy Weir/Project Hail Mary", Title: "Project Hail Mary", Author: "Andy Weir",
-			Total: 1, Done: 1, LastUpdated: now.Add(-3 * time.Minute)},
-		{Dir: "/books/Frank Herbert/Dune", Title: "Dune", Author: "Frank Herbert",
-			Total: 24, Done: 22, Claimed: 1, Pending: 1, LastUpdated: now.Add(-12 * time.Second)},
-		{Dir: "/books/Cixin Liu/The Three-Body Problem", Title: "The Three-Body Problem", Author: "Cixin Liu",
-			Total: 16, Done: 14, Failed: 2, LastUpdated: now.Add(-9 * time.Minute)},
+		// audio-libro: author dir holds loose track files; title from filename.
+		{Dir: "/books/audio-libro/Daniel Kahneman",
+			SamplePath: "/books/audio-libro/Daniel Kahneman/Thinking Fast and Slow - Track 1.mp3",
+			Total:      202, Pending: 202, LastUpdated: now.Add(-21 * time.Hour)},
+		// audio-libation: author/title dirs.
+		{Dir: "/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]",
+			SamplePath: "/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]/Project Hail Mary.m4b",
+			Total:      1, Done: 1, LastUpdated: now.Add(-3 * time.Minute)},
+		{Dir: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]",
+			SamplePath: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]/01 - Chapter 1.mp3",
+			Total:      24, Done: 22, Claimed: 1, Pending: 1, LastUpdated: now.Add(-12 * time.Second)},
+		{Dir: "/books/audio-libation/Cixin Liu/The Three-Body Problem",
+			SamplePath: "/books/audio-libation/Cixin Liu/The Three-Body Problem/01 - Part 1.mp3",
+			Total:      16, Done: 14, Failed: 2, LastUpdated: now.Add(-9 * time.Minute)},
+		// audio-custom: single-file book in an author dir.
+		{Dir: "/books/audio-custom/George Orwell",
+			SamplePath: "/books/audio-custom/George Orwell/1984.m4b",
+			Total:      1, Pending: 1, LastUpdated: now.Add(-2 * time.Hour)},
 	}
 }
+
+// demoCollections mirrors a realistic LIBRARY_COLLECTIONS so the demo resolver
+// derives author/title the same way production does.
+const demoCollections = `[
+	{"root":"audio-libation","layout":"author/title"},
+	{"root":"audio-libro","layout":"author"},
+	{"root":"audio-custom","layout":"author"}
+]`
 
 // GetBookSummaries serves the synthetic library, honoring status/query/paging so
 // the filter and pagination controls are exercisable with no database.
@@ -156,8 +182,11 @@ func (d demoDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookS
 	books := demoBooks()
 	filtered := books[:0:0]
 	for _, b := range books {
-		if f.Query != "" && !strings.Contains(strings.ToLower(b.Dir), strings.ToLower(f.Query)) {
-			continue
+		if f.Query != "" {
+			hay := strings.ToLower(b.Dir + " " + b.SamplePath)
+			if !strings.Contains(hay, strings.ToLower(f.Query)) {
+				continue
+			}
 		}
 		switch f.Status {
 		case "pending":
@@ -195,7 +224,9 @@ func (d demoDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookS
 	return filtered[start:end], total, nil
 }
 
-// GetBookTracks returns synthetic tracks for a demo book directory.
+// GetBookTracks returns synthetic tracks for a demo book directory. Track 0 uses
+// the book's real SamplePath so the book page's resolver derives the same
+// author/title as the library list; later tracks vary the trailing number.
 func (d demoDB) GetBookTracks(_ context.Context, dir string) ([]db.RecentJob, error) {
 	now := time.Now()
 	var out []db.RecentJob
@@ -204,23 +235,48 @@ func (d demoDB) GetBookTracks(_ context.Context, dir string) ([]db.RecentJob, er
 			continue
 		}
 		n := b.Total
-		if n > 5 {
-			n = 5 // cap demo expansion
+		if n > 8 {
+			n = 8 // cap demo expansion
 		}
 		for i := 0; i < n; i++ {
 			status := "pending"
-			if i < b.Done {
+			switch {
+			case i < b.Done:
 				status = "done"
+			case i < b.Done+b.Failed:
+				status = "failed"
+			}
+			fp := b.SamplePath
+			if i > 0 {
+				fp = renumber(b.SamplePath, i+1)
 			}
 			out = append(out, db.RecentJob{
 				ID:        dir + "#" + strconv.Itoa(i),
-				FilePath:  dir + "/Track " + strconv.Itoa(i+1) + ".mp3",
+				FilePath:  fp,
 				Status:    status,
 				UpdatedAt: now.Add(-time.Duration(i) * time.Minute),
 			})
 		}
 	}
 	return out, nil
+}
+
+// renumber replaces the last run of digits in a path's filename with n (demo
+// helper, so sibling track names look plausible).
+func renumber(p string, n int) string {
+	end := strings.LastIndex(p, ".")
+	if end < 0 {
+		end = len(p)
+	}
+	name, ext := p[:end], p[end:]
+	i := len(name)
+	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
+		i--
+	}
+	if i == len(name) {
+		return name + " " + strconv.Itoa(n) + ext
+	}
+	return name[:i] + strconv.Itoa(n) + ext
 }
 
 // StartDemoDashboard starts the HTTP transport (status dashboard + /mcp +
@@ -235,7 +291,12 @@ func StartDemoDashboard(addr string) error {
 	if scenario == "" {
 		scenario = "active"
 	}
-	cfg := &config.Config{MCPHTTPAddr: addr, StaleJobTimeout: 30 * time.Minute}
+	cfg := &config.Config{
+		MCPHTTPAddr:        addr,
+		StaleJobTimeout:    30 * time.Minute,
+		BooksDir:           "/books",
+		LibraryCollections: demoCollections,
+	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",
 		"address", addr, "scenario", scenario)

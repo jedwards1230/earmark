@@ -11,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/library"
 	"github.com/jedwards1230/lil-whisper/internal/log"
 )
 
@@ -29,6 +30,10 @@ type MCPServer struct {
 	// embedURL is the configured embeddings endpoint, shown in the embed-stall
 	// warning so an operator knows which Ollama to check.
 	embedURL string
+
+	// resolver derives (author, title) from book paths using LIBRARY_COLLECTIONS
+	// config, so labels aren't hardcoded to one directory layout.
+	resolver *library.Resolver
 }
 
 // NewMCPServer creates a new MCP server instance
@@ -49,6 +54,14 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	)
 
 	handlers := NewToolHandlers(database)
+
+	// Build the library label resolver from config. A parse error falls back to
+	// the generic resolver rather than failing startup — labels are cosmetic.
+	resolver, err := library.ParseCollections(cfg.LibraryCollections, cfg.BooksDir)
+	if err != nil {
+		logger.Warn("LIBRARY_COLLECTIONS parse failed; using generic label resolver", "error", err)
+		resolver = library.NewResolver(cfg.BooksDir, nil)
+	}
 
 	// Add semantic search tool
 	mcpServer.AddTool(mcp.NewTool("semantic_search_audiobooks",
@@ -111,6 +124,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		db:               database,
 		runnerStaleAfter: staleAfter,
 		embedURL:         cfg.EmbeddingsBaseURL,
+		resolver:         resolver,
 	}
 }
 
@@ -155,18 +169,17 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 
 	mux := http.NewServeMux()
 
-	// Status dashboard — full HTML shell (/) and htmx fragment (/status/data),
-	// both GET-only. We enforce GET with a wrapper rather than a "GET /" method
-	// pattern: the method-less "/mcp" and "/health" routes would conflict with
-	// it and make ServeMux panic (method-vs-path-specificity ambiguity).
+	// Three pages share a header/nav: Overview (/), Library (/library), and Book
+	// detail (/book). Each page shell loads its data fragment via htmx. GET is
+	// enforced with a wrapper rather than a "GET /" method pattern, which would
+	// conflict with the method-less "/mcp" route and make ServeMux panic.
 	// Only reachable under HTTP transport.
-	mux.HandleFunc("/", getOnly(s.handleDashboardPage))
+	mux.HandleFunc("/", getOnly(s.handleOverviewPage))
 	mux.HandleFunc("/status/data", getOnly(s.handleStatusData))
-
-	// Library — the complete, book-grouped, filterable/paginated job list. Driven
-	// by the user (not the 3s poll) so filter/search/page state is never clobbered.
-	mux.HandleFunc("/library", getOnly(s.handleLibrary))
-	mux.HandleFunc("/library/tracks", getOnly(s.handleBookTracks))
+	mux.HandleFunc("/library", getOnly(s.handleLibraryPage))
+	mux.HandleFunc("/library/data", getOnly(s.handleLibraryData))
+	mux.HandleFunc("/book", getOnly(s.handleBookPage))
+	mux.HandleFunc("/book/data", getOnly(s.handleBookData))
 
 	// Vendored htmx (pinned), served from the binary so the dashboard needs no
 	// external CDN at runtime.
@@ -174,9 +187,9 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 
 	// Mutating actions — POST-only (method pattern is safe here: these are
 	// specific paths, unlike the "/" catch-all). htmx-guarded inside the handler.
-	// Each re-renders the status fragment so the table updates immediately.
 	mux.HandleFunc("POST /actions/requeue", s.handleRequeueJob)
 	mux.HandleFunc("POST /actions/retry-failed", s.handleRetryFailed)
+	mux.HandleFunc("POST /actions/book-requeue", s.handleBookRequeue)
 	mux.HandleFunc("POST /actions/pause", s.handlePause)
 	mux.HandleFunc("POST /actions/resume", s.handleResume)
 

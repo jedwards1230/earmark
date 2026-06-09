@@ -75,6 +75,10 @@ func (m *MockDBInterface) GetBookTracks(context.Context, string) ([]db.RecentJob
 	return nil, nil
 }
 
+func (m *MockDBInterface) RequeueByDir(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

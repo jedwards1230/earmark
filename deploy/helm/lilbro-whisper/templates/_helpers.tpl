@@ -98,6 +98,10 @@ the two Deployments.
   value: {{ .Values.config.staleJobTimeout | quote }}
 - name: CHUNK_SIZE
   value: {{ .Values.config.chunkSize | quote }}
+{{- with .Values.config.libraryCollections }}
+- name: LIBRARY_COLLECTIONS
+  value: {{ toJson . | quote }}
+{{- end }}
 {{- end }}
 
 {{/*

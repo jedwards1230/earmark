@@ -46,6 +46,14 @@ type Config struct {
 	// Overlap is 64 tokens (implementation constant in the chunker).
 	ChunkSize int
 
+	// LIBRARY_COLLECTIONS — optional JSON describing how each library root is
+	// shaped, so author/title labels are derived from configuration rather than
+	// hardcoded path assumptions. Empty → a generic fallback is used.
+	// Example: [{"root":"audio-libation","layout":"author/title"},
+	//           {"root":"audio-libro","layout":"author"}]
+	// See internal/library for the layout grammar.
+	LibraryCollections string
+
 	// Debug enables verbose structured logging.
 	Debug bool
 
@@ -78,6 +86,7 @@ func LoadConfig() (*Config, error) {
 	cfg.EmbeddingsBaseURL = getEnvOrDefault("EMBEDDINGS_BASE_URL", "http://ollama:11434/v1")
 	cfg.EmbeddingsModel = getEnvOrDefault("EMBEDDINGS_MODEL", "nomic-embed-text")
 	cfg.MCPHTTPAddr = getEnvOrDefault("MCP_HTTP_ADDR", ":8081")
+	cfg.LibraryCollections = os.Getenv("LIBRARY_COLLECTIONS")
 
 	var err error
 
@@ -128,6 +137,7 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("Embeddings Base URL", "value", c.EmbeddingsBaseURL)
 	logger.Debug("Embeddings Model", "value", c.EmbeddingsModel)
 	logger.Debug("MCP HTTP Addr", "value", c.MCPHTTPAddr)
+	logger.Debug("Library Collections", "value", c.LibraryCollections)
 	logger.Debug("Stale Job Timeout", "value", c.StaleJobTimeout)
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
 }
