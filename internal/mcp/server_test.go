@@ -760,3 +760,35 @@ func TestRequeueTrackFromBookPage(t *testing.T) {
 		t.Error("track requeue with a book param should re-render the book fragment")
 	}
 }
+
+// TestLibraryPageThreadsStatusFilter is the regression guard for the
+// stat-card-link bug: GET /library?status=… must thread the filter into the
+// page shell's initial fragment load, not drop it.
+func TestLibraryPageThreadsStatusFilter(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+
+	// status filter is forwarded
+	req := httptest.NewRequest(http.MethodGet, "/library?status=failed", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), `/library/data?status=failed`) {
+		t.Errorf("library page should thread status into the fragment hx-get:\n%s", w.Body.String())
+	}
+
+	// status + search both forwarded (order per url.Values.Encode: q before status)
+	req = httptest.NewRequest(http.MethodGet, "/library?status=pending&q=dune", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, "q=dune") || !strings.Contains(body, "status=pending") {
+		t.Errorf("library page should thread both status and q:\n%s", body)
+	}
+
+	// invalid status is dropped → plain /library/data, no query
+	req = httptest.NewRequest(http.MethodGet, "/library?status=bogus", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), `hx-get="/library/data"`) {
+		t.Errorf("invalid status should yield an unfiltered /library/data load:\n%s", w.Body.String())
+	}
+}

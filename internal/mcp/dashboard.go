@@ -86,7 +86,7 @@ var overviewPage = mustPage(`{{define "content"}}
 
 var libraryPage = mustPage(`{{define "content"}}
 <div id="action-error" aria-live="assertive"></div>
-<div id="library-region" hx-get="/library/data" hx-trigger="load" hx-swap="innerHTML">
+<div id="library-region" hx-get="/library/data{{.DataQuery}}" hx-trigger="load" hx-swap="innerHTML">
   <p class="htmx-indicator">loading library…</p>
 </div>
 {{end}}`)
@@ -289,9 +289,10 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
 // ─── Template models ─────────────────────────────────────────────────────────
 
 type pageShell struct {
-	Title    string
-	Nav      string
-	DirQuery string // book page only
+	Title     string
+	Nav       string
+	DirQuery  string // book page only
+	DataQuery string // library page only: "?status=…&q=…" for the initial fragment load
 }
 
 type statusData struct {
@@ -472,8 +473,22 @@ func (s *MCPServer) handleOverviewPage(w http.ResponseWriter, r *http.Request) {
 	s.renderPage(w, overviewPage, pageShell{Title: "overview", Nav: "overview"})
 }
 
-func (s *MCPServer) handleLibraryPage(w http.ResponseWriter, _ *http.Request) {
-	s.renderPage(w, libraryPage, pageShell{Title: "library", Nav: "library"})
+func (s *MCPServer) handleLibraryPage(w http.ResponseWriter, r *http.Request) {
+	// Thread the status/search filter (e.g. from an Overview stat-card link) into
+	// the initial fragment load, so /library?status=pending actually shows the
+	// pending books instead of the whole library.
+	vals := url.Values{}
+	if status := validStatus(r.URL.Query().Get("status")); status != "" {
+		vals.Set("status", status)
+	}
+	if q := strings.TrimSpace(r.URL.Query().Get("q")); q != "" {
+		vals.Set("q", q)
+	}
+	dataQuery := ""
+	if enc := vals.Encode(); enc != "" {
+		dataQuery = "?" + enc
+	}
+	s.renderPage(w, libraryPage, pageShell{Title: "library", Nav: "library", DataQuery: dataQuery})
 }
 
 func (s *MCPServer) handleBookPage(w http.ResponseWriter, r *http.Request) {
