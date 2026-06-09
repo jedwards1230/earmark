@@ -1,123 +1,33 @@
-# Automatic PR code review using Claude Code Action (Haiku model).
-# Triggers on PR open/update; posts inline comments, summary via tracking comment.
-# Read-only — writes nothing beyond PR review comments.
-
+# Claude PR review — calls the shared reusable workflow in
+# jedwards1230/release-workflows, which runs claude-code-action@v1 in Haiku
+# PR-review mode with the public jedwards1230-plugins marketplace + review-team
+# plugin enabled by default. The focus below is appended to the base prompt.
 name: Claude PR Review
-
-run-name: "Review PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}"
 
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
 
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  id-token: write
 
 jobs:
   review:
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      id-token: write # Required by claude-code-action for OIDC GitHub token exchange
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Run Claude Code Review
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          track_progress: true
-          claude_args: |
-            --model claude-haiku-4-5
-            --max-turns 50
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git fetch:*),Bash(git show:*),Read,Glob,Grep"
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
-
-            You are reviewing a PR for lilbro-whisper, a Go service that indexes
-            audiobook transcripts for semantic search. It runs as a Linux
-            container in Kubernetes with three roles in one binary: `monitor`
-            (walks BOOKS_DIR, enqueues transcription_jobs), `worker` (polls
-            completed transcripts → chunks → Ollama embeddings → transcript_chunks),
-            and `mcp` (streamable-HTTP MCP server + an htmx status dashboard).
-            Postgres is CloudNativePG with pgvector. An external Python ASR runner
-            (on a GPU host) claims jobs and writes transcripts back. The PR branch
-            is checked out. `docs/CONTRACT.md` is the authoritative interface spec.
-
-            ### Focus, in priority order
-
-            1. SQL safety — every query in `internal/db` must use pgx parameterized
-               args ($1, $2...). Flag any string-concatenated/`fmt.Sprintf`'d SQL,
-               especially in search and the job-queue paths.
-            2. Job-queue correctness & concurrency — claim atomicity (SELECT ... FOR
-               UPDATE SKIP LOCKED), stale-job recovery, heartbeat/retry, and that
-               the shared `*pgxpool.Pool` (not a bare `*pgx.Conn`) is used (it is
-               goroutine-safe; a bare Conn shared across the monitor/worker/HTTP
-               goroutines would be a data race).
-            3. Go correctness — ignored error returns, nil deref, unchecked type
-               assertions, missing `rows.Err()` after iteration, missing
-               `defer Close` on opened files/bodies, context not propagated.
-            4. HTTP input handling — the MCP server mux and the status dashboard
-               (`/`, `/status/data`): missing method checks, unbounded reads,
-               unescaped user/DB content in html/template (XSS), `template.HTML`
-               casts. Note stdio MCP transport must never write to stdout.
-            5. Hardcoded secrets or tokens; and no homelab-specific values
-               (internal IPs, real hostnames, the real domain, 1Password vault
-               paths) — chart defaults must stay generic placeholders.
-            6. Code↔chart drift — if the change adds, renames, or removes an env
-               var the service reads (`internal/config`), a CLI flag, a port, or a
-               config value, check the Helm chart in `deploy/helm/lilbro-whisper/`
-               (templates, `values.yaml`, AND `values.schema.json`) exposes and
-               passes it. The schema is strict (`additionalProperties: false`), so
-               a new value not added to the schema will fail `helm template`.
-            7. Contract drift — if the change touches an env var name, DB column,
-               table, or the MCP upstream key, `docs/CONTRACT.md` must be updated to
-               match (it is authoritative).
-
-            Do NOT comment on formatting/naming/style — gofmt, go vet, and
-            golangci-lint run in CI and own that. You cannot build or run the code,
-            so do not claim test/race/runtime results.
-
-            ### Output
-
-            Post specific issues as inline comments with
-            `mcp__github_inline_comment__create_inline_comment`. Give your overall
-            verdict as your final message — track_progress posts it to the PR.
-
-            Only flag real, actionable problems — no nitpicking, no praise. If the
-            change looks good, say so in one line and skip inline comments. Cite
-            file:line with a concrete fix. Keep total comment volume low.
-
-      - name: Write job summary
-        if: always()
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          EXEC_FILE="${RUNNER_TEMP}/claude-execution-output.json"
-          {
-            echo "## Claude PR Review"
-            echo ""
-            echo "**PR:** #${{ github.event.pull_request.number }} — ${PR_TITLE}"
-            echo "**Session:** \`${{ steps.claude.outputs.session_id }}\`"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ -f "$EXEC_FILE" ]; then
-            RESULT=$(jq -r 'last | .subtype // "unknown"' "$EXEC_FILE" 2>/dev/null || echo "unknown")
-            TURNS=$(jq -r 'last | .num_turns // "?"' "$EXEC_FILE" 2>/dev/null || echo "?")
-            COST=$(jq -r 'last | .total_cost_usd // "?"' "$EXEC_FILE" 2>/dev/null || echo "?")
-            {
-              echo "| Metric | Value |"
-              echo "|--------|-------|"
-              echo "| Result | \`$RESULT\` |"
-              echo "| Turns | $TURNS |"
-              echo "| Cost | \$${COST} |"
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+    uses: jedwards1230/release-workflows/.github/workflows/claude-pr-review.yml@v1
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    with:
+      focus: |
+        lilbro-whisper is a Go service: indexes audiobook transcripts into a
+        CNPG Postgres (pgvector + pg_trgm) and serves semantic search over MCP.
+        - SQL: parameterized queries only via pgx — no string-concatenated SQL.
+          Use *pgxpool.Pool, never a raw *pgx.Conn.
+        - MCP stdio transport: all diagnostics must go to stderr, never stdout
+          (stdout is reserved for JSON-RPC).
+        - Embeddings/Ollama client + worker: error handling, stale-job timeout
+          SQL correctness (integer-seconds interval).
+        - The DEBUG_DB_RESET double-confirmation guard must stay intact.
+        Do NOT re-flag golangci-lint findings — CI already owns those.
