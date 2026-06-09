@@ -54,6 +54,9 @@ var tmplFuncs = template.FuncMap{
 		return *s
 	},
 	"commafy": commafy,
+	// statusLabel maps the internal job status to the operator-facing word. The
+	// DB/API/CSS value stays "claimed"; humans see "transcribing".
+	"statusLabel": statusLabel,
 	// bookDir is the book directory for a track path. Used to build the
 	// book-detail href: passed as a plain string into an href="…?dir={{…}}"
 	// URL-context interpolation, which html/template auto-escapes (no template.URL
@@ -122,19 +125,27 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   {{end}}
 </div>
 
-<div class="grid">
-  <a class="card card-click" href="/library?status=pending" title="show pending books">
-    <div class="card-label">Pending</div><div class="card-value blue">{{commafy .Stats.Pending}}</div></a>
-  <a class="card card-click" href="/library?status=claimed" title="show in-progress books">
-    <div class="card-label">Claimed</div><div class="card-value yellow">{{commafy .Stats.Claimed}}</div></a>
-  <a class="card card-click" href="/library?status=done" title="show completed books">
-    <div class="card-label">Done</div><div class="card-value green">{{commafy .Stats.Done}}</div></a>
-  <a class="card card-click" href="/library?status=failed" title="show books with failures">
-    <div class="card-label">Failed</div><div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{commafy .Stats.Failed}}</div></a>
-  <div class="card"><div class="card-label">Transcripts</div><div class="card-value purple">{{commafy .Stats.Transcripts}}</div></div>
-  <div class="card"><div class="card-label">Chunks</div><div class="card-value">{{commafy .Stats.Chunks}}</div></div>
-  <div class="card" title="completed transcripts not yet embedded (worker backlog)">
-    <div class="card-label">Unembedded</div><div class="card-value{{if .EmbedStall}} amber{{end}}">{{commafy .Stats.EmbedBacklog}}</div></div>
+<div class="card-group">
+  <div class="group-label">transcription</div>
+  <div class="grid">
+    <a class="card card-click" href="/library?status=pending" title="show pending books">
+      <div class="card-label">Pending</div><div class="card-value blue">{{commafy .Stats.Pending}}</div></a>
+    <a class="card card-click" href="/library?status=claimed" title="show books being transcribed">
+      <div class="card-label">Transcribing</div><div class="card-value yellow">{{commafy .Stats.Claimed}}</div></a>
+    <a class="card card-click" href="/library?status=done" title="show completed books">
+      <div class="card-label">Done</div><div class="card-value green">{{commafy .Stats.Done}}</div></a>
+    <a class="card card-click" href="/library?status=failed" title="show books with failures">
+      <div class="card-label">Failed</div><div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{commafy .Stats.Failed}}</div></a>
+  </div>
+</div>
+
+<div class="card-group">
+  <div class="group-label">embedding</div>
+  <div class="grid">
+    <div class="card"><div class="card-label">Chunks</div><div class="card-value">{{commafy .Stats.Chunks}}</div></div>
+    <div class="card" title="completed transcripts not yet embedded (worker backlog)">
+      <div class="card-label">Unembedded</div><div class="card-value{{if .EmbedStall}} amber{{end}}">{{commafy .Stats.EmbedBacklog}}</div></div>
+  </div>
 </div>
 
 {{if .EmbedStall}}
@@ -166,7 +177,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
           <a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}
         </td>
-        <td><span class="badge {{.Status}}">{{.Status}}</span></td>
+        <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
         <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
         <td class="actions">
           {{if or (eq .Status "done") (eq .Status "failed")}}
@@ -196,7 +207,7 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
   <div class="lib-chips">
     <a class="chip{{if eq .Status ""}} active{{end}}"        hx-get="/library/data?q={{.QueryEscaped}}"                hx-target="#library-region" hx-swap="innerHTML">all</a>
     <a class="chip{{if eq .Status "pending"}} active{{end}}" hx-get="/library/data?status=pending&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">pending</a>
-    <a class="chip{{if eq .Status "claimed"}} active{{end}}" hx-get="/library/data?status=claimed&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">claimed</a>
+    <a class="chip{{if eq .Status "claimed"}} active{{end}}" hx-get="/library/data?status=claimed&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">transcribing</a>
     <a class="chip{{if eq .Status "done"}} active{{end}}"    hx-get="/library/data?status=done&q={{.QueryEscaped}}"    hx-target="#library-region" hx-swap="innerHTML">done</a>
     <a class="chip{{if eq .Status "failed"}} active{{end}}"  hx-get="/library/data?status=failed&q={{.QueryEscaped}}"  hx-target="#library-region" hx-swap="innerHTML">failed</a>
   </div>
@@ -219,7 +230,7 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
       </td>
       <td class="mini-badges">
         {{if gt .Pending 0}}<span class="badge pending">{{commafy .Pending}} pend</span>{{end}}
-        {{if gt .Claimed 0}}<span class="badge claimed">{{commafy .Claimed}} run</span>{{end}}
+        {{if gt .Claimed 0}}<span class="badge claimed">{{commafy .Claimed}} transcribing</span>{{end}}
         {{if gt .Done 0}}<span class="badge done">{{commafy .Done}} done</span>{{end}}
         {{if gt .Failed 0}}<span class="badge failed">{{commafy .Failed}} fail</span>{{end}}
       </td>
@@ -251,7 +262,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
     <span>{{commafy .Total}} track{{if ne .Total 1}}s{{end}}</span>
     <span class="time-muted">{{commafy .Done}} done</span>
     {{if gt .Pending 0}}<span class="time-muted">{{commafy .Pending}} pending</span>{{end}}
-    {{if gt .Claimed 0}}<span class="time-muted">{{commafy .Claimed}} in progress</span>{{end}}
+    {{if gt .Claimed 0}}<span class="time-muted">{{commafy .Claimed}} transcribing</span>{{end}}
     {{if gt .Failed 0}}<span style="color:var(--red)">{{commafy .Failed}} failed</span>{{end}}
   </div>
   <div class="book-path">{{.Dir}}</div>
@@ -270,7 +281,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
     <tr>
       <td><div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div>
           {{if .Error}}<div class="error-row">{{derefStr .Error}}</div>{{end}}</td>
-      <td><span class="badge {{.Status}}">{{.Status}}</span></td>
+      <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
       <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
       <td class="actions">
         {{if or (eq .Status "done") (eq .Status "failed")}}
@@ -393,6 +404,16 @@ func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, sta
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// statusLabel maps an internal job status to the operator-facing word. Only
+// "claimed" differs — it reads as "transcribing" to a human watching the
+// pipeline; the stored value, CSS class, and filter param stay "claimed".
+func statusLabel(status string) string {
+	if status == "claimed" {
+		return "transcribing"
+	}
+	return status
+}
 
 func commafy(n int) string {
 	s := strconv.Itoa(n)

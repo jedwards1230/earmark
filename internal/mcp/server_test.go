@@ -524,10 +524,32 @@ func TestStatusDataFragment(t *testing.T) {
 		"chapter01.m4b",   // shortName of first recent job
 		"chapter02.m4b",
 		`badge done`,
-		`badge claimed`,
+		`badge claimed`,  // CSS class stays the internal status
+		`>transcribing<`, // ...but the visible badge text is the operator word
+		"Transcribing",   // card label (was "Claimed")
+		"transcription",  // card-group label
+		"embedding",      // card-group label
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("GET /status/data: body missing %q\nbody:\n%s", want, body)
+		}
+	}
+	// The redundant Transcripts card (always == Done) is gone.
+	if strings.Contains(body, `card-label">Transcripts<`) {
+		t.Error("the Transcripts card should have been removed")
+	}
+}
+
+func TestStatusLabel(t *testing.T) {
+	cases := map[string]string{
+		"claimed": "transcribing",
+		"pending": "pending",
+		"done":    "done",
+		"failed":  "failed",
+	}
+	for in, want := range cases {
+		if got := statusLabel(in); got != want {
+			t.Errorf("statusLabel(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
