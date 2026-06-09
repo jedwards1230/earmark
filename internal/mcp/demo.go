@@ -56,6 +56,28 @@ func (demoDB) RequeueByDir(_ context.Context, dir string) ([]string, error) {
 	return []string{dir}, nil
 }
 
+// GetFailedJobs returns synthetic failed jobs (with full errors, attempts, and
+// runner) for the failures view. Empty/healthy scenarios have none.
+func (d demoDB) GetFailedJobs(context.Context) ([]db.FailedJob, error) {
+	if d.scenario == "empty" || d.scenario == "stale" {
+		return nil, nil
+	}
+	now := time.Now()
+	cudaErr := "Traceback (most recent call last):\n" +
+		"  File \"runner.py\", line 412, in transcribe\n" +
+		"    result = model.transcribe(audio_path)\n" +
+		"RuntimeError: CUDA out of memory. Tried to allocate 2.40 GiB " +
+		"(GPU 0; 31.49 GiB total; 28.12 GiB allocated; 1.05 GiB free)"
+	codecErr := "ffmpeg: unsupported codec in chapter 3; file skipped"
+	runner := "asr-runner-desktop-1"
+	return []db.FailedJob{
+		{ID: "f1", FilePath: "/books/audio-libation/Author Seven/An Epic/An Epic.m4b",
+			Error: &cudaErr, Attempts: 3, ClaimedBy: &runner, UpdatedAt: now.Add(-15 * time.Second)},
+		{ID: "f2", FilePath: "/books/audio-libro/Some Author/Short Stories - Track 3.mp3",
+			Error: &codecErr, Attempts: 1, ClaimedBy: &runner, UpdatedAt: now.Add(-9 * time.Minute)},
+	}, nil
+}
+
 // SetPaused flips the in-memory demo pause flag so the toggle is exercisable.
 func (d demoDB) SetPaused(_ context.Context, paused bool, _ string) error {
 	if d.paused != nil {

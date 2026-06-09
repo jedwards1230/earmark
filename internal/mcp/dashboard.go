@@ -102,6 +102,43 @@ var bookPage = mustPage(`{{define "content"}}
 </div>
 {{end}}`)
 
+var failedPage = mustPage(`{{define "content"}}
+<div id="action-error" aria-live="assertive"></div>
+<div id="failed-region" hx-get="/failed/data" hx-trigger="load" hx-swap="innerHTML">
+  <p class="htmx-indicator">loading…</p>
+</div>
+{{end}}`)
+
+// failedFragmentTmpl is the track-level failures view: full error, retry count,
+// and which runner last claimed each job, with per-row requeue.
+var failedFragmentTmpl = template.Must(template.New("failed").Funcs(tmplFuncs).Parse(`
+<div class="section-title">Failed jobs ({{len .Jobs}})</div>
+{{if .Jobs}}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Track</th><th>Error</th><th>Attempts</th><th>Runner</th><th>Updated</th><th></th></tr></thead>
+  <tbody>
+  {{range .Jobs}}
+    <tr>
+      <td><a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a></td>
+      <td>{{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{else}}<span class="time-muted">—</span>{{end}}</td>
+      <td class="time-muted">{{.Attempts}}/3</td>
+      <td class="time-muted">{{if .ClaimedBy}}{{derefStr .ClaimedBy}}{{else}}—{{end}}</td>
+      <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
+      <td class="actions">
+        <button class="btn" hx-post="/actions/requeue?id={{.ID}}&failed=1" hx-target="#failed-region" hx-swap="innerHTML"
+                hx-confirm="Re-transcribe this track? It is reset to pending and re-run.">requeue</button>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{else}}
+<p class="lib-empty">No failed jobs. &#127881;</p>
+{{end}}
+`))
+
 // ─── Status fragment (Overview) ──────────────────────────────────────────────
 
 var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).Parse(`
@@ -169,7 +206,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 
 {{if gt .Stats.Failed 0}}
 <div class="failed-callout">
-  <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}}</span>
+  <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} &nbsp;<a href="/failed">view failed jobs &#8250;</a></span>
   <button class="btn btn-warn" hx-post="/actions/retry-failed" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Retry all {{.Stats.Failed}} failed job(s)? Each is reset to pending and re-transcribed.">retry all failed</button>
 </div>
@@ -378,6 +415,10 @@ type bookData struct {
 	Done     int
 	Failed   int
 	Tracks   []db.RecentJob
+}
+
+type failedData struct {
+	Jobs []db.FailedJob
 }
 
 // newStatusData derives the unified pipeline state from the pause flag and the
@@ -706,6 +747,30 @@ func (s *MCPServer) renderBookFragment(w http.ResponseWriter, r *http.Request, d
 	}
 }
 
+// ─── Failed jobs view ────────────────────────────────────────────────────────
+
+func (s *MCPServer) handleFailedPage(w http.ResponseWriter, _ *http.Request) {
+	s.renderPage(w, failedPage, pageShell{Title: "failed", Nav: "failed"})
+}
+
+func (s *MCPServer) handleFailedData(w http.ResponseWriter, r *http.Request) {
+	s.renderFailedFragment(w, r)
+}
+
+func (s *MCPServer) renderFailedFragment(w http.ResponseWriter, r *http.Request) {
+	jobs, err := s.db.GetFailedJobs(r.Context())
+	if err != nil {
+		s.logger.Error("GetFailedJobs error", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := failedFragmentTmpl.Execute(w, failedData{Jobs: jobs}); err != nil {
+		s.logger.Error("failed fragment render error", "error", err)
+	}
+}
+
 // ─── Mutating action handlers ────────────────────────────────────────────────
 
 // handleRequeueJob re-transcribes a single job (POST /actions/requeue?id=…).
@@ -727,6 +792,10 @@ func (s *MCPServer) handleRequeueJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("requeued job via dashboard", "id", id)
+	if r.URL.Query().Get("failed") != "" {
+		s.renderFailedFragment(w, r)
+		return
+	}
 	if book := r.URL.Query().Get("book"); book != "" {
 		s.renderBookFragment(w, r, book)
 		return
