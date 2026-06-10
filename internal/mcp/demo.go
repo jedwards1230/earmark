@@ -26,6 +26,7 @@ import (
 type demoDB struct {
 	scenario string
 	paused   *bool // heap-backed so value-receiver SetPaused can mutate it
+	runLimit *int  // bounded-run counter for the control API (nil = unlimited)
 }
 
 func (demoDB) Ping(context.Context) error { return nil }
@@ -88,6 +89,14 @@ func (d demoDB) SetPaused(_ context.Context, paused bool, _ string) error {
 
 func (d demoDB) isPaused() bool { return d.paused != nil && *d.paused }
 
+// GetControl reports the demo control state. SetRunLimit is a no-op in the demo
+// (value receiver) — the control API isn't exercised against the demo fixture.
+func (d demoDB) GetControl(context.Context) (bool, *int, error) {
+	return d.isPaused(), d.runLimit, nil
+}
+
+func (d demoDB) SetRunLimit(context.Context, *int, string) error { return nil }
+
 // GetServiceStatus returns a synthetic snapshot for the selected scenario.
 func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 	now := time.Now()
@@ -121,6 +130,7 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		}
 	}
 	q.Paused = d.isPaused()
+	q.RunLimit = d.runLimit
 	return q, nil
 }
 
@@ -321,6 +331,9 @@ func StartDemoDashboard(addr string) error {
 		StaleJobTimeout:    30 * time.Minute,
 		BooksDir:           "/books",
 		LibraryCollections: demoCollections,
+		// Honor CONTROL_API_TOKEN so the control-API mutations are exercisable
+		// against the demo (otherwise they fail closed with 503).
+		ControlAPIToken: os.Getenv("CONTROL_API_TOKEN"),
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",

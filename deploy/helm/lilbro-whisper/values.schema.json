@@ -168,6 +168,15 @@
             "name":     { "type": "string", "minLength": 1 },
             "itemPath": { "type": "string", "minLength": 1 }
           }
+        },
+        "controlApiToken": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name":     { "type": "string", "minLength": 1 },
+            "key":      { "type": "string", "minLength": 1 },
+            "itemPath": { "type": "string" }
+          }
         }
       }
     }

@@ -66,6 +66,10 @@ func (m *MockDBInterface) RequeueFailed(ctx context.Context) ([]string, error) {
 // Pause/library methods are part of DBInterface but unused by the MCP tool
 // handlers under test, so they are plain stubs (no testify expectations).
 func (m *MockDBInterface) SetPaused(context.Context, bool, string) error { return nil }
+func (m *MockDBInterface) GetControl(context.Context) (bool, *int, error) {
+	return false, nil, nil
+}
+func (m *MockDBInterface) SetRunLimit(context.Context, *int, string) error { return nil }
 
 func (m *MockDBInterface) GetBookSummaries(context.Context, db.BookFilter) ([]db.BookSummary, int, error) {
 	return nil, 0, nil

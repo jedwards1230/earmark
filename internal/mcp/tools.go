@@ -30,6 +30,12 @@ type DBInterface interface {
 	RequeueFailed(ctx context.Context) ([]string, error)
 	// SetPaused writes the global runner pause flag (dashboard pause/resume).
 	SetPaused(ctx context.Context, paused bool, by string) error
+	// GetControl returns the full runner_control state — pause flag plus the
+	// bounded-run counter (nil = unlimited) — for the control API.
+	GetControl(ctx context.Context) (paused bool, runLimit *int, err error)
+	// SetRunLimit writes the bounded-run counter without touching the pause flag
+	// (nil = unlimited). Used by the control API's "run N jobs then auto-pause".
+	SetRunLimit(ctx context.Context, limit *int, by string) error
 	// GetBookSummaries returns one row per book directory (the library view),
 	// plus the total matching-book count for pagination.
 	GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error)
