@@ -407,7 +407,8 @@ chunk (backward-compatible). When set, the hit's quoted text is truncated to
 marker. Text search centres the window on the literal query match; semantic
 search returns a **leading preview** (there is no sub-chunk match position) and
 `get_chunk_context` returns the full surrounding text. A positive value below 80
-is raised to 80 so the excerpt stays readable.
+is raised to 80 so the excerpt stays readable, and a value above 4000 is capped
+to 4000 (well past a full chunk, so the cap only guards against absurd inputs).
 
 **`book` resolution** (both search tools + `get_transcript`): the `book` string
 (a title or directory substring) is matched against the known book directories

@@ -702,7 +702,7 @@ func TestClampHelpers(t *testing.T) {
 		t.Errorf("clampLimit(-1, 50) = %d, want 50 (reset to default)", got)
 	}
 
-	// clampOffset: negative → 0; non-negative passes through.
+	// clampOffset: negative → 0; in-range passes through; above ceiling → maxOffset.
 	if got := clampOffset(0); got != 0 {
 		t.Errorf("clampOffset(0) = %d, want 0", got)
 	}
@@ -711,6 +711,15 @@ func TestClampHelpers(t *testing.T) {
 	}
 	if got := clampOffset(-1); got != 0 {
 		t.Errorf("clampOffset(-1) = %d, want 0", got)
+	}
+	if got := clampOffset(maxOffset); got != maxOffset {
+		t.Errorf("clampOffset(maxOffset) = %d, want %d (exact ceiling passes through)", got, maxOffset)
+	}
+	if got := clampOffset(maxOffset + 1); got != maxOffset {
+		t.Errorf("clampOffset(maxOffset+1) = %d, want %d (clamped to ceiling)", got, maxOffset)
+	}
+	if got := clampOffset(2147483647); got != maxOffset {
+		t.Errorf("clampOffset(MaxInt32) = %d, want %d (clamped to ceiling)", got, maxOffset)
 	}
 }
 
