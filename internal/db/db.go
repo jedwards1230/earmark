@@ -327,10 +327,19 @@ func (db *DB) initialize(ctx context.Context) error {
 		) d
 		WHERE t.file_path = d.file_path AND t.id <> d.keep_id;
 
+		-- Idempotent + concurrency-safe: skip if the constraint already exists, and
+		-- still swallow the error if two pods race to create it on a fresh DB.
+		-- (ADD CONSTRAINT on an existing constraint raises duplicate_table 42P07 —
+		-- the backing index relation already exists — not duplicate_object.)
 		DO $$ BEGIN
-			ALTER TABLE transcription_jobs
-				ADD CONSTRAINT transcription_jobs_file_path_unique UNIQUE (file_path);
-		EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = 'transcription_jobs_file_path_unique'
+			) THEN
+				ALTER TABLE transcription_jobs
+					ADD CONSTRAINT transcription_jobs_file_path_unique UNIQUE (file_path);
+			END IF;
+		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+		END $$;
 	`); err != nil {
 		return fmt.Errorf("file_path dedup migration: %w", err)
 	}
