@@ -3,6 +3,7 @@ package db
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/library"
@@ -96,6 +97,44 @@ func TestScanResultsMetadata(t *testing.T) {
 				t.Errorf("title = %q, want %q", title, tc.wantTitle)
 			}
 		})
+	}
+}
+
+// TestTextSearchSQLShape validates that textSearchSQL uses the trigram similarity
+// operator and ordering, and has an ILIKE fallback. This is a regression guard:
+// if someone reverts to ILIKE-only the trigram GIN index is bypassed and this
+// test will fail.
+//
+// The test does NOT require a live database — it inspects the SQL string that
+// TextSearch sends to the pool. A live-DB integration test is deferred to M-8
+// (testcontainers suite, needs Docker in CI).
+func TestTextSearchSQLShape(t *testing.T) {
+	sql := textSearchSQL
+
+	// Must use the trigram similarity operator so the GIN index on text is hit.
+	if !strings.Contains(sql, "c.text % $1") {
+		t.Errorf("textSearchSQL missing trigram operator 'c.text %% $1': got:\n%s", sql)
+	}
+
+	// Must rank by similarity() descending — the core of the trigram rewrite.
+	if !strings.Contains(sql, "similarity(c.text, $1) DESC") {
+		t.Errorf("textSearchSQL missing 'ORDER BY similarity(c.text, $1) DESC': got:\n%s", sql)
+	}
+
+	// Must have a similarity() column in the SELECT list for scanning.
+	if !strings.Contains(sql, "similarity(c.text, $1) AS similarity") {
+		t.Errorf("textSearchSQL missing 'similarity(c.text, $1) AS similarity' in SELECT: got:\n%s", sql)
+	}
+
+	// Must retain the ILIKE fallback for short queries below the pg_trgm threshold.
+	if !strings.Contains(sql, "ILIKE") {
+		t.Errorf("textSearchSQL missing ILIKE fallback clause: got:\n%s", sql)
+	}
+
+	// Must NOT be ILIKE-only: confirm the trigram WHERE predicate is present.
+	// An ILIKE-only rewrite would be: WHERE c.text ILIKE ... with no '% $1'.
+	if strings.Contains(sql, "WHERE c.text ILIKE") && !strings.Contains(sql, "c.text % $1") {
+		t.Errorf("textSearchSQL reverted to ILIKE-only — trigram operator missing: got:\n%s", sql)
 	}
 }
 

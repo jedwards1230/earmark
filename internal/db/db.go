@@ -586,6 +586,33 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 	return db.scanResults(rows)
 }
 
+// textSearchSQL is the trigram-ranked full-text search query used by TextSearch.
+// It is a package-level variable (not a constant) solely so that tests can
+// inspect the SQL shape and catch regressions to the old ILIKE-only form.
+//
+// The query uses:
+//   - `c.text % $1`          — trigram similarity operator (GIN-accelerated)
+//   - `similarity(c.text, $1) DESC` — similarity-ranked ordering
+//   - `ILIKE '%' || $1 || '%'` — fallback for very short queries below the
+//     pg_trgm threshold (leading wildcard, so GIN not used for this clause)
+var textSearchSQL = `
+	SELECT
+		c.id,
+		c.text,
+		c.file_path,
+		c.chunk_index,
+		c.start_sec,
+		c.end_sec,
+		c.speaker,
+		similarity(c.text, $1) AS similarity,
+		(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
+	FROM transcript_chunks c
+	WHERE c.text % $1
+	   OR c.text ILIKE '%' || $1 || '%'
+	ORDER BY similarity(c.text, $1) DESC, c.chunk_index ASC
+	LIMIT $2
+`
+
 // TextSearch performs a trigram full-text search over transcript_chunks using
 // pg_trgm similarity so the GIN index on text (text_trgm_idx) is usable.
 //
@@ -602,23 +629,7 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 // single-character queries the ILIKE clause dominates; those are rare in
 // practice.
 func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]SearchResultWithMetadata, error) {
-	rows, err := db.pool.Query(ctx, `
-		SELECT
-			c.id,
-			c.text,
-			c.file_path,
-			c.chunk_index,
-			c.start_sec,
-			c.end_sec,
-			c.speaker,
-			similarity(c.text, $1) AS similarity,
-			(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
-		FROM transcript_chunks c
-		WHERE c.text % $1
-		   OR c.text ILIKE '%' || $1 || '%'
-		ORDER BY similarity(c.text, $1) DESC, c.chunk_index ASC
-		LIMIT $2
-	`, query, limit)
+	rows, err := db.pool.Query(ctx, textSearchSQL, query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("text search query: %w", err)
 	}
