@@ -153,14 +153,16 @@ func TestChunkByWord(t *testing.T) {
 			want:      []string{"the quick brown"},
 		},
 		{
-			name:      "multiple sentences with chunk size 4",
+			// Periods are preserved (sentence boundaries must not be destroyed).
+			// The old implementation stripped them; the fixed one does not.
+			name:      "multiple sentences with chunk size 4 preserves periods",
 			content:   "I like red apples. My friend prefers green ones. The store has both.",
 			chunkSize: 4,
 			want: []string{
-				"I like red apples",
+				"I like red apples.",
 				"My friend prefers green",
-				"ones The store has",
-				"both",
+				"ones. The store has",
+				"both.",
 			},
 		},
 	}

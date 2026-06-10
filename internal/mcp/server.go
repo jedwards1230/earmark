@@ -67,9 +67,18 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		resolver = library.NewResolver(cfg.BooksDir, nil)
 	}
 
+	// All four search/browse tools are read-only and non-destructive — they only
+	// query the database; they never mutate state or produce side-effects.
+	readOnlyAnnotations := mcp.ToolAnnotation{
+		ReadOnlyHint:    mcp.ToBoolPtr(true),
+		DestructiveHint: mcp.ToBoolPtr(false),
+		IdempotentHint:  mcp.ToBoolPtr(true),
+	}
+
 	// Add semantic search tool
 	mcpServer.AddTool(mcp.NewTool("semantic_search_audiobooks",
 		mcp.WithDescription("Search audiobook transcriptions using semantic similarity"),
+		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("query",
 			mcp.Description("The search query to find relevant content"),
 			mcp.Required(),
@@ -87,6 +96,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// Add text search tool
 	mcpServer.AddTool(mcp.NewTool("text_search_audiobooks",
 		mcp.WithDescription("Search audiobook transcriptions using full-text search"),
+		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("query",
 			mcp.Description("The search query to find exact text matches"),
 			mcp.Required(),
@@ -100,6 +110,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// Add browse library tool
 	mcpServer.AddTool(mcp.NewTool("browse_audiobook_library",
 		mcp.WithDescription("Browse the audiobook library structure and metadata"),
+		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("author",
 			mcp.Description("Filter by author name (case-insensitive partial match)"),
 		),
@@ -111,6 +122,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// Add chunk context tool
 	mcpServer.AddTool(mcp.NewTool("get_chunk_context",
 		mcp.WithDescription("Get surrounding chunks for better context around a specific chunk"),
+		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("chunkID",
 			mcp.Description("The unique chunk ID (format: author_book_chapter_chunk)"),
 			mcp.Required(),

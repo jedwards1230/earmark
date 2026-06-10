@@ -50,8 +50,9 @@ func chunkByWord(content string, chunkSize int) []string {
 	}
 
 	var chunks []string
-	// Remove periods before splitting into words
-	content = strings.ReplaceAll(content, ".", " ")
+	// Do NOT strip periods — they are sentence boundaries and must be preserved
+	// so that the word-split path produces correct output if ever enabled in
+	// production (it is currently dormant; SplitTypeToken is used in prod).
 	words := strings.Fields(content)
 	currentChunk := strings.Builder{}
 	wordCount := 0

@@ -26,6 +26,7 @@ import (
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/lil-whisper/internal/library"
 	"github.com/jedwards1230/lil-whisper/internal/log"
 	"github.com/jedwards1230/lil-whisper/internal/openai"
 )
@@ -146,10 +147,11 @@ type SearchResultWithMetadata struct {
 // DB is the service's database handle.
 // pool is a *pgxpool.Pool (goroutine-safe) replacing the former single *pgx.Conn.
 type DB struct {
-	pool *pgxpool.Pool
-	e    *openai.Embeddings
-	cfg  *config.Config
-	log  log.Logger
+	pool     *pgxpool.Pool
+	e        *openai.Embeddings
+	cfg      *config.Config
+	log      log.Logger
+	resolver *library.Resolver
 }
 
 // New opens a PostgreSQL connection pool and runs schema migrations.
@@ -170,11 +172,21 @@ func New(cfg *config.Config) (*DB, error) {
 	}
 
 	logger := log.NewLogger("db")
+
+	// Build the library label resolver from config. A parse error falls back to
+	// the generic resolver — labels are cosmetic, never a startup blocker.
+	resolver, err := library.ParseCollections(cfg.LibraryCollections, cfg.BooksDir)
+	if err != nil {
+		logger.Warn("LIBRARY_COLLECTIONS parse failed; using generic label resolver", "error", err)
+		resolver = library.NewResolver(cfg.BooksDir, nil)
+	}
+
 	db := &DB{
-		pool: pool,
-		e:    openai.NewEmbeddings(cfg),
-		cfg:  cfg,
-		log:  logger,
+		pool:     pool,
+		e:        openai.NewEmbeddings(cfg),
+		cfg:      cfg,
+		log:      logger,
+		resolver: resolver,
 	}
 
 	if err := db.initialize(context.Background()); err != nil {
@@ -676,37 +688,80 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 	}
 	defer rows.Close()
 
-	return scanResults(rows)
+	return db.scanResults(rows)
 }
 
-// TextSearch performs a trigram full-text search over transcript_chunks.
-// Filtering at the chunk level (c.text ILIKE) makes LIMIT meaningful.
+// textSearchSQL is the trigram-ranked full-text search query used by TextSearch.
+// It is a package-level variable (not a constant) solely so that tests can
+// inspect the SQL shape and catch regressions to the old ILIKE-only form.
+//
+// The query uses:
+//   - `c.text % $1`          — trigram similarity operator (GIN-accelerated)
+//   - `similarity(c.text, $1) DESC` — similarity-ranked ordering
+//   - `ILIKE '%' || $1 || '%'` — fallback for very short queries below the
+//     pg_trgm threshold (leading wildcard, so GIN not used for this clause)
+var textSearchSQL = `
+	SELECT
+		c.id,
+		c.text,
+		c.file_path,
+		c.chunk_index,
+		c.start_sec,
+		c.end_sec,
+		c.speaker,
+		similarity(c.text, $1) AS similarity,
+		(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
+	FROM transcript_chunks c
+	WHERE c.text % $1
+	   OR c.text ILIKE '%' || $1 || '%'
+	ORDER BY similarity(c.text, $1) DESC, c.chunk_index ASC
+	LIMIT $2
+`
+
+// rowQuerier is the narrow slice of the pgx pool API that TextSearch needs to
+// run a query. Both *pgxpool.Pool and pgxmock.PgxPoolIface satisfy it, which
+// lets TextSearch be exercised at execution level by a pure-Go mock pool in
+// tests (no live Postgres required).
+type rowQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// TextSearch performs a trigram full-text search over transcript_chunks using
+// pg_trgm similarity so the GIN index on text (text_trgm_idx) is usable.
+//
+// Strategy: rank by trigram similarity descending (best match first), with an
+// ILIKE fallback so short substrings that don't meet the similarity threshold
+// are still surfaced. The GIN index accelerates the similarity() ranking path;
+// the ILIKE clause is an additional safety net for very short queries where
+// pg_trgm similarity may be 0. Combined, the results are still sorted by
+// similarity DESC so the most relevant chunks appear first.
+//
+// Tradeoff: ILIKE with a leading wildcard prevents the GIN index from being
+// used for that clause alone, but the similarity() predicate keeps overall
+// performance good for typical query lengths (3+ chars). For very short
+// single-character queries the ILIKE clause dominates; those are rare in
+// practice.
 func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]SearchResultWithMetadata, error) {
-	rows, err := db.pool.Query(ctx, `
-		SELECT
-			c.id,
-			c.text,
-			c.file_path,
-			c.chunk_index,
-			c.start_sec,
-			c.end_sec,
-			c.speaker,
-			0.0 AS similarity,
-			(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
-		FROM transcript_chunks c
-		WHERE c.text ILIKE '%' || $1 || '%'
-		ORDER BY c.chunk_index ASC
-		LIMIT $2
-	`, query, limit)
+	return db.textSearch(ctx, db.pool, query, limit)
+}
+
+// textSearch is the querier-parameterized core of TextSearch, split out so the
+// query execution + scan path can be tested against a mock pool.
+func (db *DB) textSearch(ctx context.Context, q rowQuerier, query string, limit int) ([]SearchResultWithMetadata, error) {
+	rows, err := q.Query(ctx, textSearchSQL, query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("text search query: %w", err)
 	}
 	defer rows.Close()
 
-	return scanResults(rows)
+	return db.scanResults(rows)
 }
 
-func scanResults(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
+// scanResults scans a result set from findSimilar, TextSearch, or
+// GetChunkContext, populating the legacy Author/Title/Chapter fields using the
+// DB's library.Resolver so that metadata is correct for both 3-level
+// (author/title/track) and 2-level (author/book.m4b) collection layouts.
+func (db *DB) scanResults(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
 	var results []SearchResultWithMetadata
 	for rows.Next() {
 		var r SearchResultWithMetadata
@@ -720,10 +775,15 @@ func scanResults(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
 		}
 		r.Speaker = speaker
 		r.ChunkID = r.ID
-		// Populate legacy fields from file path for the MCP formatter.
-		r.Title = filepath.Base(filepath.Dir(r.FilePath))
-		r.Author = filepath.Base(filepath.Dir(filepath.Dir(r.FilePath)))
+
+		// Derive Author/Title using the layout-aware resolver so that both
+		// 3-level (author/title/track) and 2-level (author/book.m4b) collections
+		// return correct labels. Chapter is the audio filename (sans path), which
+		// is meaningful for multi-track books and empty-ish for single-file ones.
+		bookDir := filepath.Dir(r.FilePath)
+		r.Author, r.Title = db.resolver.Resolve(bookDir, r.FilePath)
 		r.Chapter = filepath.Base(r.FilePath)
+
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -799,7 +859,7 @@ func (db *DB) GetChunkContext(ctx context.Context, chunkID string, contextWindow
 	}
 	defer rows.Close()
 
-	return scanResults(rows)
+	return db.scanResults(rows)
 }
 
 // ─── Processing stats ────────────────────────────────────────────────────────
