@@ -613,6 +613,14 @@ var textSearchSQL = `
 	LIMIT $2
 `
 
+// rowQuerier is the narrow slice of the pgx pool API that TextSearch needs to
+// run a query. Both *pgxpool.Pool and pgxmock.PgxPoolIface satisfy it, which
+// lets TextSearch be exercised at execution level by a pure-Go mock pool in
+// tests (no live Postgres required).
+type rowQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
 // TextSearch performs a trigram full-text search over transcript_chunks using
 // pg_trgm similarity so the GIN index on text (text_trgm_idx) is usable.
 //
@@ -629,7 +637,13 @@ var textSearchSQL = `
 // single-character queries the ILIKE clause dominates; those are rare in
 // practice.
 func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]SearchResultWithMetadata, error) {
-	rows, err := db.pool.Query(ctx, textSearchSQL, query, limit)
+	return db.textSearch(ctx, db.pool, query, limit)
+}
+
+// textSearch is the querier-parameterized core of TextSearch, split out so the
+// query execution + scan path can be tested against a mock pool.
+func (db *DB) textSearch(ctx context.Context, q rowQuerier, query string, limit int) ([]SearchResultWithMetadata, error) {
+	rows, err := q.Query(ctx, textSearchSQL, query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("text search query: %w", err)
 	}
