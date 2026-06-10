@@ -206,7 +206,13 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/book/data", getOnly(s.handleBookData))
 	mux.HandleFunc("/track", getOnly(s.handleTrackPage))
 	mux.HandleFunc("/track/data", getOnly(s.handleTrackData))
+	mux.HandleFunc("/track/segments", getOnly(s.handleTrackSegments))
 	mux.HandleFunc("/failed", getOnly(s.handleFailedPage))
+
+	// Per-book transcript search (read-only; accepts the htmx form POST or a GET).
+	// Specific path → method patterns are safe (no "/" catch-all conflict).
+	mux.HandleFunc("GET /search/book", s.handleBookSearch)
+	mux.HandleFunc("POST /search/book", s.handleBookSearch)
 	mux.HandleFunc("/failed/data", getOnly(s.handleFailedData))
 
 	// Vendored htmx (pinned), served from the binary so the dashboard needs no

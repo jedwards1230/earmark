@@ -33,6 +33,11 @@ var htmxJS = func() []byte {
 // libraryPageSize is the number of books per page in the library list.
 const libraryPageSize = 20
 
+// segmentPageSize is the number of transcript segments rendered per page in the
+// track-detail reader; beyond this an htmx "load more" button appends the next
+// page (P7), so a multi-thousand-segment transcript doesn't render all at once.
+const segmentPageSize = 30
+
 // embedStallThreshold is the embed backlog above which the dashboard warns that
 // embeddings are not draining. A few transcripts always sit briefly between
 // transcription and the worker's 30s embed poll, so a small backlog is normal;
@@ -136,6 +141,8 @@ var tmplFuncs = template.FuncMap{
 		}
 		return fmt.Sprintf("%.1f kHz", float64(*n)/1000)
 	},
+	// sub subtracts b from a (small arithmetic for the "N remaining" reader label).
+	"sub": func(a, b int) int { return a - b },
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.
@@ -289,6 +296,18 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   </div>
 </div>
 
+<div class="card-group">
+  <div class="group-label">library</div>
+  <div class="grid">
+    <div class="card" title="total audio duration across all indexed transcripts">
+      <div class="card-label">Duration indexed</div><div class="card-value">{{durTime .Stats.TotalDurationSeconds}}</div></div>
+    <div class="card" title="total transcript words across all indexed transcripts">
+      <div class="card-label">Words indexed</div><div class="card-value">{{commafy64Ptr .Stats.TotalWords}}</div></div>
+    <div class="card" title="book directories whose every track is done">
+      <div class="card-label">Books complete</div><div class="card-value green">{{commafy .Stats.BooksFullyDone}}</div></div>
+  </div>
+</div>
+
 {{if .EmbedStall}}
 <div class="stall-callout">
   &#9888;&#xFE0F;&nbsp;{{commafy .Stats.EmbedBacklog}} completed transcripts are waiting to be embedded and not draining.
@@ -422,6 +441,12 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
   </div>
 </div>
 
+<form class="lib-search" hx-post="/search/book?dir={{.DirQuery}}" hx-target="#book-search-results" hx-swap="innerHTML">
+  <input type="search" name="q" placeholder="search this book's transcript…" autocomplete="off">
+  <button type="submit" class="btn">search</button>
+</form>
+<div id="book-search-results"></div>
+
 {{if .Tracks}}
 <div class="table-wrap">
 <table>
@@ -456,6 +481,54 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
 </table>
 </div>
 {{else}}<p class="lib-empty">No tracks found for this book.</p>{{end}}
+`))
+
+// ─── Per-book search results fragment ────────────────────────────────────────
+
+// bookSearchFragmentTmpl renders the matching chunks for the per-book search
+// box: each row shows the track filename, the chunk's timestamp range, and the
+// matched text. Reuses the trigram TextSearch scoped to the book.
+var bookSearchFragmentTmpl = template.Must(template.New("booksearch").Funcs(tmplFuncs).Parse(`
+{{if .Query}}
+<div class="section-title">Search results for &ldquo;{{.Query}}&rdquo; ({{len .Results}})</div>
+{{if .Results}}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Track</th><th>Time</th><th>Match</th></tr></thead>
+  <tbody>
+  {{range .Results}}
+    <tr>
+      <td><div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div></td>
+      <td class="time-muted">{{timestamp .StartSec}} &#8594; {{timestamp .EndSec}}</td>
+      <td>{{.Content}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{else}}<p class="lib-empty">No matches in this book for &ldquo;{{.Query}}&rdquo;.</p>{{end}}
+{{end}}
+`))
+
+// ─── Transcript segments page fragment (reader "load more") ──────────────────
+
+// segmentsFragmentTmpl is the htmx "load more" response for the transcript
+// reader: the next page of segment rows, followed by a fresh load-more button
+// (which replaces itself via outerHTML) when more remain. The button the user
+// clicked is swapped out (hx-swap="outerHTML"), so appending rows + a new button
+// here continues the chain cleanly.
+var segmentsFragmentTmpl = template.Must(template.New("segments").Funcs(tmplFuncs).Parse(`
+{{range .Segments}}
+<div class="seg">
+  <span class="seg-time">[{{timestamp .Start}} &#8594; {{timestamp .End}}]</span>
+  {{if .Speaker}}<span class="seg-speaker">{{derefStr .Speaker}}</span>{{end}}
+  <span class="seg-text">{{.Text}}</span>
+</div>
+{{end}}
+{{if .HasMore}}
+<button class="btn load-more" hx-get="/track/segments?id={{.IDQuery}}&offset={{.NextOffset}}"
+        hx-swap="outerHTML" hx-target="this">load more</button>
+{{end}}
 `))
 
 // ─── Track detail fragment ───────────────────────────────────────────────────
@@ -514,15 +587,19 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
 
 {{if .Detail.HasTranscript}}
   <div class="section">
-    <div class="section-title">Transcript ({{commafy (len .Detail.Segments)}} segment{{if ne (len .Detail.Segments) 1}}s{{end}})</div>
-    {{if .Detail.Segments}}
+    <div class="section-title">Transcript ({{commafy .TotalSegments}} segment{{if ne .TotalSegments 1}}s{{end}})</div>
+    {{if .PageSegments}}
     <div class="reader">
-      {{range .Detail.Segments}}
+      {{range .PageSegments}}
       <div class="seg">
         <span class="seg-time">[{{timestamp .Start}} &#8594; {{timestamp .End}}]</span>
         {{if .Speaker}}<span class="seg-speaker">{{derefStr .Speaker}}</span>{{end}}
         <span class="seg-text">{{.Text}}</span>
       </div>
+      {{end}}
+      {{if .HasMore}}
+      <button class="btn load-more" hx-get="/track/segments?id={{.IDQuery}}&offset={{.NextOffset}}"
+              hx-swap="outerHTML" hx-target="this">load more ({{commafy (sub .TotalSegments .NextOffset)}} remaining)</button>
       {{end}}
     </div>
     {{else}}<p class="lib-empty">Transcript has no segments.</p>{{end}}
@@ -637,6 +714,11 @@ type failedData struct {
 	Jobs []db.FailedJob
 }
 
+type bookSearchData struct {
+	Query   string
+	Results []db.SearchResultWithMetadata
+}
+
 type trackData struct {
 	Detail  *db.TrackDetail
 	Title   string
@@ -645,6 +727,23 @@ type trackData struct {
 	// DurationPtr adapts the non-pointer Detail.DurationSeconds to the *float64
 	// the durTime helper expects (nil → em dash when no transcript).
 	DurationPtr *float64
+
+	// Transcript reader pagination (P7): the first page of segments plus a "load
+	// more" affordance when there are more than segmentPageSize total.
+	TotalSegments int
+	PageSegments  []db.Segment
+	HasMore       bool
+	NextOffset    int
+	IDQuery       string // URL-escaped job id for the "load more" hx-get
+}
+
+// segmentsData backs the segment-page fragment (the htmx "load more" target):
+// one page of segments plus the link to the next page.
+type segmentsData struct {
+	Segments   []db.Segment
+	HasMore    bool
+	NextOffset int
+	IDQuery    string
 }
 
 // newStatusData derives the unified pipeline state from the pause flag and the
@@ -1062,6 +1161,47 @@ func (s *MCPServer) renderBookFragment(w http.ResponseWriter, r *http.Request, d
 	}
 }
 
+// ─── Per-book search handler ─────────────────────────────────────────────────
+
+// bookSearchLimit caps the per-book search result count.
+const bookSearchLimit = 50
+
+// handleBookSearch runs a trigram text search scoped to one book and renders the
+// matching chunk rows (POST /search/book?dir=…, q in the form or query). It's a
+// read, but accepts POST (htmx form submit) as well as GET; both are fine since
+// it only queries. The dir comes from the query string; q from the form (POST)
+// or query (GET).
+func (s *MCPServer) handleBookSearch(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		http.Error(w, "missing dir", http.StatusBadRequest)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	// r.Form merges query + POST body params, so this works for GET and POST.
+	query := strings.TrimSpace(r.Form.Get("q"))
+
+	var results []db.SearchResultWithMetadata
+	if query != "" {
+		var err error
+		results, err = s.db.TextSearchInBook(r.Context(), dir, query, bookSearchLimit)
+		if err != nil {
+			s.logger.Error("TextSearchInBook error", "dir", dir, "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := bookSearchFragmentTmpl.Execute(w, bookSearchData{Query: query, Results: results}); err != nil {
+		s.logger.Error("book search render error", "error", err)
+	}
+}
+
 // ─── Track detail handlers ───────────────────────────────────────────────────
 
 func (s *MCPServer) handleTrackPage(w http.ResponseWriter, r *http.Request) {
@@ -1098,18 +1238,75 @@ func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bookDir := path.Dir(detail.FilePath)
-	d := trackData{Detail: detail, BackDir: url.QueryEscape(bookDir)}
+	d := trackData{Detail: detail, BackDir: url.QueryEscape(bookDir), IDQuery: url.QueryEscape(id)}
 	d.Author, d.Title = s.resolver.Resolve(bookDir, detail.FilePath)
 	if detail.HasTranscript {
 		dur := detail.DurationSeconds
 		d.DurationPtr = &dur
 	}
 
+	// Transcript reader pagination (P7): render only the first page of segments;
+	// the rest load on demand via the htmx "load more" button.
+	d.TotalSegments = len(detail.Segments)
+	page, hasMore, next := paginateSegments(detail.Segments, 0)
+	d.PageSegments, d.HasMore, d.NextOffset = page, hasMore, next
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := trackFragmentTmpl.Execute(w, d); err != nil {
 		s.logger.Error("track fragment render error", "error", err)
 	}
+}
+
+// handleTrackSegments serves one page of the transcript reader (the htmx "load
+// more" target): segments [offset, offset+segmentPageSize) for the given job.
+func (s *MCPServer) handleTrackSegments(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+
+	detail, err := s.db.GetTrackDetail(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "no such track", http.StatusNotFound)
+			return
+		}
+		s.logger.Error("GetTrackDetail (segments) error", "id", id, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	page, hasMore, next := paginateSegments(detail.Segments, offset)
+	data := segmentsData{Segments: page, HasMore: hasMore, NextOffset: next, IDQuery: url.QueryEscape(id)}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := segmentsFragmentTmpl.Execute(w, data); err != nil {
+		s.logger.Error("segments fragment render error", "error", err)
+	}
+}
+
+// paginateSegments returns the page of segments starting at offset (size
+// segmentPageSize), whether more remain after it, and the next offset. A
+// negative or out-of-range offset is clamped to the valid range.
+func paginateSegments(segs []db.Segment, offset int) (page []db.Segment, hasMore bool, next int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(segs) {
+		offset = len(segs)
+	}
+	end := offset + segmentPageSize
+	if end > len(segs) {
+		end = len(segs)
+	}
+	return segs[offset:end], end < len(segs), end
 }
 
 // ─── Failed jobs view ────────────────────────────────────────────────────────

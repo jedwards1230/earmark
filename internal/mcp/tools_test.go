@@ -28,6 +28,10 @@ func (m *MockDBInterface) TextSearch(ctx context.Context, query string, limit in
 	return args.Get(0).([]db.SearchResultWithMetadata), args.Error(1)
 }
 
+func (m *MockDBInterface) TextSearchInBook(_ context.Context, _, _ string, _ int) ([]db.SearchResultWithMetadata, error) {
+	return nil, nil
+}
+
 func (m *MockDBInterface) GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error) {
 	args := m.Called(ctx)
 	return args.Get(0).([]db.HierarchicalEntry), args.Error(1)
