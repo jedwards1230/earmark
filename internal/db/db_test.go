@@ -900,6 +900,97 @@ func TestLikePrefix(t *testing.T) {
 	}
 }
 
+// TestSearchInBookEscapesMetacharactersInDir verifies that searchInBook correctly
+// escapes LIKE metacharacters in the dir prefix so a book whose name contains %
+// or _ does not over-match tracks from other books. The test drives the inner
+// searchInBook function against a mock pool and asserts that the prefix argument
+// is the LIKE-escaped form (e.g. "\%_title/%" → "\\%\_title/%"), not the raw
+// dir. It also verifies that the SQL carries the explicit ESCAPE '\' clause so
+// the escaping is unambiguous regardless of server configuration.
+func TestSearchInBookEscapesMetacharactersInDir(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	// Dir whose name contains both % and _ — without escaping these would act as
+	// LIKE wildcards and could match sibling directories.
+	dir := `/books/audio-libation/Andy Weir/100%_Winner`
+	// likePrefix escapes \, % and _ in order; the expected prefix is:
+	//   /books/audio-libation/Andy Weir/100\%\_Winner/%
+	escapedDir := `/books/audio-libation/Andy Weir/100\%\_Winner`
+	wantPrefix := escapedDir + "/%"
+
+	vec := make([]float32, 768)
+	vec[0] = 0.5
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("c1", "the passage", dir+"/01.m4b", 1, 0.0, 5.0, nil, 0.75, 3)
+
+	// The mock expectation uses the ESCAPED prefix — if the handler passes the raw
+	// dir the args won't match and ExpectationsWereMet will fail.
+	mock.ExpectQuery(searchInBookSQL).
+		WithArgs(pgvector.NewVector(vec), 5, wantPrefix, 0.0).
+		WillReturnRows(rows)
+
+	got, err := db.searchInBook(context.Background(), mock, vec, dir, 5, 0.0)
+	if err != nil {
+		t.Fatalf("searchInBook: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet mock expectations (prefix not escaped?): %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+
+	// The SQL must carry an explicit ESCAPE clause so the backslash escape is
+	// honoured unconditionally (independent of standard_conforming_strings).
+	if !strings.Contains(searchInBookSQL, `ESCAPE '\'`) {
+		t.Error("searchInBookSQL missing ESCAPE '\\' clause")
+	}
+}
+
+// TestTextSearchInBookEscapesMetacharactersInDir mirrors the semantic-search
+// test for textSearchInBook: a dir containing % and _ must be escaped before use
+// in the LIKE predicate, and the SQL must carry an explicit ESCAPE clause.
+func TestTextSearchInBookEscapesMetacharactersInDir(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	dir := `/books/audio-libation/Science_% Authors/Basics`
+	wantPrefix := `/books/audio-libation/Science\_\% Authors/Basics` + "/%"
+
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("c2", "chapter text", dir+"/ch1.mp3", 0, 0.0, 10.0, nil, 0.6, 5)
+
+	mock.ExpectQuery(textSearchInBookSQL).
+		WithArgs("basics", 10, wantPrefix).
+		WillReturnRows(rows)
+
+	got, err := db.textSearchInBook(context.Background(), mock, dir, "basics", 10)
+	if err != nil {
+		t.Fatalf("textSearchInBook: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet mock expectations (prefix not escaped?): %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+
+	if !strings.Contains(textSearchInBookSQL, `ESCAPE '\'`) {
+		t.Error("textSearchInBookSQL missing ESCAPE '\\' clause")
+	}
+}
+
 func TestComputeFileChecksum_DifferentFiles(t *testing.T) {
 	dir := t.TempDir()
 	f1 := filepath.Join(dir, "a.bin")

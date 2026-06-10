@@ -83,6 +83,22 @@ func NewToolHandlers(database DBInterface, resolver *library.Resolver) *ToolHand
 	}
 }
 
+// clampLimit returns def if limit is outside [1, 1000], otherwise returns limit.
+// It also clamps negative offsets to 0.
+func clampLimit(limit, def int) int {
+	if limit < 1 || limit > 1000 {
+		return def
+	}
+	return limit
+}
+
+func clampOffset(offset int) int {
+	if offset < 0 {
+		return 0
+	}
+	return offset
+}
+
 // handleSemanticSearch performs semantic search on audiobook transcriptions,
 // over the whole library by default or scoped to one book when `book` is given.
 func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -94,7 +110,7 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 
 	// Extract optional parameters with defaults
 	threshold := request.GetFloat("threshold", 0.3)
-	limit := request.GetInt("limit", 10)
+	limit := clampLimit(request.GetInt("limit", 10), 10)
 	book := strings.TrimSpace(request.GetString("book", ""))
 
 	// Scoped: resolve `book` → a canonical dir, then run an exact (non-HNSW)
@@ -136,7 +152,7 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 	}
 
 	// Extract optional parameters
-	limit := request.GetInt("limit", 10)
+	limit := clampLimit(request.GetInt("limit", 10), 10)
 	book := strings.TrimSpace(request.GetString("book", ""))
 
 	// Scoped: resolve `book` → a canonical dir and reuse the per-book text search.
@@ -227,8 +243,8 @@ func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string,
 // handleListBooks returns the library inventory: each book with author, title,
 // track progress, duration, word count, and chunk count.
 func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	limit := request.GetInt("limit", 50)
-	offset := request.GetInt("offset", 0)
+	limit := clampLimit(request.GetInt("limit", 50), 50)
+	offset := clampOffset(request.GetInt("offset", 0))
 	author := strings.TrimSpace(request.GetString("author", ""))
 
 	h.logger.Info("Listing books", "limit", limit, "offset", offset, "author", author)
@@ -249,8 +265,8 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 // has multiple tracks), then returns timestamped segments with offset/limit
 // pagination.
 func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	offset := request.GetInt("offset", 0)
-	limit := request.GetInt("limit", 50)
+	offset := clampOffset(request.GetInt("offset", 0))
+	limit := clampLimit(request.GetInt("limit", 50), 50)
 
 	// Two ways in: an explicit track/job id, or a `book` to resolve.
 	trackID := strings.TrimSpace(request.GetString("trackID", ""))

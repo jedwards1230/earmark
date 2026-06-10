@@ -782,6 +782,115 @@ func TestHandleGetTranscriptByTrackID(t *testing.T) {
 	mockDB.AssertExpectations(t)
 }
 
+// TestClampHelpers verifies the clampLimit and clampOffset helpers directly.
+func TestClampHelpers(t *testing.T) {
+	// clampLimit: values in [1,1000] pass through; outside → default.
+	if got := clampLimit(10, 50); got != 10 {
+		t.Errorf("clampLimit(10, 50) = %d, want 10", got)
+	}
+	if got := clampLimit(1000, 50); got != 1000 {
+		t.Errorf("clampLimit(1000, 50) = %d, want 1000", got)
+	}
+	if got := clampLimit(0, 50); got != 50 {
+		t.Errorf("clampLimit(0, 50) = %d, want 50 (reset to default)", got)
+	}
+	if got := clampLimit(1001, 50); got != 50 {
+		t.Errorf("clampLimit(1001, 50) = %d, want 50 (reset to default)", got)
+	}
+	if got := clampLimit(-1, 50); got != 50 {
+		t.Errorf("clampLimit(-1, 50) = %d, want 50 (reset to default)", got)
+	}
+
+	// clampOffset: negative → 0; non-negative passes through.
+	if got := clampOffset(0); got != 0 {
+		t.Errorf("clampOffset(0) = %d, want 0", got)
+	}
+	if got := clampOffset(100); got != 100 {
+		t.Errorf("clampOffset(100) = %d, want 100", got)
+	}
+	if got := clampOffset(-1); got != 0 {
+		t.Errorf("clampOffset(-1) = %d, want 0", got)
+	}
+}
+
+// TestHandleListBooksLimitClamping asserts that out-of-range limit/offset values
+// are clamped to safe defaults before the DB query is issued.
+func TestHandleListBooksLimitClamping(t *testing.T) {
+	cases := []struct {
+		name       string
+		args       map[string]interface{}
+		wantFilter db.BookFilter
+	}{
+		{
+			name:       "huge limit clamped to default 50",
+			args:       map[string]interface{}{"limit": 999999999.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 50, Offset: 0},
+		},
+		{
+			name:       "zero limit clamped to default 50",
+			args:       map[string]interface{}{"limit": 0.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 50, Offset: 0},
+		},
+		{
+			name:       "negative offset clamped to 0",
+			args:       map[string]interface{}{"offset": -5.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 50, Offset: 0},
+		},
+		{
+			name:       "valid limit and offset pass through",
+			args:       map[string]interface{}{"limit": 20.0, "offset": 10.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 20, Offset: 10},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := &MockDBInterface{}
+			mockDB.On("GetBookSummaries", mock.Anything, tc.wantFilter).
+				Return([]db.BookSummary{}, 0, nil).Once()
+
+			h := NewToolHandlers(mockDB, resolverForTest())
+			res, err := h.handleListBooks(context.Background(), req("list_books", tc.args))
+			assert.NoError(t, err)
+			assert.False(t, res.IsError)
+			mockDB.AssertExpectations(t)
+		})
+	}
+}
+
+// TestHandleSemanticSearchLimitClamping asserts that out-of-range limit is
+// clamped to the search default (10) before the DB query.
+func TestHandleSemanticSearchLimitClamping(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	// Limit 999999 should be clamped to default 10.
+	mockDB.On("Search", mock.Anything, "dragons", 10, 0.3).
+		Return([]db.SearchResultWithMetadata{}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
+		"query": "dragons", "limit": 999999.0,
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleTextSearchLimitClamping asserts that an out-of-range limit is
+// clamped to the text-search default (10).
+func TestHandleTextSearchLimitClamping(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	mockDB.On("TextSearch", mock.Anything, "spice", 10).
+		Return([]db.SearchResultWithMetadata{}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
+		"query": "spice", "limit": -5.0,
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	mockDB.AssertExpectations(t)
+}
+
 // TestHandleGetTranscriptNotTranscribed asserts a pending track (no transcript)
 // returns a clear error instead of an empty body.
 func TestHandleGetTranscriptNotTranscribed(t *testing.T) {

@@ -717,7 +717,7 @@ var searchInBookSQL = `
 		1 - (c.embedding <=> $1) AS similarity,
 		(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
 	FROM transcript_chunks c
-	WHERE c.file_path LIKE $3
+	WHERE c.file_path LIKE $3 ESCAPE '\'
 	  AND ($4 = 0 OR 1 - (c.embedding <=> $1) >= $4)
 	ORDER BY c.embedding <=> $1
 	LIMIT $2
@@ -842,7 +842,7 @@ var textSearchInBookSQL = `
 		similarity(c.text, $1) AS similarity,
 		(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
 	FROM transcript_chunks c
-	WHERE c.file_path LIKE $3
+	WHERE c.file_path LIKE $3 ESCAPE '\'
 	  AND (c.text % $1 OR c.text ILIKE '%' || $1 || '%')
 	ORDER BY similarity(c.text, $1) DESC, c.chunk_index ASC
 	LIMIT $2
