@@ -330,8 +330,13 @@ Rules:
 - **Token mapping (embed worker):** `embed_total_tokens` is the **authoritative**
   count — the Go service tokenizes the embedded chunk texts locally with the same
   tokenizer the chunker uses, because Ollama does not reliably populate `usage`
-  for embeddings. `embed_prompt_tokens` stores the provider-reported
-  `usage.prompt_tokens` only when non-zero, and is left NULL otherwise.
+  for embeddings. It is written **only when every chunk tokenizes successfully**;
+  if any chunk fails to tokenize the column is left **NULL = unknown** (a partial
+  sum is never stored, since it would be indistinguishable from a complete count),
+  and the worker logs a warning naming the failed-chunk count. Consumers must
+  treat NULL as "unknown", not zero. `embed_prompt_tokens` stores the
+  provider-reported `usage.prompt_tokens` only when non-zero, and is left NULL
+  otherwise.
 - `chunked` / `n_windows` describe the runner's chunked-vs-single-pass inference
   (driven by `ASR_CHUNK_THRESHOLD_SECONDS`, §2.4), not the Go embed chunking.
 

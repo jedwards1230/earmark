@@ -45,21 +45,23 @@ func TestDBTypesCompile(t *testing.T) {
 }
 
 // TestEmbedMetricsFields ensures the embed worker's run_metrics slice carries
-// the expected fields, with PromptTokens nullable (Ollama omits provider usage)
-// and TotalTokens the authoritative local count.
+// the expected fields, with both PromptTokens (Ollama omits provider usage) and
+// TotalTokens nullable — TotalTokens is the authoritative local count but goes
+// NULL when a chunk fails to tokenize.
 func TestEmbedMetricsFields(t *testing.T) {
 	prompt := 7
+	total := 321
 	m := EmbedMetrics{
 		JobID:        "job-uuid",
 		Model:        "nomic-embed-text",
 		ChunkCount:   4,
 		PromptTokens: &prompt,
-		TotalTokens:  321,
+		TotalTokens:  &total,
 	}
 	if m.PromptTokens == nil || *m.PromptTokens != 7 {
 		t.Errorf("PromptTokens mismatch")
 	}
-	if m.TotalTokens != 321 {
+	if m.TotalTokens == nil || *m.TotalTokens != 321 {
 		t.Errorf("TotalTokens mismatch")
 	}
 
@@ -67,6 +69,12 @@ func TestEmbedMetricsFields(t *testing.T) {
 	m.PromptTokens = nil
 	if m.PromptTokens != nil {
 		t.Errorf("expected nil-able PromptTokens")
+	}
+
+	// TotalTokens must be allowed to be nil (unknown — a chunk failed to tokenize).
+	m.TotalTokens = nil
+	if m.TotalTokens != nil {
+		t.Errorf("expected nil-able TotalTokens")
 	}
 }
 

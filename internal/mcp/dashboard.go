@@ -563,16 +563,26 @@ func humanizeSince(d time.Duration) string {
 }
 
 // humanizeSeconds renders a non-negative duration in seconds as a compact
-// "1h2m", "3m4s", or "5s" string for the per-run processing-time column.
+// "1h1m2s", "3m4s", or "5s" string for the per-run processing-time column.
+//
+// The input is rounded to whole seconds (deliberate — sub-second precision is
+// noise for a processing-time column), then decomposed from the total so no
+// component is silently dropped: e.g. 3661.5s → "1h1m2s" (1h, 1m, 2s after
+// rounding), not "1h1m". Zero-valued leading components are omitted; for the
+// h/m branches the trailing seconds are kept even when zero ("1h0m0s") so the
+// breakdown is unambiguous.
 func humanizeSeconds(secs float64) string {
-	d := time.Duration(secs * float64(time.Second))
+	total := int64(secs + 0.5) // round to whole seconds
+	h := total / 3600
+	m := (total % 3600) / 60
+	s := total % 60
 	switch {
-	case d >= time.Hour:
-		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
-	case d >= time.Minute:
-		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	case h > 0:
+		return fmt.Sprintf("%dh%dm%ds", h, m, s)
+	case m > 0:
+		return fmt.Sprintf("%dm%ds", m, s)
 	default:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
+		return fmt.Sprintf("%ds", s)
 	}
 }
 

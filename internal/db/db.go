@@ -586,7 +586,7 @@ type EmbedMetrics struct {
 	Model        string
 	ChunkCount   int
 	PromptTokens *int // provider-reported; nil when Ollama leaves usage zeroed
-	TotalTokens  int  // authoritative local tokenizer count
+	TotalTokens  *int // authoritative local tokenizer count; nil (NULL) when unknown — a chunk failed to tokenize
 }
 
 // UpsertAudioBytes records the audio file size for a job (the monitor's slice of
@@ -613,9 +613,11 @@ func (db *DB) UpsertAudioBytes(ctx context.Context, jobID string, bytes int64) e
 // runner's transcription columns on the same row.
 //
 // Token mapping (see CONTRACT §1.5): embed_total_tokens is the authoritative
-// local tokenizer count summed across the embedded chunk texts; embed_prompt_tokens
-// is the provider-reported usage, stored only when non-zero (Ollama frequently
-// leaves it at 0), nullable otherwise.
+// local tokenizer count summed across the embedded chunk texts — but NULL
+// (m.TotalTokens == nil) when any chunk failed to tokenize, so a partial count is
+// never stored as if it were complete; embed_prompt_tokens is the
+// provider-reported usage, stored only when non-zero (Ollama frequently leaves it
+// at 0), nullable otherwise.
 func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO run_metrics
@@ -977,6 +979,7 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		         FILTER (WHERE transcribe_started_at IS NOT NULL
 		                   AND transcribe_finished_at IS NOT NULL),
 		       SUM(embed_total_tokens)
+		         FILTER (WHERE embed_finished_at IS NOT NULL)
 		FROM run_metrics
 	`).Scan(&q.AvgProcessingSeconds, &q.TotalEmbedTokens); err != nil {
 		return nil, fmt.Errorf("run_metrics aggregates: %w", err)

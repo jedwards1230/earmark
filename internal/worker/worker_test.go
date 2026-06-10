@@ -129,7 +129,8 @@ func TestProcessTranscript_RecordsEmbedMetrics(t *testing.T) {
 	require.Equal(t, "job-metrics", m.JobID)
 	require.Equal(t, "nomic-embed-text", m.Model)
 	require.Equal(t, len(fdb.chunks), m.ChunkCount)
-	require.Greater(t, m.TotalTokens, 0, "local token count must be authoritative and non-zero")
+	require.NotNil(t, m.TotalTokens, "all chunks tokenized → total is known (non-nil)")
+	require.Greater(t, *m.TotalTokens, 0, "local token count must be authoritative and non-zero")
 	require.Nil(t, m.PromptTokens, "no provider usage → prompt tokens nil")
 	require.False(t, m.FinishedAt.Before(m.StartedAt))
 }

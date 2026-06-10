@@ -198,7 +198,19 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 // the provider-reported value, stored only when non-zero (nullable otherwise).
 // Best-effort: a tokenizer or DB error is logged and swallowed.
 func (w *Worker) recordEmbedMetrics(t *db.Transcript, texts []string, usage openai.EmbeddingUsage, started, finished time.Time, chunkCount int, model string) {
-	total := localTokenCount(texts)
+	total, failed := localTokenCount(texts)
+
+	// If any chunk failed to tokenize, total is a partial sum indistinguishable
+	// from a complete count. Store NULL (unknown) rather than a misleading
+	// partial, and warn so the failure is visible.
+	var totalTokens *int
+	if failed > 0 {
+		w.log.Warn("embed_total_tokens unknown: chunk tokenization failed (storing NULL)",
+			"transcript_id", t.ID, "job_id", t.JobID,
+			"failed_chunks", failed, "total_chunks", len(texts))
+	} else {
+		totalTokens = &total
+	}
 
 	var promptTokens *int
 	if usage.PromptTokens > 0 {
@@ -213,7 +225,7 @@ func (w *Worker) recordEmbedMetrics(t *db.Transcript, texts []string, usage open
 		Model:        model,
 		ChunkCount:   chunkCount,
 		PromptTokens: promptTokens,
-		TotalTokens:  total,
+		TotalTokens:  totalTokens,
 	}
 	if err := w.db.UpsertEmbedMetrics(w.ctx, m); err != nil {
 		w.log.Warn("embed metrics write failed (continuing)",
@@ -222,20 +234,26 @@ func (w *Worker) recordEmbedMetrics(t *db.Transcript, texts []string, usage open
 }
 
 // localTokenCount sums the tokenizer's token count across the embedded chunk
-// texts. This is the authoritative embed_total_tokens — the same tokenizer the
-// chunker uses, so the count reflects exactly what was embedded regardless of
-// whether the provider reported usage. A per-text tokenizer error is skipped
-// (best-effort), so the total degrades gracefully rather than failing the embed.
-func localTokenCount(texts []string) int {
-	total := 0
+// texts and reports how many chunks failed to tokenize. This is the
+// authoritative embed_total_tokens — the same tokenizer the chunker uses, so the
+// count reflects exactly what was embedded regardless of whether the provider
+// reported usage.
+//
+// The returned count is only meaningful when failed == 0: if any chunk fails to
+// tokenize, the sum is partial and indistinguishable from a complete count, so
+// the caller MUST treat the total as unknown (store NULL) rather than persist a
+// misleading partial. The tokenization errors themselves never fail the embed —
+// the chunks are already embedded by this point; only the metric is degraded.
+func localTokenCount(texts []string) (total, failed int) {
 	for _, txt := range texts {
 		n, err := tokenizer.CountTokens(txt)
 		if err != nil {
+			failed++
 			continue
 		}
 		total += n
 	}
-	return total
+	return total, failed
 }
 
 // embedModel returns the configured embeddings model, falling back to the
