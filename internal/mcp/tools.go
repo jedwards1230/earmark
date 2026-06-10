@@ -41,6 +41,9 @@ type DBInterface interface {
 	GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error)
 	// GetBookTracks returns the individual track jobs for one book directory.
 	GetBookTracks(ctx context.Context, dir string) ([]db.RecentJob, error)
+	// GetTrackDetail returns the full per-track view (job + transcript + metrics +
+	// segments + chunks) for one job UUID (the /track page).
+	GetTrackDetail(ctx context.Context, jobID string) (*db.TrackDetail, error)
 	// RequeueByDir re-transcribes every track in one book directory (book page).
 	RequeueByDir(ctx context.Context, dir string) ([]string, error)
 	// GetFailedJobs returns failed jobs with full triage detail (failures view).

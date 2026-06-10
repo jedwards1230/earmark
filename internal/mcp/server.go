@@ -172,6 +172,8 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 // Routes:
 //
 //	GET  /                     — status dashboard (full HTML shell)
+//	GET  /track                — per-track detail page (shell)
+//	GET  /track/data           — per-track detail fragment (header + reader + chunks)
 //	GET  /status/data          — htmx-refreshed fragment (counts + recent jobs)
 //	GET  /static/htmx.min.js   — vendored htmx library
 //	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
@@ -202,6 +204,8 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/library/data", getOnly(s.handleLibraryData))
 	mux.HandleFunc("/book", getOnly(s.handleBookPage))
 	mux.HandleFunc("/book/data", getOnly(s.handleBookData))
+	mux.HandleFunc("/track", getOnly(s.handleTrackPage))
+	mux.HandleFunc("/track/data", getOnly(s.handleTrackData))
 	mux.HandleFunc("/failed", getOnly(s.handleFailedPage))
 	mux.HandleFunc("/failed/data", getOnly(s.handleFailedData))
 

@@ -529,6 +529,152 @@ func TestGetBookSummariesStatusFilter(t *testing.T) {
 	}
 }
 
+// trackDetailColumns are the 32 columns SELECTed by GetTrackDetail, in scan
+// order (job, has_transcript, transcript fields, run_metrics fields).
+var trackDetailColumns = []string{
+	"id", "file_path", "status", "updated_at", "error", "attempts", "claimed_by",
+	"has_transcript",
+	"language", "duration_seconds", "speaker_count", "model_name", "created_at", "segments",
+	"audio_bytes", "audio_channels", "audio_sample_rate", "audio_codec", "audio_format",
+	"processing_seconds",
+	"asr_model", "compute_type", "runner_host", "chunked", "n_windows",
+	"char_count", "word_count", "segment_count",
+	"embed_model", "embed_chunk_count", "embed_prompt_tokens", "embed_total_tokens",
+}
+
+var trackChunkColumns = []string{"chunk_index", "start_sec", "end_sec", "char_count", "speaker"}
+
+// TestGetTrackDetailWithTranscript drives getTrackDetail at execution level: a
+// done track with a transcript (segments JSON unmarshalled), populated
+// run_metrics, and two chunks. It asserts the segments parse, the chunk follow-
+// up query runs, and HasTranscript is true.
+func TestGetTrackDetailWithTranscript(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	jobID := "11111111-1111-1111-1111-111111111111"
+	lang := "en"
+	dur := 1830.0
+	spkCount := 1
+	model := "large-v3"
+	segs := []byte(`[{"id":0,"start":0.0,"end":4.2,"text":"Hello.","speaker":"SPEAKER_00","words":[]}]`)
+	bytesN := int64(48300000)
+	ch, rate := 2, 44100
+	codec, format := "aac", "m4b"
+	proc := 95.5
+	asr, compute, host := "large-v3", "bfloat16", "asr-runner-1"
+	chunkedF := false
+	words, chars, segCount := 14200, 84000, 1
+	embModel := "nomic-embed-text"
+	embChunks, embTotal := 36, 18240
+
+	row := pgxmock.NewRows(trackDetailColumns).AddRow(
+		jobID, "/books/audio-libation/A/B/01.m4b", "done", now, nil, 1, nil,
+		true,
+		&lang, &dur, &spkCount, &model, &now, segs,
+		&bytesN, &ch, &rate, &codec, &format,
+		&proc,
+		&asr, &compute, &host, &chunkedF, (*int)(nil),
+		&chars, &words, &segCount,
+		&embModel, &embChunks, (*int)(nil), &embTotal,
+	)
+	mock.ExpectQuery(trackDetailSQL).WithArgs(jobID).WillReturnRows(row)
+
+	spk := "SPEAKER_00"
+	chunkRows := pgxmock.NewRows(trackChunkColumns).
+		AddRow(0, 0.0, 90.4, 512, &spk).
+		AddRow(1, 88.1, 182.7, 498, &spk)
+	mock.ExpectQuery(trackChunksSQL).WithArgs(jobID).WillReturnRows(chunkRows)
+
+	got, err := db.getTrackDetail(context.Background(), mock, jobID)
+	if err != nil {
+		t.Fatalf("getTrackDetail: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+
+	if !got.HasTranscript {
+		t.Error("HasTranscript = false, want true")
+	}
+	if got.Language != "en" || got.DurationSeconds != dur || got.ModelName != "large-v3" {
+		t.Errorf("transcript fields wrong: lang=%q dur=%v model=%q", got.Language, got.DurationSeconds, got.ModelName)
+	}
+	if len(got.Segments) != 1 || got.Segments[0].Text != "Hello." {
+		t.Errorf("segments = %+v, want 1 segment 'Hello.'", got.Segments)
+	}
+	if got.AudioCodec == nil || *got.AudioCodec != "aac" {
+		t.Errorf("AudioCodec = %v, want aac", got.AudioCodec)
+	}
+	if got.EmbedTotalTokens == nil || *got.EmbedTotalTokens != embTotal {
+		t.Errorf("EmbedTotalTokens = %v, want %d", got.EmbedTotalTokens, embTotal)
+	}
+	if got.NWindows != nil {
+		t.Errorf("NWindows = %v, want nil (NULL)", got.NWindows)
+	}
+	if len(got.Chunks) != 2 || got.Chunks[1].CharCount != 498 {
+		t.Errorf("chunks = %+v, want 2 chunks (2nd char_count 498)", got.Chunks)
+	}
+}
+
+// TestGetTrackDetailNoTranscript drives the pending-track path: has_transcript
+// false, all transcript/metric columns NULL, no chunks. The handler renders a
+// "not transcribed yet" state for this — here we assert HasTranscript is false
+// and the metric pointers stay nil.
+func TestGetTrackDetailNoTranscript(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	jobID := "22222222-2222-2222-2222-222222222222"
+
+	row := pgxmock.NewRows(trackDetailColumns).AddRow(
+		jobID, "/books/audio-libation/A/B/02.m4b", "pending", now, nil, 0, nil,
+		false,
+		(*string)(nil), (*float64)(nil), (*int)(nil), (*string)(nil), (*time.Time)(nil), ([]byte)(nil),
+		(*int64)(nil), (*int)(nil), (*int)(nil), (*string)(nil), (*string)(nil),
+		(*float64)(nil),
+		(*string)(nil), (*string)(nil), (*string)(nil), (*bool)(nil), (*int)(nil),
+		(*int)(nil), (*int)(nil), (*int)(nil),
+		(*string)(nil), (*int)(nil), (*int)(nil), (*int)(nil),
+	)
+	mock.ExpectQuery(trackDetailSQL).WithArgs(jobID).WillReturnRows(row)
+	// No chunks for a pending track.
+	mock.ExpectQuery(trackChunksSQL).WithArgs(jobID).WillReturnRows(pgxmock.NewRows(trackChunkColumns))
+
+	got, err := db.getTrackDetail(context.Background(), mock, jobID)
+	if err != nil {
+		t.Fatalf("getTrackDetail: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+
+	if got.HasTranscript {
+		t.Error("HasTranscript = true, want false for pending track")
+	}
+	if got.Status != "pending" {
+		t.Errorf("Status = %q, want pending", got.Status)
+	}
+	if got.AudioCodec != nil || got.EmbedTotalTokens != nil || got.ProcessingSeconds != nil {
+		t.Error("metric pointers should be nil for a no-run_metrics pending track")
+	}
+	if len(got.Segments) != 0 || len(got.Chunks) != 0 {
+		t.Errorf("pending track should have no segments/chunks, got %d/%d", len(got.Segments), len(got.Chunks))
+	}
+}
+
 func TestComputeFileChecksum_DifferentFiles(t *testing.T) {
 	dir := t.TempDir()
 	f1 := filepath.Join(dir, "a.bin")

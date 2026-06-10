@@ -285,6 +285,119 @@ func TestBookFragmentRendersDetailAndEmDash(t *testing.T) {
 	}
 }
 
+// TestTrackFragmentRendersDetail renders trackFragmentTmpl for a done track with
+// transcript + chunks and asserts the 3 panels, the timestamped reader (mm:ss),
+// and the chunk list all appear, plus the back-to-book link.
+func TestTrackFragmentRendersDetail(t *testing.T) {
+	spk := "SPEAKER_00"
+	codec := "aac"
+	channels := 2
+	bytesN := int64(48300000)
+	tot := 18240
+	dur := 1830.0
+	d := trackData{
+		Title: "B", Author: "A", BackDir: "/books/audio-libation/A/B", DurationPtr: &dur,
+		Detail: &db.TrackDetail{
+			ID: "t1", FilePath: "/books/audio-libation/A/B/01.m4b", Status: "done",
+			UpdatedAt: time.Now(), HasTranscript: true, Language: "en", DurationSeconds: dur,
+			ModelName:  "large-v3",
+			AudioCodec: &codec, AudioChannels: &channels, AudioBytes: &bytesN, EmbedTotalTokens: &tot,
+			Segments: []db.Segment{
+				{ID: 0, Start: 0, End: 4.2, Text: "Chapter one.", Speaker: &spk},
+				{ID: 1, Start: 4.2, End: 9.8, Text: "She waited.", Speaker: &spk},
+			},
+			Chunks: []db.ChunkRow{{ChunkIndex: 0, StartSec: 0, EndSec: 90.4, CharCount: 512, Speaker: &spk}},
+		},
+	}
+	var buf bytes.Buffer
+	if err := trackFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"href=\"/book?dir=",                         // back-to-book link
+		">Audio<", ">Transcription<", ">Embedding<", // 3 panels
+		"large-v3",              // model
+		"18,240",                // total tokens
+		"[00:00 &#8594; 00:04]", // reader timestamp (mm:ss)
+		"Chapter one.",          // segment text
+		"Time range",            // chunk table header
+		"01:30",                 // chunk end 90.4s → 1m30s → "01:30"
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in track fragment:\n%s", want, out)
+		}
+	}
+}
+
+// TestTrackFragmentNotTranscribedYet renders the pending-track path: no
+// transcript → the graceful "not transcribed yet" state plus em-dashes in the
+// panels, and no reader/chunk-table.
+func TestTrackFragmentNotTranscribedYet(t *testing.T) {
+	d := trackData{
+		Title: "B", Author: "A", BackDir: "/books/audio-libation/A/B",
+		Detail: &db.TrackDetail{
+			ID: "t2", FilePath: "/books/audio-libation/A/B/02.m4b", Status: "pending",
+			UpdatedAt: time.Now(), HasTranscript: false,
+		},
+	}
+	var buf bytes.Buffer
+	if err := trackFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Not transcribed yet") {
+		t.Errorf("expected graceful 'Not transcribed yet' state:\n%s", out)
+	}
+	if !strings.Contains(out, "<dd>—</dd>") {
+		t.Error("expected em-dashes in the panels for a no-metrics pending track")
+	}
+	if strings.Contains(out, "seg-text") || strings.Contains(out, "Time range") {
+		t.Error("pending track must not render the reader or chunk table")
+	}
+}
+
+func TestTrackFragmentNotTranscribedYet_EmDashCount(t *testing.T) {
+	d := trackData{
+		Detail: &db.TrackDetail{ID: "t3", FilePath: "/a/b/c.m4b", Status: "claimed"},
+	}
+	var buf bytes.Buffer
+	if err := trackFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if n := strings.Count(buf.String(), "—"); n < 15 {
+		t.Errorf("expected many em-dashes for a no-data track, got %d", n)
+	}
+}
+
+func TestTimestamp(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{0, "00:00"}, {4.2, "00:04"}, {65, "01:05"}, {3661, "1:01:01"}, {-5, "00:00"},
+	}
+	for _, c := range cases {
+		if got := timestamp(c.in); got != c.want {
+			t.Errorf("timestamp(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestHumanizeBytes(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{512, "512 B"}, {1024, "1.0 KB"}, {1536, "1.5 KB"}, {48300000, "46.1 MB"},
+	}
+	for _, c := range cases {
+		if got := humanizeBytes(c.in); got != c.want {
+			t.Errorf("humanizeBytes(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestErrorRowIsExpandable(t *testing.T) {
 	evil := "Traceback line 1\n<script>alert(1)</script>\nRuntimeError: boom"
 	data := newStatusData(&db.QueueStats{TotalJobs: 1, Failed: 1}, []db.RecentJob{

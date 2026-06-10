@@ -726,6 +726,15 @@ type rowQuerier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
+// rowScanner extends rowQuerier with QueryRow, the slice needed by queries that
+// fetch a single row plus a follow-up list (e.g. GetTrackDetail). Both
+// *pgxpool.Pool and pgxmock.PgxPoolIface satisfy it, so the single-row + chunk
+// path is execution-testable with a mock pool.
+type rowScanner interface {
+	rowQuerier
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // TextSearch performs a trigram full-text search over transcript_chunks using
 // pg_trgm similarity so the GIN index on text (text_trgm_idx) is usable.
 //
@@ -1360,6 +1369,184 @@ func (db *DB) getBookTracks(ctx context.Context, q rowQuerier, dir string) ([]Re
 		return nil, fmt.Errorf("rows error (book tracks): %w", err)
 	}
 	return jobs, nil
+}
+
+// ─── Track detail (single-track page) ────────────────────────────────────────
+
+// ChunkRow is one transcript_chunks row, trimmed to what the track-detail chunk
+// list renders: ordinal, time range, and the text length (not the full text).
+type ChunkRow struct {
+	ChunkIndex int
+	StartSec   float64
+	EndSec     float64
+	CharCount  int     // len([]rune(text)) — characters, not bytes
+	Speaker    *string // dominant speaker, or nil
+}
+
+// TrackDetail is the full per-track view for the /track page: the job row plus
+// its (optional) transcript and (optional) run_metrics, the transcript's
+// segments (the timestamped reader), and its chunk list. HasTranscript is false
+// for a pending/claimed/failed track that has no transcripts row yet — the page
+// renders a "not transcribed yet" state in that case. Every transcript/metric
+// field is nullable because most rows have no run_metrics and pending tracks
+// have no transcript at all.
+type TrackDetail struct {
+	// Job (always present).
+	ID        string
+	FilePath  string
+	Status    string
+	UpdatedAt time.Time
+	Error     *string
+	Attempts  int
+	ClaimedBy *string
+
+	// Transcript (present only when HasTranscript).
+	HasTranscript   bool
+	Language        string
+	DurationSeconds float64
+	SpeakerCount    *int
+	ModelName       string
+	TranscriptAt    time.Time
+	Segments        []Segment
+
+	// run_metrics (all nullable — most rows have none).
+	AudioBytes        *int64
+	AudioChannels     *int
+	AudioSampleRate   *int
+	AudioCodec        *string
+	AudioFormat       *string
+	ProcessingSeconds *float64
+	ASRModel          *string
+	ComputeType       *string
+	RunnerHost        *string
+	Chunked           *bool
+	NWindows          *int
+	CharCount         *int
+	WordCount         *int
+	SegmentCount      *int
+	EmbedModel        *string
+	EmbedChunkCount   *int
+	EmbedPromptTokens *int
+	EmbedTotalTokens  *int
+
+	// Embedded chunks (empty until the worker embeds the transcript).
+	Chunks []ChunkRow
+}
+
+// trackDetailSQL fetches the job row plus its optional transcript and optional
+// run_metrics in one LEFT-JOINed row. `t.id IS NOT NULL` (aliased
+// has_transcript) tells the caller whether a transcript exists at all.
+var trackDetailSQL = `
+		SELECT j.id, j.file_path, j.status, j.updated_at, j.error, j.attempts, j.claimed_by,
+		       (t.id IS NOT NULL)         AS has_transcript,
+		       t.language, t.duration_seconds, t.speaker_count, t.model_name, t.created_at, t.segments,
+		       m.audio_bytes, m.audio_channels, m.audio_sample_rate, m.audio_codec, m.audio_format,
+		       EXTRACT(EPOCH FROM (m.transcribe_finished_at - m.transcribe_started_at)) AS processing_seconds,
+		       m.asr_model, m.compute_type, m.runner_host, m.chunked, m.n_windows,
+		       m.char_count, m.word_count, m.segment_count,
+		       m.embed_model, m.embed_chunk_count, m.embed_prompt_tokens, m.embed_total_tokens
+		FROM transcription_jobs j
+		LEFT JOIN transcripts  t ON t.job_id = j.id
+		LEFT JOIN run_metrics  m ON m.job_id = j.id
+		WHERE j.id = $1::uuid
+	`
+
+// GetTrackDetail returns the full per-track view for one job UUID: the job, its
+// optional transcript (with segments for the timestamped reader), its optional
+// run_metrics, and its embedded chunk list. Returns pgx.ErrNoRows if no job has
+// that id, which the handler maps to a 404.
+func (db *DB) GetTrackDetail(ctx context.Context, jobID string) (*TrackDetail, error) {
+	return db.getTrackDetail(ctx, db.pool, jobID)
+}
+
+// getTrackDetail is the querier-parameterized core of GetTrackDetail, split out
+// so the single-row + chunk-list path can be tested against a mock pool.
+func (db *DB) getTrackDetail(ctx context.Context, q rowScanner, jobID string) (*TrackDetail, error) {
+	var d TrackDetail
+	var (
+		hasTranscript   bool
+		language        *string
+		durationSeconds *float64
+		modelName       *string
+		transcriptAt    *time.Time
+		segJSON         []byte
+	)
+	err := q.QueryRow(ctx, trackDetailSQL, jobID).Scan(
+		&d.ID, &d.FilePath, &d.Status, &d.UpdatedAt, &d.Error, &d.Attempts, &d.ClaimedBy,
+		&hasTranscript,
+		&language, &durationSeconds, &d.SpeakerCount, &modelName, &transcriptAt, &segJSON,
+		&d.AudioBytes, &d.AudioChannels, &d.AudioSampleRate, &d.AudioCodec, &d.AudioFormat,
+		&d.ProcessingSeconds,
+		&d.ASRModel, &d.ComputeType, &d.RunnerHost, &d.Chunked, &d.NWindows,
+		&d.CharCount, &d.WordCount, &d.SegmentCount,
+		&d.EmbedModel, &d.EmbedChunkCount, &d.EmbedPromptTokens, &d.EmbedTotalTokens,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("track detail query: %w", err)
+	}
+
+	d.HasTranscript = hasTranscript
+	if hasTranscript {
+		if language != nil {
+			d.Language = *language
+		}
+		if durationSeconds != nil {
+			d.DurationSeconds = *durationSeconds
+		}
+		if modelName != nil {
+			d.ModelName = *modelName
+		}
+		if transcriptAt != nil {
+			d.TranscriptAt = *transcriptAt
+		}
+		if len(segJSON) > 0 {
+			if err := json.Unmarshal(segJSON, &d.Segments); err != nil {
+				return nil, fmt.Errorf("unmarshal segments: %w", err)
+			}
+		}
+	}
+
+	// Chunk list (empty until embedded). Keyed on the job's transcript; a missing
+	// transcript yields no rows.
+	chunks, err := db.getTrackChunks(ctx, q, jobID)
+	if err != nil {
+		return nil, err
+	}
+	d.Chunks = chunks
+	return &d, nil
+}
+
+// trackChunksSQL fetches a job's embedded chunks, trimmed to the ordinal /
+// time-range / char-length / speaker the chunk list shows.
+var trackChunksSQL = `
+		SELECT c.chunk_index, c.start_sec, c.end_sec,
+		       char_length(c.text) AS char_count, c.speaker
+		FROM transcript_chunks c
+		JOIN transcripts t ON t.id = c.transcript_id
+		WHERE t.job_id = $1::uuid
+		ORDER BY c.chunk_index
+	`
+
+// getTrackChunks returns the embedded chunks for a job's transcript.
+func (db *DB) getTrackChunks(ctx context.Context, q rowQuerier, jobID string) ([]ChunkRow, error) {
+	rows, err := q.Query(ctx, trackChunksSQL, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("track chunks query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ChunkRow
+	for rows.Next() {
+		var c ChunkRow
+		if err := rows.Scan(&c.ChunkIndex, &c.StartSec, &c.EndSec, &c.CharCount, &c.Speaker); err != nil {
+			return nil, fmt.Errorf("scan track chunk: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (track chunks): %w", err)
+	}
+	return out, nil
 }
 
 // ─── Checksum helper ─────────────────────────────────────────────────────────
