@@ -310,6 +310,41 @@ func (db *DB) initialize(ctx context.Context) error {
 		);
 		INSERT INTO runner_control (id, paused) VALUES (1, false)
 			ON CONFLICT (id) DO NOTHING;
+
+		-- run_metrics: per-run observability (CONTRACT §1.5). One row per job,
+		-- written by three independent writers that each UPSERT only their slice
+		-- of columns (all nullable) keyed on job_id:
+		--   Go monitor       — audio_bytes (file size at enqueue time)
+		--   Python runner     — audio probe (channels/sample_rate/codec/format) +
+		--                       transcription timing/model/counts
+		--   Go embed worker   — embedding timing/model/chunk count + token counts
+		-- ON DELETE CASCADE keeps the row's lifetime tied to the job.
+		CREATE TABLE IF NOT EXISTS run_metrics (
+			job_id              UUID        PRIMARY KEY REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+			audio_bytes         BIGINT,
+			audio_channels      INT,
+			audio_sample_rate   INT,
+			audio_codec         TEXT,
+			audio_format        TEXT,
+			transcribe_started_at  TIMESTAMPTZ,
+			transcribe_finished_at TIMESTAMPTZ,
+			asr_model           TEXT,
+			compute_type        TEXT,
+			runner_host         TEXT,
+			chunked             BOOLEAN,
+			n_windows           INT,
+			char_count          INT,
+			word_count          INT,
+			segment_count       INT,
+			embed_started_at    TIMESTAMPTZ,
+			embed_finished_at   TIMESTAMPTZ,
+			embed_model         TEXT,
+			embed_chunk_count   INT,
+			embed_prompt_tokens INT,
+			embed_total_tokens  INT,
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -533,6 +568,74 @@ func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 // GetEmbeddings delegates to the openai.Embeddings client.
 func (db *DB) GetEmbeddings(texts []string) ([][]float32, error) {
 	return db.e.GetEmbeddings(texts)
+}
+
+// GetEmbeddingsWithUsage delegates to the openai.Embeddings client, also
+// returning the provider-reported token usage (which Ollama may leave zeroed).
+func (db *DB) GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error) {
+	return db.e.GetEmbeddingsWithUsage(texts)
+}
+
+// ─── Run metrics (per-run observability, CONTRACT §1.5) ──────────────────────
+
+// EmbedMetrics is the embed worker's slice of run_metrics columns.
+type EmbedMetrics struct {
+	JobID        string
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	Model        string
+	ChunkCount   int
+	PromptTokens *int // provider-reported; nil when Ollama leaves usage zeroed
+	TotalTokens  int  // authoritative local tokenizer count
+}
+
+// UpsertAudioBytes records the audio file size for a job (the monitor's slice of
+// run_metrics). Best-effort: callers should log-and-continue on error so a
+// metrics write never fails enqueue. Only the audio_bytes column is touched, so
+// it never clobbers the runner's or embed worker's columns on the same row.
+func (db *DB) UpsertAudioBytes(ctx context.Context, jobID string, bytes int64) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO run_metrics (job_id, audio_bytes)
+		VALUES ($1, $2)
+		ON CONFLICT (job_id) DO UPDATE
+		SET audio_bytes = EXCLUDED.audio_bytes,
+		    updated_at  = now()
+	`, jobID, bytes)
+	if err != nil {
+		return fmt.Errorf("upsert audio_bytes: %w", err)
+	}
+	return nil
+}
+
+// UpsertEmbedMetrics records embedding timing, model, chunk count, and token
+// counts for a job (the embed worker's slice of run_metrics). Only the embed_*
+// columns are written, so it never clobbers the monitor's audio_bytes or the
+// runner's transcription columns on the same row.
+//
+// Token mapping (see CONTRACT §1.5): embed_total_tokens is the authoritative
+// local tokenizer count summed across the embedded chunk texts; embed_prompt_tokens
+// is the provider-reported usage, stored only when non-zero (Ollama frequently
+// leaves it at 0), nullable otherwise.
+func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO run_metrics
+		       (job_id, embed_started_at, embed_finished_at, embed_model,
+		        embed_chunk_count, embed_prompt_tokens, embed_total_tokens)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (job_id) DO UPDATE
+		SET embed_started_at    = EXCLUDED.embed_started_at,
+		    embed_finished_at   = EXCLUDED.embed_finished_at,
+		    embed_model         = EXCLUDED.embed_model,
+		    embed_chunk_count   = EXCLUDED.embed_chunk_count,
+		    embed_prompt_tokens = EXCLUDED.embed_prompt_tokens,
+		    embed_total_tokens  = EXCLUDED.embed_total_tokens,
+		    updated_at          = now()
+	`, m.JobID, m.StartedAt, m.FinishedAt, m.Model,
+		m.ChunkCount, m.PromptTokens, m.TotalTokens)
+	if err != nil {
+		return fmt.Errorf("upsert embed metrics: %w", err)
+	}
+	return nil
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
@@ -761,6 +864,13 @@ type QueueStats struct {
 	RunnerActive  bool
 	RunnerID      string     // claimed_by of the most-recently-updated claimed job
 	LastHeartbeat *time.Time // updated_at of that job
+
+	// Per-run aggregates (run_metrics). AvgProcessingSeconds is the mean
+	// transcription wall-clock over jobs the runner has timed; TotalEmbedTokens
+	// is the summed authoritative local token count over all embedded runs. Both
+	// are nil when no run_metrics rows carry the underlying data yet.
+	AvgProcessingSeconds *float64
+	TotalEmbedTokens     *int64
 }
 
 // GetServiceStatus returns a single aggregate snapshot used by the status
@@ -859,28 +969,56 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		q.LastHeartbeat = updatedAt
 	}
 
+	// Per-run aggregates from run_metrics. NULL-safe: AVG/SUM over zero matching
+	// rows return NULL, scanned into the nilable pointers (so the dashboard shows
+	// an em dash until the runner/worker have populated metrics).
+	if err := db.pool.QueryRow(ctx, `
+		SELECT AVG(EXTRACT(EPOCH FROM (transcribe_finished_at - transcribe_started_at)))
+		         FILTER (WHERE transcribe_started_at IS NOT NULL
+		                   AND transcribe_finished_at IS NOT NULL),
+		       SUM(embed_total_tokens)
+		FROM run_metrics
+	`).Scan(&q.AvgProcessingSeconds, &q.TotalEmbedTokens); err != nil {
+		return nil, fmt.Errorf("run_metrics aggregates: %w", err)
+	}
+
 	return q, nil
 }
 
 // RecentJob is a lightweight view of a transcription_jobs row for the recent-
-// activity table on the status dashboard.
+// activity table on the status dashboard. The Metrics-* fields are populated by
+// a LEFT JOIN on run_metrics and are nil when no metrics row exists yet (or for
+// callers that don't join, e.g. GetBookTracks).
 type RecentJob struct {
 	ID        string
 	FilePath  string
 	Status    string
 	UpdatedAt time.Time
 	Error     *string
+
+	// Per-run metrics (run_metrics LEFT JOIN; all nullable).
+	ProcessingSeconds *float64 // transcribe_finished_at - transcribe_started_at
+	Chunked           *bool
+	NWindows          *int
+	CharCount         *int
+	EmbedTotalTokens  *int
 }
 
-// GetRecentJobs returns the most-recently-updated jobs, newest first.
+// GetRecentJobs returns the most-recently-updated jobs, newest first. It
+// LEFT JOINs run_metrics to surface per-run observability (processing time,
+// chunked flag, window/char counts, embed tokens) — all nil when no metrics
+// row exists yet.
 func (db *DB) GetRecentJobs(ctx context.Context, limit int) ([]RecentJob, error) {
 	if limit <= 0 {
 		limit = 15
 	}
 	rows, err := db.pool.Query(ctx, `
-		SELECT id, file_path, status, updated_at, error
-		FROM transcription_jobs
-		ORDER BY updated_at DESC
+		SELECT j.id, j.file_path, j.status, j.updated_at, j.error,
+		       EXTRACT(EPOCH FROM (m.transcribe_finished_at - m.transcribe_started_at)) AS processing_seconds,
+		       m.chunked, m.n_windows, m.char_count, m.embed_total_tokens
+		FROM transcription_jobs j
+		LEFT JOIN run_metrics m ON m.job_id = j.id
+		ORDER BY j.updated_at DESC
 		LIMIT $1
 	`, limit)
 	if err != nil {
@@ -891,7 +1029,9 @@ func (db *DB) GetRecentJobs(ctx context.Context, limit int) ([]RecentJob, error)
 	var jobs []RecentJob
 	for rows.Next() {
 		var j RecentJob
-		if err := rows.Scan(&j.ID, &j.FilePath, &j.Status, &j.UpdatedAt, &j.Error); err != nil {
+		if err := rows.Scan(&j.ID, &j.FilePath, &j.Status, &j.UpdatedAt, &j.Error,
+			&j.ProcessingSeconds, &j.Chunked, &j.NWindows, &j.CharCount, &j.EmbedTotalTokens,
+		); err != nil {
 			return nil, fmt.Errorf("scan recent job: %w", err)
 		}
 		jobs = append(jobs, j)

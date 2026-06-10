@@ -53,6 +53,9 @@ type apiStatus struct {
 	RunnerActive  bool    `json:"runnerActive"`
 	RunnerID      string  `json:"runnerId,omitempty"`
 	LastHeartbeat *string `json:"lastHeartbeat,omitempty"`
+	// Per-run aggregates (run_metrics); null until the runner/worker populate them.
+	AvgProcessingSeconds *float64 `json:"avgProcessingSeconds"`
+	TotalEmbedTokens     *int64   `json:"totalEmbedTokens"`
 }
 
 // pauseState is the JSON shape of the pipeline pause endpoints.
@@ -119,6 +122,9 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		RunLimit:     stats.RunLimit,
 		RunnerActive: stats.RunnerActive,
 		RunnerID:     stats.RunnerID,
+
+		AvgProcessingSeconds: stats.AvgProcessingSeconds,
+		TotalEmbedTokens:     stats.TotalEmbedTokens,
 	}
 	if stats.LastHeartbeat != nil {
 		hb := stats.LastHeartbeat.UTC().Format("2006-01-02T15:04:05Z07:00")

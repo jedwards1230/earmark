@@ -290,6 +290,51 @@ runner) and is transactional:
   next poll (it selects transcripts with no chunks). Use after an embedding
   model or `CHUNK_SIZE` change — no re-transcription.
 
+### 1.5 Per-run observability — `run_metrics` table
+
+One row per job capturing telemetry across the whole run (probe → transcribe →
+embed). It is **additive**: nothing in §1.1–§1.4 or §3 depends on it, and a
+missing row never blocks the pipeline. Three independent writers each UPSERT
+**only their own slice** of columns keyed on `job_id`, so they never clobber
+each other:
+
+```sql
+CREATE TABLE IF NOT EXISTS run_metrics (
+  job_id UUID PRIMARY KEY REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+  audio_bytes BIGINT, audio_channels INT, audio_sample_rate INT, audio_codec TEXT, audio_format TEXT,
+  transcribe_started_at TIMESTAMPTZ, transcribe_finished_at TIMESTAMPTZ, asr_model TEXT, compute_type TEXT,
+  runner_host TEXT, chunked BOOLEAN, n_windows INT, char_count INT, word_count INT, segment_count INT,
+  embed_started_at TIMESTAMPTZ, embed_finished_at TIMESTAMPTZ, embed_model TEXT, embed_chunk_count INT,
+  embed_prompt_tokens INT, embed_total_tokens INT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+**All columns are nullable** (except the PK and `created_at`/`updated_at`). Each
+writer UPSERTs via `INSERT … ON CONFLICT (job_id) DO UPDATE SET <its cols>=EXCLUDED…, updated_at=now()`.
+
+#### Column ownership (which writer writes which columns)
+
+| Writer | When | Columns it writes |
+|--------|------|-------------------|
+| **Go monitor** | at enqueue (file size from `os.Stat`) | `audio_bytes` |
+| **Python ASR runner** | after transcribing | `audio_channels`, `audio_sample_rate`, `audio_codec`, `audio_format`, `transcribe_started_at`, `transcribe_finished_at`, `asr_model`, `compute_type`, `runner_host`, `chunked`, `n_windows`, `char_count`, `word_count`, `segment_count` |
+| **Go embed worker** | after `transcript_chunks` insert | `embed_started_at`, `embed_finished_at`, `embed_model`, `embed_chunk_count`, `embed_prompt_tokens`, `embed_total_tokens` |
+
+Rules:
+- Every write is **best-effort** — a `run_metrics` failure MUST NOT fail the
+  underlying enqueue/transcribe/embed. Writers log and continue.
+- The Go service creates the table in its schema-init transaction, so it exists
+  before the runner ever writes; the runner's UPSERT is still defensive (treats a
+  missing table/row as a no-op-equivalent best-effort write).
+- **Token mapping (embed worker):** `embed_total_tokens` is the **authoritative**
+  count — the Go service tokenizes the embedded chunk texts locally with the same
+  tokenizer the chunker uses, because Ollama does not reliably populate `usage`
+  for embeddings. `embed_prompt_tokens` stores the provider-reported
+  `usage.prompt_tokens` only when non-zero, and is left NULL otherwise.
+- `chunked` / `n_windows` describe the runner's chunked-vs-single-pass inference
+  (driven by `ASR_CHUNK_THRESHOLD_SECONDS`, §2.4), not the Go embed chunking.
+
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
@@ -590,7 +635,7 @@ These are implementation constants in the Go chunker, not a DB concern.
 ## 4. CHANGE CONTROL
 
 Any change to:
-- A column name, type, or constraint in sections 1.1, 1.2, or 3
+- A column name, type, or constraint in sections 1.1, 1.2, 1.5, or 3
 - An env var name in section 2.4
 - The mcp-proxy upstream key or URL in section 2.2
 - The embedding model or vector dimension in section 2.3

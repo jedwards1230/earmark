@@ -11,7 +11,9 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/openai"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
+	"github.com/jedwards1230/lil-whisper/internal/tokenizer"
 )
 
 // DBInterface is the subset of db.DB used by the worker.
@@ -19,7 +21,9 @@ type DBInterface interface {
 	GetCompletedTranscripts(ctx context.Context) ([]*db.Transcript, error)
 	InsertChunks(ctx context.Context, chunks []db.Chunk) error
 	GetEmbeddings(texts []string) ([][]float32, error)
+	GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
 	RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
+	UpsertEmbedMetrics(ctx context.Context, m db.EmbedMetrics) error
 }
 
 // Worker polls for completed transcripts and embeds them.
@@ -158,7 +162,7 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		texts[i] = c.Text
 	}
 
-	embeddings, err := w.db.GetEmbeddings(texts)
+	embeddings, usage, err := w.db.GetEmbeddingsWithUsage(texts)
 	if err != nil {
 		return fmt.Errorf("get embeddings: %w", err)
 	}
@@ -173,13 +177,74 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	if err := w.db.InsertChunks(w.ctx, chunks); err != nil {
 		return fmt.Errorf("insert chunks: %w", err)
 	}
+	finished := time.Now()
 
 	w.log.Info("transcript embedded",
 		"file", t.FilePath,
 		"transcript_id", t.ID,
 		"chunks", len(chunks),
-		"duration", time.Since(start).Round(time.Millisecond))
+		"duration", finished.Sub(start).Round(time.Millisecond))
+
+	// Per-run observability: record embedding timing, model, chunk count, and
+	// token counts. Best-effort — a metrics write must not fail the embed.
+	w.recordEmbedMetrics(t, texts, usage, start, finished, len(chunks),
+		embedModel(cfg))
 	return nil
+}
+
+// recordEmbedMetrics UPSERTs the embed worker's slice of run_metrics for a
+// transcript's job. embed_total_tokens is the authoritative local tokenizer
+// count (Ollama frequently omits usage for embeddings); embed_prompt_tokens is
+// the provider-reported value, stored only when non-zero (nullable otherwise).
+// Best-effort: a tokenizer or DB error is logged and swallowed.
+func (w *Worker) recordEmbedMetrics(t *db.Transcript, texts []string, usage openai.EmbeddingUsage, started, finished time.Time, chunkCount int, model string) {
+	total := localTokenCount(texts)
+
+	var promptTokens *int
+	if usage.PromptTokens > 0 {
+		p := usage.PromptTokens
+		promptTokens = &p
+	}
+
+	m := db.EmbedMetrics{
+		JobID:        t.JobID,
+		StartedAt:    started,
+		FinishedAt:   finished,
+		Model:        model,
+		ChunkCount:   chunkCount,
+		PromptTokens: promptTokens,
+		TotalTokens:  total,
+	}
+	if err := w.db.UpsertEmbedMetrics(w.ctx, m); err != nil {
+		w.log.Warn("embed metrics write failed (continuing)",
+			"transcript_id", t.ID, "job_id", t.JobID, "error", err)
+	}
+}
+
+// localTokenCount sums the tokenizer's token count across the embedded chunk
+// texts. This is the authoritative embed_total_tokens — the same tokenizer the
+// chunker uses, so the count reflects exactly what was embedded regardless of
+// whether the provider reported usage. A per-text tokenizer error is skipped
+// (best-effort), so the total degrades gracefully rather than failing the embed.
+func localTokenCount(texts []string) int {
+	total := 0
+	for _, txt := range texts {
+		n, err := tokenizer.CountTokens(txt)
+		if err != nil {
+			continue
+		}
+		total += n
+	}
+	return total
+}
+
+// embedModel returns the configured embeddings model, falling back to the
+// CONTRACT default when unset.
+func embedModel(cfg *config.Config) string {
+	if cfg.EmbeddingsModel != "" {
+		return cfg.EmbeddingsModel
+	}
+	return "nomic-embed-text"
 }
 
 // buildChunksFromSegments accumulates WhisperX segments into token-budgeted

@@ -38,11 +38,27 @@ func NewEmbeddings(cfg *config.Config) *Embeddings {
 // BaseURL returns the configured embeddings endpoint, for diagnostics/logging.
 func (e *Embeddings) BaseURL() string { return e.baseURL }
 
+// EmbeddingUsage is the provider-reported token usage for an embeddings call.
+// Ollama does not reliably populate these for embeddings (they are frequently
+// zero), so callers that need an authoritative count should also tokenize the
+// inputs locally; this carries the provider numbers when present.
+type EmbeddingUsage struct {
+	PromptTokens int
+	TotalTokens  int
+}
+
 // GetEmbeddings returns one 768-float32 vector per chunk.
 // Callers must ensure the result length equals len(chunks).
 func (e *Embeddings) GetEmbeddings(chunks []string) ([][]float32, error) {
+	vecs, _, err := e.GetEmbeddingsWithUsage(chunks)
+	return vecs, err
+}
+
+// GetEmbeddingsWithUsage is GetEmbeddings plus the provider-reported token usage
+// (which Ollama may leave zeroed — see EmbeddingUsage).
+func (e *Embeddings) GetEmbeddingsWithUsage(chunks []string) ([][]float32, EmbeddingUsage, error) {
 	if len(chunks) == 0 {
-		return nil, nil
+		return nil, EmbeddingUsage{}, nil
 	}
 
 	resp, err := e.c.CreateEmbeddings(
@@ -55,19 +71,23 @@ func (e *Embeddings) GetEmbeddings(chunks []string) ([][]float32, error) {
 	if err != nil {
 		// Include the endpoint URL: an unreachable Ollama or an un-pulled model
 		// both surface here, and the URL is what an operator needs to act on.
-		return nil, fmt.Errorf("creating embeddings via model %q at %s: %w", e.model, e.baseURL, err)
+		return nil, EmbeddingUsage{}, fmt.Errorf("creating embeddings via model %q at %s: %w", e.model, e.baseURL, err)
 	}
 
 	if len(resp.Data) == 0 {
-		return nil, fmt.Errorf("no embeddings returned for %d chunks", len(chunks))
+		return nil, EmbeddingUsage{}, fmt.Errorf("no embeddings returned for %d chunks", len(chunks))
 	}
 	if len(resp.Data) != len(chunks) {
-		return nil, fmt.Errorf("embedding count mismatch: got %d for %d", len(resp.Data), len(chunks))
+		return nil, EmbeddingUsage{}, fmt.Errorf("embedding count mismatch: got %d for %d", len(resp.Data), len(chunks))
 	}
 
 	embeddings := make([][]float32, len(resp.Data))
 	for i, d := range resp.Data {
 		embeddings[i] = d.Embedding
 	}
-	return embeddings, nil
+	usage := EmbeddingUsage{
+		PromptTokens: resp.Usage.PromptTokens,
+		TotalTokens:  resp.Usage.TotalTokens,
+	}
+	return embeddings, usage, nil
 }

@@ -36,6 +36,23 @@ func TestHumanizeSince(t *testing.T) {
 	}
 }
 
+func TestHumanizeSeconds(t *testing.T) {
+	cases := []struct {
+		secs float64
+		want string
+	}{
+		{5, "5s"},
+		{65, "1m5s"},
+		{3725, "1h2m"},
+		{0, "0s"},
+	}
+	for _, c := range cases {
+		if got := humanizeSeconds(c.secs); got != c.want {
+			t.Errorf("humanizeSeconds(%v) = %q, want %q", c.secs, got, c.want)
+		}
+	}
+}
+
 // TestPipelineStateDerivation verifies the unified pipeline state never
 // contradicts itself: RUNNING only when a fresh runner is connected, IDLE when
 // enabled-but-no/stale-runner, PAUSED when the flag is set.

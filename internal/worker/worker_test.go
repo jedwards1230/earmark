@@ -9,6 +9,7 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/openai"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
 	"github.com/stretchr/testify/require"
 )
@@ -36,6 +37,9 @@ type fakeDB struct {
 	chunks      []db.Chunk
 	embedErr    error
 	insertErr   error
+	usage       openai.EmbeddingUsage // returned by GetEmbeddingsWithUsage
+	metrics     []db.EmbedMetrics     // captured by UpsertEmbedMetrics
+	metricsErr  error
 }
 
 func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, error) {
@@ -60,6 +64,19 @@ func (f *fakeDB) GetEmbeddings(texts []string) ([][]float32, error) {
 		result[i] = make([]float32, 768)
 	}
 	return result, nil
+}
+
+func (f *fakeDB) GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error) {
+	vecs, err := f.GetEmbeddings(texts)
+	return vecs, f.usage, err
+}
+
+func (f *fakeDB) UpsertEmbedMetrics(_ context.Context, m db.EmbedMetrics) error {
+	if f.metricsErr != nil {
+		return f.metricsErr
+	}
+	f.metrics = append(f.metrics, m)
+	return nil
 }
 
 func (f *fakeDB) RecoverStaleJobs(_ context.Context, _ time.Duration) error { return nil }
@@ -87,6 +104,55 @@ func TestProcessTranscript_Success(t *testing.T) {
 		require.Equal(t, "/books/author/title/ch1.mp3", c.FilePath)
 		require.Len(t, c.Embedding, 768)
 	}
+}
+
+func TestProcessTranscript_RecordsEmbedMetrics(t *testing.T) {
+	// Ollama-style: no provider usage reported. embed_total_tokens must come from
+	// the local tokenizer (non-zero), and embed_prompt_tokens must be nil.
+	fdb := &fakeDB{usage: openai.EmbeddingUsage{}}
+	w := &Worker{
+		ctx: context.Background(),
+		db:  fdb,
+		log: log.NewLogger("worker-test"),
+	}
+	cfg := &config.Config{ChunkSize: 10, EmbeddingsModel: "nomic-embed-text"}
+	transcript := &db.Transcript{
+		ID:       "tid-metrics",
+		JobID:    "job-metrics",
+		FilePath: "/books/author/title/ch1.mp3",
+		RawText:  "Hello world this is a test transcript for chunking.",
+	}
+
+	require.NoError(t, w.processTranscript(cfg, transcript))
+	require.Len(t, fdb.metrics, 1)
+	m := fdb.metrics[0]
+	require.Equal(t, "job-metrics", m.JobID)
+	require.Equal(t, "nomic-embed-text", m.Model)
+	require.Equal(t, len(fdb.chunks), m.ChunkCount)
+	require.Greater(t, m.TotalTokens, 0, "local token count must be authoritative and non-zero")
+	require.Nil(t, m.PromptTokens, "no provider usage → prompt tokens nil")
+	require.False(t, m.FinishedAt.Before(m.StartedAt))
+}
+
+func TestProcessTranscript_EmbedMetricsPromptTokensFromProvider(t *testing.T) {
+	// When the provider does report usage (non-Ollama), prompt tokens are stored.
+	fdb := &fakeDB{usage: openai.EmbeddingUsage{PromptTokens: 42, TotalTokens: 42}}
+	w := &Worker{
+		ctx: context.Background(),
+		db:  fdb,
+		log: log.NewLogger("worker-test"),
+	}
+	cfg := &config.Config{ChunkSize: 10, EmbeddingsModel: "nomic-embed-text"}
+	transcript := &db.Transcript{
+		ID: "tid-mp", JobID: "job-mp",
+		FilePath: "/books/a/t/ch.mp3",
+		RawText:  "Hello world this is a test transcript for chunking.",
+	}
+
+	require.NoError(t, w.processTranscript(cfg, transcript))
+	require.Len(t, fdb.metrics, 1)
+	require.NotNil(t, fdb.metrics[0].PromptTokens)
+	require.Equal(t, 42, *fdb.metrics[0].PromptTokens)
 }
 
 func TestProcessTranscript_WithSegments(t *testing.T) {

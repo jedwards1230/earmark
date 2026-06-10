@@ -57,6 +57,7 @@ type fakeDB struct {
 	insertedPath map[string]string // file_path -> jobID
 	insertCalls  int               // times a NEW job was actually created
 	pruned       int               // times PruneAppleDoubleJobs was called
+	audioBytes   map[string]int64  // jobID -> audio_bytes recorded
 }
 
 func (f *fakeDB) InsertJobIfAbsent(_ context.Context, filePath, checksum string) (string, bool, error) {
@@ -89,6 +90,14 @@ func (f *fakeDB) PruneAppleDoubleJobs(context.Context) (int, error) {
 	return 0, nil
 }
 
+func (f *fakeDB) UpsertAudioBytes(_ context.Context, jobID string, bytes int64) error {
+	if f.audioBytes == nil {
+		f.audioBytes = map[string]int64{}
+	}
+	f.audioBytes[jobID] = bytes
+	return nil
+}
+
 func newTestMonitor(dir string, db DBInterface) *FileMonitor {
 	cfg := &config.Config{BooksDir: dir}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -119,6 +128,16 @@ func TestMonitorEnqueueFile(t *testing.T) {
 	fm.enqueueFile(filePath)
 	if len(db.inserted) != 1 {
 		t.Errorf("expected 1 job inserted, got %d", len(db.inserted))
+	}
+
+	// audio_bytes must be recorded for the enqueued job (per-run observability).
+	if len(db.audioBytes) != 1 {
+		t.Fatalf("expected audio_bytes recorded for 1 job, got %d", len(db.audioBytes))
+	}
+	for _, b := range db.audioBytes {
+		if b != int64(len("audio data")) {
+			t.Errorf("expected audio_bytes=%d, got %d", len("audio data"), b)
+		}
 	}
 
 	// Second call — should be idempotent.
