@@ -144,6 +144,23 @@ func clampOffset(offset int) int {
 	return offset
 }
 
+// maxContextWindow caps get_chunk_context's neighbour radius. GetChunkContext
+// pulls chunks in [index-window, index+window], so an unbounded window (e.g.
+// contextWindow=2147483647) would scan/return an entire transcript. 50 each side
+// is far more surrounding context than any caller needs.
+const maxContextWindow = 50
+
+// clampContextWindow bounds the chunk-context radius to [0, maxContextWindow].
+func clampContextWindow(window int) int {
+	if window < 0 {
+		return 0
+	}
+	if window > maxContextWindow {
+		return maxContextWindow
+	}
+	return window
+}
+
 // handleSemanticSearch performs semantic search on audiobook transcriptions,
 // over the whole library by default or scoped to one book when `book` is given.
 func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -372,8 +389,9 @@ func (h *ToolHandlers) handleGetContext(ctx context.Context, request mcp.CallToo
 		return mcp.NewToolResultError(fmt.Sprintf("Missing or invalid chunkID parameter: %v", err)), nil
 	}
 
-	// Extract optional context window size (default 2 chunks before and after)
-	contextWindow := request.GetInt("contextWindow", 2)
+	// Extract optional context window size (default 2 chunks before and after),
+	// bounded so a huge value can't pull an entire transcript's chunks.
+	contextWindow := clampContextWindow(request.GetInt("contextWindow", 2))
 
 	h.logger.Info("Getting chunk context", "chunkID", chunkID, "contextWindow", contextWindow)
 

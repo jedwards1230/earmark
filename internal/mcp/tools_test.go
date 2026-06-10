@@ -721,6 +721,20 @@ func TestClampHelpers(t *testing.T) {
 	if got := clampOffset(2147483647); got != maxOffset {
 		t.Errorf("clampOffset(MaxInt32) = %d, want %d (clamped to ceiling)", got, maxOffset)
 	}
+
+	// clampContextWindow: negative → 0; in-range passes through; above ceiling → maxContextWindow.
+	if got := clampContextWindow(-1); got != 0 {
+		t.Errorf("clampContextWindow(-1) = %d, want 0", got)
+	}
+	if got := clampContextWindow(2); got != 2 {
+		t.Errorf("clampContextWindow(2) = %d, want 2", got)
+	}
+	if got := clampContextWindow(maxContextWindow); got != maxContextWindow {
+		t.Errorf("clampContextWindow(maxContextWindow) = %d, want %d", got, maxContextWindow)
+	}
+	if got := clampContextWindow(2147483647); got != maxContextWindow {
+		t.Errorf("clampContextWindow(MaxInt32) = %d, want %d (clamped to ceiling)", got, maxContextWindow)
+	}
 }
 
 // TestSnippetCharsClamp verifies that snippetChars enforces both floor and
