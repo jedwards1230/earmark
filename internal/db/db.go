@@ -1065,6 +1065,15 @@ type RecentJob struct {
 	NWindows          *int
 	CharCount         *int
 	EmbedTotalTokens  *int
+
+	// Per-track detail (transcripts + run_metrics LEFT JOINs; all nullable).
+	// Populated by GetBookTracks for the surfaced book-detail columns; nil on the
+	// recent-activity path (GetRecentJobs doesn't select them).
+	DurationSeconds *float64 // transcripts.duration_seconds
+	WordCount       *int     // run_metrics.word_count
+	AudioCodec      *string  // run_metrics.audio_codec (e.g. "aac")
+	AudioChannels   *int     // run_metrics.audio_channels (e.g. 2 → "stereo")
+	EmbedChunkCount *int     // run_metrics.embed_chunk_count
 }
 
 // GetRecentJobs returns the most-recently-updated jobs, newest first. It
@@ -1192,6 +1201,15 @@ type BookSummary struct {
 	Done        int
 	Failed      int
 	LastUpdated time.Time
+
+	// Per-book aggregates over the book's done tracks (transcripts + run_metrics
+	// LEFT JOINs). All nullable — a book with no transcribed track, or whose
+	// transcripts predate run_metrics, sums to NULL → nil here (rendered as an em
+	// dash / 0 by the caller). DurationSeconds sums transcripts.duration_seconds;
+	// WordCount and EmbedChunkCount sum the matching run_metrics columns.
+	DurationSeconds *float64
+	WordCount       *int
+	EmbedChunkCount *int
 }
 
 // BookFilter narrows and paginates GetBookSummaries.
@@ -1206,6 +1224,12 @@ type BookFilter struct {
 // counts, plus the total number of matching books (for pagination). Books are
 // ordered by most-recently-updated so active work surfaces first.
 func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary, int, error) {
+	return db.getBookSummaries(ctx, db.pool, f)
+}
+
+// getBookSummaries is the querier-parameterized core of GetBookSummaries, split
+// out so the dynamic query + scan path can be tested against a mock pool.
+func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter) ([]BookSummary, int, error) {
 	if f.Limit <= 0 {
 		f.Limit = 20
 	}
@@ -1217,37 +1241,50 @@ func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary
 		// no status filter
 	case "pending", "claimed", "done", "failed":
 		statusHaving = fmt.Sprintf(
-			"HAVING COUNT(*) FILTER (WHERE status = '%s') > 0", f.Status)
+			"HAVING COUNT(*) FILTER (WHERE j.status = '%s') > 0", f.Status)
 	default:
 		return nil, 0, fmt.Errorf("invalid status filter: %q", f.Status)
 	}
 
 	// COUNT(*) OVER() yields the total matching-book count alongside the page so
 	// pagination needs only one round-trip. $1=query, $2=limit, $3=offset.
+	// The per-book LEFT JOINs to transcripts/run_metrics let us SUM the stored
+	// duration / word / embed-chunk totals across each book's tracks. A track with
+	// no transcript (pending) or no run_metrics row contributes NULL to its SUM;
+	// SUM ignores NULLs, and a book with zero contributing rows sums to NULL →
+	// nilable pointer here (em dash in the UI). The join multiplies job rows only
+	// by 0-or-1 (transcripts.job_id and run_metrics.job_id are both unique per
+	// job), so the status COUNTs are unaffected.
 	query := fmt.Sprintf(`
 		WITH books AS (
 			SELECT
-				regexp_replace(file_path, '/[^/]+$', '')        AS book_dir,
-				MIN(file_path)                                    AS sample_path,
-				COUNT(*)                                          AS total,
-				COUNT(*) FILTER (WHERE status = 'pending')        AS pending,
-				COUNT(*) FILTER (WHERE status = 'claimed')        AS claimed,
-				COUNT(*) FILTER (WHERE status = 'done')           AS done,
-				COUNT(*) FILTER (WHERE status = 'failed')         AS failed,
-				MAX(updated_at)                                   AS last_updated
-			FROM transcription_jobs
-			WHERE ($1 = '' OR file_path ILIKE '%%' || $1 || '%%')
+				regexp_replace(j.file_path, '/[^/]+$', '')        AS book_dir,
+				MIN(j.file_path)                                    AS sample_path,
+				COUNT(*)                                            AS total,
+				COUNT(*) FILTER (WHERE j.status = 'pending')        AS pending,
+				COUNT(*) FILTER (WHERE j.status = 'claimed')        AS claimed,
+				COUNT(*) FILTER (WHERE j.status = 'done')           AS done,
+				COUNT(*) FILTER (WHERE j.status = 'failed')         AS failed,
+				MAX(j.updated_at)                                   AS last_updated,
+				SUM(t.duration_seconds)                             AS duration_seconds,
+				SUM(m.word_count)                                   AS word_count,
+				SUM(m.embed_chunk_count)                            AS embed_chunk_count
+			FROM transcription_jobs j
+			LEFT JOIN transcripts t ON t.job_id = j.id
+			LEFT JOIN run_metrics m ON m.job_id = j.id
+			WHERE ($1 = '' OR j.file_path ILIKE '%%' || $1 || '%%')
 			GROUP BY book_dir
 			%s
 		)
 		SELECT book_dir, sample_path, total, pending, claimed, done, failed, last_updated,
+		       duration_seconds, word_count, embed_chunk_count,
 		       COUNT(*) OVER() AS total_books
 		FROM books
 		ORDER BY last_updated DESC, book_dir
 		LIMIT $2 OFFSET $3
 	`, statusHaving)
 
-	rows, err := db.pool.Query(ctx, query, f.Query, f.Limit, f.Offset)
+	rows, err := qr.Query(ctx, query, f.Query, f.Limit, f.Offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("book summaries query: %w", err)
 	}
@@ -1260,7 +1297,8 @@ func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary
 	for rows.Next() {
 		var b BookSummary
 		if err := rows.Scan(&b.Dir, &b.SamplePath, &b.Total, &b.Pending, &b.Claimed, &b.Done,
-			&b.Failed, &b.LastUpdated, &total); err != nil {
+			&b.Failed, &b.LastUpdated, &b.DurationSeconds, &b.WordCount, &b.EmbedChunkCount,
+			&total); err != nil {
 			return nil, 0, fmt.Errorf("scan book summary: %w", err)
 		}
 		out = append(out, b)
@@ -1274,13 +1312,34 @@ func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary
 // GetBookTracks returns the individual track jobs for one book directory,
 // ordered by file path, for the expand-to-tracks view. dir must be an exact
 // book_dir as returned by GetBookSummaries.
+//
+// It LEFT JOINs transcripts and run_metrics to surface per-track detail
+// (duration, word count, processing time, codec/channels, embed chunk count).
+// Most transcripts have no run_metrics row yet — and a pending track has no
+// transcript row at all — so every joined column is nullable and the caller
+// renders an em dash when nil. The em-dash rendering lives in the templates.
 func (db *DB) GetBookTracks(ctx context.Context, dir string) ([]RecentJob, error) {
-	rows, err := db.pool.Query(ctx, `
-		SELECT id, file_path, status, updated_at, error
-		FROM transcription_jobs
-		WHERE regexp_replace(file_path, '/[^/]+$', '') = $1
-		ORDER BY file_path
-	`, dir)
+	return db.getBookTracks(ctx, db.pool, dir)
+}
+
+// bookTracksSQL is the per-track detail query, a package-level variable so tests
+// can assert its shape (the LEFT JOINs that make every metric nullable).
+var bookTracksSQL = `
+		SELECT j.id, j.file_path, j.status, j.updated_at, j.error,
+		       t.duration_seconds,
+		       EXTRACT(EPOCH FROM (m.transcribe_finished_at - m.transcribe_started_at)) AS processing_seconds,
+		       m.word_count, m.audio_codec, m.audio_channels, m.embed_chunk_count
+		FROM transcription_jobs j
+		LEFT JOIN transcripts  t ON t.job_id = j.id
+		LEFT JOIN run_metrics  m ON m.job_id = j.id
+		WHERE regexp_replace(j.file_path, '/[^/]+$', '') = $1
+		ORDER BY j.file_path
+	`
+
+// getBookTracks is the querier-parameterized core of GetBookTracks, split out so
+// the query execution + scan path can be tested against a mock pool.
+func (db *DB) getBookTracks(ctx context.Context, q rowQuerier, dir string) ([]RecentJob, error) {
+	rows, err := q.Query(ctx, bookTracksSQL, dir)
 	if err != nil {
 		return nil, fmt.Errorf("book tracks query: %w", err)
 	}
@@ -1289,7 +1348,10 @@ func (db *DB) GetBookTracks(ctx context.Context, dir string) ([]RecentJob, error
 	var jobs []RecentJob
 	for rows.Next() {
 		var j RecentJob
-		if err := rows.Scan(&j.ID, &j.FilePath, &j.Status, &j.UpdatedAt, &j.Error); err != nil {
+		if err := rows.Scan(&j.ID, &j.FilePath, &j.Status, &j.UpdatedAt, &j.Error,
+			&j.DurationSeconds, &j.ProcessingSeconds,
+			&j.WordCount, &j.AudioCodec, &j.AudioChannels, &j.EmbedChunkCount,
+		); err != nil {
 			return nil, fmt.Errorf("scan book track: %w", err)
 		}
 		jobs = append(jobs, j)

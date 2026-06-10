@@ -78,6 +78,26 @@ var tmplFuncs = template.FuncMap{
 		}
 		return commafy(*n)
 	},
+	// durTime renders a nullable audio duration (seconds) as a compact human
+	// string (transcripts.duration_seconds), or an em dash when absent.
+	"durTime": func(secs *float64) string {
+		if secs == nil || *secs <= 0 {
+			return "—"
+		}
+		return humanizeSeconds(*secs)
+	},
+	// codecLabel renders the audio codec + channel layout as "aac · stereo",
+	// degrading gracefully when either run_metrics field is NULL: just "aac",
+	// just "stereo", or an em dash when both are absent.
+	"codecLabel": codecLabel,
+	// commafy64Ptr renders a nullable 64-bit count (e.g. SUM of token counts)
+	// with thousands separators, or an em dash when absent.
+	"commafy64Ptr": func(n *int64) string {
+		if n == nil {
+			return "—"
+		}
+		return commafy64(*n)
+	},
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.
@@ -209,6 +229,18 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
     <div class="card"><div class="card-label">Chunks</div><div class="card-value">{{commafy .Stats.Chunks}}</div></div>
     <div class="card" title="completed transcripts not yet embedded (worker backlog)">
       <div class="card-label">Unembedded</div><div class="card-value{{if .EmbedStall}} amber{{end}}">{{commafy .Stats.EmbedBacklog}}</div></div>
+    <div class="card" title="total embedding tokens (local tokenizer) across all embedded runs">
+      <div class="card-label">Embed tokens</div><div class="card-value purple">{{commafy64Ptr .Stats.TotalEmbedTokens}}</div></div>
+  </div>
+</div>
+
+<div class="card-group">
+  <div class="group-label">throughput</div>
+  <div class="grid">
+    <div class="card" title="mean transcription wall-clock time over runs the runner has timed">
+      <div class="card-label">Avg proc / track</div><div class="card-value">{{procTime .Stats.AvgProcessingSeconds}}</div></div>
+    <div class="card" title="jobs completed in the last hour">
+      <div class="card-label">Done / hour</div><div class="card-value">{{commafy .Stats.DoneLastHour}}</div></div>
   </div>
 </div>
 
@@ -282,7 +314,11 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
 {{if .Books}}
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Book</th><th>Author</th><th>Progress</th><th>Breakdown</th><th>Updated</th><th></th></tr></thead>
+  <thead><tr><th>Book</th><th>Author</th><th>Progress</th>
+    <th title="total audio duration across done tracks">Duration</th>
+    <th title="total transcript words across done tracks">Words</th>
+    <th title="total embedded chunks across done tracks">Chunks</th>
+    <th>Breakdown</th><th>Updated</th><th></th></tr></thead>
   <tbody>
   {{range .Books}}
     <tr class="clickable" onclick="window.location=this.querySelector('a.file-name').href">
@@ -294,6 +330,9 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
         </div>
         <span class="progress-text">{{commafy .Done}}/{{commafy .Total}}</span>
       </td>
+      <td class="time-muted">{{durTime .DurationSeconds}}</td>
+      <td class="time-muted">{{commafyPtr .WordCount}}</td>
+      <td class="time-muted">{{commafyPtr .EmbedChunkCount}}</td>
       <td class="mini-badges">
         {{if gt .Pending 0}}<span class="badge pending">{{commafy .Pending}} pend</span>{{end}}
         {{if gt .Claimed 0}}<span class="badge claimed">{{commafy .Claimed}} transcribing</span>{{end}}
@@ -341,13 +380,24 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
 {{if .Tracks}}
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Track</th><th>Status</th><th>Updated</th><th></th></tr></thead>
+  <thead><tr><th>Track</th><th>Status</th>
+    <th title="audio duration">Duration</th>
+    <th title="transcript word count (runner)">Words</th>
+    <th title="transcription wall-clock time (runner)">Proc</th>
+    <th title="audio codec · channel layout (runner)">Codec</th>
+    <th title="embedded chunks">Chunks</th>
+    <th>Updated</th><th></th></tr></thead>
   <tbody>
   {{range .Tracks}}
     <tr>
       <td><div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div>
           {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}</td>
       <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
+      <td class="time-muted">{{durTime .DurationSeconds}}</td>
+      <td class="time-muted">{{commafyPtr .WordCount}}</td>
+      <td class="time-muted">{{procTime .ProcessingSeconds}}</td>
+      <td class="time-muted">{{codecLabel .AudioCodec .AudioChannels}}</td>
+      <td class="time-muted">{{commafyPtr .EmbedChunkCount}}</td>
       <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
       <td class="actions">
         {{if or (eq .Status "done") (eq .Status "failed")}}
@@ -406,6 +456,11 @@ type bookRow struct {
 	Done        int
 	Failed      int
 	LastUpdated time.Time
+
+	// Per-book aggregates over done tracks (nullable — em dash when none done).
+	DurationSeconds *float64
+	WordCount       *int
+	EmbedChunkCount *int
 }
 
 type libraryData struct {
@@ -514,8 +569,40 @@ func statusLabel(status string) string {
 	return status
 }
 
-func commafy(n int) string {
-	s := strconv.Itoa(n)
+// channelLabel maps an audio channel count to a human layout word; for unusual
+// counts it falls back to "Nch".
+func channelLabel(n int) string {
+	switch n {
+	case 1:
+		return "mono"
+	case 2:
+		return "stereo"
+	default:
+		return strconv.Itoa(n) + "ch"
+	}
+}
+
+// codecLabel renders "codec · channels" (e.g. "aac · stereo") from the nullable
+// run_metrics audio fields, degrading to just the codec, just the channel
+// layout, or an em dash when both are absent.
+func codecLabel(codec *string, channels *int) string {
+	var parts []string
+	if codec != nil && *codec != "" {
+		parts = append(parts, *codec)
+	}
+	if channels != nil && *channels > 0 {
+		parts = append(parts, channelLabel(*channels))
+	}
+	if len(parts) == 0 {
+		return "—"
+	}
+	return strings.Join(parts, " · ")
+}
+
+func commafy(n int) string { return commafy64(int64(n)) }
+
+func commafy64(n int64) string {
+	s := strconv.FormatInt(n, 10)
 	neg := strings.HasPrefix(s, "-")
 	if neg {
 		s = s[1:]
@@ -723,7 +810,8 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, bookRow{
 			Dir: b.Dir, Title: title, Author: author, DonePct: pct,
 			Total: b.Total, Pending: b.Pending, Claimed: b.Claimed, Done: b.Done, Failed: b.Failed,
-			LastUpdated: b.LastUpdated,
+			LastUpdated:     b.LastUpdated,
+			DurationSeconds: b.DurationSeconds, WordCount: b.WordCount, EmbedChunkCount: b.EmbedChunkCount,
 		})
 	}
 

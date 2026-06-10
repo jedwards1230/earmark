@@ -106,27 +106,37 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		q = &db.QueueStats{}
 	case "stale":
 		hb := now.Add(-2 * time.Hour) // older than the 30m stale window
+		avg := 0.0
+		tok := int64(0)
 		q = &db.QueueStats{
 			Pending: 5, Claimed: 1, Done: 120, Failed: 0,
 			Transcripts: 120, Chunks: 7431, EmbedBacklog: 0,
 			TotalJobs: 126, DoneLastHour: 0, // stalled → no recent completions → ETA "—"
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			// run_metrics exist but predate this stall; avg over zero-duration → "—".
+			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 		}
 	case "failed":
 		hb := now.Add(-40 * time.Second)
+		avg := 624.0
+		tok := int64(2_140_500)
 		q = &db.QueueStats{
 			Pending: 3, Claimed: 1, Done: 88, Failed: 7,
 			Transcripts: 88, Chunks: 5120, EmbedBacklog: 14, // large → exercises the stall warning
 			TotalJobs: 99, DoneLastHour: 4,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 		}
 	default: // active
 		hb := now.Add(-12 * time.Second)
+		avg := 487.5
+		tok := int64(6_820_400)
 		q = &db.QueueStats{
 			Pending: 42, Claimed: 1, Done: 317, Failed: 2,
 			Transcripts: 317, Chunks: 18452, EmbedBacklog: 3,
 			TotalJobs: 362, DoneLastHour: 22,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 		}
 	}
 	q.Paused = d.isPaused()
@@ -188,22 +198,31 @@ func (d demoDB) GetRecentJobs(_ context.Context, limit int) ([]db.RecentJob, err
 // visibly exercised (matching demoCollections below).
 func demoBooks() []db.BookSummary {
 	now := time.Now()
+	// fp/ip build nilable pointers inline so the demo can mix populated and NULL
+	// per-book aggregates (a book with no run_metrics → em dash, like prod).
+	fp := func(v float64) *float64 { return &v }
+	ip := func(v int) *int { return &v }
 	return []db.BookSummary{
 		// audio-libro: author dir holds loose track files; title from filename.
+		// Pending-only → no done tracks → all aggregates NULL (em dash).
 		{Dir: "/books/audio-libro/Daniel Kahneman",
 			SamplePath: "/books/audio-libro/Daniel Kahneman/Thinking Fast and Slow - Track 1.mp3",
 			Total:      202, Pending: 202, LastUpdated: now.Add(-21 * time.Hour)},
-		// audio-libation: author/title dirs.
+		// audio-libation: author/title dirs. Fully done with aggregates populated.
 		{Dir: "/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]",
 			SamplePath: "/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]/Project Hail Mary.m4b",
-			Total:      1, Done: 1, LastUpdated: now.Add(-3 * time.Minute)},
+			Total:      1, Done: 1, LastUpdated: now.Add(-3 * time.Minute),
+			DurationSeconds: fp(58320), WordCount: ip(124800), EmbedChunkCount: ip(412)},
 		{Dir: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]",
 			SamplePath: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]/01 - Chapter 1.mp3",
-			Total:      24, Done: 22, Claimed: 1, Pending: 1, LastUpdated: now.Add(-12 * time.Second)},
+			Total:      24, Done: 22, Claimed: 1, Pending: 1, LastUpdated: now.Add(-12 * time.Second),
+			DurationSeconds: fp(75600), WordCount: ip(198400), EmbedChunkCount: ip(640)},
+		// Done tracks exist but predate run_metrics → counts NULL, duration set.
 		{Dir: "/books/audio-libation/Cixin Liu/The Three-Body Problem",
 			SamplePath: "/books/audio-libation/Cixin Liu/The Three-Body Problem/01 - Part 1.mp3",
-			Total:      16, Done: 14, Failed: 2, LastUpdated: now.Add(-9 * time.Minute)},
-		// audio-custom: single-file book in an author dir.
+			Total:      16, Done: 14, Failed: 2, LastUpdated: now.Add(-9 * time.Minute),
+			DurationSeconds: fp(46800)},
+		// audio-custom: single-file book in an author dir (pending → em dashes).
 		{Dir: "/books/audio-custom/George Orwell",
 			SamplePath: "/books/audio-custom/George Orwell/1984.m4b",
 			Total:      1, Pending: 1, LastUpdated: now.Add(-2 * time.Hour)},
@@ -295,12 +314,31 @@ func (d demoDB) GetBookTracks(_ context.Context, dir string) ([]db.RecentJob, er
 			if i > 0 {
 				fp = renumber(b.SamplePath, i+1)
 			}
-			out = append(out, db.RecentJob{
+			rj := db.RecentJob{
 				ID:        dir + "#" + strconv.Itoa(i),
 				FilePath:  fp,
 				Status:    status,
 				UpdatedAt: now.Add(-time.Duration(i) * time.Minute),
-			})
+			}
+			// Populate per-track detail only for 'done' tracks, and only on every
+			// other one — so the book-detail view shows both populated cells AND
+			// em-dashes (most real transcripts have no run_metrics row). Pending /
+			// failed / odd-index done tracks render em-dashes, mirroring prod.
+			if status == "done" && i%2 == 0 {
+				dur := 1800.0 + float64(i)*123.0
+				proc := 95.0 + float64(i)*40.0
+				words := 14200 + i*900
+				codec := "aac"
+				channels := 2
+				chunks := 36 + i*4
+				rj.DurationSeconds = &dur
+				rj.ProcessingSeconds = &proc
+				rj.WordCount = &words
+				rj.AudioCodec = &codec
+				rj.AudioChannels = &channels
+				rj.EmbedChunkCount = &chunks
+			}
+			out = append(out, rj)
 		}
 	}
 	return out, nil
