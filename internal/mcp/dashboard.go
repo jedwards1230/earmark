@@ -641,7 +641,7 @@ type trackData struct {
 	Detail  *db.TrackDetail
 	Title   string
 	Author  string
-	BackDir string // RAW book dir (dirname of file_path); html/template escapes it
+	BackDir string // URL-escaped book dir (dirname of file_path) for use in href query params
 	// DurationPtr adapts the non-pointer Detail.DurationSeconds to the *float64
 	// the durTime helper expects (nil → em dash when no transcript).
 	DurationPtr *float64
@@ -1098,7 +1098,7 @@ func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bookDir := path.Dir(detail.FilePath)
-	d := trackData{Detail: detail, BackDir: bookDir}
+	d := trackData{Detail: detail, BackDir: url.QueryEscape(bookDir)}
 	d.Author, d.Title = s.resolver.Resolve(bookDir, detail.FilePath)
 	if detail.HasTranscript {
 		dur := detail.DurationSeconds

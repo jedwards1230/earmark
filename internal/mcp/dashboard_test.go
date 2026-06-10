@@ -398,6 +398,48 @@ func TestHumanizeBytes(t *testing.T) {
 	}
 }
 
+// TestTrackFragmentXSSEscaping verifies that html/template auto-escapes
+// DB-sourced transcript segment text and speaker names, preventing XSS from
+// malicious content stored in the database.
+func TestTrackFragmentXSSEscaping(t *testing.T) {
+	maliciousText := `<script>alert(1)</script>`
+	maliciousSpeaker := `"><img src=x onerror=alert(1)>`
+	chunkSpeaker := maliciousSpeaker
+	dur := 10.0
+	d := trackData{
+		Title: "B", Author: "A", BackDir: "%2Fbooks%2FA%2FB", DurationPtr: &dur,
+		Detail: &db.TrackDetail{
+			ID: "t-xss", FilePath: "/books/A/B/01.m4b", Status: "done",
+			UpdatedAt: time.Now(), HasTranscript: true, DurationSeconds: dur,
+			Segments: []db.Segment{
+				{ID: 0, Start: 0, End: 5, Text: maliciousText, Speaker: &maliciousSpeaker},
+			},
+			Chunks: []db.ChunkRow{{ChunkIndex: 0, StartSec: 0, EndSec: 10, CharCount: 26, Speaker: &chunkSpeaker}},
+		},
+	}
+	var buf bytes.Buffer
+	if err := trackFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+
+	// Raw script tags and unquoted attribute injections must not appear.
+	if strings.Contains(out, "<script>alert(1)</script>") {
+		t.Error("segment text: raw <script> tag must not appear in output — html/template must escape it")
+	}
+	if strings.Contains(out, `"><img src=x onerror=alert(1)>`) {
+		t.Error("segment speaker: raw attribute-injection payload must not appear in output — html/template must escape it")
+	}
+
+	// The escaped forms must be present, proving the content is rendered (not dropped).
+	if !strings.Contains(out, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Error("segment text: expected HTML-escaped form &lt;script&gt; in output")
+	}
+	if !strings.Contains(out, "&gt;&lt;img src=x onerror=alert(1)&gt;") {
+		t.Error("segment speaker / chunk speaker: expected HTML-escaped form in output")
+	}
+}
+
 func TestErrorRowIsExpandable(t *testing.T) {
 	evil := "Traceback line 1\n<script>alert(1)</script>\nRuntimeError: boom"
 	data := newStatusData(&db.QueueStats{TotalJobs: 1, Failed: 1}, []db.RecentJob{
