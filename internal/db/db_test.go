@@ -675,6 +675,47 @@ func TestGetTrackDetailNoTranscript(t *testing.T) {
 	}
 }
 
+// TestGetTrackDetailCorruptSegmentsJSON verifies that a track row whose segments
+// JSONB column contains invalid JSON causes getTrackDetail to return a non-nil
+// error wrapping the unmarshal failure. The has_transcript flag is true so the
+// unmarshal path is exercised; the chunk query is never reached.
+func TestGetTrackDetailCorruptSegmentsJSON(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	jobID := "33333333-3333-3333-3333-333333333333"
+	lang := "en"
+	dur := 600.0
+	model := "large-v3"
+	badJSON := []byte(`{not valid json}`)
+
+	row := pgxmock.NewRows(trackDetailColumns).AddRow(
+		jobID, "/books/audio-libation/A/B/03.m4b", "done", now, nil, 1, nil,
+		true,
+		&lang, &dur, (*int)(nil), &model, &now, badJSON,
+		(*int64)(nil), (*int)(nil), (*int)(nil), (*string)(nil), (*string)(nil),
+		(*float64)(nil),
+		(*string)(nil), (*string)(nil), (*string)(nil), (*bool)(nil), (*int)(nil),
+		(*int)(nil), (*int)(nil), (*int)(nil),
+		(*string)(nil), (*int)(nil), (*int)(nil), (*int)(nil),
+	)
+	mock.ExpectQuery(trackDetailSQL).WithArgs(jobID).WillReturnRows(row)
+
+	_, gotErr := db.getTrackDetail(context.Background(), mock, jobID)
+	if gotErr == nil {
+		t.Fatal("getTrackDetail: want error for corrupt segments JSON, got nil")
+	}
+	if !strings.Contains(gotErr.Error(), "unmarshal segments") {
+		t.Errorf("error %q does not mention 'unmarshal segments'", gotErr.Error())
+	}
+}
+
 func TestComputeFileChecksum_DifferentFiles(t *testing.T) {
 	dir := t.TempDir()
 	f1 := filepath.Join(dir, "a.bin")

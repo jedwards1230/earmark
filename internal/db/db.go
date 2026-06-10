@@ -1510,7 +1510,7 @@ func (db *DB) getTrackDetail(ctx context.Context, q rowScanner, jobID string) (*
 	// transcript yields no rows.
 	chunks, err := db.getTrackChunks(ctx, q, jobID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get track chunks for %s: %w", jobID, err)
 	}
 	d.Chunks = chunks
 	return &d, nil
