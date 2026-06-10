@@ -94,8 +94,10 @@ func runMCP(cmd *cobra.Command, args []string) {
 	diag("Starting MCP server for lilbro-whisper...")
 	diag("Available tools:")
 	diag("  - semantic_search_audiobooks: Search using semantic similarity")
-	diag("  - text_search_audiobooks: Search using full-text search")
-	diag("  - browse_audiobook_library: Browse library structure")
+	diag("  - text_search_audiobooks: Search using trigram keyword match")
+	diag("  - list_books: Library inventory (flat or author tree)")
+	diag("  - get_transcript: Read a track's full transcript (paginated segments)")
+	diag("  - get_chunk_context: Surrounding chunks around a search hit")
 	diag("")
 	diag("Transport: %s", transport)
 	if transport == "http" {

@@ -68,10 +68,6 @@ func (demoDB) SearchInBook(_ context.Context, query, dir string, _ int, _ float6
 	}, nil
 }
 
-func (demoDB) GetHierarchicalData(context.Context) ([]db.HierarchicalEntry, error) {
-	return nil, nil
-}
-
 func (demoDB) GetChunkContext(context.Context, string, int) ([]db.SearchResultWithMetadata, error) {
 	return nil, nil
 }

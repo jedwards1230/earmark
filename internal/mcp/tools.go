@@ -22,7 +22,6 @@ type DBInterface interface {
 	// SearchInBook runs semantic search scoped to one book directory via an exact
 	// (non-HNSW) distance scan, so a selective single-book filter keeps full recall.
 	SearchInBook(ctx context.Context, query, dir string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error)
-	GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error)
 	GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error)
 	// Ping checks that the database is reachable; used by /readyz.
 	Ping(ctx context.Context) error
@@ -106,6 +105,34 @@ func clampThreshold(threshold float64) float64 {
 // in the offset). No real library or transcript needs to page this deep.
 const maxOffset = 1_000_000
 
+// minSnippetChars is the floor a non-zero `snippet` is raised to, so a tiny
+// value (e.g. snippet=5) still yields a useful excerpt rather than a few letters.
+const minSnippetChars = 80
+
+// maxSnippetChars is the ceiling for the `snippet` parameter. Chunks are
+// ~400 words / ~2500 chars; any value at or above the full chunk length yields
+// the whole chunk anyway, so capping at 4000 is harmless and prevents large
+// rune-slice allocations from a malicious or misconfigured client.
+const maxSnippetChars = 4000
+
+// snippetChars normalizes the optional `snippet` param (max chars per hit).
+// 0 or negative → 0 (omitted: return the full chunk). A positive value below the
+// floor is raised to minSnippetChars; a value above the ceiling is clamped to
+// maxSnippetChars (a snippet ≥ the full chunk just returns the full chunk, so
+// the cap is harmless).
+func snippetChars(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n < minSnippetChars {
+		return minSnippetChars
+	}
+	if n > maxSnippetChars {
+		return maxSnippetChars
+	}
+	return n
+}
+
 // clampOffset bounds the pagination offset to [0, maxOffset].
 func clampOffset(offset int) int {
 	if offset < 0 {
@@ -130,6 +157,8 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 	threshold := clampThreshold(request.GetFloat("threshold", 0.3))
 	limit := clampLimit(request.GetInt("limit", 10), 10)
 	book := strings.TrimSpace(request.GetString("book", ""))
+	// snippet (max chars per hit). 0/omitted → full chunk; <0 ignored.
+	snippet := snippetChars(request.GetInt("snippet", 0))
 
 	// Scoped: resolve `book` → a canonical dir, then run an exact (non-HNSW)
 	// distance scan within that book so a selective filter keeps full recall.
@@ -138,16 +167,16 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 		if errResult != nil {
 			return errResult, nil
 		}
-		h.logger.Info("Performing scoped semantic search", "query", query, "book", book, "dir", dir, "threshold", threshold, "limit", limit)
+		h.logger.Info("Performing scoped semantic search", "query", query, "book", book, "dir", dir, "threshold", threshold, "limit", limit, "snippet", snippet)
 		results, err := h.db.SearchInBook(ctx, query, dir, limit, threshold)
 		if err != nil {
 			h.logger.Error("Scoped semantic search failed", "error", err)
 			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 		}
-		return formatSearchResults(results), nil
+		return formatSearchResultsOpts(results, searchSemantic, query, snippet), nil
 	}
 
-	h.logger.Info("Performing semantic search", "query", query, "threshold", threshold, "limit", limit)
+	h.logger.Info("Performing semantic search", "query", query, "threshold", threshold, "limit", limit, "snippet", snippet)
 
 	// Perform semantic search (whole library, HNSW-accelerated)
 	results, err := h.db.Search(ctx, query, limit, threshold)
@@ -157,7 +186,7 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 	}
 
 	// Format results using the shared formatting function
-	return formatSearchResults(results), nil
+	return formatSearchResultsOpts(results, searchSemantic, query, snippet), nil
 }
 
 // handleTextSearch performs full-text search on audiobook transcriptions, over
@@ -172,6 +201,8 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 	// Extract optional parameters
 	limit := clampLimit(request.GetInt("limit", 10), 10)
 	book := strings.TrimSpace(request.GetString("book", ""))
+	// snippet (max chars per hit). 0/omitted → full chunk; <0 ignored.
+	snippet := snippetChars(request.GetInt("snippet", 0))
 
 	// Scoped: resolve `book` → a canonical dir and reuse the per-book text search.
 	if book != "" {
@@ -179,16 +210,16 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 		if errResult != nil {
 			return errResult, nil
 		}
-		h.logger.Info("Performing scoped text search", "query", query, "book", book, "dir", dir, "limit", limit)
+		h.logger.Info("Performing scoped text search", "query", query, "book", book, "dir", dir, "limit", limit, "snippet", snippet)
 		results, err := h.db.TextSearchInBook(ctx, dir, query, limit)
 		if err != nil {
 			h.logger.Error("Scoped text search failed", "error", err)
 			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 		}
-		return formatSearchResults(results), nil
+		return formatSearchResultsOpts(results, searchText, query, snippet), nil
 	}
 
-	h.logger.Info("Performing text search", "query", query, "limit", limit)
+	h.logger.Info("Performing text search", "query", query, "limit", limit, "snippet", snippet)
 
 	// Perform text search (whole library)
 	results, err := h.db.TextSearch(ctx, query, limit)
@@ -198,7 +229,7 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 	}
 
 	// Format results using the shared formatting function
-	return formatSearchResults(results), nil
+	return formatSearchResultsOpts(results, searchText, query, snippet), nil
 }
 
 // bookCandidate pairs a resolved book directory with its display labels, used
@@ -264,8 +295,11 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 	limit := clampLimit(request.GetInt("limit", 50), 50)
 	offset := clampOffset(request.GetInt("offset", 0))
 	author := strings.TrimSpace(request.GetString("author", ""))
+	// format: "flat" (default, one entry per book) or "tree" (group books by
+	// author). Both query the same rows; tree only regroups them in the formatter.
+	format := strings.ToLower(strings.TrimSpace(request.GetString("format", "flat")))
 
-	h.logger.Info("Listing books", "limit", limit, "offset", offset, "author", author)
+	h.logger.Info("Listing books", "limit", limit, "offset", offset, "author", author, "format", format)
 
 	summaries, total, err := h.db.GetBookSummaries(ctx, db.BookFilter{
 		Query: author, Limit: limit, Offset: offset,
@@ -275,6 +309,9 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list books: %v", err)), nil
 	}
 
+	if format == "tree" {
+		return formatBookTree(summaries, total, offset, h.resolver), nil
+	}
 	return formatBookList(summaries, total, offset, h.resolver), nil
 }
 
@@ -325,33 +362,6 @@ func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.Call
 	}
 
 	return formatTranscriptPage(detail, offset, limit), nil
-}
-
-// handleBrowseLibrary browses the audiobook library structure
-func (h *ToolHandlers) handleBrowseLibrary(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract optional filter parameters
-	authorFilter := request.GetString("author", "")
-	bookFilter := request.GetString("book", "")
-
-	h.logger.Info("Browsing audiobook library", "author", authorFilter, "book", bookFilter)
-
-	// Get hierarchical library data
-	data, err := h.db.GetHierarchicalData(ctx)
-	if err != nil {
-		h.logger.Error("Failed to get library data", "error", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to browse library: %v", err)), nil
-	}
-
-	// Apply filter if provided
-	var filteredData []db.HierarchicalEntry
-	if authorFilter != "" || bookFilter != "" {
-		filteredData = filterHierarchicalData(data, authorFilter, bookFilter)
-	} else {
-		filteredData = data
-	}
-
-	// Format results using the shared formatting function
-	return formatHierarchicalData(filteredData), nil
 }
 
 // handleGetContext retrieves surrounding chunks for better context

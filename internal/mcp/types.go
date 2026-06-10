@@ -160,17 +160,44 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int) *mcp.CallToolRes
 	return textResult(b.String())
 }
 
-// formatSearchResults converts search results to MCP text content
+// searchKind labels how a result set was ranked, so the formatter can render an
+// honest relevance line. Semantic results carry a real cosine-similarity score;
+// text (trigram) results are ranked by pg_trgm match — a value the user must not
+// read as a semantic-vector score (a literal hit can show a ~1% trigram score).
+type searchKind int
+
+const (
+	// searchContext is the neutral kind for get_chunk_context, where there is no
+	// query-relative relevance to report (the rows are positional neighbours).
+	searchContext searchKind = iota
+	// searchSemantic ranks by vector cosine similarity (semantic_search_audiobooks).
+	searchSemantic
+	// searchText ranks by pg_trgm trigram match (text_search_audiobooks).
+	searchText
+)
+
+// formatSearchResults renders results with no query-relative relevance line —
+// used by get_chunk_context, whose rows are positional neighbours, not ranked
+// hits. Search tools use formatSearchResultsOpts so they can label relevance and
+// honour the snippet window.
 func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolResult {
+	return formatSearchResultsOpts(results, searchContext, "", 0)
+}
+
+// formatSearchResultsOpts renders search results as MCP text content.
+//
+//   - kind controls the per-hit relevance line: semantic shows "similarity: NN%"
+//     (a real cosine score); text shows "trigram match" (NOT a semantic score —
+//     pg_trgm values are tiny for a literal hit and would mislead if labelled
+//     "similarity"); context omits the line entirely.
+//   - query/snippet drive the optional excerpt window: when snippet > 0 the chunk
+//     text is truncated to ~snippet chars. Text search centres the window on the
+//     literal query match; semantic search returns a leading preview (no
+//     sub-chunk match position exists). Truncated text gets a marker pointing at
+//     get_chunk_context for the full surrounding text.
+func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchKind, query string, snippet int) *mcp.CallToolResult {
 	if len(results) == 0 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				mcp.TextContent{
-					Type: "text",
-					Text: "No results found.",
-				},
-			},
-		}
+		return textResult("No results found.")
 	}
 
 	var output strings.Builder
@@ -180,10 +207,20 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 		// Format: **Title** by Author
 		fmt.Fprintf(&output, "**%s** by %s\n", result.Title, result.Author)
 
-		// Format: Chapter X: Title (chunk Y/Z, similarity: XX%)
-		similarity := int(result.Similarity * 100)
-		fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d, similarity: %d%%)\n",
-			result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks, similarity)
+		// Relevance line varies by ranking mechanism.
+		switch kind {
+		case searchSemantic:
+			fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d, similarity: %d%%)\n",
+				result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks, int(result.Similarity*100))
+		case searchText:
+			// pg_trgm rank — deliberately NOT shown as a percentage "similarity",
+			// which reads like a broken semantic score for literal matches.
+			fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d, ranked by trigram match)\n",
+				result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks)
+		default: // searchContext
+			fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d)\n",
+				result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks)
+		}
 
 		// Enhanced citation info
 		if result.ChunkID != "" {
@@ -197,8 +234,16 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 			output.WriteString("\n")
 		}
 
-		// Format: > Content
-		fmt.Fprintf(&output, "> %s\n", result.Content)
+		// Format: > Content (optionally windowed to a snippet).
+		content := result.Content
+		if snippet > 0 {
+			if excerpt, truncated := makeSnippet(content, query, snippet, kind); truncated {
+				content = excerpt + " …(truncated, use get_chunk_context for full text)"
+			} else {
+				content = excerpt
+			}
+		}
+		fmt.Fprintf(&output, "> %s\n", content)
 
 		// Add spacing between results
 		if result.ID != results[len(results)-1].ID {
@@ -206,66 +251,133 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 		}
 	}
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			mcp.TextContent{
-				Type: "text",
-				Text: output.String(),
-			},
-		},
-	}
+	return textResult(output.String())
 }
 
-// formatHierarchicalData converts hierarchical library data to MCP text content.
-// Each HierarchicalEntry has a FilePath and ChunkCount; we derive a display
-// name from the file path.
-func formatHierarchicalData(entries []db.HierarchicalEntry) *mcp.CallToolResult {
-	var output strings.Builder
-	output.WriteString("📚 **Audiobook Library**\n\n")
+// makeSnippet trims content to roughly max characters. For text search it centres
+// the window on the first case-insensitive occurrence of query; for semantic
+// search (or when query is absent / not found) it returns a leading window. It
+// reports whether the content was actually shortened so the caller can append a
+// truncation marker. Trimming is rune-safe and snaps to surrounding spaces so
+// words aren't sliced mid-character/mid-word.
+func makeSnippet(content, query string, max int, kind searchKind) (string, bool) {
+	r := []rune(content)
+	if len(r) <= max {
+		return content, false
+	}
 
-	if len(entries) == 0 {
-		output.WriteString("No audiobooks found.")
-	} else {
-		for i, entry := range entries {
-			prefix := "├──"
-			if i == len(entries)-1 {
-				prefix = "└──"
+	start := 0
+	if kind == searchText && query != "" {
+		if idx := strings.Index(strings.ToLower(content), strings.ToLower(query)); idx >= 0 {
+			// idx is a byte offset; convert to a rune offset, then centre the window.
+			matchRune := len([]rune(content[:idx]))
+			start = matchRune - (max-len([]rune(query)))/2
+			if start < 0 {
+				start = 0
 			}
-			name := filepath.Base(entry.FilePath)
-			fmt.Fprintf(&output, "%s %s (%d chunks)\n", prefix, name, entry.ChunkCount)
+		}
+	}
+	end := start + max
+	if end > len(r) {
+		end = len(r)
+		start = end - max
+		if start < 0 {
+			start = 0
 		}
 	}
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			mcp.TextContent{
-				Type: "text",
-				Text: output.String(),
-			},
-		},
+	// Snap the start forward to the next space (so we don't begin mid-word) when
+	// we're not already at the very beginning.
+	if start > 0 {
+		for start < end && r[start] != ' ' {
+			start++
+		}
+		for start < end && r[start] == ' ' {
+			start++
+		}
 	}
+	// Snap the end back to the previous space for the same reason.
+	if end < len(r) {
+		for end > start && r[end-1] != ' ' {
+			end--
+		}
+	}
+	if start >= end { // degenerate (e.g. a single very long token) → hard cut.
+		start, end = 0, max
+	}
+
+	excerpt := strings.TrimSpace(string(r[start:end]))
+	prefix, suffix := "", ""
+	if start > 0 {
+		prefix = "…"
+	}
+	if end < len(r) {
+		suffix = "…"
+	}
+	return prefix + excerpt + suffix, true
 }
 
-// filterHierarchicalData filters entries by path substring matches
-// (case-insensitive). Both authorFilter and bookFilter must match
-// independently — an entry is included only if the file path contains
-// both substrings (when non-empty).
-func filterHierarchicalData(entries []db.HierarchicalEntry, authorFilter, bookFilter string) []db.HierarchicalEntry {
-	if authorFilter == "" && bookFilter == "" {
-		return entries
+// authorGroup is one author and their books, used to render the list_books tree.
+type authorGroup struct {
+	author string
+	books  []db.BookSummary
+}
+
+// formatBookTree renders the same inventory as formatBookList but grouped by
+// author (list_books format=tree). It only regroups the rows list_books already
+// produced — no new queries — so author → books, books in their original order.
+func formatBookTree(books []db.BookSummary, total, offset int, resolver *library.Resolver) *mcp.CallToolResult {
+	if len(books) == 0 {
+		return textResult("No books found.")
 	}
 
-	authorFilter = strings.ToLower(authorFilter)
-	bookFilter = strings.ToLower(bookFilter)
-
-	var filtered []db.HierarchicalEntry
-	for _, entry := range entries {
-		path := strings.ToLower(entry.FilePath)
-		authorMatch := authorFilter == "" || strings.Contains(path, authorFilter)
-		bookMatch := bookFilter == "" || strings.Contains(path, bookFilter)
-		if authorMatch && bookMatch {
-			filtered = append(filtered, entry)
+	// Group books by resolver-derived author, preserving first-seen order.
+	var groups []authorGroup
+	index := map[string]int{}
+	for _, bk := range books {
+		author, _ := resolver.Resolve(bk.Dir, bk.SamplePath)
+		if author == "" {
+			author = "Unknown"
+		}
+		if i, ok := index[author]; ok {
+			groups[i].books = append(groups[i].books, bk)
+		} else {
+			index[author] = len(groups)
+			groups = append(groups, authorGroup{author: author, books: []db.BookSummary{bk}})
 		}
 	}
-	return filtered
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Library: %d book(s) across %d author(s)", total, len(groups))
+	if offset > 0 || len(books) < total {
+		fmt.Fprintf(&b, " (showing %d–%d)", offset+1, offset+len(books))
+	}
+	b.WriteString("\n\n")
+
+	for _, g := range groups {
+		fmt.Fprintf(&b, "%s\n", g.author)
+		for _, bk := range g.books {
+			_, title := resolver.Resolve(bk.Dir, bk.SamplePath)
+			if title == "" {
+				title = filepath.Base(bk.Dir)
+			}
+			fmt.Fprintf(&b, "  • %s — tracks: %d/%d done", title, bk.Done, bk.Total)
+			if bk.Pending > 0 {
+				fmt.Fprintf(&b, ", %d pending", bk.Pending)
+			}
+			if bk.Failed > 0 {
+				fmt.Fprintf(&b, ", %d failed", bk.Failed)
+			}
+			fmt.Fprintf(&b, " | duration: %s | words: %s | chunks: %s\n",
+				fmtHMS(bk.DurationSeconds), intOrDash(bk.WordCount), intOrDash(bk.EmbedChunkCount))
+			fmt.Fprintf(&b, "    dir: %s\n", bk.Dir)
+		}
+		b.WriteString("\n")
+	}
+
+	if offset+len(books) < total {
+		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, offset+len(books))
+	}
+
+	return textResult(strings.TrimRight(b.String(), "\n"))
 }

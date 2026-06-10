@@ -1,199 +1,178 @@
 package mcp
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/library"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 )
 
+// TestFormatSearchResults covers the get_chunk_context path: positional
+// neighbours with NO similarity/relevance line (that line is reserved for the
+// ranked search tools, which use formatSearchResultsOpts).
 func TestFormatSearchResults(t *testing.T) {
 	tests := []struct {
 		name     string
 		results  []db.SearchResultWithMetadata
-		expected *mcp.CallToolResult
+		expected string
 	}{
 		{
-			name: "single search result",
+			name: "single context result has no relevance line",
 			results: []db.SearchResultWithMetadata{
 				{
-					ID:            "chunk-uuid-1",
-					Content:       "The dragon soared through the sky",
-					Author:        "J.R.R. Tolkien",
-					Title:         "The Hobbit",
-					Chapter:       "Chapter 1: An Unexpected Party",
-					ChunkIndex:    5,
-					Similarity:    0.85,
-					ChapterIndex:  1,
-					ChapterTitle:  "An Unexpected Party",
-					TotalChunks:   50,
-					TotalChapters: 19,
-					FilePath:      "/media/audiobooks/tolkien/the-hobbit.m4b",
-					FileChecksum:  "abc123def456",
-					ChunkID:       "J.R.R. Tolkien_The Hobbit_1_5",
-					WordCount:     8,
-					ISBN:          "9780547928227",
-					ASIN:          "B0099RNJB2",
+					ID:           "chunk-uuid-1",
+					Content:      "The dragon soared through the sky",
+					Author:       "J.R.R. Tolkien",
+					Title:        "The Hobbit",
+					ChunkIndex:   5,
+					Similarity:   0.85,
+					ChapterIndex: 1,
+					ChapterTitle: "An Unexpected Party",
+					TotalChunks:  50,
+					FilePath:     "/media/audiobooks/tolkien/the-hobbit.m4b",
+					ChunkID:      "11111111-1111-1111-1111-111111111111",
+					WordCount:    8,
 				},
 			},
-			expected: &mcp.CallToolResult{
-				Content: []mcp.Content{
-					mcp.TextContent{
-						Type: "text",
-						Text: `Found 1 result(s):
+			expected: `Found 1 result(s):
 
 **The Hobbit** by J.R.R. Tolkien
-Chapter 1: An Unexpected Party (chunk 6/50, similarity: 85%)
-ID: J.R.R. Tolkien_The Hobbit_1_5 | File: /media/audiobooks/tolkien/the-hobbit.m4b | Words: 8
+Chapter 1: An Unexpected Party (chunk 6/50)
+ID: 11111111-1111-1111-1111-111111111111 | File: /media/audiobooks/tolkien/the-hobbit.m4b | Words: 8
 > The dragon soared through the sky
 `,
-					},
-				},
-			},
 		},
 		{
-			name:    "empty results",
-			results: []db.SearchResultWithMetadata{},
-			expected: &mcp.CallToolResult{
-				Content: []mcp.Content{
-					mcp.TextContent{
-						Type: "text",
-						Text: "No results found.",
-					},
-				},
-			},
-		},
-		{
-			name: "multiple results",
-			results: []db.SearchResultWithMetadata{
-				{
-					ID:            "chunk-uuid-2",
-					Content:       "First result content",
-					Author:        "Author One",
-					Title:         "Book One",
-					Chapter:       "Chapter 1",
-					ChunkIndex:    0,
-					Similarity:    0.9,
-					ChapterIndex:  1,
-					ChapterTitle:  "Chapter 1",
-					TotalChunks:   10,
-					TotalChapters: 5,
-					FilePath:      "/media/audiobooks/author-one/book-one.m4b",
-					FileChecksum:  "def789ghi012",
-					ChunkID:       "Author One_Book One_1_0",
-					WordCount:     4,
-				},
-				{
-					ID:            "chunk-uuid-3",
-					Content:       "Second result content",
-					Author:        "Author Two",
-					Title:         "Book Two",
-					Chapter:       "Chapter 2",
-					ChunkIndex:    1,
-					Similarity:    0.7,
-					ChapterIndex:  2,
-					ChapterTitle:  "Chapter 2",
-					TotalChunks:   20,
-					TotalChapters: 8,
-					FilePath:      "/media/audiobooks/author-two/book-two.m4b",
-					FileChecksum:  "ghi345jkl678",
-					ChunkID:       "Author Two_Book Two_2_1",
-					WordCount:     5,
-				},
-			},
-			expected: &mcp.CallToolResult{
-				Content: []mcp.Content{
-					mcp.TextContent{
-						Type: "text",
-						Text: `Found 2 result(s):
-
-**Book One** by Author One
-Chapter 1: Chapter 1 (chunk 1/10, similarity: 90%)
-ID: Author One_Book One_1_0 | File: /media/audiobooks/author-one/book-one.m4b | Words: 4
-> First result content
-
-**Book Two** by Author Two
-Chapter 2: Chapter 2 (chunk 2/20, similarity: 70%)
-ID: Author Two_Book Two_2_1 | File: /media/audiobooks/author-two/book-two.m4b | Words: 5
-> Second result content
-`,
-					},
-				},
-			},
+			name:     "empty results",
+			results:  []db.SearchResultWithMetadata{},
+			expected: "No results found.",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := formatSearchResults(tt.results)
-			assert.Equal(t, tt.expected.Content[0].(mcp.TextContent).Text,
-				result.Content[0].(mcp.TextContent).Text)
+			assert.Equal(t, tt.expected, result.Content[0].(mcp.TextContent).Text)
 		})
 	}
 }
 
-func TestFormatHierarchicalData(t *testing.T) {
-	tests := []struct {
-		name         string
-		entries      []db.HierarchicalEntry
-		expectedText string
-	}{
-		{
-			name: "single file entry",
-			entries: []db.HierarchicalEntry{
-				{FilePath: "/books/Tolkien/The Hobbit/ch1.mp3", ChunkCount: 42},
-			},
-			expectedText: "📚 **Audiobook Library**\n\n└── ch1.mp3 (42 chunks)\n",
-		},
-		{
-			name:         "empty library",
-			entries:      []db.HierarchicalEntry{},
-			expectedText: "📚 **Audiobook Library**\n\nNo audiobooks found.",
-		},
-		{
-			name: "multiple entries",
-			entries: []db.HierarchicalEntry{
-				{FilePath: "/books/A/Book/ch1.mp3", ChunkCount: 10},
-				{FilePath: "/books/B/Book/ch2.mp3", ChunkCount: 20},
-			},
-			expectedText: "📚 **Audiobook Library**\n\n├── ch1.mp3 (10 chunks)\n└── ch2.mp3 (20 chunks)\n",
-		},
+// TestFormatSemanticVsTextRelevance is the regression guard for the misleading
+// text-search "similarity" line: semantic results show a similarity percentage;
+// text results show "trigram match" and NEVER a percentage.
+func TestFormatSemanticVsTextRelevance(t *testing.T) {
+	res := []db.SearchResultWithMetadata{{
+		ID: "c1", Content: "the spice must flow", Author: "Frank Herbert", Title: "Dune",
+		ChunkIndex: 2, ChapterIndex: 3, ChapterTitle: "Arrakis", TotalChunks: 40,
+		Similarity: 0.012, ChunkID: "c1",
+	}}
+
+	semantic := formatSearchResultsOpts(res, searchSemantic, "spice", 0).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, semantic, "similarity: 1%")
+
+	text := formatSearchResultsOpts(res, searchText, "spice", 0).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "ranked by trigram match")
+	assert.NotContains(t, text, "similarity:")
+	assert.NotContains(t, text, "%)") // no percentage on a literal-match hit
+}
+
+// TestSnippetTruncation covers both truncation paths: text search centres the
+// window on the literal match; semantic search returns a leading preview. Both
+// append the get_chunk_context marker only when actually shortened.
+func TestSnippetTruncation(t *testing.T) {
+	// A leading run of filler well over the 80-char window, then NEEDLE far out so
+	// a leading preview clearly excludes it while a centred window includes it.
+	long := "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi " +
+		"omicron pi rho sigma tau upsilon phi chi psi omega aaa bbb ccc ddd eee fff " +
+		"ggg hhh iii jjj NEEDLE kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www"
+	res := []db.SearchResultWithMetadata{{
+		ID: "c1", Content: long, Author: "A", Title: "B", ChunkIndex: 0, TotalChunks: 1, ChunkID: "c1",
+	}}
+
+	// Text search, snippet=80, query NEEDLE → centred excerpt that includes NEEDLE.
+	text := formatSearchResultsOpts(res, searchText, "NEEDLE", 80).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "NEEDLE")
+	assert.Contains(t, text, "(truncated, use get_chunk_context for full text)")
+	assert.NotContains(t, text, "alpha beta gamma") // leading text dropped by centring
+
+	// Semantic search, snippet=80 → leading preview (starts at alpha, excludes the
+	// far-out NEEDLE since there is no sub-chunk match position to centre on).
+	sem := formatSearchResultsOpts(res, searchSemantic, "NEEDLE", 80).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, sem, "alpha beta")
+	assert.NotContains(t, sem, "NEEDLE")
+	assert.Contains(t, sem, "(truncated, use get_chunk_context for full text)")
+
+	// snippet larger than the content → no truncation, no marker.
+	full := formatSearchResultsOpts(res, searchSemantic, "", 100000).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, full, long)
+	assert.NotContains(t, full, "(truncated")
+}
+
+// TestMakeSnippetKindGate tests makeSnippet directly to assert the centering gate
+// is kind-gated: searchSemantic ALWAYS returns a leading window, even when the
+// query string appears mid-chunk; searchText centres on the match.
+func TestMakeSnippetKindGate(t *testing.T) {
+	// Build a chunk whose query word sits well past the first 80 chars so that a
+	// leading window excludes it while a centred window includes it.
+	prefix := "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 "
+	needle := "TARGET"
+	suffix := " word13 word14 word15 word16 word17 word18 word19 word20"
+	chunk := prefix + needle + suffix
+	max := 80
+
+	// searchSemantic: NEVER centres — even when needle is in the content, the
+	// result must be a leading window that starts at the beginning of the chunk.
+	semSnip, truncated := makeSnippet(chunk, needle, max, searchSemantic)
+	if truncated {
+		// Leading window: must start with the first word(s) of the chunk.
+		if !strings.HasPrefix(semSnip, "word1") && !strings.HasPrefix(semSnip, "…") {
+			// Allow a leading ellipsis only if start==0 (it won't be here).
+			t.Errorf("semantic snippet does not start at chunk beginning: %q", semSnip)
+		}
+		// Must NOT contain the needle (it is beyond the leading window).
+		if strings.Contains(semSnip, needle) {
+			t.Errorf("semantic snippet centered on query match (contains %q); want leading preview: %q", needle, semSnip)
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := formatHierarchicalData(tt.entries)
-			assert.Equal(t, tt.expectedText, result.Content[0].(mcp.TextContent).Text)
-		})
+	// searchText: DOES centre — the excerpt must contain the needle.
+	textSnip, _ := makeSnippet(chunk, needle, max, searchText)
+	if !strings.Contains(textSnip, needle) {
+		t.Errorf("text snippet does not contain query match %q: %q", needle, textSnip)
 	}
 }
 
-func TestFilterHierarchicalData(t *testing.T) {
-	entries := []db.HierarchicalEntry{
-		{FilePath: "/books/J.R.R. Tolkien/The Hobbit/ch1.mp3", ChunkCount: 5},
-		{FilePath: "/books/J.R.R. Tolkien/The Fellowship/ch1.mp3", ChunkCount: 8},
-		{FilePath: "/books/Brandon Sanderson/The Way of Kings/ch1.mp3", ChunkCount: 12},
+// TestFormatBookTree asserts the author-grouped list_books output groups the same
+// rows under their author with the same per-book metadata.
+func TestFormatBookTree(t *testing.T) {
+	resolver := library.NewResolver("/books", []library.Collection{
+		{Root: "audio-libation", Layout: "author/title"},
+	})
+	books := []db.BookSummary{
+		{Dir: "/books/audio-libation/Andy Weir/Project Hail Mary",
+			SamplePath: "/books/audio-libation/Andy Weir/Project Hail Mary/PHM.m4b",
+			Total:      1, Done: 1, DurationSeconds: fpT(58320), WordCount: ipT(124800), EmbedChunkCount: ipT(412)},
+		{Dir: "/books/audio-libation/Andy Weir/The Martian",
+			SamplePath: "/books/audio-libation/Andy Weir/The Martian/TM.m4b",
+			Total:      1, Done: 1},
+		{Dir: "/books/audio-libation/Frank Herbert/Dune",
+			SamplePath: "/books/audio-libation/Frank Herbert/Dune/01.mp3",
+			Total:      24, Done: 22, Pending: 2},
 	}
-
-	tests := []struct {
-		name          string
-		authorFilter  string
-		bookFilter    string
-		expectedCount int
-	}{
-		{"no filters", "", "", 3},
-		{"filter by tolkien", "tolkien", "", 2},
-		{"filter by hobbit", "", "hobbit", 1},
-		{"combined filter", "tolkien", "fellowship", 1},
-		{"no matches", "nonexistent", "", 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			filtered := filterHierarchicalData(entries, tt.authorFilter, tt.bookFilter)
-			assert.Len(t, filtered, tt.expectedCount)
-		})
-	}
+	out := formatBookTree(books, 3, 0, resolver).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, out, "Library: 3 book(s) across 2 author(s)")
+	assert.Contains(t, out, "Andy Weir\n")
+	assert.Contains(t, out, "Frank Herbert\n")
+	assert.Contains(t, out, "• Project Hail Mary — tracks: 1/1 done")
+	assert.Contains(t, out, "• The Martian — tracks: 1/1 done")
+	assert.Contains(t, out, "• Dune — tracks: 22/24 done, 2 pending")
+	assert.Contains(t, out, "words: 124800")
+	assert.Contains(t, out, "chunks: 412")
 }
+
+func fpT(v float64) *float64 { return &v }
+func ipT(v int) *int         { return &v }

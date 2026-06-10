@@ -81,7 +81,10 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	mcpServer.AddTool(mcp.NewTool("semantic_search_audiobooks",
 		mcp.WithDescription("Search audiobook transcriptions by meaning (vector similarity). "+
 			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. "+
-			"Use this to find passages about a concept; use list_books to discover titles and get_transcript to read full text."),
+			"Each hit is a chunk (the embedding/search unit — a chunk is tens of consecutive ASR "+
+			"segments grouped together, so one book has far fewer chunks than segments). "+
+			"Use this to find passages about a concept; use list_books to discover titles, "+
+			"get_chunk_context to expand around a hit, and get_transcript to read full text."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("query",
 			mcp.Description("The search query to find relevant content"),
@@ -98,12 +101,21 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			mcp.Description("Maximum number of results to return (default: 10)"),
 			mcp.DefaultNumber(10),
 		),
+		mcp.WithNumber("snippet",
+			mcp.Description("Optional: cap each hit's quoted text to roughly this many characters to keep iterative searches cheap. "+
+				"Omit to return the full ~400-word chunk (default). A semantic hit has no sub-chunk match position, so the "+
+				"snippet is a leading PREVIEW of the chunk, not a centered excerpt — use get_chunk_context for the full "+
+				"surrounding text."),
+		),
 	), handlers.handleSemanticSearch)
 
 	// Add text search tool
 	mcpServer.AddTool(mcp.NewTool("text_search_audiobooks",
-		mcp.WithDescription("Search audiobook transcriptions by literal/keyword text (trigram full-text search). "+
+		mcp.WithDescription("Search audiobook transcriptions by literal/keyword text (trigram match). "+
 			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. "+
+			"Each hit is a chunk (the search unit — a chunk is tens of consecutive ASR segments grouped "+
+			"together). Ranked by trigram match, not vector distance — results carry a \"trigram match\" "+
+			"label, NOT a semantic-similarity score. "+
 			"Use this for exact phrases or names; use semantic_search_audiobooks for conceptual queries."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("query",
@@ -117,6 +129,11 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			mcp.Description("Maximum number of results to return (default: 10)"),
 			mcp.DefaultNumber(10),
 		),
+		mcp.WithNumber("snippet",
+			mcp.Description("Optional: cap each hit's quoted text to roughly this many characters to keep iterative searches cheap. "+
+				"Omit to return the full ~400-word chunk (default). When set, the excerpt is CENTERED on the literal query "+
+				"match within the chunk. Use get_chunk_context for the full surrounding text."),
+		),
 	), handlers.handleTextSearch)
 
 	// Add list_books tool — the library inventory.
@@ -124,10 +141,15 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		mcp.WithDescription("List the audiobook library inventory: each book with author, title, "+
 			"track progress (done/total), total duration, word count, and embedded-chunk count. "+
 			"This is the inventory tool — use it to discover which titles exist before scoping a "+
-			"search or fetching a transcript."),
+			"search or fetching a transcript. Pass format=tree to group the same books under their "+
+			"authors instead of a flat list."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("author",
 			mcp.Description("Optional: filter to books whose path/author matches this substring (case-insensitive)."),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output shape: \"flat\" (default) — one entry per book; or \"tree\" — group books by author. "+
+				"Both list the same books with the same metadata; tree only changes the grouping."),
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of books to return (default: 50)"),
@@ -142,7 +164,9 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// Add get_transcript tool — read the full transcript text (paginated).
 	mcpServer.AddTool(mcp.NewTool("get_transcript",
 		mcp.WithDescription("Read the full transcript of a book/track as timestamped segments, so you can "+
-			"READ the text rather than only search fragments. Provide `book` (a title) or `trackID` (a job id "+
+			"READ the text rather than only search fragments. This paginates SEGMENTS (raw ASR "+
+			"timestamp units — there are far more segments than search chunks; a chunk is tens of "+
+			"consecutive segments grouped for embedding). Provide `book` (a title) or `trackID` (a job id "+
 			"from list_books / a track chooser). Transcripts are large, so segments are paginated via "+
 			"offset/limit; the response footer tells you the next offset. If a book has multiple tracks, this "+
 			"returns the track list so you can pick one by trackID."),
@@ -163,24 +187,15 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		),
 	), handlers.handleGetTranscript)
 
-	// Add browse library tool
-	mcpServer.AddTool(mcp.NewTool("browse_audiobook_library",
-		mcp.WithDescription("Browse the audiobook library structure and metadata"),
-		mcp.WithToolAnnotation(readOnlyAnnotations),
-		mcp.WithString("author",
-			mcp.Description("Filter by author name (case-insensitive partial match)"),
-		),
-		mcp.WithString("book",
-			mcp.Description("Filter by book title (case-insensitive partial match)"),
-		),
-	), handlers.handleBrowseLibrary)
-
 	// Add chunk context tool
 	mcpServer.AddTool(mcp.NewTool("get_chunk_context",
-		mcp.WithDescription("Get surrounding chunks for better context around a specific chunk"),
+		mcp.WithDescription("Get the chunks surrounding a search hit, so you can read the full text around a match. "+
+			"Operates on CHUNKS (the search/embedding unit — a chunk is tens of consecutive ASR segments grouped "+
+			"together; use get_transcript to page raw segments instead). Pass the chunk's UUID from a search result."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("chunkID",
-			mcp.Description("The unique chunk ID (format: author_book_chapter_chunk)"),
+			mcp.Description("The chunk UUID returned in the `ID` field of semantic_search_audiobooks / "+
+				"text_search_audiobooks results."),
 			mcp.Required(),
 		),
 		mcp.WithNumber("contextWindow",
