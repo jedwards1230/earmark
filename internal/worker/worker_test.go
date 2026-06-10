@@ -232,6 +232,32 @@ func TestProcessTranscript_InsertError(t *testing.T) {
 	require.Contains(t, err.Error(), "db write failed")
 }
 
+// TestProcessTranscript_MetricsWriteError verifies that a UpsertEmbedMetrics
+// failure is best-effort: the transcript processing still SUCCEEDS (chunks are
+// written) and the error does not propagate to the caller.
+func TestProcessTranscript_MetricsWriteError(t *testing.T) {
+	fdb := &fakeDB{metricsErr: fmt.Errorf("boom")}
+	w := &Worker{
+		ctx: context.Background(),
+		db:  fdb,
+		log: log.NewLogger("worker-test"),
+	}
+	cfg := &config.Config{ChunkSize: 10, EmbeddingsModel: "nomic-embed-text"}
+	transcript := &db.Transcript{
+		ID:       "tid-merr",
+		JobID:    "job-merr",
+		FilePath: "/books/author/title/ch1.mp3",
+		RawText:  "Hello world this is a test transcript for chunking.",
+	}
+
+	// The call must succeed — metrics failure is swallowed.
+	err := w.processTranscript(cfg, transcript)
+	require.NoError(t, err, "metrics write error must not propagate")
+
+	// Chunks must still be written.
+	require.NotEmpty(t, fdb.chunks, "chunks must be inserted despite metrics error")
+}
+
 // M-6: embed error case with segments present.
 func TestProcessTranscript_EmbedErrorWithSegments(t *testing.T) {
 	fdb := &fakeDB{embedErr: fmt.Errorf("ollama timeout")}

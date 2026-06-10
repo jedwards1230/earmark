@@ -191,6 +191,28 @@ func TestMonitorScan(t *testing.T) {
 	if len(db.inserted) != 2 {
 		t.Errorf("expected 2 jobs after scan (AppleDouble skipped), got %d", len(db.inserted))
 	}
+
+	// audio_bytes must be recorded for each enqueued file (per-run observability).
+	if len(db.audioBytes) != 2 {
+		t.Fatalf("expected audio_bytes recorded for 2 jobs, got %d", len(db.audioBytes))
+	}
+	for jobID, b := range db.audioBytes {
+		if b <= 0 {
+			t.Errorf("job %s: expected positive audio_bytes, got %d", jobID, b)
+		}
+	}
+	// Verify each recorded size matches the actual file content.
+	for name, content := range audioFiles {
+		path := filepath.Join(dir, name)
+		jobID, ok := db.insertedPath[path]
+		if !ok {
+			t.Errorf("no job found for path %s", path)
+			continue
+		}
+		if got := db.audioBytes[jobID]; got != int64(len(content)) {
+			t.Errorf("%s: expected audio_bytes=%d, got %d", name, len(content), got)
+		}
+	}
 }
 
 func TestMonitorScanSkipsKnownPaths(t *testing.T) {
