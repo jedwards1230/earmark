@@ -117,7 +117,7 @@ Debug-only (both must be set):
 | `internal/db` | pgxpool-based DB handle; schema init; job queue; search; chunks |
 | `internal/worker` | Polls completed transcripts, chunks via segments, embeds, stores |
 | `internal/monitor` | Walks BOOKS_DIR, inserts pending jobs (dedup by SHA-256) |
-| `internal/mcp` | MCP server + tool handlers — 5 tools: semantic/text search (optional per-book scope + `snippet` excerpt window; text hits labelled "trigram match", not similarity), `list_books` (`format=flat\|tree`), `get_transcript` (paginates segments), `get_chunk_context` (chunk UUID → neighbours). No `browse` tool. |
+| `internal/mcp` | MCP server + tool handlers — 5 tools: semantic/text search (optional per-book scope + `snippet` excerpt window; text hits labelled "trigram match", not similarity; ASIN-aware `book` resolution — bracketed `[B0…]`/`[digits]` matches ASIN exactly, else title+author substring with ASIN stripped), `list_books` (`format=flat\|tree`; transcribed-first ordering, whole-library summary line, flat omits `dir:`), `get_transcript` (paginates segments), `get_chunk_context` (chunk UUID → neighbours; `contextWindow` default 1). No `browse` tool. Result formatter suppresses the dead `Chapter 0:` label. |
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client (pointed at Ollama) |
 | `internal/config` | Env-var configuration loader |

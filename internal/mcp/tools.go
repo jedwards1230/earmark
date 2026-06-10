@@ -46,6 +46,10 @@ type DBInterface interface {
 	// GetBookSummaries returns one row per book directory (the library view),
 	// plus the total matching-book count for pagination.
 	GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error)
+	// GetLibraryTotals returns whole-library book counts (total, fully
+	// transcribed, with pending) for the list_books summary line. query scopes it
+	// to the same author filter list_books uses (empty = whole library).
+	GetLibraryTotals(ctx context.Context, query string) (db.LibraryTotals, error)
 	// GetBookTracks returns the individual track jobs for one book directory.
 	GetBookTracks(ctx context.Context, dir string) ([]db.RecentJob, error)
 	// GetTrackDetail returns the full per-track view (job + transcript + metrics +
@@ -260,12 +264,20 @@ type bookCandidate struct {
 // resolveBookDir maps a user-supplied `book` string (a book name or directory
 // substring) to a single canonical book directory. It queries GetBookSummaries
 // with the term as an ILIKE filter, resolves each candidate's author/title via
-// the resolver, then keeps candidates whose dir, title, or "author - title"
-// label contains the term (case-insensitive). Exactly one match → its dir;
-// zero or many → a helpful error result listing candidate labels.
+// the resolver, then keeps candidates by one of two rules:
 //
-// The returned *mcp.CallToolResult is non-nil only on the error/ambiguous path
-// (already formatted for return to the model); dir is set only on success.
+//   - If the query contains a bracketed catalogue id (`[B0...]` or `[<digits>]`),
+//     it is matched against each book's ASIN EXACTLY. This is the precise lookup
+//     and avoids a bare title colliding on an unrelated book's ASIN.
+//   - Otherwise the (ASIN-stripped) "author + title" label is substring-matched.
+//     Crucially the raw dir/path/ASIN is NOT part of the haystack, so a query like
+//     "1984" matches the *1984* titles but never a book whose ASIN merely contains
+//     "1984" (e.g. Kahneman's *Noise* at ASIN 1984832069).
+//
+// Exactly one match → its dir; zero or many → a helpful error result listing
+// candidate labels. The returned *mcp.CallToolResult is non-nil only on the
+// error/ambiguous path (already formatted for return to the model); dir is set
+// only on success.
 func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string, *mcp.CallToolResult) {
 	// A generous page so substring matches across a large library aren't truncated
 	// before the in-Go label filter runs.
@@ -275,13 +287,31 @@ func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string,
 		return "", mcp.NewToolResultError(fmt.Sprintf("Failed to resolve book %q: %v", book, err))
 	}
 
+	// A bracketed catalogue id in the query switches to exact-ASIN matching.
+	queryASIN := library.ExtractASIN(book)
 	term := strings.ToLower(book)
+
 	var matches []bookCandidate
 	for _, s := range summaries {
 		author, title := h.resolver.Resolve(s.Dir, s.SamplePath)
-		label := strings.ToLower(strings.TrimSpace(author + " " + title))
-		hay := strings.ToLower(s.Dir) + "\n" + strings.ToLower(title) + "\n" + label
-		if strings.Contains(hay, term) {
+
+		if queryASIN != "" {
+			// Exact ASIN lookup: compare against the id embedded in the book's
+			// title/dir, never a substring of the surrounding text.
+			bookASIN := library.ExtractASIN(title)
+			if bookASIN == "" {
+				bookASIN = library.ExtractASIN(s.Dir)
+			}
+			if strings.EqualFold(bookASIN, queryASIN) {
+				matches = append(matches, bookCandidate{dir: s.Dir, author: author, title: title})
+			}
+			continue
+		}
+
+		// Substring match against the human "author + title" label only — with the
+		// ASIN stripped — so the raw path/ASIN can't cause a false hit.
+		label := strings.ToLower(strings.TrimSpace(library.StripASIN(author) + " " + library.StripASIN(title)))
+		if strings.Contains(label, term) {
 			matches = append(matches, bookCandidate{dir: s.Dir, author: author, title: title})
 		}
 	}
@@ -326,10 +356,19 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list books: %v", err)), nil
 	}
 
-	if format == "tree" {
-		return formatBookTree(summaries, total, offset, h.resolver), nil
+	// Whole-library (filter-scoped) counts for the one-line summary header. This is
+	// a TRUE total across the library, not just the current page. A failure here is
+	// non-fatal — the inventory still renders, just without the summary line.
+	totals, err := h.db.GetLibraryTotals(ctx, author)
+	if err != nil {
+		h.logger.Warn("library totals failed; omitting summary line", "error", err)
+		totals = db.LibraryTotals{}
 	}
-	return formatBookList(summaries, total, offset, h.resolver), nil
+
+	if format == "tree" {
+		return formatBookTree(summaries, total, offset, totals, h.resolver), nil
+	}
+	return formatBookList(summaries, total, offset, totals, h.resolver), nil
 }
 
 // handleGetTranscript returns a page of a track's transcript so the model can
@@ -389,9 +428,10 @@ func (h *ToolHandlers) handleGetContext(ctx context.Context, request mcp.CallToo
 		return mcp.NewToolResultError(fmt.Sprintf("Missing or invalid chunkID parameter: %v", err)), nil
 	}
 
-	// Extract optional context window size (default 2 chunks before and after),
-	// bounded so a huge value can't pull an entire transcript's chunks.
-	contextWindow := clampContextWindow(request.GetInt("contextWindow", 2))
+	// Extract optional context window size (default 1 chunk before and after, so
+	// the default response is ~3 chunks), bounded so a huge value can't pull an
+	// entire transcript's chunks.
+	contextWindow := clampContextWindow(request.GetInt("contextWindow", 1))
 
 	h.logger.Info("Getting chunk context", "chunkID", chunkID, "contextWindow", contextWindow)
 

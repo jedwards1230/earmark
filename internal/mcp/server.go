@@ -199,8 +199,8 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			mcp.Required(),
 		),
 		mcp.WithNumber("contextWindow",
-			mcp.Description("Number of chunks before and after to include (default: 2)"),
-			mcp.DefaultNumber(2),
+			mcp.Description("Number of chunks before and after to include (default: 1, i.e. ~3 chunks; clamped to 0–50)"),
+			mcp.DefaultNumber(1),
 		),
 	), handlers.handleGetContext)
 

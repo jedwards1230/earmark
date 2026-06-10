@@ -530,6 +530,34 @@ func TestGetBookSummariesStatusFilter(t *testing.T) {
 	}
 }
 
+// TestGetLibraryTotals drives getLibraryTotals at execution level: it asserts the
+// whole-library book counts (total / fully-transcribed / with-pending) scan into
+// the right fields and the ILIKE filter arg is passed through.
+func TestGetLibraryTotals(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows([]string{"total", "fully_done", "with_pending"}).
+		AddRow(10, 6, 4)
+	mock.ExpectQuery("WITH books AS").WithArgs("").WillReturnRows(rows)
+
+	got, err := db.getLibraryTotals(context.Background(), mock, "")
+	if err != nil {
+		t.Fatalf("getLibraryTotals: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if got.TotalBooks != 10 || got.FullyTranscribed != 6 || got.WithPending != 4 {
+		t.Errorf("totals = %+v, want {10 6 4}", got)
+	}
+}
+
 // trackDetailColumns are the 32 columns SELECTed by GetTrackDetail, in scan
 // order (job, has_transcript, transcript fields, run_metrics fields).
 var trackDetailColumns = []string{

@@ -163,7 +163,9 @@ func TestFormatBookTree(t *testing.T) {
 			SamplePath: "/books/audio-libation/Frank Herbert/Dune/01.mp3",
 			Total:      24, Done: 22, Pending: 2},
 	}
-	out := formatBookTree(books, 3, 0, resolver).Content[0].(mcp.TextContent).Text
+	totals := db.LibraryTotals{TotalBooks: 3, FullyTranscribed: 2, WithPending: 1}
+	out := formatBookTree(books, 3, 0, totals, resolver).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, out, "Library: 3 books — 2 fully transcribed, 1 with pending tracks.")
 	assert.Contains(t, out, "Library: 3 book(s) across 2 author(s)")
 	assert.Contains(t, out, "Andy Weir\n")
 	assert.Contains(t, out, "Frank Herbert\n")
@@ -172,6 +174,39 @@ func TestFormatBookTree(t *testing.T) {
 	assert.Contains(t, out, "• Dune — tracks: 22/24 done, 2 pending")
 	assert.Contains(t, out, "words: 124800")
 	assert.Contains(t, out, "chunks: 412")
+	// Tree view KEEPS the per-book dir line.
+	assert.Contains(t, out, "dir: /books/audio-libation/Andy Weir/Project Hail Mary")
+}
+
+// TestFormatChapterZeroSuppressed asserts the dead "Chapter 0:" label is dropped
+// when there's no real chapter data (index 0 + empty title), while a real chapter
+// (non-zero index or a title) still renders.
+func TestFormatChapterZeroSuppressed(t *testing.T) {
+	// No chapter data → no "Chapter" prefix at all.
+	noChap := []db.SearchResultWithMetadata{{
+		ID: "c1", Content: "passage", Author: "A", Title: "B",
+		ChunkIndex: 4, TotalChunks: 10, Similarity: 0.5, ChunkID: "c1",
+	}}
+	sem := formatSearchResultsOpts(noChap, searchSemantic, "q", 0).Content[0].(mcp.TextContent).Text
+	assert.NotContains(t, sem, "Chapter 0:")
+	assert.NotContains(t, sem, "Chapter")
+	assert.Contains(t, sem, "(chunk 5/10, similarity: 50%)")
+
+	txt := formatSearchResultsOpts(noChap, searchText, "q", 0).Content[0].(mcp.TextContent).Text
+	assert.NotContains(t, txt, "Chapter")
+	assert.Contains(t, txt, "(chunk 5/10, ranked by trigram match)")
+
+	ctx := formatSearchResults(noChap).Content[0].(mcp.TextContent).Text
+	assert.NotContains(t, ctx, "Chapter")
+	assert.Contains(t, ctx, "(chunk 5/10)")
+
+	// A populated chapter (index 0 but with a title) still renders.
+	titled := []db.SearchResultWithMetadata{{
+		ID: "c2", Content: "x", Author: "A", Title: "B",
+		ChunkIndex: 0, TotalChunks: 3, ChapterIndex: 0, ChapterTitle: "Prologue", ChunkID: "c2",
+	}}
+	out := formatSearchResults(titled).Content[0].(mcp.TextContent).Text
+	assert.Contains(t, out, "Chapter 0: Prologue (chunk 1/3)")
 }
 
 func fpT(v float64) *float64 { return &v }

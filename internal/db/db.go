@@ -1369,7 +1369,8 @@ type BookFilter struct {
 
 // GetBookSummaries returns one row per book directory, aggregating track-job
 // counts, plus the total number of matching books (for pagination). Books are
-// ordered by most-recently-updated so active work surfaces first.
+// ordered transcribed-first (by done-ratio, then done count) so completed books
+// lead the list; ties break on most-recently-updated then book_dir.
 func (db *DB) GetBookSummaries(ctx context.Context, f BookFilter) ([]BookSummary, int, error) {
 	return db.getBookSummaries(ctx, db.pool, f)
 }
@@ -1427,7 +1428,13 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 		       duration_seconds, word_count, embed_chunk_count,
 		       COUNT(*) OVER() AS total_books
 		FROM books
-		ORDER BY last_updated DESC, book_dir
+		-- Lead with transcribed books: fully-done first (done-ratio = 1), then
+		-- partially-done, then fully-pending (ratio 0). Within a tier, the most
+		-- recently-updated book surfaces first, with book_dir as a stable tiebreak.
+		ORDER BY (done::float8 / NULLIF(total, 0)) DESC NULLS LAST,
+		         done DESC,
+		         last_updated DESC,
+		         book_dir
 		LIMIT $2 OFFSET $3
 	`, statusHaving)
 
@@ -1454,6 +1461,48 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 		return nil, 0, fmt.Errorf("rows error (book summaries): %w", err)
 	}
 	return out, total, nil
+}
+
+// LibraryTotals are library-wide book counts for the list_books summary line.
+// These are TRUE totals across the whole library, independent of the current
+// page or any author filter — so a single page can report the real library shape.
+type LibraryTotals struct {
+	TotalBooks       int // distinct book directories
+	FullyTranscribed int // books whose every track is 'done'
+	WithPending      int // books with ≥1 track not yet 'done' (pending/claimed/failed)
+}
+
+// GetLibraryTotals returns whole-library book counts (total, fully-transcribed,
+// with-pending) for the list_books summary line. It groups transcription_jobs by
+// book directory once. Pass query to scope the totals to the same author filter
+// list_books uses (empty = whole library) so the summary matches the filtered view.
+func (db *DB) GetLibraryTotals(ctx context.Context, query string) (LibraryTotals, error) {
+	return db.getLibraryTotals(ctx, db.pool, query)
+}
+
+// getLibraryTotals is the querier-parameterized core of GetLibraryTotals, split
+// out so the count query + scan can be tested against a mock pool.
+func (db *DB) getLibraryTotals(ctx context.Context, qr rowScanner, query string) (LibraryTotals, error) {
+	var t LibraryTotals
+	// One pass: group jobs by book_dir, then count books overall vs. those with
+	// no non-done track (fully transcribed). $1 mirrors the list_books ILIKE filter.
+	err := qr.QueryRow(ctx, `
+		WITH books AS (
+			SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir,
+			       COUNT(*) FILTER (WHERE status <> 'done') AS not_done
+			FROM transcription_jobs
+			WHERE ($1 = '' OR file_path ILIKE '%' || $1 || '%')
+			GROUP BY book_dir
+		)
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE not_done = 0),
+		       COUNT(*) FILTER (WHERE not_done > 0)
+		FROM books
+	`, query).Scan(&t.TotalBooks, &t.FullyTranscribed, &t.WithPending)
+	if err != nil {
+		return LibraryTotals{}, fmt.Errorf("library totals query: %w", err)
+	}
+	return t, nil
 }
 
 // GetBookTracks returns the individual track jobs for one book directory,

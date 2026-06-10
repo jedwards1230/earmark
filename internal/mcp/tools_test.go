@@ -102,6 +102,14 @@ func (m *MockDBInterface) GetBookSummaries(ctx context.Context, f db.BookFilter)
 	return args.Get(0).([]db.BookSummary), args.Int(1), args.Error(2)
 }
 
+func (m *MockDBInterface) GetLibraryTotals(ctx context.Context, query string) (db.LibraryTotals, error) {
+	if !m.hasExpect("GetLibraryTotals") {
+		return db.LibraryTotals{}, nil
+	}
+	args := m.Called(ctx, query)
+	return args.Get(0).(db.LibraryTotals), args.Error(1)
+}
+
 func (m *MockDBInterface) GetBookTracks(ctx context.Context, dir string) ([]db.RecentJob, error) {
 	if !m.hasExpect("GetBookTracks") {
 		return nil, nil
@@ -520,12 +528,16 @@ func TestHandleListBooks(t *testing.T) {
 	}
 	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "", Limit: 50, Offset: 0}).
 		Return(books, 2, nil).Once()
+	mockDB.On("GetLibraryTotals", mock.Anything, "").
+		Return(db.LibraryTotals{TotalBooks: 2, FullyTranscribed: 1, WithPending: 1}, nil).Once()
 
 	h := NewToolHandlers(mockDB, resolverForTest())
 	res, err := h.handleListBooks(context.Background(), req("list_books", map[string]interface{}{}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
 	text := res.Content[0].(mcp.TextContent).Text
+	// Leading whole-library summary line (TRUE totals).
+	assert.Contains(t, text, "Library: 2 books — 1 fully transcribed, 1 with pending tracks.")
 	assert.Contains(t, text, "Library: 2 book(s)")
 	assert.Contains(t, text, "**Project Hail Mary** by Andy Weir")
 	assert.Contains(t, text, "tracks: 1/1 done")
@@ -534,6 +546,8 @@ func TestHandleListBooks(t *testing.T) {
 	// Dune has no metrics → em dashes for words/chunks.
 	assert.Contains(t, text, "**Dune** by Frank Herbert")
 	assert.Contains(t, text, "words: — | chunks: —")
+	// Flat view OMITS the per-book dir line (it ~doubles the payload).
+	assert.NotContains(t, text, "dir:")
 	mockDB.AssertExpectations(t)
 }
 
@@ -602,6 +616,60 @@ func TestResolveBookDirAmbiguous(t *testing.T) {
 	assert.Contains(t, text, "matched 2 books")
 	assert.Contains(t, text, "Project Hail Mary")
 	assert.Contains(t, text, "The Martian")
+	mockDB.AssertExpectations(t)
+}
+
+// TestResolveBookDirASINCollision is the regression guard for the ASIN-collision
+// bug: book="1984" must NOT resolve to Kahneman's *Noise* just because its ASIN
+// (1984832069) contains the substring "1984". It should match the *1984* title
+// (Orwell) instead. The ILIKE prefilter on file_path returns BOTH candidates;
+// the in-Go label filter must reject the ASIN-only match.
+func TestResolveBookDirASINCollision(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	orwell := "/books/audio-libation/George Orwell/1984 [B0029Z9OBM]"
+	noise := "/books/audio-libation/Daniel Kahneman/Noise [1984832069]"
+	// The DB ILIKE '%1984%' on file_path returns both (Noise's ASIN contains 1984).
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "1984", Limit: 200}).
+		Return([]db.BookSummary{
+			{Dir: orwell, SamplePath: orwell + "/1984.m4b"},
+			{Dir: noise, SamplePath: noise + "/Noise.m4b"},
+		}, 2, nil).Once()
+	// Only the genuine 1984 title is searched — Noise is rejected.
+	mockDB.On("TextSearchInBook", mock.Anything, orwell, "telescreen", 10).
+		Return([]db.SearchResultWithMetadata{{ID: "t1", Content: "the telescreen", Title: "1984 [B0029Z9OBM]", Author: "George Orwell"}}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
+		"query": "telescreen", "book": "1984",
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError, "book=1984 should resolve to the 1984 title, not collide on Noise's ASIN")
+	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
+	mockDB.AssertExpectations(t)
+}
+
+// TestResolveBookDirASINExact asserts a bracketed ASIN in the query resolves
+// EXACTLY to the book carrying that ASIN — a precise lookup, even when a title
+// substring would be ambiguous.
+func TestResolveBookDirASINExact(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	noise := "/books/audio-libation/Daniel Kahneman/Noise [1984832069]"
+	other := "/books/audio-libation/George Orwell/1984 [B0029Z9OBM]"
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "[1984832069]", Limit: 200}).
+		Return([]db.BookSummary{
+			{Dir: noise, SamplePath: noise + "/Noise.m4b"},
+			{Dir: other, SamplePath: other + "/1984.m4b"},
+		}, 2, nil).Once()
+	mockDB.On("TextSearchInBook", mock.Anything, noise, "bias", 10).
+		Return([]db.SearchResultWithMetadata{{ID: "t1", Content: "noisy judgment", Title: "Noise [1984832069]", Author: "Daniel Kahneman"}}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
+		"query": "bias", "book": "[1984832069]",
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
 	mockDB.AssertExpectations(t)
 }
 
