@@ -120,6 +120,11 @@ func formatTrackChooser(book string, tracks []db.RecentJob) *mcp.CallToolResult 
 // segments. raw_text can be hundreds of thousands of characters, so segments are
 // paginated by offset/limit with a footer pointing at the next page.
 func formatTranscriptPage(d *db.TrackDetail, offset, limit int) *mcp.CallToolResult {
+	// Defensive: the caller checks for nil, but guard here too so the helper is
+	// safe to reuse. A nil detail has no transcript to render.
+	if d == nil {
+		return mcp.NewToolResultError("no transcript available")
+	}
 	totalSegs := len(d.Segments)
 	if offset < 0 {
 		offset = 0

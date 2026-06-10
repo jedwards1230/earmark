@@ -91,6 +91,16 @@ func clampLimit(limit, def int) int {
 	return limit
 }
 
+// clampThreshold bounds the cosine-similarity threshold to [0.0, 1.0]. Out-of-range
+// values are nonsensical: < 0 bypasses the filter entirely, > 1 guarantees zero
+// results. An out-of-range value falls back to the default 0.3.
+func clampThreshold(threshold float64) float64 {
+	if threshold < 0.0 || threshold > 1.0 {
+		return 0.3
+	}
+	return threshold
+}
+
 // maxOffset bounds pagination offset to keep a malicious/garbage value from
 // forcing Postgres to skip through a huge result set (SQL OFFSET cost is linear
 // in the offset). No real library or transcript needs to page this deep.
@@ -117,7 +127,7 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 	}
 
 	// Extract optional parameters with defaults
-	threshold := request.GetFloat("threshold", 0.3)
+	threshold := clampThreshold(request.GetFloat("threshold", 0.3))
 	limit := clampLimit(request.GetInt("limit", 10), 10)
 	book := strings.TrimSpace(request.GetString("book", ""))
 
