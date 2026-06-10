@@ -1070,9 +1070,15 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 	status := validStatus(r.URL.Query().Get("status"))
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	if offset < 0 {
-		offset = 0
+	// offset is the htmx "load more" cursor. A missing or malformed value
+	// intentionally falls back to the first page (0) rather than erroring —
+	// this is a UI pagination control, not an API, so a bad cursor should
+	// degrade gracefully instead of surfacing a 400.
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			offset = n
+		}
 	}
 
 	books, total, err := s.db.GetBookSummaries(r.Context(), db.BookFilter{
@@ -1266,9 +1272,15 @@ func (s *MCPServer) handleTrackSegments(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
 	}
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	if offset < 0 {
-		offset = 0
+	// offset is the htmx "load more" cursor. A missing or malformed value
+	// intentionally falls back to the first page (0) rather than erroring —
+	// this is a UI pagination control, not an API, so a bad cursor should
+	// degrade gracefully instead of surfacing a 400.
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			offset = n
+		}
 	}
 
 	detail, err := s.db.GetTrackDetail(r.Context(), id)
