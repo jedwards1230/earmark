@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pashagolub/pgxmock/v4"
+	"github.com/pgvector/pgvector-go"
 
 	"github.com/jedwards1230/lil-whisper/internal/library"
 )
@@ -757,6 +758,133 @@ func TestTextSearchInBookScopesToDir(t *testing.T) {
 	}
 }
 
+// TestSearchInBookScopesAndBypassesHNSW drives searchInBook at execution level
+// against a mock pool: it asserts (a) the dir prefix is passed as the LIKE arg so
+// the search is scoped to one book, and (b) the executed SQL is the exact
+// (non-HNSW) distance scan — i.e. it constrains file_path FIRST and orders by the
+// raw `<=>` distance with no ANN index hint, which is what keeps recall perfect
+// for a selective single-book filter.
+func TestSearchInBookScopesAndBypassesHNSW(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	dir := "/books/audio-libation/Andy Weir/PHM"
+	vec := make([]float32, 768)
+	vec[0] = 0.1
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("c1", "the matching passage", dir+"/01.m4b", 5, 305.0, 372.5, nil, 0.82, 12)
+
+	// Args: $1 vec, $2 limit, $3 dir prefix "<dir>/%", $4 threshold.
+	mock.ExpectQuery(searchInBookSQL).
+		WithArgs(pgvector.NewVector(vec), 10, dir+"/%", 0.3).
+		WillReturnRows(rows)
+
+	got, err := db.searchInBook(context.Background(), mock, vec, dir, 10, 0.3)
+	if err != nil {
+		t.Fatalf("searchInBook: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 1 || got[0].FilePath != dir+"/01.m4b" {
+		t.Fatalf("got %+v, want 1 result under the book dir", got)
+	}
+
+	// Must constrain file_path (the btree-narrowing scope) and order by the raw
+	// distance operator — i.e. an exact scan, not an HNSW ANN scan.
+	if !strings.Contains(searchInBookSQL, "c.file_path LIKE $3") {
+		t.Error("searchInBookSQL missing file_path scope")
+	}
+	if !strings.Contains(searchInBookSQL, "ORDER BY c.embedding <=> $1") {
+		t.Error("searchInBookSQL missing exact distance ordering")
+	}
+}
+
+// TestRequeueTxClearsRunMetrics drives requeueTx (the requeue transaction body)
+// against a pgxmock transaction and asserts the run_metrics cleanup runs in the
+// SAME transaction as the transcript-delete + job-reset, keyed on the requeued
+// job ids. This is the data-integrity fix: requeue UPDATEs (not deletes) the job
+// row and deletes the transcript, so neither path cascades to run_metrics — the
+// orphaned telemetry row must be deleted explicitly here.
+func TestRequeueTxClearsRunMetrics(t *testing.T) {
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	id := "11111111-1111-1111-1111-111111111111"
+	path := "/books/audio-libation/Andy Weir/PHM/PHM.m4b"
+
+	mock.ExpectBegin()
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	// 1) delete transcripts for the selected job
+	mock.ExpectExec(requeueByID.deleteTranscripts).
+		WithArgs(id).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	// 2) reset the job → pending, RETURNING (id, file_path)
+	mock.ExpectQuery(requeueByID.resetJobs).
+		WithArgs(id).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, path))
+	// 3) THE FIX: clear the now-orphaned run_metrics for that job id
+	mock.ExpectExec(requeueDeleteMetricsSQL).
+		WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+
+	paths, err := requeueTx(context.Background(), tx, requeueByID, id)
+	if err != nil {
+		t.Fatalf("requeueTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations (run_metrics cleanup missing?): %v", err)
+	}
+	if len(paths) != 1 || paths[0] != path {
+		t.Fatalf("paths = %v, want [%s]", paths, path)
+	}
+}
+
+// TestRequeueTxNoMetricsDeleteWhenNothingReset asserts the run_metrics delete is
+// skipped entirely when the reset matched no jobs (empty RETURNING) — so a
+// no-match requeue issues no spurious DELETE.
+func TestRequeueTxNoMetricsDeleteWhenNothingReset(t *testing.T) {
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	mock.ExpectExec(requeueFailed.deleteTranscripts).
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectQuery(requeueFailed.resetJobs).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"})) // no rows
+
+	paths, err := requeueTx(context.Background(), tx, requeueFailed)
+	if err != nil {
+		t.Fatalf("requeueTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("paths = %v, want empty", paths)
+	}
+}
+
 func TestLikePrefix(t *testing.T) {
 	cases := map[string]string{
 		"/books/A/B":   "/books/A/B",
@@ -769,6 +897,97 @@ func TestLikePrefix(t *testing.T) {
 		if got := likePrefix(in); got != want {
 			t.Errorf("likePrefix(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestSearchInBookEscapesMetacharactersInDir verifies that searchInBook correctly
+// escapes LIKE metacharacters in the dir prefix so a book whose name contains %
+// or _ does not over-match tracks from other books. The test drives the inner
+// searchInBook function against a mock pool and asserts that the prefix argument
+// is the LIKE-escaped form (e.g. "\%_title/%" → "\\%\_title/%"), not the raw
+// dir. It also verifies that the SQL carries the explicit ESCAPE '\' clause so
+// the escaping is unambiguous regardless of server configuration.
+func TestSearchInBookEscapesMetacharactersInDir(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	// Dir whose name contains both % and _ — without escaping these would act as
+	// LIKE wildcards and could match sibling directories.
+	dir := `/books/audio-libation/Andy Weir/100%_Winner`
+	// likePrefix escapes \, % and _ in order; the expected prefix is:
+	//   /books/audio-libation/Andy Weir/100\%\_Winner/%
+	escapedDir := `/books/audio-libation/Andy Weir/100\%\_Winner`
+	wantPrefix := escapedDir + "/%"
+
+	vec := make([]float32, 768)
+	vec[0] = 0.5
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("c1", "the passage", dir+"/01.m4b", 1, 0.0, 5.0, nil, 0.75, 3)
+
+	// The mock expectation uses the ESCAPED prefix — if the handler passes the raw
+	// dir the args won't match and ExpectationsWereMet will fail.
+	mock.ExpectQuery(searchInBookSQL).
+		WithArgs(pgvector.NewVector(vec), 5, wantPrefix, 0.0).
+		WillReturnRows(rows)
+
+	got, err := db.searchInBook(context.Background(), mock, vec, dir, 5, 0.0)
+	if err != nil {
+		t.Fatalf("searchInBook: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet mock expectations (prefix not escaped?): %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+
+	// The SQL must carry an explicit ESCAPE clause so the backslash escape is
+	// honoured unconditionally (independent of standard_conforming_strings).
+	if !strings.Contains(searchInBookSQL, `ESCAPE '\'`) {
+		t.Error("searchInBookSQL missing ESCAPE '\\' clause")
+	}
+}
+
+// TestTextSearchInBookEscapesMetacharactersInDir mirrors the semantic-search
+// test for textSearchInBook: a dir containing % and _ must be escaped before use
+// in the LIKE predicate, and the SQL must carry an explicit ESCAPE clause.
+func TestTextSearchInBookEscapesMetacharactersInDir(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	dir := `/books/audio-libation/Science_% Authors/Basics`
+	wantPrefix := `/books/audio-libation/Science\_\% Authors/Basics` + "/%"
+
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("c2", "chapter text", dir+"/ch1.mp3", 0, 0.0, 10.0, nil, 0.6, 5)
+
+	mock.ExpectQuery(textSearchInBookSQL).
+		WithArgs("basics", 10, wantPrefix).
+		WillReturnRows(rows)
+
+	got, err := db.textSearchInBook(context.Background(), mock, dir, "basics", 10)
+	if err != nil {
+		t.Fatalf("textSearchInBook: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet mock expectations (prefix not escaped?): %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+
+	if !strings.Contains(textSearchInBookSQL, `ESCAPE '\'`) {
+		t.Error("textSearchInBookSQL missing ESCAPE '\\' clause")
 	}
 }
 

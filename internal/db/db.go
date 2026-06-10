@@ -692,6 +692,65 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 	return db.scanResults(rows)
 }
 
+// searchInBookSQL is the book-scoped semantic search.
+//
+// CRITICAL — why this deliberately does NOT use the HNSW index: an HNSW ANN scan
+// finds the global top-K nearest chunks first and *then* applies the WHERE
+// filter, so a selective single-book filter (a few hundred chunks out of the
+// whole library) under-returns — most of the ANN top-K belong to other books and
+// get filtered away, leaving far fewer than `limit` hits (the well-known
+// filtered-ANN recall problem). Instead we narrow to the book FIRST via the
+// btree on file_path (`transcript_chunks_file_path_idx`, usable under C-collation
+// for the `LIKE prefix || '%'` prefix), then do an EXACT distance scan + order
+// over just that book's chunks. Exact ordering over a few-hundred-row set is both
+// fast and recall-perfect — no ANN approximation. $1=vec, $2=limit, $3=dir
+// prefix ("<dir>/%"), $4=threshold (0 disables).
+var searchInBookSQL = `
+	SELECT
+		c.id,
+		c.text,
+		c.file_path,
+		c.chunk_index,
+		c.start_sec,
+		c.end_sec,
+		c.speaker,
+		1 - (c.embedding <=> $1) AS similarity,
+		(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
+	FROM transcript_chunks c
+	WHERE c.file_path LIKE $3 ESCAPE '\'
+	  AND ($4 = 0 OR 1 - (c.embedding <=> $1) >= $4)
+	ORDER BY c.embedding <=> $1
+	LIMIT $2
+`
+
+// SearchInBook performs a vector-similarity search scoped to one book directory.
+// It embeds the query, then runs an exact (non-HNSW) distance scan over only that
+// book's chunks — see searchInBookSQL for why HNSW is bypassed here. dir must be
+// an exact book_dir as returned by GetBookSummaries.
+func (db *DB) SearchInBook(ctx context.Context, query, dir string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
+	vecs, err := db.e.GetEmbeddings([]string{query})
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+	if len(vecs) == 0 {
+		return nil, fmt.Errorf("no embedding returned for query")
+	}
+	return db.searchInBook(ctx, db.pool, vecs[0], dir, limit, threshold)
+}
+
+// searchInBook is the querier-parameterized core of SearchInBook, split out so
+// the exact-scan query + scan path is testable against a mock pool. The dir
+// prefix is LIKE-escaped so a book name containing %, _, or \ can't widen scope.
+func (db *DB) searchInBook(ctx context.Context, q rowQuerier, vec []float32, dir string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
+	prefix := likePrefix(dir) + "/%"
+	rows, err := q.Query(ctx, searchInBookSQL, pgvector.NewVector(vec), limit, prefix, threshold)
+	if err != nil {
+		return nil, fmt.Errorf("book similarity query: %w", err)
+	}
+	defer rows.Close()
+	return db.scanResults(rows)
+}
+
 // textSearchSQL is the trigram-ranked full-text search query used by TextSearch.
 // It is a package-level variable (not a constant) solely so that tests can
 // inspect the SQL shape and catch regressions to the old ILIKE-only form.
@@ -783,7 +842,7 @@ var textSearchInBookSQL = `
 		similarity(c.text, $1) AS similarity,
 		(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
 	FROM transcript_chunks c
-	WHERE c.file_path LIKE $3
+	WHERE c.file_path LIKE $3 ESCAPE '\'
 	  AND (c.text % $1 OR c.text ILIKE '%' || $1 || '%')
 	ORDER BY similarity(c.text, $1) DESC, c.chunk_index ASC
 	LIMIT $2
@@ -1805,7 +1864,7 @@ func (db *DB) RequeueByDir(ctx context.Context, dir string) ([]string, error) {
 // runtime, so the only dynamic input is the bound $1 parameter (when present).
 type requeuePlan struct {
 	deleteTranscripts string // delete transcripts for the selected jobs (chunks cascade)
-	resetJobs         string // reset those jobs to pending; RETURNING file_path
+	resetJobs         string // reset those jobs to pending; RETURNING id, file_path
 }
 
 var (
@@ -1817,7 +1876,7 @@ var (
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
 			WHERE  file_path ILIKE $1
-			RETURNING file_path`,
+			RETURNING id, file_path`,
 	}
 	// requeueFailed selects every job in the 'failed' state (no parameters).
 	requeueFailed = requeuePlan{
@@ -1827,7 +1886,7 @@ var (
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
 			WHERE  status = 'failed'
-			RETURNING file_path`,
+			RETURNING id, file_path`,
 	}
 	// requeueByID selects a single job by its UUID ($1, cast for safety).
 	requeueByID = requeuePlan{
@@ -1837,7 +1896,7 @@ var (
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
 			WHERE  id = $1::uuid
-			RETURNING file_path`,
+			RETURNING id, file_path`,
 	}
 	// requeueByDir selects every track job in one book directory: an exact match
 	// on dirname(file_path) ($1). Used by the per-book "requeue book" action.
@@ -1850,14 +1909,30 @@ var (
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
 			WHERE  regexp_replace(file_path, '/[^/]+$', '') = $1
-			RETURNING file_path`,
+			RETURNING id, file_path`,
 	}
 )
 
-// requeue runs a requeuePlan's two static statements in one transaction: delete
-// the selected transcripts (chunks cascade) and reset the jobs to pending. args
-// are the bound parameters for the plan's $N placeholders (one for by-path,
-// none for failed).
+// requeueDeleteMetricsSQL drops the run_metrics rows for the requeued jobs in the
+// same transaction. run_metrics references transcription_jobs (not transcripts),
+// so deleting the transcript does NOT cascade to it — and requeue UPDATEs the job
+// row rather than deleting it, so the ON DELETE CASCADE never fires either. Left
+// untouched, the run_metrics row describes a now-deleted transcript (orphaned
+// telemetry that mis-reports the new run). $1 is the requeued job-id array.
+const requeueDeleteMetricsSQL = `DELETE FROM run_metrics WHERE job_id = ANY($1)`
+
+// txQuerier is the slice of pgx.Tx used by the requeue core. Both pgx.Tx and
+// pgxmock's transaction handle satisfy it, so requeueTx is execution-testable
+// against a mock pool (ExpectBegin/ExpectExec/ExpectQuery/ExpectCommit).
+type txQuerier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// requeue runs a requeuePlan's statements in one transaction: delete the selected
+// transcripts (chunks cascade), reset the jobs to pending, and clear the now-stale
+// run_metrics rows for those jobs. args are the bound parameters for the plan's
+// $N placeholders (one for by-path/by-id/by-dir, none for failed).
 func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]string, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
@@ -1865,6 +1940,22 @@ func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]str
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	paths, err := requeueTx(ctx, tx, plan, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit requeue tx: %w", err)
+	}
+	return paths, nil
+}
+
+// requeueTx is the transaction-body core of requeue, split out so the
+// delete-transcripts → reset-jobs → clear-metrics sequence is testable against a
+// pgxmock transaction. It does NOT begin/commit — the caller owns the tx
+// lifecycle. Returns the reset jobs' file paths.
+func requeueTx(ctx context.Context, tx txQuerier, plan requeuePlan, args ...any) ([]string, error) {
 	if _, err := tx.Exec(ctx, plan.deleteTranscripts, args...); err != nil {
 		return nil, fmt.Errorf("delete transcripts: %w", err)
 	}
@@ -1873,14 +1964,18 @@ func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]str
 	if err != nil {
 		return nil, fmt.Errorf("reset jobs: %w", err)
 	}
-	paths, err := scanPaths(rows)
+	ids, paths, err := scanIDPaths(rows)
 	rows.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit requeue tx: %w", err)
+	// Clear the orphaned run_metrics for the requeued jobs so the next run's
+	// telemetry starts clean. A no-op when nothing was reset.
+	if len(ids) > 0 {
+		if _, err := tx.Exec(ctx, requeueDeleteMetricsSQL, ids); err != nil {
+			return nil, fmt.Errorf("delete run_metrics: %w", err)
+		}
 	}
 	return paths, nil
 }
@@ -1928,19 +2023,22 @@ func (db *DB) ReembedJobs(ctx context.Context, substr string) ([]string, error) 
 	return paths, nil
 }
 
-func scanPaths(rows pgx.Rows) ([]string, error) {
-	var paths []string
+// scanIDPaths scans the (id, file_path) pairs RETURNING'd by a requeue reset, so
+// the caller has both the job ids (for the run_metrics cleanup) and the paths
+// (for the operator-facing report).
+func scanIDPaths(rows pgx.Rows) (ids, paths []string, err error) {
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
-			return nil, fmt.Errorf("scan path: %w", err)
+		var id, p string
+		if err := rows.Scan(&id, &p); err != nil {
+			return nil, nil, fmt.Errorf("scan id/path: %w", err)
 		}
+		ids = append(ids, id)
 		paths = append(paths, p)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows error (paths): %w", err)
+		return nil, nil, fmt.Errorf("rows error (id/paths): %w", err)
 	}
-	return paths, nil
+	return ids, paths, nil
 }
 
 // Reset drops all tables and re-initialises the schema (DEBUG_DB_RESET only).

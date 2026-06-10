@@ -54,6 +54,20 @@ func (demoDB) TextSearchInBook(_ context.Context, dir, query string, _ int) ([]d
 	}, nil
 }
 
+// SearchInBook returns synthetic book-scoped semantic hits so the scoped
+// semantic_search tool is exercisable with no database (mirrors TextSearchInBook).
+func (demoDB) SearchInBook(_ context.Context, query, dir string, _ int, _ float64) ([]db.SearchResultWithMetadata, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	return []db.SearchResultWithMetadata{
+		{ID: "v1", FilePath: dir + "/01.m4b", ChunkIndex: 5, StartSec: 305.0, EndSec: 372.5,
+			Similarity: 0.82, Content: "A passage closely related to " + query + " in meaning."},
+		{ID: "v2", FilePath: dir + "/02.m4b", ChunkIndex: 9, StartSec: 940.0, EndSec: 1012.0,
+			Similarity: 0.74, Content: "Another semantically similar moment about " + query + "."},
+	}, nil
+}
+
 func (demoDB) GetHierarchicalData(context.Context) ([]db.HierarchicalEntry, error) {
 	return nil, nil
 }

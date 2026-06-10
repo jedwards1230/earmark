@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/library"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -28,8 +29,31 @@ func (m *MockDBInterface) TextSearch(ctx context.Context, query string, limit in
 	return args.Get(0).([]db.SearchResultWithMetadata), args.Error(1)
 }
 
-func (m *MockDBInterface) TextSearchInBook(_ context.Context, _, _ string, _ int) ([]db.SearchResultWithMetadata, error) {
-	return nil, nil
+func (m *MockDBInterface) TextSearchInBook(ctx context.Context, dir, query string, limit int) ([]db.SearchResultWithMetadata, error) {
+	if !m.hasExpect("TextSearchInBook") {
+		return nil, nil
+	}
+	args := m.Called(ctx, dir, query, limit)
+	return args.Get(0).([]db.SearchResultWithMetadata), args.Error(1)
+}
+
+func (m *MockDBInterface) SearchInBook(ctx context.Context, query, dir string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error) {
+	if !m.hasExpect("SearchInBook") {
+		return nil, nil
+	}
+	args := m.Called(ctx, query, dir, limit, threshold)
+	return args.Get(0).([]db.SearchResultWithMetadata), args.Error(1)
+}
+
+// hasExpect reports whether an expectation was registered for method — lets the
+// shared mock double as a plain stub for handlers that don't set expectations.
+func (m *MockDBInterface) hasExpect(method string) bool {
+	for _, c := range m.ExpectedCalls {
+		if c.Method == method {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MockDBInterface) GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error) {
@@ -75,16 +99,29 @@ func (m *MockDBInterface) GetControl(context.Context) (bool, *int, error) {
 }
 func (m *MockDBInterface) SetRunLimit(context.Context, *int, string) error { return nil }
 
-func (m *MockDBInterface) GetBookSummaries(context.Context, db.BookFilter) ([]db.BookSummary, int, error) {
-	return nil, 0, nil
+func (m *MockDBInterface) GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error) {
+	if !m.hasExpect("GetBookSummaries") {
+		return nil, 0, nil
+	}
+	args := m.Called(ctx, f)
+	return args.Get(0).([]db.BookSummary), args.Int(1), args.Error(2)
 }
 
-func (m *MockDBInterface) GetBookTracks(context.Context, string) ([]db.RecentJob, error) {
-	return nil, nil
+func (m *MockDBInterface) GetBookTracks(ctx context.Context, dir string) ([]db.RecentJob, error) {
+	if !m.hasExpect("GetBookTracks") {
+		return nil, nil
+	}
+	args := m.Called(ctx, dir)
+	return args.Get(0).([]db.RecentJob), args.Error(1)
 }
 
-func (m *MockDBInterface) GetTrackDetail(context.Context, string) (*db.TrackDetail, error) {
-	return nil, nil
+func (m *MockDBInterface) GetTrackDetail(ctx context.Context, id string) (*db.TrackDetail, error) {
+	if !m.hasExpect("GetTrackDetail") {
+		return nil, nil
+	}
+	args := m.Called(ctx, id)
+	td, _ := args.Get(0).(*db.TrackDetail)
+	return td, args.Error(1)
 }
 
 func (m *MockDBInterface) RequeueByDir(context.Context, string) ([]string, error) {
@@ -205,7 +242,7 @@ func TestHandleSemanticSearch(t *testing.T) {
 					Return(tt.mockResults, tt.mockError).Once()
 			}
 
-			handler := NewToolHandlers(mockDB)
+			handler := NewToolHandlers(mockDB, nil)
 			result, err := handler.handleSemanticSearch(context.Background(), tt.request)
 
 			if tt.expectedError {
@@ -303,7 +340,7 @@ func TestHandleTextSearch(t *testing.T) {
 			mockDB.On("TextSearch", mock.Anything, query, expectedLimit).
 				Return(tt.mockResults, tt.mockError).Once()
 
-			handler := NewToolHandlers(mockDB)
+			handler := NewToolHandlers(mockDB, nil)
 			result, err := handler.handleTextSearch(context.Background(), tt.request)
 
 			if tt.expectedError {
@@ -396,7 +433,7 @@ func TestHandleBrowseLibrary(t *testing.T) {
 			mockDB.On("GetHierarchicalData", mock.Anything).
 				Return(tt.mockEntries, tt.mockError).Once()
 
-			handler := NewToolHandlers(mockDB)
+			handler := NewToolHandlers(mockDB, nil)
 			result, err := handler.handleBrowseLibrary(context.Background(), tt.request)
 
 			if tt.expectedError {
@@ -510,7 +547,7 @@ func TestHandleGetContext(t *testing.T) {
 				mockDB.On("GetChunkContext", mock.Anything, chunkID, contextWindow).Return(tt.mockResults, tt.mockError)
 			}
 
-			handlers := NewToolHandlers(mockDB)
+			handlers := NewToolHandlers(mockDB, nil)
 			result, err := handlers.handleGetContext(context.Background(), tt.request)
 
 			if tt.expectedError {
@@ -525,4 +562,348 @@ func TestHandleGetContext(t *testing.T) {
 			mockDB.AssertExpectations(t)
 		})
 	}
+}
+
+// req builds a CallToolRequest with the given name and arguments.
+func req(name string, args map[string]interface{}) mcp.CallToolRequest {
+	return mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: args}}
+}
+
+// resolverForTest returns a resolver that labels the demo collections, so
+// book-scope resolution in handler tests derives the same author/title as prod.
+func resolverForTest() *library.Resolver {
+	return library.NewResolver("/books", []library.Collection{
+		{Root: "audio-libation", Layout: "author/title"},
+	})
+}
+
+func fp(v float64) *float64 { return &v }
+func ip(v int) *int         { return &v }
+
+// TestHandleListBooks asserts the inventory formatting: author/title, track
+// progress, and the duration/word/chunk aggregates (em dash when nil).
+func TestHandleListBooks(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	books := []db.BookSummary{
+		{Dir: "/books/audio-libation/Andy Weir/Project Hail Mary",
+			SamplePath: "/books/audio-libation/Andy Weir/Project Hail Mary/PHM.m4b",
+			Total:      1, Done: 1,
+			DurationSeconds: fp(58320), WordCount: ip(124800), EmbedChunkCount: ip(412)},
+		// No run_metrics yet → aggregates nil → em dashes.
+		{Dir: "/books/audio-libation/Frank Herbert/Dune",
+			SamplePath: "/books/audio-libation/Frank Herbert/Dune/01.mp3",
+			Total:      24, Done: 0, Pending: 24},
+	}
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "", Limit: 50, Offset: 0}).
+		Return(books, 2, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleListBooks(context.Background(), req("list_books", map[string]interface{}{}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	text := res.Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "Library: 2 book(s)")
+	assert.Contains(t, text, "**Project Hail Mary** by Andy Weir")
+	assert.Contains(t, text, "tracks: 1/1 done")
+	assert.Contains(t, text, "words: 124800")
+	assert.Contains(t, text, "chunks: 412")
+	// Dune has no metrics → em dashes for words/chunks.
+	assert.Contains(t, text, "**Dune** by Frank Herbert")
+	assert.Contains(t, text, "words: — | chunks: —")
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleSemanticSearchScoped asserts that passing `book` resolves to a single
+// dir and routes through SearchInBook (the exact-scan path), not Search.
+func TestHandleSemanticSearchScoped(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	dir := "/books/audio-libation/Andy Weir/Project Hail Mary"
+	summaries := []db.BookSummary{
+		{Dir: dir, SamplePath: dir + "/PHM.m4b", Total: 1, Done: 1},
+	}
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "Project Hail Mary", Limit: 200}).
+		Return(summaries, 1, nil).Once()
+	mockDB.On("SearchInBook", mock.Anything, "amino acids", dir, 10, 0.3).
+		Return([]db.SearchResultWithMetadata{{ID: "v1", Content: "about amino acids", Title: "Project Hail Mary", Author: "Andy Weir"}}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
+		"query": "amino acids", "book": "Project Hail Mary",
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleTextSearchScoped asserts the `book` param routes text search through
+// TextSearchInBook scoped to the resolved dir.
+func TestHandleTextSearchScoped(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	dir := "/books/audio-libation/Frank Herbert/Dune"
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "Dune", Limit: 200}).
+		Return([]db.BookSummary{{Dir: dir, SamplePath: dir + "/01.mp3"}}, 1, nil).Once()
+	mockDB.On("TextSearchInBook", mock.Anything, dir, "spice", 10).
+		Return([]db.SearchResultWithMetadata{{ID: "t1", Content: "the spice must flow", Title: "Dune", Author: "Frank Herbert"}}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
+		"query": "spice", "book": "Dune",
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
+	mockDB.AssertExpectations(t)
+}
+
+// TestResolveBookDirAmbiguous asserts a `book` term matching multiple books
+// returns a helpful disambiguation error listing the candidates.
+func TestResolveBookDirAmbiguous(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	d1 := "/books/audio-libation/Andy Weir/Project Hail Mary"
+	d2 := "/books/audio-libation/Andy Weir/The Martian"
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "Andy Weir", Limit: 200}).
+		Return([]db.BookSummary{
+			{Dir: d1, SamplePath: d1 + "/a.m4b"},
+			{Dir: d2, SamplePath: d2 + "/b.m4b"},
+		}, 2, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
+		"query": "engineering", "book": "Andy Weir",
+	}))
+	assert.NoError(t, err)
+	assert.True(t, res.IsError)
+	text := res.Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "matched 2 books")
+	assert.Contains(t, text, "Project Hail Mary")
+	assert.Contains(t, text, "The Martian")
+	mockDB.AssertExpectations(t)
+}
+
+// TestResolveBookDirNoMatch asserts an unmatched `book` term returns a not-found
+// hint that points at list_books.
+func TestResolveBookDirNoMatch(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "Nonexistent", Limit: 200}).
+		Return([]db.BookSummary{}, 0, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
+		"query": "x", "book": "Nonexistent",
+	}))
+	assert.NoError(t, err)
+	assert.True(t, res.IsError)
+	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "No book matched")
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleGetTranscriptSingleTrack asserts a single-track book is resolved and
+// its transcript paginated into timestamped segments with a next-offset footer.
+func TestHandleGetTranscriptSingleTrack(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	dir := "/books/audio-libation/Andy Weir/Project Hail Mary"
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "Project Hail Mary", Limit: 200}).
+		Return([]db.BookSummary{{Dir: dir, SamplePath: dir + "/PHM.m4b"}}, 1, nil).Once()
+	mockDB.On("GetBookTracks", mock.Anything, dir).
+		Return([]db.RecentJob{{ID: "job-1", FilePath: dir + "/PHM.m4b", Status: "done"}}, nil).Once()
+
+	segs := make([]db.Segment, 4)
+	for i := range segs {
+		segs[i] = db.Segment{ID: i, Start: float64(i) * 10, End: float64(i)*10 + 8, Text: fmt.Sprintf("line %d", i)}
+	}
+	mockDB.On("GetTrackDetail", mock.Anything, "job-1").
+		Return(&db.TrackDetail{
+			ID: "job-1", FilePath: dir + "/PHM.m4b", Status: "done",
+			HasTranscript: true, Language: "en", ModelName: "parakeet", DurationSeconds: 60,
+			Segments: segs,
+		}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
+		"book": "Project Hail Mary", "limit": 2.0,
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	text := res.Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "Transcript: "+dir+"/PHM.m4b")
+	assert.Contains(t, text, "[00:00 → 00:08] line 0")
+	assert.Contains(t, text, "[00:10 → 00:18] line 1")
+	// Paginated: only 2 of 4 shown, footer points at the next offset.
+	assert.NotContains(t, text, "line 2")
+	assert.Contains(t, text, "Showing segments 1–2 of 4. Next page: offset=2.")
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleGetTranscriptMultiTrack asserts a multi-track book returns a track
+// chooser (so the caller picks a trackID) rather than a single transcript.
+func TestHandleGetTranscriptMultiTrack(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	dir := "/books/audio-libation/Frank Herbert/Dune"
+	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "Dune", Limit: 200}).
+		Return([]db.BookSummary{{Dir: dir, SamplePath: dir + "/01.mp3"}}, 1, nil).Once()
+	mockDB.On("GetBookTracks", mock.Anything, dir).
+		Return([]db.RecentJob{
+			{ID: "j1", FilePath: dir + "/01.mp3", Status: "done"},
+			{ID: "j2", FilePath: dir + "/02.mp3", Status: "done"},
+		}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
+		"book": "Dune",
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	text := res.Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "has 2 tracks")
+	assert.Contains(t, text, "trackID=j1")
+	assert.Contains(t, text, "trackID=j2")
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleGetTranscriptByTrackID asserts trackID takes precedence (no book
+// resolution) and reads the named track directly.
+func TestHandleGetTranscriptByTrackID(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	mockDB.On("GetTrackDetail", mock.Anything, "job-9").
+		Return(&db.TrackDetail{
+			ID: "job-9", FilePath: "/books/x/y/z.m4b", Status: "done",
+			HasTranscript: true, Language: "en", ModelName: "parakeet", DurationSeconds: 30,
+			Segments: []db.Segment{{ID: 0, Start: 0, End: 5, Text: "hello"}},
+		}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
+		"trackID": "job-9",
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "[00:00 → 00:05] hello")
+	mockDB.AssertExpectations(t)
+}
+
+// TestClampHelpers verifies the clampLimit and clampOffset helpers directly.
+func TestClampHelpers(t *testing.T) {
+	// clampLimit: values in [1,1000] pass through; outside → default.
+	if got := clampLimit(10, 50); got != 10 {
+		t.Errorf("clampLimit(10, 50) = %d, want 10", got)
+	}
+	if got := clampLimit(1000, 50); got != 1000 {
+		t.Errorf("clampLimit(1000, 50) = %d, want 1000", got)
+	}
+	if got := clampLimit(0, 50); got != 50 {
+		t.Errorf("clampLimit(0, 50) = %d, want 50 (reset to default)", got)
+	}
+	if got := clampLimit(1001, 50); got != 50 {
+		t.Errorf("clampLimit(1001, 50) = %d, want 50 (reset to default)", got)
+	}
+	if got := clampLimit(-1, 50); got != 50 {
+		t.Errorf("clampLimit(-1, 50) = %d, want 50 (reset to default)", got)
+	}
+
+	// clampOffset: negative → 0; non-negative passes through.
+	if got := clampOffset(0); got != 0 {
+		t.Errorf("clampOffset(0) = %d, want 0", got)
+	}
+	if got := clampOffset(100); got != 100 {
+		t.Errorf("clampOffset(100) = %d, want 100", got)
+	}
+	if got := clampOffset(-1); got != 0 {
+		t.Errorf("clampOffset(-1) = %d, want 0", got)
+	}
+}
+
+// TestHandleListBooksLimitClamping asserts that out-of-range limit/offset values
+// are clamped to safe defaults before the DB query is issued.
+func TestHandleListBooksLimitClamping(t *testing.T) {
+	cases := []struct {
+		name       string
+		args       map[string]interface{}
+		wantFilter db.BookFilter
+	}{
+		{
+			name:       "huge limit clamped to default 50",
+			args:       map[string]interface{}{"limit": 999999999.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 50, Offset: 0},
+		},
+		{
+			name:       "zero limit clamped to default 50",
+			args:       map[string]interface{}{"limit": 0.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 50, Offset: 0},
+		},
+		{
+			name:       "negative offset clamped to 0",
+			args:       map[string]interface{}{"offset": -5.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 50, Offset: 0},
+		},
+		{
+			name:       "valid limit and offset pass through",
+			args:       map[string]interface{}{"limit": 20.0, "offset": 10.0},
+			wantFilter: db.BookFilter{Query: "", Limit: 20, Offset: 10},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := &MockDBInterface{}
+			mockDB.On("GetBookSummaries", mock.Anything, tc.wantFilter).
+				Return([]db.BookSummary{}, 0, nil).Once()
+
+			h := NewToolHandlers(mockDB, resolverForTest())
+			res, err := h.handleListBooks(context.Background(), req("list_books", tc.args))
+			assert.NoError(t, err)
+			assert.False(t, res.IsError)
+			mockDB.AssertExpectations(t)
+		})
+	}
+}
+
+// TestHandleSemanticSearchLimitClamping asserts that out-of-range limit is
+// clamped to the search default (10) before the DB query.
+func TestHandleSemanticSearchLimitClamping(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	// Limit 999999 should be clamped to default 10.
+	mockDB.On("Search", mock.Anything, "dragons", 10, 0.3).
+		Return([]db.SearchResultWithMetadata{}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
+		"query": "dragons", "limit": 999999.0,
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleTextSearchLimitClamping asserts that an out-of-range limit is
+// clamped to the text-search default (10).
+func TestHandleTextSearchLimitClamping(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	mockDB.On("TextSearch", mock.Anything, "spice", 10).
+		Return([]db.SearchResultWithMetadata{}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
+		"query": "spice", "limit": -5.0,
+	}))
+	assert.NoError(t, err)
+	assert.False(t, res.IsError)
+	mockDB.AssertExpectations(t)
+}
+
+// TestHandleGetTranscriptNotTranscribed asserts a pending track (no transcript)
+// returns a clear error instead of an empty body.
+func TestHandleGetTranscriptNotTranscribed(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	mockDB.On("GetTrackDetail", mock.Anything, "job-p").
+		Return(&db.TrackDetail{ID: "job-p", FilePath: "/books/a/b.m4b", Status: "pending", HasTranscript: false}, nil).Once()
+
+	h := NewToolHandlers(mockDB, resolverForTest())
+	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
+		"trackID": "job-p",
+	}))
+	assert.NoError(t, err)
+	assert.True(t, res.IsError)
+	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "not transcribed yet")
+	mockDB.AssertExpectations(t)
 }

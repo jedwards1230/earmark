@@ -117,7 +117,7 @@ Debug-only (both must be set):
 | `internal/db` | pgxpool-based DB handle; schema init; job queue; search; chunks |
 | `internal/worker` | Polls completed transcripts, chunks via segments, embeds, stores |
 | `internal/monitor` | Walks BOOKS_DIR, inserts pending jobs (dedup by SHA-256) |
-| `internal/mcp` | MCP server + tool handlers (semantic search, text search, browse) |
+| `internal/mcp` | MCP server + tool handlers (semantic/text search w/ optional per-book scope, list_books, get_transcript, browse, chunk context) |
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client (pointed at Ollama) |
 | `internal/config` | Env-var configuration loader |

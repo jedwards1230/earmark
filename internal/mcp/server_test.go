@@ -166,6 +166,16 @@ func (m *SimpleMockDB) TextSearchInBook(_ context.Context, dir, query string, _ 
 	}, nil
 }
 
+func (m *SimpleMockDB) SearchInBook(_ context.Context, query, dir string, _ int, _ float64) ([]db.SearchResultWithMetadata, error) {
+	m.lastSearchDir, m.lastSearchQuery = dir, query
+	if query == "" {
+		return nil, nil
+	}
+	return []db.SearchResultWithMetadata{
+		{ID: "vs1", Content: "semantic match in " + dir, FilePath: dir + "/01.mp3", StartSec: 12.5, EndSec: 18.0, Similarity: 0.8},
+	}, nil
+}
+
 func (m *SimpleMockDB) GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error) {
 	return []db.HierarchicalEntry{
 		{
