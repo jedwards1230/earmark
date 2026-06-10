@@ -716,6 +716,62 @@ func TestGetTrackDetailCorruptSegmentsJSON(t *testing.T) {
 	}
 }
 
+// TestTextSearchInBookScopesToDir drives textSearchInBook at execution level and
+// asserts it sends the book-scoped SQL with (query, limit, dirPrefix) args, the
+// prefix being the LIKE-escaped dir + "/%".
+func TestTextSearchInBookScopesToDir(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	dir := "/books/audio-libation/Andy Weir/PHM"
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("c1", "the matching text", dir+"/01.m4b", 3, 12.5, 18.0, nil, 0.8, 10)
+
+	// Args: $1 query, $2 limit, $3 dir prefix "<dir>/%".
+	mock.ExpectQuery(textSearchInBookSQL).
+		WithArgs("matching", 50, dir+"/%").
+		WillReturnRows(rows)
+
+	got, err := db.textSearchInBook(context.Background(), mock, dir, "matching", 50)
+	if err != nil {
+		t.Fatalf("textSearchInBook: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 1 || got[0].FilePath != dir+"/01.m4b" {
+		t.Fatalf("got %+v, want 1 result under the book dir", got)
+	}
+
+	// The book-scoped SQL must constrain file_path and reuse the trigram predicate.
+	if !strings.Contains(textSearchInBookSQL, "c.file_path LIKE $3") {
+		t.Error("textSearchInBookSQL missing file_path scope")
+	}
+	if !strings.Contains(textSearchInBookSQL, "c.text % $1") {
+		t.Error("textSearchInBookSQL missing trigram predicate")
+	}
+}
+
+func TestLikePrefix(t *testing.T) {
+	cases := map[string]string{
+		"/books/A/B":   "/books/A/B",
+		"50% off":      `50\% off`,
+		"a_b":          `a\_b`,
+		`back\slash`:   `back\\slash`,
+		`%_\ combined`: `\%\_\\ combined`,
+	}
+	for in, want := range cases {
+		if got := likePrefix(in); got != want {
+			t.Errorf("likePrefix(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestComputeFileChecksum_DifferentFiles(t *testing.T) {
 	dir := t.TempDir()
 	f1 := filepath.Join(dir, "a.bin")

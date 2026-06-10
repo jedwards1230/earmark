@@ -39,6 +39,21 @@ func (demoDB) TextSearch(context.Context, string, int) ([]db.SearchResultWithMet
 	return nil, nil
 }
 
+// TextSearchInBook returns synthetic per-book search hits so the book-detail
+// search box is exercisable with no database: two matching chunk rows within
+// the given dir (timestamps inline). An empty query yields nothing.
+func (demoDB) TextSearchInBook(_ context.Context, dir, query string, _ int) ([]db.SearchResultWithMetadata, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	return []db.SearchResultWithMetadata{
+		{ID: "s1", FilePath: dir + "/01.m4b", ChunkIndex: 3, StartSec: 182.4, EndSec: 271.0,
+			Content: "…and there, in the " + query + ", everything changed at once."},
+		{ID: "s2", FilePath: dir + "/04.m4b", ChunkIndex: 12, StartSec: 1820.0, EndSec: 1905.5,
+			Content: "She returned to the " + query + " one final time before dawn."},
+	}, nil
+}
+
 func (demoDB) GetHierarchicalData(context.Context) ([]db.HierarchicalEntry, error) {
 	return nil, nil
 }
@@ -108,6 +123,8 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		hb := now.Add(-2 * time.Hour) // older than the 30m stale window
 		avg := 0.0
 		tok := int64(0)
+		libDur := 432000.0
+		libWords := int64(7_800_000)
 		q = &db.QueueStats{
 			Pending: 5, Claimed: 1, Done: 120, Failed: 0,
 			Transcripts: 120, Chunks: 7431, EmbedBacklog: 0,
@@ -115,28 +132,35 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			// run_metrics exist but predate this stall; avg over zero-duration → "—".
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 18,
 		}
 	case "failed":
 		hb := now.Add(-40 * time.Second)
 		avg := 624.0
 		tok := int64(2_140_500)
+		libDur := 295200.0
+		libWords := int64(4_120_000)
 		q = &db.QueueStats{
 			Pending: 3, Claimed: 1, Done: 88, Failed: 7,
 			Transcripts: 88, Chunks: 5120, EmbedBacklog: 14, // large → exercises the stall warning
 			TotalJobs: 99, DoneLastHour: 4,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 12,
 		}
 	default: // active
 		hb := now.Add(-12 * time.Second)
 		avg := 487.5
 		tok := int64(6_820_400)
+		libDur := 1_188_000.0
+		libWords := int64(12_400_000)
 		q = &db.QueueStats{
 			Pending: 42, Claimed: 1, Done: 317, Failed: 2,
 			Transcripts: 317, Chunks: 18452, EmbedBacklog: 3,
 			TotalJobs: 362, DoneLastHour: 22,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 41,
 		}
 	}
 	q.Paused = d.isPaused()
@@ -419,10 +443,23 @@ func (d demoDB) GetTrackDetail(_ context.Context, jobID string) (*db.TrackDetail
 	det.EmbedTotalTokens = &totalTok
 
 	spk0 := "SPEAKER_00"
-	det.Segments = []db.Segment{
-		{ID: 0, Start: 0.0, End: 4.2, Text: "Chapter one. The morning light fell across the desk.", Speaker: &spk0},
-		{ID: 1, Start: 4.2, End: 9.8, Text: "She had been waiting for this moment longer than she cared to admit.", Speaker: &spk0},
-		{ID: 2, Start: 9.8, End: 15.3, Text: "Outside, the rain had finally stopped, and the city began to stir.", Speaker: &spk0},
+	// Generate 72 segments so the reader's "load more" pagination (P7,
+	// segmentPageSize=30) is visibly exercised: 3 pages (30 + 30 + 12).
+	lines := []string{
+		"The morning light fell across the desk.",
+		"She had been waiting for this moment longer than she cared to admit.",
+		"Outside, the rain had finally stopped, and the city began to stir.",
+		"A single thought kept returning, unbidden, to the front of her mind.",
+		"He closed the book and looked out toward the harbor.",
+	}
+	const nSegs = 72
+	det.Segments = make([]db.Segment, nSegs)
+	for i := 0; i < nSegs; i++ {
+		start := float64(i) * 5.4
+		det.Segments[i] = db.Segment{
+			ID: i, Start: start, End: start + 5.0,
+			Text: lines[i%len(lines)], Speaker: &spk0,
+		}
 	}
 	det.Chunks = []db.ChunkRow{
 		{ChunkIndex: 0, StartSec: 0.0, EndSec: 90.4, CharCount: 512, Speaker: &spk0},

@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -766,6 +767,58 @@ func (db *DB) textSearch(ctx context.Context, q rowQuerier, query string, limit 
 	return db.scanResults(rows)
 }
 
+// textSearchInBookSQL is textSearchSQL scoped to one book directory: the same
+// trigram-ranked search, but with the chunk's file_path constrained to that
+// book's tracks ($3 is the dir prefix, e.g. "<dir>/%"). Same SELECT/scan shape
+// as textSearchSQL so scanResults is reused unchanged.
+var textSearchInBookSQL = `
+	SELECT
+		c.id,
+		c.text,
+		c.file_path,
+		c.chunk_index,
+		c.start_sec,
+		c.end_sec,
+		c.speaker,
+		similarity(c.text, $1) AS similarity,
+		(SELECT COUNT(*) FROM transcript_chunks WHERE transcript_id = c.transcript_id) AS total_chunks
+	FROM transcript_chunks c
+	WHERE c.file_path LIKE $3
+	  AND (c.text % $1 OR c.text ILIKE '%' || $1 || '%')
+	ORDER BY similarity(c.text, $1) DESC, c.chunk_index ASC
+	LIMIT $2
+`
+
+// TextSearchInBook runs the trigram text search scoped to a single book
+// directory (the per-book search box on the book-detail page). dir is an exact
+// book_dir as returned by GetBookSummaries; matching is restricted to chunks
+// whose file_path is under "<dir>/". Reuses the same SELECT/scan shape as
+// TextSearch.
+func (db *DB) TextSearchInBook(ctx context.Context, dir, query string, limit int) ([]SearchResultWithMetadata, error) {
+	return db.textSearchInBook(ctx, db.pool, dir, query, limit)
+}
+
+// textSearchInBook is the querier-parameterized core of TextSearchInBook. The
+// dir prefix is built with a LIKE-escape so a book whose name contains %, _, or
+// \ can't widen the match.
+func (db *DB) textSearchInBook(ctx context.Context, q rowQuerier, dir, query string, limit int) ([]SearchResultWithMetadata, error) {
+	prefix := likePrefix(dir) + "/%"
+	rows, err := q.Query(ctx, textSearchInBookSQL, query, limit, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("book text search query: %w", err)
+	}
+	defer rows.Close()
+	return db.scanResults(rows)
+}
+
+// likePrefix escapes LIKE metacharacters (%, _, \) in a literal so it can be
+// used as an exact prefix in a `... LIKE prefix || '%'` pattern. Postgres LIKE
+// uses backslash as the default escape character.
+func likePrefix(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
 // scanResults scans a result set from findSimilar, TextSearch, or
 // GetChunkContext, populating the legacy Author/Title/Chapter fields using the
 // DB's library.Resolver so that metadata is correct for both 3-level
@@ -942,6 +995,15 @@ type QueueStats struct {
 	// are nil when no run_metrics rows carry the underlying data yet.
 	AvgProcessingSeconds *float64
 	TotalEmbedTokens     *int64
+
+	// Library-wide totals over indexed content (the overview "library" card).
+	// TotalDurationSeconds sums transcripts.duration_seconds across every
+	// transcript; TotalWords sums run_metrics.word_count; BooksFullyDone counts
+	// book directories whose every track job is 'done'. The first two are nil
+	// when nothing is transcribed/metered yet.
+	TotalDurationSeconds *float64
+	TotalWords           *int64
+	BooksFullyDone       int
 }
 
 // GetServiceStatus returns a single aggregate snapshot used by the status
@@ -1052,6 +1114,23 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		FROM run_metrics
 	`).Scan(&q.AvgProcessingSeconds, &q.TotalEmbedTokens); err != nil {
 		return nil, fmt.Errorf("run_metrics aggregates: %w", err)
+	}
+
+	// Library-wide indexed totals: duration + words over all transcripts, and the
+	// count of book directories whose every track is 'done'. NULL-safe (nilable
+	// pointers) so a fresh install shows an em dash, not 0-as-known.
+	if err := db.pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT SUM(duration_seconds) FROM transcripts),
+		  (SELECT SUM(word_count) FROM run_metrics),
+		  (SELECT COUNT(*) FROM (
+		     SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir
+		     FROM transcription_jobs
+		     GROUP BY book_dir
+		     HAVING COUNT(*) FILTER (WHERE status <> 'done') = 0
+		   ) fully_done)
+	`).Scan(&q.TotalDurationSeconds, &q.TotalWords, &q.BooksFullyDone); err != nil {
+		return nil, fmt.Errorf("library totals: %w", err)
 	}
 
 	return q, nil

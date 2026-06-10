@@ -14,6 +14,9 @@ import (
 type DBInterface interface {
 	Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error)
 	TextSearch(ctx context.Context, query string, limit int) ([]db.SearchResultWithMetadata, error)
+	// TextSearchInBook runs TextSearch scoped to one book directory (the per-book
+	// search box on the book-detail page).
+	TextSearchInBook(ctx context.Context, dir, query string, limit int) ([]db.SearchResultWithMetadata, error)
 	GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error)
 	GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error)
 	// Ping checks that the database is reachable; used by /readyz.

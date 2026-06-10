@@ -295,6 +295,10 @@ func TestTrackFragmentRendersDetail(t *testing.T) {
 	bytesN := int64(48300000)
 	tot := 18240
 	dur := 1830.0
+	segs := []db.Segment{
+		{ID: 0, Start: 0, End: 4.2, Text: "Chapter one.", Speaker: &spk},
+		{ID: 1, Start: 4.2, End: 9.8, Text: "She waited.", Speaker: &spk},
+	}
 	d := trackData{
 		Title: "B", Author: "A", BackDir: "/books/audio-libation/A/B", DurationPtr: &dur,
 		Detail: &db.TrackDetail{
@@ -302,12 +306,11 @@ func TestTrackFragmentRendersDetail(t *testing.T) {
 			UpdatedAt: time.Now(), HasTranscript: true, Language: "en", DurationSeconds: dur,
 			ModelName:  "large-v3",
 			AudioCodec: &codec, AudioChannels: &channels, AudioBytes: &bytesN, EmbedTotalTokens: &tot,
-			Segments: []db.Segment{
-				{ID: 0, Start: 0, End: 4.2, Text: "Chapter one.", Speaker: &spk},
-				{ID: 1, Start: 4.2, End: 9.8, Text: "She waited.", Speaker: &spk},
-			},
-			Chunks: []db.ChunkRow{{ChunkIndex: 0, StartSec: 0, EndSec: 90.4, CharCount: 512, Speaker: &spk}},
+			Segments: segs,
+			Chunks:   []db.ChunkRow{{ChunkIndex: 0, StartSec: 0, EndSec: 90.4, CharCount: 512, Speaker: &spk}},
 		},
+		// Mirror handleTrackData: first page of segments, no "load more" (2 < 30).
+		TotalSegments: len(segs), PageSegments: segs, HasMore: false,
 	}
 	var buf bytes.Buffer
 	if err := trackFragmentTmpl.Execute(&buf, d); err != nil {
@@ -406,14 +409,13 @@ func TestTrackFragmentXSSEscaping(t *testing.T) {
 	maliciousSpeaker := `"><img src=x onerror=alert(1)>`
 	chunkSpeaker := maliciousSpeaker
 	dur := 10.0
+	seg := db.Segment{ID: 0, Start: 0, End: 5, Text: maliciousText, Speaker: &maliciousSpeaker}
 	d := trackData{
 		Title: "B", Author: "A", BackDir: "%2Fbooks%2FA%2FB", DurationPtr: &dur,
+		TotalSegments: 1, PageSegments: []db.Segment{seg},
 		Detail: &db.TrackDetail{
 			ID: "t-xss", FilePath: "/books/A/B/01.m4b", Status: "done",
 			UpdatedAt: time.Now(), HasTranscript: true, DurationSeconds: dur,
-			Segments: []db.Segment{
-				{ID: 0, Start: 0, End: 5, Text: maliciousText, Speaker: &maliciousSpeaker},
-			},
 			Chunks: []db.ChunkRow{{ChunkIndex: 0, StartSec: 0, EndSec: 10, CharCount: 26, Speaker: &chunkSpeaker}},
 		},
 	}
@@ -437,6 +439,95 @@ func TestTrackFragmentXSSEscaping(t *testing.T) {
 	}
 	if !strings.Contains(out, "&gt;&lt;img src=x onerror=alert(1)&gt;") {
 		t.Error("segment speaker / chunk speaker: expected HTML-escaped form in output")
+	}
+}
+
+func TestPaginateSegments(t *testing.T) {
+	mk := func(n int) []db.Segment {
+		s := make([]db.Segment, n)
+		for i := range s {
+			s[i] = db.Segment{ID: i}
+		}
+		return s
+	}
+	cases := []struct {
+		name        string
+		total       int
+		offset      int
+		wantLen     int
+		wantHasMore bool
+		wantNext    int
+	}{
+		{"first page of many", 72, 0, 30, true, 30},
+		{"second page", 72, 30, 30, true, 60},
+		{"last partial page", 72, 60, 12, false, 72},
+		{"exact one page", 30, 0, 30, false, 30},
+		{"fewer than a page", 5, 0, 5, false, 5},
+		{"empty", 0, 0, 0, false, 0},
+		{"offset past end clamps", 10, 99, 0, false, 10},
+		{"negative offset clamps", 40, -5, 30, true, 30},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			page, hasMore, next := paginateSegments(mk(c.total), c.offset)
+			if len(page) != c.wantLen {
+				t.Errorf("len = %d, want %d", len(page), c.wantLen)
+			}
+			if hasMore != c.wantHasMore {
+				t.Errorf("hasMore = %v, want %v", hasMore, c.wantHasMore)
+			}
+			if next != c.wantNext {
+				t.Errorf("next = %d, want %d", next, c.wantNext)
+			}
+		})
+	}
+}
+
+// TestTrackReaderPaginates renders the track fragment with >segmentPageSize
+// segments and asserts only the first page is rendered plus a "load more"
+// button, and the second-page (segments fragment) renders the remainder.
+func TestTrackReaderPaginates(t *testing.T) {
+	const total = 72
+	segs := make([]db.Segment, total)
+	for i := range segs {
+		segs[i] = db.Segment{ID: i, Start: float64(i), End: float64(i) + 1, Text: "seg"}
+	}
+	page, hasMore, next := paginateSegments(segs, 0)
+	d := trackData{
+		IDQuery: "abc",
+		Detail: &db.TrackDetail{
+			ID: "t1", FilePath: "/a/b/c.m4b", Status: "done", HasTranscript: true,
+			Segments: segs,
+		},
+		TotalSegments: total, PageSegments: page, HasMore: hasMore, NextOffset: next,
+	}
+	var buf bytes.Buffer
+	if err := trackFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, `class="seg"`); n != segmentPageSize {
+		t.Errorf("rendered %d segments on first page, want %d", n, segmentPageSize)
+	}
+	if !strings.Contains(out, `/track/segments?id=abc&offset=30`) {
+		t.Errorf("expected load-more button to /track/segments offset=30:\n%s", out)
+	}
+	if !strings.Contains(out, "72 segments") {
+		t.Error("header should show the FULL segment count, not just the page")
+	}
+
+	// Second page via the standalone segments fragment.
+	page2, hasMore2, next2 := paginateSegments(segs, 30)
+	var buf2 bytes.Buffer
+	if err := segmentsFragmentTmpl.Execute(&buf2, segmentsData{Segments: page2, HasMore: hasMore2, NextOffset: next2, IDQuery: "abc"}); err != nil {
+		t.Fatalf("execute segments: %v", err)
+	}
+	out2 := buf2.String()
+	if n := strings.Count(out2, `class="seg"`); n != segmentPageSize {
+		t.Errorf("second page rendered %d segments, want %d", n, segmentPageSize)
+	}
+	if !strings.Contains(out2, "offset=60") {
+		t.Error("second page should chain to offset=60")
 	}
 }
 

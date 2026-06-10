@@ -18,20 +18,22 @@ import (
 // SimpleMockDB implements DBInterface for simple testing.
 // pingErr controls whether Ping returns an error (nil = healthy).
 type SimpleMockDB struct {
-	pingErr       error
-	requeueErr    error  // if set, RequeueByID/RequeueFailed return it
-	requeuedID    string // last id passed to RequeueByID
-	requeuedDir   string // last dir passed to RequeueByDir
-	retriedFailed bool   // RequeueFailed was called
-	paused        bool   // current pause flag (mutated by SetPaused)
-	pausedSetTo   *bool  // last value passed to SetPaused
-	setPausedErr  error  // if set, SetPaused returns it
-	runLimit      *int   // current run_limit (mutated by SetRunLimit)
-	runLimitSetTo *int   // last value passed to SetRunLimit (heap copy)
-	runLimitSet   bool   // SetRunLimit was called
-	setRunLimErr  error  // if set, SetRunLimit returns it
-	embedBacklog  int    // EmbedBacklog reported by GetServiceStatus
-	lastBookDir   string // last dir passed to GetBookTracks
+	pingErr         error
+	requeueErr      error  // if set, RequeueByID/RequeueFailed return it
+	requeuedID      string // last id passed to RequeueByID
+	requeuedDir     string // last dir passed to RequeueByDir
+	retriedFailed   bool   // RequeueFailed was called
+	paused          bool   // current pause flag (mutated by SetPaused)
+	pausedSetTo     *bool  // last value passed to SetPaused
+	setPausedErr    error  // if set, SetPaused returns it
+	runLimit        *int   // current run_limit (mutated by SetRunLimit)
+	runLimitSetTo   *int   // last value passed to SetRunLimit (heap copy)
+	runLimitSet     bool   // SetRunLimit was called
+	setRunLimErr    error  // if set, SetRunLimit returns it
+	embedBacklog    int    // EmbedBacklog reported by GetServiceStatus
+	lastBookDir     string // last dir passed to GetBookTracks
+	lastSearchDir   string // last dir passed to TextSearchInBook
+	lastSearchQuery string // last query passed to TextSearchInBook
 }
 
 func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error {
@@ -151,6 +153,16 @@ func (m *SimpleMockDB) TextSearch(ctx context.Context, query string, limit int) 
 			Chapter:    "Chapter 1",
 			ChunkIndex: 0,
 		},
+	}, nil
+}
+
+func (m *SimpleMockDB) TextSearchInBook(_ context.Context, dir, query string, _ int) ([]db.SearchResultWithMetadata, error) {
+	m.lastSearchDir, m.lastSearchQuery = dir, query
+	if query == "" {
+		return nil, nil
+	}
+	return []db.SearchResultWithMetadata{
+		{ID: "bs1", Content: "match in " + dir, FilePath: dir + "/01.mp3", StartSec: 12.5, EndSec: 18.0},
 	}, nil
 }
 
@@ -912,5 +924,77 @@ func TestRequeueFromFailedView(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "Failed jobs") {
 		t.Error("requeue with failed=1 should re-render the failures fragment")
+	}
+}
+
+// TestBookSearchEndpoint verifies POST /search/book?dir=… runs the per-book
+// search with the form's q and renders the matching chunk rows scoped to dir.
+func TestBookSearchEndpoint(t *testing.T) {
+	mock := &SimpleMockDB{}
+	form := url.Values{"q": {"dragons"}}
+	dir := "/books/audio-libation/Andy Weir/PHM"
+	req := httptest.NewRequest(http.MethodPost, "/search/book?dir="+url.QueryEscape(dir),
+		strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("book search: want 200, got %d", w.Code)
+	}
+	if mock.lastSearchDir != dir {
+		t.Errorf("search dir = %q, want %q", mock.lastSearchDir, dir)
+	}
+	if mock.lastSearchQuery != "dragons" {
+		t.Errorf("search query = %q, want dragons", mock.lastSearchQuery)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Search results for") || !strings.Contains(body, "match in "+dir) {
+		t.Errorf("book search body missing results:\n%s", body)
+	}
+}
+
+// TestBookSearchEmptyQuery verifies an empty q renders nothing (no search run).
+func TestBookSearchEmptyQuery(t *testing.T) {
+	mock := &SimpleMockDB{}
+	dir := "/books/A/B"
+	req := httptest.NewRequest(http.MethodPost, "/search/book?dir="+url.QueryEscape(dir),
+		strings.NewReader("q="))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty book search: want 200, got %d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "Search results for") {
+		t.Error("empty query should render nothing")
+	}
+}
+
+// TestBookSearchMissingDir verifies a missing dir param is a 400.
+func TestBookSearchMissingDir(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/search/book", strings.NewReader("q=x"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	buildTestMux(&SimpleMockDB{}).ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing dir: want 400, got %d", w.Code)
+	}
+}
+
+// TestTrackSegmentsEndpoint verifies GET /track/segments?id=…&offset=… returns a
+// page of the transcript reader (the SimpleMockDB track has one segment).
+func TestTrackSegmentsEndpoint(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/track/segments?id=t1&offset=0", nil)
+	w := httptest.NewRecorder()
+	buildTestMux(&SimpleMockDB{}).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("track segments: want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "seg-text") {
+		t.Errorf("track segments should render seg rows:\n%s", w.Body.String())
 	}
 }
