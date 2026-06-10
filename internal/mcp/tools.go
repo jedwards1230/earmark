@@ -109,15 +109,26 @@ const maxOffset = 1_000_000
 // value (e.g. snippet=5) still yields a useful excerpt rather than a few letters.
 const minSnippetChars = 80
 
+// maxSnippetChars is the ceiling for the `snippet` parameter. Chunks are
+// ~400 words / ~2500 chars; any value at or above the full chunk length yields
+// the whole chunk anyway, so capping at 4000 is harmless and prevents large
+// rune-slice allocations from a malicious or misconfigured client.
+const maxSnippetChars = 4000
+
 // snippetChars normalizes the optional `snippet` param (max chars per hit).
 // 0 or negative → 0 (omitted: return the full chunk). A positive value below the
-// floor is raised to minSnippetChars so the excerpt is still readable.
+// floor is raised to minSnippetChars; a value above the ceiling is clamped to
+// maxSnippetChars (a snippet ≥ the full chunk just returns the full chunk, so
+// the cap is harmless).
 func snippetChars(n int) int {
 	if n <= 0 {
 		return 0
 	}
 	if n < minSnippetChars {
 		return minSnippetChars
+	}
+	if n > maxSnippetChars {
+		return maxSnippetChars
 	}
 	return n
 }

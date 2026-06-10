@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
@@ -109,6 +110,40 @@ func TestSnippetTruncation(t *testing.T) {
 	full := formatSearchResultsOpts(res, searchSemantic, "", 100000).Content[0].(mcp.TextContent).Text
 	assert.Contains(t, full, long)
 	assert.NotContains(t, full, "(truncated")
+}
+
+// TestMakeSnippetKindGate tests makeSnippet directly to assert the centering gate
+// is kind-gated: searchSemantic ALWAYS returns a leading window, even when the
+// query string appears mid-chunk; searchText centres on the match.
+func TestMakeSnippetKindGate(t *testing.T) {
+	// Build a chunk whose query word sits well past the first 80 chars so that a
+	// leading window excludes it while a centred window includes it.
+	prefix := "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 "
+	needle := "TARGET"
+	suffix := " word13 word14 word15 word16 word17 word18 word19 word20"
+	chunk := prefix + needle + suffix
+	max := 80
+
+	// searchSemantic: NEVER centres — even when needle is in the content, the
+	// result must be a leading window that starts at the beginning of the chunk.
+	semSnip, truncated := makeSnippet(chunk, needle, max, searchSemantic)
+	if truncated {
+		// Leading window: must start with the first word(s) of the chunk.
+		if !strings.HasPrefix(semSnip, "word1") && !strings.HasPrefix(semSnip, "…") {
+			// Allow a leading ellipsis only if start==0 (it won't be here).
+			t.Errorf("semantic snippet does not start at chunk beginning: %q", semSnip)
+		}
+		// Must NOT contain the needle (it is beyond the leading window).
+		if strings.Contains(semSnip, needle) {
+			t.Errorf("semantic snippet centered on query match (contains %q); want leading preview: %q", needle, semSnip)
+		}
+	}
+
+	// searchText: DOES centre — the excerpt must contain the needle.
+	textSnip, _ := makeSnippet(chunk, needle, max, searchText)
+	if !strings.Contains(textSnip, needle) {
+		t.Errorf("text snippet does not contain query match %q: %q", needle, textSnip)
+	}
 }
 
 // TestFormatBookTree asserts the author-grouped list_books output groups the same

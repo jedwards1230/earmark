@@ -714,6 +714,41 @@ func TestClampHelpers(t *testing.T) {
 	}
 }
 
+// TestSnippetCharsClamp verifies that snippetChars enforces both floor and
+// ceiling, preventing large rune-slice allocations from a giant snippet value.
+func TestSnippetCharsClamp(t *testing.T) {
+	// Zero / negative → disabled (return full chunk).
+	if got := snippetChars(0); got != 0 {
+		t.Errorf("snippetChars(0) = %d, want 0", got)
+	}
+	if got := snippetChars(-1); got != 0 {
+		t.Errorf("snippetChars(-1) = %d, want 0", got)
+	}
+
+	// Below floor → raised to minSnippetChars.
+	if got := snippetChars(5); got != minSnippetChars {
+		t.Errorf("snippetChars(5) = %d, want %d (floor)", got, minSnippetChars)
+	}
+
+	// Normal value passes through unchanged.
+	if got := snippetChars(300); got != 300 {
+		t.Errorf("snippetChars(300) = %d, want 300", got)
+	}
+
+	// Exactly at ceiling passes through.
+	if got := snippetChars(maxSnippetChars); got != maxSnippetChars {
+		t.Errorf("snippetChars(%d) = %d, want %d", maxSnippetChars, got, maxSnippetChars)
+	}
+
+	// Above ceiling → clamped to maxSnippetChars (prevents large allocations).
+	if got := snippetChars(maxSnippetChars + 1); got != maxSnippetChars {
+		t.Errorf("snippetChars(%d) = %d, want %d (ceiling clamp)", maxSnippetChars+1, got, maxSnippetChars)
+	}
+	if got := snippetChars(2_147_483_647); got != maxSnippetChars {
+		t.Errorf("snippetChars(MaxInt32) = %d, want %d (ceiling clamp)", got, maxSnippetChars)
+	}
+}
+
 // TestHandleListBooksLimitClamping asserts that out-of-range limit/offset values
 // are clamped to safe defaults before the DB query is issued.
 func TestHandleListBooksLimitClamping(t *testing.T) {
