@@ -465,6 +465,29 @@ func TestHandleGetContext(t *testing.T) {
 	}
 }
 
+// TestHandleGetContextClampsWindow verifies the clamp fires in the handler, not
+// just in isolation: a huge contextWindow must reach GetChunkContext as the
+// clamped maxContextWindow. The mock expectation is set to maxContextWindow, so
+// if the handler passed the raw value, AssertExpectations would fail.
+func TestHandleGetContextClampsWindow(t *testing.T) {
+	mockDB := new(MockDBInterface)
+	chunkID := "11111111-1111-1111-1111-111111111111"
+	mockDB.On("GetChunkContext", mock.Anything, chunkID, maxContextWindow).
+		Return([]db.SearchResultWithMetadata{
+			{ID: chunkID, Content: "ctx", Author: "A", Title: "T", ChunkIndex: 1, ChunkID: chunkID},
+		}, nil)
+
+	handlers := NewToolHandlers(mockDB, nil)
+	result, err := handlers.handleGetContext(context.Background(), req("get_chunk_context", map[string]interface{}{
+		"chunkID":       chunkID,
+		"contextWindow": 2147483647,
+	}))
+
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	mockDB.AssertExpectations(t)
+}
+
 // req builds a CallToolRequest with the given name and arguments.
 func req(name string, args map[string]interface{}) mcp.CallToolRequest {
 	return mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: args}}
@@ -720,6 +743,20 @@ func TestClampHelpers(t *testing.T) {
 	}
 	if got := clampOffset(2147483647); got != maxOffset {
 		t.Errorf("clampOffset(MaxInt32) = %d, want %d (clamped to ceiling)", got, maxOffset)
+	}
+
+	// clampContextWindow: negative → 0; in-range passes through; above ceiling → maxContextWindow.
+	if got := clampContextWindow(-1); got != 0 {
+		t.Errorf("clampContextWindow(-1) = %d, want 0", got)
+	}
+	if got := clampContextWindow(2); got != 2 {
+		t.Errorf("clampContextWindow(2) = %d, want 2", got)
+	}
+	if got := clampContextWindow(maxContextWindow); got != maxContextWindow {
+		t.Errorf("clampContextWindow(maxContextWindow) = %d, want %d", got, maxContextWindow)
+	}
+	if got := clampContextWindow(2147483647); got != maxContextWindow {
+		t.Errorf("clampContextWindow(MaxInt32) = %d, want %d (clamped to ceiling)", got, maxContextWindow)
 	}
 }
 
