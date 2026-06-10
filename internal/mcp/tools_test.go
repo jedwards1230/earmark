@@ -79,6 +79,10 @@ func (m *MockDBInterface) GetBookTracks(context.Context, string) ([]db.RecentJob
 	return nil, nil
 }
 
+func (m *MockDBInterface) GetTrackDetail(context.Context, string) (*db.TrackDetail, error) {
+	return nil, nil
+}
+
 func (m *MockDBInterface) RequeueByDir(context.Context, string) ([]string, error) {
 	return nil, nil
 }

@@ -344,6 +344,94 @@ func (d demoDB) GetBookTracks(_ context.Context, dir string) ([]db.RecentJob, er
 	return out, nil
 }
 
+// GetTrackDetail returns a synthetic per-track detail for the /track page. A
+// trailing "#0" (or an id ending in an even index) is treated as a done track
+// with a full transcript + chunks; an odd index is a pending track with no
+// transcript (exercising the "not transcribed yet" state). The id format mirrors
+// demoDB.GetBookTracks ("<dir>#<n>").
+func (d demoDB) GetTrackDetail(_ context.Context, jobID string) (*db.TrackDetail, error) {
+	now := time.Now()
+	// Recover the synthetic track index from the "<dir>#<n>" id; default 0.
+	idx := 0
+	if h := strings.LastIndex(jobID, "#"); h >= 0 {
+		if n, err := strconv.Atoi(jobID[h+1:]); err == nil {
+			idx = n
+		}
+	}
+	fp := jobID
+	if h := strings.LastIndex(jobID, "#"); h >= 0 {
+		fp = jobID[:h] + "/track.m4b"
+	}
+
+	det := &db.TrackDetail{
+		ID: jobID, FilePath: fp, UpdatedAt: now.Add(-time.Duration(idx) * time.Minute),
+		Attempts: 1,
+	}
+
+	// Odd index → pending track with no transcript (graceful empty state).
+	if idx%2 == 1 {
+		det.Status = "pending"
+		return det, nil
+	}
+
+	// Even index → done track with full detail.
+	det.Status = "done"
+	det.HasTranscript = true
+	det.Language = "en"
+	det.DurationSeconds = 1830 + float64(idx)*120
+	spk := 1
+	det.SpeakerCount = &spk
+	det.ModelName = "nvidia/parakeet-tdt-0.6b-v3"
+	det.TranscriptAt = now.Add(-time.Duration(idx) * time.Minute)
+
+	bytes := int64(48_300_000)
+	channels := 2
+	rate := 44100
+	codec := "aac"
+	format := "m4b"
+	proc := 95.0 + float64(idx)*30
+	compute := "bfloat16"
+	host := "asr-runner-desktop-1"
+	chunkedF := false
+	words := 14200 + idx*800
+	chars := 84000 + idx*4000
+	segCount := 3
+	embModel := "nomic-embed-text"
+	embChunks := 36 + idx*4
+	promptTok := 0
+	totalTok := 18240 + idx*1200
+	det.AudioBytes = &bytes
+	det.AudioChannels = &channels
+	det.AudioSampleRate = &rate
+	det.AudioCodec = &codec
+	det.AudioFormat = &format
+	det.ProcessingSeconds = &proc
+	det.ASRModel = &det.ModelName
+	det.ComputeType = &compute
+	det.RunnerHost = &host
+	det.Chunked = &chunkedF
+	det.WordCount = &words
+	det.CharCount = &chars
+	det.SegmentCount = &segCount
+	det.EmbedModel = &embModel
+	det.EmbedChunkCount = &embChunks
+	det.EmbedPromptTokens = &promptTok
+	det.EmbedTotalTokens = &totalTok
+
+	spk0 := "SPEAKER_00"
+	det.Segments = []db.Segment{
+		{ID: 0, Start: 0.0, End: 4.2, Text: "Chapter one. The morning light fell across the desk.", Speaker: &spk0},
+		{ID: 1, Start: 4.2, End: 9.8, Text: "She had been waiting for this moment longer than she cared to admit.", Speaker: &spk0},
+		{ID: 2, Start: 9.8, End: 15.3, Text: "Outside, the rain had finally stopped, and the city began to stir.", Speaker: &spk0},
+	}
+	det.Chunks = []db.ChunkRow{
+		{ChunkIndex: 0, StartSec: 0.0, EndSec: 90.4, CharCount: 512, Speaker: &spk0},
+		{ChunkIndex: 1, StartSec: 88.1, EndSec: 182.7, CharCount: 498, Speaker: &spk0},
+		{ChunkIndex: 2, StartSec: 180.0, EndSec: 274.5, CharCount: 530, Speaker: &spk0},
+	}
+	return det, nil
+}
+
 // renumber replaces the last run of digits in a path's filename with n (demo
 // helper, so sibling track names look plausible).
 func renumber(p string, n int) string {

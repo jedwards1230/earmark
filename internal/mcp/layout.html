@@ -189,6 +189,20 @@
   .back-link:hover { color: var(--text); }
   .book-path { color: var(--muted); font-size: 11px; margin-top: 6px; word-break: break-all; }
 
+  /* ── track detail: 3-panel header, kv lists, transcript reader ──── */
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .panel-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 10px; }
+  dl.kv { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  dl.kv dt { color: var(--muted); font-size: 12px; }
+  dl.kv dd { margin: 0; font-size: 12px; text-align: right; word-break: break-word; }
+  .reader { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; max-height: 60vh; overflow-y: auto; line-height: 1.55; }
+  .seg { margin-bottom: 8px; font-size: 13px; }
+  .seg-time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; margin-right: 6px; }
+  .seg-speaker { color: var(--purple); font-size: 11px; margin-right: 6px; }
+  .seg-text { color: var(--text); }
+  .load-more { margin-top: 10px; }
+
   @media (max-width: 560px) {
     main { padding: 14px; }
     .file-name { max-width: 50vw; }

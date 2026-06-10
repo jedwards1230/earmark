@@ -84,6 +84,17 @@ func (m *SimpleMockDB) GetBookTracks(_ context.Context, dir string) ([]db.Recent
 	}, nil
 }
 
+func (m *SimpleMockDB) GetTrackDetail(_ context.Context, jobID string) (*db.TrackDetail, error) {
+	spk := "SPEAKER_00"
+	return &db.TrackDetail{
+		ID: jobID, FilePath: "/books/Author/Book/" + jobID + ".m4b", Status: "done",
+		UpdatedAt: time.Now().UTC(), HasTranscript: true, Language: "en",
+		DurationSeconds: 1830, ModelName: "large-v3",
+		Segments: []db.Segment{{ID: 0, Start: 0, End: 4.2, Text: "Hello.", Speaker: &spk}},
+		Chunks:   []db.ChunkRow{{ChunkIndex: 0, StartSec: 0, EndSec: 90, CharCount: 512, Speaker: &spk}},
+	}, nil
+}
+
 func (m *SimpleMockDB) RequeueByID(_ context.Context, id string) (string, error) {
 	m.requeuedID = id
 	if m.requeueErr != nil {

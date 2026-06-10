@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
 )
@@ -98,6 +101,41 @@ var tmplFuncs = template.FuncMap{
 		}
 		return commafy64(*n)
 	},
+	// timestamp renders a float seconds offset as mm:ss (or h:mm:ss past an hour)
+	// for the transcript reader and chunk list.
+	"timestamp": timestamp,
+	// strPtr renders a nullable string, or an em dash when nil/empty.
+	"strPtr": func(s *string) string {
+		if s == nil || *s == "" {
+			return "—"
+		}
+		return *s
+	},
+	// boolPtr renders a nullable bool as "yes"/"no", or an em dash when nil.
+	"boolPtr": func(b *bool) string {
+		if b == nil {
+			return "—"
+		}
+		if *b {
+			return "yes"
+		}
+		return "no"
+	},
+	// bytesPtr renders a nullable byte count as a human size (e.g. "12.4 MB"), or
+	// an em dash when nil.
+	"bytesPtr": func(n *int64) string {
+		if n == nil {
+			return "—"
+		}
+		return humanizeBytes(*n)
+	},
+	// hzPtr renders a nullable sample rate in Hz as "44.1 kHz", or an em dash.
+	"hzPtr": func(n *int) string {
+		if n == nil {
+			return "—"
+		}
+		return fmt.Sprintf("%.1f kHz", float64(*n)/1000)
+	},
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.
@@ -141,6 +179,13 @@ var bookPage = mustPage(`{{define "content"}}
 var failedPage = mustPage(`{{define "content"}}
 <div id="action-error" aria-live="assertive"></div>
 <div id="failed-region" hx-get="/failed/data" hx-trigger="load" hx-swap="innerHTML">
+  <p class="htmx-indicator">loading…</p>
+</div>
+{{end}}`)
+
+var trackPage = mustPage(`{{define "content"}}
+<div id="action-error" aria-live="assertive"></div>
+<div id="track-region" hx-get="/track/data?id={{.IDQuery}}" hx-trigger="load" hx-swap="innerHTML">
   <p class="htmx-indicator">loading…</p>
 </div>
 {{end}}`)
@@ -390,7 +435,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
   <tbody>
   {{range .Tracks}}
     <tr>
-      <td><div class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</div>
+      <td><a class="file-name" href="/track?id={{.ID}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}</td>
       <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
       <td class="time-muted">{{durTime .DurationSeconds}}</td>
@@ -413,12 +458,110 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
 {{else}}<p class="lib-empty">No tracks found for this book.</p>{{end}}
 `))
 
+// ─── Track detail fragment ───────────────────────────────────────────────────
+
+var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Parse(`
+<a class="back-link" href="/book?dir={{.BackDir}}">&#8592;&nbsp;Book</a>
+<div class="book-head">
+  <div class="book-title">{{.Title}}</div>
+  {{if .Author}}<div class="book-author">{{.Author}}</div>{{end}}
+  <div class="book-stats">
+    <span><span class="badge {{.Detail.Status}}">{{statusLabel .Detail.Status}}</span></span>
+    {{if .Detail.HasTranscript}}<span class="time-muted">{{durTime .DurationPtr}}</span>{{end}}
+    <span class="time-muted" title="{{formatTime .Detail.UpdatedAt}}">updated {{relTime .Detail.UpdatedAt}}</span>
+  </div>
+  <div class="book-path">{{.Detail.FilePath}}</div>
+  {{if .Detail.Error}}<details class="error-row" style="margin-top:10px"><summary>show error</summary><pre>{{derefStr .Detail.Error}}</pre></details>{{end}}
+</div>
+
+<div class="panels">
+  <div class="panel">
+    <div class="panel-title">Audio</div>
+    <dl class="kv">
+      <dt>Size</dt><dd>{{bytesPtr .Detail.AudioBytes}}</dd>
+      <dt>Codec</dt><dd>{{strPtr .Detail.AudioCodec}}</dd>
+      <dt>Channels</dt><dd>{{commafyPtr .Detail.AudioChannels}}</dd>
+      <dt>Sample rate</dt><dd>{{hzPtr .Detail.AudioSampleRate}}</dd>
+      <dt>Format</dt><dd>{{strPtr .Detail.AudioFormat}}</dd>
+      <dt>Duration</dt><dd>{{if .Detail.HasTranscript}}{{durTime .DurationPtr}}{{else}}—{{end}}</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Transcription</div>
+    <dl class="kv">
+      <dt>Model</dt><dd>{{if .Detail.HasTranscript}}{{if .Detail.ModelName}}{{.Detail.ModelName}}{{else}}{{strPtr .Detail.ASRModel}}{{end}}{{else}}—{{end}}</dd>
+      <dt>Language</dt><dd>{{if .Detail.Language}}{{.Detail.Language}}{{else}}—{{end}}</dd>
+      <dt>Compute</dt><dd>{{strPtr .Detail.ComputeType}}</dd>
+      <dt>Runner</dt><dd>{{strPtr .Detail.RunnerHost}}</dd>
+      <dt>Proc time</dt><dd>{{procTime .Detail.ProcessingSeconds}}</dd>
+      <dt>Chunked</dt><dd>{{boolPtr .Detail.Chunked}}{{if .Detail.NWindows}} ({{commafyPtr .Detail.NWindows}} windows){{end}}</dd>
+      <dt>Words</dt><dd>{{commafyPtr .Detail.WordCount}}</dd>
+      <dt>Segments</dt><dd>{{if .Detail.HasTranscript}}{{commafy (len .Detail.Segments)}}{{else}}{{commafyPtr .Detail.SegmentCount}}{{end}}</dd>
+      <dt>Characters</dt><dd>{{commafyPtr .Detail.CharCount}}</dd>
+      <dt>Speakers</dt><dd>{{commafyPtr .Detail.SpeakerCount}}</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Embedding</div>
+    <dl class="kv">
+      <dt>Model</dt><dd>{{strPtr .Detail.EmbedModel}}</dd>
+      <dt>Chunks</dt><dd>{{if .Detail.Chunks}}{{commafy (len .Detail.Chunks)}}{{else}}{{commafyPtr .Detail.EmbedChunkCount}}{{end}}</dd>
+      <dt>Prompt tokens</dt><dd>{{commafyPtr .Detail.EmbedPromptTokens}}</dd>
+      <dt>Total tokens</dt><dd>{{commafyPtr .Detail.EmbedTotalTokens}}</dd>
+    </dl>
+  </div>
+</div>
+
+{{if .Detail.HasTranscript}}
+  <div class="section">
+    <div class="section-title">Transcript ({{commafy (len .Detail.Segments)}} segment{{if ne (len .Detail.Segments) 1}}s{{end}})</div>
+    {{if .Detail.Segments}}
+    <div class="reader">
+      {{range .Detail.Segments}}
+      <div class="seg">
+        <span class="seg-time">[{{timestamp .Start}} &#8594; {{timestamp .End}}]</span>
+        {{if .Speaker}}<span class="seg-speaker">{{derefStr .Speaker}}</span>{{end}}
+        <span class="seg-text">{{.Text}}</span>
+      </div>
+      {{end}}
+    </div>
+    {{else}}<p class="lib-empty">Transcript has no segments.</p>{{end}}
+  </div>
+
+  <div class="section">
+    <div class="section-title">Chunks ({{commafy (len .Detail.Chunks)}})</div>
+    {{if .Detail.Chunks}}
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Time range</th><th>Chars</th><th>Speaker</th></tr></thead>
+      <tbody>
+      {{range .Detail.Chunks}}
+        <tr>
+          <td class="time-muted">{{.ChunkIndex}}</td>
+          <td class="time-muted">{{timestamp .StartSec}} &#8594; {{timestamp .EndSec}}</td>
+          <td class="time-muted">{{commafy .CharCount}}</td>
+          <td class="time-muted">{{if .Speaker}}{{derefStr .Speaker}}{{else}}—{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    </div>
+    {{else}}<p class="lib-empty">Not embedded yet — chunks appear after the worker's next embed pass.</p>{{end}}
+  </div>
+{{else}}
+  <div class="section">
+    <p class="lib-empty">Not transcribed yet — this track is <span class="badge {{.Detail.Status}}">{{statusLabel .Detail.Status}}</span>. The transcript reader and chunk list appear once the runner completes it.</p>
+  </div>
+{{end}}
+`))
+
 // ─── Template models ─────────────────────────────────────────────────────────
 
 type pageShell struct {
 	Title     string
 	Nav       string
-	DirQuery  string // book page only
+	DirQuery  string // book page: URL-escaped dir for the hx-get fragment load
+	IDQuery   string // track page only: URL-escaped job id for the hx-get fragment load
 	DataQuery string // library page only: "?status=…&q=…" for the initial fragment load
 }
 
@@ -494,6 +637,16 @@ type failedData struct {
 	Jobs []db.FailedJob
 }
 
+type trackData struct {
+	Detail  *db.TrackDetail
+	Title   string
+	Author  string
+	BackDir string // URL-escaped book dir (dirname of file_path) for use in href query params
+	// DurationPtr adapts the non-pointer Detail.DurationSeconds to the *float64
+	// the durTime helper expects (nil → em dash when no transcript).
+	DurationPtr *float64
+}
+
 // newStatusData derives the unified pipeline state from the pause flag and the
 // runner heartbeat freshness, so the banner is never self-contradictory.
 func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, staleAfter time.Duration, embedURL string) statusData {
@@ -567,6 +720,38 @@ func statusLabel(status string) string {
 		return "transcribing"
 	}
 	return status
+}
+
+// timestamp renders a non-negative float seconds offset as a clock string:
+// "mm:ss" below an hour, "h:mm:ss" at or above one. Used by the transcript
+// reader and chunk list. Negative input is clamped to 0.
+func timestamp(secs float64) string {
+	if secs < 0 {
+		secs = 0
+	}
+	total := int64(secs) // truncate — segment boundaries are already second-ish
+	h := total / 3600
+	m := (total % 3600) / 60
+	s := total % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+// humanizeBytes renders a byte count as a human-readable size (KB/MB/GB, base
+// 1024). Used for the run_metrics audio_bytes field.
+func humanizeBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // channelLabel maps an audio channel count to a human layout word; for unusual
@@ -874,6 +1059,56 @@ func (s *MCPServer) renderBookFragment(w http.ResponseWriter, r *http.Request, d
 	w.WriteHeader(http.StatusOK)
 	if err := bookFragmentTmpl.Execute(w, d); err != nil {
 		s.logger.Error("book fragment render error", "error", err)
+	}
+}
+
+// ─── Track detail handlers ───────────────────────────────────────────────────
+
+func (s *MCPServer) handleTrackPage(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	// The id goes into an hx-get attribute, which html/template does NOT
+	// URL-filter, so it is pre-escaped. The "back to book" link is derived in the
+	// fragment from the track's own file_path, so no dir param is threaded here.
+	s.renderPage(w, trackPage, pageShell{
+		Title: "track", Nav: "library", IDQuery: url.QueryEscape(id),
+	})
+}
+
+func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	detail, err := s.db.GetTrackDetail(r.Context(), id)
+	if err != nil {
+		// A bad/unknown id is a 404, not a 500 — distinguishes "no such track"
+		// from a real backend failure.
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "no such track", http.StatusNotFound)
+			return
+		}
+		s.logger.Error("GetTrackDetail error", "id", id, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	bookDir := path.Dir(detail.FilePath)
+	d := trackData{Detail: detail, BackDir: url.QueryEscape(bookDir)}
+	d.Author, d.Title = s.resolver.Resolve(bookDir, detail.FilePath)
+	if detail.HasTranscript {
+		dur := detail.DurationSeconds
+		d.DurationPtr = &dur
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := trackFragmentTmpl.Execute(w, d); err != nil {
+		s.logger.Error("track fragment render error", "error", err)
 	}
 }
 
