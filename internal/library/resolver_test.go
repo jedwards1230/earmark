@@ -90,6 +90,37 @@ func TestTitleFromFilename(t *testing.T) {
 	}
 }
 
+func TestExtractASIN(t *testing.T) {
+	cases := map[string]string{
+		"Project Hail Mary [B08GB58KD5]":      "B08GB58KD5",
+		"Neuromancer [B0057HR4E6]":            "B0057HR4E6",
+		"Noise [1984832069]":                  "1984832069", // numeric catalogue id
+		"[b08gb58kd5]":                        "B08GB58KD5", // case-insensitive
+		"1984":                                "",           // a bare title, no bracket
+		"Plain Title":                         "",
+		"/books/audio/A/Title [B0011UGNDG]/x": "B0011UGNDG",
+	}
+	for in, want := range cases {
+		if got := ExtractASIN(in); got != want {
+			t.Errorf("ExtractASIN(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestStripASIN(t *testing.T) {
+	cases := map[string]string{
+		"Project Hail Mary [B08GB58KD5]": "Project Hail Mary",
+		"Noise [1984832069]":             "Noise",
+		"1984":                           "1984", // no bracket → unchanged
+		"Plain Title":                    "Plain Title",
+	}
+	for in, want := range cases {
+		if got := StripASIN(in); got != want {
+			t.Errorf("StripASIN(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestParseCollectionsEmpty(t *testing.T) {
 	r, err := ParseCollections("", "/books")
 	if err != nil {

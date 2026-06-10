@@ -139,6 +139,36 @@ func (r *Resolver) match(dir string) (compiled, bool) {
 	return compiled{}, false
 }
 
+// asinBracket matches a bracketed catalogue id embedded in a directory/title,
+// e.g. "[B08GB58KD5]" (Audible ASIN) or a bracketed all-digit id "[1984832069]".
+// The captured group is the id itself, without the brackets.
+var asinBracket = regexp.MustCompile(`\[((?:B0[0-9A-Z]{8})|(?:[0-9]{6,}))\]`)
+
+// ExtractASIN returns the bracketed catalogue id (ASIN or numeric id) embedded in
+// a book directory or title, e.g. "Project Hail Mary [B08GB58KD5]" → "B08GB58KD5".
+// Returns "" when no bracketed id is present. Matching is case-insensitive on the
+// "B0" prefix form so "[b08gb58kd5]" resolves too.
+func ExtractASIN(s string) string {
+	m := asinBracket.FindStringSubmatch(strings.ToUpper(s))
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// StripASIN removes a bracketed catalogue id (and any surrounding whitespace) from
+// a title so substring matching compares against the human title text only, e.g.
+// "Project Hail Mary [B08GB58KD5]" → "Project Hail Mary". The ASIN itself must be
+// matched via the bracketed-query path, not as an incidental substring of the title.
+func StripASIN(title string) string {
+	out := asinBracketAnyCase.ReplaceAllString(title, "")
+	return strings.TrimSpace(out)
+}
+
+// asinBracketAnyCase is the case-insensitive variant used for stripping (the
+// title text we strip from is not upper-cased first, unlike ExtractASIN).
+var asinBracketAnyCase = regexp.MustCompile(`(?i)\s*\[(?:B0[0-9A-Z]{8}|[0-9]{6,})\]`)
+
 // trailingTrack strips a trailing track/part/chapter/disc marker and its number
 // (e.g. " - Track 202", " Part 1", " - 01", " CD2") so a per-track filename
 // collapses to the book title.

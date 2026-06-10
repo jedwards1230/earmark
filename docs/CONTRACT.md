@@ -395,11 +395,11 @@ raw **segments**.
 
 | Tool | Purpose | Key params |
 |------|---------|-----------|
-| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. `format=tree` groups the same rows under their authors (no extra queries). | `author?` (substring filter), `format?` (`flat` default \| `tree`), `limit?` (default 50), `offset?` |
+| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. Ordered **transcribed-first** (fully-done books, then partial, then fully-pending). Leads with a one-line whole-library summary (`Library: T books — P fully transcribed, Q with pending tracks.` — TRUE totals across the library, not just the page). `format=flat` (default) **omits each book's `dir:` line** to keep the payload small; `format=tree` groups rows under their authors **and** keeps the `dir:` line. | `author?` (substring filter), `format?` (`flat` default \| `tree`), `limit?` (default 50), `offset?` |
 | `semantic_search_audiobooks` | Vector-similarity (meaning) search; hits show a real cosine `similarity: NN%`. Whole library by default; `book` scopes it. `snippet?` caps each hit's quoted text (leading **preview** — no sub-chunk match position). | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `text_search_audiobooks` | Trigram literal/keyword search; hits are labelled **"ranked by trigram match"** (NOT a similarity %, which would mislead on a literal hit). Whole library by default; `book` scopes it. `snippet?` returns an excerpt **centred on the literal match**. | `query` (required), `book?`, `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments) |
-| `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (2; clamped to 0–50 to bound the response size) |
+| `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (**default 1** → ~3 chunks; clamped to 0–50 to bound the response size) |
 
 **Snippet windows** (`snippet` on both search tools): omitted → the full ~400-word
 chunk (backward-compatible). When set, the hit's quoted text is truncated to
@@ -411,9 +411,23 @@ is raised to 80 so the excerpt stays readable, and a value above 4000 is capped
 to 4000 (well past a full chunk, so the cap only guards against absurd inputs).
 
 **`book` resolution** (both search tools + `get_transcript`): the `book` string
-(a title or directory substring) is matched against the known book directories
-via `GetBookSummaries` and resolved to a single canonical `file_path` directory
-prefix. Zero or multiple matches return a helpful error listing the candidates.
+is resolved to a single canonical `file_path` directory prefix via
+`GetBookSummaries`. Matching is **ASIN-aware** to avoid catalogue-id collisions:
+
+- A **bracketed catalogue id** in the query (`[B0…]` or `[<digits>]`, e.g.
+  `[1984832069]`) is matched against each book's embedded ASIN **exactly**.
+- Otherwise the query is substring-matched against the human **title + author**
+  label **with the bracketed ASIN stripped** — NOT the raw path/ASIN. So
+  `book="1984"` resolves to a *1984* title (and Orwell) but never to a book whose
+  ASIN merely contains `1984` (e.g. Kahneman's *Noise* at ASIN `1984832069`).
+
+Zero or multiple matches return a helpful error listing the candidates.
+
+**Result formatting (search + context):** chapter mapping is not yet populated
+(a future ABS-integration PR fills it in), so the formatter **suppresses the
+chapter label entirely** when there is no real chapter data (chapter index 0 AND
+empty title) — no misleading `Chapter 0:` prefix is emitted. A populated chapter
+(non-zero index or a non-empty title) still renders as `Chapter N: <title>`.
 
 **Scoped semantic search query strategy (`book` set):** scoped semantic search
 does **NOT** add a `WHERE file_path LIKE` predicate to the HNSW query — pgvector

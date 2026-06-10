@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,15 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
 )
+
+// doneRatio is the fraction of a book's tracks that are done (0 when no tracks),
+// used by the demo to mirror the real transcribed-first ORDER BY.
+func doneRatio(b db.BookSummary) float64 {
+	if b.Total == 0 {
+		return 0
+	}
+	return float64(b.Done) / float64(b.Total)
+}
 
 // demoDB is an in-memory DBInterface implementation that serves synthetic data
 // for the status dashboard. It lets the dashboard render with no Postgres,
@@ -260,6 +270,12 @@ func demoBooks() []db.BookSummary {
 		{Dir: "/books/audio-custom/George Orwell",
 			SamplePath: "/books/audio-custom/George Orwell/1984.m4b",
 			Total:      1, Pending: 1, LastUpdated: now.Add(-2 * time.Hour)},
+		// Kahneman's *Noise* with a numeric ASIN containing "1984" — the regression
+		// case for the book-resolution collision: book="1984" must NOT match this.
+		{Dir: "/books/audio-libation/Daniel Kahneman/Noise [1984832069]",
+			SamplePath: "/books/audio-libation/Daniel Kahneman/Noise [1984832069]/Noise.m4b",
+			Total:      1, Done: 1, LastUpdated: now.Add(-5 * time.Hour),
+			DurationSeconds: fp(50400), WordCount: ip(110000), EmbedChunkCount: ip(360)},
 	}
 }
 
@@ -306,6 +322,15 @@ func (d demoDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookS
 		}
 		filtered = append(filtered, b)
 	}
+	// Mirror the real query's transcribed-first ORDER BY (done-ratio desc, then
+	// done count desc) so the demo shows the same ordering as production.
+	sort.SliceStable(filtered, func(i, j int) bool {
+		ri, rj := doneRatio(filtered[i]), doneRatio(filtered[j])
+		if ri != rj {
+			return ri > rj
+		}
+		return filtered[i].Done > filtered[j].Done
+	})
 	total := len(filtered)
 	lim := f.Limit
 	if lim <= 0 {
@@ -320,6 +345,32 @@ func (d demoDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookS
 		end = total
 	}
 	return filtered[start:end], total, nil
+}
+
+// GetLibraryTotals computes whole-library counts from the synthetic books, so the
+// list_books summary line is exercisable with no database. Honors the query
+// (author) filter the same way GetBookSummaries does.
+func (d demoDB) GetLibraryTotals(_ context.Context, query string) (db.LibraryTotals, error) {
+	if d.scenario == "empty" {
+		return db.LibraryTotals{}, nil
+	}
+	var t db.LibraryTotals
+	for _, b := range demoBooks() {
+		if query != "" {
+			hay := strings.ToLower(b.Dir + " " + b.SamplePath)
+			if !strings.Contains(hay, strings.ToLower(query)) {
+				continue
+			}
+		}
+		t.TotalBooks++
+		// "Fully transcribed" = every track done (no pending/claimed/failed).
+		if b.Done == b.Total && b.Total > 0 {
+			t.FullyTranscribed++
+		} else {
+			t.WithPending++
+		}
+	}
+	return t, nil
 }
 
 // GetBookTracks returns synthetic tracks for a demo book directory. Track 0 uses

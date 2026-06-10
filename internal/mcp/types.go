@@ -59,15 +59,33 @@ func intOrDash(n *int) string {
 	return fmt.Sprintf("%d", *n)
 }
 
+// librarySummaryLine renders the one-line library summary header from the
+// whole-library totals: total books, how many are fully transcribed, and how many
+// still have pending tracks. Returns "" when there are no books (so the caller can
+// skip it for an empty library).
+func librarySummaryLine(t db.LibraryTotals) string {
+	if t.TotalBooks == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Library: %d books — %d fully transcribed, %d with pending tracks.",
+		t.TotalBooks, t.FullyTranscribed, t.WithPending)
+}
+
 // formatBookList renders the library inventory for the list_books tool: one line
 // per book with author/title, track progress, duration, word count, and chunk
 // count. A book with no run_metrics yet shows em dashes / 0 for its aggregates.
-func formatBookList(books []db.BookSummary, total, offset int, resolver *library.Resolver) *mcp.CallToolResult {
+// The flat view omits each book's dir line to keep the payload small (the tree
+// view keeps it); a leading summary line reports whole-library totals.
+func formatBookList(books []db.BookSummary, total, offset int, totals db.LibraryTotals, resolver *library.Resolver) *mcp.CallToolResult {
 	if len(books) == 0 {
 		return textResult("No books found.")
 	}
 
 	var b strings.Builder
+	if summary := librarySummaryLine(totals); summary != "" {
+		b.WriteString(summary)
+		b.WriteString("\n\n")
+	}
 	fmt.Fprintf(&b, "Library: %d book(s)", total)
 	if offset > 0 || len(books) < total {
 		fmt.Fprintf(&b, " (showing %d–%d)", offset+1, offset+len(books))
@@ -93,9 +111,10 @@ func formatBookList(books []db.BookSummary, total, offset int, resolver *library
 		if bk.Failed > 0 {
 			fmt.Fprintf(&b, ", %d failed", bk.Failed)
 		}
-		fmt.Fprintf(&b, " | duration: %s | words: %s | chunks: %s\n",
+		// Flat view drops the dir line (it ~doubles the payload); use format=tree
+		// to see each book's directory.
+		fmt.Fprintf(&b, " | duration: %s | words: %s | chunks: %s\n\n",
 			fmtHMS(bk.DurationSeconds), intOrDash(bk.WordCount), intOrDash(bk.EmbedChunkCount))
-		fmt.Fprintf(&b, "  dir: %s\n\n", bk.Dir)
 	}
 
 	if offset+len(books) < total {
@@ -207,19 +226,27 @@ func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchK
 		// Format: **Title** by Author
 		fmt.Fprintf(&output, "**%s** by %s\n", result.Title, result.Author)
 
+		// Chapter mapping isn't populated yet (a future ABS-integration PR will
+		// fill it in), so suppress the misleading "Chapter 0:" prefix whenever
+		// there's no real chapter data — index 0 AND empty title.
+		chapterPrefix := ""
+		if result.ChapterIndex != 0 || strings.TrimSpace(result.ChapterTitle) != "" {
+			chapterPrefix = fmt.Sprintf("Chapter %d: %s ", result.ChapterIndex, result.ChapterTitle)
+		}
+
 		// Relevance line varies by ranking mechanism.
 		switch kind {
 		case searchSemantic:
-			fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d, similarity: %d%%)\n",
-				result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks, int(result.Similarity*100))
+			fmt.Fprintf(&output, "%s(chunk %d/%d, similarity: %d%%)\n",
+				chapterPrefix, result.ChunkIndex+1, result.TotalChunks, int(result.Similarity*100))
 		case searchText:
 			// pg_trgm rank — deliberately NOT shown as a percentage "similarity",
 			// which reads like a broken semantic score for literal matches.
-			fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d, ranked by trigram match)\n",
-				result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks)
+			fmt.Fprintf(&output, "%s(chunk %d/%d, ranked by trigram match)\n",
+				chapterPrefix, result.ChunkIndex+1, result.TotalChunks)
 		default: // searchContext
-			fmt.Fprintf(&output, "Chapter %d: %s (chunk %d/%d)\n",
-				result.ChapterIndex, result.ChapterTitle, result.ChunkIndex+1, result.TotalChunks)
+			fmt.Fprintf(&output, "%s(chunk %d/%d)\n",
+				chapterPrefix, result.ChunkIndex+1, result.TotalChunks)
 		}
 
 		// Enhanced citation info
@@ -326,7 +353,7 @@ type authorGroup struct {
 // formatBookTree renders the same inventory as formatBookList but grouped by
 // author (list_books format=tree). It only regroups the rows list_books already
 // produced — no new queries — so author → books, books in their original order.
-func formatBookTree(books []db.BookSummary, total, offset int, resolver *library.Resolver) *mcp.CallToolResult {
+func formatBookTree(books []db.BookSummary, total, offset int, totals db.LibraryTotals, resolver *library.Resolver) *mcp.CallToolResult {
 	if len(books) == 0 {
 		return textResult("No books found.")
 	}
@@ -348,6 +375,10 @@ func formatBookTree(books []db.BookSummary, total, offset int, resolver *library
 	}
 
 	var b strings.Builder
+	if summary := librarySummaryLine(totals); summary != "" {
+		b.WriteString(summary)
+		b.WriteString("\n\n")
+	}
 	fmt.Fprintf(&b, "Library: %d book(s) across %d author(s)", total, len(groups))
 	if offset > 0 || len(books) < total {
 		fmt.Fprintf(&b, " (showing %d–%d)", offset+1, offset+len(books))

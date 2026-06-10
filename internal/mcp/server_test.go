@@ -78,6 +78,10 @@ func (m *SimpleMockDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]d
 	return books, len(books), nil
 }
 
+func (m *SimpleMockDB) GetLibraryTotals(_ context.Context, _ string) (db.LibraryTotals, error) {
+	return db.LibraryTotals{TotalBooks: 2, FullyTranscribed: 1, WithPending: 1}, nil
+}
+
 func (m *SimpleMockDB) GetBookTracks(_ context.Context, dir string) ([]db.RecentJob, error) {
 	m.lastBookDir = dir
 	return []db.RecentJob{
