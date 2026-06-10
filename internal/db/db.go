@@ -914,7 +914,7 @@ func (db *DB) scanResults(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
 }
 
 // GetHierarchicalData returns a list of files with their chunk counts for the
-// browse_audiobook_library MCP tool.
+// `lil-whisper list` CLI command (a flat per-file chunk listing).
 func (db *DB) GetHierarchicalData(ctx context.Context) ([]HierarchicalEntry, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT file_path, COUNT(*) AS chunk_count

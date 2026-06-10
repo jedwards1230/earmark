@@ -56,11 +56,6 @@ func (m *MockDBInterface) hasExpect(method string) bool {
 	return false
 }
 
-func (m *MockDBInterface) GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error) {
-	args := m.Called(ctx)
-	return args.Get(0).([]db.HierarchicalEntry), args.Error(1)
-}
-
 func (m *MockDBInterface) GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error) {
 	args := m.Called(ctx, chunkID, contextWindow)
 	return args.Get(0).([]db.SearchResultWithMetadata), args.Error(1)
@@ -348,100 +343,6 @@ func TestHandleTextSearch(t *testing.T) {
 					assert.Error(t, err)
 				} else {
 					assert.True(t, result.IsError)
-				}
-			} else {
-				assert.NoError(t, err)
-				assert.False(t, result.IsError)
-				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
-			}
-
-			mockDB.AssertExpectations(t)
-		})
-	}
-}
-
-func TestHandleBrowseLibrary(t *testing.T) {
-	tests := []struct {
-		name          string
-		request       mcp.CallToolRequest
-		mockEntries   []db.HierarchicalEntry
-		mockError     error
-		expectedError bool
-		expectedText  string
-	}{
-		{
-			name: "browse all books",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name:      "browse_audiobook_library",
-					Arguments: map[string]interface{}{},
-				},
-			},
-			mockEntries: []db.HierarchicalEntry{
-				{
-					FilePath:   "/books/Test Author/Test Book/chapter1.mp3",
-					ChunkCount: 10,
-				},
-			},
-			mockError:     nil,
-			expectedError: false,
-			expectedText:  "📚 **Audiobook Library**",
-		},
-		{
-			name: "filter by author",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "browse_audiobook_library",
-					Arguments: map[string]interface{}{
-						"author": "tolkien",
-					},
-				},
-			},
-			mockEntries: []db.HierarchicalEntry{
-				{
-					FilePath:   "/books/J.R.R. Tolkien/The Hobbit/ch1.mp3",
-					ChunkCount: 5,
-				},
-				{
-					FilePath:   "/books/Brandon Sanderson/The Way of Kings/ch1.mp3",
-					ChunkCount: 8,
-				},
-			},
-			mockError:     nil,
-			expectedError: false,
-			expectedText:  "📚 **Audiobook Library**",
-		},
-		{
-			name: "database error",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name:      "browse_audiobook_library",
-					Arguments: map[string]interface{}{},
-				},
-			},
-			mockEntries:   []db.HierarchicalEntry{},
-			mockError:     errors.New("database error"),
-			expectedError: true,
-			expectedText:  "Failed to browse library: database error",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockDB := &MockDBInterface{}
-
-			mockDB.On("GetHierarchicalData", mock.Anything).
-				Return(tt.mockEntries, tt.mockError).Once()
-
-			handler := NewToolHandlers(mockDB, nil)
-			result, err := handler.handleBrowseLibrary(context.Background(), tt.request)
-
-			if tt.expectedError {
-				if err != nil {
-					assert.Error(t, err)
-				} else {
-					assert.True(t, result.IsError)
-					assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
 				}
 			} else {
 				assert.NoError(t, err)

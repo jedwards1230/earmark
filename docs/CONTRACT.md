@@ -382,16 +382,32 @@ The mcp-proxy configmap entry (add to `mcpServers` object):
 #### 2.2.1 MCP Tools
 
 All tools are read-only (no side-effects). The two search tools default to the
-**whole library** and take an optional `book` to scope to a single title.
+**whole library** and take an optional `book` to scope to a single title. There
+are **5 tools** (the legacy `browse_audiobook_library` was removed — `list_books`
+strictly dominates it; its tree view is folded in via `list_books format=tree`).
+
+**Chunks vs segments** — two granularities of the same text, surfaced by
+different tools: a **chunk** is the embedding/search unit (~hundreds per book; a
+chunk is *tens of consecutive ASR segments* grouped together), while a
+**segment** is a single ASR timestamp unit (thousands per book). The search
+tools + `get_chunk_context` operate on **chunks**; `get_transcript` paginates
+raw **segments**.
 
 | Tool | Purpose | Key params |
 |------|---------|-----------|
-| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. | `author?` (substring filter), `limit?` (default 50), `offset?` |
-| `semantic_search_audiobooks` | Vector-similarity (meaning) search. Whole library by default; `book` scopes it. | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10) |
-| `text_search_audiobooks` | Trigram literal/keyword search. Whole library by default; `book` scopes it. | `query` (required), `book?`, `limit?` (10) |
-| `get_transcript` | Read a track's full transcript as timestamped segments (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments) |
-| `browse_audiobook_library` | Legacy flat per-file chunk listing. | `author?`, `book?` |
-| `get_chunk_context` | Surrounding chunks around a chunk id. | `chunkID` (required), `contextWindow?` (2) |
+| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. `format=tree` groups the same rows under their authors (no extra queries). | `author?` (substring filter), `format?` (`flat` default \| `tree`), `limit?` (default 50), `offset?` |
+| `semantic_search_audiobooks` | Vector-similarity (meaning) search; hits show a real cosine `similarity: NN%`. Whole library by default; `book` scopes it. `snippet?` caps each hit's quoted text (leading **preview** — no sub-chunk match position). | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10), `snippet?` (max chars; floored to 80) |
+| `text_search_audiobooks` | Trigram literal/keyword search; hits are labelled **"ranked by trigram match"** (NOT a similarity %, which would mislead on a literal hit). Whole library by default; `book` scopes it. `snippet?` returns an excerpt **centred on the literal match**. | `query` (required), `book?`, `limit?` (10), `snippet?` (max chars; floored to 80) |
+| `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments) |
+| `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (2) |
+
+**Snippet windows** (`snippet` on both search tools): omitted → the full ~400-word
+chunk (backward-compatible). When set, the hit's quoted text is truncated to
+~`snippet` chars with a `…(truncated, use get_chunk_context for full text)`
+marker. Text search centres the window on the literal query match; semantic
+search returns a **leading preview** (there is no sub-chunk match position) and
+`get_chunk_context` returns the full surrounding text. A positive value below 80
+is raised to 80 so the excerpt stays readable.
 
 **`book` resolution** (both search tools + `get_transcript`): the `book` string
 (a title or directory substring) is matched against the known book directories

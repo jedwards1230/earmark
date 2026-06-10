@@ -176,15 +176,6 @@ func (m *SimpleMockDB) SearchInBook(_ context.Context, query, dir string, _ int,
 	}, nil
 }
 
-func (m *SimpleMockDB) GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error) {
-	return []db.HierarchicalEntry{
-		{
-			FilePath:   "/books/Christopher Paolini/Eragon/chapter1.mp3",
-			ChunkCount: 42,
-		},
-	}, nil
-}
-
 func (m *SimpleMockDB) GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error) {
 	return []db.SearchResultWithMetadata{
 		{
