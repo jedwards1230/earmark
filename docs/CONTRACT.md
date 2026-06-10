@@ -282,9 +282,13 @@ In addition to the runner/service transitions above, an operator may move a job
 runner) and is transactional:
 
 - **Re-transcribe**: delete the job's row in `transcripts` (which cascades to
-  `transcript_chunks`) and `UPDATE … SET status='pending', attempts=0,
-  error=NULL, claimed_by=NULL, claimed_at=NULL`. The runner then re-processes it
-  like any pending job.
+  `transcript_chunks`), delete the job's `run_metrics` row, and `UPDATE … SET
+  status='pending', attempts=0, error=NULL, claimed_by=NULL, claimed_at=NULL`.
+  All in **one transaction**. The runner then re-processes it like any pending
+  job. The `run_metrics` delete is required because requeue *updates* the job row
+  rather than deleting it, so the `run_metrics → transcription_jobs ON DELETE
+  CASCADE` never fires; left in place, the row would describe the now-deleted
+  transcript (orphaned telemetry for the prior run).
 - **Re-embed only**: delete the matching rows in `transcript_chunks` and leave
   `transcripts`/`transcription_jobs` untouched. The Go worker re-embeds on its
   next poll (it selects transcripts with no chunks). Use after an embedding
@@ -374,6 +378,35 @@ The mcp-proxy configmap entry (add to `mcpServers` object):
   "transportType": "streamable-http"
 }
 ```
+
+#### 2.2.1 MCP Tools
+
+All tools are read-only (no side-effects). The two search tools default to the
+**whole library** and take an optional `book` to scope to a single title.
+
+| Tool | Purpose | Key params |
+|------|---------|-----------|
+| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. | `author?` (substring filter), `limit?` (default 50), `offset?` |
+| `semantic_search_audiobooks` | Vector-similarity (meaning) search. Whole library by default; `book` scopes it. | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10) |
+| `text_search_audiobooks` | Trigram literal/keyword search. Whole library by default; `book` scopes it. | `query` (required), `book?`, `limit?` (10) |
+| `get_transcript` | Read a track's full transcript as timestamped segments (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments) |
+| `browse_audiobook_library` | Legacy flat per-file chunk listing. | `author?`, `book?` |
+| `get_chunk_context` | Surrounding chunks around a chunk id. | `chunkID` (required), `contextWindow?` (2) |
+
+**`book` resolution** (both search tools + `get_transcript`): the `book` string
+(a title or directory substring) is matched against the known book directories
+via `GetBookSummaries` and resolved to a single canonical `file_path` directory
+prefix. Zero or multiple matches return a helpful error listing the candidates.
+
+**Scoped semantic search query strategy (`book` set):** scoped semantic search
+does **NOT** add a `WHERE file_path LIKE` predicate to the HNSW query — pgvector
+HNSW returns the global top-K then filters, so a selective single-book filter
+under-returns (filtered-ANN recall loss). Instead it runs an **exact (non-HNSW)
+distance scan within the book**: the `file_path` btree
+(`transcript_chunks_file_path_idx`, usable under C-collation for the `LIKE
+prefix || '%'` prefix) narrows to that book's few-hundred chunks first, then an
+exact `ORDER BY embedding <=> $vec LIMIT $k` orders them — fast AND recall-perfect.
+Unscoped semantic search keeps using the HNSW index.
 
 ### 2.3 Embeddings
 

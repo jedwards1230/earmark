@@ -57,8 +57,6 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		server.WithLogging(),
 	)
 
-	handlers := NewToolHandlers(database)
-
 	// Build the library label resolver from config. A parse error falls back to
 	// the generic resolver rather than failing startup — labels are cosmetic.
 	resolver, err := library.ParseCollections(cfg.LibraryCollections, cfg.BooksDir)
@@ -67,7 +65,11 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		resolver = library.NewResolver(cfg.BooksDir, nil)
 	}
 
-	// All four search/browse tools are read-only and non-destructive — they only
+	// The tool handlers share the same resolver so the `book` argument on the
+	// search tools and the list_books labels match the dashboard's labels.
+	handlers := NewToolHandlers(database, resolver)
+
+	// All search/browse/read tools are read-only and non-destructive — they only
 	// query the database; they never mutate state or produce side-effects.
 	readOnlyAnnotations := mcp.ToolAnnotation{
 		ReadOnlyHint:    mcp.ToBoolPtr(true),
@@ -77,11 +79,16 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 
 	// Add semantic search tool
 	mcpServer.AddTool(mcp.NewTool("semantic_search_audiobooks",
-		mcp.WithDescription("Search audiobook transcriptions using semantic similarity"),
+		mcp.WithDescription("Search audiobook transcriptions by meaning (vector similarity). "+
+			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. "+
+			"Use this to find passages about a concept; use list_books to discover titles and get_transcript to read full text."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("query",
 			mcp.Description("The search query to find relevant content"),
 			mcp.Required(),
+		),
+		mcp.WithString("book",
+			mcp.Description("Optional: restrict the search to one book (a title or directory substring, e.g. \"Project Hail Mary\"). Omit to search the entire library. Run list_books to see available titles."),
 		),
 		mcp.WithNumber("threshold",
 			mcp.Description("Similarity threshold (0.0-1.0, default: 0.3)"),
@@ -95,17 +102,66 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 
 	// Add text search tool
 	mcpServer.AddTool(mcp.NewTool("text_search_audiobooks",
-		mcp.WithDescription("Search audiobook transcriptions using full-text search"),
+		mcp.WithDescription("Search audiobook transcriptions by literal/keyword text (trigram full-text search). "+
+			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. "+
+			"Use this for exact phrases or names; use semantic_search_audiobooks for conceptual queries."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithString("query",
 			mcp.Description("The search query to find exact text matches"),
 			mcp.Required(),
+		),
+		mcp.WithString("book",
+			mcp.Description("Optional: restrict the search to one book (a title or directory substring, e.g. \"Dune\"). Omit to search the entire library. Run list_books to see available titles."),
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of results to return (default: 10)"),
 			mcp.DefaultNumber(10),
 		),
 	), handlers.handleTextSearch)
+
+	// Add list_books tool — the library inventory.
+	mcpServer.AddTool(mcp.NewTool("list_books",
+		mcp.WithDescription("List the audiobook library inventory: each book with author, title, "+
+			"track progress (done/total), total duration, word count, and embedded-chunk count. "+
+			"This is the inventory tool — use it to discover which titles exist before scoping a "+
+			"search or fetching a transcript."),
+		mcp.WithToolAnnotation(readOnlyAnnotations),
+		mcp.WithString("author",
+			mcp.Description("Optional: filter to books whose path/author matches this substring (case-insensitive)."),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum number of books to return (default: 50)"),
+			mcp.DefaultNumber(50),
+		),
+		mcp.WithNumber("offset",
+			mcp.Description("Pagination offset into the book list (default: 0)"),
+			mcp.DefaultNumber(0),
+		),
+	), handlers.handleListBooks)
+
+	// Add get_transcript tool — read the full transcript text (paginated).
+	mcpServer.AddTool(mcp.NewTool("get_transcript",
+		mcp.WithDescription("Read the full transcript of a book/track as timestamped segments, so you can "+
+			"READ the text rather than only search fragments. Provide `book` (a title) or `trackID` (a job id "+
+			"from list_books / a track chooser). Transcripts are large, so segments are paginated via "+
+			"offset/limit; the response footer tells you the next offset. If a book has multiple tracks, this "+
+			"returns the track list so you can pick one by trackID."),
+		mcp.WithToolAnnotation(readOnlyAnnotations),
+		mcp.WithString("book",
+			mcp.Description("A book title or directory substring to read (e.g. \"Project Hail Mary\"). Either this or trackID is required."),
+		),
+		mcp.WithString("trackID",
+			mcp.Description("A specific track/job id (UUID) to read. Takes precedence over `book`. Use when a book has multiple tracks."),
+		),
+		mcp.WithNumber("offset",
+			mcp.Description("Segment offset to start the page at (default: 0)"),
+			mcp.DefaultNumber(0),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Number of segments to return per page (default: 50)"),
+			mcp.DefaultNumber(50),
+		),
+	), handlers.handleGetTranscript)
 
 	// Add browse library tool
 	mcpServer.AddTool(mcp.NewTool("browse_audiobook_library",

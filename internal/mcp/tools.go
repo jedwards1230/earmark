@@ -3,10 +3,12 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/library"
 	"github.com/jedwards1230/lil-whisper/internal/log"
 )
 
@@ -15,8 +17,11 @@ type DBInterface interface {
 	Search(ctx context.Context, query string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error)
 	TextSearch(ctx context.Context, query string, limit int) ([]db.SearchResultWithMetadata, error)
 	// TextSearchInBook runs TextSearch scoped to one book directory (the per-book
-	// search box on the book-detail page).
+	// search box on the book-detail page; also the scoped text_search MCP tool).
 	TextSearchInBook(ctx context.Context, dir, query string, limit int) ([]db.SearchResultWithMetadata, error)
+	// SearchInBook runs semantic search scoped to one book directory via an exact
+	// (non-HNSW) distance scan, so a selective single-book filter keeps full recall.
+	SearchInBook(ctx context.Context, query, dir string, limit int, threshold float64) ([]db.SearchResultWithMetadata, error)
 	GetHierarchicalData(ctx context.Context) ([]db.HierarchicalEntry, error)
 	GetChunkContext(ctx context.Context, chunkID string, contextWindow int) ([]db.SearchResultWithMetadata, error)
 	// Ping checks that the database is reachable; used by /readyz.
@@ -57,17 +62,29 @@ type DBInterface interface {
 type ToolHandlers struct {
 	db     DBInterface
 	logger log.Logger
+	// resolver derives (author, title) labels from book paths, used to match a
+	// user-supplied `book` argument to a canonical book directory and to label the
+	// list_books inventory. May be a generic resolver if LIBRARY_COLLECTIONS is
+	// unset; never nil once constructed via NewToolHandlers.
+	resolver *library.Resolver
 }
 
-// NewToolHandlers creates a new ToolHandlers instance
-func NewToolHandlers(database DBInterface) *ToolHandlers {
+// NewToolHandlers creates a new ToolHandlers instance. resolver may be nil (e.g.
+// in unit tests that don't exercise book resolution); a generic fallback resolver
+// is substituted so handlers can always call it safely.
+func NewToolHandlers(database DBInterface, resolver *library.Resolver) *ToolHandlers {
+	if resolver == nil {
+		resolver = library.NewResolver("", nil)
+	}
 	return &ToolHandlers{
-		db:     database,
-		logger: log.NewLogger("mcp-tools"),
+		db:       database,
+		logger:   log.NewLogger("mcp-tools"),
+		resolver: resolver,
 	}
 }
 
-// handleSemanticSearch performs semantic search on audiobook transcriptions
+// handleSemanticSearch performs semantic search on audiobook transcriptions,
+// over the whole library by default or scoped to one book when `book` is given.
 func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Extract required query parameter
 	query, err := request.RequireString("query")
@@ -78,10 +95,27 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 	// Extract optional parameters with defaults
 	threshold := request.GetFloat("threshold", 0.3)
 	limit := request.GetInt("limit", 10)
+	book := strings.TrimSpace(request.GetString("book", ""))
+
+	// Scoped: resolve `book` → a canonical dir, then run an exact (non-HNSW)
+	// distance scan within that book so a selective filter keeps full recall.
+	if book != "" {
+		dir, errResult := h.resolveBookDir(ctx, book)
+		if errResult != nil {
+			return errResult, nil
+		}
+		h.logger.Info("Performing scoped semantic search", "query", query, "book", book, "dir", dir, "threshold", threshold, "limit", limit)
+		results, err := h.db.SearchInBook(ctx, query, dir, limit, threshold)
+		if err != nil {
+			h.logger.Error("Scoped semantic search failed", "error", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+		}
+		return formatSearchResults(results), nil
+	}
 
 	h.logger.Info("Performing semantic search", "query", query, "threshold", threshold, "limit", limit)
 
-	// Perform semantic search
+	// Perform semantic search (whole library, HNSW-accelerated)
 	results, err := h.db.Search(ctx, query, limit, threshold)
 	if err != nil {
 		h.logger.Error("Semantic search failed", "error", err)
@@ -92,7 +126,8 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 	return formatSearchResults(results), nil
 }
 
-// handleTextSearch performs full-text search on audiobook transcriptions
+// handleTextSearch performs full-text search on audiobook transcriptions, over
+// the whole library by default or scoped to one book when `book` is given.
 func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Extract required query parameter
 	query, err := request.RequireString("query")
@@ -100,12 +135,28 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 		return mcp.NewToolResultError(fmt.Sprintf("Missing or invalid query parameter: %v", err)), nil
 	}
 
-	// Extract optional limit parameter with default
+	// Extract optional parameters
 	limit := request.GetInt("limit", 10)
+	book := strings.TrimSpace(request.GetString("book", ""))
+
+	// Scoped: resolve `book` → a canonical dir and reuse the per-book text search.
+	if book != "" {
+		dir, errResult := h.resolveBookDir(ctx, book)
+		if errResult != nil {
+			return errResult, nil
+		}
+		h.logger.Info("Performing scoped text search", "query", query, "book", book, "dir", dir, "limit", limit)
+		results, err := h.db.TextSearchInBook(ctx, dir, query, limit)
+		if err != nil {
+			h.logger.Error("Scoped text search failed", "error", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+		}
+		return formatSearchResults(results), nil
+	}
 
 	h.logger.Info("Performing text search", "query", query, "limit", limit)
 
-	// Perform text search
+	// Perform text search (whole library)
 	results, err := h.db.TextSearch(ctx, query, limit)
 	if err != nil {
 		h.logger.Error("Text search failed", "error", err)
@@ -114,6 +165,132 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 
 	// Format results using the shared formatting function
 	return formatSearchResults(results), nil
+}
+
+// bookCandidate pairs a resolved book directory with its display labels, used
+// both for book-scope resolution and the candidate list in disambiguation errors.
+type bookCandidate struct {
+	dir    string
+	author string
+	title  string
+}
+
+// resolveBookDir maps a user-supplied `book` string (a book name or directory
+// substring) to a single canonical book directory. It queries GetBookSummaries
+// with the term as an ILIKE filter, resolves each candidate's author/title via
+// the resolver, then keeps candidates whose dir, title, or "author - title"
+// label contains the term (case-insensitive). Exactly one match → its dir;
+// zero or many → a helpful error result listing candidate labels.
+//
+// The returned *mcp.CallToolResult is non-nil only on the error/ambiguous path
+// (already formatted for return to the model); dir is set only on success.
+func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string, *mcp.CallToolResult) {
+	// A generous page so substring matches across a large library aren't truncated
+	// before the in-Go label filter runs.
+	summaries, _, err := h.db.GetBookSummaries(ctx, db.BookFilter{Query: book, Limit: 200})
+	if err != nil {
+		h.logger.Error("book resolution failed", "book", book, "error", err)
+		return "", mcp.NewToolResultError(fmt.Sprintf("Failed to resolve book %q: %v", book, err))
+	}
+
+	term := strings.ToLower(book)
+	var matches []bookCandidate
+	for _, s := range summaries {
+		author, title := h.resolver.Resolve(s.Dir, s.SamplePath)
+		label := strings.ToLower(strings.TrimSpace(author + " " + title))
+		hay := strings.ToLower(s.Dir) + "\n" + strings.ToLower(title) + "\n" + label
+		if strings.Contains(hay, term) {
+			matches = append(matches, bookCandidate{dir: s.Dir, author: author, title: title})
+		}
+	}
+
+	switch len(matches) {
+	case 1:
+		return matches[0].dir, nil
+	case 0:
+		return "", mcp.NewToolResultError(fmt.Sprintf(
+			"No book matched %q. Use list_books to see the available titles, or omit `book` to search the whole library.", book))
+	default:
+		var b strings.Builder
+		fmt.Fprintf(&b, "%q matched %d books — please be more specific:\n", book, len(matches))
+		for _, m := range matches {
+			label := strings.TrimSpace(m.title)
+			if m.author != "" {
+				label = strings.TrimSpace(m.author + " — " + m.title)
+			}
+			fmt.Fprintf(&b, "  • %s  (%s)\n", label, m.dir)
+		}
+		return "", mcp.NewToolResultError(b.String())
+	}
+}
+
+// handleListBooks returns the library inventory: each book with author, title,
+// track progress, duration, word count, and chunk count.
+func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	limit := request.GetInt("limit", 50)
+	offset := request.GetInt("offset", 0)
+	author := strings.TrimSpace(request.GetString("author", ""))
+
+	h.logger.Info("Listing books", "limit", limit, "offset", offset, "author", author)
+
+	summaries, total, err := h.db.GetBookSummaries(ctx, db.BookFilter{
+		Query: author, Limit: limit, Offset: offset,
+	})
+	if err != nil {
+		h.logger.Error("list books failed", "error", err)
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to list books: %v", err)), nil
+	}
+
+	return formatBookList(summaries, total, offset, h.resolver), nil
+}
+
+// handleGetTranscript returns a page of a track's transcript so the model can
+// read the full text. It resolves `book` → a track (disambiguating when a book
+// has multiple tracks), then returns timestamped segments with offset/limit
+// pagination.
+func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	offset := request.GetInt("offset", 0)
+	limit := request.GetInt("limit", 50)
+
+	// Two ways in: an explicit track/job id, or a `book` to resolve.
+	trackID := strings.TrimSpace(request.GetString("trackID", ""))
+	if trackID == "" {
+		book := strings.TrimSpace(request.GetString("book", ""))
+		if book == "" {
+			return mcp.NewToolResultError("Provide either `book` (a title/dir) or `trackID` (a job id). Use list_books to find titles."), nil
+		}
+		dir, errResult := h.resolveBookDir(ctx, book)
+		if errResult != nil {
+			return errResult, nil
+		}
+		tracks, err := h.db.GetBookTracks(ctx, dir)
+		if err != nil {
+			h.logger.Error("get book tracks failed", "dir", dir, "error", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to load tracks for %q: %v", book, err)), nil
+		}
+		if len(tracks) == 0 {
+			return mcp.NewToolResultError(fmt.Sprintf("No tracks found for %q.", book)), nil
+		}
+		if len(tracks) > 1 {
+			// Multiple tracks → list them so the caller can pick one via trackID.
+			return formatTrackChooser(book, tracks), nil
+		}
+		trackID = tracks[0].ID
+	}
+
+	detail, err := h.db.GetTrackDetail(ctx, trackID)
+	if err != nil {
+		h.logger.Error("get track detail failed", "trackID", trackID, "error", err)
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to load transcript for track %q: %v", trackID, err)), nil
+	}
+	if detail == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("No track found with id %q.", trackID)), nil
+	}
+	if !detail.HasTranscript {
+		return mcp.NewToolResultError(fmt.Sprintf("Track %q is not transcribed yet (status: %s).", detail.FilePath, detail.Status)), nil
+	}
+
+	return formatTranscriptPage(detail, offset, limit), nil
 }
 
 // handleBrowseLibrary browses the audiobook library structure
