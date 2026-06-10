@@ -124,13 +124,41 @@ re-embed and a column type migration.
 **Chunk size**: 512 tokens, 64-token overlap (Go tokenizer). Controlled by
 `CHUNK_SIZE` env var.
 
+### 4. `run_metrics` — Per-run Observability (CONTRACT §1.5)
+
+One nullable-columns row per job, written by three independent UPSERTers (Go
+monitor → `audio_bytes`; Python runner → audio probe + transcription
+timing/counts; Go embed worker → embedding timing/model/token counts). All
+writes are best-effort and never block the pipeline. See CONTRACT §1.5 for the
+full column list and per-writer ownership.
+
+```sql
+CREATE TABLE run_metrics (
+    job_id UUID PRIMARY KEY REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+    -- audio probe (monitor: audio_bytes; runner: the rest)
+    audio_bytes BIGINT, audio_channels INT, audio_sample_rate INT, audio_codec TEXT, audio_format TEXT,
+    -- transcription (runner)
+    transcribe_started_at TIMESTAMPTZ, transcribe_finished_at TIMESTAMPTZ, asr_model TEXT, compute_type TEXT,
+    runner_host TEXT, chunked BOOLEAN, n_windows INT, char_count INT, word_count INT, segment_count INT,
+    -- embedding (Go embed worker)
+    embed_started_at TIMESTAMPTZ, embed_finished_at TIMESTAMPTZ, embed_model TEXT, embed_chunk_count INT,
+    embed_prompt_tokens INT, embed_total_tokens INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`embed_total_tokens` is the authoritative local tokenizer count;
+`embed_prompt_tokens` is the provider-reported value (NULL when Ollama omits it).
+
 ## Relationships
 
 ```
 transcription_jobs (1) ←── transcripts (1) ←── transcript_chunks (N)
+                  (1) ←── run_metrics (0..1)
 ```
 
-Cascade deletes propagate: deleting a job removes its transcript and all chunks.
+Cascade deletes propagate: deleting a job removes its transcript, all chunks,
+and its run_metrics row.
 
 ## Common Queries
 

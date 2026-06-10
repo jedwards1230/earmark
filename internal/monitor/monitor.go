@@ -31,6 +31,9 @@ type DBInterface interface {
 	// IsPathQueued reports whether a job already exists for this file_path, so
 	// the scan can skip re-hashing known files.
 	IsPathQueued(ctx context.Context, filePath string) (bool, error)
+	// UpsertAudioBytes records the audio file size for a job (per-run
+	// observability). Best-effort: a failure here must not fail enqueue.
+	UpsertAudioBytes(ctx context.Context, jobID string, bytes int64) error
 }
 
 // Default file-stability tuning. A new file is only hashed once its size has
@@ -235,6 +238,15 @@ func (fm *FileMonitor) enqueueFile(filePath string) {
 		fm.log.Info("enqueued transcription job", "file", filePath, "job_id", jobID)
 	} else {
 		fm.log.Debug("job already exists", "file", filePath)
+	}
+
+	// Record the audio file size for per-run observability. Best-effort: a stat
+	// or metrics-write failure must never fail enqueue, so we only log it. The
+	// UPSERT touches only run_metrics.audio_bytes, so re-enqueues are harmless.
+	if info, statErr := os.Stat(filePath); statErr != nil {
+		fm.log.Debug("audio_bytes: stat failed", "file", filePath, "error", statErr)
+	} else if err := fm.db.UpsertAudioBytes(ctx, jobID, info.Size()); err != nil {
+		fm.log.Warn("audio_bytes: metrics write failed (continuing)", "file", filePath, "job_id", jobID, "error", err)
 	}
 }
 

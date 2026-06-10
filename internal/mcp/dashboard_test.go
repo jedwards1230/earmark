@@ -36,6 +36,29 @@ func TestHumanizeSince(t *testing.T) {
 	}
 }
 
+func TestHumanizeSeconds(t *testing.T) {
+	cases := []struct {
+		secs float64
+		want string
+	}{
+		{0, "0s"},
+		{5, "5s"},          // sub-minute
+		{59, "59s"},        // sub-minute boundary
+		{60, "1m0s"},       // exact minute — seconds component kept, not dropped
+		{65, "1m5s"},       // minutes + seconds
+		{3600, "1h0m0s"},   // exact hour — m/s kept for an unambiguous breakdown
+		{3725, "1h2m5s"},   // hours + minutes + seconds (no dropped component)
+		{3661.5, "1h1m2s"}, // fractional input rounds to whole seconds (61.5s → 1m2s)
+		{2.4, "2s"},        // fractional rounds down
+		{2.5, "3s"},        // fractional rounds up
+	}
+	for _, c := range cases {
+		if got := humanizeSeconds(c.secs); got != c.want {
+			t.Errorf("humanizeSeconds(%v) = %q, want %q", c.secs, got, c.want)
+		}
+	}
+}
+
 // TestPipelineStateDerivation verifies the unified pipeline state never
 // contradicts itself: RUNNING only when a fresh runner is connected, IDLE when
 // enabled-but-no/stale-runner, PAUSED when the flag is set.

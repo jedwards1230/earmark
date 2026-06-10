@@ -151,13 +151,23 @@ func (d demoDB) GetRecentJobs(_ context.Context, limit int) ([]db.RecentJob, err
 		"RuntimeError: CUDA out of memory. Tried to allocate 2.40 GiB " +
 		"(GPU 0; 31.49 GiB total capacity; 28.12 GiB already allocated; 1.05 GiB free)"
 
+	// Synthetic run_metrics for 'done' jobs (nil on others — em-dash in the UI).
+	procFast, procSlow := 92.0, 1340.0
+	chunkedT, chunkedF := true, false
+	win := 14
+	tok1, tok2, tok3 := 18240, 4120, 26500
+	chars1 := 612000
+
 	jobs := []db.RecentJob{
 		{ID: "demo-1", FilePath: "/books/Author One/A Long Title/01.m4b", Status: "claimed", UpdatedAt: now.Add(-12 * time.Second)},
-		{ID: "demo-2", FilePath: "/books/Author Two/Another Book/Another Book.m4b", Status: "done", UpdatedAt: now.Add(-3 * time.Minute)},
+		{ID: "demo-2", FilePath: "/books/Author Two/Another Book/Another Book.m4b", Status: "done", UpdatedAt: now.Add(-3 * time.Minute),
+			ProcessingSeconds: &procFast, Chunked: &chunkedF, CharCount: &chars1, EmbedTotalTokens: &tok1},
 		{ID: "demo-3", FilePath: "/books/Author Three/Short Stories/Short Stories.mp3", Status: "failed", UpdatedAt: now.Add(-9 * time.Minute), Error: &shortErr},
-		{ID: "demo-4", FilePath: "/books/Author Four/The Sequel/The Sequel.m4b", Status: "done", UpdatedAt: now.Add(-22 * time.Minute)},
+		{ID: "demo-4", FilePath: "/books/Author Four/The Sequel/The Sequel.m4b", Status: "done", UpdatedAt: now.Add(-22 * time.Minute),
+			ProcessingSeconds: &procSlow, Chunked: &chunkedT, NWindows: &win, EmbedTotalTokens: &tok3},
 		{ID: "demo-5", FilePath: "/books/Author Five/A Classic/A Classic.m4b", Status: "pending", UpdatedAt: now.Add(-31 * time.Minute)},
-		{ID: "demo-6", FilePath: "/books/Author Six/A Novella/A Novella.m4b", Status: "done", UpdatedAt: now.Add(-48 * time.Minute)},
+		{ID: "demo-6", FilePath: "/books/Author Six/A Novella/A Novella.m4b", Status: "done", UpdatedAt: now.Add(-48 * time.Minute),
+			ProcessingSeconds: &procFast, Chunked: &chunkedF, EmbedTotalTokens: &tok2},
 	}
 	if d.scenario == "failed" {
 		// Lead with a long, multi-line error to exercise the bounded error row.

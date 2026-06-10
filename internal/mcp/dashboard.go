@@ -62,6 +62,22 @@ var tmplFuncs = template.FuncMap{
 	// URL-context interpolation, which html/template auto-escapes (no template.URL
 	// taint, no gosec G203).
 	"bookDir": func(fp string) string { return path.Dir(fp) },
+	// procTime renders a run_metrics processing duration (seconds) as a compact
+	// human string, or an em dash when the metric is absent.
+	"procTime": func(secs *float64) string {
+		if secs == nil || *secs <= 0 {
+			return "—"
+		}
+		return humanizeSeconds(*secs)
+	},
+	// commafyPtr renders a nullable integer count with thousands separators, or
+	// an em dash when absent.
+	"commafyPtr": func(n *int) string {
+		if n == nil {
+			return "—"
+		}
+		return commafy(*n)
+	},
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.
@@ -217,7 +233,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   {{if .Jobs}}
   <div class="table-wrap">
   <table>
-    <thead><tr><th>File</th><th>Status</th><th>Updated</th><th></th></tr></thead>
+    <thead><tr><th>File</th><th>Status</th><th title="transcription wall-clock time (runner)">Proc</th><th title="embedding tokens (local tokenizer)">Tokens</th><th>Updated</th><th></th></tr></thead>
     <tbody>
     {{range .Jobs}}
       <tr>
@@ -226,6 +242,8 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
           {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}
         </td>
         <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
+        <td class="time-muted" title="{{if .Chunked}}chunked{{if .NWindows}} ({{commafyPtr .NWindows}} windows){{end}}{{else}}single-pass{{end}}">{{procTime .ProcessingSeconds}}</td>
+        <td class="time-muted">{{commafyPtr .EmbedTotalTokens}}</td>
         <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
         <td class="actions">
           {{if or (eq .Status "done") (eq .Status "failed")}}
@@ -541,6 +559,30 @@ func humanizeSince(d time.Duration) string {
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	default:
 		return fmt.Sprintf("%dd ago", int(d.Hours())/24)
+	}
+}
+
+// humanizeSeconds renders a non-negative duration in seconds as a compact
+// "1h1m2s", "3m4s", or "5s" string for the per-run processing-time column.
+//
+// The input is rounded to whole seconds (deliberate — sub-second precision is
+// noise for a processing-time column), then decomposed from the total so no
+// component is silently dropped: e.g. 3661.5s → "1h1m2s" (1h, 1m, 2s after
+// rounding), not "1h1m". Zero-valued leading components are omitted; for the
+// h/m branches the trailing seconds are kept even when zero ("1h0m0s") so the
+// breakdown is unambiguous.
+func humanizeSeconds(secs float64) string {
+	total := int64(secs + 0.5) // round to whole seconds
+	h := total / 3600
+	m := (total % 3600) / 60
+	s := total % 60
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh%dm%ds", h, m, s)
+	case m > 0:
+		return fmt.Sprintf("%dm%ds", m, s)
+	default:
+		return fmt.Sprintf("%ds", s)
 	}
 }
 
