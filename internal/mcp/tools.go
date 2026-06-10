@@ -84,7 +84,6 @@ func NewToolHandlers(database DBInterface, resolver *library.Resolver) *ToolHand
 }
 
 // clampLimit returns def if limit is outside [1, 1000], otherwise returns limit.
-// It also clamps negative offsets to 0.
 func clampLimit(limit, def int) int {
 	if limit < 1 || limit > 1000 {
 		return def
@@ -92,9 +91,18 @@ func clampLimit(limit, def int) int {
 	return limit
 }
 
+// maxOffset bounds pagination offset to keep a malicious/garbage value from
+// forcing Postgres to skip through a huge result set (SQL OFFSET cost is linear
+// in the offset). No real library or transcript needs to page this deep.
+const maxOffset = 1_000_000
+
+// clampOffset bounds the pagination offset to [0, maxOffset].
 func clampOffset(offset int) int {
 	if offset < 0 {
 		return 0
+	}
+	if offset > maxOffset {
+		return maxOffset
 	}
 	return offset
 }
