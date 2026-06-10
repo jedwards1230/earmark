@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pashagolub/pgxmock/v4"
 
@@ -340,6 +341,191 @@ func TestTextSearchSQLShape(t *testing.T) {
 	// An ILIKE-only rewrite would be: WHERE c.text ILIKE ... with no '% $1'.
 	if strings.Contains(sql, "WHERE c.text ILIKE") && !strings.Contains(sql, "c.text % $1") {
 		t.Errorf("textSearchSQL reverted to ILIKE-only — trigram operator missing: got:\n%s", sql)
+	}
+}
+
+// bookTrackColumns are the 11 columns SELECTed by GetBookTracks, in scan order.
+var bookTrackColumns = []string{
+	"id", "file_path", "status", "updated_at", "error",
+	"duration_seconds", "processing_seconds",
+	"word_count", "audio_codec", "audio_channels", "embed_chunk_count",
+}
+
+// TestGetBookTracksPopulatesDetail drives getBookTracks at execution level with
+// pgxmock rows: one fully-populated 'done' track and one 'pending' track whose
+// transcript/run_metrics columns are all NULL (the common case — most rows have
+// no run_metrics yet). It asserts the nullable per-track detail lands in the
+// right fields and that NULLs scan to nil pointers (em dash in the UI).
+func TestGetBookTracksPopulatesDetail(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	dur := 1830.0
+	proc := 95.5
+	words := 14200
+	codec := "aac"
+	channels := 2
+	chunks := 36
+
+	rows := pgxmock.NewRows(bookTrackColumns).
+		// Done track: every detail column populated.
+		AddRow("t1", "/books/audio-libation/A/B/01.m4b", "done", now, nil,
+			&dur, &proc, &words, &codec, &channels, &chunks).
+		// Pending track: no transcript / no run_metrics → all NULL.
+		AddRow("t2", "/books/audio-libation/A/B/02.m4b", "pending", now, nil,
+			nil, nil, nil, nil, nil, nil)
+
+	dir := "/books/audio-libation/A/B"
+	mock.ExpectQuery(bookTracksSQL).WithArgs(dir).WillReturnRows(rows)
+
+	got, err := db.getBookTracks(context.Background(), mock, dir)
+	if err != nil {
+		t.Fatalf("getBookTracks: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d tracks, want 2", len(got))
+	}
+
+	// Row 1: populated.
+	r := got[0]
+	if r.DurationSeconds == nil || *r.DurationSeconds != dur {
+		t.Errorf("DurationSeconds = %v, want %v", r.DurationSeconds, dur)
+	}
+	if r.ProcessingSeconds == nil || *r.ProcessingSeconds != proc {
+		t.Errorf("ProcessingSeconds = %v, want %v", r.ProcessingSeconds, proc)
+	}
+	if r.WordCount == nil || *r.WordCount != words {
+		t.Errorf("WordCount = %v, want %d", r.WordCount, words)
+	}
+	if r.AudioCodec == nil || *r.AudioCodec != codec {
+		t.Errorf("AudioCodec = %v, want %q", r.AudioCodec, codec)
+	}
+	if r.AudioChannels == nil || *r.AudioChannels != channels {
+		t.Errorf("AudioChannels = %v, want %d", r.AudioChannels, channels)
+	}
+	if r.EmbedChunkCount == nil || *r.EmbedChunkCount != chunks {
+		t.Errorf("EmbedChunkCount = %v, want %d", r.EmbedChunkCount, chunks)
+	}
+
+	// Row 2: every detail field nil (the no-run_metrics case → em dash).
+	r2 := got[1]
+	for name, isNil := range map[string]bool{
+		"DurationSeconds":   r2.DurationSeconds == nil,
+		"ProcessingSeconds": r2.ProcessingSeconds == nil,
+		"WordCount":         r2.WordCount == nil,
+		"AudioCodec":        r2.AudioCodec == nil,
+		"AudioChannels":     r2.AudioChannels == nil,
+		"EmbedChunkCount":   r2.EmbedChunkCount == nil,
+	} {
+		if !isNil {
+			t.Errorf("row2 %s = non-nil, want nil (NULL → em dash)", name)
+		}
+	}
+}
+
+// bookSummaryColumns are the 12 columns SELECTed by GetBookSummaries, in scan
+// order. The dynamic HAVING clause doesn't change the SELECT list.
+var bookSummaryColumns = []string{
+	"book_dir", "sample_path", "total", "pending", "claimed", "done", "failed",
+	"last_updated", "duration_seconds", "word_count", "embed_chunk_count", "total_books",
+}
+
+// TestGetBookSummariesAggregates drives getBookSummaries at execution level with
+// pgxmock rows and asserts the per-book aggregate sums (duration / words /
+// chunks) land in the right fields, with NULL aggregates (a book with no done
+// track) scanning to nil pointers.
+func TestGetBookSummariesAggregates(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	dur := 58320.0
+	words := 124800
+	chunks := 412
+
+	rows := pgxmock.NewRows(bookSummaryColumns).
+		// Book with done tracks → aggregates populated.
+		AddRow("/books/audio-libation/Andy Weir/PHM", "/books/audio-libation/Andy Weir/PHM/01.m4b",
+			1, 0, 0, 1, 0, now, &dur, &words, &chunks, 2).
+		// Pending-only book → no done track → aggregates NULL.
+		AddRow("/books/audio-libro/X", "/books/audio-libro/X/01.mp3",
+			3, 3, 0, 0, 0, now, nil, nil, nil, 2)
+
+	// Default 20-page limit, offset 0, empty query.
+	mock.ExpectQuery("WITH books AS").WithArgs("", 20, 0).WillReturnRows(rows)
+
+	got, total, err := db.getBookSummaries(context.Background(), mock, BookFilter{})
+	if err != nil {
+		t.Fatalf("getBookSummaries: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("total = %d, want 2", total)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d books, want 2", len(got))
+	}
+
+	b := got[0]
+	if b.DurationSeconds == nil || *b.DurationSeconds != dur {
+		t.Errorf("DurationSeconds = %v, want %v", b.DurationSeconds, dur)
+	}
+	if b.WordCount == nil || *b.WordCount != words {
+		t.Errorf("WordCount = %v, want %d", b.WordCount, words)
+	}
+	if b.EmbedChunkCount == nil || *b.EmbedChunkCount != chunks {
+		t.Errorf("EmbedChunkCount = %v, want %d", b.EmbedChunkCount, chunks)
+	}
+
+	b2 := got[1]
+	if b2.DurationSeconds != nil || b2.WordCount != nil || b2.EmbedChunkCount != nil {
+		t.Errorf("row2 aggregates = (%v,%v,%v), want all nil",
+			b2.DurationSeconds, b2.WordCount, b2.EmbedChunkCount)
+	}
+}
+
+// TestGetBookSummariesStatusFilter asserts the validated status filter is
+// interpolated into the HAVING clause (and rejects an invalid status).
+func TestGetBookSummariesStatusFilter(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(bookSummaryColumns)
+	// The HAVING clause for status=done must reference j.status.
+	mock.ExpectQuery(`HAVING COUNT\(\*\) FILTER \(WHERE j\.status = 'done'\)`).
+		WithArgs("", 20, 0).WillReturnRows(rows)
+
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Status: "done"}); err != nil {
+		t.Fatalf("getBookSummaries(done): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+
+	// An invalid status is rejected before any query runs.
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Status: "bogus"}); err == nil {
+		t.Error("expected error for invalid status filter")
 	}
 }
 

@@ -206,6 +206,85 @@ func TestHumanizeETA(t *testing.T) {
 
 // TestErrorRowIsExpandable verifies a job error renders inside a <details>
 // expander (the full traceback is reachable), and is still HTML-escaped.
+func TestCodecLabel(t *testing.T) {
+	aac := "aac"
+	mp3 := "mp3"
+	empty := ""
+	one, two, six := 1, 2, 6
+	cases := []struct {
+		name     string
+		codec    *string
+		channels *int
+		want     string
+	}{
+		{"codec+stereo", &aac, &two, "aac · stereo"},
+		{"codec+mono", &mp3, &one, "mp3 · mono"},
+		{"codec+multichannel", &aac, &six, "aac · 6ch"},
+		{"codec only (channels nil)", &aac, nil, "aac"},
+		{"channels only (codec nil)", nil, &two, "stereo"},
+		{"both nil", nil, nil, "—"},
+		{"empty codec string falls back", &empty, nil, "—"},
+	}
+	for _, c := range cases {
+		if got := codecLabel(c.codec, c.channels); got != c.want {
+			t.Errorf("%s: codecLabel = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestCommafy64(t *testing.T) {
+	cases := map[int64]string{0: "0", 412: "412", 6_820_400: "6,820,400", -2500: "-2,500"}
+	for in, want := range cases {
+		if got := commafy64(in); got != want {
+			t.Errorf("commafy64(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestBookFragmentRendersDetailAndEmDash renders bookFragmentTmpl with one
+// fully-populated 'done' track and one 'pending' track whose detail fields are
+// all nil, and asserts both the populated cells (duration, words, "aac ·
+// stereo", chunk count) AND the em-dashes for the NULL track appear — the
+// load-bearing "never assume the joined row exists" requirement.
+func TestBookFragmentRendersDetailAndEmDash(t *testing.T) {
+	dur := 1830.0
+	proc := 95.5
+	words := 14200
+	codec := "aac"
+	channels := 2
+	chunks := 36
+
+	d := bookData{
+		Dir: "/books/audio-libation/A/B", DirQuery: "x", Title: "B", Author: "A", Total: 2, Done: 1, Pending: 1,
+		Tracks: []db.RecentJob{
+			{ID: "t1", FilePath: "/books/audio-libation/A/B/01.m4b", Status: "done", UpdatedAt: time.Now(),
+				DurationSeconds: &dur, ProcessingSeconds: &proc, WordCount: &words,
+				AudioCodec: &codec, AudioChannels: &channels, EmbedChunkCount: &chunks},
+			{ID: "t2", FilePath: "/books/audio-libation/A/B/02.m4b", Status: "pending", UpdatedAt: time.Now()},
+		},
+	}
+	var buf bytes.Buffer
+	if err := bookFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"<th title=\"audio duration\">Duration</th>",
+		"<th title=\"embedded chunks\">Chunks</th>",
+		"30m30s",       // duration 1830s
+		"1m36s",        // proc 95.5s rounds to 96s
+		"14,200",       // words
+		"aac · stereo", // codec + channels
+		">36<",         // chunk count cell
+		"—",            // em-dash for the pending track's NULL detail
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in book fragment output:\n%s", want, out)
+		}
+	}
+}
+
 func TestErrorRowIsExpandable(t *testing.T) {
 	evil := "Traceback line 1\n<script>alert(1)</script>\nRuntimeError: boom"
 	data := newStatusData(&db.QueueStats{TotalJobs: 1, Failed: 1}, []db.RecentJob{
