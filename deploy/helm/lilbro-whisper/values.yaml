@@ -113,3 +113,13 @@ secrets:
   garageSecret:
     name: cnpg-garage-secret
     itemPath: "vaults/example/items/cnpg-garage-secret"
+
+  # Bearer token for the JSON control API (PUT/POST/DELETE /api/v1/pipeline/*).
+  # When itemPath is set, the 1Password item is synced to a Secret and wired to
+  # the MCP pod's CONTROL_API_TOKEN env. Leave itemPath empty to omit it — the
+  # mutating control endpoints then fail closed (503). `key` is the field label in
+  # the 1Password item that holds the token.
+  controlApiToken:
+    name: lilbro-whisper-control-api
+    key: API_TOKEN
+    itemPath: ""

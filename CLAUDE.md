@@ -67,6 +67,12 @@ each done/failed job and a **retry all failed** button. They POST to
 `/actions/requeue?id=…` / `/actions/retry-failed` (htmx-guarded via the
 `HX-Request` header) and re-render the status fragment.
 
+For scripts/agents there is a JSON **control API** under `/api/v1` (see
+`docs/CONTRACT.md §2.12`): `GET /status`, `GET|PUT /pipeline/pause`, and
+`POST|DELETE /pipeline/run` (run N jobs then auto-pause — a one-call smoke test).
+Mutations require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed
+(`503`) when the token is unset.
+
 ## Visual Verification
 
 The `mcp` HTTP transport serves a status dashboard at `/` (htmx, auto-refreshing

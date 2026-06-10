@@ -860,6 +860,14 @@ func (s *MCPServer) handleResume(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	// Resume = clear any bounded run (run_limit→NULL), then unpause. Limit first so
+	// the runner stays gated by paused until the final write. A dashboard resume
+	// means "run normally", matching the control API's resume semantics.
+	if err := s.db.SetRunLimit(r.Context(), nil, "dashboard"); err != nil {
+		s.logger.Error("resume (clear limit) error", "error", err)
+		writeActionError(w, "resume failed — see server logs")
+		return
+	}
 	if err := s.db.SetPaused(r.Context(), false, "dashboard"); err != nil {
 		s.logger.Error("resume error", "error", err)
 		writeActionError(w, "resume failed — see server logs")

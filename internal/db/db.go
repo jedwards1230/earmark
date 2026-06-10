@@ -291,14 +291,20 @@ func (db *DB) initialize(ctx context.Context) error {
 			BEFORE UPDATE ON transcription_jobs
 			FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_updated_at();
 
-		-- runner_control: singleton row holding the global pause flag (CONTRACT §1.4).
-		-- The ASR runner reads runner_control.paused before each claim; the Go
-		-- service's dashboard writes it. A DB row is the only channel the (separate-
-		-- host) runner and service share, and it is durable across reboots — unlike
-		-- the gaming busy-flag file, which lives in tmpfs on the GPU host.
+		-- runner_control: singleton row gating the ASR runner's claims (CONTRACT §1.4).
+		-- The runner reads it before each claim; the Go service (dashboard + control
+		-- API) writes it. A DB row is the only channel the (separate-host) runner and
+		-- service share, and it is durable across reboots — unlike the gaming busy-
+		-- flag file, which lives in tmpfs on the GPU host.
+		--   paused    — true means decline all new claims.
+		--   run_limit — NULL means unlimited; a non-negative integer is a bounded run
+		--               (e.g. a single-job smoke test). The runner decrements it as
+		--               part of each claim and declines once it reaches 0.
+		-- Gate: claim iff (NOT paused) AND (run_limit IS NULL OR run_limit > 0).
 		CREATE TABLE IF NOT EXISTS runner_control (
 			id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 			paused     BOOLEAN     NOT NULL DEFAULT false,
+			run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_by TEXT
 		);
@@ -306,6 +312,27 @@ func (db *DB) initialize(ctx context.Context) error {
 			ON CONFLICT (id) DO NOTHING;
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
+	}
+
+	// run_limit migration: CREATE TABLE IF NOT EXISTS won't add the column to an
+	// existing prod table, so add it (and its CHECK) idempotently. ADD COLUMN IF
+	// NOT EXISTS is a no-op when present; the CHECK is guarded by pg_constraint and
+	// swallows the duplicate-on-race SQLSTATEs (same pattern as the file_path
+	// constraint below).
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS run_limit INTEGER;
+		DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = 'runner_control_run_limit_nonneg'
+			) THEN
+				ALTER TABLE runner_control
+					ADD CONSTRAINT runner_control_run_limit_nonneg
+					CHECK (run_limit IS NULL OR run_limit >= 0);
+			END IF;
+		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+		END $$;
+	`); err != nil {
+		return fmt.Errorf("run_limit migration: %w", err)
 	}
 
 	// Path-level dedup migration: the original dedup was checksum-only, so a file
@@ -726,6 +753,10 @@ type QueueStats struct {
 	// Paused mirrors runner_control.paused — true means the runner is declining
 	// to claim new work (set via the dashboard pause toggle).
 	Paused bool
+	// RunLimit mirrors runner_control.run_limit — nil means unlimited (normal
+	// operation); a non-negative value is a bounded run with that many claims
+	// remaining (e.g. 1 for a single-job smoke test). The runner decrements it.
+	RunLimit *int
 	// Runner fields — populated when at least one job has status='claimed'.
 	RunnerActive  bool
 	RunnerID      string     // claimed_by of the most-recently-updated claimed job
@@ -800,12 +831,13 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		return nil, fmt.Errorf("done-last-hour count: %w", err)
 	}
 
-	// Global pause flag (runner_control singleton). Tolerate a missing row by
-	// defaulting to not-paused; the init seed normally guarantees it exists.
+	// Global control row (runner_control singleton): pause flag + bounded-run
+	// counter. Tolerate a missing row by defaulting to not-paused/unlimited; the
+	// init seed normally guarantees it exists.
 	if err := db.pool.QueryRow(ctx,
-		`SELECT paused FROM runner_control WHERE id = 1`,
-	).Scan(&q.Paused); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("paused flag query: %w", err)
+		`SELECT paused, run_limit FROM runner_control WHERE id = 1`,
+	).Scan(&q.Paused, &q.RunLimit); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("control row query: %w", err)
 	}
 
 	// Active runner: most-recently-updated claimed job.
@@ -900,6 +932,42 @@ func (db *DB) SetPaused(ctx context.Context, paused bool, by string) error {
 	`, paused, by)
 	if err != nil {
 		return fmt.Errorf("set paused: %w", err)
+	}
+	return nil
+}
+
+// GetControl returns the full runner_control state: the pause flag and the
+// bounded-run counter (nil = unlimited). A missing row is treated as
+// not-paused/unlimited so callers degrade safely.
+func (db *DB) GetControl(ctx context.Context) (paused bool, runLimit *int, err error) {
+	err = db.pool.QueryRow(ctx,
+		`SELECT paused, run_limit FROM runner_control WHERE id = 1`,
+	).Scan(&paused, &runLimit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, fmt.Errorf("get control: %w", err)
+	}
+	return paused, runLimit, nil
+}
+
+// SetRunLimit writes the bounded-run counter without touching the pause flag.
+// A nil limit clears the bound (back to unlimited); a non-negative value starts
+// a bounded run of that many claims. The runner — not this method — performs the
+// per-claim decrement, so the counter and the claim stay atomic on the runner
+// side; here we only set the target. by records who set it for the audit column.
+func (db *DB) SetRunLimit(ctx context.Context, limit *int, by string) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO runner_control (id, paused, run_limit, updated_at, updated_by)
+		VALUES (1, false, $1, now(), $2)
+		ON CONFLICT (id) DO UPDATE
+			SET run_limit = EXCLUDED.run_limit,
+			    updated_at = EXCLUDED.updated_at,
+			    updated_by = EXCLUDED.updated_by
+	`, limit, by)
+	if err != nil {
+		return fmt.Errorf("set run limit: %w", err)
 	}
 	return nil
 }

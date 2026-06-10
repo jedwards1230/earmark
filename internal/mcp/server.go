@@ -34,6 +34,10 @@ type MCPServer struct {
 	// resolver derives (author, title) from book paths using LIBRARY_COLLECTIONS
 	// config, so labels aren't hardcoded to one directory layout.
 	resolver *library.Resolver
+
+	// controlToken is the bearer token required on mutating control-API endpoints.
+	// Empty → those endpoints fail closed (503); see requireToken in api.go.
+	controlToken string
 }
 
 // NewMCPServer creates a new MCP server instance
@@ -125,6 +129,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		runnerStaleAfter: staleAfter,
 		embedURL:         cfg.EmbeddingsBaseURL,
 		resolver:         resolver,
+		controlToken:     cfg.ControlAPIToken,
 	}
 }
 
@@ -159,6 +164,11 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	GET  /static/htmx.min.js   — vendored htmx library
 //	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
 //	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)
+//	GET  /api/v1/status              — pipeline status snapshot (JSON, no auth)
+//	GET  /api/v1/pipeline/pause      — current pause/run-limit state (JSON, no auth)
+//	PUT  /api/v1/pipeline/pause      — pause/resume (JSON, bearer token)
+//	POST /api/v1/pipeline/run        — run N jobs then auto-pause (JSON, bearer token)
+//	DELETE /api/v1/pipeline/run      — clear a bounded run (JSON, bearer token)
 //	GET  /health               — liveness probe (always 200 "ok")
 //	GET  /readyz               — readiness probe (200 if DB ping OK, 503 otherwise)
 //	*    /mcp                  — MCP streamable-HTTP handler
@@ -194,6 +204,16 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("POST /actions/book-requeue", s.handleBookRequeue)
 	mux.HandleFunc("POST /actions/pause", s.handlePause)
 	mux.HandleFunc("POST /actions/resume", s.handleResume)
+
+	// JSON control API (script/agent-facing) — distinct from the htmx dashboard
+	// actions above. Reads are unauthenticated; mutations require the bearer token
+	// (requireToken). These specific method+path patterns don't conflict with the
+	// "/" catch-all or the method-less "/mcp" handler.
+	mux.HandleFunc("GET /api/v1/status", s.handleAPIStatus)
+	mux.HandleFunc("GET /api/v1/pipeline/pause", s.handleAPIPauseGet)
+	mux.HandleFunc("PUT /api/v1/pipeline/pause", s.requireToken(s.handleAPIPausePut))
+	mux.HandleFunc("POST /api/v1/pipeline/run", s.requireToken(s.handleAPIRun))
+	mux.HandleFunc("DELETE /api/v1/pipeline/run", s.requireToken(s.handleAPIRunClear))
 
 	// Liveness — no external deps.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

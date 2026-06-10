@@ -220,17 +220,18 @@ for a transient, host-side GPU-contention gate (e.g. gaming), but it does NOT
 survive a host reboot and is invisible to the in-cluster Go service. For a
 durable, operator-controlled pause use the pause-control table below.
 
-#### Pause control — `runner_control` table
+#### Pause + bounded-run control — `runner_control` table
 
-A singleton row holds the global pause flag. The Go service (dashboard) writes
-it; the runner reads it. Because it lives in the shared database it is durable
-across reboots and visible to both the off-host runner and the in-cluster
-service (unlike the busy flag).
+A singleton row gates the runner's claims. The Go service (dashboard + control
+API) writes it; the runner reads and decrements it. Because it lives in the
+shared database it is durable across reboots and visible to both the off-host
+runner and the in-cluster service (unlike the busy flag).
 
 ```sql
 CREATE TABLE IF NOT EXISTS runner_control (
     id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     paused     BOOLEAN     NOT NULL DEFAULT false,
+    run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by TEXT
 );
@@ -238,17 +239,40 @@ CREATE TABLE IF NOT EXISTS runner_control (
 INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NOTHING;
 ```
 
-The runner MUST check this flag at the top of each poll cycle, before the claim
-UPDATE (alongside the busy-flag check). When `paused` is true it finishes any
-in-flight job, then skips claiming new work:
+- **`paused`** — true means decline all new claims.
+- **`run_limit`** — `NULL` means unlimited (normal operation); a non-negative
+  integer is a **bounded run** with that many claims remaining (e.g. `1` for a
+  single-job smoke test).
 
-```sql
-SELECT paused FROM runner_control WHERE id = 1;
+**Gate (the load-bearing rule):** the runner claims a job only when
+
+```
+NOT paused  AND  (run_limit IS NULL OR run_limit > 0)
 ```
 
+and, in the **same transaction as the claim**, decrements `run_limit` by 1 when
+it is non-NULL — so exactly `N` jobs are claimed even if a poll races the write.
+The decrement is conditional on a row actually being claimed (an empty-queue poll
+must NOT decrement). When `run_limit` reaches 0 the runner declines further
+claims (it does **not** also set `paused`; the two axes are independent). The
+decrement happens at **claim** time, so a job that is claimed and then fails still
+consumes one of the `N`.
+
 A missing row (the Go service not yet initialized) MUST be treated as
-**not paused** so the runner degrades safely. The flag gates new claims only; an
-in-flight transcription always runs to completion.
+**not paused / unlimited** so the runner degrades safely. The gate governs new
+claims only; an in-flight transcription always runs to completion.
+
+The Go service exposes these write shapes (see §2.7 Control API):
+
+| Operation | `paused` | `run_limit` |
+|-----------|----------|-------------|
+| pause     | `true`   | unchanged |
+| resume    | `false`  | `NULL` (clears any bound) |
+| run N     | `false`  | `N` |
+| clear run | unchanged | `NULL` |
+
+resume/run set `run_limit` **before** flipping `paused=false`, so the runner is
+never momentarily unbounded.
 
 #### Operator requeue (out-of-band, `lil-whisper requeue`)
 
@@ -335,6 +359,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
+| `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 
 `LIBRARY_COLLECTIONS` is a JSON array of `{"root","layout"}` objects. `root` is a
 path prefix (absolute, or relative to `BOOKS_DIR`); `layout` is a slash-delimited
@@ -499,6 +524,34 @@ labels:
 ```yaml
 securityContext:
   fsGroup: 100    # NFS compatibility (users group)
+```
+
+### 2.12 Control API
+
+The MCP HTTP transport (`:8081`) serves a JSON control API under `/api/v1` for
+driving the pipeline from scripts/agents — distinct from the htmx dashboard
+actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
+`runner_control` row described in §1.4.
+
+| Method | Path | Auth | Body | Result |
+|--------|------|------|------|--------|
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON) |
+| `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
+| `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
+| `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
+| `DELETE` | `/api/v1/pipeline/run` | bearer | — | `200` clears the bounded run (`run_limit→NULL`) |
+
+**Auth**: mutating endpoints require `Authorization: Bearer <CONTROL_API_TOKEN>`
+(constant-time compared). When `CONTROL_API_TOKEN` is unset they **fail closed**
+with `503` — the pipeline can never be paused/driven by an unauthenticated
+caller. Read endpoints are always open. This is layered on the LAN-only ingress.
+
+Single-job smoke test (one call):
+
+```bash
+curl -fsS -X POST https://<host>/api/v1/pipeline/run \
+  -H "Authorization: Bearer $CONTROL_API_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"limit":1}'
 ```
 
 ---

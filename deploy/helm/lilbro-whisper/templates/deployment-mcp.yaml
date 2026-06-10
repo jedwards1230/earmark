@@ -52,6 +52,16 @@ spec:
               value: "http"
             - name: MCP_HTTP_ADDR
               value: {{ .Values.config.mcpHttpAddr | quote }}
+            {{- if and .Values.secrets.enabled .Values.secrets.controlApiToken.itemPath }}
+            # Bearer token for the JSON control API (/api/v1 mutations). Synced from
+            # 1Password via the controlApiToken OnePasswordItem. Absent → those
+            # endpoints fail closed (503).
+            - name: CONTROL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.controlApiToken.name | quote }}
+                  key: {{ .Values.secrets.controlApiToken.key | quote }}
+            {{- end }}
 
           livenessProbe:
             httpGet:

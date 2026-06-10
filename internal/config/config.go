@@ -54,6 +54,12 @@ type Config struct {
 	// See internal/library for the layout grammar.
 	LibraryCollections string
 
+	// CONTROL_API_TOKEN — bearer token required on the mutating control-API
+	// endpoints (PUT /api/v1/pipeline/pause, POST|DELETE /api/v1/pipeline/run).
+	// Empty → those endpoints fail closed (503), so the pipeline can never be
+	// paused or driven by an unauthenticated caller. Read endpoints need no token.
+	ControlAPIToken string
+
 	// Debug enables verbose structured logging.
 	Debug bool
 
@@ -87,6 +93,7 @@ func LoadConfig() (*Config, error) {
 	cfg.EmbeddingsModel = getEnvOrDefault("EMBEDDINGS_MODEL", "nomic-embed-text")
 	cfg.MCPHTTPAddr = getEnvOrDefault("MCP_HTTP_ADDR", ":8081")
 	cfg.LibraryCollections = os.Getenv("LIBRARY_COLLECTIONS")
+	cfg.ControlAPIToken = os.Getenv("CONTROL_API_TOKEN")
 
 	var err error
 
@@ -138,6 +145,7 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("Embeddings Model", "value", c.EmbeddingsModel)
 	logger.Debug("MCP HTTP Addr", "value", c.MCPHTTPAddr)
 	logger.Debug("Library Collections", "value", c.LibraryCollections)
+	logger.Debug("Control API Token", "value", MaskSecret(c.ControlAPIToken))
 	logger.Debug("Stale Job Timeout", "value", c.StaleJobTimeout)
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
 }

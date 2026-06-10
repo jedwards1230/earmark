@@ -26,6 +26,10 @@ type SimpleMockDB struct {
 	paused        bool   // current pause flag (mutated by SetPaused)
 	pausedSetTo   *bool  // last value passed to SetPaused
 	setPausedErr  error  // if set, SetPaused returns it
+	runLimit      *int   // current run_limit (mutated by SetRunLimit)
+	runLimitSetTo *int   // last value passed to SetRunLimit (heap copy)
+	runLimitSet   bool   // SetRunLimit was called
+	setRunLimErr  error  // if set, SetRunLimit returns it
 	embedBacklog  int    // EmbedBacklog reported by GetServiceStatus
 	lastBookDir   string // last dir passed to GetBookTracks
 }
@@ -36,6 +40,25 @@ func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error
 	}
 	m.paused = paused
 	m.pausedSetTo = &paused
+	return nil
+}
+
+func (m *SimpleMockDB) GetControl(_ context.Context) (bool, *int, error) {
+	return m.paused, m.runLimit, nil
+}
+
+func (m *SimpleMockDB) SetRunLimit(_ context.Context, limit *int, _ string) error {
+	if m.setRunLimErr != nil {
+		return m.setRunLimErr
+	}
+	m.runLimit = limit
+	m.runLimitSet = true
+	if limit != nil {
+		v := *limit
+		m.runLimitSetTo = &v
+	} else {
+		m.runLimitSetTo = nil
+	}
 	return nil
 }
 
@@ -181,6 +204,7 @@ func (m *SimpleMockDB) GetServiceStatus(_ context.Context) (*db.QueueStats, erro
 		TotalJobs:     13,
 		DoneLastHour:  3,
 		Paused:        m.paused,
+		RunLimit:      m.runLimit,
 		RunnerActive:  true,
 		RunnerID:      runnerID,
 		LastHeartbeat: &now,
@@ -851,11 +875,11 @@ func TestFailedDataEndpoint(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, want := range []string{
-		"ch03.m4b",                      // track
-		"CUDA out of memory",            // full error
-		"<details class=\"error-row\"",  // expandable
-		"2/3",                           // attempts
-		"asr-runner-test",               // claimed_by
+		"ch03.m4b",                        // track
+		"CUDA out of memory",              // full error
+		"<details class=\"error-row\"",    // expandable
+		"2/3",                             // attempts
+		"asr-runner-test",                 // claimed_by
 		"/actions/requeue?id=f1&failed=1", // per-row requeue targets the failed view
 	} {
 		if !strings.Contains(body, want) {
