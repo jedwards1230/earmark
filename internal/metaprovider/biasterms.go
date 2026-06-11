@@ -85,7 +85,7 @@ const minTermLen = 3
 // returns the same slice (though the order may vary by map iteration).
 func DeriveBiasTerms(meta BookMeta) []string {
 	seen := make(map[string]bool)
-	var terms []string
+	terms := make([]string, 0)
 
 	// add inserts term into the deduplicated output. The key is lowercased so
 	// "Orwell" and "ORWELL" are treated as the same term; the original
@@ -173,10 +173,10 @@ func splitWords(s string) []string {
 // ASR biasing: it must start with an upper-case Unicode letter, be at least
 // minTermLen characters, and not appear in commonWords.
 func isProperNoun(word string) bool {
-	if len([]rune(word)) < minTermLen {
+	runes := []rune(word)
+	if len(runes) < minTermLen {
 		return false
 	}
-	runes := []rune(word)
 	if !unicode.IsUpper(runes[0]) {
 		return false
 	}

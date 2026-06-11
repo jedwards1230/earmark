@@ -61,8 +61,10 @@ func TestDeriveBiasTerms_SeriesField(t *testing.T) {
 	}
 	got := metaprovider.DeriveBiasTerms(meta)
 
-	// Series phrase (whole) should appear.
-	containsAll(t, got, []string{"Stormlight", "Archive"})
+	// Series phrase (whole, including the leading article) and its individual
+	// proper-noun tokens should appear. The phrase is joined from all words, so
+	// it retains "The"; "The" is still filtered as a standalone term below.
+	containsAll(t, got, []string{"Stormlight", "Archive", "The Stormlight Archive"})
 	// "The" is a common word — must NOT appear.
 	containsNone(t, got, []string{"The"})
 }
