@@ -27,8 +27,8 @@ import (
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/library"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 	"github.com/jedwards1230/lil-whisper/internal/openai"
 )
 
@@ -148,11 +148,11 @@ type SearchResultWithMetadata struct {
 // DB is the service's database handle.
 // pool is a *pgxpool.Pool (goroutine-safe) replacing the former single *pgx.Conn.
 type DB struct {
-	pool     *pgxpool.Pool
-	e        *openai.Embeddings
-	cfg      *config.Config
-	log      log.Logger
-	resolver *library.Resolver
+	pool *pgxpool.Pool
+	e    *openai.Embeddings
+	cfg  *config.Config
+	log  log.Logger
+	meta metaprovider.MetadataProvider
 }
 
 // New opens a PostgreSQL connection pool and runs schema migrations.
@@ -174,20 +174,15 @@ func New(cfg *config.Config) (*DB, error) {
 
 	logger := log.NewLogger("db")
 
-	// Build the library label resolver from config. A parse error falls back to
-	// the generic resolver — labels are cosmetic, never a startup blocker.
-	resolver, err := library.ParseCollections(cfg.LibraryCollections, cfg.BooksDir)
-	if err != nil {
-		logger.Warn("LIBRARY_COLLECTIONS parse failed; using generic label resolver", "error", err)
-		resolver = library.NewResolver(cfg.BooksDir, nil)
-	}
-
+	// Build the metadata provider from config. NewPathProvider handles parse
+	// errors internally (falls back to generic resolver) — labels are cosmetic,
+	// never a startup blocker.
 	db := &DB{
-		pool:     pool,
-		e:        openai.NewEmbeddings(cfg),
-		cfg:      cfg,
-		log:      logger,
-		resolver: resolver,
+		pool: pool,
+		e:    openai.NewEmbeddings(cfg),
+		cfg:  cfg,
+		log:  logger,
+		meta: metaprovider.NewPathProvider(cfg.LibraryCollections, cfg.BooksDir),
 	}
 
 	if err := db.initialize(context.Background()); err != nil {
@@ -689,7 +684,7 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 	}
 	defer rows.Close()
 
-	return db.scanResults(rows)
+	return db.scanResults(ctx, rows)
 }
 
 // searchInBookSQL is the book-scoped semantic search.
@@ -748,7 +743,7 @@ func (db *DB) searchInBook(ctx context.Context, q rowQuerier, vec []float32, dir
 		return nil, fmt.Errorf("book similarity query: %w", err)
 	}
 	defer rows.Close()
-	return db.scanResults(rows)
+	return db.scanResults(ctx, rows)
 }
 
 // textSearchSQL is the trigram-ranked full-text search query used by TextSearch.
@@ -823,7 +818,7 @@ func (db *DB) textSearch(ctx context.Context, q rowQuerier, query string, limit 
 	}
 	defer rows.Close()
 
-	return db.scanResults(rows)
+	return db.scanResults(ctx, rows)
 }
 
 // textSearchInBookSQL is textSearchSQL scoped to one book directory: the same
@@ -867,7 +862,7 @@ func (db *DB) textSearchInBook(ctx context.Context, q rowQuerier, dir, query str
 		return nil, fmt.Errorf("book text search query: %w", err)
 	}
 	defer rows.Close()
-	return db.scanResults(rows)
+	return db.scanResults(ctx, rows)
 }
 
 // likePrefix escapes LIKE metacharacters (%, _, \) in a literal so it can be
@@ -880,9 +875,9 @@ func likePrefix(s string) string {
 
 // scanResults scans a result set from findSimilar, TextSearch, or
 // GetChunkContext, populating the legacy Author/Title/Chapter fields using the
-// DB's library.Resolver so that metadata is correct for both 3-level
+// DB's MetadataProvider so that metadata is correct for both 3-level
 // (author/title/track) and 2-level (author/book.m4b) collection layouts.
-func (db *DB) scanResults(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
+func (db *DB) scanResults(ctx context.Context, rows pgx.Rows) ([]SearchResultWithMetadata, error) {
 	var results []SearchResultWithMetadata
 	for rows.Next() {
 		var r SearchResultWithMetadata
@@ -897,12 +892,12 @@ func (db *DB) scanResults(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
 		r.Speaker = speaker
 		r.ChunkID = r.ID
 
-		// Derive Author/Title using the layout-aware resolver so that both
+		// Derive Author/Title using the layout-aware provider so that both
 		// 3-level (author/title/track) and 2-level (author/book.m4b) collections
 		// return correct labels. Chapter is the audio filename (sans path), which
 		// is meaningful for multi-track books and empty-ish for single-file ones.
-		bookDir := filepath.Dir(r.FilePath)
-		r.Author, r.Title = db.resolver.Resolve(bookDir, r.FilePath)
+		bookMeta, _ := db.meta.Lookup(ctx, r.FilePath, r.FilePath)
+		r.Author, r.Title = bookMeta.Author, bookMeta.Title
 		r.Chapter = filepath.Base(r.FilePath)
 
 		results = append(results, r)
@@ -980,7 +975,7 @@ func (db *DB) GetChunkContext(ctx context.Context, chunkID string, contextWindow
 	}
 	defer rows.Close()
 
-	return db.scanResults(rows)
+	return db.scanResults(ctx, rows)
 }
 
 // ─── Processing stats ────────────────────────────────────────────────────────
@@ -1335,13 +1330,13 @@ func (db *DB) SetRunLimit(ctx context.Context, limit *int, by string) error {
 
 // BookSummary aggregates all track jobs that share a book directory (the parent
 // directory of the audio file). Author/Title are NOT derived here — the caller
-// applies a library.Resolver (config-driven) to Dir + SamplePath, since the
+// applies a MetadataProvider (config-driven) to Dir + SamplePath, since the
 // right author/title split depends on each collection's directory shape.
 type BookSummary struct {
 	Dir         string // book directory (group key): dirname(file_path)
 	SamplePath  string // one file_path within the book (for filename-based title parsing)
-	Author      string // populated by the caller via library.Resolver
-	Title       string // populated by the caller via library.Resolver
+	Author      string // populated by the caller via MetadataProvider
+	Title       string // populated by the caller via MetadataProvider
 	Total       int
 	Pending     int
 	Claimed     int

@@ -1,11 +1,12 @@
 package mcp
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/library"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -149,9 +150,8 @@ func TestMakeSnippetKindGate(t *testing.T) {
 // TestFormatBookTree asserts the author-grouped list_books output groups the same
 // rows under their author with the same per-book metadata.
 func TestFormatBookTree(t *testing.T) {
-	resolver := library.NewResolver("/books", []library.Collection{
-		{Root: "audio-libation", Layout: "author/title"},
-	})
+	const collectionsJSON = `[{"root":"audio-libation","layout":"author/title"}]`
+	meta := metaprovider.NewPathProvider(collectionsJSON, "/books")
 	books := []db.BookSummary{
 		{Dir: "/books/audio-libation/Andy Weir/Project Hail Mary",
 			SamplePath: "/books/audio-libation/Andy Weir/Project Hail Mary/PHM.m4b",
@@ -164,7 +164,7 @@ func TestFormatBookTree(t *testing.T) {
 			Total:      24, Done: 22, Pending: 2},
 	}
 	totals := db.LibraryTotals{TotalBooks: 3, FullyTranscribed: 2, WithPending: 1}
-	out := formatBookTree(books, 3, 0, totals, resolver).Content[0].(mcp.TextContent).Text
+	out := formatBookTree(context.Background(), books, 3, 0, totals, meta).Content[0].(mcp.TextContent).Text
 	assert.Contains(t, out, "Library: 3 books — 2 fully transcribed, 1 with pending tracks.")
 	assert.Contains(t, out, "Library: 3 book(s) across 2 author(s)")
 	assert.Contains(t, out, "Andy Weir\n")

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/library"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -501,12 +501,11 @@ func req(name string, args map[string]interface{}) mcp.CallToolRequest {
 	return mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: args}}
 }
 
-// resolverForTest returns a resolver that labels the demo collections, so
-// book-scope resolution in handler tests derives the same author/title as prod.
-func resolverForTest() *library.Resolver {
-	return library.NewResolver("/books", []library.Collection{
-		{Root: "audio-libation", Layout: "author/title"},
-	})
+// providerForTest returns a MetadataProvider that labels the demo collections,
+// so book-scope resolution in handler tests derives the same author/title as prod.
+func providerForTest() metaprovider.MetadataProvider {
+	const collectionsJSON = `[{"root":"audio-libation","layout":"author/title"}]`
+	return metaprovider.NewPathProvider(collectionsJSON, "/books")
 }
 
 func fp(v float64) *float64 { return &v }
@@ -531,7 +530,7 @@ func TestHandleListBooks(t *testing.T) {
 	mockDB.On("GetLibraryTotals", mock.Anything, "").
 		Return(db.LibraryTotals{TotalBooks: 2, FullyTranscribed: 1, WithPending: 1}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleListBooks(context.Background(), req("list_books", map[string]interface{}{}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
@@ -564,7 +563,7 @@ func TestHandleSemanticSearchScoped(t *testing.T) {
 	mockDB.On("SearchInBook", mock.Anything, "amino acids", dir, 10, 0.3).
 		Return([]db.SearchResultWithMetadata{{ID: "v1", Content: "about amino acids", Title: "Project Hail Mary", Author: "Andy Weir"}}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
 		"query": "amino acids", "book": "Project Hail Mary",
 	}))
@@ -584,7 +583,7 @@ func TestHandleTextSearchScoped(t *testing.T) {
 	mockDB.On("TextSearchInBook", mock.Anything, dir, "spice", 10).
 		Return([]db.SearchResultWithMetadata{{ID: "t1", Content: "the spice must flow", Title: "Dune", Author: "Frank Herbert"}}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
 		"query": "spice", "book": "Dune",
 	}))
@@ -606,7 +605,7 @@ func TestResolveBookDirAmbiguous(t *testing.T) {
 			{Dir: d2, SamplePath: d2 + "/b.m4b"},
 		}, 2, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
 		"query": "engineering", "book": "Andy Weir",
 	}))
@@ -638,7 +637,7 @@ func TestResolveBookDirASINCollision(t *testing.T) {
 	mockDB.On("TextSearchInBook", mock.Anything, orwell, "telescreen", 10).
 		Return([]db.SearchResultWithMetadata{{ID: "t1", Content: "the telescreen", Title: "1984 [B0029Z9OBM]", Author: "George Orwell"}}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
 		"query": "telescreen", "book": "1984",
 	}))
@@ -663,7 +662,7 @@ func TestResolveBookDirASINExact(t *testing.T) {
 	mockDB.On("TextSearchInBook", mock.Anything, noise, "bias", 10).
 		Return([]db.SearchResultWithMetadata{{ID: "t1", Content: "noisy judgment", Title: "Noise [1984832069]", Author: "Daniel Kahneman"}}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
 		"query": "bias", "book": "[1984832069]",
 	}))
@@ -680,7 +679,7 @@ func TestResolveBookDirNoMatch(t *testing.T) {
 	mockDB.On("GetBookSummaries", mock.Anything, db.BookFilter{Query: "Nonexistent", Limit: 200}).
 		Return([]db.BookSummary{}, 0, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
 		"query": "x", "book": "Nonexistent",
 	}))
@@ -711,7 +710,7 @@ func TestHandleGetTranscriptSingleTrack(t *testing.T) {
 			Segments: segs,
 		}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
 		"book": "Project Hail Mary", "limit": 2.0,
 	}))
@@ -740,7 +739,7 @@ func TestHandleGetTranscriptMultiTrack(t *testing.T) {
 			{ID: "j2", FilePath: dir + "/02.mp3", Status: "done"},
 		}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
 		"book": "Dune",
 	}))
@@ -764,7 +763,7 @@ func TestHandleGetTranscriptByTrackID(t *testing.T) {
 			Segments: []db.Segment{{ID: 0, Start: 0, End: 5, Text: "hello"}},
 		}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
 		"trackID": "job-9",
 	}))
@@ -899,7 +898,7 @@ func TestHandleListBooksLimitClamping(t *testing.T) {
 			mockDB.On("GetBookSummaries", mock.Anything, tc.wantFilter).
 				Return([]db.BookSummary{}, 0, nil).Once()
 
-			h := NewToolHandlers(mockDB, resolverForTest())
+			h := NewToolHandlers(mockDB, providerForTest())
 			res, err := h.handleListBooks(context.Background(), req("list_books", tc.args))
 			assert.NoError(t, err)
 			assert.False(t, res.IsError)
@@ -916,7 +915,7 @@ func TestHandleSemanticSearchLimitClamping(t *testing.T) {
 	mockDB.On("Search", mock.Anything, "dragons", 10, 0.3).
 		Return([]db.SearchResultWithMetadata{}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
 		"query": "dragons", "limit": 999999.0,
 	}))
@@ -932,7 +931,7 @@ func TestHandleTextSearchLimitClamping(t *testing.T) {
 	mockDB.On("TextSearch", mock.Anything, "spice", 10).
 		Return([]db.SearchResultWithMetadata{}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
 		"query": "spice", "limit": -5.0,
 	}))
@@ -948,7 +947,7 @@ func TestHandleGetTranscriptNotTranscribed(t *testing.T) {
 	mockDB.On("GetTrackDetail", mock.Anything, "job-p").
 		Return(&db.TrackDetail{ID: "job-p", FilePath: "/books/a/b.m4b", Status: "pending", HasTranscript: false}, nil).Once()
 
-	h := NewToolHandlers(mockDB, resolverForTest())
+	h := NewToolHandlers(mockDB, providerForTest())
 	res, err := h.handleGetTranscript(context.Background(), req("get_transcript", map[string]interface{}{
 		"trackID": "job-p",
 	}))

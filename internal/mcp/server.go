@@ -11,8 +11,8 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/library"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 )
 
 // MCPServer wraps the MCP server functionality for the lilbro-whisper service
@@ -31,9 +31,9 @@ type MCPServer struct {
 	// warning so an operator knows which Ollama to check.
 	embedURL string
 
-	// resolver derives (author, title) from book paths using LIBRARY_COLLECTIONS
+	// meta derives (author, title) from book paths using LIBRARY_COLLECTIONS
 	// config, so labels aren't hardcoded to one directory layout.
-	resolver *library.Resolver
+	meta metaprovider.MetadataProvider
 
 	// controlToken is the bearer token required on mutating control-API endpoints.
 	// Empty → those endpoints fail closed (503); see requireToken in api.go.
@@ -57,17 +57,14 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		server.WithLogging(),
 	)
 
-	// Build the library label resolver from config. A parse error falls back to
-	// the generic resolver rather than failing startup — labels are cosmetic.
-	resolver, err := library.ParseCollections(cfg.LibraryCollections, cfg.BooksDir)
-	if err != nil {
-		logger.Warn("LIBRARY_COLLECTIONS parse failed; using generic label resolver", "error", err)
-		resolver = library.NewResolver(cfg.BooksDir, nil)
-	}
+	// Build the metadata provider from config. NewPathProvider handles parse
+	// errors internally (falls back to generic resolver) — labels are cosmetic,
+	// never a startup blocker.
+	meta := metaprovider.NewPathProvider(cfg.LibraryCollections, cfg.BooksDir)
 
-	// The tool handlers share the same resolver so the `book` argument on the
+	// The tool handlers share the same provider so the `book` argument on the
 	// search tools and the list_books labels match the dashboard's labels.
-	handlers := NewToolHandlers(database, resolver)
+	handlers := NewToolHandlers(database, meta)
 
 	// All search/browse/read tools are read-only and non-destructive — they only
 	// query the database; they never mutate state or produce side-effects.
@@ -211,7 +208,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		db:               database,
 		runnerStaleAfter: staleAfter,
 		embedURL:         cfg.EmbeddingsBaseURL,
-		resolver:         resolver,
+		meta:             meta,
 		controlToken:     cfg.ControlAPIToken,
 	}
 }

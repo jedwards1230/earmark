@@ -10,6 +10,7 @@ import (
 	"github.com/jedwards1230/lil-whisper/internal/db"
 	"github.com/jedwards1230/lil-whisper/internal/library"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 )
 
 // DBInterface defines the database operations needed by MCP tools
@@ -65,24 +66,23 @@ type DBInterface interface {
 type ToolHandlers struct {
 	db     DBInterface
 	logger log.Logger
-	// resolver derives (author, title) labels from book paths, used to match a
+	// meta derives (author, title) labels from book paths, used to match a
 	// user-supplied `book` argument to a canonical book directory and to label the
-	// list_books inventory. May be a generic resolver if LIBRARY_COLLECTIONS is
-	// unset; never nil once constructed via NewToolHandlers.
-	resolver *library.Resolver
+	// list_books inventory. Never nil once constructed via NewToolHandlers.
+	meta metaprovider.MetadataProvider
 }
 
-// NewToolHandlers creates a new ToolHandlers instance. resolver may be nil (e.g.
-// in unit tests that don't exercise book resolution); a generic fallback resolver
-// is substituted so handlers can always call it safely.
-func NewToolHandlers(database DBInterface, resolver *library.Resolver) *ToolHandlers {
-	if resolver == nil {
-		resolver = library.NewResolver("", nil)
+// NewToolHandlers creates a new ToolHandlers instance. meta may be nil (e.g.
+// in unit tests that don't exercise book resolution); a no-op PathProvider is
+// substituted so handlers can always call it safely.
+func NewToolHandlers(database DBInterface, meta metaprovider.MetadataProvider) *ToolHandlers {
+	if meta == nil {
+		meta = metaprovider.NewPathProvider("", "")
 	}
 	return &ToolHandlers{
-		db:       database,
-		logger:   log.NewLogger("mcp-tools"),
-		resolver: resolver,
+		db:     database,
+		logger: log.NewLogger("mcp-tools"),
+		meta:   meta,
 	}
 }
 
@@ -293,7 +293,8 @@ func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string,
 
 	var matches []bookCandidate
 	for _, s := range summaries {
-		author, title := h.resolver.Resolve(s.Dir, s.SamplePath)
+		bookMeta, _ := h.meta.Lookup(ctx, s.SamplePath, s.SamplePath)
+		author, title := bookMeta.Author, bookMeta.Title
 
 		if queryASIN != "" {
 			// Exact ASIN lookup: compare against the id embedded in the book's
@@ -366,9 +367,9 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 	}
 
 	if format == "tree" {
-		return formatBookTree(summaries, total, offset, totals, h.resolver), nil
+		return formatBookTree(ctx, summaries, total, offset, totals, h.meta), nil
 	}
-	return formatBookList(summaries, total, offset, totals, h.resolver), nil
+	return formatBookList(ctx, summaries, total, offset, totals, h.meta), nil
 }
 
 // handleGetTranscript returns a page of a track's transcript so the model can
