@@ -60,6 +60,29 @@ type Config struct {
 	// paused or driven by an unauthenticated caller. Read endpoints need no token.
 	ControlAPIToken string
 
+	// METADATA_PROVIDER — which MetadataProvider to use.
+	// "path" (default) — PathProvider: derives author/title from the directory
+	//   layout defined by LIBRARY_COLLECTIONS. Byte-identical to pre-PR behaviour.
+	// "abs"             — ABSProvider: looks up the book in Audiobookshelf by ASIN.
+	//   Requires ABS_URL and ABS_TOKEN. Falls back to path if they are unset.
+	// "chain:abs,path"  — ChainProvider: tries ABS first, then path. Recommended
+	//   production value when ABS credentials are available.
+	MetadataProvider string
+
+	// ABS_URL — base URL of the Audiobookshelf instance reachable in-cluster,
+	// e.g. "http://audiobookshelf.media:13378". Required when METADATA_PROVIDER
+	// includes "abs". Empty → ABS provider degrades to path.
+	ABSURL string
+
+	// ABS_TOKEN — bearer token for the ABS REST API.
+	// Populate from 1Password (Audiobookshelf item, api_token field).
+	// Required when METADATA_PROVIDER includes "abs".
+	ABSToken string
+
+	// ABS_LIBRARY_ID — UUID of the ABS books library to search.
+	// Default: "c749dc72-87a0-4889-8714-227eddb25900" (the homelab books library).
+	ABSLibraryID string
+
 	// Debug enables verbose structured logging.
 	Debug bool
 
@@ -94,6 +117,10 @@ func LoadConfig() (*Config, error) {
 	cfg.MCPHTTPAddr = getEnvOrDefault("MCP_HTTP_ADDR", ":8081")
 	cfg.LibraryCollections = os.Getenv("LIBRARY_COLLECTIONS")
 	cfg.ControlAPIToken = os.Getenv("CONTROL_API_TOKEN")
+	cfg.MetadataProvider = getEnvOrDefault("METADATA_PROVIDER", "path")
+	cfg.ABSURL = os.Getenv("ABS_URL")
+	cfg.ABSToken = os.Getenv("ABS_TOKEN")
+	cfg.ABSLibraryID = getEnvOrDefault("ABS_LIBRARY_ID", "c749dc72-87a0-4889-8714-227eddb25900")
 
 	var err error
 
@@ -148,7 +175,29 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("Control API Token", "value", MaskSecret(c.ControlAPIToken))
 	logger.Debug("Stale Job Timeout", "value", c.StaleJobTimeout)
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
+	logger.Debug("Metadata Provider", "value", c.MetadataProvider)
+	logger.Debug("ABS URL", "value", c.ABSURL)
+	logger.Debug("ABS Token", "value", MaskSecret(c.ABSToken))
+	logger.Debug("ABS Library ID", "value", c.ABSLibraryID)
 }
+
+// GetMetadataProvider satisfies metaprovider.providerConfig.
+func (c *Config) GetMetadataProvider() string { return c.MetadataProvider }
+
+// GetABSURL satisfies metaprovider.providerConfig.
+func (c *Config) GetABSURL() string { return c.ABSURL }
+
+// GetABSToken satisfies metaprovider.providerConfig.
+func (c *Config) GetABSToken() string { return c.ABSToken }
+
+// GetABSLibraryID satisfies metaprovider.providerConfig.
+func (c *Config) GetABSLibraryID() string { return c.ABSLibraryID }
+
+// GetLibraryCollections satisfies metaprovider.providerConfig.
+func (c *Config) GetLibraryCollections() string { return c.LibraryCollections }
+
+// GetBooksDir satisfies metaprovider.providerConfig.
+func (c *Config) GetBooksDir() string { return c.BooksDir }
 
 // getEnvOrDefault returns the env var value or defaultValue when unset/empty.
 func getEnvOrDefault(key, defaultValue string) string {

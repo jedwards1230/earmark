@@ -1,7 +1,11 @@
 package main
 
 import (
+	"log"
+	"os"
+
 	"github.com/jedwards1230/lil-whisper/cmd"
+	"github.com/jedwards1230/lil-whisper/cmd/backfill"
 	"github.com/jedwards1230/lil-whisper/cmd/list"
 	"github.com/jedwards1230/lil-whisper/cmd/mcp"
 	"github.com/jedwards1230/lil-whisper/cmd/monitor"
@@ -10,8 +14,6 @@ import (
 	"github.com/jedwards1230/lil-whisper/cmd/serve"
 	"github.com/jedwards1230/lil-whisper/cmd/update"
 	"github.com/jedwards1230/lil-whisper/cmd/version"
-	"log"
-	"os"
 )
 
 func main() {
@@ -23,6 +25,7 @@ func main() {
 	rootCmd.AddCommand(list.ListCmd)
 	rootCmd.AddCommand(search.SearchCmd)
 	rootCmd.AddCommand(requeue.RequeueCmd)
+	rootCmd.AddCommand(backfill.BackfillCmd)
 	rootCmd.AddCommand(mcp.MCPCmd)
 	rootCmd.AddCommand(version.VersionCmd)
 	rootCmd.AddCommand(update.UpdateCmd)

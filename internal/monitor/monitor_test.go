@@ -62,9 +62,9 @@ type fakeDB struct {
 	audioBytes   map[string]int64  // jobID -> audio_bytes recorded
 
 	// book_metadata tracking
-	bookMetadata  map[string][4]string // bookDir -> [title, author, source, ""]
-	bookMetaErr   error                // if set, UpsertBookMetadata returns this error
-	bookMetaCalls int                  // number of UpsertBookMetadata calls
+	bookMetadata  map[string]metaprovider.BookMeta // bookDir -> BookMeta last written
+	bookMetaErr   error                            // if set, UpsertBookMetadata returns this error
+	bookMetaCalls int                              // number of UpsertBookMetadata calls
 }
 
 func (f *fakeDB) InsertJobIfAbsent(_ context.Context, filePath, checksum string) (string, bool, error) {
@@ -105,15 +105,15 @@ func (f *fakeDB) UpsertAudioBytes(_ context.Context, jobID string, bytes int64) 
 	return nil
 }
 
-func (f *fakeDB) UpsertBookMetadata(_ context.Context, bookDir, title, author, source string) error {
+func (f *fakeDB) UpsertBookMetadata(_ context.Context, bookDir string, meta metaprovider.BookMeta) error {
 	f.bookMetaCalls++
 	if f.bookMetaErr != nil {
 		return f.bookMetaErr
 	}
 	if f.bookMetadata == nil {
-		f.bookMetadata = map[string][4]string{}
+		f.bookMetadata = map[string]metaprovider.BookMeta{}
 	}
-	f.bookMetadata[bookDir] = [4]string{title, author, source, ""}
+	f.bookMetadata[bookDir] = meta
 	return nil
 }
 
@@ -396,14 +396,14 @@ func TestBookMetadataWrittenOnEnqueue(t *testing.T) {
 	if !ok {
 		t.Fatalf("no book_metadata row found for book_dir=%q", bookDir)
 	}
-	if row[0] != "My Book" {
-		t.Errorf("title: got %q, want %q", row[0], "My Book")
+	if row.Title != "My Book" {
+		t.Errorf("title: got %q, want %q", row.Title, "My Book")
 	}
-	if row[1] != "The Author" {
-		t.Errorf("author: got %q, want %q", row[1], "The Author")
+	if row.Author != "The Author" {
+		t.Errorf("author: got %q, want %q", row.Author, "The Author")
 	}
-	if row[2] != "path" {
-		t.Errorf("source: got %q, want %q", row[2], "path")
+	if row.Source != "path" {
+		t.Errorf("source: got %q, want %q", row.Source, "path")
 	}
 }
 
@@ -501,8 +501,8 @@ func TestBookMetadataEmptyFromProvider(t *testing.T) {
 	if !ok {
 		t.Fatalf("no book_metadata row found for book_dir=%q", bookDir)
 	}
-	if row[0] != "" || row[1] != "" || row[2] != "" {
-		t.Errorf("expected all-empty metadata stored, got title=%q author=%q source=%q", row[0], row[1], row[2])
+	if row.Title != "" || row.Author != "" || row.Source != "" {
+		t.Errorf("expected all-empty metadata stored, got title=%q author=%q source=%q", row.Title, row.Author, row.Source)
 	}
 }
 
