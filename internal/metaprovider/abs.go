@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -150,11 +151,11 @@ func (p *ABSProvider) findByASIN(ctx context.Context, asin string) (string, absM
 	const pageSize = 500 // large enough to cover most collections in one request
 	page := 0
 	for {
-		url := fmt.Sprintf("%s/api/libraries/%s/items?limit=%d&page=%d",
-			p.baseURL, p.libraryID, pageSize, page)
+		u := fmt.Sprintf("%s/api/libraries/%s/items?limit=%d&page=%d",
+			p.baseURL, url.PathEscape(p.libraryID), pageSize, page)
 
 		var resp absLibraryItemsResponse
-		if err := p.getJSON(ctx, url, &resp); err != nil {
+		if err := p.getJSON(ctx, u, &resp); err != nil {
 			return "", absMetadata{}, err
 		}
 
@@ -175,7 +176,7 @@ func (p *ABSProvider) findByASIN(ctx context.Context, asin string) (string, absM
 
 // fetchChapters fetches the full item detail and returns the mapped chapters.
 func (p *ABSProvider) fetchChapters(ctx context.Context, itemID string) ([]Chapter, error) {
-	url := fmt.Sprintf("%s/api/items/%s", p.baseURL, itemID)
+	url := fmt.Sprintf("%s/api/items/%s", p.baseURL, url.PathEscape(itemID))
 	var item absItem
 	if err := p.getJSON(ctx, url, &item); err != nil {
 		return nil, err
@@ -218,7 +219,9 @@ func (p *ABSProvider) getJSON(ctx context.Context, url string, dst any) error {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
-		// Treat 404 as not-found, not a transport error.
+		// 404 is treated as "not found, no error": dst is left at its zero value
+		// and the caller (findByASIN / fetchChapters) interprets an empty struct
+		// as "not present in library". This is intentional and documented.
 		return nil
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -226,7 +229,9 @@ func (p *ABSProvider) getJSON(ctx context.Context, url string, dst any) error {
 		return fmt.Errorf("GET %s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(dst); err != nil {
+	// Limit response body to 10 MiB as a safeguard against oversized payloads.
+	const maxResponseBytes = 10 * 1024 * 1024
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(dst); err != nil {
 		return fmt.Errorf("decode response from %s: %w", url, err)
 	}
 	return nil
