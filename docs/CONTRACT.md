@@ -349,8 +349,8 @@ Rules:
 One row per **book directory** (`book_dir = filepath.Dir(file_path)` of any
 track under the book). It is **additive** — nothing in §1.1–§1.5 or §3 depends
 on it, and a missing row never blocks the pipeline. Writer: **Go monitor**, at
-enqueue time via `MetadataProvider.Lookup`. Readers: added by PR 4 (ABS
-chapters) and PR 5 (bias terms); no reader exists yet.
+enqueue time via `MetadataProvider.Lookup`. Reader: the Python ASR runner reads
+`bias_terms` to drive NeMo word-boosting (PR 5 homelab-ansible runner PR).
 
 ```sql
 CREATE TABLE IF NOT EXISTS book_metadata (
@@ -371,23 +371,30 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 
 | Writer | When | Columns it writes |
 |--------|------|-------------------|
-| **Go monitor** | at enqueue (PathProvider) | `title`, `author`, `source` |
-| **PR 4 — ABS integration** | after ABS chapter fetch | `narrator`, `series`, `asin`, `chapters` |
-| **PR 5 — bias terms** | derived from chapters + title | `bias_terms` |
+| **Go monitor** | at every enqueue (via `db.UpsertBookMetadata`) | `title`, `author`, `bias_terms`, `source` |
+| **Go monitor — ABS path** | when METADATA_PROVIDER includes ABS | `narrator`, `series`, `asin`, `chapters` |
+
+`bias_terms` is derived by `metaprovider.DeriveBiasTerms(meta)` inside
+`db.UpsertBookMetadata` at every call — both at enqueue time (monitor) and
+during a metadata backfill (`lil-whisper backfill-metadata --yes`). It is
+always written (never COALESCE-guarded), so a richer metadata source
+(e.g. ABS providing series/narrator) triggers a re-derive of bias terms on
+the next enqueue or backfill call.
 
 **Key choice — `book_dir` as primary key:** the monitor groups files by
 `book_dir = filepath.Dir(file_path)` (one row per book directory, not per
 track). This is the same granularity the rest of the pipeline uses for
-per-book queries, and it lets the runner in PR 5 derive the key from a job's
+per-book queries, and it lets the runner derive the key from a job's
 `file_path` with a single `filepath.Dir` call.
 
 Rules:
 - Every write is **best-effort** — a `book_metadata` failure MUST NOT fail
   enqueue. The monitor logs and continues.
-- The UPSERT touches only the columns its writer owns, so concurrent writes
-  from later PRs can't clobber each other.
-- `chapters` and `bias_terms` are nullable and left `NULL` by the monitor; PR 4
-  and PR 5 fill them in independently.
+- The UPSERT is column-selective for ABS enrichment columns (narrator, series,
+  asin, chapters) so a PathProvider call can never clobber ABS-sourced data.
+  `bias_terms` is always overwritten (not COALESCE-guarded) so an improved
+  metadata source is reflected on the next write.
+- `chapters` is nullable and left `NULL` when no ABS provider is configured.
 - The Go service creates the table in its schema-init transaction.
 
 ---

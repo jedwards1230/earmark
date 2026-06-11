@@ -669,12 +669,44 @@ func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 
 // ─── Book metadata (CONTRACT §1.6) ───────────────────────────────────────────
 
+// upsertBookMetadataSQL is the column-selective UPSERT for book_metadata.
+// It is a package-level variable (not a constant) so tests can inspect the
+// SQL shape to catch regressions — e.g. verifying that bias_terms is present
+// and not accidentally COALESCE-guarded. A full round-trip test requires
+// testcontainers (M-8).
+//
+// Parameter order: $1=book_dir $2=title $3=author $4=narrator $5=series
+//
+//	$6=asin $7=chapters(jsonb) $8=bias_terms $9=source
+var upsertBookMetadataSQL = `
+	INSERT INTO book_metadata
+	       (book_dir, title, author, narrator, series, asin, chapters, bias_terms, source, updated_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, now())
+	ON CONFLICT (book_dir) DO UPDATE
+	SET title      = EXCLUDED.title,
+	    author     = EXCLUDED.author,
+	    narrator   = COALESCE(EXCLUDED.narrator,   book_metadata.narrator),
+	    series     = COALESCE(EXCLUDED.series,     book_metadata.series),
+	    asin       = COALESCE(EXCLUDED.asin,       book_metadata.asin),
+	    chapters   = COALESCE(EXCLUDED.chapters,   book_metadata.chapters),
+	    bias_terms = EXCLUDED.bias_terms,
+	    source     = EXCLUDED.source,
+	    updated_at = now()
+`
+
 // UpsertBookMetadata writes or refreshes the book_metadata row for a book
 // directory. The UPSERT is column-selective: it always updates title, author,
-// and source (every provider supplies these), and additionally updates narrator,
-// series, asin, and chapters when the provider returned them (non-zero values
-// only — a PathProvider result never clobbers ABS-sourced chapter data because
-// PathProvider sets none of those fields).
+// source, and bias_terms (every call re-derives bias_terms from the current
+// meta so the list stays current when metadata improves), and additionally
+// updates narrator, series, asin, and chapters when the provider returned them
+// (non-zero values only — a PathProvider result never clobbers ABS-sourced
+// chapter data because PathProvider sets none of those fields).
+//
+// bias_terms is derived by calling metaprovider.DeriveBiasTerms(meta) and is
+// always written — even when the derived list is empty (an empty array is
+// stored as NULL to stay consistent with "not yet populated" for other
+// nullable columns). The runner reads bias_terms to drive NeMo word-boosting
+// (CONTRACT §1.6, PR 5).
 //
 // chapters is serialised as JSONB when non-empty; a nil or empty slice leaves
 // the column NULL (not an empty array), consistent with the "not yet populated"
@@ -707,20 +739,17 @@ func (db *DB) UpsertBookMetadata(ctx context.Context, bookDir string, meta metap
 		asin = &meta.ASIN
 	}
 
-	_, err := db.pool.Exec(ctx, `
-		INSERT INTO book_metadata
-		       (book_dir, title, author, narrator, series, asin, chapters, source, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now())
-		ON CONFLICT (book_dir) DO UPDATE
-		SET title      = EXCLUDED.title,
-		    author     = EXCLUDED.author,
-		    narrator   = COALESCE(EXCLUDED.narrator,  book_metadata.narrator),
-		    series     = COALESCE(EXCLUDED.series,    book_metadata.series),
-		    asin       = COALESCE(EXCLUDED.asin,      book_metadata.asin),
-		    chapters   = COALESCE(EXCLUDED.chapters,  book_metadata.chapters),
-		    source     = EXCLUDED.source,
-		    updated_at = now()
-	`, bookDir, meta.Title, meta.Author, narrator, series, asin, chaptersJSON, meta.Source)
+	// Derive ASR bias terms from the current metadata. An empty list is stored
+	// as NULL (nil slice) rather than an empty array — consistent with the
+	// "not yet populated" sentinel used by other nullable columns.
+	biasTerms := metaprovider.DeriveBiasTerms(meta)
+	var biasTermsArg interface{}
+	if len(biasTerms) > 0 {
+		biasTermsArg = biasTerms
+	}
+
+	_, err := db.pool.Exec(ctx, upsertBookMetadataSQL,
+		bookDir, meta.Title, meta.Author, narrator, series, asin, chaptersJSON, biasTermsArg, meta.Source)
 	if err != nil {
 		return fmt.Errorf("upsert book_metadata: %w", err)
 	}
