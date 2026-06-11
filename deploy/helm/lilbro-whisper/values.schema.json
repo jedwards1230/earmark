@@ -72,6 +72,9 @@
         "mcpHttpAddr":       { "type": "string" },
         "staleJobTimeout":   { "type": "string" },
         "chunkSize":         { "type": "string" },
+        "metadataProvider":  { "type": "string" },
+        "absURL":            { "type": "string" },
+        "absLibraryID":      { "type": "string" },
         "libraryCollections": {
           "type": "array",
           "items": {
@@ -170,6 +173,15 @@
           }
         },
         "controlApiToken": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name":     { "type": "string", "minLength": 1 },
+            "key":      { "type": "string", "minLength": 1 },
+            "itemPath": { "type": "string" }
+          }
+        },
+        "absToken": {
           "type": "object",
           "additionalProperties": false,
           "properties": {

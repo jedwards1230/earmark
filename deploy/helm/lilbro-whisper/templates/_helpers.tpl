@@ -102,6 +102,23 @@ the two Deployments.
 - name: LIBRARY_COLLECTIONS
   value: {{ toJson . | quote }}
 {{- end }}
+- name: METADATA_PROVIDER
+  value: {{ .Values.config.metadataProvider | quote }}
+{{- with .Values.config.absURL }}
+- name: ABS_URL
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.config.absLibraryID }}
+- name: ABS_LIBRARY_ID
+  value: {{ . | quote }}
+{{- end }}
+{{- if and .Values.secrets.enabled .Values.secrets.absToken.itemPath }}
+- name: ABS_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.secrets.absToken.name | quote }}
+      key: {{ .Values.secrets.absToken.key | quote }}
+{{- end }}
 {{- end }}
 
 {{/*
