@@ -469,6 +469,43 @@ func TestBookMetadataWriteFailureDoesNotBlockEnqueue(t *testing.T) {
 	}
 }
 
+// TestBookMetadataEmptyFromProvider verifies that an empty (but successful)
+// provider result — the valid "couldn't resolve" case for a real provider —
+// is still written (empty strings stored, no error) and enqueue succeeds.
+func TestBookMetadataEmptyFromProvider(t *testing.T) {
+	dir := t.TempDir()
+	bookDir := filepath.Join(dir, "Unknown")
+	if err := os.MkdirAll(bookDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(bookDir, "track01.mp3")
+	if err := os.WriteFile(filePath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	db := &fakeDB{}
+	// Successful lookup returning all-empty metadata (no err) — the case where a
+	// real provider cannot resolve a directory but does not error.
+	meta := &stubMetaProvider{title: "", author: "", source: ""}
+	fm := newTestMonitorWithMeta(dir, db, meta)
+
+	fm.enqueueFile(filePath)
+
+	if db.insertCalls != 1 {
+		t.Errorf("expected 1 job inserted, got %d", db.insertCalls)
+	}
+	if db.bookMetaCalls != 1 {
+		t.Fatalf("expected 1 metadata upsert (empty values still written), got %d", db.bookMetaCalls)
+	}
+	row, ok := db.bookMetadata[bookDir]
+	if !ok {
+		t.Fatalf("no book_metadata row found for book_dir=%q", bookDir)
+	}
+	if row[0] != "" || row[1] != "" || row[2] != "" {
+		t.Errorf("expected all-empty metadata stored, got title=%q author=%q source=%q", row[0], row[1], row[2])
+	}
+}
+
 // TestBookMetadataProviderFailureDoesNotBlockEnqueue verifies that a provider
 // error (e.g. network timeout in a future ABS provider) is also swallowed.
 func TestBookMetadataProviderFailureDoesNotBlockEnqueue(t *testing.T) {
