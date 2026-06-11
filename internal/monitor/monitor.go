@@ -38,7 +38,7 @@ type DBInterface interface {
 	// UpsertBookMetadata records book-level metadata derived from the
 	// MetadataProvider at enqueue time (CONTRACT §1.6). Best-effort: a failure
 	// here must not fail enqueue.
-	UpsertBookMetadata(ctx context.Context, bookDir, title, author, source string) error
+	UpsertBookMetadata(ctx context.Context, bookDir string, meta metaprovider.BookMeta) error
 }
 
 // Default file-stability tuning. A new file is only hashed once its size has
@@ -278,7 +278,7 @@ func (fm *FileMonitor) upsertBookMetadata(ctx context.Context, filePath string) 
 		return
 	}
 
-	if err := fm.db.UpsertBookMetadata(ctx, bookDir, meta.Title, meta.Author, meta.Source); err != nil {
+	if err := fm.db.UpsertBookMetadata(ctx, bookDir, meta); err != nil {
 		fm.log.Warn("book_metadata: DB write failed (continuing)", "file", filePath, "book_dir", bookDir, "error", err)
 	}
 }

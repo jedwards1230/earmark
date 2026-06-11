@@ -174,15 +174,15 @@ func New(cfg *config.Config) (*DB, error) {
 
 	logger := log.NewLogger("db")
 
-	// Build the metadata provider from config. NewPathProvider handles parse
-	// errors internally (falls back to generic resolver) — labels are cosmetic,
-	// never a startup blocker.
+	// Build the metadata provider from config (METADATA_PROVIDER env var).
+	// The factory handles parse errors and missing ABS credentials internally,
+	// falling back to PathProvider — labels are cosmetic, never a startup blocker.
 	db := &DB{
 		pool: pool,
 		e:    openai.NewEmbeddings(cfg),
 		cfg:  cfg,
 		log:  logger,
-		meta: metaprovider.NewPathProvider(cfg.LibraryCollections, cfg.BooksDir),
+		meta: metaprovider.New(cfg),
 	}
 
 	if err := db.initialize(context.Background()); err != nil {
@@ -670,28 +670,82 @@ func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 // ─── Book metadata (CONTRACT §1.6) ───────────────────────────────────────────
 
 // UpsertBookMetadata writes or refreshes the book_metadata row for a book
-// directory. Only the title, author, and source columns are touched, so it
-// never overwrites the nullable enrichment columns (narrator, series, asin,
-// chapters, bias_terms) written by later PRs (ABS chapters in PR 4, bias
-// terms in PR 5).
+// directory. The UPSERT is column-selective: it always updates title, author,
+// and source (every provider supplies these), and additionally updates narrator,
+// series, asin, and chapters when the provider returned them (non-zero values
+// only — a PathProvider result never clobbers ABS-sourced chapter data because
+// PathProvider sets none of those fields).
+//
+// chapters is serialised as JSONB when non-empty; a nil or empty slice leaves
+// the column NULL (not an empty array), consistent with the "not yet populated"
+// sentinel used by chapter readers.
 //
 // Best-effort: callers must log and continue on error so a metadata write
 // never fails enqueue. A missing row in book_metadata is always a no-op for
 // the rest of the pipeline.
-func (db *DB) UpsertBookMetadata(ctx context.Context, bookDir, title, author, source string) error {
+func (db *DB) UpsertBookMetadata(ctx context.Context, bookDir string, meta metaprovider.BookMeta) error {
+	// Serialise chapters to JSONB; nil when no chapters (leave column NULL).
+	var chaptersJSON []byte
+	if len(meta.Chapters) > 0 {
+		var err error
+		chaptersJSON, err = json.Marshal(meta.Chapters)
+		if err != nil {
+			return fmt.Errorf("marshal chapters: %w", err)
+		}
+	}
+
+	// Narrator is only non-empty for "abs" or richer sources. We coerce a nil
+	// narrator to NULL by using a pointer — pgx handles *string → NULL cleanly.
+	var narrator, series, asin *string
+	if meta.Narrator != "" {
+		narrator = &meta.Narrator
+	}
+	if meta.Series != "" {
+		series = &meta.Series
+	}
+	if meta.ASIN != "" {
+		asin = &meta.ASIN
+	}
+
 	_, err := db.pool.Exec(ctx, `
-		INSERT INTO book_metadata (book_dir, title, author, source, updated_at)
-		VALUES ($1, $2, $3, $4, now())
+		INSERT INTO book_metadata
+		       (book_dir, title, author, narrator, series, asin, chapters, source, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now())
 		ON CONFLICT (book_dir) DO UPDATE
 		SET title      = EXCLUDED.title,
 		    author     = EXCLUDED.author,
+		    narrator   = COALESCE(EXCLUDED.narrator,  book_metadata.narrator),
+		    series     = COALESCE(EXCLUDED.series,    book_metadata.series),
+		    asin       = COALESCE(EXCLUDED.asin,      book_metadata.asin),
+		    chapters   = COALESCE(EXCLUDED.chapters,  book_metadata.chapters),
 		    source     = EXCLUDED.source,
 		    updated_at = now()
-	`, bookDir, title, author, source)
+	`, bookDir, meta.Title, meta.Author, narrator, series, asin, chaptersJSON, meta.Source)
 	if err != nil {
 		return fmt.Errorf("upsert book_metadata: %w", err)
 	}
 	return nil
+}
+
+// GetBookChapters reads the chapters JSONB column from book_metadata for the
+// given book directory. Returns nil (not an error) when no row exists or
+// chapters is NULL — callers treat nil as "no chapter data yet".
+func (db *DB) GetBookChapters(ctx context.Context, bookDir string) ([]metaprovider.Chapter, error) {
+	var chaptersJSON []byte
+	err := db.pool.QueryRow(ctx, `
+		SELECT chapters FROM book_metadata WHERE book_dir = $1
+	`, bookDir).Scan(&chaptersJSON)
+	if errors.Is(err, pgx.ErrNoRows) || chaptersJSON == nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get book chapters: %w", err)
+	}
+	var chapters []metaprovider.Chapter
+	if err := json.Unmarshal(chaptersJSON, &chapters); err != nil {
+		return nil, fmt.Errorf("unmarshal chapters: %w", err)
+	}
+	return chapters, nil
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
@@ -730,7 +784,7 @@ func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, thresho
 	}
 	defer rows.Close()
 
-	return db.scanResults(ctx, rows)
+	return db.scanResults(ctx, db.pool, rows)
 }
 
 // searchInBookSQL is the book-scoped semantic search.
@@ -782,14 +836,14 @@ func (db *DB) SearchInBook(ctx context.Context, query, dir string, limit int, th
 // searchInBook is the querier-parameterized core of SearchInBook, split out so
 // the exact-scan query + scan path is testable against a mock pool. The dir
 // prefix is LIKE-escaped so a book name containing %, _, or \ can't widen scope.
-func (db *DB) searchInBook(ctx context.Context, q rowQuerier, vec []float32, dir string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
+func (db *DB) searchInBook(ctx context.Context, q rowScanner, vec []float32, dir string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
 	prefix := likePrefix(dir) + "/%"
 	rows, err := q.Query(ctx, searchInBookSQL, pgvector.NewVector(vec), limit, prefix, threshold)
 	if err != nil {
 		return nil, fmt.Errorf("book similarity query: %w", err)
 	}
 	defer rows.Close()
-	return db.scanResults(ctx, rows)
+	return db.scanResults(ctx, q, rows)
 }
 
 // textSearchSQL is the trigram-ranked full-text search query used by TextSearch.
@@ -857,14 +911,14 @@ func (db *DB) TextSearch(ctx context.Context, query string, limit int) ([]Search
 
 // textSearch is the querier-parameterized core of TextSearch, split out so the
 // query execution + scan path can be tested against a mock pool.
-func (db *DB) textSearch(ctx context.Context, q rowQuerier, query string, limit int) ([]SearchResultWithMetadata, error) {
+func (db *DB) textSearch(ctx context.Context, q rowScanner, query string, limit int) ([]SearchResultWithMetadata, error) {
 	rows, err := q.Query(ctx, textSearchSQL, query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("text search query: %w", err)
 	}
 	defer rows.Close()
 
-	return db.scanResults(ctx, rows)
+	return db.scanResults(ctx, q, rows)
 }
 
 // textSearchInBookSQL is textSearchSQL scoped to one book directory: the same
@@ -901,14 +955,14 @@ func (db *DB) TextSearchInBook(ctx context.Context, dir, query string, limit int
 // textSearchInBook is the querier-parameterized core of TextSearchInBook. The
 // dir prefix is built with a LIKE-escape so a book whose name contains %, _, or
 // \ can't widen the match.
-func (db *DB) textSearchInBook(ctx context.Context, q rowQuerier, dir, query string, limit int) ([]SearchResultWithMetadata, error) {
+func (db *DB) textSearchInBook(ctx context.Context, q rowScanner, dir, query string, limit int) ([]SearchResultWithMetadata, error) {
 	prefix := likePrefix(dir) + "/%"
 	rows, err := q.Query(ctx, textSearchInBookSQL, query, limit, prefix)
 	if err != nil {
 		return nil, fmt.Errorf("book text search query: %w", err)
 	}
 	defer rows.Close()
-	return db.scanResults(ctx, rows)
+	return db.scanResults(ctx, q, rows)
 }
 
 // likePrefix escapes LIKE metacharacters (%, _, \) in a literal so it can be
@@ -920,10 +974,21 @@ func likePrefix(s string) string {
 }
 
 // scanResults scans a result set from findSimilar, TextSearch, or
-// GetChunkContext, populating the legacy Author/Title/Chapter fields using the
-// DB's MetadataProvider so that metadata is correct for both 3-level
-// (author/title/track) and 2-level (author/book.m4b) collection layouts.
-func (db *DB) scanResults(ctx context.Context, rows pgx.Rows) ([]SearchResultWithMetadata, error) {
+// GetChunkContext, populating Author/Title from the MetadataProvider and
+// ChapterIndex/ChapterTitle by mapping the chunk's start_sec into the book's
+// chapter list stored in book_metadata.chapters.
+//
+// Chapter mapping: for each result we read book_metadata.chapters (one DB call
+// per distinct book_dir; a simple inline call is acceptable here because each
+// search result set is ≤50 rows and book_metadata is tiny). The chapter whose
+// [StartSec, EndSec) contains the chunk's start_sec is selected. When no chapter
+// data exists the ChapterIndex/ChapterTitle stay zero, and the MCP formatter
+// already suppresses the label in that case (CONTRACT §2.2.1).
+func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]SearchResultWithMetadata, error) {
+	// Cache book chapters per book_dir to avoid redundant DB reads within one
+	// result set (a typical 10-result search touches 1–3 books).
+	chaptersCache := make(map[string][]metaprovider.Chapter)
+
 	var results []SearchResultWithMetadata
 	for rows.Next() {
 		var r SearchResultWithMetadata
@@ -946,12 +1011,50 @@ func (db *DB) scanResults(ctx context.Context, rows pgx.Rows) ([]SearchResultWit
 		r.Author, r.Title = bookMeta.Author, bookMeta.Title
 		r.Chapter = filepath.Base(r.FilePath)
 
+		// Chapter mapping: map the chunk's start_sec into the book's chapter list.
+		bookDir := filepath.Dir(r.FilePath)
+		chapters, seen := chaptersCache[bookDir]
+		if !seen {
+			var err error
+			chapters, err = db.getBookChaptersQ(ctx, q, bookDir)
+			if err != nil {
+				db.log.Debug("chapter lookup failed (continuing without chapter label)",
+					"book_dir", bookDir, "error", err)
+			}
+			chaptersCache[bookDir] = chapters // cache even on error (nil chapters)
+		}
+		if idx, title, ok := metaprovider.ChapterForSec(chapters, r.StartSec); ok {
+			r.ChapterIndex = idx
+			r.ChapterTitle = title
+		}
+
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows error (scan results): %w", err)
 	}
 	return results, nil
+}
+
+// getBookChaptersQ reads the chapters JSONB column from book_metadata using the
+// supplied rowScanner — this lets scanResults be exercised against a mock pool
+// in tests without hitting db.pool (which may be nil in test doubles).
+func (db *DB) getBookChaptersQ(ctx context.Context, q rowScanner, bookDir string) ([]metaprovider.Chapter, error) {
+	var chaptersJSON []byte
+	err := q.QueryRow(ctx, `
+		SELECT chapters FROM book_metadata WHERE book_dir = $1
+	`, bookDir).Scan(&chaptersJSON)
+	if errors.Is(err, pgx.ErrNoRows) || chaptersJSON == nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get book chapters: %w", err)
+	}
+	var chapters []metaprovider.Chapter
+	if err := json.Unmarshal(chaptersJSON, &chapters); err != nil {
+		return nil, fmt.Errorf("unmarshal chapters: %w", err)
+	}
+	return chapters, nil
 }
 
 // GetHierarchicalData returns a list of files with their chunk counts for the
@@ -1021,7 +1124,7 @@ func (db *DB) GetChunkContext(ctx context.Context, chunkID string, contextWindow
 	}
 	defer rows.Close()
 
-	return db.scanResults(ctx, rows)
+	return db.scanResults(ctx, db.pool, rows)
 }
 
 // ─── Processing stats ────────────────────────────────────────────────────────

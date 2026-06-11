@@ -53,7 +53,7 @@ func runMonitor(cmd *cobra.Command, args []string) {
 		log.Println("Debug reset completed - All data cleared")
 	}
 
-	meta := metaprovider.NewPathProvider(cfg.LibraryCollections, cfg.BooksDir)
+	meta := metaprovider.New(cfg)
 
 	workQueue := queue.NewQueue()
 	fileMonitor := monitor.NewFileMonitor(cfg, database, meta)
