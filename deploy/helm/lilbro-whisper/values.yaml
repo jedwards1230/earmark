@@ -65,6 +65,8 @@ config:
   metadataProvider: "path"
   # Base URL of the in-cluster Audiobookshelf instance. Required when
   # metadataProvider includes "abs"; ignored otherwise. e.g. http://audiobookshelf.media
+  # NOTE: setting absURL REQUIRES secrets.absToken.itemPath — the chart fails to
+  # render otherwise (ABS_TOKEN is mandatory when ABS_URL is set; CONTRACT §2.4).
   absURL: ""
   # ABS books library UUID. Empty → the service's built-in default Books library.
   absLibraryID: ""
