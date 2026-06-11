@@ -102,6 +102,32 @@ the two Deployments.
 - name: LIBRARY_COLLECTIONS
   value: {{ toJson . | quote }}
 {{- end }}
+- name: METADATA_PROVIDER
+  value: {{ .Values.config.metadataProvider | quote }}
+{{- /*
+  ABS atomicity guard: ABS_TOKEN is required whenever ABS_URL is set
+  (CONTRACT §2.4). Without this, a URL-but-no-token config silently degrades
+  to the path provider at runtime (the Go factory falls back rather than
+  crashing) — confusing to debug. Fail fast at render time instead.
+*/}}
+{{- if and .Values.config.absURL (not (and .Values.secrets.enabled .Values.secrets.absToken.itemPath)) }}
+{{- fail "config.absURL is set but secrets.absToken.itemPath is empty (or secrets.enabled is false). ABS_TOKEN is required when ABS_URL is set (CONTRACT §2.4): set secrets.absToken.itemPath, or clear config.absURL to use the path provider." }}
+{{- end }}
+{{- with .Values.config.absURL }}
+- name: ABS_URL
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.config.absLibraryID }}
+- name: ABS_LIBRARY_ID
+  value: {{ . | quote }}
+{{- end }}
+{{- if and .Values.secrets.enabled .Values.secrets.absToken.itemPath }}
+- name: ABS_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.secrets.absToken.name | quote }}
+      key: {{ .Values.secrets.absToken.key | quote }}
+{{- end }}
 {{- end }}
 
 {{/*

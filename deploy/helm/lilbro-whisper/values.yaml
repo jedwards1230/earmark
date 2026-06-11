@@ -56,6 +56,21 @@ config:
   #     - {root: audio-libro, layout: author}
   libraryCollections: []
 
+  # ── Metadata provider (CONTRACT §2.4) ──────────────────────────────────────
+  # METADATA_PROVIDER selects how the ingest monitor derives book metadata:
+  #   path           — filesystem path only (default; no external dependency)
+  #   abs            — query Audiobookshelf (requires absURL + secrets.absToken)
+  #   chain:abs,path — try each left-to-right, first non-empty wins
+  # The factory falls back to "path" if ABS is requested but unconfigured.
+  metadataProvider: "path"
+  # Base URL of the in-cluster Audiobookshelf instance. Required when
+  # metadataProvider includes "abs"; ignored otherwise. e.g. http://audiobookshelf.media
+  # NOTE: setting absURL REQUIRES secrets.absToken.itemPath — the chart fails to
+  # render otherwise (ABS_TOKEN is mandatory when ABS_URL is set; CONTRACT §2.4).
+  absURL: ""
+  # ABS books library UUID. Empty → the service's built-in default Books library.
+  absLibraryID: ""
+
 resources:
   requests:
     cpu: 100m
@@ -122,4 +137,13 @@ secrets:
   controlApiToken:
     name: lilbro-whisper-control-api
     key: API_TOKEN
+    itemPath: ""
+
+  # Audiobookshelf API bearer token — synced to a Secret consumed by the ingest
+  # pod's ABS_TOKEN env (used when config.metadataProvider includes "abs").
+  # Leave itemPath empty to omit it — the metadata factory then falls back to the
+  # path provider. `key` is the field label in the 1Password item holding the token.
+  absToken:
+    name: lilbro-whisper-abs
+    key: api_token
     itemPath: ""
