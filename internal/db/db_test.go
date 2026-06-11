@@ -11,7 +11,7 @@ import (
 	"github.com/pashagolub/pgxmock/v4"
 	"github.com/pgvector/pgvector-go"
 
-	"github.com/jedwards1230/lil-whisper/internal/library"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 )
 
 // scanResultColumns are the 9 columns SELECTed by findSimilar / TextSearch /
@@ -22,15 +22,12 @@ var scanResultColumns = []string{
 	"start_sec", "end_sec", "speaker", "similarity", "total_chunks",
 }
 
-// newTestDB builds a DB with only the layout-aware resolver populated (no pool).
-// scanResults never touches the pool, so this is sufficient for execution-level
-// scan tests and for exercising the Author/Title derivation.
+// newTestDB builds a DB with only the layout-aware metadata provider populated
+// (no pool). scanResults never touches the pool, so this is sufficient for
+// execution-level scan tests and for exercising the Author/Title derivation.
 func newTestDB() *DB {
-	cols := []library.Collection{
-		{Root: "audio-libation", Layout: "author/title"}, // 3-level
-		{Root: "audio-custom", Layout: "author"},         // 2-level single-file
-	}
-	return &DB{resolver: library.NewResolver("/books", cols)}
+	const collectionsJSON = `[{"root":"audio-libation","layout":"author/title"},{"root":"audio-custom","layout":"author"}]`
+	return &DB{meta: metaprovider.NewPathProvider(collectionsJSON, "/books")}
 }
 
 func TestComputeFileChecksum(t *testing.T) {
@@ -72,19 +69,15 @@ func TestComputeFileChecksum_NonExistent(t *testing.T) {
 }
 
 // TestScanResultsMetadata validates that the Author/Title fields returned by
-// scanResults (via DB.resolver) are correct for both 3-level (author/title/track)
+// scanResults (via DB.meta) are correct for both 3-level (author/title/track)
 // and 2-level (author/book.m4b) library layouts.
 //
-// We test the resolver used internally by scanResults rather than scanResults
+// We test the provider used internally by scanResults rather than scanResults
 // itself (which needs a live pgx.Rows), so the coverage is at the logic level
 // that was the root cause of the mis-attribution bug.
 func TestScanResultsMetadata(t *testing.T) {
-	cols := []library.Collection{
-		{Root: "audio-libation", Layout: "author/title"}, // 3-level
-		{Root: "audio-custom", Layout: "author"},         // 2-level single-file
-	}
-	resolver := library.NewResolver("/books", cols)
-	db := &DB{resolver: resolver}
+	collectionsJSON := `[{"root":"audio-libation","layout":"author/title"},{"root":"audio-custom","layout":"author"}]`
+	db := &DB{meta: metaprovider.NewPathProvider(collectionsJSON, "/books")}
 
 	cases := []struct {
 		name       string
@@ -112,13 +105,15 @@ func TestScanResultsMetadata(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			bookDir := filepath.Dir(tc.filePath)
-			author, title := db.resolver.Resolve(bookDir, tc.filePath)
-			if author != tc.wantAuthor {
-				t.Errorf("author = %q, want %q", author, tc.wantAuthor)
+			got, err := db.meta.Lookup(context.Background(), tc.filePath, tc.filePath)
+			if err != nil {
+				t.Fatalf("Lookup error: %v", err)
 			}
-			if title != tc.wantTitle {
-				t.Errorf("title = %q, want %q", title, tc.wantTitle)
+			if got.Author != tc.wantAuthor {
+				t.Errorf("author = %q, want %q", got.Author, tc.wantAuthor)
+			}
+			if got.Title != tc.wantTitle {
+				t.Errorf("title = %q, want %q", got.Title, tc.wantTitle)
 			}
 		})
 	}

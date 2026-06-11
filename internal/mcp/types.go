@@ -1,12 +1,13 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/library"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -76,7 +77,7 @@ func librarySummaryLine(t db.LibraryTotals) string {
 // count. A book with no run_metrics yet shows em dashes / 0 for its aggregates.
 // The flat view omits each book's dir line to keep the payload small (the tree
 // view keeps it); a leading summary line reports whole-library totals.
-func formatBookList(books []db.BookSummary, total, offset int, totals db.LibraryTotals, resolver *library.Resolver) *mcp.CallToolResult {
+func formatBookList(ctx context.Context, books []db.BookSummary, total, offset int, totals db.LibraryTotals, meta metaprovider.MetadataProvider) *mcp.CallToolResult {
 	if len(books) == 0 {
 		return textResult("No books found.")
 	}
@@ -93,7 +94,8 @@ func formatBookList(books []db.BookSummary, total, offset int, totals db.Library
 	b.WriteString("\n\n")
 
 	for _, bk := range books {
-		author, title := resolver.Resolve(bk.Dir, bk.SamplePath)
+		bookMeta, _ := meta.Lookup(ctx, bk.SamplePath, bk.SamplePath)
+		author, title := bookMeta.Author, bookMeta.Title
 		if title == "" {
 			title = filepath.Base(bk.Dir)
 		}
@@ -353,16 +355,17 @@ type authorGroup struct {
 // formatBookTree renders the same inventory as formatBookList but grouped by
 // author (list_books format=tree). It only regroups the rows list_books already
 // produced — no new queries — so author → books, books in their original order.
-func formatBookTree(books []db.BookSummary, total, offset int, totals db.LibraryTotals, resolver *library.Resolver) *mcp.CallToolResult {
+func formatBookTree(ctx context.Context, books []db.BookSummary, total, offset int, totals db.LibraryTotals, meta metaprovider.MetadataProvider) *mcp.CallToolResult {
 	if len(books) == 0 {
 		return textResult("No books found.")
 	}
 
-	// Group books by resolver-derived author, preserving first-seen order.
+	// Group books by provider-derived author, preserving first-seen order.
 	var groups []authorGroup
 	index := map[string]int{}
 	for _, bk := range books {
-		author, _ := resolver.Resolve(bk.Dir, bk.SamplePath)
+		bookMeta, _ := meta.Lookup(ctx, bk.SamplePath, bk.SamplePath)
+		author := bookMeta.Author
 		if author == "" {
 			author = "Unknown"
 		}
@@ -388,7 +391,8 @@ func formatBookTree(books []db.BookSummary, total, offset int, totals db.Library
 	for _, g := range groups {
 		fmt.Fprintf(&b, "%s\n", g.author)
 		for _, bk := range g.books {
-			_, title := resolver.Resolve(bk.Dir, bk.SamplePath)
+			bkMeta, _ := meta.Lookup(ctx, bk.SamplePath, bk.SamplePath)
+			title := bkMeta.Title
 			if title == "" {
 				title = filepath.Base(bk.Dir)
 			}

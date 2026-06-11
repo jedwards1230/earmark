@@ -1092,7 +1092,8 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 
 	rows := make([]bookRow, 0, len(books))
 	for _, b := range books {
-		author, title := s.resolver.Resolve(b.Dir, b.SamplePath)
+		bookMeta, _ := s.meta.Lookup(r.Context(), b.SamplePath, b.SamplePath)
+		author, title := bookMeta.Author, bookMeta.Title
 		pct := 0
 		if b.Total > 0 {
 			pct = b.Done * 100 / b.Total
@@ -1154,11 +1155,15 @@ func (s *MCPServer) renderBookFragment(w http.ResponseWriter, r *http.Request, d
 			d.Failed++
 		}
 	}
-	sample := dir
+	// filePath must be a track file so that filepath.Dir(filePath) == dir.
+	// When no tracks exist yet, synthesise one so the provider sees the correct
+	// directory depth; the fictitious filename is never stored.
+	filePath := dir + "/__"
 	if len(tracks) > 0 {
-		sample = tracks[0].FilePath
+		filePath = tracks[0].FilePath
 	}
-	d.Author, d.Title = s.resolver.Resolve(dir, sample)
+	bookMeta, _ := s.meta.Lookup(r.Context(), filePath, filePath)
+	d.Author, d.Title = bookMeta.Author, bookMeta.Title
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -1245,7 +1250,8 @@ func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
 
 	bookDir := path.Dir(detail.FilePath)
 	d := trackData{Detail: detail, BackDir: url.QueryEscape(bookDir), IDQuery: url.QueryEscape(id)}
-	d.Author, d.Title = s.resolver.Resolve(bookDir, detail.FilePath)
+	trackMeta, _ := s.meta.Lookup(r.Context(), detail.FilePath, detail.FilePath)
+	d.Author, d.Title = trackMeta.Author, trackMeta.Title
 	if detail.HasTranscript {
 		dur := detail.DurationSeconds
 		d.DurationPtr = &dur
