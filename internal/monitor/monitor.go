@@ -19,6 +19,7 @@ import (
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 	"github.com/jedwards1230/lil-whisper/internal/transcribe"
 )
 
@@ -34,6 +35,10 @@ type DBInterface interface {
 	// UpsertAudioBytes records the audio file size for a job (per-run
 	// observability). Best-effort: a failure here must not fail enqueue.
 	UpsertAudioBytes(ctx context.Context, jobID string, bytes int64) error
+	// UpsertBookMetadata records book-level metadata derived from the
+	// MetadataProvider at enqueue time (CONTRACT §1.6). Best-effort: a failure
+	// here must not fail enqueue.
+	UpsertBookMetadata(ctx context.Context, bookDir, title, author, source string) error
 }
 
 // Default file-stability tuning. A new file is only hashed once its size has
@@ -49,6 +54,7 @@ const (
 type FileMonitor struct {
 	cfg    *config.Config
 	db     DBInterface
+	meta   metaprovider.MetadataProvider
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -63,11 +69,14 @@ type FileMonitor struct {
 }
 
 // NewFileMonitor creates a FileMonitor. Call Start to begin watching.
-func NewFileMonitor(cfg *config.Config, db DBInterface) *FileMonitor {
+// The MetadataProvider is used at enqueue time to derive book-level metadata
+// (title, author) that is written best-effort to book_metadata (CONTRACT §1.6).
+func NewFileMonitor(cfg *config.Config, db DBInterface, meta metaprovider.MetadataProvider) *FileMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &FileMonitor{
 		cfg:               cfg,
 		db:                db,
+		meta:              meta,
 		ctx:               ctx,
 		cancel:            cancel,
 		done:              make(chan struct{}),
@@ -247,6 +256,30 @@ func (fm *FileMonitor) enqueueFile(filePath string) {
 		fm.log.Debug("audio_bytes: stat failed", "file", filePath, "error", statErr)
 	} else if err := fm.db.UpsertAudioBytes(ctx, jobID, info.Size()); err != nil {
 		fm.log.Warn("audio_bytes: metrics write failed (continuing)", "file", filePath, "job_id", jobID, "error", err)
+	}
+
+	// Derive and persist book-level metadata (CONTRACT §1.6). Best-effort: a
+	// provider or DB error must never block enqueue — mirror the UpsertAudioBytes
+	// pattern exactly. The sampleName is the filename component, which the
+	// PathProvider uses to strip track-number prefixes and derive a title.
+	fm.upsertBookMetadata(ctx, filePath)
+}
+
+// upsertBookMetadata derives book metadata from filePath via the configured
+// MetadataProvider and writes it to book_metadata. Best-effort: all errors are
+// logged and swallowed so enqueue is never blocked.
+func (fm *FileMonitor) upsertBookMetadata(ctx context.Context, filePath string) {
+	bookDir := filepath.Dir(filePath)
+	sampleName := filepath.Base(filePath)
+
+	meta, err := fm.meta.Lookup(ctx, filePath, sampleName)
+	if err != nil {
+		fm.log.Warn("book_metadata: provider lookup failed (continuing)", "file", filePath, "error", err)
+		return
+	}
+
+	if err := fm.db.UpsertBookMetadata(ctx, bookDir, meta.Title, meta.Author, meta.Source); err != nil {
+		fm.log.Warn("book_metadata: DB write failed (continuing)", "file", filePath, "book_dir", bookDir, "error", err)
 	}
 }
 

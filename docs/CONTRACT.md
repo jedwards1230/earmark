@@ -344,6 +344,52 @@ Rules:
 - `chunked` / `n_windows` describe the runner's chunked-vs-single-pass inference
   (driven by `ASR_CHUNK_THRESHOLD_SECONDS`, §2.4), not the Go embed chunking.
 
+### 1.6 Per-book enrichment — `book_metadata` table
+
+One row per **book directory** (`book_dir = filepath.Dir(file_path)` of any
+track under the book). It is **additive** — nothing in §1.1–§1.5 or §3 depends
+on it, and a missing row never blocks the pipeline. Writer: **Go monitor**, at
+enqueue time via `MetadataProvider.Lookup`. Readers: added by PR 4 (ABS
+chapters) and PR 5 (bias terms); no reader exists yet.
+
+```sql
+CREATE TABLE IF NOT EXISTS book_metadata (
+  book_dir   TEXT        NOT NULL PRIMARY KEY,
+  title      TEXT,
+  author     TEXT,
+  narrator   TEXT,
+  series     TEXT,
+  asin       TEXT,
+  chapters   JSONB,
+  bias_terms TEXT[],
+  source     TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+#### Column ownership
+
+| Writer | When | Columns it writes |
+|--------|------|-------------------|
+| **Go monitor** | at enqueue (PathProvider) | `title`, `author`, `source` |
+| **PR 4 — ABS integration** | after ABS chapter fetch | `narrator`, `series`, `asin`, `chapters` |
+| **PR 5 — bias terms** | derived from chapters + title | `bias_terms` |
+
+**Key choice — `book_dir` as primary key:** the monitor groups files by
+`book_dir = filepath.Dir(file_path)` (one row per book directory, not per
+track). This is the same granularity the rest of the pipeline uses for
+per-book queries, and it lets the runner in PR 5 derive the key from a job's
+`file_path` with a single `filepath.Dir` call.
+
+Rules:
+- Every write is **best-effort** — a `book_metadata` failure MUST NOT fail
+  enqueue. The monitor logs and continues.
+- The UPSERT touches only the columns its writer owns, so concurrent writes
+  from later PRs can't clobber each other.
+- `chapters` and `bias_terms` are nullable and left `NULL` by the monitor; PR 4
+  and PR 5 fill them in independently.
+- The Go service creates the table in its schema-init transaction.
+
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
@@ -704,7 +750,7 @@ These are implementation constants in the Go chunker, not a DB concern.
 ## 4. CHANGE CONTROL
 
 Any change to:
-- A column name, type, or constraint in sections 1.1, 1.2, 1.5, or 3
+- A column name, type, or constraint in sections 1.1, 1.2, 1.5, 1.6, or 3
 - An env var name in section 2.4
 - The mcp-proxy upstream key or URL in section 2.2
 - The embedding model or vector dimension in section 2.3

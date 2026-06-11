@@ -353,6 +353,25 @@ func (db *DB) initialize(ctx context.Context) error {
 			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
+
+		-- book_metadata: per-book enrichment (CONTRACT §1.6). One row per book
+		-- directory (book_dir = filepath.Dir of any track under the book). This is
+		-- the DB seam for the provider-architecture: the Go monitor writes the
+		-- initial row at enqueue time using the MetadataProvider; later PRs populate
+		-- the nullable columns (chapters in PR 4, bias_terms in PR 5). No pipeline
+		-- code reads this table yet — it is additive and a missing row is a no-op.
+		CREATE TABLE IF NOT EXISTS book_metadata (
+			book_dir    TEXT        NOT NULL PRIMARY KEY,
+			title       TEXT,
+			author      TEXT,
+			narrator    TEXT,
+			series      TEXT,
+			asin        TEXT,
+			chapters    JSONB,
+			bias_terms  TEXT[],
+			source      TEXT,
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -644,6 +663,33 @@ func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 		m.ChunkCount, m.PromptTokens, m.TotalTokens)
 	if err != nil {
 		return fmt.Errorf("upsert embed metrics: %w", err)
+	}
+	return nil
+}
+
+// ─── Book metadata (CONTRACT §1.6) ───────────────────────────────────────────
+
+// UpsertBookMetadata writes or refreshes the book_metadata row for a book
+// directory. Only the title, author, and source columns are touched, so it
+// never overwrites the nullable enrichment columns (narrator, series, asin,
+// chapters, bias_terms) written by later PRs (ABS chapters in PR 4, bias
+// terms in PR 5).
+//
+// Best-effort: callers must log and continue on error so a metadata write
+// never fails enqueue. A missing row in book_metadata is always a no-op for
+// the rest of the pipeline.
+func (db *DB) UpsertBookMetadata(ctx context.Context, bookDir, title, author, source string) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO book_metadata (book_dir, title, author, source, updated_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (book_dir) DO UPDATE
+		SET title      = EXCLUDED.title,
+		    author     = EXCLUDED.author,
+		    source     = EXCLUDED.source,
+		    updated_at = now()
+	`, bookDir, title, author, source)
+	if err != nil {
+		return fmt.Errorf("upsert book_metadata: %w", err)
 	}
 	return nil
 }

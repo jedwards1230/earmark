@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 )
 
 func TestIsAudioFile(t *testing.T) {
@@ -58,6 +60,11 @@ type fakeDB struct {
 	insertCalls  int               // times a NEW job was actually created
 	pruned       int               // times PruneAppleDoubleJobs was called
 	audioBytes   map[string]int64  // jobID -> audio_bytes recorded
+
+	// book_metadata tracking
+	bookMetadata  map[string][4]string // bookDir -> [title, author, source, ""]
+	bookMetaErr   error                // if set, UpsertBookMetadata returns this error
+	bookMetaCalls int                  // number of UpsertBookMetadata calls
 }
 
 func (f *fakeDB) InsertJobIfAbsent(_ context.Context, filePath, checksum string) (string, bool, error) {
@@ -98,12 +105,52 @@ func (f *fakeDB) UpsertAudioBytes(_ context.Context, jobID string, bytes int64) 
 	return nil
 }
 
+func (f *fakeDB) UpsertBookMetadata(_ context.Context, bookDir, title, author, source string) error {
+	f.bookMetaCalls++
+	if f.bookMetaErr != nil {
+		return f.bookMetaErr
+	}
+	if f.bookMetadata == nil {
+		f.bookMetadata = map[string][4]string{}
+	}
+	f.bookMetadata[bookDir] = [4]string{title, author, source, ""}
+	return nil
+}
+
+// stubMetaProvider implements metaprovider.MetadataProvider for tests.
+type stubMetaProvider struct {
+	title  string
+	author string
+	source string
+	err    error // if set, Lookup returns this error
+}
+
+func (s *stubMetaProvider) Lookup(_ context.Context, _, _ string) (metaprovider.BookMeta, error) {
+	if s.err != nil {
+		return metaprovider.BookMeta{}, s.err
+	}
+	return metaprovider.BookMeta{
+		Title:  s.title,
+		Author: s.author,
+		Source: s.source,
+	}, nil
+}
+
 func newTestMonitor(dir string, db DBInterface) *FileMonitor {
+	return newTestMonitorWithMeta(dir, db, &stubMetaProvider{
+		title:  "Test Book",
+		author: "Test Author",
+		source: "path",
+	})
+}
+
+func newTestMonitorWithMeta(dir string, db DBInterface, meta metaprovider.MetadataProvider) *FileMonitor {
 	cfg := &config.Config{BooksDir: dir}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &FileMonitor{
 		cfg:    cfg,
 		db:     db,
+		meta:   meta,
 		ctx:    ctx,
 		cancel: cancel,
 		done:   make(chan struct{}),
@@ -318,5 +365,168 @@ func TestWaitForStableSizeTimeoutWhileGrowing(t *testing.T) {
 
 	if err := fm.waitForStableSize(p); err == nil {
 		t.Error("expected a timeout error for a continuously growing file")
+	}
+}
+
+// ─── book_metadata tests (CONTRACT §1.6) ────────────────────────────────────
+
+// TestBookMetadataWrittenOnEnqueue verifies that enqueueFile writes a
+// book_metadata row with the values from the MetadataProvider.
+func TestBookMetadataWrittenOnEnqueue(t *testing.T) {
+	dir := t.TempDir()
+	bookDir := filepath.Join(dir, "Author", "My Book")
+	if err := os.MkdirAll(bookDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(bookDir, "track01.mp3")
+	if err := os.WriteFile(filePath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	db := &fakeDB{}
+	meta := &stubMetaProvider{title: "My Book", author: "The Author", source: "path"}
+	fm := newTestMonitorWithMeta(dir, db, meta)
+
+	fm.enqueueFile(filePath)
+
+	if db.bookMetaCalls != 1 {
+		t.Fatalf("expected 1 book_metadata upsert, got %d", db.bookMetaCalls)
+	}
+	row, ok := db.bookMetadata[bookDir]
+	if !ok {
+		t.Fatalf("no book_metadata row found for book_dir=%q", bookDir)
+	}
+	if row[0] != "My Book" {
+		t.Errorf("title: got %q, want %q", row[0], "My Book")
+	}
+	if row[1] != "The Author" {
+		t.Errorf("author: got %q, want %q", row[1], "The Author")
+	}
+	if row[2] != "path" {
+		t.Errorf("source: got %q, want %q", row[2], "path")
+	}
+}
+
+// TestBookMetadataUpsertUpdatesExisting verifies that enqueuing a second file
+// from the same book directory refreshes the book_metadata row (not a dup).
+func TestBookMetadataUpsertUpdatesExisting(t *testing.T) {
+	dir := t.TempDir()
+	bookDir := filepath.Join(dir, "Author", "My Book")
+	if err := os.MkdirAll(bookDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	db := &fakeDB{}
+	meta := &stubMetaProvider{title: "My Book", author: "The Author", source: "path"}
+	fm := newTestMonitorWithMeta(dir, db, meta)
+
+	for _, track := range []string{"track01.mp3", "track02.mp3"} {
+		p := filepath.Join(bookDir, track)
+		if err := os.WriteFile(p, []byte(track), 0600); err != nil {
+			t.Fatal(err)
+		}
+		fm.enqueueFile(p)
+	}
+
+	// Two tracks → two UpsertBookMetadata calls (idempotent ON CONFLICT).
+	if db.bookMetaCalls != 2 {
+		t.Errorf("expected 2 book_metadata upserts (one per track), got %d", db.bookMetaCalls)
+	}
+	// Still exactly one row per book_dir.
+	if len(db.bookMetadata) != 1 {
+		t.Errorf("expected 1 unique book_dir in metadata map, got %d", len(db.bookMetadata))
+	}
+}
+
+// TestBookMetadataWriteFailureDoesNotBlockEnqueue verifies the best-effort
+// guarantee: a DB error from UpsertBookMetadata must be logged and swallowed,
+// never propagated, so enqueue still succeeds.
+func TestBookMetadataWriteFailureDoesNotBlockEnqueue(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "track01.mp3")
+	if err := os.WriteFile(filePath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	db := &fakeDB{bookMetaErr: errors.New("simulated DB failure")}
+	meta := &stubMetaProvider{title: "Book", author: "Author", source: "path"}
+	fm := newTestMonitorWithMeta(dir, db, meta)
+
+	// Must not panic or return an error — enqueue swallows the metadata failure.
+	fm.enqueueFile(filePath)
+
+	// The job itself must still be enqueued.
+	if db.insertCalls != 1 {
+		t.Errorf("expected 1 job inserted despite metadata failure, got %d", db.insertCalls)
+	}
+	// book_metadata should have been attempted.
+	if db.bookMetaCalls != 1 {
+		t.Errorf("expected 1 metadata upsert attempt, got %d", db.bookMetaCalls)
+	}
+	// But no row recorded (the error was returned before storage).
+	if len(db.bookMetadata) != 0 {
+		t.Errorf("expected no book_metadata stored after failure, got %d rows", len(db.bookMetadata))
+	}
+}
+
+// TestBookMetadataEmptyFromProvider verifies that an empty (but successful)
+// provider result — the valid "couldn't resolve" case for a real provider —
+// is still written (empty strings stored, no error) and enqueue succeeds.
+func TestBookMetadataEmptyFromProvider(t *testing.T) {
+	dir := t.TempDir()
+	bookDir := filepath.Join(dir, "Unknown")
+	if err := os.MkdirAll(bookDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(bookDir, "track01.mp3")
+	if err := os.WriteFile(filePath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	db := &fakeDB{}
+	// Successful lookup returning all-empty metadata (no err) — the case where a
+	// real provider cannot resolve a directory but does not error.
+	meta := &stubMetaProvider{title: "", author: "", source: ""}
+	fm := newTestMonitorWithMeta(dir, db, meta)
+
+	fm.enqueueFile(filePath)
+
+	if db.insertCalls != 1 {
+		t.Errorf("expected 1 job inserted, got %d", db.insertCalls)
+	}
+	if db.bookMetaCalls != 1 {
+		t.Fatalf("expected 1 metadata upsert (empty values still written), got %d", db.bookMetaCalls)
+	}
+	row, ok := db.bookMetadata[bookDir]
+	if !ok {
+		t.Fatalf("no book_metadata row found for book_dir=%q", bookDir)
+	}
+	if row[0] != "" || row[1] != "" || row[2] != "" {
+		t.Errorf("expected all-empty metadata stored, got title=%q author=%q source=%q", row[0], row[1], row[2])
+	}
+}
+
+// TestBookMetadataProviderFailureDoesNotBlockEnqueue verifies that a provider
+// error (e.g. network timeout in a future ABS provider) is also swallowed.
+func TestBookMetadataProviderFailureDoesNotBlockEnqueue(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "track01.mp3")
+	if err := os.WriteFile(filePath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	db := &fakeDB{}
+	meta := &stubMetaProvider{err: errors.New("simulated provider failure")}
+	fm := newTestMonitorWithMeta(dir, db, meta)
+
+	fm.enqueueFile(filePath)
+
+	// The job must still be enqueued.
+	if db.insertCalls != 1 {
+		t.Errorf("expected 1 job inserted despite provider failure, got %d", db.insertCalls)
+	}
+	// No DB call should have been made (provider failed before upsert).
+	if db.bookMetaCalls != 0 {
+		t.Errorf("expected 0 metadata upserts (provider failed), got %d", db.bookMetaCalls)
 	}
 }
