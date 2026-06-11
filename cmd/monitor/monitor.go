@@ -10,6 +10,7 @@ import (
 
 	"github.com/jedwards1230/lil-whisper/internal/config"
 	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
 	"github.com/jedwards1230/lil-whisper/internal/monitor"
 	"github.com/jedwards1230/lil-whisper/internal/queue"
 	"github.com/jedwards1230/lil-whisper/internal/worker"
@@ -52,8 +53,10 @@ func runMonitor(cmd *cobra.Command, args []string) {
 		log.Println("Debug reset completed - All data cleared")
 	}
 
+	meta := metaprovider.NewPathProvider(cfg.LibraryCollections, cfg.BooksDir)
+
 	workQueue := queue.NewQueue()
-	fileMonitor := monitor.NewFileMonitor(cfg, database)
+	fileMonitor := monitor.NewFileMonitor(cfg, database, meta)
 	w := worker.NewWorker(workQueue, database, cfg)
 
 	// Start monitor first and wait for initial scan to complete.
