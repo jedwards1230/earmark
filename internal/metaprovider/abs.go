@@ -121,7 +121,7 @@ func (p *ABSProvider) Lookup(ctx context.Context, filePath, _ string) (BookMeta,
 	asin := library.ExtractASIN(filepath.Dir(filePath))
 	if asin == "" {
 		asin = library.ExtractASIN(filepath.Base(filePath))
-	} else if fileASIN := library.ExtractASIN(filepath.Base(filePath)); fileASIN != "" && fileASIN != asin {
+	} else if fileASIN := library.ExtractASIN(filepath.Base(filePath)); fileASIN != "" && !strings.EqualFold(fileASIN, asin) {
 		p.log.Warn("ASIN mismatch between directory and filename; using directory ASIN",
 			"dir_asin", asin, "file_asin", fileASIN, "file", filePath)
 	}

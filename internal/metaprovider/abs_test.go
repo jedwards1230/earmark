@@ -185,6 +185,49 @@ func TestABSProvider_Lookup_FilenameASIN(t *testing.T) {
 	}
 }
 
+// TestABSProvider_Lookup_DirectoryASINWinsOnMismatch verifies the priority rule:
+// when both the directory and the filename carry an ASIN and they differ, the
+// directory ASIN is used (it identifies the book) and the filename ASIN is ignored.
+func TestABSProvider_Lookup_DirectoryASINWinsOnMismatch(t *testing.T) {
+	t.Parallel()
+
+	const (
+		itemID   = "test-item-id"
+		dirASIN  = "B000000001" // on the directory — must win (valid 10-char ASIN)
+		fileASIN = "B08G9PRS1K" // on the filename — must be ignored
+		libID    = "lib-id"
+		token    = "test-token"
+		filePath = "/books/audio-libation/Author/Title [" + dirASIN + "]/track [" + fileASIN + "].m4b"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/libraries/" + libID + "/items":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(absItemsFixture(itemID, dirASIN)) // library only has the dir ASIN
+		case "/api/items/" + itemID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(absItemDetailFixture(itemID))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := metaprovider.NewABSProvider(srv.URL, token, libID, srv.Client())
+	got, err := p.Lookup(context.Background(), filePath, filepath.Base(filePath))
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	if got.ASIN != dirASIN {
+		t.Errorf("ASIN = %q, want %q (directory ASIN must win on mismatch)", got.ASIN, dirASIN)
+	}
+}
+
 // TestABSProvider_Lookup_NoASIN verifies that a path without a bracketed ASIN
 // returns empty BookMeta with no error (not-found signal).
 func TestABSProvider_Lookup_NoASIN(t *testing.T) {
