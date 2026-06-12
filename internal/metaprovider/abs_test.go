@@ -171,6 +171,15 @@ func TestABSProvider_Lookup_FilenameASIN(t *testing.T) {
 	if got.Title != "Project Hail Mary" {
 		t.Errorf("Title = %q, want %q", got.Title, "Project Hail Mary")
 	}
+	if got.Author != "Andy Weir" {
+		t.Errorf("Author = %q, want %q", got.Author, "Andy Weir")
+	}
+	if got.Narrator != "Ray Porter" {
+		t.Errorf("Narrator = %q, want %q", got.Narrator, "Ray Porter")
+	}
+	if got.Source != "abs" {
+		t.Errorf("Source = %q, want %q", got.Source, "abs")
+	}
 	if len(got.Chapters) != 3 {
 		t.Errorf("len(Chapters) = %d, want 3 (chapters should resolve via filename ASIN)", len(got.Chapters))
 	}

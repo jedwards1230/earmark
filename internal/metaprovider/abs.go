@@ -113,10 +113,17 @@ func NewABSProvider(baseURL, token, libraryID string, client *http.Client) *ABSP
 // fallback is what enables author-only layouts (audio-custom, audio-libro) where
 // the book dir carries no ASIN but each track file does, e.g.
 // `audio-custom/Benjamin Schumacher/The Science of Information [1629976067].m4b`.
+//
+// When both the directory and the filename carry an ASIN and they differ, the
+// directory ASIN wins (it identifies the book; the filename can be a per-track
+// variant) and a warning is logged to surface a likely misnaming.
 func (p *ABSProvider) Lookup(ctx context.Context, filePath, _ string) (BookMeta, error) {
 	asin := library.ExtractASIN(filepath.Dir(filePath))
 	if asin == "" {
 		asin = library.ExtractASIN(filepath.Base(filePath))
+	} else if fileASIN := library.ExtractASIN(filepath.Base(filePath)); fileASIN != "" && fileASIN != asin {
+		p.log.Warn("ASIN mismatch between directory and filename; using directory ASIN",
+			"dir_asin", asin, "file_asin", fileASIN, "file", filePath)
 	}
 	if asin == "" {
 		p.log.Debug("no ASIN in path, skipping ABS lookup", "file", filePath)
