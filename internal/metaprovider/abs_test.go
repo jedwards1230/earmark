@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
@@ -122,6 +123,51 @@ func TestABSProvider_Lookup_Hit(t *testing.T) {
 	}
 	if got.Chapters[2].Index != 2 {
 		t.Errorf("Chapters[2].Index = %d, want 2", got.Chapters[2].Index)
+	}
+}
+
+// TestABSProvider_Lookup_FilenameASIN verifies the author-only layout path:
+// the book directory carries no ASIN, but the track filename does, so ABS still
+// matches via the filename fallback (audio-custom / audio-libro layouts).
+func TestABSProvider_Lookup_FilenameASIN(t *testing.T) {
+	t.Parallel()
+
+	const (
+		itemID = "test-item-id"
+		asin   = "B08G9PRS1K"
+		libID  = "lib-id"
+		token  = "test-token"
+		// No ASIN on the directory; the ASIN lives only on the file itself.
+		filePath = "/books/audio-custom/Andy Weir/Project Hail Mary [B08G9PRS1K].m4b"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/libraries/" + libID + "/items":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(absItemsFixture(itemID, asin))
+		case "/api/items/" + itemID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(absItemDetailFixture(itemID))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := metaprovider.NewABSProvider(srv.URL, token, libID, srv.Client())
+	got, err := p.Lookup(context.Background(), filePath, filepath.Base(filePath))
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	if got.ASIN != asin {
+		t.Errorf("ASIN = %q, want %q (filename fallback)", got.ASIN, asin)
+	}
+	if got.Title != "Project Hail Mary" {
+		t.Errorf("Title = %q, want %q", got.Title, "Project Hail Mary")
+	}
+	if len(got.Chapters) != 3 {
+		t.Errorf("len(Chapters) = %d, want 3 (chapters should resolve via filename ASIN)", len(got.Chapters))
 	}
 }
 
