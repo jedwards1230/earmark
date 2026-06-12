@@ -142,6 +142,11 @@ func TestABSProvider_Lookup_FilenameASIN(t *testing.T) {
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify bearer token is forwarded.
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		switch r.URL.Path {
 		case "/api/libraries/" + libID + "/items":
 			w.Header().Set("Content-Type", "application/json")
