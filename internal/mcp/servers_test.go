@@ -49,7 +49,7 @@ func TestBuildServerViews_States(t *testing.T) {
 		},
 	}
 
-	views := buildServerViews(configured, obs, now, stale)
+	views := buildServerViews(configured, obs, nil, now, stale)
 	byName := map[string]serverView{}
 	for _, v := range views {
 		byName[v.Name] = v
@@ -106,7 +106,7 @@ func TestBuildServerViews_StaleClaim(t *testing.T) {
 			{ClaimedBy: "asr-runner-desktop-1", ClaimedCount: 1, LastHeartbeat: now.Add(-2 * time.Hour)},
 		},
 	}
-	views := buildServerViews(configured, obs, now, stale)
+	views := buildServerViews(configured, obs, nil, now, stale)
 	if len(views) != 1 || views[0].State.Label != "STALLED" {
 		t.Fatalf("want one STALLED view, got %+v", views)
 	}
@@ -129,7 +129,7 @@ func TestBuildServerViews_UnconfiguredRunnerPairsHost(t *testing.T) {
 	}
 	// No configured servers: the live runner must pair with the host whose name is
 	// a substring of claimed_by, so its model shows and the host isn't double-rendered.
-	views := buildServerViews(nil, obs, now, 30*time.Minute)
+	views := buildServerViews(nil, obs, nil, now, 30*time.Minute)
 	if len(views) != 1 {
 		t.Fatalf("want a single merged unconfigured view, got %d: %+v", len(views), views)
 	}
@@ -141,3 +141,97 @@ func TestBuildServerViews_UnconfiguredRunnerPairsHost(t *testing.T) {
 		t.Errorf("merged view wrong: %+v", v)
 	}
 }
+
+func TestBuildServerViews_GPUReadiness(t *testing.T) {
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	stale := 30 * time.Minute
+	ip := func(n int) *int { return &n }
+	bp := func(b bool) *bool { return &b }
+
+	configured := []config.ASRServer{
+		{Name: "ready-1", GPUArbiterURL: "http://x/ready"},
+		{Name: "busy-1", GPUArbiterURL: "http://x/busy"},
+		{Name: "offline-1", GPUArbiterURL: "http://x/offline"},
+		{Name: "rundown-1", GPUArbiterURL: "http://x/rundown"},
+	}
+	probes := map[string]arbiterStatus{
+		"ready-1":   {Reachable: true, State: "available", ASRRunning: bp(true), VRAMUsedMB: ip(512), VRAMTotalMB: ip(32607)},
+		"busy-1":    {Reachable: true, State: "gaming", Claims: []string{"steam:440"}, ASRRunning: bp(false), VRAMUsedMB: ip(7338), VRAMTotalMB: ip(32607)},
+		"offline-1": {Reachable: false},
+		// reachable + available but the runner unit is down → not usable → BUSY
+		"rundown-1": {Reachable: true, State: "available", ASRRunning: bp(false)},
+	}
+
+	byName := map[string]serverView{}
+	for _, v := range buildServerViews(configured, &db.ServerObservation{}, probes, now, stale) {
+		byName[v.Name] = v
+	}
+
+	if v := byName["ready-1"]; v.State.Label != "READY" || v.State.Token != "ready" || v.State.Dot != "green" {
+		t.Errorf("ready-1 = %+v, want READY/green", v.State)
+	}
+	if v := byName["ready-1"]; !v.Probed || !v.Reachable || v.GPUState != "available" {
+		t.Errorf("ready-1 probe fields wrong: %+v", v)
+	}
+	if v := byName["busy-1"]; v.State.Label != "BUSY" || v.State.Dot != "amber" {
+		t.Errorf("busy-1 = %+v, want BUSY/amber", v.State)
+	}
+	if v := byName["busy-1"]; !strings.Contains(v.State.Sub, "game mode") || !strings.Contains(v.State.Sub, "steam:440") {
+		t.Errorf("busy-1 sub = %q, want game mode + claim", v.State.Sub)
+	}
+	if v := byName["offline-1"]; v.State.Label != "OFFLINE" || v.State.Dot != "grey" {
+		t.Errorf("offline-1 = %+v, want OFFLINE/grey", v.State)
+	}
+	if v := byName["rundown-1"]; v.State.Label != "BUSY" || !strings.Contains(v.State.Sub, "asr-runner stopped") {
+		t.Errorf("rundown-1 = %+v, want BUSY (runner stopped)", v.State)
+	}
+}
+
+func TestBuildServerViews_LiveClaimBeatsProbe(t *testing.T) {
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	// A fresh live claim must win even if gpu-arbiter says gaming: if the runner
+	// holds a job, it is plainly transcribing.
+	configured := []config.ASRServer{{Name: "desktop-1", GPUArbiterURL: "http://x/busy"}}
+	obs := &db.ServerObservation{
+		LiveRunners: []db.LiveRunner{{ClaimedBy: "asr-runner-desktop-1", LastHeartbeat: now.Add(-10 * time.Second), CurrentFile: "/b/01.m4b"}},
+	}
+	probes := map[string]arbiterStatus{"desktop-1": {Reachable: true, State: "gaming"}}
+	views := buildServerViews(configured, obs, probes, now, 30*time.Minute)
+	if views[0].State.Label != "TRANSCRIBING" {
+		t.Fatalf("want TRANSCRIBING (live claim beats probe), got %q", views[0].State.Label)
+	}
+}
+
+func TestArbiterRawToStatus(t *testing.T) {
+	used, total := 7338, 32607
+	raw := arbiterRaw{
+		State:  "gaming",
+		Claims: []string{"steam:2215200"},
+		Units: []struct {
+			Unit    string `json:"unit"`
+			Running bool   `json:"running"`
+		}{
+			{Unit: "ollama.service", Running: false},
+			{Unit: "asr-runner.service", Running: false},
+		},
+		VRAMUsedMB:  &used,
+		VRAMTotalMB: &total,
+	}
+	st := raw.toStatus()
+	if !st.Reachable || st.State != "gaming" {
+		t.Fatalf("unexpected: %+v", st)
+	}
+	if st.ASRRunning == nil || *st.ASRRunning {
+		t.Errorf("ASRRunning should be non-nil false, got %v", st.ASRRunning)
+	}
+	if st.ready() {
+		t.Errorf("gaming state must not be ready()")
+	}
+	// available + runner up → ready
+	up := arbiterStatus{Reachable: true, State: "available", ASRRunning: boolPtrT(true)}
+	if !up.ready() {
+		t.Errorf("available + runner up should be ready()")
+	}
+}
+
+func boolPtrT(b bool) *bool { return &b }

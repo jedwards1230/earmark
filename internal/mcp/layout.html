@@ -206,14 +206,18 @@
   /* ── servers page ──────────────────────────────────────────────── */
   .server-card { border-left: 3px solid var(--border); }
   .server-card.state-running { border-left-color: var(--green); }
+  .server-card.state-busy    { border-left-color: var(--amber); }
   .server-card.state-stalled { border-left-color: var(--red); }
+  .server-card.state-offline { border-left-color: var(--muted); }
   .server-card.state-idle    { border-left-color: var(--blue); }
   .server-card.state-unknown { border-left-color: var(--muted); }
   .server-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   .server-name { font-weight: 700; font-size: 14px; }
   .server-state { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; }
   .server-state.state-running { color: var(--green); }
+  .server-state.state-busy    { color: var(--amber); }
   .server-state.state-stalled { color: var(--red); }
+  .server-state.state-offline { color: var(--muted); }
   .server-state.state-idle    { color: var(--blue); }
   .server-state.state-unknown { color: var(--muted); }
   .server-sub { color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-word; }

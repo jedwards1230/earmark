@@ -153,7 +153,7 @@ func TestLoadConfig_ASRServers(t *testing.T) {
 	clearContractEnvVars(t)
 	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
 	t.Setenv("ASR_SERVERS", `[
-		{"name":"desktop-1","host":"192.168.8.10","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary"},
+		{"name":"desktop-1","host":"192.168.8.10","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary","gpuArbiterUrl":"http://192.168.8.10:48750/status"},
 		{"name":"linux-1","role":"fallback","match":"linux-1"}
 	]`)
 
@@ -162,6 +162,7 @@ func TestLoadConfig_ASRServers(t *testing.T) {
 	require.Len(t, cfg.ASRServers, 2)
 	assert.Equal(t, "desktop-1", cfg.ASRServers[0].Name)
 	assert.Equal(t, "primary", cfg.ASRServers[0].Role)
+	assert.Equal(t, "http://192.168.8.10:48750/status", cfg.ASRServers[0].GPUArbiterURL)
 	// Match defaults to the (lower-cased) name when omitted.
 	assert.Equal(t, "desktop-1", cfg.ASRServers[0].MatchToken())
 	assert.Equal(t, "linux-1", cfg.ASRServers[1].MatchToken())

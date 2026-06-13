@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"context"
+	"fmt"
 	"html/template"
 	"net/http"
 	"path"
@@ -28,10 +30,14 @@ import (
 
 // serverState is the derived liveness of one server, with its CSS/dot classes.
 type serverState struct {
-	Label string // TRANSCRIBING / STALLED / IDLE / NOT SEEN
-	Class string // state-running / state-stalled / state-idle / state-unknown
-	Dot   string // green / red / blue / grey
+	Label string // TRANSCRIBING / READY / BUSY / STALLED / OFFLINE / IDLE / NOT SEEN
+	Class string // state-running / state-busy / state-stalled / state-offline / state-idle / state-unknown
+	Dot   string // green / amber / red / grey / blue
 	Sub   string // human one-liner
+	// Token is the machine-readable state for the JSON API, derived from Label
+	// (e.g. "transcribing", "ready", "busy", "stalled", "offline", "idle",
+	// "not_seen").
+	Token string
 }
 
 // serverView is one row/card on the Servers page: the merge of a configured
@@ -55,6 +61,15 @@ type serverView struct {
 	JobsDone    int    // run_metrics rows attributed to this server
 	AvgProc     string // humanized mean wall-clock, or "—"
 	LastActive  string // rel time of last completion, or "—"
+
+	// Live GPU readiness from gpu-arbiter (only when a gpuArbiterUrl is
+	// configured for this server). Probed is false when no probe ran; the rest
+	// are then zero. Exposed in the JSON API as the fallback-automation hook.
+	Probed      bool
+	Reachable   bool
+	GPUState    string // "available" / "gaming" / "evicting" / "" (unknown)
+	VRAMUsedMB  *int
+	VRAMTotalMB *int
 }
 
 // modelSizeRe extracts a parameter-count token like "0.6b" / "1b" / "7b" from an
@@ -74,7 +89,10 @@ func modelSize(model string) string {
 // buildServerViews merges the configured ASR_SERVERS list with observed runner
 // activity into the Servers-page model. It is pure (deterministic given now) so
 // the state logic is unit-testable without a DB or HTTP server.
-func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, now time.Time, staleAfter time.Duration) []serverView {
+// probes maps a configured server's Name to its gpu-arbiter readiness (only for
+// servers with a gpuArbiterUrl); nil/absent → readiness is inferred from job
+// activity. Kept as a parameter so buildServerViews stays pure (no HTTP).
+func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, probes map[string]arbiterStatus, now time.Time, staleAfter time.Duration) []serverView {
 	if obs == nil {
 		obs = &db.ServerObservation{}
 	}
@@ -126,7 +144,7 @@ func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, 
 		}
 
 		v := serverView{Name: c.Name, Host: c.Host, Role: c.Role, Configured: true}
-		applyObserved(&v, live, host, jobs, c.Model, now, staleAfter)
+		applyObserved(&v, live, host, probeFor(probes, c.Name), jobs, c.Model, now, staleAfter)
 		views = append(views, v)
 	}
 
@@ -156,7 +174,7 @@ func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, 
 		}
 		lr := lr
 		v := serverView{Name: lr.ClaimedBy, Configured: false}
-		applyObserved(&v, &lr, host, jobs, "", now, staleAfter)
+		applyObserved(&v, &lr, host, nil, jobs, "", now, staleAfter)
 		views = append(views, v)
 	}
 
@@ -168,11 +186,53 @@ func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, 
 		hostUsed[i] = true
 		h := h
 		v := serverView{Name: h.Host, Configured: false}
-		applyObserved(&v, nil, &h, h.JobsDone, "", now, staleAfter)
+		applyObserved(&v, nil, &h, nil, h.JobsDone, "", now, staleAfter)
 		views = append(views, v)
 	}
 
 	return views
+}
+
+// probeFor returns the probe result for a server name, or nil when none ran.
+func probeFor(probes map[string]arbiterStatus, name string) *arbiterStatus {
+	if probes == nil {
+		return nil
+	}
+	if st, ok := probes[name]; ok {
+		return &st
+	}
+	return nil
+}
+
+// busySubtext describes why a reachable runner is not usable right now (its
+// GPU is gaming/evicting, or free-but-runner-stopped), with the active game
+// claim and VRAM appended when known.
+func busySubtext(probe *arbiterStatus) string {
+	var sub string
+	switch probe.State {
+	case "gaming":
+		sub = "connected — GPU in use (game mode)"
+	case "evicting":
+		sub = "connected — switching workloads (evicting)"
+	case "available": // ready() was false → the runner unit is down
+		sub = "connected — GPU free but asr-runner stopped"
+	default:
+		sub = "connected — GPU busy"
+	}
+	if len(probe.Claims) > 0 {
+		sub += " · " + probe.Claims[0]
+	}
+	return sub + vramSuffix(probe)
+}
+
+// vramSuffix renders " · VRAM 7.3/32 GB" when the probe reported both figures.
+func vramSuffix(probe *arbiterStatus) string {
+	if probe == nil || probe.VRAMUsedMB == nil || probe.VRAMTotalMB == nil || *probe.VRAMTotalMB <= 0 {
+		return ""
+	}
+	used := float64(*probe.VRAMUsedMB) / 1024
+	total := float64(*probe.VRAMTotalMB) / 1024
+	return fmt.Sprintf(" · VRAM %.1f/%.0f GB", used, total)
 }
 
 // laterFinish reports whether host a completed work more recently than b
@@ -188,10 +248,22 @@ func laterFinish(a, b db.HostMetrics) bool {
 }
 
 // applyObserved fills the state + model/mode fields of v from the optional live
-// runner and host metrics, falling back to the configured model when no run has
-// reported one yet.
-func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, jobs int, configuredModel string, now time.Time, staleAfter time.Duration) {
-	// State, derived from claim heartbeat freshness then historical activity.
+// runner, host metrics, and gpu-arbiter probe, falling back to the configured
+// model when no run has reported one yet.
+//
+// State precedence: an active claim (TRANSCRIBING/STALLED) trumps everything —
+// if the runner holds a job, the GPU is plainly serving it. Otherwise, when a
+// probe is configured, live reachability decides (OFFLINE / READY / BUSY).
+// Only without a probe do we fall back to historical inference (IDLE/NOT SEEN).
+func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, probe *arbiterStatus, jobs int, configuredModel string, now time.Time, staleAfter time.Duration) {
+	if probe != nil {
+		v.Probed = true
+		v.Reachable = probe.Reachable
+		v.GPUState = probe.State
+		v.VRAMUsedMB = probe.VRAMUsedMB
+		v.VRAMTotalMB = probe.VRAMTotalMB
+	}
+
 	switch {
 	case live != nil && now.Sub(live.LastHeartbeat) <= staleAfter:
 		sub := "transcribing"
@@ -202,6 +274,15 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, job
 	case live != nil:
 		v.State = serverState{Label: "STALLED", Class: "state-stalled", Dot: "red",
 			Sub: "claim heartbeat stale (" + humanizeSince(now.Sub(live.LastHeartbeat)) + ") — runner may have crashed"}
+	case probe != nil && !probe.Reachable:
+		v.State = serverState{Label: "OFFLINE", Class: "state-offline", Dot: "grey",
+			Sub: "host unreachable (gpu-arbiter not responding)"}
+	case probe != nil && probe.ready():
+		v.State = serverState{Label: "READY", Class: "state-running", Dot: "green",
+			Sub: "connected — GPU available" + vramSuffix(probe)}
+	case probe != nil:
+		v.State = serverState{Label: "BUSY", Class: "state-busy", Dot: "amber",
+			Sub: busySubtext(probe)}
 	case host != nil && host.JobsDone > 0:
 		sub := "idle — no live claim"
 		if host.LastFinished != nil {
@@ -212,6 +293,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, job
 		v.State = serverState{Label: "NOT SEEN", Class: "state-unknown", Dot: "grey",
 			Sub: "configured — no activity observed yet"}
 	}
+	v.State.Token = strings.ReplaceAll(strings.ToLower(v.State.Label), " ", "_")
 
 	// Model & mode: observed run wins; else the configured expectation.
 	if host != nil && host.ASRModel != nil && *host.ASRModel != "" {
@@ -304,7 +386,7 @@ var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs)
   </div>
 </div>
 
-<p class="server-note">A server is shown <em>idle</em> when it has transcribed before but holds no current job — earmark has no idle heartbeat, so it can't confirm a quiet runner is still online. Routing work to a specific server (primary/fallback by job type) is not yet implemented; the runner claims jobs itself.</p>
+<p class="server-note">Servers with a <code>gpuArbiterUrl</code> show live readiness from gpu-arbiter: <em>ready</em> (GPU free), <em>busy</em> (GPU held by a game — connected but not usable, the fallback signal), or <em>offline</em> (host unreachable). Servers without a probe fall back to <em>idle</em>/<em>not&nbsp;seen</em> inferred from job history. Routing work to a specific server (primary/fallback by job type) is not yet implemented; the runner claims jobs itself.</p>
 {{end}}
 `))
 
@@ -329,11 +411,32 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 	}
 	data := serversData{
 		RenderedAt: time.Now().UTC().Format("15:04:05 UTC"),
-		Servers:    buildServerViews(s.asrServers, obs, time.Now(), s.runnerStaleAfter),
+		Servers:    buildServerViews(s.asrServers, obs, s.probeServers(r.Context()), time.Now(), s.runnerStaleAfter),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := serversFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("servers fragment render error", "error", err)
 	}
+}
+
+// probeServers polls gpu-arbiter for every configured server that declares a
+// gpuArbiterUrl, keyed by server Name. Returns nil when none are configured (or
+// no prober is wired), so buildServerViews falls back to history-only inference.
+// The prober caches per URL, so calling this on both render paths is cheap.
+func (s *MCPServer) probeServers(ctx context.Context) map[string]arbiterStatus {
+	if s.prober == nil {
+		return nil
+	}
+	out := map[string]arbiterStatus{}
+	for _, c := range s.asrServers {
+		if c.GPUArbiterURL == "" {
+			continue
+		}
+		out[c.Name] = s.prober.Probe(ctx, c.GPUArbiterURL)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

@@ -115,11 +115,33 @@ func (d demoDB) GetFailedJobs(context.Context) ([]db.FailedJob, error) {
 }
 
 // demoASRServers is the synthetic ASR_SERVERS registry for the demo: a primary
-// (desktop-1) and a declared fallback (linux-1), so the Servers page shows the
-// configured-vs-observed merge including a configured-but-idle fallback.
+// (desktop-1, GPU ready), a fallback (linux-1, GPU busy/gaming), and an offline
+// one (pi-1), so the Servers page shows every gpu-arbiter readiness state. The
+// gpuArbiterUrl values are demo sentinels routed by demoGPUProber, not real
+// endpoints (the demo swaps in a static prober, so no network call is made).
 var demoASRServers = []config.ASRServer{
-	{Name: "desktop-1", Host: "192.168.8.10", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "primary"},
-	{Name: "linux-1", Host: "192.168.8.31", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback"},
+	{Name: "desktop-1", Host: "192.168.8.10", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "primary", GPUArbiterURL: "http://demo/desktop-1/ready"},
+	{Name: "linux-1", Host: "192.168.8.31", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback", GPUArbiterURL: "http://demo/linux-1/busy"},
+	{Name: "pi-1", Host: "192.168.8.33", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback", GPUArbiterURL: "http://demo/pi-1/offline"},
+}
+
+// demoGPUProber is a static gpuProber for the demo, routing by a sentinel in the
+// URL so the page renders ready / busy / offline without any network call.
+type demoGPUProber struct{}
+
+func (demoGPUProber) Probe(_ context.Context, url string) arbiterStatus {
+	ip := func(n int) *int { return &n }
+	bp := func(b bool) *bool { return &b }
+	switch {
+	case strings.Contains(url, "busy"):
+		return arbiterStatus{Reachable: true, State: "gaming", Claims: []string{"steam:2215200"},
+			ASRRunning: bp(false), VRAMUsedMB: ip(7338), VRAMTotalMB: ip(32607)}
+	case strings.Contains(url, "offline"):
+		return arbiterStatus{Reachable: false}
+	default: // ready
+		return arbiterStatus{Reachable: true, State: "available",
+			ASRRunning: bp(true), VRAMUsedMB: ip(512), VRAMTotalMB: ip(32607)}
+	}
 }
 
 // GetServerObservation returns synthetic runner activity for the Servers page.
@@ -627,6 +649,9 @@ func StartDemoDashboard(addr string) error {
 		ASRServers:      demoASRServers,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
+	// Swap the real HTTP gpu-arbiter prober for the static demo one so the
+	// readiness states render without any network call.
+	srv.prober = demoGPUProber{}
 	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",
 		"address", addr, "scenario", scenario)
 	return srv.StartHTTP(addr)

@@ -35,6 +35,13 @@ type ASRServer struct {
 	Model string `json:"model,omitempty"` // expected ASR model, e.g. "nvidia/parakeet-tdt-0.6b-v3"
 	Role  string `json:"role,omitempty"`  // "primary" | "fallback" (free-form; informational)
 	Match string `json:"match,omitempty"` // token matched against claimed_by/runner_host; defaults to Name
+
+	// GPUArbiterURL is an optional gpu-arbiter /status endpoint (e.g.
+	// "http://192.168.8.10:48750/status") the dashboard polls for live
+	// readiness: reachable + GPU available → ready; reachable + GPU in a game →
+	// busy (the fallback signal); unreachable → offline. Empty → readiness is
+	// inferred from job activity only (idle/not-seen). See internal/mcp/servers.go.
+	GPUArbiterURL string `json:"gpuArbiterUrl,omitempty"`
 }
 
 // MatchToken is the lower-cased substring used to attribute observed runner

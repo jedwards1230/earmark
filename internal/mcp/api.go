@@ -63,7 +63,10 @@ type apiStatus struct {
 }
 
 // apiServer is the JSON shape of one transcription server in GET /api/v1/status.
-// state is a machine token: "transcribing" | "stalled" | "idle" | "not_seen".
+// state is a machine token: "transcribing" | "ready" | "busy" | "stalled" |
+// "offline" | "idle" | "not_seen". The gpu-* fields are present only when a
+// gpuArbiterUrl is configured for the server — they are the hook a future
+// fallback automation reads to decide whether the primary is usable.
 type apiServer struct {
 	Name        string `json:"name"`
 	Host        string `json:"host,omitempty"`
@@ -74,6 +77,12 @@ type apiServer struct {
 	ModelSize   string `json:"modelSize,omitempty"`
 	ComputeMode string `json:"computeMode,omitempty"`
 	JobsDone    int    `json:"jobsDone"`
+	// GPU readiness (gpu-arbiter); omitted unless this server has a probe.
+	GPUProbed    bool   `json:"gpuProbed,omitempty"`
+	GPUReachable bool   `json:"gpuReachable,omitempty"`
+	GPUState     string `json:"gpuState,omitempty"`
+	VRAMUsedMB   *int   `json:"vramUsedMb,omitempty"`
+	VRAMTotalMB  *int   `json:"vramTotalMb,omitempty"`
 }
 
 // pauseState is the JSON shape of the pipeline pause endpoints.
@@ -154,17 +163,22 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	if obs, err := s.db.GetServerObservation(r.Context()); err != nil {
 		s.logger.Error("api status servers error", "error", err)
 	} else {
-		for _, v := range buildServerViews(s.asrServers, obs, time.Now(), s.runnerStaleAfter) {
+		for _, v := range buildServerViews(s.asrServers, obs, s.probeServers(r.Context()), time.Now(), s.runnerStaleAfter) {
 			out.Servers = append(out.Servers, apiServer{
-				Name:        v.Name,
-				Host:        v.Host,
-				Role:        v.Role,
-				Configured:  v.Configured,
-				State:       strings.ReplaceAll(strings.ToLower(v.State.Label), " ", "_"),
-				Model:       v.Model,
-				ModelSize:   v.ModelSize,
-				ComputeMode: v.ComputeMode,
-				JobsDone:    v.JobsDone,
+				Name:         v.Name,
+				Host:         v.Host,
+				Role:         v.Role,
+				Configured:   v.Configured,
+				State:        v.State.Token,
+				Model:        v.Model,
+				ModelSize:    v.ModelSize,
+				ComputeMode:  v.ComputeMode,
+				JobsDone:     v.JobsDone,
+				GPUProbed:    v.Probed,
+				GPUReachable: v.Reachable,
+				GPUState:     v.GPUState,
+				VRAMUsedMB:   v.VRAMUsedMB,
+				VRAMTotalMB:  v.VRAMTotalMB,
 			})
 		}
 	}

@@ -125,7 +125,7 @@ Debug-only (both must be set):
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client (pointed at Ollama) |
 | `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry) |
-| `internal/mcp` (servers.go) | **Servers** dashboard page (`/servers`) + `servers[]` in `/api/v1/status`: merges the configured `ASR_SERVERS` list with observed runner activity (live claims + per-host `run_metrics`) into status + a models/modes table. Observability only — no job routing. |
+| `internal/mcp` (servers.go, gpuprobe.go) | **Servers** dashboard page (`/servers`) + `servers[]` in `/api/v1/status`: merges the configured `ASR_SERVERS` list with observed runner activity (live claims + per-host `run_metrics`) and an optional gpu-arbiter readiness probe (per-server `gpuArbiterUrl` → ready/busy/offline) into status + a models/modes table. Observability only — no job routing. |
 
 ## Development Notes
 
