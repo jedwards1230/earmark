@@ -1,0 +1,22 @@
+# ASR runner runtime dependencies.
+#
+# These are documented here for reference and for the CI test job. The
+# authoritative production install is the homelab-ansible `asr-runner` role
+# (roles/asr-runner/defaults/main.yaml), which installs into a dedicated
+# Python 3.12 venv — Python 3.14 has no reliable GPU torch wheels and exceeds
+# NeMo's tested ceiling.
+#
+# --- GPU runtime (production) ---
+# torch must come from the CUDA 13.0 wheel index (cu128 tops out at 2.11.0):
+#   pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.12.0
+#   pip install nemo_toolkit[asr]==2.7.3
+# torch==2.12.0
+# nemo_toolkit[asr]==2.7.3
+
+# --- Always required ---
+psycopg2-binary
+
+# --- Test-only (CI: `pip install psycopg2-binary pytest`) ---
+# test_runner.py imports only stdlib + psycopg2 + (the runner module under test);
+# it does NOT import torch/NeMo, so the GPU stack is not needed to run the suite.
+# pytest

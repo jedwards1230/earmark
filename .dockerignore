@@ -5,6 +5,7 @@ deploy/
 *.md
 docs/
 scripts/
+runner/
 worktrees/
 compose.yaml
 Makefile
