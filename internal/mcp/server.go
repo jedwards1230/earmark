@@ -38,6 +38,10 @@ type MCPServer struct {
 	// controlToken is the bearer token required on mutating control-API endpoints.
 	// Empty → those endpoints fail closed (503); see requireToken in api.go.
 	controlToken string
+
+	// asrServers is the static ASR_SERVERS registry (may be empty) the Servers
+	// page merges with observed runner activity. Read-only; not used for routing.
+	asrServers []config.ASRServer
 }
 
 // NewMCPServer creates a new MCP server instance
@@ -221,6 +225,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		embedURL:         cfg.EmbeddingsBaseURL,
 		meta:             meta,
 		controlToken:     cfg.ControlAPIToken,
+		asrServers:       cfg.ASRServers,
 	}
 }
 
@@ -254,6 +259,8 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	GET  /track                — per-track detail page (shell)
 //	GET  /track/data           — per-track detail fragment (header + reader + chunks)
 //	GET  /status/data          — htmx-refreshed fragment (counts + recent jobs)
+//	GET  /servers              — transcription-servers page (shell)
+//	GET  /servers/data         — servers fragment (status + models/modes)
 //	GET  /static/htmx.min.js   — vendored htmx library
 //	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
 //	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)
@@ -287,6 +294,8 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/track/data", getOnly(s.handleTrackData))
 	mux.HandleFunc("/track/segments", getOnly(s.handleTrackSegments))
 	mux.HandleFunc("/failed", getOnly(s.handleFailedPage))
+	mux.HandleFunc("/servers", getOnly(s.handleServersPage))
+	mux.HandleFunc("/servers/data", getOnly(s.handleServersData))
 
 	// Per-book transcript search (read-only; accepts the htmx form POST or a GET).
 	// Specific path → method patterns are safe (no "/" catch-all conflict).

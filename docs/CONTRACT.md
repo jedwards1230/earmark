@@ -540,6 +540,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
+| `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
 | `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.lilbro.cloud`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
 | `ABS_TOKEN` | no | Audiobookshelf API token. Required when `ABS_URL` is set. |
@@ -557,6 +558,26 @@ warning and falls back, never failing startup. Example:
 [{"root":"audio-libation","layout":"author/title"},
  {"root":"audio-libro","layout":"author"}]
 ```
+
+`ASR_SERVERS` is a JSON array of `{"name","host","model","role","match"}` objects;
+only `name` is required. `match` is a case-insensitive substring tested against
+both `transcription_jobs.claimed_by` and `run_metrics.runner_host` to attribute
+observed activity to the server (defaults to `name`). `role` is free-form
+(conventionally `primary`/`fallback`) and informational. The Servers dashboard
+page (and the `servers` array in `GET /api/v1/status`) merges this list with
+observed runner activity; an observed runner with no matching entry is still
+shown, marked *unconfigured*. Example:
+
+```json
+[{"name":"desktop-1","host":"192.168.8.10","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary"},
+ {"name":"linux-1","host":"192.168.8.31","model":"nvidia/parakeet-tdt-0.6b-v3","role":"fallback"}]
+```
+
+> **Not routing.** This is observability only. There is no per-runner registry
+> or heartbeat table (§1.4), so an idle-but-online runner is indistinguishable
+> from an offline one — the page reports `idle — last active <t>`, never a false
+> "ready". Routing different job types to specific servers, and primary/fallback
+> selection, would require runner-side changes and a contract amendment.
 
 #### Python ASR runner — NeMo Parakeet-TDT (GPU/ASR host native service)
 
@@ -719,7 +740,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 
 | Method | Path | Auth | Body | Result |
 |--------|------|------|------|--------|
-| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON) |
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone) |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |

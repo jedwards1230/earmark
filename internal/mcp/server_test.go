@@ -125,6 +125,10 @@ func (m *SimpleMockDB) RequeueByDir(_ context.Context, dir string) ([]string, er
 	return []string{dir + "/01.mp3", dir + "/02.mp3"}, nil
 }
 
+func (m *SimpleMockDB) GetServerObservation(_ context.Context) (*db.ServerObservation, error) {
+	return &db.ServerObservation{}, nil
+}
+
 func (m *SimpleMockDB) GetFailedJobs(_ context.Context) ([]db.FailedJob, error) {
 	err := "RuntimeError: CUDA out of memory"
 	runner := "asr-runner-test"

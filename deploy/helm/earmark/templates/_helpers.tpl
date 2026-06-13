@@ -102,6 +102,10 @@ the two Deployments.
 - name: LIBRARY_COLLECTIONS
   value: {{ toJson . | quote }}
 {{- end }}
+{{- with .Values.config.asrServers }}
+- name: ASR_SERVERS
+  value: {{ toJson . | quote }}
+{{- end }}
 - name: METADATA_PROVIDER
   value: {{ .Values.config.metadataProvider | quote }}
 {{- /*
