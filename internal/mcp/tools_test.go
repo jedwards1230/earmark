@@ -135,6 +135,10 @@ func (m *MockDBInterface) GetFailedJobs(context.Context) ([]db.FailedJob, error)
 	return nil, nil
 }
 
+func (m *MockDBInterface) GetServerObservation(context.Context) (*db.ServerObservation, error) {
+	return &db.ServerObservation{}, nil
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

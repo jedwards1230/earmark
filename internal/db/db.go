@@ -1368,6 +1368,114 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 	return q, nil
 }
 
+// ─── Server observation (Servers page) ───────────────────────────────────────
+
+// ServerObservation is the raw, runner-reported activity the Servers page
+// merges with the configured ASR_SERVERS list. It has two independent sources
+// the DB cannot join — claimed_by is written on the job at claim time, while
+// runner_host only appears in run_metrics after the transcript completes — so
+// both are returned and attributed to a configured server by token match in the
+// mcp layer. (There is no per-runner registry/heartbeat table; see CONTRACT
+// §1.4. "Server" state is therefore inferred, never authoritative.)
+type ServerObservation struct {
+	// LiveRunners is one entry per distinct claimed_by that currently holds a
+	// claimed job — the only live-presence signal available (a fresh heartbeat
+	// means transcribing; a stale one means a crashed/wedged runner).
+	LiveRunners []LiveRunner
+	// Hosts is one entry per distinct run_metrics.runner_host — the historical
+	// record of what model/mode each host has actually run, and how much.
+	Hosts []HostMetrics
+}
+
+// LiveRunner is a runner currently holding claimed work, keyed by its free-form
+// claimed_by identity string.
+type LiveRunner struct {
+	ClaimedBy     string
+	ClaimedCount  int
+	LastHeartbeat time.Time
+	CurrentFile   string // most-recently-claimed file_path (the in-flight track)
+}
+
+// HostMetrics aggregates run_metrics for one runner_host: its most-recent model
+// and compute mode, jobs transcribed, last completion, and mean wall-clock.
+type HostMetrics struct {
+	Host                 string
+	ASRModel             *string
+	ComputeType          *string
+	JobsDone             int
+	LastFinished         *time.Time
+	AvgProcessingSeconds *float64
+}
+
+// GetServerObservation returns the live claimed-runner set and the per-host
+// run_metrics aggregates. Both lists are empty (not nil-erroring) on a fresh
+// install. Callers attribute these to configured servers by substring match.
+func (db *DB) GetServerObservation(ctx context.Context) (*ServerObservation, error) {
+	obs := &ServerObservation{}
+
+	// Live runners: one row per claimed_by currently holding claimed work, with
+	// its freshest heartbeat (max updated_at), how many jobs it holds, and the
+	// most-recently-claimed file (the in-flight track).
+	liveRows, err := db.pool.Query(ctx, `
+		SELECT claimed_by,
+		       COUNT(*)        AS claimed_count,
+		       MAX(updated_at) AS last_heartbeat,
+		       (ARRAY_AGG(file_path ORDER BY updated_at DESC))[1] AS current_file
+		FROM transcription_jobs
+		WHERE status = 'claimed' AND claimed_by IS NOT NULL AND claimed_by <> ''
+		GROUP BY claimed_by
+		ORDER BY last_heartbeat DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("live runners query: %w", err)
+	}
+	defer liveRows.Close()
+	for liveRows.Next() {
+		var lr LiveRunner
+		if err := liveRows.Scan(&lr.ClaimedBy, &lr.ClaimedCount, &lr.LastHeartbeat, &lr.CurrentFile); err != nil {
+			return nil, fmt.Errorf("scan live runner: %w", err)
+		}
+		obs.LiveRunners = append(obs.LiveRunners, lr)
+	}
+	if err := liveRows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (live runners): %w", err)
+	}
+
+	// Per-host metrics: latest non-null model/compute mode (by run recency),
+	// jobs transcribed, last completion, mean transcription wall-clock.
+	hostRows, err := db.pool.Query(ctx, `
+		SELECT runner_host,
+		       (ARRAY_AGG(asr_model    ORDER BY updated_at DESC) FILTER (WHERE asr_model    IS NOT NULL))[1] AS asr_model,
+		       (ARRAY_AGG(compute_type ORDER BY updated_at DESC) FILTER (WHERE compute_type IS NOT NULL))[1] AS compute_type,
+		       COUNT(*) AS jobs_done,
+		       MAX(transcribe_finished_at) AS last_finished,
+		       AVG(EXTRACT(EPOCH FROM (transcribe_finished_at - transcribe_started_at)))
+		         FILTER (WHERE transcribe_started_at IS NOT NULL
+		                   AND transcribe_finished_at IS NOT NULL) AS avg_proc
+		FROM run_metrics
+		WHERE runner_host IS NOT NULL AND runner_host <> ''
+		GROUP BY runner_host
+		ORDER BY last_finished DESC NULLS LAST
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("host metrics query: %w", err)
+	}
+	defer hostRows.Close()
+	for hostRows.Next() {
+		var hm HostMetrics
+		if err := hostRows.Scan(&hm.Host, &hm.ASRModel, &hm.ComputeType, &hm.JobsDone,
+			&hm.LastFinished, &hm.AvgProcessingSeconds); err != nil {
+			return nil, fmt.Errorf("scan host metrics: %w", err)
+		}
+		obs.Hosts = append(obs.Hosts, hm)
+	}
+	if err := hostRows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (host metrics): %w", err)
+	}
+
+	return obs, nil
+}
+
 // RecentJob is a lightweight view of a transcription_jobs row for the recent-
 // activity table on the status dashboard. The Metrics-* fields are populated by
 // a LEFT JOIN on run_metrics and are nil when no metrics row exists yet (or for

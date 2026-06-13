@@ -106,6 +106,10 @@ Required: `DATABASE_URL`
 Optional (with defaults): `BOOKS_DIR`, `EMBEDDINGS_BASE_URL`, `EMBEDDINGS_MODEL`,
 `MCP_HTTP_ADDR`, `STALE_JOB_TIMEOUT`, `CHUNK_SIZE`, `DEBUG`.
 
+Optional (no default): `ASR_SERVERS` — JSON array declaring the transcription
+servers for the **Servers** dashboard page (`/servers`). Read-only/observability
+only; does not route work. See `docs/CONTRACT.md §2.4`.
+
 Debug-only (both must be set):
 - `DEBUG_DB_RESET=true`
 - `DEBUG_DB_RESET_CONFIRM=yes-delete-everything`
@@ -120,7 +124,8 @@ Debug-only (both must be set):
 | `internal/mcp` | MCP server + tool handlers — 5 tools: semantic/text search (optional per-book scope + `snippet` excerpt window; text hits labelled "trigram match", not similarity; ASIN-aware `book` resolution — bracketed `[B0…]`/`[digits]` matches ASIN exactly, else title+author substring with ASIN stripped), `list_books` (`format=flat\|tree`; transcribed-first ordering, whole-library summary line, flat omits `dir:`), `get_transcript` (paginates segments), `get_chunk_context` (chunk UUID → neighbours; `contextWindow` default 1). No `browse` tool. Result formatter suppresses the dead `Chapter 0:` label. |
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client (pointed at Ollama) |
-| `internal/config` | Env-var configuration loader |
+| `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry) |
+| `internal/mcp` (servers.go) | **Servers** dashboard page (`/servers`) + `servers[]` in `/api/v1/status`: merges the configured `ASR_SERVERS` list with observed runner activity (live claims + per-host `run_metrics`) into status + a models/modes table. Observability only — no job routing. |
 
 ## Development Notes
 

@@ -60,6 +60,9 @@ type DBInterface interface {
 	RequeueByDir(ctx context.Context, dir string) ([]string, error)
 	// GetFailedJobs returns failed jobs with full triage detail (failures view).
 	GetFailedJobs(ctx context.Context) ([]db.FailedJob, error)
+	// GetServerObservation returns observed runner activity (live claims + per-host
+	// run_metrics) the Servers page merges with the configured ASR_SERVERS list.
+	GetServerObservation(ctx context.Context) (*db.ServerObservation, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

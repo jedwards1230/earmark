@@ -203,6 +203,26 @@
   .seg-text { color: var(--text); }
   .load-more { margin-top: 10px; }
 
+  /* ── servers page ──────────────────────────────────────────────── */
+  .server-card { border-left: 3px solid var(--border); }
+  .server-card.state-running { border-left-color: var(--green); }
+  .server-card.state-stalled { border-left-color: var(--red); }
+  .server-card.state-idle    { border-left-color: var(--blue); }
+  .server-card.state-unknown { border-left-color: var(--muted); }
+  .server-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .server-name { font-weight: 700; font-size: 14px; }
+  .server-state { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; }
+  .server-state.state-running { color: var(--green); }
+  .server-state.state-stalled { color: var(--red); }
+  .server-state.state-idle    { color: var(--blue); }
+  .server-state.state-unknown { color: var(--muted); }
+  .server-sub { color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-word; }
+  .server-host { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .badge.role-primary  { background: #0a2a1a; color: var(--green); }
+  .badge.role-fallback { background: #15233a; color: var(--blue); }
+  .badge.unconfigured  { background: #2a2a1a; color: var(--amber); }
+  .server-note { color: var(--muted); font-size: 11px; line-height: 1.5; margin-top: 16px; max-width: 760px; }
+
   @media (max-width: 560px) {
     main { padding: 14px; }
     .file-name { max-width: 50vw; }
@@ -218,6 +238,7 @@
   <nav class="nav">
     <a href="/" class="{{if eq .Nav "overview"}}active{{end}}">Overview</a>
     <a href="/library" class="{{if eq .Nav "library"}}active{{end}}">Library</a>
+    <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Servers</a>
     <a href="/failed" class="{{if eq .Nav "failed"}}active{{end}}">Failed</a>
   </nav>
 </header>

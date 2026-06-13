@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // errInvalidJSON is returned for any malformed control-request body; the raw
@@ -56,6 +57,23 @@ type apiStatus struct {
 	// Per-run aggregates (run_metrics); null until the runner/worker populate them.
 	AvgProcessingSeconds *float64 `json:"avgProcessingSeconds"`
 	TotalEmbedTokens     *int64   `json:"totalEmbedTokens"`
+	// Servers is the configured-vs-observed transcription-server view (see the
+	// Servers dashboard page). Empty when no servers are configured or observed.
+	Servers []apiServer `json:"servers"`
+}
+
+// apiServer is the JSON shape of one transcription server in GET /api/v1/status.
+// state is a machine token: "transcribing" | "stalled" | "idle" | "not_seen".
+type apiServer struct {
+	Name        string `json:"name"`
+	Host        string `json:"host,omitempty"`
+	Role        string `json:"role,omitempty"`
+	Configured  bool   `json:"configured"`
+	State       string `json:"state"`
+	Model       string `json:"model,omitempty"`
+	ModelSize   string `json:"modelSize,omitempty"`
+	ComputeMode string `json:"computeMode,omitempty"`
+	JobsDone    int    `json:"jobsDone"`
 }
 
 // pauseState is the JSON shape of the pipeline pause endpoints.
@@ -130,6 +148,27 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		hb := stats.LastHeartbeat.UTC().Format("2006-01-02T15:04:05Z07:00")
 		out.LastHeartbeat = &hb
 	}
+
+	// Servers view is supplementary: a query error here logs but does not fail the
+	// whole status response (the counts above are the primary payload).
+	if obs, err := s.db.GetServerObservation(r.Context()); err != nil {
+		s.logger.Error("api status servers error", "error", err)
+	} else {
+		for _, v := range buildServerViews(s.asrServers, obs, time.Now(), s.runnerStaleAfter) {
+			out.Servers = append(out.Servers, apiServer{
+				Name:        v.Name,
+				Host:        v.Host,
+				Role:        v.Role,
+				Configured:  v.Configured,
+				State:       strings.ReplaceAll(strings.ToLower(v.State.Label), " ", "_"),
+				Model:       v.Model,
+				ModelSize:   v.ModelSize,
+				ComputeMode: v.ComputeMode,
+				JobsDone:    v.JobsDone,
+			})
+		}
+	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 

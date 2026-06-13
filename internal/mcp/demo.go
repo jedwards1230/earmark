@@ -114,6 +114,62 @@ func (d demoDB) GetFailedJobs(context.Context) ([]db.FailedJob, error) {
 	}, nil
 }
 
+// demoASRServers is the synthetic ASR_SERVERS registry for the demo: a primary
+// (desktop-1) and a declared fallback (linux-1), so the Servers page shows the
+// configured-vs-observed merge including a configured-but-idle fallback.
+var demoASRServers = []config.ASRServer{
+	{Name: "desktop-1", Host: "192.168.8.10", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "primary"},
+	{Name: "linux-1", Host: "192.168.8.31", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback"},
+}
+
+// GetServerObservation returns synthetic runner activity for the Servers page.
+// active/failed: desktop-1 transcribing, linux-1 idle (fallback), plus an
+// unconfigured host (mini-1, a model with no size token). stale: desktop-1's
+// claim heartbeat is hours old → STALLED. empty: nothing observed, so the
+// configured servers render as NOT SEEN.
+func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, error) {
+	now := time.Now()
+	parakeet := "nvidia/parakeet-tdt-0.6b-v3"
+	bf16, f16, int8 := "bfloat16", "float16", "int8"
+	whisper := "whisper-large-v3"
+	fp := func(v float64) *float64 { return &v }
+	tp := func(t time.Time) *time.Time { return &t }
+	sp := func(s string) *string { return &s }
+
+	switch d.scenario {
+	case "empty":
+		return &db.ServerObservation{}, nil
+	case "stale":
+		return &db.ServerObservation{
+			LiveRunners: []db.LiveRunner{
+				{ClaimedBy: "asr-runner-desktop-1", ClaimedCount: 1, LastHeartbeat: now.Add(-2 * time.Hour),
+					CurrentFile: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]/01 - Chapter 1.mp3"},
+			},
+			Hosts: []db.HostMetrics{
+				{Host: "desktop-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 120,
+					LastFinished: tp(now.Add(-2 * time.Hour)), AvgProcessingSeconds: fp(498.0)},
+			},
+		}, nil
+	default: // active / failed
+		return &db.ServerObservation{
+			LiveRunners: []db.LiveRunner{
+				{ClaimedBy: "asr-runner-desktop-1", ClaimedCount: 1, LastHeartbeat: now.Add(-12 * time.Second),
+					CurrentFile: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]/01 - Chapter 1.mp3"},
+			},
+			Hosts: []db.HostMetrics{
+				{Host: "desktop-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 311,
+					LastFinished: tp(now.Add(-3 * time.Minute)), AvgProcessingSeconds: fp(487.5)},
+				{Host: "linux-1", ASRModel: &parakeet, ComputeType: &f16, JobsDone: 24,
+					LastFinished: tp(now.Add(-6 * time.Hour)), AvgProcessingSeconds: fp(902.0)},
+				// Unconfigured host: not in demoASRServers; whisper-large-v3 has no
+				// param-size token, so the Size column shows an em dash.
+				{Host: "mini-1", ASRModel: &whisper, ComputeType: sp(int8), JobsDone: 5,
+					LastFinished: tp(now.Add(-48 * time.Hour)), AvgProcessingSeconds: fp(1840.0)},
+			},
+		}, nil
+	}
+}
+
 // SetPaused flips the in-memory demo pause flag so the toggle is exercisable.
 func (d demoDB) SetPaused(_ context.Context, paused bool, _ string) error {
 	if d.paused != nil {
@@ -568,6 +624,7 @@ func StartDemoDashboard(addr string) error {
 		// Honor CONTROL_API_TOKEN so the control-API mutations are exercisable
 		// against the demo (otherwise they fail closed with 503).
 		ControlAPIToken: os.Getenv("CONTROL_API_TOKEN"),
+		ASRServers:      demoASRServers,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",

@@ -4,9 +4,11 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/log"
@@ -14,6 +16,36 @@ import (
 )
 
 var logger = log.NewLogger("config")
+
+// ASRServer is one entry in the static ASR_SERVERS registry — the set of
+// transcription servers (Python ASR runners) the operator declares as part of
+// the deployment. The Go service does NOT route work to these (the runner
+// claims jobs itself, FOR UPDATE SKIP LOCKED); the list exists purely so the
+// dashboard can show a configured-but-idle server (e.g. a declared fallback)
+// rather than only servers it has happened to observe in run_metrics.
+//
+// Live status is matched against observed data by Match (a case-insensitive
+// substring tested against both transcription_jobs.claimed_by and
+// run_metrics.runner_host). Match defaults to Name when omitted — e.g. a server
+// named "desktop-1" matches claimed_by "asr-runner-desktop-1" and runner_host
+// "desktop-1".
+type ASRServer struct {
+	Name  string `json:"name"`            // display name, e.g. "desktop-1"
+	Host  string `json:"host,omitempty"`  // host/address (informational), e.g. "192.168.8.10"
+	Model string `json:"model,omitempty"` // expected ASR model, e.g. "nvidia/parakeet-tdt-0.6b-v3"
+	Role  string `json:"role,omitempty"`  // "primary" | "fallback" (free-form; informational)
+	Match string `json:"match,omitempty"` // token matched against claimed_by/runner_host; defaults to Name
+}
+
+// MatchToken is the lower-cased substring used to attribute observed runner
+// activity to this server. Falls back to the (lower-cased) name.
+func (a ASRServer) MatchToken() string {
+	t := a.Match
+	if t == "" {
+		t = a.Name
+	}
+	return strings.ToLower(strings.TrimSpace(t))
+}
 
 // Config holds all runtime configuration for the earmark Go service.
 // Field names mirror the canonical env var names from CONTRACT.md §2.4.
@@ -83,6 +115,15 @@ type Config struct {
 	// Default: "c749dc72-87a0-4889-8714-227eddb25900" (the homelab books library).
 	ABSLibraryID string
 
+	// ASRServers — optional JSON array describing the transcription servers
+	// (ASR runners) declared for this deployment, so the dashboard can show a
+	// configured-but-idle server (e.g. a fallback) instead of only servers it
+	// has observed. Empty → the Servers page lists only observed runners.
+	// Example: [{"name":"desktop-1","host":"192.168.8.10",
+	//            "model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary"}]
+	// This does NOT influence job routing — the runner claims work itself.
+	ASRServers []ASRServer
+
 	// Debug enables verbose structured logging.
 	Debug bool
 
@@ -139,6 +180,18 @@ func LoadConfig() (*Config, error) {
 		cfg.ChunkSize = 512
 	}
 
+	// ASR_SERVERS is best-effort, like LIBRARY_COLLECTIONS: a parse error logs a
+	// warning and degrades to "no configured servers" (the page then lists only
+	// observed runners) rather than blocking startup on a cosmetic list.
+	if raw := strings.TrimSpace(os.Getenv("ASR_SERVERS")); raw != "" {
+		var servers []ASRServer
+		if err := json.Unmarshal([]byte(raw), &servers); err != nil {
+			logger.Warn("ASR_SERVERS is not valid JSON; ignoring", "error", err)
+		} else {
+			cfg.ASRServers = servers
+		}
+	}
+
 	cfg.Debug = parseBoolEnv("DEBUG")
 	cfg.DebugDBReset = parseBoolEnv("DEBUG_DB_RESET")
 
@@ -179,6 +232,7 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("ABS URL", "value", c.ABSURL)
 	logger.Debug("ABS Token", "value", MaskSecret(c.ABSToken))
 	logger.Debug("ABS Library ID", "value", c.ABSLibraryID)
+	logger.Debug("ASR Servers", "count", len(c.ASRServers))
 }
 
 // GetMetadataProvider satisfies metaprovider.providerConfig.
