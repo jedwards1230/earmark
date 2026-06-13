@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jedwards1230/earmark/internal/asr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -177,4 +178,70 @@ func TestLoadConfig_ASRServersInvalidJSONIsIgnored(t *testing.T) {
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	assert.Empty(t, cfg.ASRServers)
+}
+
+func TestLoadConfig_ASRServersBackendDescriptor(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("ASR_SERVERS", `[
+		{"name":"gpu-1","host":"gpu-1","model":"nvidia/parakeet-tdt-0.6b-v3",
+		 "role":"primary","family":"nemo-parakeet","runtime":"nemo-cuda",
+		 "capabilities":{"word_timestamps":true,"context_biasing":false,"diarization":false},
+		 "languages":["en","es","fr"]},
+		{"name":"mac-1","family":"whisper","runtime":"parakeet-mlx"}
+	]`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.ASRServers, 2)
+
+	s0 := cfg.ASRServers[0]
+	assert.Equal(t, "nemo-parakeet", s0.Family)
+	assert.Equal(t, "nemo-cuda", s0.Runtime)
+	assert.Equal(t, asr.Capabilities{
+		asr.CapWordTimestamps: true,
+		asr.CapContextBiasing: false,
+		asr.CapDiarization:    false,
+	}, s0.Capabilities)
+	assert.Equal(t, []string{"en", "es", "fr"}, s0.Languages)
+
+	// A server with no capabilities/languages declared → nil (unknown), not an error.
+	s1 := cfg.ASRServers[1]
+	assert.Equal(t, "whisper", s1.Family)
+	assert.Nil(t, s1.Capabilities)
+	assert.Nil(t, s1.Languages)
+}
+
+func TestLoadConfig_ASRServersDropsUnknownCapabilityKeys(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	// "speaker_count" and "magic" are not in the closed enum — they must be
+	// dropped (warn+drop), leaving only the recognized keys; the server itself
+	// still loads (best-effort, never blocks startup).
+	t.Setenv("ASR_SERVERS", `[
+		{"name":"gpu-1","capabilities":{"word_timestamps":true,"speaker_count":true,"magic":false}}
+	]`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.ASRServers, 1)
+	assert.Equal(t, asr.Capabilities{asr.CapWordTimestamps: true}, cfg.ASRServers[0].Capabilities)
+}
+
+func TestLoadConfig_ASRServersBackCompatNoNewFields(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	// An old ASR_SERVERS value with none of the new fields must keep working
+	// byte-for-byte: new fields default to empty/nil.
+	t.Setenv("ASR_SERVERS", `[{"name":"gpu-1","host":"gpu-1","model":"m","role":"primary"}]`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.ASRServers, 1)
+	s := cfg.ASRServers[0]
+	assert.Equal(t, "gpu-1", s.Name)
+	assert.Empty(t, s.Family)
+	assert.Empty(t, s.Runtime)
+	assert.Nil(t, s.Capabilities)
+	assert.Nil(t, s.Languages)
 }

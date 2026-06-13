@@ -26,6 +26,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 
+	"github.com/jedwards1230/earmark/internal/asr"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
@@ -350,6 +351,15 @@ func (db *DB) initialize(ctx context.Context) error {
 			embed_chunk_count   INT,
 			embed_prompt_tokens INT,
 			embed_total_tokens  INT,
+			-- ASR backend descriptor (CONTRACT §1.5 / §2.13). Runner-owned,
+			-- all nullable, best-effort (SHOULD). Also added to existing tables
+			-- via the ADD COLUMN IF NOT EXISTS migration below.
+			asr_family           TEXT,
+			asr_runtime          TEXT,
+			caps_applied         JSONB,
+			caps_requested       JSONB,
+			caps_skipped_reason  JSONB,
+			mean_word_confidence FLOAT8,
 			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
@@ -431,6 +441,23 @@ func (db *DB) initialize(ctx context.Context) error {
 		END $$;
 	`); err != nil {
 		return fmt.Errorf("file_path dedup migration: %w", err)
+	}
+
+	// ASR backend-descriptor migration (CONTRACT §1.5 / §2.13): add the six
+	// runner-owned columns to an existing run_metrics table. All additive +
+	// nullable, so the existing single NeMo runner that writes none of them keeps
+	// working (columns stay NULL → "unknown"). ADD COLUMN IF NOT EXISTS is a no-op
+	// when the column is already present, so this is safe to run on every boot.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE run_metrics
+			ADD COLUMN IF NOT EXISTS asr_family           TEXT,
+			ADD COLUMN IF NOT EXISTS asr_runtime          TEXT,
+			ADD COLUMN IF NOT EXISTS caps_applied         JSONB,
+			ADD COLUMN IF NOT EXISTS caps_requested       JSONB,
+			ADD COLUMN IF NOT EXISTS caps_skipped_reason  JSONB,
+			ADD COLUMN IF NOT EXISTS mean_word_confidence FLOAT8;
+	`); err != nil {
+		return fmt.Errorf("run_metrics asr-descriptor migration: %w", err)
 	}
 
 	return tx.Commit(ctx)
@@ -1398,6 +1425,12 @@ type LiveRunner struct {
 
 // HostMetrics aggregates run_metrics for one runner_host: its most-recent model
 // and compute mode, jobs transcribed, last completion, and mean wall-clock.
+//
+// The ASR backend-descriptor fields (Family/Runtime/CapsApplied/
+// CapsSkippedReason/MeanWordConfidence, CONTRACT §1.5 / §2.13) surface what the
+// host's most-recent run actually reported. They are runner-written and
+// best-effort, so all are nil/empty until a runner that populates them has run
+// on this host — the Phase-2 dashboard renders nil as "unknown", never an error.
 type HostMetrics struct {
 	Host                 string
 	ASRModel             *string
@@ -1405,6 +1438,20 @@ type HostMetrics struct {
 	JobsDone             int
 	LastFinished         *time.Time
 	AvgProcessingSeconds *float64
+
+	// ASRFamily / ASRRuntime are the most-recent non-null family/runtime ids
+	// reported by a run on this host (free-form strings; see asr.KnownFamily).
+	ASRFamily  *string
+	ASRRuntime *string
+	// CapsApplied / CapsSkippedReason are the capability maps from the host's
+	// most-recent run that reported them. CapsApplied is key→bool (what ran);
+	// CapsSkippedReason is key→reason (why a requested cap was declined). Nil
+	// when no run on this host has reported them.
+	CapsApplied       asr.Capabilities
+	CapsSkippedReason map[string]string
+	// MeanWordConfidence is the most-recent non-null mean per-word confidence
+	// (0–1) reported for this host; nil when the model emits no scores.
+	MeanWordConfidence *float64
 }
 
 // GetServerObservation returns the live claimed-runner set and the per-host
@@ -1442,7 +1489,11 @@ func (db *DB) GetServerObservation(ctx context.Context) (*ServerObservation, err
 	}
 
 	// Per-host metrics: latest non-null model/compute mode (by run recency),
-	// jobs transcribed, last completion, mean transcription wall-clock.
+	// jobs transcribed, last completion, mean transcription wall-clock, plus the
+	// most-recent non-null ASR backend descriptor (family/runtime/applied caps/
+	// skipped reasons/mean confidence — CONTRACT §1.5 / §2.13). The caps_* JSONB
+	// columns use the same "latest non-null" recency pick as model/compute so a
+	// run that didn't report them never blanks an earlier run that did.
 	hostRows, err := db.pool.Query(ctx, `
 		SELECT runner_host,
 		       (ARRAY_AGG(asr_model    ORDER BY updated_at DESC) FILTER (WHERE asr_model    IS NOT NULL))[1] AS asr_model,
@@ -1451,7 +1502,12 @@ func (db *DB) GetServerObservation(ctx context.Context) (*ServerObservation, err
 		       MAX(transcribe_finished_at) AS last_finished,
 		       AVG(EXTRACT(EPOCH FROM (transcribe_finished_at - transcribe_started_at)))
 		         FILTER (WHERE transcribe_started_at IS NOT NULL
-		                   AND transcribe_finished_at IS NOT NULL) AS avg_proc
+		                   AND transcribe_finished_at IS NOT NULL) AS avg_proc,
+		       (ARRAY_AGG(asr_family  ORDER BY updated_at DESC) FILTER (WHERE asr_family  IS NOT NULL))[1] AS asr_family,
+		       (ARRAY_AGG(asr_runtime ORDER BY updated_at DESC) FILTER (WHERE asr_runtime IS NOT NULL))[1] AS asr_runtime,
+		       (ARRAY_AGG(caps_applied        ORDER BY updated_at DESC) FILTER (WHERE caps_applied        IS NOT NULL))[1] AS caps_applied,
+		       (ARRAY_AGG(caps_skipped_reason ORDER BY updated_at DESC) FILTER (WHERE caps_skipped_reason IS NOT NULL))[1] AS caps_skipped_reason,
+		       (ARRAY_AGG(mean_word_confidence ORDER BY updated_at DESC) FILTER (WHERE mean_word_confidence IS NOT NULL))[1] AS mean_word_confidence
 		FROM run_metrics
 		WHERE runner_host IS NOT NULL AND runner_host <> ''
 		GROUP BY runner_host
@@ -1462,10 +1518,34 @@ func (db *DB) GetServerObservation(ctx context.Context) (*ServerObservation, err
 	}
 	defer hostRows.Close()
 	for hostRows.Next() {
-		var hm HostMetrics
+		var (
+			hm                    HostMetrics
+			capsAppliedJSON       []byte
+			capsSkippedReasonJSON []byte
+		)
 		if err := hostRows.Scan(&hm.Host, &hm.ASRModel, &hm.ComputeType, &hm.JobsDone,
-			&hm.LastFinished, &hm.AvgProcessingSeconds); err != nil {
+			&hm.LastFinished, &hm.AvgProcessingSeconds,
+			&hm.ASRFamily, &hm.ASRRuntime,
+			&capsAppliedJSON, &capsSkippedReasonJSON, &hm.MeanWordConfidence); err != nil {
 			return nil, fmt.Errorf("scan host metrics: %w", err)
+		}
+		// caps_* are best-effort runner telemetry: a malformed/legacy value is
+		// dropped (logged) rather than failing the whole observation query.
+		if len(capsAppliedJSON) > 0 {
+			var raw map[string]bool
+			if err := json.Unmarshal(capsAppliedJSON, &raw); err != nil {
+				db.log.Warn("dropping malformed run_metrics.caps_applied", "host", hm.Host, "error", err)
+			} else {
+				hm.CapsApplied = asr.ParseCapabilities(raw, "run_metrics.caps_applied")
+			}
+		}
+		if len(capsSkippedReasonJSON) > 0 {
+			var reasons map[string]string
+			if err := json.Unmarshal(capsSkippedReasonJSON, &reasons); err != nil {
+				db.log.Warn("dropping malformed run_metrics.caps_skipped_reason", "host", hm.Host, "error", err)
+			} else {
+				hm.CapsSkippedReason = filterKnownCapReasons(reasons)
+			}
 		}
 		obs.Hosts = append(obs.Hosts, hm)
 	}
@@ -1474,6 +1554,26 @@ func (db *DB) GetServerObservation(ctx context.Context) (*ServerObservation, err
 	}
 
 	return obs, nil
+}
+
+// filterKnownCapReasons keeps only skipped-reason entries whose key is a known
+// capability (CONTRACT §2.13 closed enum), dropping the rest for forward-compat
+// — the same drop-unknown-keys policy asr.ParseCapabilities applies to bool
+// maps. Returns nil when nothing remains.
+func filterKnownCapReasons(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		if asr.IsKnownCapability(k) {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // RecentJob is a lightweight view of a transcription_jobs row for the recent-

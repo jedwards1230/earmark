@@ -61,12 +61,26 @@ config:
   # Servers dashboard page. Lets a configured-but-idle fallback appear, not just
   # servers already observed. Empty → the page lists only observed runners.
   # Read-only: this does NOT route work — the runner claims jobs itself.
-  # Each entry: {name, host?, model?, role?, match?, gpuArbiterUrl?}; only name is
-  # required. gpuArbiterUrl (a gpu-arbiter /status endpoint) adds live readiness:
-  # ready (GPU free) / busy (GPU held by a game) / offline (host unreachable).
+  # Each entry: {name, host?, model?, role?, match?, gpuArbiterUrl?,
+  #              family?, runtime?, capabilities?{...bool}, languages?[]}; only
+  # name is required. gpuArbiterUrl (a gpu-arbiter /status endpoint) adds live
+  # readiness: ready (GPU free) / busy (GPU held by a game) / offline (host
+  # unreachable). This is pass-through JSON → the ASR_SERVERS env var; no
+  # template logic depends on the fields.
+  # Backend descriptor (CONTRACT §2.13, all optional/back-compat):
+  #   family       — free-form family id, e.g. nemo-parakeet, whisper
+  #   runtime      — free-form runtime id, e.g. nemo-cuda, whisper.cpp-sycl
+  #   capabilities — keys from the closed enum (word_timestamps, context_biasing,
+  #                  diarization, confidence_scores, language_detection) → bool;
+  #                  unknown keys are dropped with a warning
+  #   languages    — ISO-639-1 codes the backend supports (omit = unknown)
   #   asrServers:
-  #     - {name: gpu-1, host: gpu-1, model: nvidia/parakeet-tdt-0.6b-v3, role: primary, gpuArbiterUrl: "http://gpu-1:48750/status"}
-  #     - {name: gpu-2,   host: gpu-2, model: nvidia/parakeet-tdt-0.6b-v3, role: fallback}
+  #     - {name: gpu-1, host: gpu-1, model: nvidia/parakeet-tdt-0.6b-v3, role: primary, gpuArbiterUrl: "http://gpu-1:48750/status",
+  #        family: nemo-parakeet, runtime: nemo-cuda,
+  #        capabilities: {word_timestamps: true, context_biasing: false, diarization: false},
+  #        languages: [en, es, fr, de]}
+  #     - {name: cpu-1, host: cpu-1, role: fallback, family: whisper, runtime: whisper.cpp,
+  #        capabilities: {word_timestamps: true}}
   asrServers: []
 
   # ── Metadata provider (CONTRACT §2.4) ──────────────────────────────────────

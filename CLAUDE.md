@@ -124,7 +124,8 @@ Debug-only (both must be set):
 | `internal/mcp` | MCP server + tool handlers — 5 tools: semantic/text search (optional per-book scope + `snippet` excerpt window; text hits labelled "trigram match", not similarity; ASIN-aware `book` resolution — bracketed `[B0…]`/`[digits]` matches ASIN exactly, else title+author substring with ASIN stripped), `list_books` (`format=flat\|tree`; transcribed-first ordering, whole-library summary line, flat omits `dir:`), `get_transcript` (paginates segments), `get_chunk_context` (chunk UUID → neighbours; `contextWindow` default 1). No `browse` tool. Result formatter suppresses the dead `Chapter 0:` label. |
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client (pointed at Ollama) |
-| `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry) |
+| `internal/asr` | ASR backend capability vocabulary (CONTRACT §2.13): closed capability enum + `ParseCapabilities` (drops unknown keys), recommended `family`/`runtime` ids + `KnownFamily`/`KnownRuntime` label helpers. Pure leaf package (no DB/HTTP deps). |
+| `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry + per-server backend descriptor: family/runtime/capabilities/languages) |
 | `internal/mcp` (servers.go, gpuprobe.go) | **Servers** dashboard page (`/servers`) + `servers[]` in `/api/v1/status`: merges the configured `ASR_SERVERS` list with observed runner activity (live claims + per-host `run_metrics`) and an optional gpu-arbiter readiness probe (per-server `gpuArbiterUrl` → ready/busy/offline) into status + a models/modes table. Observability only — no job routing. |
 
 ## Development Notes

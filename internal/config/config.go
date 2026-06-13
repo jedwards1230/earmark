@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedwards1230/earmark/internal/asr"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/joho/godotenv"
 )
@@ -42,6 +43,26 @@ type ASRServer struct {
 	// busy (the fallback signal); unreachable → offline. Empty → readiness is
 	// inferred from job activity only (idle/not-seen). See internal/mcp/servers.go.
 	GPUArbiterURL string `json:"gpuArbiterUrl,omitempty"`
+
+	// Backend descriptor (CONTRACT §2.13) — all optional, all back-compat. These
+	// declare the *expected* shape of the backend; the runner's run_metrics rows
+	// are the ground truth the dashboard prefers when present (observed > config).
+	//
+	// Family / Runtime are FREE-FORM strings (earmark does not gatekeep which
+	// families/runtimes exist); see asr.KnownFamily for the recommended canonical
+	// ids used only for nicer labels.
+	Family  string `json:"family,omitempty"`  // e.g. "nemo-parakeet", "whisper"
+	Runtime string `json:"runtime,omitempty"` // e.g. "nemo-cuda", "whisper.cpp-sycl"
+
+	// Capabilities is the declared/advertised capability map. Its keys are the
+	// CLOSED asr.* enum (§2.13); unknown keys are dropped with a warning during
+	// LoadConfig (forward-compat). Nil → "unknown" on the dashboard.
+	Capabilities asr.Capabilities `json:"capabilities,omitempty"`
+
+	// Languages is an optional ISO-639-1 code set the backend supports. Omitted →
+	// unknown. Modeled as a string set rather than a boolean capability because
+	// "which languages" is the useful fact (§2.13).
+	Languages []string `json:"languages,omitempty"`
 }
 
 // MatchToken is the lower-cased substring used to attribute observed runner
@@ -52,6 +73,51 @@ func (a ASRServer) MatchToken() string {
 		t = a.Name
 	}
 	return strings.ToLower(strings.TrimSpace(t))
+}
+
+// asrServerJSON is the wire shape of one ASR_SERVERS entry. It mirrors ASRServer
+// but takes capabilities as a raw {string: bool} map so unknown capability keys
+// can be dropped via asr.ParseCapabilities (the closed-enum + forward-compat
+// rule of CONTRACT §2.13) before they reach the typed asr.Capabilities field.
+type asrServerJSON struct {
+	Name          string          `json:"name"`
+	Host          string          `json:"host"`
+	Model         string          `json:"model"`
+	Role          string          `json:"role"`
+	Match         string          `json:"match"`
+	GPUArbiterURL string          `json:"gpuArbiterUrl"`
+	Family        string          `json:"family"`
+	Runtime       string          `json:"runtime"`
+	Capabilities  map[string]bool `json:"capabilities"`
+	Languages     []string        `json:"languages"`
+}
+
+// parseASRServers decodes the ASR_SERVERS JSON array and validates each entry's
+// capability map against the closed asr enum (unknown keys warn+drop). A JSON
+// syntax error is returned to the caller so it can warn-and-degrade; a bad
+// capability key never errors (it is dropped) — best-effort, never blocks startup.
+func parseASRServers(raw string) ([]ASRServer, error) {
+	var wire []asrServerJSON
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+		return nil, err
+	}
+	servers := make([]ASRServer, len(wire))
+	for i, w := range wire {
+		caps := asr.ParseCapabilities(w.Capabilities, "ASR_SERVERS["+w.Name+"].capabilities")
+		servers[i] = ASRServer{
+			Name:          w.Name,
+			Host:          w.Host,
+			Model:         w.Model,
+			Role:          w.Role,
+			Match:         w.Match,
+			GPUArbiterURL: w.GPUArbiterURL,
+			Family:        w.Family,
+			Runtime:       w.Runtime,
+			Capabilities:  caps,
+			Languages:     w.Languages,
+		}
+	}
+	return servers, nil
 }
 
 // Config holds all runtime configuration for the earmark Go service.
@@ -191,8 +257,8 @@ func LoadConfig() (*Config, error) {
 	// warning and degrades to "no configured servers" (the page then lists only
 	// observed runners) rather than blocking startup on a cosmetic list.
 	if raw := strings.TrimSpace(os.Getenv("ASR_SERVERS")); raw != "" {
-		var servers []ASRServer
-		if err := json.Unmarshal([]byte(raw), &servers); err != nil {
+		servers, err := parseASRServers(raw)
+		if err != nil {
 			logger.Warn("ASR_SERVERS is not valid JSON; ignoring", "error", err)
 		} else {
 			cfg.ASRServers = servers
