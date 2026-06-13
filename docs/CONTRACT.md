@@ -310,6 +310,10 @@ CREATE TABLE IF NOT EXISTS run_metrics (
   runner_host TEXT, chunked BOOLEAN, n_windows INT, char_count INT, word_count INT, segment_count INT,
   embed_started_at TIMESTAMPTZ, embed_finished_at TIMESTAMPTZ, embed_model TEXT, embed_chunk_count INT,
   embed_prompt_tokens INT, embed_total_tokens INT,
+  -- ASR backend descriptor (§2.13). All nullable, runner-owned, best-effort.
+  asr_family TEXT, asr_runtime TEXT,
+  caps_applied JSONB, caps_requested JSONB, caps_skipped_reason JSONB,
+  mean_word_confidence FLOAT8,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -317,13 +321,35 @@ CREATE TABLE IF NOT EXISTS run_metrics (
 **All columns are nullable** (except the PK and `created_at`/`updated_at`). Each
 writer UPSERTs via `INSERT … ON CONFLICT (job_id) DO UPDATE SET <its cols>=EXCLUDED…, updated_at=now()`.
 
+The six ASR backend-descriptor columns (`asr_family`, `asr_runtime`,
+`caps_applied`, `caps_requested`, `caps_skipped_reason`, `mean_word_confidence`)
+are **additive and nullable** — added via `ADD COLUMN IF NOT EXISTS` in the Go
+service's schema-init, so an existing prod table gains them with no migration
+ceremony. They are written **only** by the Python ASR runner, and only as a
+**SHOULD** (see below): the existing single NeMo runner that writes none of them
+stays fully contract-compliant — the columns simply stay NULL and the dashboard
+renders them as "unknown", never an error. **This is the back-compat guarantee:
+no breaking change.** Their shapes and the capability vocabulary are defined in
+§2.13.
+
 #### Column ownership (which writer writes which columns)
 
 | Writer | When | Columns it writes |
 |--------|------|-------------------|
 | **Go monitor** | at enqueue (file size from `os.Stat`) | `audio_bytes` |
-| **Python ASR runner** | after transcribing | `audio_channels`, `audio_sample_rate`, `audio_codec`, `audio_format`, `transcribe_started_at`, `transcribe_finished_at`, `asr_model`, `compute_type`, `runner_host`, `chunked`, `n_windows`, `char_count`, `word_count`, `segment_count` |
+| **Python ASR runner** | after transcribing | `audio_channels`, `audio_sample_rate`, `audio_codec`, `audio_format`, `transcribe_started_at`, `transcribe_finished_at`, `asr_model`, `compute_type`, `runner_host`, `chunked`, `n_windows`, `char_count`, `word_count`, `segment_count`; **SHOULD also** `asr_family`, `asr_runtime`, `caps_applied`, `caps_requested`, `caps_skipped_reason`, `mean_word_confidence` (the §2.13 backend descriptor) |
 | **Go embed worker** | after `transcript_chunks` insert | `embed_started_at`, `embed_finished_at`, `embed_model`, `embed_chunk_count`, `embed_prompt_tokens`, `embed_total_tokens` |
+
+The new runner-owned columns join the runner's existing single UPSERT slice — no
+clobber risk, since they are columns no other writer touches. Populating them is
+**SHOULD, not MUST**: a runner that omits them is still compliant (the columns
+stay NULL). When the runner declines a *requested* capability it
+SHOULD record `applied=false` for that key in `caps_applied` and a short
+human-readable reason under the same key in `caps_skipped_reason` — that
+honest-degradation record is the entire point of the backend descriptor (e.g.
+NeMo Parakeet-TDT seeing a bias list but declining boosting because TDT word
+timestamps break under it). `mean_word_confidence` is written only when the model
+emits per-word scores; NULL otherwise.
 
 Rules:
 - Every write is **best-effort** — a `run_metrics` failure MUST NOT fail the
@@ -592,7 +618,15 @@ marked *unconfigured*. Example:
 > primary/fallback selection still require runner-side changes and a contract
 > amendment.
 
-#### Python ASR runner — NeMo Parakeet-TDT (GPU/ASR host native service)
+#### Python ASR runner (any backend — GPU/ASR host native service)
+
+The runner is no longer assumed to be NeMo Parakeet-TDT specifically; earmark
+supports multiple, swappable backends (different model families, runtimes, and
+hosts) reporting into the same `transcription_jobs` / `transcripts` /
+`run_metrics` contract. The variables below are backend-agnostic; the defaults
+preserve the original NeMo-Parakeet behavior, so the existing runner keeps
+working unchanged. The three `ASR_FAMILY` / `ASR_RUNTIME` / `ASR_CAPABILITIES`
+vars are new and **optional** — see §2.13 for the vocabulary.
 
 | Variable | Required | Default / Notes |
 |----------|----------|-----------------|
@@ -601,11 +635,28 @@ marked *unconfigured*. Example:
 | `RUNNER_POLL_INTERVAL_SECONDS` | no | `30` |
 | `RUNNER_HEARTBEAT_SECONDS` | no | `60` |
 | `RUNNER_BUSY_FLAG_PATH` | no | `/tmp/earmark-busy` |
-| `ASR_MODEL` | no | `nvidia/parakeet-tdt-0.6b-v3` (NeMo model id) |
-| `ASR_DIARIZE` | no | `false` (default). Set `true` to run NeMo Sortformer speaker diarization for multi-voice/full-cast titles |
+| `ASR_MODEL` | no | `nvidia/parakeet-tdt-0.6b-v3` (model id; written to `transcripts.model_name` + `run_metrics.asr_model`) |
+| `ASR_FAMILY` | no | Model-family id, e.g. `nemo-parakeet`, `whisper` (§2.13). Free-form-but-conventional. Written to `run_metrics.asr_family`. Unset → NULL ("unknown"). |
+| `ASR_RUNTIME` | no | Runtime id, e.g. `nemo-cuda`, `whisper.cpp-sycl` (§2.13). Free-form-but-conventional. Written to `run_metrics.asr_runtime`. Unset → NULL ("unknown"). |
+| `ASR_CAPABILITIES` | no | JSON map of the runner's **advertised** capabilities (its static truth), keys from the §2.13 closed enum → bool, e.g. `{"word_timestamps":true,"context_biasing":false}`. Defaults per known family. Used for the deferred routing match and as `caps_applied` defaults. Unknown keys are ignored with a warning. |
+| `ASR_DIARIZE` | no | `false` (default). Set `true` to run speaker diarization (e.g. NeMo Sortformer) for multi-voice/full-cast titles. **Global** (per-job diarization is a deferred Phase-3 concern). |
 | `ASR_COMPUTE_TYPE` | no | `bfloat16` (native on RTX 5090 / Blackwell) |
 | `ASR_CHUNK_THRESHOLD_SECONDS` | no | `3600` — single-pass below this duration; chunked/buffered inference above |
 | `BOOKS_MOUNT` | no | `/srv/audiobooks` (NFS export path on the storage host) |
+
+**Breaking changes: none** for the existing runner — every new var is optional
+and the defaults preserve current behavior.
+
+#### Runner result obligation — report applied capabilities (SHOULD)
+
+In the same best-effort `run_metrics` UPSERT it already performs on "mark done",
+the runner **SHOULD** populate the §2.13 backend descriptor for the run:
+`asr_family`, `asr_runtime`, `caps_applied` (what it actually did), and — when it
+*declined* a requested capability — `caps_skipped_reason` (key → short reason),
+plus `mean_word_confidence` when the model emits per-word scores. This is
+**SHOULD, not MUST**: a runner that omits them is still contract-compliant (the
+columns stay NULL → "unknown"). This is the explicit backward-compat carve-out;
+the obligation is additive and introduces no breaking change.
 
 ### 2.5 CNPG Cluster
 
@@ -772,6 +823,84 @@ curl -fsS -X POST https://<host>/api/v1/pipeline/run \
   -H 'Content-Type: application/json' -d '{"limit":1}'
 ```
 
+### 2.13 ASR Backend Capability Vocabulary
+
+earmark supports multiple, swappable ASR backends that vary by **model family**,
+**runtime**, **compute type**, and **host**, and that may or may not support a
+given **capability**. To compare backends honestly (A/B), the data model records
+*which* backend ran and *what capabilities it actually applied* vs what was
+requested. This section defines the shared vocabulary.
+
+#### Capability enum (closed)
+
+These are the **only** valid capability keys. Both the Go service
+(`internal/asr`) and any runner MUST use exactly these strings. Unknown keys are
+**ignored with a warning** (forward-compat — a future earmark release may add
+keys; an older consumer drops what it doesn't recognize rather than erroring).
+
+| Key | Meaning |
+|-----|---------|
+| `word_timestamps` | per-word start/end timestamps in `segments[].words` |
+| `context_biasing` | word-boosting / context biasing from `book_metadata.bias_terms` |
+| `diarization` | speaker labels (`segments[].speaker`, `words[].speaker`) |
+| `confidence_scores` | per-word confidence (`words[].score`) |
+| `language_detection` | auto language id vs a fixed language |
+
+Languages are modeled **separately** as a string set (ISO-639-1 codes), not as a
+boolean capability — "which languages" is the useful fact. (Config carries an
+optional per-server `languages` list; there is no `run_metrics` language-set
+column in Phase 1.)
+
+#### Capability JSON shapes (`run_metrics` columns)
+
+Each is a JSONB object whose keys are drawn from the enum above. All three are
+nullable and runner-written (SHOULD, §2.4):
+
+```jsonc
+// caps_applied — what the runner actually did this run (key → bool)
+{ "word_timestamps": true, "context_biasing": false, "diarization": false, "confidence_scores": false }
+
+// caps_requested — what the job asked for (snapshot, key → bool). In Phase 1 the
+// runner authors this too (it knows it saw bias_terms / ASR_DIARIZE); Phase 3
+// moves authorship to earmark at enqueue time. Omitted keys mean "not requested".
+{ "context_biasing": true, "diarization": false }
+
+// caps_skipped_reason — why a *requested* capability was NOT applied (key →
+// short human-readable reason). Only keys present in caps_requested-but-declined
+// appear here; it drives the dashboard's honest-degradation tooltip.
+{ "context_biasing": "parakeet-tdt timestamps break under boosting" }
+```
+
+`requested && supported && !applied` is a real, recordable outcome (a backend
+that *could* do a thing but declined this run) — that is the difference between
+"this backend ignored my bias list" and "this backend can't do bias lists", and
+both must remain legible after the fact.
+
+#### Recommended `family` / `runtime` ids (open, not enforced)
+
+`family` and `runtime` are **free-form strings**, not a closed enum — a new
+runtime must not require an earmark release. earmark does **not** gatekeep which
+families/runtimes exist; unknown values render verbatim on the dashboard.
+`internal/asr` carries a *recommended* canonical-id set + a `KnownFamily` helper
+purely for nice labels. The table below is the convention runners SHOULD converge
+on so the same backend reports the same id everywhere:
+
+| Axis | Recommended id | Notes |
+|------|----------------|-------|
+| family | `nemo-parakeet` | NVIDIA NeMo Parakeet (TDT/CTC) |
+| family | `nemo-canary` | NVIDIA NeMo Canary (AED — context biasing works) |
+| family | `granite-speech` | IBM Granite Speech |
+| family | `whisper` | OpenAI Whisper / faster-whisper / WhisperX |
+| runtime | `nemo-cuda` | NeMo on CUDA (NVIDIA GPU) |
+| runtime | `parakeet-mlx` | Parakeet on Apple Silicon (MLX) |
+| runtime | `parakeet.cpp` | Parakeet C++ / sherpa-onnx (CPU) |
+| runtime | `whisper.cpp-sycl` | whisper.cpp SYCL (Intel iGPU) |
+| runtime | `whisper.cpp` | whisper.cpp (CPU) |
+| runtime | `openvino` | OpenVINO runtime |
+
+These ids are **recommendations**; a runner may report any string and earmark
+stores/displays it as-is.
+
 ---
 
 ## 3. SCHEMA — pgvector chunks table
@@ -812,6 +941,7 @@ Any change to:
 - An env var name in section 2.4
 - The mcp-proxy upstream key or URL in section 2.2
 - The embedding model or vector dimension in section 2.3
+- The capability enum or the `caps_*` JSON shapes in section 2.13
 
 ...requires updating this file **before** writing implementation code. All
 three repos (earmark Go, homelab-ansible runner, homelab-k8s manifests)
