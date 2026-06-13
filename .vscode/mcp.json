@@ -2,7 +2,7 @@
 	"servers": {
 		"earmark": {
 			"type": "stdio",
-			"command": "/Users/justin/go/bin/earmark",
+			"command": "earmark",
 			"args": [
 				"mcp"
 			]
