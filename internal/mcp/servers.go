@@ -149,8 +149,8 @@ func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, 
 	}
 
 	// Unconfigured live runners: pair with an as-yet-unused host when the host
-	// token sits inside the claimed_by string (e.g. host "desktop-1" ⊂
-	// "asr-runner-desktop-1"), so its model/mode shows too.
+	// token sits inside the claimed_by string (e.g. host "gpu-1" ⊂
+	// "asr-runner-gpu-1"), so its model/mode shows too.
 	for i, lr := range obs.LiveRunners {
 		if liveUsed[i] {
 			continue

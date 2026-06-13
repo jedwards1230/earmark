@@ -3,7 +3,9 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"time"
@@ -12,7 +14,7 @@ import (
 // gpu-arbiter readiness probe.
 //
 // gpu-arbiter (https://github.com/jedwards1230/gpu-arbiter) is a host daemon on
-// the GPU box (desktop-1) that treats the machine as a gaming PC first: when a
+// the GPU box (gpu-1) that treats the machine as a gaming PC first: when a
 // game launches it evicts GPU tenants (Ollama, the ASR runner) and restores
 // them when gaming ends. It serves an unauthenticated LAN /status endpoint.
 //
@@ -27,7 +29,7 @@ import (
 type arbiterStatus struct {
 	Reachable   bool
 	State       string   // "available" | "gaming" | "evicting" | "" (unknown)
-	Claims      []string // why the GPU is claimed, e.g. ["steam:2215200"]
+	Claims      []string // why the GPU is claimed, e.g. ["steam:413150"]
 	ASRRunning  *bool    // asr-runner.service running (nil when no such unit reported)
 	VRAMUsedMB  *int
 	VRAMTotalMB *int
@@ -74,12 +76,23 @@ type probeEntry struct {
 	at     time.Time
 }
 
+// maxProbeBody caps the gpu-arbiter response we read. The real /status payload
+// is well under 1 KB; the cap stops a malicious/buggy endpoint from forcing an
+// unbounded allocation (a huge claims/units array).
+const maxProbeBody = 64 << 10 // 64 KB
+
 func newHTTPGPUProber(timeout, ttl time.Duration) *httpGPUProber {
 	return &httpGPUProber{
-		client: &http.Client{Timeout: timeout},
-		ttl:    ttl,
-		now:    time.Now,
-		cache:  map[string]probeEntry{},
+		client: &http.Client{
+			Timeout: timeout,
+			// Don't follow redirects: a status probe never redirects, and following
+			// one would let a compromised endpoint bounce the request to an internal
+			// target (SSRF). A 3xx then fails the StatusOK check → treated offline.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		ttl:   ttl,
+		now:   time.Now,
+		cache: map[string]probeEntry{},
 	}
 }
 
@@ -99,8 +112,13 @@ func (p *httpGPUProber) Probe(ctx context.Context, url string) arbiterStatus {
 	return st
 }
 
-func (p *httpGPUProber) fetch(ctx context.Context, url string) arbiterStatus {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (p *httpGPUProber) fetch(ctx context.Context, rawURL string) arbiterStatus {
+	// Only http/https — reject file://, gopher://, etc. so a mis- or maliciously
+	// configured gpuArbiterUrl can't be turned into an SSRF/file-read primitive.
+	if u, err := neturl.Parse(rawURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return arbiterStatus{}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return arbiterStatus{}
 	}
@@ -113,7 +131,7 @@ func (p *httpGPUProber) fetch(ctx context.Context, url string) arbiterStatus {
 		return arbiterStatus{}
 	}
 	var raw arbiterRaw
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxProbeBody)).Decode(&raw); err != nil {
 		return arbiterStatus{}
 	}
 	return raw.toStatus()

@@ -40,6 +40,37 @@ func TestHTTPGPUProber_Unreachable(t *testing.T) {
 	}
 }
 
+func TestHTTPGPUProber_RejectsNonHTTPScheme(t *testing.T) {
+	p := newHTTPGPUProber(2*time.Second, time.Minute)
+	for _, u := range []string{"file:///etc/passwd", "gopher://x", "ftp://x/y", "://nope"} {
+		if st := p.Probe(context.Background(), u); st.Reachable {
+			t.Errorf("scheme %q should be rejected (unreachable), got %+v", u, st)
+		}
+	}
+}
+
+func TestHTTPGPUProber_DoesNotFollowRedirect(t *testing.T) {
+	// A redirect must not be followed (SSRF guard): the 3xx fails the 200 check,
+	// so the probe reports unreachable rather than fetching the redirect target.
+	var targetHit int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&targetHit, 1)
+	}))
+	defer target.Close()
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, target.URL, http.StatusFound)
+	}))
+	defer redir.Close()
+
+	p := newHTTPGPUProber(2*time.Second, time.Minute)
+	if st := p.Probe(context.Background(), redir.URL); st.Reachable {
+		t.Errorf("redirect should not be followed → unreachable, got %+v", st)
+	}
+	if atomic.LoadInt32(&targetHit) != 0 {
+		t.Errorf("redirect target must not be hit, got %d hits", targetHit)
+	}
+}
+
 func TestHTTPGPUProber_Non200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

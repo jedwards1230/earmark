@@ -581,8 +581,8 @@ observed activity; an observed runner with no matching entry is still shown,
 marked *unconfigured*. Example:
 
 ```json
-[{"name":"desktop-1","host":"192.168.8.10","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary","gpuArbiterUrl":"http://192.168.8.10:48750/status"},
- {"name":"linux-1","host":"192.168.8.31","model":"nvidia/parakeet-tdt-0.6b-v3","role":"fallback"}]
+[{"name":"gpu-1","host":"gpu-1","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary","gpuArbiterUrl":"http://gpu-1:48750/status"},
+ {"name":"gpu-2","host":"gpu-2","model":"nvidia/parakeet-tdt-0.6b-v3","role":"fallback"}]
 ```
 
 > **Not routing.** This is observability only. earmark does not move work between
