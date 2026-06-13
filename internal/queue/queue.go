@@ -1,7 +1,7 @@
 package queue
 
 import (
-	"github.com/jedwards1230/lil-whisper/internal/meta"
+	"github.com/jedwards1230/earmark/internal/meta"
 	"sync"
 )
 

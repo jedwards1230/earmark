@@ -1,6 +1,6 @@
 # Ingest Deployment — file-watcher + embedding worker.
 #
-# Runs: lil-whisper monitor
+# Runs: earmark monitor
 #   - Walks BOOKS_DIR and enqueues new audio files as transcription_jobs.
 #   - Polls for completed transcripts, chunks them, calls Ollama, stores embeddings.
 #
@@ -9,10 +9,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "lilbro-whisper.ingest.name" . }}
+  name: {{ include "earmark.ingest.name" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: ingest
 spec:
   replicas: 1
@@ -20,31 +20,31 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      {{- include "lilbro-whisper.ingest.selectorLabels" . | nindent 6 }}
+      {{- include "earmark.ingest.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "lilbro-whisper.labels" . | nindent 8 }}
+        {{- include "earmark.labels" . | nindent 8 }}
         app.kubernetes.io/component: ingest
       annotations:
-        {{- include "lilbro-whisper.configChecksum" . | nindent 8 }}
+        {{- include "earmark.configChecksum" . | nindent 8 }}
     spec:
       securityContext:
-        {{- include "lilbro-whisper.podSecurityContext" . | nindent 8 }}
+        {{- include "earmark.podSecurityContext" . | nindent 8 }}
 
       containers:
-        - name: lilbro-whisper-ingest
-          image: "{{ .Values.image.repository }}:{{ include "lilbro-whisper.imageTag" . }}"
+        - name: earmark-ingest
+          image: "{{ .Values.image.repository }}:{{ include "earmark.imageTag" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
 
           # args overrides the Dockerfile CMD — always explicit, never rely on CMD.
           args: ["monitor"]
 
           securityContext:
-            {{- include "lilbro-whisper.containerSecurityContext" . | nindent 12 }}
+            {{- include "earmark.containerSecurityContext" . | nindent 12 }}
 
           env:
-            {{- include "lilbro-whisper.commonEnv" . | nindent 12 }}
+            {{- include "earmark.commonEnv" . | nindent 12 }}
 
           # Liveness: confirm the process is still running.
           # No HTTP port on this pod, so use an exec probe.
@@ -53,7 +53,7 @@ spec:
               command:
                 - pgrep
                 - "-f"
-                - lil-whisper
+                - earmark
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
@@ -62,7 +62,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
 
           volumeMounts:
-            {{- include "lilbro-whisper.volumeMounts" . | nindent 12 }}
+            {{- include "earmark.volumeMounts" . | nindent 12 }}
 
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -74,4 +74,4 @@ spec:
       {{- end }}
 
       volumes:
-        {{- include "lilbro-whisper.volumes" . | nindent 8 }}
+        {{- include "earmark.volumes" . | nindent 8 }}

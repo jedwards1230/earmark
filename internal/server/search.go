@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {

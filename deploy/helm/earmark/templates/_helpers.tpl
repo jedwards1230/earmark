@@ -1,14 +1,14 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "lilbro-whisper.name" -}}
+{{- define "earmark.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Create a default fully qualified app name.
 */}}
-{{- define "lilbro-whisper.fullname" -}}
+{{- define "earmark.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -19,40 +19,40 @@ Create a default fully qualified app name.
 {{/*
 Image tag — defaults to Chart.AppVersion.
 */}}
-{{- define "lilbro-whisper.imageTag" -}}
+{{- define "earmark.imageTag" -}}
 {{- .Values.image.tag | default .Chart.AppVersion }}
 {{- end }}
 
 {{/*
 Common labels (all resources).
 */}}
-{{- define "lilbro-whisper.labels" -}}
+{{- define "earmark.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
-app.kubernetes.io/name: {{ include "lilbro-whisper.name" . }}
+app.kubernetes.io/name: {{ include "earmark.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/part-of: lilbro-whisper-stack
+app.kubernetes.io/part-of: earmark-stack
 {{- end }}
 
 {{/*
 Selector labels shared by BOTH deployments — used by the Service to target mcp pods.
 The Service only routes to mcp pods, so selector must include the component label.
 */}}
-{{- define "lilbro-whisper.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "lilbro-whisper.name" . }}
+{{- define "earmark.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "earmark.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
 MCP component: name, selector labels.
 */}}
-{{- define "lilbro-whisper.mcp.name" -}}
-{{- printf "%s-mcp" (include "lilbro-whisper.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- define "earmark.mcp.name" -}}
+{{- printf "%s-mcp" (include "earmark.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{- define "lilbro-whisper.mcp.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "lilbro-whisper.name" . }}
+{{- define "earmark.mcp.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "earmark.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: mcp-server
 {{- end }}
@@ -60,12 +60,12 @@ app.kubernetes.io/component: mcp-server
 {{/*
 Ingest component: name, selector labels.
 */}}
-{{- define "lilbro-whisper.ingest.name" -}}
-{{- printf "%s-ingest" (include "lilbro-whisper.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- define "earmark.ingest.name" -}}
+{{- printf "%s-ingest" (include "earmark.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{- define "lilbro-whisper.ingest.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "lilbro-whisper.name" . }}
+{{- define "earmark.ingest.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "earmark.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: ingest
 {{- end }}
@@ -74,7 +74,7 @@ app.kubernetes.io/component: ingest
 Config checksum annotation — roll pods when ConfigMap/env config changes.
 Pass the entire .Values.config as the checksum source.
 */}}
-{{- define "lilbro-whisper.configChecksum" -}}
+{{- define "earmark.configChecksum" -}}
 checksum/config: {{ .Values.config | toJson | sha256sum }}
 {{- end }}
 
@@ -82,7 +82,7 @@ checksum/config: {{ .Values.config | toJson | sha256sum }}
 Shared container env block (database + app config) — avoids duplication across
 the two Deployments.
 */}}
-{{- define "lilbro-whisper.commonEnv" -}}
+{{- define "earmark.commonEnv" -}}
 - name: DATABASE_URL
   valueFrom:
     secretKeyRef:
@@ -133,7 +133,7 @@ the two Deployments.
 {{/*
 Shared container securityContext.
 */}}
-{{- define "lilbro-whisper.containerSecurityContext" -}}
+{{- define "earmark.containerSecurityContext" -}}
 runAsNonRoot: true
 runAsUser: 65532
 runAsGroup: 65532
@@ -149,14 +149,14 @@ capabilities:
 {{/*
 Shared pod securityContext.
 */}}
-{{- define "lilbro-whisper.podSecurityContext" -}}
+{{- define "earmark.podSecurityContext" -}}
 fsGroup: 100
 {{- end }}
 
 {{/*
 Shared volumeMounts for both containers.
 */}}
-{{- define "lilbro-whisper.volumeMounts" -}}
+{{- define "earmark.volumeMounts" -}}
 - name: books
   mountPath: {{ .Values.config.booksDir }}
   readOnly: true
@@ -167,7 +167,7 @@ Shared volumeMounts for both containers.
 {{/*
 Shared volumes spec for both pods.
 */}}
-{{- define "lilbro-whisper.volumes" -}}
+{{- define "earmark.volumes" -}}
 - name: books
   persistentVolumeClaim:
     claimName: {{ required "booksPvcName is required" .Values.booksPvcName | quote }}

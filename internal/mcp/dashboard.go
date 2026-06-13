@@ -14,7 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 //go:embed layout.html htmx.min.js

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
 // absItemsFixture returns the JSON body for the library items list, containing

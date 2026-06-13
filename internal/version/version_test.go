@@ -107,7 +107,7 @@ func TestCheckCommitVersion(t *testing.T) {
 	Commit = "abc1234"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lilbro-whisper/commits/main")
+		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/earmark/commits/main")
 
 		commit := GitHubCommit{
 			SHA: "def5678",
@@ -190,7 +190,7 @@ func TestCheckReleaseVersion(t *testing.T) {
 	Version = "1.0.0"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/lilbro-whisper/releases/latest")
+		assert.Contains(t, r.URL.Path, "/repos/jedwards1230/earmark/releases/latest")
 
 		release := GitHubRelease{
 			TagName:     "v1.1.0",
@@ -299,7 +299,7 @@ func TestGetCacheDir(t *testing.T) {
 	cacheDir, err := getCacheDir()
 	require.NoError(t, err)
 
-	expectedDir := filepath.Join(tmpDir, ".cache", "lil-whisper")
+	expectedDir := filepath.Join(tmpDir, ".cache", "earmark")
 	assert.Equal(t, expectedDir, cacheDir)
 
 	info, err := os.Stat(cacheDir)

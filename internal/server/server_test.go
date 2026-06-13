@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 // MockDB implements the database interface for testing

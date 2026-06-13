@@ -1,10 +1,7 @@
 # Database Schema Reference
 
-> **CURRENT SCHEMA — see CONTRACT.md §§1.1, 1.2, 3 for authoritative definitions.**
->
-> The old five-table schema (authors / books / chapters / vectors / transcriptions,
-> VECTOR(1536), OpenAI ada-002) has been replaced. If you have an existing
-> database from that era, drop it and re-run the service to auto-migrate.
+> **See CONTRACT.md §§1.1, 1.2, 1.5, 1.6, and 3 for authoritative definitions.**
+> This document summarises the current schema; CONTRACT.md wins on any discrepancy.
 
 ## Extensions Required
 
@@ -33,11 +30,21 @@ CREATE TABLE transcription_jobs (
     error        TEXT,                   -- last error when status='failed'
     attempts     INTEGER     NOT NULL DEFAULT 0,
 
-    CONSTRAINT transcription_jobs_checksum_unique UNIQUE (checksum)
+    CONSTRAINT transcription_jobs_checksum_unique   UNIQUE (checksum),
+    CONSTRAINT transcription_jobs_file_path_unique  UNIQUE (file_path)   -- one job per file
 );
 
-CREATE INDEX transcription_jobs_status_idx  ON transcription_jobs (status, created_at);
+CREATE INDEX transcription_jobs_status_idx    ON transcription_jobs (status, created_at);
 CREATE INDEX transcription_jobs_file_path_idx ON transcription_jobs (file_path);
+
+-- Auto-update updated_at on any row change
+CREATE OR REPLACE FUNCTION transcription_jobs_set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$;
+CREATE TRIGGER transcription_jobs_updated_at
+    BEFORE UPDATE ON transcription_jobs
+    FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_updated_at();
 ```
 
 Status lifecycle: `pending` → `claimed` → `done` | `failed`.
@@ -58,7 +65,7 @@ CREATE TABLE transcripts (
     speaker_count    INTEGER,               -- NULL when diarization disabled
     segments         JSONB       NOT NULL,  -- []Segment (see CONTRACT §1.2.1)
     raw_text         TEXT        NOT NULL,  -- full transcript, concatenated
-    model_name       TEXT        NOT NULL,  -- e.g. "large-v3"
+    model_name       TEXT        NOT NULL,  -- ASR model id, e.g. "nvidia/parakeet-tdt-0.6b-v3"
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
@@ -150,11 +157,57 @@ CREATE TABLE run_metrics (
 `embed_total_tokens` is the authoritative local tokenizer count;
 `embed_prompt_tokens` is the provider-reported value (NULL when Ollama omits it).
 
+### 5. `runner_control` — Pipeline Gate (CONTRACT §1.3)
+
+Singleton row that gates the Python ASR runner's claim loop. Written by the Go
+service (dashboard + control API); read by the runner at the top of each poll
+cycle. Missing row = not paused / unlimited (safe degraded default).
+
+```sql
+CREATE TABLE IF NOT EXISTS runner_control (
+    id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    paused     BOOLEAN     NOT NULL DEFAULT false,
+    run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by TEXT
+);
+-- Seeded once by the Go service on init:
+INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NOTHING;
+```
+
+- `paused=true` — runner declines all new claims.
+- `run_limit=N` — bounded run: claim at most N more jobs, then stop. `NULL` = unlimited.
+
+### 6. `book_metadata` — Per-book Enrichment (CONTRACT §1.6)
+
+One row per book directory. Written best-effort by the Go monitor at enqueue.
+Read by the Python runner to drive NeMo word-boosting (`bias_terms`). A missing
+row never blocks the pipeline.
+
+```sql
+CREATE TABLE IF NOT EXISTS book_metadata (
+    book_dir   TEXT        NOT NULL PRIMARY KEY,
+    title      TEXT,
+    author     TEXT,
+    narrator   TEXT,
+    series     TEXT,
+    asin       TEXT,
+    chapters   JSONB,
+    bias_terms TEXT[],
+    source     TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`bias_terms` is re-derived from metadata on every write (never COALESCE-guarded).
+
 ## Relationships
 
 ```
 transcription_jobs (1) ←── transcripts (1) ←── transcript_chunks (N)
-                  (1) ←── run_metrics (0..1)
+                   (1) ←── run_metrics (0..1)
+book_metadata      (key: book_dir — filepath.Dir of any file_path in the book)
+runner_control     (singleton, id=1)
 ```
 
 Cascade deletes propagate: deleting a job removes its transcript, all chunks,
@@ -222,6 +275,5 @@ LIMIT $2;
 ---
 
 > **Tombstone**: The old schema (authors / books / chapters / vectors / transcriptions,
-> VECTOR(1536), OpenAI text-embedding-ada-002) was removed when the service was
-> rewritten for the Linux/Postgres/Ollama/WhisperX architecture. Do not reference
-> those table names in new code.
+> VECTOR(1536), OpenAI text-embedding-ada-002) is gone. Do not reference those
+> table names in new code.

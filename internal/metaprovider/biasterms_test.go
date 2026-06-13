@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
 // containsAll reports whether got contains every element of want (order-independent).

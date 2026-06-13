@@ -1,7 +1,7 @@
 package chunker
 
 import (
-	"github.com/jedwards1230/lil-whisper/internal/tokenizer"
+	"github.com/jedwards1230/earmark/internal/tokenizer"
 	"strings"
 )
 

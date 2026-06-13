@@ -1,234 +1,97 @@
-# Startup Process Overview
+# Startup Process
 
-## Command: `./lil-whisper monitor`
+earmark runs as two separate commands in Kubernetes: `earmark monitor` (ingest Deployment) and `earmark mcp` (MCP Deployment). Both share the same binary and the same Postgres database.
 
-This document outlines the step-by-step process that occurs when the transcription service starts up.
+---
 
-## Initialization Sequence
+## `earmark monitor`
 
-### 1. Configuration Loading
-**File**: `cmd/monitor/monitor.go:30`
-```go
-cfg, err := config.LoadConfig()
-```
+Runs the file watcher and embed worker together.
 
-**Process**:
-- Loads configuration from environment variables and `.env` file
-- Validates required settings (database, OpenAI API key, directories)
-- Sets default values for optional parameters
-- Prints environment variables for verification
+### 1. Config loading
 
-**Key Settings Loaded**:
-- Database connection parameters
-- OpenAI API configuration
-- Audio and cache directory paths
-- Processing parameters (chunk size, similarity thresholds)
+`config.LoadConfig()` reads all env vars. `DATABASE_URL` is required; startup fails immediately if it is absent. Optional vars (`BOOKS_DIR`, `EMBEDDINGS_BASE_URL`, `EMBEDDINGS_MODEL`, `CHUNK_SIZE`, `STALE_JOB_TIMEOUT`, etc.) fall back to documented defaults.
 
-### 2. Database Connection & Initialization
-**File**: `cmd/monitor/monitor.go:37-48`
-```go
-database, err := db.New(cfg)
-```
+### 2. DB connection and schema init
 
-**Process**:
-- Establishes PostgreSQL connection using configuration
-- Initializes database schema if needed:
-  - Creates tables: `authors`, `books`, `chapters`, `vectors`, `transcriptions`
-  - Sets up pgvector extension for similarity search
-  - Creates indexes for performance optimization
-- Optionally performs destructive debug reset if `cfg.DebugDBReset` is true:
-  - ⚠️ **WARNING**: Deletes ALL database tables and transcription text files
-  - Clears `OutputDir/raw/` and `OutputDir/corrected/` directories
-  - Reinitializes database schema from scratch
+Opens a `pgxpool.Pool` to the CNPG read-write endpoint (`earmark-pg-rw.earmark:5432`). On first connect, a schema-init transaction runs:
 
-### 3. Core Component Initialization
-**File**: `cmd/monitor/monitor.go:50-52`
+- `CREATE EXTENSION IF NOT EXISTS vector` and `pg_trgm`
+- `CREATE TABLE IF NOT EXISTS transcription_jobs` (with status check constraint, unique indexes, `updated_at` trigger)
+- `CREATE TABLE IF NOT EXISTS transcripts` (with trgm GIN index on `raw_text`)
+- `CREATE TABLE IF NOT EXISTS transcript_chunks` (`VECTOR(768)`, HNSW index)
+- `CREATE TABLE IF NOT EXISTS run_metrics` (additive telemetry; never blocks the pipeline)
+- `CREATE TABLE IF NOT EXISTS book_metadata` (additive enrichment)
+- `CREATE TABLE IF NOT EXISTS runner_control` + `INSERT … ON CONFLICT DO NOTHING` to seed the singleton pause/run-limit row
 
-#### Work Queue Creation
-```go
-workQueue := queue.NewQueue()
-```
-- Creates in-memory FIFO queue for processing coordination
-- Thread-safe with mutex protection
+Schema init is idempotent — safe on every restart.
 
-#### File Monitor Setup
-```go
-fileMonitor := monitor.NewFileMonitor(cfg, workQueue, database)
-```
-- Initializes filesystem monitoring component
-- Links to work queue and database
-- Prepares for directory scanning and fsnotify watching
+### 3. Monitor goroutine
 
-#### Worker Initialization  
-```go
-worker := worker.NewWorker(workQueue, database)
-```
-- Creates background processing worker
-- Links to work queue for job consumption
-- Initializes transcription and storage capabilities
+Walks `BOOKS_DIR` to discover audio files. For each file not already in `transcription_jobs` (dedup by SHA-256 checksum):
 
-### 4. File Monitor Startup (Sequential)
-**File**: `cmd/monitor/monitor.go:54-61`
-```go
-go func() {
-    fileMonitor.Start(monitorReady)
-}()
-<-monitorReady  // Wait for completion
-```
+- Computes checksum
+- Calls `MetadataProvider.Lookup` to derive title/author/bias_terms and upserts `book_metadata` (best-effort; failure does not block enqueue)
+- UPSERTs a `pending` row into `transcription_jobs`
+- UPSERTs a `run_metrics` row with `audio_bytes` (from `os.Stat`)
 
-**Monitor Startup Process** (`internal/monitor/monitor.go:352`):
+After the initial walk, the monitor enters a poll/watch loop for new files.
 
-#### 4.1 Chunk Size Verification
-- Checks existing database chunks against current configuration
-- Identifies books with mismatched chunk sizes
-- Deletes old chunks and re-queues chapters for reprocessing
-- Logs reprocessing statistics
+### 4. Stale-job recovery goroutine
 
-#### 4.2 Library Statistics Collection
-- Walks audio directory to count books and files
-- Queries database for processing statistics
-- Logs comprehensive library overview:
-  - Total books and audio files discovered
-  - Books and chapters already processed
-  - Books queued for reprocessing
+A background goroutine runs on a ticker (period: `STALE_JOB_TIMEOUT`, default `30m`). It resets `claimed` jobs whose `updated_at` is older than the timeout back to `pending` (if `attempts < 3`) or marks them `failed` (if `attempts >= 3`). This recovers jobs from a crashed ASR runner without any manual intervention.
 
-#### 4.3 Orphaned File Detection
-- Scans for audio files without corresponding metadata.json
-- Warns about files that cannot be properly processed
-- Helps identify incomplete book imports
+### 5. Worker goroutine
 
-#### 4.4 Initial Book Scanning
-- Walks directory tree looking for `metadata.json` files
-- For each metadata file:
-  - Parses book metadata (author, title, ISBN, ASIN, chapters)
-  - Finds associated audio files in same directory
-  - Matches audio files to chapter information
-  - Checks processing status in database
-  - Enqueues new/unprocessed files to work queue
+Polls `transcripts` for rows whose `job_id` has no corresponding `transcript_chunks`. For each:
 
-#### 4.5 Filesystem Watcher Setup
-- Creates fsnotify watcher for real-time monitoring
-- Recursively adds all subdirectories to watch list
-- Begins monitoring for new file creation events
+1. Reads the `segments` JSONB column
+2. Chunks segments into ~512-token windows (64-token overlap) via `internal/chunker`
+3. Calls Ollama (`nomic-embed-text`, 768-dim) via the OpenAI-compatible embeddings API at `EMBEDDINGS_BASE_URL`
+4. Bulk-inserts `transcript_chunks` rows
+5. UPSERTs `run_metrics` embed columns (best-effort)
 
-**Ready Signal**: Monitor signals completion and service proceeds
+The worker does **no transcription** — it only processes transcripts already written by the external Python ASR runner.
 
-### 5. Worker Startup (Concurrent)
-**File**: `cmd/monitor/monitor.go:64-69`
-```go
-go func() {
-    defer wg.Done()
-    worker.Start(cfg)
-}()
-```
+### 6. Signal handling
 
-**Worker Process** (`internal/worker/worker.go:41`):
-- Begins continuous loop checking work queue
-- For each queued item:
-  1. **Transcription Check**: Verifies if current transcription exists and is up-to-date
-  2. **Audio Transcription**: Uses Yap for local speech recognition if needed
-  3. **Text Processing**: Chunks transcription text for embedding generation
-  4. **Embedding Generation**: Calls OpenAI API to create vector embeddings
-  5. **Database Storage**: Stores raw transcription and vector chunks
-  6. **Progress Logging**: Reports completion status and timing
+`SIGINT`/`SIGTERM` triggers a graceful shutdown: the monitor and worker goroutines drain, the DB pool closes, the process exits cleanly.
 
-### 6. HTTP Server (Separate Command)
-**Note**: The HTTP server is started separately using `./lil-whisper serve`
+---
 
-**File**: `cmd/serve/serve.go:30-40`
-```go
-srv := server.NewServer(database, cfg)
-httpServer := srv.Start()
-```
+## `earmark mcp`
 
-**Server Process** (`internal/server/server.go:33`):
-- Creates HTTP server on port 8080
-- Sets up `/search` endpoint for semantic search queries
-- Begins accepting search requests
-- Logs server readiness with access URL
+Runs the MCP HTTP server and status dashboard.
 
-### 7. Signal Handling Setup
-**File**: `cmd/monitor/monitor.go:75-78`
-```go
-sigChan := make(chan os.Signal, 1)
-signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-<-sigChan  // Wait for shutdown signal
-```
+### 1. Config loading
 
-- Configures graceful shutdown on SIGINT/SIGTERM
-- Service runs indefinitely until signal received
+Same `config.LoadConfig()`. `DATABASE_URL` is required.
 
-## Operational State
+### 2. DB connection
 
-### Running Services
-Once startup completes, the following services run concurrently:
+Same `pgxpool.Pool` open; same idempotent schema init (safe to run on both pods).
 
-1. **File Monitor**: 
-   - Watches for new audio files
-   - Automatically enqueues new content for processing
+### 3. HTTP server
 
-2. **Worker**: 
-   - Continuously processes queued audio files
-   - Performs transcription, chunking, and embedding generation
-   - Updates database with results
+Listens on `MCP_HTTP_ADDR` (default `:8081`). Serves:
 
-3. **HTTP Server**: 
-   - Start separately with `./lil-whisper serve`
-   - Accepts search queries on http://localhost:8080/search
-   - Performs vector similarity search against processed content
-   - Returns ranked results with metadata
+- `/mcp` — streamable-HTTP MCP transport (5 tools: `list_books`, `semantic_search_audiobooks`, `text_search_audiobooks`, `get_transcript`, `get_chunk_context`)
+- `/` — htmx status dashboard (auto-refreshes `/status/data` fragment every 3 s)
+- `/api/v1/*` — JSON control API (pause/resume/run-N; mutating endpoints require `Authorization: Bearer $CONTROL_API_TOKEN`)
+- `/actions/*` — htmx-guarded dashboard actions (requeue, retry-failed)
 
-Note: Services are now split into separate commands - use `./lil-whisper monitor` for file monitoring and transcription, and `./lil-whisper serve` for the HTTP API server.
+### 4. Signal handling
 
-### Processing Pipeline
-When new audio files are detected:
-```
-[New Audio File] → [Monitor Detects] → [Queue Enqueue] → [Worker Dequeue] 
-    → [Transcribe] → [Chunk Text] → [Generate Embeddings] → [Store in DB]
-```
+`SIGINT`/`SIGTERM` triggers an HTTP graceful shutdown (30 s timeout for in-flight requests), then closes the DB pool.
 
-## Shutdown Process
-**File**: `cmd/monitor/monitor.go:80-102`
+---
 
-When shutdown signal received (monitor command):
-1. **Service Shutdown**: Stop monitor and worker
-2. **Wait for Completion**: All goroutines finish processing
-3. **Database Cleanup**: Close database connections
-4. **Exit**: Clean service termination
+## Startup failure modes
 
-When shutdown signal received (serve command):
-1. **HTTP Graceful Shutdown**: 30-second timeout for in-flight requests  
-2. **Database Cleanup**: Close database connections
-3. **Exit**: Clean service termination
-
-## Error Handling
-
-### Startup Failures
-- **Configuration errors**: Service exits immediately with error message
-- **Database connection failures**: Service exits with connection details
-- **Directory access issues**: Monitor logs warnings but continues
-- **Missing dependencies**: Transcriber validates Yap availability
-
-### Runtime Resilience
-- **Transcription failures**: Logged but don't stop service
-- **Database errors**: Retried with exponential backoff
-- **Queue overflow**: Additional items wait until space available
-- **API failures**: OpenAI errors logged, processing continues for other files
-
-## Performance Characteristics
-
-### Startup Time
-- **Small libraries** (< 100 files): 1-5 seconds
-- **Large libraries** (> 1000 files): 30-60 seconds for initial scan
-- **Cold start**: Additional time for database schema creation
-
-### Resource Usage
-- **Memory**: Scales with queue size and concurrent processing
-- **CPU**: Intensive during transcription and embedding generation  
-- **Disk**: Temporary files created during transcription
-- **Network**: OpenAI API calls for embedding generation
-
-### Throughput
-- **Transcription**: Depends on audio length and hardware
-- **Processing**: Limited by OpenAI API rate limits
-- **Search**: Sub-second response times for vector queries
+| Condition | Behavior |
+|-----------|----------|
+| `DATABASE_URL` missing | Immediate fatal exit |
+| DB unreachable | Fatal exit with connection error |
+| `BOOKS_DIR` unreadable | Monitor logs a warning; enqueue loop skips (service stays up) |
+| Ollama unreachable | Worker logs per-job errors and retries on the next poll cycle |
+| `book_metadata` / `run_metrics` write failure | Logged and skipped; never blocks enqueue or embed |

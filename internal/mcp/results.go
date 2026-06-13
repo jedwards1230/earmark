@@ -1,6 +1,6 @@
 package mcp
 
-import "github.com/jedwards1230/lil-whisper/internal/db"
+import "github.com/jedwards1230/earmark/internal/db"
 
 // This file defines the structured-output payloads for the MCP tools. Each tool
 // returns BOTH a human-readable text rendering (the long-standing format, kept as

@@ -3,7 +3,7 @@ package metaprovider_test
 import (
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
 // fakeConfig is a minimal providerConfig implementation for factory tests.

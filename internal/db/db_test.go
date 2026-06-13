@@ -11,7 +11,7 @@ import (
 	"github.com/pashagolub/pgxmock/v4"
 	"github.com/pgvector/pgvector-go"
 
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
 // scanResultColumns are the 9 columns SELECTed by findSimilar / TextSearch /

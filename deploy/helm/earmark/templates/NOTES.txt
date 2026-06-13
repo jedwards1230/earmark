@@ -1,14 +1,14 @@
-lilbro-whisper deployed successfully.
+earmark deployed successfully.
 
 ━━━ MCP server ────────────────────────────────────────────────────────────────
-In-cluster:  http://{{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp
+In-cluster:  http://{{ include "earmark.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp
 {{- if .Values.ingress.enabled }}
 External:    https://{{ .Values.ingress.host }}/mcp
 {{- end }}
 
 Add to mcp-proxy configmap:
   "audiobooks": {
-    "url": "http://{{ include "lilbro-whisper.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp",
+    "url": "http://{{ include "earmark.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}/mcp",
     "transportType": "streamable-http"
   }
 
@@ -17,7 +17,7 @@ Liveness:   GET :{{ .Values.service.port }}/health  → 200 "ok"
 Readiness:  GET :{{ .Values.service.port }}/readyz  → 200 if DB ping ok, 503 otherwise
 
 ━━━ Pod status ────────────────────────────────────────────────────────────────
-kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "lilbro-whisper.name" . }}
+kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "earmark.name" . }}
 
 # Watch just the mcp server:
 kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=mcp-server
@@ -35,7 +35,7 @@ kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=inge
 {{- end }}
   - PVC "{{ .Values.booksPvcName }}" (ReadOnlyMany, bound to your NFS books export)
 {{- if .Values.cnpg.enabled }}
-  ✓ CNPG Cluster "lilbro-whisper-pg" will be created by this chart (CNPG operator required)
+  ✓ CNPG Cluster "earmark-pg" will be created by this chart (CNPG operator required)
 {{- end }}
 
 ━━━ Image note ────────────────────────────────────────────────────────────────

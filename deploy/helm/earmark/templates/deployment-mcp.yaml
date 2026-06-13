@@ -1,16 +1,16 @@
 # MCP HTTP server Deployment.
 #
-# Runs: lil-whisper mcp (with MCP_TRANSPORT=http)
+# Runs: earmark mcp (with MCP_TRANSPORT=http)
 # Exposes: :8081/mcp    (MCP protocol)
 #          :8081/health (liveness — no deps)
 #          :8081/readyz (readiness — DB ping)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "lilbro-whisper.mcp.name" . }}
+  name: {{ include "earmark.mcp.name" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: mcp-server
 spec:
   replicas: {{ .Values.mcp.replicaCount }}
@@ -18,28 +18,28 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      {{- include "lilbro-whisper.mcp.selectorLabels" . | nindent 6 }}
+      {{- include "earmark.mcp.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "lilbro-whisper.labels" . | nindent 8 }}
+        {{- include "earmark.labels" . | nindent 8 }}
         app.kubernetes.io/component: mcp-server
       annotations:
-        {{- include "lilbro-whisper.configChecksum" . | nindent 8 }}
+        {{- include "earmark.configChecksum" . | nindent 8 }}
     spec:
       securityContext:
-        {{- include "lilbro-whisper.podSecurityContext" . | nindent 8 }}
+        {{- include "earmark.podSecurityContext" . | nindent 8 }}
 
       containers:
-        - name: lilbro-whisper-mcp
-          image: "{{ .Values.image.repository }}:{{ include "lilbro-whisper.imageTag" . }}"
+        - name: earmark-mcp
+          image: "{{ .Values.image.repository }}:{{ include "earmark.imageTag" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
 
           # args overrides the Dockerfile CMD — always explicit, never rely on CMD.
           args: ["mcp"]
 
           securityContext:
-            {{- include "lilbro-whisper.containerSecurityContext" . | nindent 12 }}
+            {{- include "earmark.containerSecurityContext" . | nindent 12 }}
 
           ports:
             - name: http
@@ -47,7 +47,7 @@ spec:
               protocol: TCP
 
           env:
-            {{- include "lilbro-whisper.commonEnv" . | nindent 12 }}
+            {{- include "earmark.commonEnv" . | nindent 12 }}
             - name: MCP_TRANSPORT
               value: "http"
             - name: MCP_HTTP_ADDR
@@ -90,7 +90,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
 
           volumeMounts:
-            {{- include "lilbro-whisper.volumeMounts" . | nindent 12 }}
+            {{- include "earmark.volumeMounts" . | nindent 12 }}
 
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -102,4 +102,4 @@ spec:
       {{- end }}
 
       volumes:
-        {{- include "lilbro-whisper.volumes" . | nindent 8 }}
+        {{- include "earmark.volumes" . | nindent 8 }}

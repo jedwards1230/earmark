@@ -8,8 +8,8 @@ cache/
 
 coverage.out
 
-lil-whisper
-lil-whisper-*
+/earmark
+/earmark-*
 test-build
 dist/
 coverage.html

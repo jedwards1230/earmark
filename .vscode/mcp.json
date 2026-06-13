@@ -1,8 +1,8 @@
 {
 	"servers": {
-		"lil-whisper": {
+		"earmark": {
 			"type": "stdio",
-			"command": "/Users/justin/go/bin/lil-whisper",
+			"command": "/Users/justin/go/bin/earmark",
 			"args": [
 				"mcp"
 			]

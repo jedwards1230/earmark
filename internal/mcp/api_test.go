@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/earmark/internal/config"
 )
 
 const testToken = "s3cr3t-control-token"

@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/jedwards1230/lilbro-whisper
+  repository: ghcr.io/jedwards1230/earmark
   # tag defaults to Chart.appVersion when unset
   tag: ""
   pullPolicy: IfNotPresent
@@ -28,7 +28,7 @@ ingress:
 # The chart references this secret by name; it does not create it.
 databaseSecret:
   # Name of the K8s Secret that holds the DATABASE_URL key.
-  name: lilbro-whisper-pg-credentials
+  name: earmark-pg-credentials
   # Key within the secret that contains the PostgreSQL DSN.
   key: DATABASE_URL
 
@@ -122,7 +122,7 @@ secrets:
 
   # DB credentials for the CNPG cluster (CONTRACT §2.5)
   dbCredentials:
-    itemPath: "vaults/example/items/lilbro-whisper-pg-credentials"
+    itemPath: "vaults/example/items/earmark-pg-credentials"
 
   # Shared Garage S3 secret for CNPG backups (CONTRACT §2.5)
   garageSecret:
@@ -135,7 +135,7 @@ secrets:
   # mutating control endpoints then fail closed (503). `key` is the field label in
   # the 1Password item that holds the token.
   controlApiToken:
-    name: lilbro-whisper-control-api
+    name: earmark-control-api
     key: API_TOKEN
     itemPath: ""
 
@@ -144,6 +144,6 @@ secrets:
   # Leave itemPath empty to omit it — the metadata factory then falls back to the
   # path provider. `key` is the field label in the 1Password item holding the token.
   absToken:
-    name: lilbro-whisper-abs
+    name: earmark-abs
     key: api_token
     itemPath: ""

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/library"
-	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/earmark/internal/library"
+	"github.com/jedwards1230/earmark/internal/log"
 )
 
 // absMetadata is the metadata block returned by the ABS /api/items/{id} endpoint

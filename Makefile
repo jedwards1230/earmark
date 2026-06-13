@@ -1,8 +1,8 @@
 # =============================================================================
-# Makefile for lil-whisper
+# Makefile for earmark
 # =============================================================================
 #
-# Common development tasks. lil-whisper is a Linux Go service (no native deps);
+# Common development tasks. earmark is a Linux Go service (no native deps);
 # it builds and runs anywhere Go does.
 #
 #   make           - Build the binary (default)
@@ -15,7 +15,7 @@
 
 .DEFAULT_GOAL := build
 
-MODULE_PATH := github.com/jedwards1230/lil-whisper
+MODULE_PATH := github.com/jedwards1230/earmark
 VERSION     ?= dev
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME  := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -33,9 +33,9 @@ LDFLAGS := -X '$(MODULE_PATH)/internal/version.Version=$(VERSION)' \
 # Build the main binary (default target).
 .PHONY: build
 build:
-	@echo "🔨 Building lil-whisper ($(VERSION), $(COMMIT))..."
-	go build -ldflags "$(LDFLAGS)" -o lil-whisper .
-	@echo "✅ Build complete: ./lil-whisper"
+	@echo "🔨 Building earmark ($(VERSION), $(COMMIT))..."
+	go build -ldflags "$(LDFLAGS)" -o earmark .
+	@echo "✅ Build complete: ./earmark"
 
 # Build a release binary; VERSION must be set explicitly.
 .PHONY: release
@@ -44,8 +44,8 @@ release:
 		echo "❌ VERSION must be set: make release VERSION=v1.0.0"; exit 1; \
 	fi
 	@echo "🚀 Building release $(VERSION)..."
-	go build -ldflags "$(LDFLAGS)" -o lil-whisper .
-	@echo "✅ Release build complete: ./lil-whisper"
+	go build -ldflags "$(LDFLAGS)" -o earmark .
+	@echo "✅ Release build complete: ./earmark"
 
 # Build the container image (matches the Dockerfile target arch).
 .PHONY: docker
@@ -54,7 +54,7 @@ docker:
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t lil-whisper:$(VERSION) .
+		-t earmark:$(VERSION) .
 
 # =============================================================================
 # Run
@@ -114,13 +114,13 @@ check: fmt vet lint test
 .PHONY: install
 install: build
 	@echo "📦 Installing to /usr/local/bin (requires sudo)..."
-	sudo cp lil-whisper /usr/local/bin/
+	sudo cp earmark /usr/local/bin/
 	@echo "✅ Installed."
 
 .PHONY: clean
 clean:
 	@echo "🧹 Cleaning build artifacts..."
-	rm -f lil-whisper coverage.out coverage.html
+	rm -f earmark coverage.out coverage.html
 	rm -rf dist/
 	@echo "✅ Clean complete."
 
@@ -134,7 +134,7 @@ version:
 
 .PHONY: help
 help:
-	@echo "🛠️  lil-whisper Makefile"
+	@echo "🛠️  earmark Makefile"
 	@echo "============================================================"
 	@echo "BUILD:"
 	@echo "  make build        - Build the binary (default)"

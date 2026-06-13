@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/version"
+	"github.com/jedwards1230/earmark/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -14,7 +14,7 @@ var VersionCmd = &cobra.Command{
 	Use:                "version",
 	Short:              "Show version information",
 	DisableFlagParsing: true,
-	Long: `Show version information for lil-whisper including version, commit hash, 
+	Long: `Show version information for earmark including version, commit hash, 
 build time, and Go version.
 
 Options:
@@ -23,13 +23,13 @@ Options:
 
 Examples:
   # Show version information
-  lil-whisper version
+  earmark version
 
   # Check for updates
-  lil-whisper version --check
+  earmark version --check
 
   # Force fresh update check
-  lil-whisper version --check --no-cache`,
+  earmark version --check --no-cache`,
 	Run: runVersion,
 }
 
@@ -45,8 +45,8 @@ func runVersion(cmd *cobra.Command, args []string) {
 		case "--no-cache":
 			noCache = true
 		case "--help", "-h":
-			fmt.Fprintf(os.Stderr, "Usage: lil-whisper version [options]\n")
-			fmt.Fprintf(os.Stderr, "Show version information for lil-whisper.\n\n")
+			fmt.Fprintf(os.Stderr, "Usage: earmark version [options]\n")
+			fmt.Fprintf(os.Stderr, "Show version information for earmark.\n\n")
 			fmt.Fprintf(os.Stderr, "Options:\n")
 			fmt.Fprintf(os.Stderr, "  --check     Check for available updates\n")
 			fmt.Fprintf(os.Stderr, "  --no-cache  Skip cache and force fresh update check\n")
@@ -79,7 +79,7 @@ func runVersion(cmd *cobra.Command, args []string) {
 				fmt.Printf("Latest commit: %s\n", result.LatestCommit[:7])
 			}
 
-			fmt.Printf("\nRun 'lil-whisper update' to update.\n")
+			fmt.Printf("\nRun 'earmark update' to update.\n")
 		} else {
 			fmt.Printf("\n✅ You are running the latest version.\n")
 		}

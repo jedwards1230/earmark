@@ -13,17 +13,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/auth"
-	"github.com/jedwards1230/lil-whisper/internal/build"
-	"github.com/jedwards1230/lil-whisper/internal/version"
+	"github.com/jedwards1230/earmark/internal/auth"
+	"github.com/jedwards1230/earmark/internal/build"
+	"github.com/jedwards1230/earmark/internal/version"
 	"github.com/spf13/cobra"
 )
 
 var UpdateCmd = &cobra.Command{
 	Use:                "update",
-	Short:              "Update lil-whisper to the latest version",
+	Short:              "Update earmark to the latest version",
 	DisableFlagParsing: true,
-	Long: `Update lil-whisper to the latest version from GitHub.
+	Long: `Update earmark to the latest version from GitHub.
 
 This command checks for updates and downloads the latest version, either from
 GitHub releases (when available) or by rebuilding from source.
@@ -35,13 +35,13 @@ Options:
 
 Examples:
   # Check and update if newer version is available
-  lil-whisper update
+  earmark update
 
   # Only check for updates
-  lil-whisper update --check
+  earmark update --check
 
   # Force update without prompts
-  lil-whisper update --force --yes`,
+  earmark update --force --yes`,
 	Run: runUpdate,
 }
 
@@ -63,8 +63,8 @@ func runUpdate(cmd *cobra.Command, args []string) {
 		case "--debug":
 			debug = true
 		case "--help", "-h":
-			fmt.Fprintf(os.Stderr, "Usage: lil-whisper update [options]\n")
-			fmt.Fprintf(os.Stderr, "Update lil-whisper to the latest version.\n\n")
+			fmt.Fprintf(os.Stderr, "Usage: earmark update [options]\n")
+			fmt.Fprintf(os.Stderr, "Update earmark to the latest version.\n\n")
 			fmt.Fprintf(os.Stderr, "Options:\n")
 			fmt.Fprintf(os.Stderr, "  --force      Force update even if no newer version is available\n")
 			fmt.Fprintf(os.Stderr, "  --check      Only check for updates, don't perform update\n")
@@ -172,14 +172,14 @@ func runUpdate(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("✅ Update completed successfully!")
-	fmt.Println("Run 'lil-whisper version' to see the new version.")
+	fmt.Println("Run 'earmark version' to see the new version.")
 }
 
 func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool, debug bool) error {
 	// Initialize authentication manager
 	authManager := auth.NewAuthManager(debug)
 	if !noConfirm {
-		fmt.Printf("\nThis will update lil-whisper to version %s.\n", latestVersion)
+		fmt.Printf("\nThis will update earmark to version %s.\n", latestVersion)
 		fmt.Print("Continue? (y/N): ")
 
 		var response string
@@ -288,7 +288,7 @@ func updateFromRelease(ctx context.Context, latestVersion string, noConfirm bool
 
 func updateFromSource(ctx context.Context, noConfirm bool, debug bool) error {
 	if !noConfirm {
-		fmt.Print("\nThis will rebuild lil-whisper from the latest source.\nContinue? (y/N): ")
+		fmt.Print("\nThis will rebuild earmark from the latest source.\nContinue? (y/N): ")
 
 		var response string
 		if _, err := fmt.Scanln(&response); err != nil {
@@ -417,7 +417,7 @@ func getAssetDownloadURL(ctx context.Context, releaseVersion string, authManager
 	}
 
 	// Fallback to direct URL construction for public repositories
-	assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+	assetName := fmt.Sprintf("earmark-%s-%s", runtime.GOOS, runtime.GOARCH)
 	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", version.GitHubRepo, releaseVersion, assetName), nil
 }
 
@@ -454,7 +454,7 @@ func getAssetDownloadURLFromAPI(ctx context.Context, releaseVersion string, auth
 	}
 
 	// Find the asset for the current platform
-	assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+	assetName := fmt.Sprintf("earmark-%s-%s", runtime.GOOS, runtime.GOARCH)
 	for _, asset := range release.Assets {
 		if asset.Name == assetName {
 			return asset.URL, nil

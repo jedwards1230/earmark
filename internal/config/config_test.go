@@ -51,7 +51,7 @@ func TestLoadConfig_MissingDatabaseURL(t *testing.T) {
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
 	clearContractEnvVars(t)
-	t.Setenv("DATABASE_URL", "postgres://u:p@host:5432/lilbro_whisper")
+	t.Setenv("DATABASE_URL", "postgres://u:p@host:5432/earmark")
 	t.Setenv("BOOKS_DIR", "/mnt/books")
 	t.Setenv("EMBEDDINGS_BASE_URL", "http://custom-ollama:11434/v1")
 	t.Setenv("EMBEDDINGS_MODEL", "mxbai-embed-large")

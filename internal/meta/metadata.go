@@ -3,8 +3,8 @@ package meta
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/meta/fetcher"
+	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/meta/fetcher"
 	"path/filepath"
 )
 

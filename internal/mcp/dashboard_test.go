@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 func TestCommafy(t *testing.T) {

@@ -8,12 +8,12 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
-	"github.com/jedwards1230/lil-whisper/internal/monitor"
-	"github.com/jedwards1230/lil-whisper/internal/queue"
-	"github.com/jedwards1230/lil-whisper/internal/worker"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/monitor"
+	"github.com/jedwards1230/earmark/internal/queue"
+	"github.com/jedwards1230/earmark/internal/worker"
 	"github.com/spf13/cobra"
 )
 
@@ -21,7 +21,7 @@ var MonitorCmd = &cobra.Command{
 	Use:   "monitor",
 	Short: "Start the file monitoring and transcription service",
 	Long: `Start the file monitoring service that watches for new audio files,
-enqueues them for transcription by the external WhisperX runner, and
+enqueues them for transcription by the external ASR runner (NeMo Parakeet), and
 embeds completed transcripts into pgvector for semantic search.
 
 The monitor service does NOT start the HTTP server. Use the 'serve' command

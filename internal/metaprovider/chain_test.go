@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
 // stubProvider is a test double for MetadataProvider.

@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/openai"
-	"github.com/jedwards1230/lil-whisper/internal/queue"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/openai"
+	"github.com/jedwards1230/earmark/internal/queue"
 	"github.com/stretchr/testify/require"
 )
 

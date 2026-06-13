@@ -5,8 +5,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
 // fakeBackfiller is a test double for Backfiller.

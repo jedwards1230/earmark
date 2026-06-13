@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 // doneRatio is the fraction of a book's tracks that are done (0 when no tracks),
@@ -25,7 +25,7 @@ func doneRatio(b db.BookSummary) float64 {
 // for the status dashboard. It lets the dashboard render with no Postgres,
 // which is what makes local UI work and AI-agent visual verification cheap
 // (see CLAUDE.md "Visual Verification"). It is never wired into production
-// code paths — only `lil-whisper mcp --demo` constructs it.
+// code paths — only `earmark mcp --demo` constructs it.
 //
 // scenario selects which state to render so every UI path is visually testable:
 //

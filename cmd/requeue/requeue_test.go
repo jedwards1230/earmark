@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 type fakeRequeuer struct {

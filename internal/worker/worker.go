@@ -1,5 +1,5 @@
-// Package worker polls for completed transcripts (from the external WhisperX
-// runner) and runs the chunk → embed → pgvector pipeline for each one.
+// Package worker polls for completed transcripts (from the external ASR runner)
+// and runs the chunk → embed → pgvector pipeline for each one.
 package worker
 
 import (
@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/chunker"
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/openai"
-	"github.com/jedwards1230/lil-whisper/internal/queue"
-	"github.com/jedwards1230/lil-whisper/internal/tokenizer"
+	"github.com/jedwards1230/earmark/internal/chunker"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/openai"
+	"github.com/jedwards1230/earmark/internal/queue"
+	"github.com/jedwards1230/earmark/internal/tokenizer"
 )
 
 // DBInterface is the subset of db.DB used by the worker.
@@ -106,7 +106,7 @@ func (w *Worker) Start(cfg *config.Config) {
 // as transcript_chunks rows.
 //
 // Chunking strategy:
-//   - If the transcript has segments (WhisperX output), accumulate whole
+//   - If the transcript has segments (NeMo Parakeet output), accumulate whole
 //     segments until the token budget (cfg.ChunkSize) is reached. The chunk
 //     gets Chunk.StartSec/EndSec from the first/last segment in the window
 //     and Speaker set to the dominant speaker across those segments.
@@ -265,7 +265,7 @@ func embedModel(cfg *config.Config) string {
 	return "nomic-embed-text"
 }
 
-// buildChunksFromSegments accumulates WhisperX segments into token-budgeted
+// buildChunksFromSegments accumulates ASR segments into token-budgeted
 // chunks, preserving start/end timestamps and dominant speaker.
 func buildChunksFromSegments(t *db.Transcript, chunkSize int) []db.Chunk {
 	var chunks []db.Chunk
