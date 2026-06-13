@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jedwards1230/earmark/internal/asr"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 )
@@ -199,6 +200,172 @@ func TestBuildServerViews_LiveClaimBeatsProbe(t *testing.T) {
 	views := buildServerViews(configured, obs, probes, now, 30*time.Minute)
 	if views[0].State.Label != "TRANSCRIBING" {
 		t.Fatalf("want TRANSCRIBING (live claim beats probe), got %q", views[0].State.Label)
+	}
+}
+
+// capByKey indexes a server's badge strip by capability key for assertions.
+func capByKey(v serverView) map[string]capBadge {
+	m := map[string]capBadge{}
+	for _, b := range v.Caps {
+		m[b.Key] = b
+	}
+	return m
+}
+
+// TestBuildServerViews_BackendDescriptor covers the Phase-2 resolution: family/
+// runtime/caps observed-wins-over-configured, the config-only "expected" path,
+// the unknown (neither) path, and skipped-reason carry-through on a declined cap.
+func TestBuildServerViews_BackendDescriptor(t *testing.T) {
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	stale := 30 * time.Minute
+	tp := func(d time.Duration) *time.Time { t := now.Add(d); return &t }
+	fp := func(v float64) *float64 { return &v }
+	sp := func(s string) *string { return &s }
+
+	parakeet := "nvidia/parakeet-tdt-0.6b-v3"
+	whisper := "whisper-large-v3"
+
+	configured := []config.ASRServer{
+		// gpu-1: config declares Parakeet/CUDA with context_biasing=true, but the
+		// observed run reports a DIFFERENT family/runtime and DECLINES biasing with
+		// a reason — observed must win and the reason must surface.
+		{Name: "gpu-1", Host: "gpu-1", Role: "primary",
+			Family: "config-parakeet", Runtime: "config-cuda", Model: parakeet,
+			Capabilities: asr.Capabilities{asr.CapContextBiasing: true, asr.CapWordTimestamps: true}},
+		// mac-1: config-only descriptor (no observed run) → "configured" source.
+		{Name: "mac-1", Host: "mac-1", Role: "fallback",
+			Family: asr.FamilyWhisper, Runtime: asr.RuntimeWhisperCPP, Model: whisper,
+			Capabilities: asr.Capabilities{asr.CapWordTimestamps: true, asr.CapContextBiasing: false}},
+		// bare-1: no descriptor anywhere → unknown/blank, must still render cleanly.
+		{Name: "bare-1", Host: "bare-1", Role: "fallback", Model: parakeet},
+	}
+	obs := &db.ServerObservation{
+		Hosts: []db.HostMetrics{
+			{Host: "gpu-1", ASRModel: &parakeet, JobsDone: 100, LastFinished: tp(-time.Minute),
+				AvgProcessingSeconds: fp(98),
+				ASRFamily:            sp(asr.FamilyNeMoParakeet), ASRRuntime: sp(asr.RuntimeNeMoCUDA),
+				CapsApplied: asr.Capabilities{
+					asr.CapWordTimestamps: true,
+					asr.CapContextBiasing: false,
+				},
+				CapsSkippedReason:  map[string]string{"context_biasing": "parakeet-tdt timestamps break under boosting"},
+				MeanWordConfidence: fp(0.91)},
+			// mac-1 has NO observed run; only the configured descriptor applies.
+			{Host: "bare-1", ASRModel: &parakeet, JobsDone: 3, LastFinished: tp(-2 * time.Hour)},
+		},
+	}
+
+	byName := map[string]serverView{}
+	for _, v := range buildServerViews(configured, obs, nil, now, stale) {
+		byName[v.Name] = v
+	}
+
+	// gpu-1: observed family/runtime win over config; known canonical ids; mean conf.
+	g := byName["gpu-1"]
+	if g.Family != asr.FamilyNeMoParakeet || g.FamilySource != "observed" || !g.FamilyKnown {
+		t.Errorf("gpu-1 family: got %q/%q known=%v, want observed nemo-parakeet/known", g.Family, g.FamilySource, g.FamilyKnown)
+	}
+	if g.Runtime != asr.RuntimeNeMoCUDA || g.RuntimeSource != "observed" || !g.RuntimeKnown {
+		t.Errorf("gpu-1 runtime: got %q/%q known=%v, want observed nemo-cuda/known", g.Runtime, g.RuntimeSource, g.RuntimeKnown)
+	}
+	if g.CapsSource != "observed" {
+		t.Errorf("gpu-1 caps source = %q, want observed", g.CapsSource)
+	}
+	if g.MeanConfidence == nil || *g.MeanConfidence != 0.91 {
+		t.Errorf("gpu-1 mean conf = %v, want 0.91", g.MeanConfidence)
+	}
+	gc := capByKey(g)
+	if b := gc["word_timestamps"]; !b.Applied || b.Label != "words" {
+		t.Errorf("gpu-1 words badge = %+v, want applied/words", b)
+	}
+	if b := gc["context_biasing"]; b.Applied || b.Reason == "" || !strings.Contains(b.Reason, "timestamps break") {
+		t.Errorf("gpu-1 bias badge = %+v, want declined with reason", b)
+	}
+
+	// mac-1: config-only → "configured" source for family/runtime/caps; no reason.
+	m := byName["mac-1"]
+	if m.Family != asr.FamilyWhisper || m.FamilySource != "configured" {
+		t.Errorf("mac-1 family: got %q/%q, want configured whisper", m.Family, m.FamilySource)
+	}
+	if m.Runtime != asr.RuntimeWhisperCPP || m.RuntimeSource != "configured" {
+		t.Errorf("mac-1 runtime: got %q/%q, want configured whisper.cpp", m.Runtime, m.RuntimeSource)
+	}
+	if m.CapsSource != "configured" {
+		t.Errorf("mac-1 caps source = %q, want configured", m.CapsSource)
+	}
+	if b := capByKey(m)["context_biasing"]; b.Applied || b.Reason != "" {
+		t.Errorf("mac-1 bias badge = %+v, want declined with NO reason (config has no run)", b)
+	}
+	if m.MeanConfidence != nil {
+		t.Errorf("mac-1 mean conf = %v, want nil (no observed run)", m.MeanConfidence)
+	}
+
+	// bare-1: no descriptor anywhere → all blank, renders cleanly (back-compat).
+	b := byName["bare-1"]
+	if b.Family != "" || b.Runtime != "" || len(b.Caps) != 0 || b.CapsSource != "" {
+		t.Errorf("bare-1 should have no descriptor data, got %+v", b)
+	}
+	if b.FamilyKnown || b.RuntimeKnown {
+		t.Errorf("bare-1 known flags should be false")
+	}
+}
+
+// TestBuildCapBadges checks strip ordering, applied/declined states, reason
+// attachment only on declined caps, and the empty input → nil contract.
+func TestBuildCapBadges(t *testing.T) {
+	if got := buildCapBadges(nil, nil); got != nil {
+		t.Errorf("nil caps → nil, got %+v", got)
+	}
+	caps := asr.Capabilities{
+		asr.CapContextBiasing: false,
+		asr.CapWordTimestamps: true, // out of map order; strip order must be stable
+	}
+	reasons := map[string]string{"context_biasing": "declined here"}
+	badges := buildCapBadges(caps, reasons)
+	if len(badges) != 2 {
+		t.Fatalf("want 2 badges, got %d: %+v", len(badges), badges)
+	}
+	// word_timestamps sorts before context_biasing in the strip order.
+	if badges[0].Key != "word_timestamps" || !badges[0].Applied {
+		t.Errorf("badge[0] = %+v, want applied word_timestamps first", badges[0])
+	}
+	if badges[1].Key != "context_biasing" || badges[1].Applied || badges[1].Reason != "declined here" {
+		t.Errorf("badge[1] = %+v, want declined context_biasing with reason", badges[1])
+	}
+	// An applied cap must NOT carry a reason even if one is supplied.
+	applied := buildCapBadges(asr.Capabilities{asr.CapWordTimestamps: true},
+		map[string]string{"word_timestamps": "should be ignored"})
+	if applied[0].Reason != "" {
+		t.Errorf("applied cap should carry no reason, got %q", applied[0].Reason)
+	}
+}
+
+// TestGroupByFamily checks first-seen-order bucketing, the trailing unknown
+// bucket, and the multiFamily toggle (≤1 family → flat render).
+func TestGroupByFamily(t *testing.T) {
+	views := []serverView{
+		{Name: "a", Family: asr.FamilyNeMoParakeet, FamilyKnown: true},
+		{Name: "b", Family: asr.FamilyWhisper},
+		{Name: "c", Family: asr.FamilyNeMoParakeet, FamilyKnown: true}, // joins a's group
+		{Name: "d"}, // no family → unknown bucket
+	}
+	groups := groupByFamily(views)
+	if len(groups) != 3 {
+		t.Fatalf("want 3 groups (parakeet, whisper, unknown), got %d: %+v", len(groups), groups)
+	}
+	if groups[0].Family != asr.FamilyNeMoParakeet || len(groups[0].Servers) != 2 || !groups[0].Known {
+		t.Errorf("group[0] wrong: %+v", groups[0])
+	}
+	if groups[2].Family != "" || groups[2].Label != "unknown" {
+		t.Errorf("group[2] should be the unknown bucket: %+v", groups[2])
+	}
+	if !multiFamily(groups) {
+		t.Errorf("3 families → multiFamily true")
+	}
+	// Single family → flat render.
+	single := groupByFamily([]serverView{{Name: "x", Family: asr.FamilyWhisper}})
+	if multiFamily(single) {
+		t.Errorf("one family → multiFamily false")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedwards1230/earmark/internal/asr"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 )
@@ -33,6 +34,9 @@ func doneRatio(b db.BookSummary) float64 {
 //	empty            — fresh install: zero counts, runner never seen
 //	stale            — runner heartbeat hours old with work waiting → STALLED
 //	failed           — failures including a long multi-line error string
+//	multibackend     — three ASR families (Parakeet/Whisper/Canary) on three
+//	                   hosts so the Servers page's Family/Runtime columns,
+//	                   capability badges, and skipped-reason tooltips render
 type demoDB struct {
 	scenario string
 	paused   *bool // heap-backed so value-receiver SetPaused can mutate it
@@ -125,6 +129,54 @@ var demoASRServers = []config.ASRServer{
 	{Name: "gpu-3", Host: "gpu-3", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback", GPUArbiterURL: "http://demo/gpu-3/offline"},
 }
 
+// demoMultibackendServers is the ASR_SERVERS registry for DEMO_SCENARIO=multibackend:
+// three different families on three hosts so the Family/Runtime columns and the
+// capability badges render with no DB. Generic placeholder names only (gpu-1 /
+// mac-1 / cpu-1) per the shareable-repo rule. The configured capabilities here are
+// the *declared* expectation; GetServerObservation reports the *applied* truth
+// (observed wins), which is what makes the requested-vs-applied story legible.
+var demoMultibackendServers = []config.ASRServer{
+	// Parakeet primary: declares word timestamps but context_biasing false (TDT
+	// timestamps break under boosting) — the canonical honest-degradation case.
+	{Name: "gpu-1", Host: "gpu-1", Role: "primary",
+		Family: asr.FamilyNeMoParakeet, Runtime: asr.RuntimeNeMoCUDA,
+		Model: "nvidia/parakeet-tdt-0.6b-v3",
+		Capabilities: asr.Capabilities{
+			asr.CapWordTimestamps: true,
+			asr.CapContextBiasing: false,
+			asr.CapDiarization:    false,
+		}},
+	// Whisper fallback: word timestamps, no biasing, no diarization.
+	{Name: "mac-1", Host: "mac-1", Role: "fallback",
+		Family: asr.FamilyWhisper, Runtime: asr.RuntimeWhisperCPP,
+		Model: "whisper-large-v3",
+		Capabilities: asr.Capabilities{
+			asr.CapWordTimestamps: true,
+			asr.CapContextBiasing: false,
+			asr.CapDiarization:    false,
+		}},
+	// Canary server: AED model that *does* apply context biasing.
+	{Name: "cpu-1", Host: "cpu-1", Role: "fallback",
+		Family: asr.FamilyNeMoCanary, Runtime: asr.RuntimeNeMoCUDA,
+		Model: "nvidia/canary-1b",
+		Capabilities: asr.Capabilities{
+			asr.CapWordTimestamps:   true,
+			asr.CapContextBiasing:   true,
+			asr.CapConfidenceScores: true,
+		}},
+}
+
+// demoServersFor returns the ASR_SERVERS registry for a scenario: the
+// multibackend scenario uses the three-family set (no gpu-arbiter probes — the
+// story there is families/caps, not readiness); every other scenario uses the
+// single-family readiness set.
+func demoServersFor(scenario string) []config.ASRServer {
+	if scenario == "multibackend" {
+		return demoMultibackendServers
+	}
+	return demoASRServers
+}
+
 // demoGPUProber is a static gpuProber for the demo, routing by a sentinel in the
 // URL so the page renders ready / busy / offline without any network call.
 type demoGPUProber struct{}
@@ -161,6 +213,52 @@ func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, er
 	switch d.scenario {
 	case "empty":
 		return &db.ServerObservation{}, nil
+	case "multibackend":
+		// Three families A/B'd on the same library. Observed caps_applied is the
+		// ground truth (wins over the configured declaration): gpu-1 (Parakeet)
+		// *declined* context_biasing with a reason (the honest-degradation surface);
+		// mac-1 (Whisper) applied words only; cpu-1 (Canary) applied biasing and
+		// reports a mean word confidence (Parakeet TDT emits none → NULL).
+		canary := "nvidia/canary-1b"
+		nemoFam, whisperFam, canaryFam := asr.FamilyNeMoParakeet, asr.FamilyWhisper, asr.FamilyNeMoCanary
+		nemoRt, whisperRt := asr.RuntimeNeMoCUDA, asr.RuntimeWhisperCPP
+		conf := 0.93
+		return &db.ServerObservation{
+			LiveRunners: []db.LiveRunner{
+				{ClaimedBy: "asr-runner-gpu-1", ClaimedCount: 1, LastHeartbeat: now.Add(-9 * time.Second),
+					CurrentFile: "/books/Author One/A Long Title/01.m4b"},
+			},
+			Hosts: []db.HostMetrics{
+				{Host: "gpu-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 412,
+					LastFinished: tp(now.Add(-9 * time.Second)), AvgProcessingSeconds: fp(98.0),
+					ASRFamily: &nemoFam, ASRRuntime: &nemoRt,
+					CapsApplied: asr.Capabilities{
+						asr.CapWordTimestamps: true,
+						asr.CapContextBiasing: false,
+						asr.CapDiarization:    false,
+					},
+					CapsSkippedReason: map[string]string{
+						"context_biasing": "parakeet-tdt timestamps break under boosting",
+					}},
+				{Host: "mac-1", ASRModel: &whisper, ComputeType: &int8, JobsDone: 57,
+					LastFinished: tp(now.Add(-2 * time.Hour)), AvgProcessingSeconds: fp(1840.0),
+					ASRFamily: &whisperFam, ASRRuntime: &whisperRt,
+					CapsApplied: asr.Capabilities{
+						asr.CapWordTimestamps: true,
+						asr.CapContextBiasing: false,
+						asr.CapDiarization:    false,
+					}},
+				{Host: "cpu-1", ASRModel: &canary, ComputeType: &f16, JobsDone: 31,
+					LastFinished: tp(now.Add(-40 * time.Minute)), AvgProcessingSeconds: fp(2710.0),
+					ASRFamily: &canaryFam, ASRRuntime: &nemoRt,
+					CapsApplied: asr.Capabilities{
+						asr.CapWordTimestamps:   true,
+						asr.CapContextBiasing:   true,
+						asr.CapConfidenceScores: true,
+					},
+					MeanWordConfidence: &conf},
+			},
+		}, nil
 	case "stale":
 		return &db.ServerObservation{
 			LiveRunners: []db.LiveRunner{
@@ -629,7 +727,7 @@ func renumber(p string, n int) string {
 // StartDemoDashboard starts the HTTP transport (status dashboard + /mcp +
 // /health + /readyz) backed by synthetic data, with no database connection.
 // Intended for local UI iteration and AI-agent visual verification only.
-// Set DEMO_SCENARIO=empty|stale|failed|active to render a specific state.
+// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend to render a state.
 func StartDemoDashboard(addr string) error {
 	if addr == "" {
 		addr = ":8081"
@@ -646,7 +744,7 @@ func StartDemoDashboard(addr string) error {
 		// Honor CONTROL_API_TOKEN so the control-API mutations are exercisable
 		// against the demo (otherwise they fail closed with 503).
 		ControlAPIToken: os.Getenv("CONTROL_API_TOKEN"),
-		ASRServers:      demoASRServers,
+		ASRServers:      demoServersFor(scenario),
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	// Swap the real HTTP gpu-arbiter prober for the static demo one so the

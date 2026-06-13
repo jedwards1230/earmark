@@ -77,6 +77,15 @@ type apiServer struct {
 	ModelSize   string `json:"modelSize,omitempty"`
 	ComputeMode string `json:"computeMode,omitempty"`
 	JobsDone    int    `json:"jobsDone"`
+	// Backend descriptor (CONTRACT §2.13), resolved observed > configured. All
+	// omitempty so old consumers are unaffected and an undescribed server stays
+	// minimal. Capabilities is the resolved applied-or-declared map (key→bool);
+	// CapsSkippedReason carries the why for any declined (false) capability.
+	Family             string            `json:"family,omitempty"`
+	Runtime            string            `json:"runtime,omitempty"`
+	Capabilities       map[string]bool   `json:"capabilities,omitempty"`
+	CapsSkippedReason  map[string]string `json:"capsSkippedReason,omitempty"`
+	MeanWordConfidence *float64          `json:"meanWordConfidence,omitempty"`
 	// GPU readiness (gpu-arbiter); omitted unless this server has a probe.
 	GPUProbed    bool   `json:"gpuProbed,omitempty"`
 	GPUReachable bool   `json:"gpuReachable,omitempty"`
@@ -165,20 +174,25 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	} else {
 		for _, v := range buildServerViews(s.asrServers, obs, s.probeServers(r.Context()), time.Now(), s.runnerStaleAfter) {
 			out.Servers = append(out.Servers, apiServer{
-				Name:         v.Name,
-				Host:         v.Host,
-				Role:         v.Role,
-				Configured:   v.Configured,
-				State:        v.State.Token,
-				Model:        v.Model,
-				ModelSize:    v.ModelSize,
-				ComputeMode:  v.ComputeMode,
-				JobsDone:     v.JobsDone,
-				GPUProbed:    v.Probed,
-				GPUReachable: v.Reachable,
-				GPUState:     v.GPUState,
-				VRAMUsedMB:   v.VRAMUsedMB,
-				VRAMTotalMB:  v.VRAMTotalMB,
+				Name:               v.Name,
+				Host:               v.Host,
+				Role:               v.Role,
+				Configured:         v.Configured,
+				State:              v.State.Token,
+				Model:              v.Model,
+				ModelSize:          v.ModelSize,
+				ComputeMode:        v.ComputeMode,
+				JobsDone:           v.JobsDone,
+				Family:             v.Family,
+				Runtime:            v.Runtime,
+				Capabilities:       v.capsMap(),
+				CapsSkippedReason:  v.capsSkippedReasons(),
+				MeanWordConfidence: v.MeanConfidence,
+				GPUProbed:          v.Probed,
+				GPUReachable:       v.Reachable,
+				GPUState:           v.GPUState,
+				VRAMUsedMB:         v.VRAMUsedMB,
+				VRAMTotalMB:        v.VRAMTotalMB,
 			})
 		}
 	}
