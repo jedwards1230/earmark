@@ -143,6 +143,14 @@ var tmplFuncs = template.FuncMap{
 	},
 	// sub subtracts b from a (small arithmetic for the "N remaining" reader label).
 	"sub": func(a, b int) int { return a - b },
+	// confPct renders a nullable mean word-confidence (0–1) as a percentage, or an
+	// em dash when the backend emitted no scores (NULL). Used by the Servers table.
+	"confPct": func(c *float64) string {
+		if c == nil {
+			return "—"
+		}
+		return fmt.Sprintf("%.0f%%", *c*100)
+	},
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.

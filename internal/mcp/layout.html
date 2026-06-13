@@ -226,6 +226,16 @@
   .badge.role-fallback { background: #15233a; color: var(--blue); }
   .badge.unconfigured  { background: #2a2a1a; color: var(--amber); }
   .server-note { color: var(--muted); font-size: 11px; line-height: 1.5; margin-top: 16px; max-width: 760px; }
+  /* per-family grouping header inside the Models & modes table */
+  .family-row td { background: var(--surface2); padding: 6px 12px; }
+  .family-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--purple); font-weight: 600; }
+  .family-known { color: var(--purple); }
+  /* capability strip: applied (green), declined/absent (amber, ✗ + reason tooltip) */
+  .cap-strip { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .cap-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; font-family: inherit; white-space: nowrap; }
+  .cap-badge.cap-on  { background: #0a2a1a; color: var(--green); }
+  .cap-badge.cap-off { background: #2a1c08; color: var(--amber); cursor: help; }
+  .server-note code.cap-badge { font-size: 10px; }
 
   @media (max-width: 560px) {
     main { padding: 14px; }
