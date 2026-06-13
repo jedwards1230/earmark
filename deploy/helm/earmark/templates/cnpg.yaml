@@ -24,10 +24,10 @@
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
-  name: lilbro-whisper-pg
+  name: earmark-pg
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: database
 spec:
   instances: {{ .Values.cnpg.instances }}
@@ -39,12 +39,12 @@ spec:
 
   bootstrap:
     initdb:
-      database: lilbro_whisper
-      owner: lilbro_whisper
+      database: earmark
+      owner: earmark
       secret:
-        # Secret name matches the OnePasswordItem below (k8s-lilbro-whisper-pg-credentials).
-        name: lilbro-whisper-pg-credentials
-      # postInitApplicationSQL runs against the APPLICATION database (lilbro_whisper).
+        # Secret name matches the OnePasswordItem below (k8s-earmark-pg-credentials).
+        name: earmark-pg-credentials
+      # postInitApplicationSQL runs against the APPLICATION database (earmark).
       # postInitSQL runs against the `postgres` database — so the extensions would
       # land where the app never connects. Verified on the live cluster (2026-06-08):
       # with postInitSQL, the app failed with "vector type not found in the database".
@@ -76,7 +76,7 @@ spec:
       isWALArchiver: true
       parameters:
         barmanObjectName: garage-backup-store
-        serverName: lilbro-whisper-pg
+        serverName: earmark-pg
         retentionPolicy: {{ required "cnpg.backup.retention is required" .Values.cnpg.backup.retention | quote }}
         backupTarget: "prefer-standby"
 
@@ -92,7 +92,7 @@ metadata:
   name: garage-backup-store
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: database
 spec:
   configuration:
@@ -113,15 +113,15 @@ spec:
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup
 metadata:
-  name: lilbro-whisper-pg-backup
+  name: earmark-pg-backup
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: database
 spec:
   schedule: {{ required "cnpg.backup.schedule is required" .Values.cnpg.backup.schedule | quote }}
   cluster:
-    name: lilbro-whisper-pg
+    name: earmark-pg
   method: plugin
   pluginConfiguration:
     name: barman-cloud.cloudnative-pg.io

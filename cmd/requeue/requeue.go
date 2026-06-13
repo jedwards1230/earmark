@@ -1,4 +1,4 @@
-// Package requeue implements the `lil-whisper requeue` command: a scoped way to
+// Package requeue implements the `earmark requeue` command: a scoped way to
 // redo work without the blunt DEBUG_DB_RESET. It can re-transcribe books, retry
 // failed jobs, or re-embed transcripts (e.g. after changing the embedding model).
 package requeue
@@ -11,8 +11,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/spf13/cobra"
 )
 
@@ -50,10 +50,10 @@ Modes:
 All modes preview matches and do nothing unless you pass --yes.
 
 Examples:
-  lil-whisper requeue "Project Hail Mary"          # preview
-  lil-whisper requeue "Project Hail Mary" --yes    # re-transcribe it
-  lil-whisper requeue --failed --yes               # retry all failures
-  lil-whisper requeue --reembed "" --yes           # re-embed everything`,
+  earmark requeue "Project Hail Mary"          # preview
+  earmark requeue "Project Hail Mary" --yes    # re-transcribe it
+  earmark requeue --failed --yes               # retry all failures
+  earmark requeue --reembed "" --yes           # re-embed everything`,
 	Run: runRequeue,
 }
 

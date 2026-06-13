@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/earmark/internal/log"
 )
 
 // providerConfig is the slice of the service config that the factory needs.

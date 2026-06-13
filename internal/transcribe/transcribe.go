@@ -17,7 +17,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/earmark/internal/log"
 )
 
 var logger = log.NewLogger("transcribe")

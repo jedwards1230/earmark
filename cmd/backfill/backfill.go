@@ -1,4 +1,4 @@
-// Package backfill implements the `lil-whisper backfill-metadata` command.
+// Package backfill implements the `earmark backfill-metadata` command.
 // It iterates over every known book directory (via GetBookSummaries) and runs
 // the configured MetadataProvider.Lookup for each, UPSERTing any new metadata
 // (chapters, narrator, series, ASIN) into book_metadata — so already-transcribed
@@ -6,9 +6,9 @@
 //
 // Usage:
 //
-//	lil-whisper backfill-metadata              # preview (dry-run): show matches
-//	lil-whisper backfill-metadata --yes        # apply UPSERTs
-//	lil-whisper backfill-metadata --book "Hail Mary" --yes  # scope to one book
+//	earmark backfill-metadata              # preview (dry-run): show matches
+//	earmark backfill-metadata --yes        # apply UPSERTs
+//	earmark backfill-metadata --book "Hail Mary" --yes  # scope to one book
 package backfill
 
 import (
@@ -20,9 +20,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/spf13/cobra"
 )
 
@@ -58,10 +58,10 @@ variables are read exactly as they are by the monitor service. Set them the
 same way as you would for the running container.
 
 Examples:
-  lil-whisper backfill-metadata                               # preview all books
-  lil-whisper backfill-metadata --yes                         # backfill all books
-  lil-whisper backfill-metadata --book "Project Hail Mary"    # preview one book
-  lil-whisper backfill-metadata --book "Project Hail Mary" --yes  # backfill one book`,
+  earmark backfill-metadata                               # preview all books
+  earmark backfill-metadata --yes                         # backfill all books
+  earmark backfill-metadata --book "Project Hail Mary"    # preview one book
+  earmark backfill-metadata --book "Project Hail Mary" --yes  # backfill one book`,
 	Run: runBackfill,
 }
 

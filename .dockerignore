@@ -12,6 +12,6 @@ Makefile
 .env.*
 *.test
 *.out
-lil-whisper
-lil-whisper-*
+earmark
+earmark-*
 dist/

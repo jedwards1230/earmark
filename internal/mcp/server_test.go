@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 // SimpleMockDB implements DBInterface for simple testing.
@@ -313,7 +313,7 @@ func TestMCPServerCreation(t *testing.T) {
 	}
 
 	name, version := server.GetServerInfo()
-	expectedName := "lilbro-whisper"
+	expectedName := "earmark"
 	expectedVersion := "1.0.0"
 
 	if name != expectedName {
@@ -384,7 +384,7 @@ func TestDashboardPage(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, marker := range []string{
-		"lilbro-whisper",
+		"earmark",
 		`src="/static/htmx.min.js"`, // vendored, not a CDN
 		`hx-get="/status/data"`,
 		`hx-trigger="load, every 3s"`,

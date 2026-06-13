@@ -4,16 +4,16 @@ import (
 	"log"
 	"os"
 
-	"github.com/jedwards1230/lil-whisper/cmd"
-	"github.com/jedwards1230/lil-whisper/cmd/backfill"
-	"github.com/jedwards1230/lil-whisper/cmd/list"
-	"github.com/jedwards1230/lil-whisper/cmd/mcp"
-	"github.com/jedwards1230/lil-whisper/cmd/monitor"
-	"github.com/jedwards1230/lil-whisper/cmd/requeue"
-	"github.com/jedwards1230/lil-whisper/cmd/search"
-	"github.com/jedwards1230/lil-whisper/cmd/serve"
-	"github.com/jedwards1230/lil-whisper/cmd/update"
-	"github.com/jedwards1230/lil-whisper/cmd/version"
+	"github.com/jedwards1230/earmark/cmd"
+	"github.com/jedwards1230/earmark/cmd/backfill"
+	"github.com/jedwards1230/earmark/cmd/list"
+	"github.com/jedwards1230/earmark/cmd/mcp"
+	"github.com/jedwards1230/earmark/cmd/monitor"
+	"github.com/jedwards1230/earmark/cmd/requeue"
+	"github.com/jedwards1230/earmark/cmd/search"
+	"github.com/jedwards1230/earmark/cmd/serve"
+	"github.com/jedwards1230/earmark/cmd/update"
+	"github.com/jedwards1230/earmark/cmd/version"
 )
 
 func main() {

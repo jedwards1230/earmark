@@ -1,4 +1,4 @@
-module github.com/jedwards1230/lil-whisper
+module github.com/jedwards1230/earmark
 
 go 1.26.4
 

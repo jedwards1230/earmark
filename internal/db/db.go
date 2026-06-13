@@ -1,4 +1,4 @@
-// Package db provides PostgreSQL access for the lilbro-whisper service.
+// Package db provides PostgreSQL access for the earmark service.
 //
 // Schema (see CONTRACT.md):
 //   - transcription_jobs  — job queue; producer: Go monitor, consumer: Python runner
@@ -26,10 +26,10 @@ import (
 	"github.com/pgvector/pgvector-go"
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
-	"github.com/jedwards1230/lil-whisper/internal/openai"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/openai"
 )
 
 // ─── Domain types ────────────────────────────────────────────────────────────
@@ -1087,7 +1087,7 @@ func (db *DB) getBookChaptersQ(ctx context.Context, q rowScanner, bookDir string
 }
 
 // GetHierarchicalData returns a list of files with their chunk counts for the
-// `lil-whisper list` CLI command (a flat per-file chunk listing).
+// `earmark list` CLI command (a flat per-file chunk listing).
 func (db *DB) GetHierarchicalData(ctx context.Context) ([]HierarchicalEntry, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT file_path, COUNT(*) AS chunk_count

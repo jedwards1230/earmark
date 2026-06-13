@@ -102,17 +102,17 @@ jobs:
           BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
             -ldflags="-s -w \
-              -X 'github.com/jedwards1230/lil-whisper/internal/version.Version=dev' \
-              -X 'github.com/jedwards1230/lil-whisper/internal/version.Commit=${COMMIT}' \
-              -X 'github.com/jedwards1230/lil-whisper/internal/version.BuildTime=${BUILD_TIME}'" \
-            -o lil-whisper-linux-amd64 \
+              -X 'github.com/jedwards1230/earmark/internal/version.Version=dev' \
+              -X 'github.com/jedwards1230/earmark/internal/version.Commit=${COMMIT}' \
+              -X 'github.com/jedwards1230/earmark/internal/version.BuildTime=${BUILD_TIME}'" \
+            -o earmark-linux-amd64 \
             .
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: lil-whisper-linux-amd64
-          path: lil-whisper-linux-amd64
+          name: earmark-linux-amd64
+          path: earmark-linux-amd64
           retention-days: 7
 
       - name: Write summary

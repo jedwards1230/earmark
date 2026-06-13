@@ -1,10 +1,10 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with the lilbro-whisper repository.
+This file provides guidance to Claude Code when working with the earmark repository.
 
 ## Project Overview
 
-**lilbro-whisper** is a Go service that indexes audiobook transcriptions produced by an
+**earmark** is a Go service that indexes audiobook transcriptions produced by an
 external ASR runner (Python, running on the GPU/ASR host) and exposes them for semantic
 search via an MCP server. It runs as a Linux container in Kubernetes.
 
@@ -14,7 +14,7 @@ search via an MCP server. It runs as a Linux container in Kubernetes.
 GPU/ASR host (Python ASR runner)
     │ writes transcription_jobs + transcripts via CNPG Postgres
     ▼
-PostgreSQL (CNPG cluster lilbro-whisper-pg, pgvector + pg_trgm)
+PostgreSQL (CNPG cluster earmark-pg, pgvector + pg_trgm)
     │ polled by Go worker
     ▼
 Go monitor + worker (K8s Deployment)
@@ -48,18 +48,18 @@ go test ./...
 golangci-lint run ./...
 
 # Run (requires DATABASE_URL)
-./lil-whisper monitor   # file watcher + worker
-./lil-whisper mcp       # MCP server (stdio by default)
-MCP_TRANSPORT=http ./lil-whisper mcp  # HTTP transport on :8081
-./lil-whisper serve     # HTTP search API
-./lil-whisper list      # list embedded books
-./lil-whisper search "query"
+./earmark monitor   # file watcher + worker
+./earmark mcp       # MCP server (stdio by default)
+MCP_TRANSPORT=http ./earmark mcp  # HTTP transport on :8081
+./earmark serve     # HTTP search API
+./earmark list      # list embedded books
+./earmark search "query"
 
 # Redo work without DEBUG_DB_RESET (dry-run unless --yes):
-./lil-whisper requeue "Project Hail Mary"          # preview matches
-./lil-whisper requeue "Project Hail Mary" --yes    # re-transcribe (drops transcript+chunks, job→pending)
-./lil-whisper requeue --failed --yes               # retry all failed jobs
-./lil-whisper requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
+./earmark requeue "Project Hail Mary"          # preview matches
+./earmark requeue "Project Hail Mary" --yes    # re-transcribe (drops transcript+chunks, job→pending)
+./earmark requeue --failed --yes               # retry all failed jobs
+./earmark requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
 ```
 
 The status dashboard also exposes requeue as buttons: a per-row **requeue** on
@@ -125,7 +125,7 @@ Debug-only (both must be set):
 ## Development Notes
 
 - `internal/db/db.go` uses `*pgxpool.Pool` (goroutine-safe). Never use `*pgx.Conn` directly.
-- Chunk timestamps (`start_sec`, `end_sec`) come from WhisperX segment boundaries.
+- Chunk timestamps (`start_sec`, `end_sec`) come from the ASR runner's segment boundaries (NeMo Parakeet-TDT).
 - The stale-job timeout uses integer-seconds SQL (`$1 * interval '1 second'`) to
   avoid PostgreSQL misinterpreting Go duration strings.
 - MCP stdio transport: all diagnostics go to `os.Stderr`, never `os.Stdout`.

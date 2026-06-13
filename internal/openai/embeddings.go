@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/sashabaranov/go-openai"
 )
 

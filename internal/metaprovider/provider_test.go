@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/library"
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/library"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
 // TestPathProviderLookup_MatchesResolver verifies that PathProvider.Lookup

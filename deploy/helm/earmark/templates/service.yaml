@@ -5,10 +5,10 @@ The ingest worker has no HTTP port and is not selected.
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "lilbro-whisper.fullname" . }}
+  name: {{ include "earmark.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: mcp-server
 spec:
   type: {{ .Values.service.type }}
@@ -18,4 +18,4 @@ spec:
       protocol: TCP
       name: http
   selector:
-    {{- include "lilbro-whisper.mcp.selectorLabels" . | nindent 4 }}
+    {{- include "earmark.mcp.selectorLabels" . | nindent 4 }}

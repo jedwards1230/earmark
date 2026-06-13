@@ -1,4 +1,4 @@
-# lilbro-whisper Interface Contract
+# earmark Interface Contract
 
 > **Status: AUTHORITATIVE — treat every value here as law.**
 > Downstream agents implementing the Go service, the Python runner, and the
@@ -67,7 +67,7 @@ CREATE TABLE transcripts (
     speaker_count       INTEGER,                -- NULL when diarization disabled
     segments            JSONB       NOT NULL,   -- array of Segment objects (schema below)
     raw_text            TEXT        NOT NULL,   -- full transcript concatenated, for FTS
-    model_name          TEXT        NOT NULL,   -- WhisperX model used, e.g. "large-v3"
+    model_name          TEXT        NOT NULL,   -- ASR model used, e.g. "nvidia/parakeet-tdt-0.6b-v3"
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
@@ -209,7 +209,7 @@ WHERE  id     = $1;
 #### GPU/ASR host busy gate
 
 The runner honors a `RUNNER_BUSY_FLAG_PATH` environment variable (default
-`/tmp/lilbro-whisper-busy`). When this file exists, the runner skips claiming
+`/tmp/earmark-busy`). When this file exists, the runner skips claiming
 new jobs (finishes any in-flight job first, then pauses). An external process
 writes this file when the host should not accept new jobs and removes it when
 the host is available again. The runner checks the flag at the top of each poll
@@ -274,7 +274,7 @@ The Go service exposes these write shapes (see §2.7 Control API):
 resume/run set `run_limit` **before** flipping `paused=false`, so the runner is
 never momentarily unbounded.
 
-#### Operator requeue (out-of-band, `lil-whisper requeue`)
+#### Operator requeue (out-of-band, `earmark requeue`)
 
 In addition to the runner/service transitions above, an operator may move a job
 **back** to `pending` to redo it. This is the only sanctioned way a `done` or
@@ -376,7 +376,7 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 
 `bias_terms` is derived by `metaprovider.DeriveBiasTerms(meta)` inside
 `db.UpsertBookMetadata` at every call — both at enqueue time (monitor) and
-during a metadata backfill (`lil-whisper backfill-metadata --yes`). It is
+during a metadata backfill (`earmark backfill-metadata --yes`). It is
 always written (never COALESCE-guarded), so a richer metadata source
 (e.g. ABS providing series/narrator) triggers a re-derive of bias terms on
 the next enqueue or backfill call.
@@ -405,11 +405,11 @@ Rules:
 
 | Property | Value |
 |----------|-------|
-| Namespace | `lilbro-whisper` |
-| Go binary image | `ghcr.io/jedwards1230/lilbro-whisper` |
-| Helm chart OCI ref | `oci://ghcr.io/jedwards1230/charts/lilbro-whisper` |
+| Namespace | `earmark` |
+| Go binary image | `ghcr.io/jedwards1230/earmark` |
+| Helm chart OCI ref | `oci://ghcr.io/jedwards1230/charts/earmark` |
 | Ingress hostname | `audiobooks-kb.example.com` |
-| CNPG cluster name | `lilbro-whisper-pg` |
+| CNPG cluster name | `earmark-pg` |
 
 `audiobooks.example.com` may be taken by an existing Audiobookshelf instance. Do NOT use it here.
 
@@ -420,14 +420,14 @@ Rules:
 | Transport | `streamable-http` (wiki parity) |
 | Container port | `8081` |
 | URL path | `/mcp` |
-| In-cluster URL | `http://lilbro-whisper.lilbro-whisper:8081/mcp` |
+| In-cluster URL | `http://earmark.earmark:8081/mcp` |
 | mcp-proxy upstream key | `"audiobooks"` |
 
 The mcp-proxy configmap entry (add to `mcpServers` object):
 
 ```json
 "audiobooks": {
-  "url": "http://lilbro-whisper.lilbro-whisper:8081/mcp",
+  "url": "http://earmark.earmark:8081/mcp",
   "transportType": "streamable-http"
 }
 ```
@@ -526,7 +526,7 @@ All env var names are fixed. No synonyms, no alternatives.
 
 | Variable | Required | Default / Notes |
 |----------|----------|-----------------|
-| `DATABASE_URL` | yes | PostgreSQL DSN: `postgres://lilbro_whisper:<pass>@lilbro-whisper-pg-rw.lilbro-whisper:5432/lilbro_whisper` |
+| `DATABASE_URL` | yes | PostgreSQL DSN: `postgres://earmark:<pass>@earmark-pg-rw.earmark:5432/earmark` |
 | `PGHOST` | no | Convenience alias; `DATABASE_URL` takes precedence |
 | `PGPORT` | no | Convenience alias |
 | `PGUSER` | no | Convenience alias |
@@ -566,7 +566,7 @@ warning and falls back, never failing startup. Example:
 | `RUNNER_IDENTITY` | no | `asr-runner` (included in `claimed_by`) |
 | `RUNNER_POLL_INTERVAL_SECONDS` | no | `30` |
 | `RUNNER_HEARTBEAT_SECONDS` | no | `60` |
-| `RUNNER_BUSY_FLAG_PATH` | no | `/tmp/lilbro-whisper-busy` |
+| `RUNNER_BUSY_FLAG_PATH` | no | `/tmp/earmark-busy` |
 | `ASR_MODEL` | no | `nvidia/parakeet-tdt-0.6b-v3` (NeMo model id) |
 | `ASR_DIARIZE` | no | `false` (default). Set `true` to run NeMo Sortformer speaker diarization for multi-voice/full-cast titles |
 | `ASR_COMPUTE_TYPE` | no | `bfloat16` (native on RTX 5090 / Blackwell) |
@@ -577,14 +577,14 @@ warning and falls back, never failing startup. Example:
 
 | Property | Value |
 |----------|-------|
-| Cluster name | `lilbro-whisper-pg` |
-| Namespace | `lilbro-whisper` |
+| Cluster name | `earmark-pg` |
+| Namespace | `earmark` |
 | PostgreSQL image | `ghcr.io/cloudnative-pg/postgresql:16-pgvector` |
 | Storage size | `20Gi` |
 | StorageClass | `nfs-databases` |
-| Read-write endpoint | `lilbro-whisper-pg-rw.lilbro-whisper` (port 5432) |
-| Database name | `lilbro_whisper` |
-| Database owner | `lilbro_whisper` |
+| Read-write endpoint | `earmark-pg-rw.earmark` (port 5432) |
+| Database name | `earmark` |
+| Database owner | `earmark` |
 | PostInitSQL extensions | `CREATE EXTENSION IF NOT EXISTS vector;` `CREATE EXTENSION IF NOT EXISTS pg_trgm;` |
 | Backup destination | `s3://postgres-backups/` via an S3-compatible object store (e.g. Garage at `http://s3.example.com:3900`) |
 | Backup plugin | `barman-cloud.cloudnative-pg.io` |
@@ -596,8 +596,8 @@ warning and falls back, never failing startup. Example:
 
 | Secret | 1Password item path |
 |--------|---------------------|
-| DB credentials (CNPG) | `vaults/example/items/k8s-lilbro-whisper-pg-credentials` |
-| S3 credentials for CNPG | `vaults/example/items/k8s-lilbro-whisper-cnpg-garage-secret` |
+| DB credentials (CNPG) | `vaults/example/items/k8s-earmark-pg-credentials` |
+| S3 credentials for CNPG | `vaults/example/items/k8s-earmark-cnpg-garage-secret` |
 | HuggingFace token (runner) | Stored in a secrets manager (not a K8s secret — runner is a GPU/ASR host native service) |
 
 The `cnpg-garage-secret` secret provides `ACCESS_KEY_ID`,
@@ -615,16 +615,16 @@ The `cnpg-garage-secret` secret provides `ACCESS_KEY_ID`,
 | Container mount path | `/books` |
 
 The `books` PVC already exists in the `media` namespace with `ReadWriteMany`.
-The lilbro-whisper Deployment in the `lilbro-whisper` namespace MUST define
+The earmark Deployment in the `earmark` namespace MUST define
 its own static PV + PVC pointing to the same NFS export with `ReadOnlyMany`
 to enforce the read-only constraint without depending on the `media` namespace.
 
 ```yaml
-# PersistentVolume — declare in lilbro-whisper namespace manifests
+# PersistentVolume — declare in earmark namespace manifests
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: lilbro-whisper-books-ro
+  name: earmark-books-ro
 spec:
   capacity:
     storage: 100Gi
@@ -637,16 +637,16 @@ spec:
     path: /srv/audiobooks
   claimRef:
     name: books-ro
-    namespace: lilbro-whisper
+    namespace: earmark
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: books-ro
-  namespace: lilbro-whisper
+  namespace: earmark
 spec:
   storageClassName: nfs-static-media
-  volumeName: lilbro-whisper-books-ro
+  volumeName: earmark-books-ro
   accessModes:
     - ReadOnlyMany
   resources:
@@ -656,14 +656,14 @@ spec:
 
 ### 2.7 Helm Chart Structure (cardigan model)
 
-Chart lives at `deploy/helm/lilbro-whisper/` in the `lilbro-whisper` repo.
-Published as `oci://ghcr.io/jedwards1230/charts/lilbro-whisper`.
+Chart lives at `deploy/helm/earmark/` in the `earmark` repo.
+Published as `oci://ghcr.io/jedwards1230/charts/earmark`.
 
 The helmfile release for homelab-k8s lives at:
-`repos/homelab-k8s/apps/lilbro-whisper/helmfile.yaml`
+`repos/homelab-k8s/apps/earmark/helmfile.yaml`
 
 ArgoCD Application CRD lives at:
-`repos/homelab-k8s/base/core/argocd/applications/lilbro-whisper/lilbro-whisper-helmfile.yaml`
+`repos/homelab-k8s/base/core/argocd/applications/earmark/earmark-helmfile.yaml`
 
 Sync policy: **auto-sync** (`prune: true`, `selfHeal: true`) — this is a
 non-critical new service, not in the manual-sync exceptions list.
@@ -696,10 +696,10 @@ is acceptable.
 
 ```yaml
 labels:
-  app.kubernetes.io/name: lilbro-whisper
-  app.kubernetes.io/instance: lilbro-whisper-prod
+  app.kubernetes.io/name: earmark
+  app.kubernetes.io/instance: earmark-prod
   app.kubernetes.io/component: mcp-server        # for the Go Deployment
-  app.kubernetes.io/part-of: lilbro-whisper-stack
+  app.kubernetes.io/part-of: earmark-stack
   app.kubernetes.io/managed-by: Helm
 ```
 
@@ -780,5 +780,5 @@ Any change to:
 - The embedding model or vector dimension in section 2.3
 
 ...requires updating this file **before** writing implementation code. All
-three repos (lilbro-whisper Go, homelab-ansible runner, homelab-k8s manifests)
+three repos (earmark Go, homelab-ansible runner, homelab-k8s manifests)
 must be updated atomically when a contract value changes.

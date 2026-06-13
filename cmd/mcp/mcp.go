@@ -5,16 +5,16 @@ import (
 	"log"
 	"os"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/db"
-	"github.com/jedwards1230/lil-whisper/internal/mcp"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/mcp"
 	"github.com/spf13/cobra"
 )
 
 var MCPCmd = &cobra.Command{
 	Use:   "mcp",
 	Short: "Start the Model Context Protocol (MCP) server",
-	Long: `Start the MCP server for lilbro-whisper audiobook transcription service.
+	Long: `Start the MCP server for earmark audiobook transcription service.
 
 The MCP server provides tools for AI assistant integration with audiobook search and browsing capabilities.
 
@@ -24,17 +24,17 @@ Environment Variables:
 
 Examples:
   # Start with stdio transport (default)
-  lil-whisper mcp
+  earmark mcp
 
   # Start with HTTP transport
-  MCP_TRANSPORT=http lil-whisper mcp
+  MCP_TRANSPORT=http earmark mcp
 
   # Start with custom HTTP address
-  MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 lil-whisper mcp
+  MCP_TRANSPORT=http MCP_HTTP_ADDR=:9000 earmark mcp
 
   # Serve only the status dashboard with synthetic data and NO database
   # (for local UI work / visual verification — see CLAUDE.md)
-  lil-whisper mcp --demo`,
+  earmark mcp --demo`,
 	Run: runMCP,
 }
 
@@ -53,7 +53,7 @@ func runMCP(cmd *cobra.Command, args []string) {
 		if addr == "" {
 			addr = ":8081"
 		}
-		fmt.Printf("Starting lilbro-whisper DEMO dashboard on %s (synthetic data, no database)\n", addr)
+		fmt.Printf("Starting earmark DEMO dashboard on %s (synthetic data, no database)\n", addr)
 		fmt.Printf("  Dashboard: http://localhost%s/\n", addr)
 		if err := mcp.StartDemoDashboard(addr); err != nil {
 			log.Fatalf("Failed to start demo dashboard: %v", err)
@@ -91,7 +91,7 @@ func runMCP(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	diag("Starting MCP server for lilbro-whisper...")
+	diag("Starting MCP server for earmark...")
 	diag("Available tools:")
 	diag("  - semantic_search_audiobooks: Search using semantic similarity")
 	diag("  - text_search_audiobooks: Search using trigram keyword match")

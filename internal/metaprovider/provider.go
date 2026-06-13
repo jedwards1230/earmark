@@ -16,7 +16,7 @@ import (
 	"context"
 	"path/filepath"
 
-	"github.com/jedwards1230/lil-whisper/internal/library"
+	"github.com/jedwards1230/earmark/internal/library"
 )
 
 // Chapter holds timestamp-bounded chapter information in seconds (matching

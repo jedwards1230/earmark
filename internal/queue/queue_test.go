@@ -2,7 +2,7 @@ package queue
 
 import (
 	"fmt"
-	"github.com/jedwards1230/lil-whisper/internal/meta"
+	"github.com/jedwards1230/earmark/internal/meta"
 	"sync"
 	"testing"
 	"time"

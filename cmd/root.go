@@ -5,8 +5,8 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "lil-whisper",
-	Short: "Audiobook transcription service: chunk, embed, and search transcripts",
+	Use:   "earmark",
+	Short: "earmark: audiobook knowledge layer — chunk, embed, and search transcripts",
 }
 
 func GetRootCmd() *cobra.Command {

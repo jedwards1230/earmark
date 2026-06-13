@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
-  "title": "lilbro-whisper Helm values",
+  "title": "earmark Helm values",
   "type": "object",
   "required": [
     "image",

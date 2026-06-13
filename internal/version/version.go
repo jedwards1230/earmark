@@ -23,7 +23,7 @@ var (
 
 const (
 	DefaultGitHubAPI = "https://api.github.com"
-	GitHubRepo       = "jedwards1230/lilbro-whisper"
+	GitHubRepo       = "jedwards1230/earmark"
 	CacheFile        = ".version_cache"
 	DefaultExpiry    = 24 * time.Hour
 )
@@ -429,7 +429,7 @@ func getCacheDir() (string, error) {
 		return "", err
 	}
 
-	cacheDir := filepath.Join(home, ".cache", "lil-whisper")
+	cacheDir := filepath.Join(home, ".cache", "earmark")
 	if err := os.MkdirAll(cacheDir, 0750); err != nil {
 		return "", err
 	}

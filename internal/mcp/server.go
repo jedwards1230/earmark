@@ -10,12 +10,12 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
-	"github.com/jedwards1230/lil-whisper/internal/log"
-	"github.com/jedwards1230/lil-whisper/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
-// MCPServer wraps the MCP server functionality for the lilbro-whisper service
+// MCPServer wraps the MCP server functionality for the earmark service
 type MCPServer struct {
 	server   *server.MCPServer
 	handlers *ToolHandlers
@@ -54,7 +54,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// omitted — the only HTTP surface is the LAN-only status dashboard, not a
 	// public site, so there's no canonical URL to advertise. Icons are likewise
 	// omitted (no published icon asset).
-	mcpServer := server.NewMCPServer("lilbro-whisper", "1.0.0",
+	mcpServer := server.NewMCPServer("earmark", "1.0.0",
 		server.WithToolCapabilities(true),
 		server.WithResourceCapabilities(false, false), // Not implementing resources yet
 		server.WithPromptCapabilities(false),          // Not implementing prompts yet
@@ -358,7 +358,7 @@ func (s *MCPServer) StartHTTP(addr string) error {
 
 // GetServerInfo returns server information for introspection
 func (s *MCPServer) GetServerInfo() (string, string) {
-	return "lilbro-whisper", "1.0.0"
+	return "earmark", "1.0.0"
 }
 
 // Close gracefully shuts down the MCP server

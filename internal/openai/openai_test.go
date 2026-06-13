@@ -3,7 +3,7 @@ package openai
 import (
 	"testing"
 
-	"github.com/jedwards1230/lil-whisper/internal/config"
+	"github.com/jedwards1230/earmark/internal/config"
 )
 
 func TestEmbeddingDimensionConstant(t *testing.T) {

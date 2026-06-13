@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/auth"
-	"github.com/jedwards1230/lil-whisper/internal/version"
+	"github.com/jedwards1230/earmark/internal/auth"
+	"github.com/jedwards1230/earmark/internal/version"
 )
 
 func TestGetAssetDownloadURL(t *testing.T) {
@@ -19,7 +19,7 @@ func TestGetAssetDownloadURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/repos/test-owner/test-repo/releases/tags/v1.0.0" {
 			// Mock successful API response
-			assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+			assetName := fmt.Sprintf("earmark-%s-%s", runtime.GOOS, runtime.GOARCH)
 			response := fmt.Sprintf(`{
 				"tag_name": "v1.0.0",
 				"assets": [
@@ -54,7 +54,7 @@ func TestGetAssetDownloadURL(t *testing.T) {
 	}
 
 	// Since we can't easily mock the GitHub API URL, this will fall back to direct URL
-	expectedFallback := fmt.Sprintf("https://github.com/%s/releases/download/v1.0.0/lil-whisper-%s-%s",
+	expectedFallback := fmt.Sprintf("https://github.com/%s/releases/download/v1.0.0/earmark-%s-%s",
 		version.GitHubRepo, runtime.GOOS, runtime.GOARCH)
 	if url != expectedFallback {
 		t.Logf("Got URL: %s", url)
@@ -80,7 +80,7 @@ func TestGetAssetDownloadURLFromAPI(t *testing.T) {
 		}
 
 		if r.URL.Path == "/repos/test-owner/test-repo/releases/tags/v1.0.0" {
-			assetName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+			assetName := fmt.Sprintf("earmark-%s-%s", runtime.GOOS, runtime.GOARCH)
 			response := fmt.Sprintf(`{
 				"tag_name": "v1.0.0",
 				"assets": [
@@ -196,10 +196,10 @@ func TestUpdateIntegration(t *testing.T) {
 
 func TestAssetNameGeneration(t *testing.T) {
 	// Test that asset names are generated correctly
-	expectedName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+	expectedName := fmt.Sprintf("earmark-%s-%s", runtime.GOOS, runtime.GOARCH)
 
 	// This is what the code should generate
-	actualName := fmt.Sprintf("lil-whisper-%s-%s", runtime.GOOS, runtime.GOARCH)
+	actualName := fmt.Sprintf("earmark-%s-%s", runtime.GOOS, runtime.GOARCH)
 
 	if actualName != expectedName {
 		t.Errorf("Expected asset name %s, got %s", expectedName, actualName)

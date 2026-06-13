@@ -3,7 +3,7 @@ package metaprovider
 import (
 	"context"
 
-	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/earmark/internal/log"
 )
 
 // ChainProvider implements MetadataProvider by trying a list of providers in

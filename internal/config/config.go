@@ -9,17 +9,17 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jedwards1230/lil-whisper/internal/log"
+	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/joho/godotenv"
 )
 
 var logger = log.NewLogger("config")
 
-// Config holds all runtime configuration for the lilbro-whisper Go service.
+// Config holds all runtime configuration for the earmark Go service.
 // Field names mirror the canonical env var names from CONTRACT.md §2.4.
 type Config struct {
 	// DATABASE_URL — PostgreSQL DSN (required).
-	// Example: postgres://lilbro_whisper:<pass>@lilbro-whisper-pg-rw.lilbro-whisper:5432/lilbro_whisper
+	// Example: postgres://earmark:<pass>@earmark-pg-rw.earmark:5432/earmark
 	DatabaseURL string
 
 	// BOOKS_DIR — read-only NFS mount of the audiobook library.

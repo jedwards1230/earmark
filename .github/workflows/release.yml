@@ -6,7 +6,7 @@
 # Release with install snippets prepended to the AI-generated body.
 #
 # Modeled on jedwards1230/my-wiki's release.yml (same Go-service + Helm-chart
-# shape). lilbro-whisper is amd64-only, so the image build is single-arch.
+# shape). earmark is amd64-only, so the image build is single-arch.
 
 name: Release
 
@@ -109,10 +109,10 @@ jobs:
     needs: [detect]
     uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v1
     with:
-      service_name: lilbro-whisper
+      service_name: earmark
       service_description: "a Go service that indexes audiobook transcripts and serves semantic search over MCP"
       bump_type: ${{ needs.detect.outputs.bump_type }}
-      chart_path: deploy/helm/lilbro-whisper/Chart.yaml
+      chart_path: deploy/helm/earmark/Chart.yaml
       dry_run: ${{ needs.detect.outputs.dry_run == 'true' }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -176,18 +176,18 @@ jobs:
 
       - name: Package and push
         run: |
-          helm package deploy/helm/lilbro-whisper/
-          helm push lilbro-whisper-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          helm package deploy/helm/earmark/
+          helm push earmark-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
 
       - name: Write summary
         run: |
-          CHART_VERSION=$(grep '^version:' deploy/helm/lilbro-whisper/Chart.yaml | awk '{print $2}')
+          CHART_VERSION=$(grep '^version:' deploy/helm/earmark/Chart.yaml | awk '{print $2}')
           echo "## Helm Chart Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Chart Version | ${CHART_VERSION} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Registry | \`oci://ghcr.io/${{ github.repository_owner }}/charts/lilbro-whisper\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry | \`oci://ghcr.io/${{ github.repository_owner }}/charts/earmark\` |" >> $GITHUB_STEP_SUMMARY
 
   release:
     name: Create GitHub Release
@@ -224,7 +224,7 @@ jobs:
             echo "### Helm"
             echo ""
             echo '```bash'
-            echo "helm install lilbro-whisper oci://ghcr.io/${REPO_OWNER}/charts/lilbro-whisper --version ${VERSION}"
+            echo "helm install earmark oci://ghcr.io/${REPO_OWNER}/charts/earmark --version ${VERSION}"
             echo '```'
             echo ""
             echo "---"
@@ -256,6 +256,6 @@ jobs:
             echo "|-------|-------|"
             echo "| Version | ${VERSION} |"
             echo "| Image | \`${REGISTRY}/${IMAGE_NAME}:${VERSION}\` |"
-            echo "| Chart | \`oci://ghcr.io/${REPO_OWNER}/charts/lilbro-whisper:${VERSION}\` |"
+            echo "| Chart | \`oci://ghcr.io/${REPO_OWNER}/charts/earmark:${VERSION}\` |"
             echo "| Bump | ${BUMP_TYPE} |"
           } >> $GITHUB_STEP_SUMMARY

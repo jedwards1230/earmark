@@ -24,21 +24,21 @@ func TestRootCommand(t *testing.T) {
 	}{
 		{
 			name:         "no arguments shows help",
-			args:         []string{"lil-whisper"},
+			args:         []string{"earmark"},
 			expectError:  false,
-			expectOutput: "A transcription service using Yap and MacOS native APIs",
+			expectOutput: "earmark: audiobook knowledge layer",
 		},
 		{
 			name:         "help flag",
-			args:         []string{"lil-whisper", "--help"},
+			args:         []string{"earmark", "--help"},
 			expectError:  false,
-			expectOutput: "A transcription service using Yap and MacOS native APIs",
+			expectOutput: "earmark: audiobook knowledge layer",
 		},
 		{
 			name:         "invalid command",
-			args:         []string{"lil-whisper", "invalid"},
+			args:         []string{"earmark", "invalid"},
 			expectError:  false,
-			expectOutput: "A transcription service using Yap and MacOS native APIs",
+			expectOutput: "earmark: audiobook knowledge layer",
 		},
 	}
 
@@ -46,8 +46,8 @@ func TestRootCommand(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Reset cobra command for each test
 			testRootCmd := &cobra.Command{
-				Use:   "lil-whisper",
-				Short: "A transcription service using Yap and MacOS native APIs",
+				Use:   "earmark",
+				Short: "earmark: audiobook knowledge layer — chunk, embed, and search transcripts",
 			}
 
 			// Capture output
@@ -93,6 +93,6 @@ func TestGetRootCmd(t *testing.T) {
 	// Test that GetRootCmd returns the correct root command
 	cmd := GetRootCmd()
 	assert.NotNil(t, cmd)
-	assert.Equal(t, "lil-whisper", cmd.Use)
-	assert.Contains(t, cmd.Short, "transcription service")
+	assert.Equal(t, "earmark", cmd.Use)
+	assert.Contains(t, cmd.Short, "earmark")
 }

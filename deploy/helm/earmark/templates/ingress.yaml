@@ -2,10 +2,10 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "lilbro-whisper.fullname" . }}
+  name: {{ include "earmark.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "lilbro-whisper.labels" . | nindent 4 }}
+    {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: mcp-server
   {{- with .Values.ingress.annotations }}
   annotations:
@@ -24,7 +24,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ include "lilbro-whisper.fullname" . }}
+                name: {{ include "earmark.fullname" . }}
                 port:
                   name: http
 {{- end }}
