@@ -568,7 +568,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
-| `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.lilbro.cloud`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
+| `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.example.com`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
 | `ABS_TOKEN` | no | Audiobookshelf API token. Required when `ABS_URL` is set. |
 | `ABS_LIBRARY_ID` | no | Audiobookshelf library ID to search for book metadata. Required when `ABS_URL` is set. Defaults to the first configured library if omitted (implementation may change). |
 

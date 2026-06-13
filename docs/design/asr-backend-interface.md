@@ -18,8 +18,8 @@ earmark does **not** transcribe. It is the in-cluster Go service that:
 - **mcp** serves the MCP tools + the htmx dashboard + the `/api/v1` control API.
 
 Transcription is performed by an **external Python ASR runner** — today exactly
-one: NVIDIA NeMo `parakeet-tdt-0.6b-v3` on desktop-1 (RTX 5090), running as a
-native host service. It claims jobs (`FOR UPDATE SKIP LOCKED`), heartbeats,
+one: NVIDIA NeMo `parakeet-tdt-0.6b-v3` on a CUDA GPU host (RTX 5090), running
+as a native host service. It claims jobs (`FOR UPDATE SKIP LOCKED`), heartbeats,
 writes `transcripts` + its slice of `run_metrics`, and honors the `runner_control`
 pause/bounded-run gate and the `book_metadata.bias_terms` for NeMo word-boosting.
 
@@ -69,7 +69,7 @@ A "backend" varies along several axes that today are flattened into a single
 | **Model family** | NeMo Parakeet, NeMo Canary, IBM Granite Speech, OpenAI Whisper / faster-whisper / WhisperX |
 | **Runtime** | NeMo-CUDA, parakeet-mlx (Apple Silicon), parakeet.cpp / sherpa-onnx (CPU), whisper.cpp SYCL (Intel iGPU), OpenVINO |
 | **Compute type** | bfloat16, float16, int8, etc. (already recorded) |
-| **Host** | desktop-1/RTX 5090, a Mac, an Intel box, … (already recorded as `runner_host`) |
+| **Host** | a CUDA GPU box, a Mac, an Intel box, … (already recorded as `runner_host`) |
 
 …and along **capabilities that may or may not be present**:
 
