@@ -36,6 +36,25 @@ jobs:
       - name: Display coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
+  python:
+    name: Python runner tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        # test_runner.py imports only stdlib + psycopg2 (no torch/NeMo), so the
+        # GPU runtime stack is not needed to run the suite.
+        run: pip install psycopg2-binary pytest
+
+      - name: Run runner unit tests
+        run: python -m pytest runner/test_runner.py -v
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -85,7 +104,7 @@ jobs:
   build:
     name: Build (linux/amd64)
     runs-on: ubuntu-latest
-    needs: [test, lint]
+    needs: [test, python, lint]
 
     steps:
       - uses: actions/checkout@v6
