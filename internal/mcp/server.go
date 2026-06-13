@@ -49,12 +49,18 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		staleAfter = 30 * time.Minute
 	}
 
-	// Create MCP server with all capabilities enabled
+	// Create MCP server with all capabilities enabled. Identity metadata (title,
+	// description) helps a host present the server in a picker. websiteUrl is
+	// omitted — the only HTTP surface is the LAN-only status dashboard, not a
+	// public site, so there's no canonical URL to advertise. Icons are likewise
+	// omitted (no published icon asset).
 	mcpServer := server.NewMCPServer("lilbro-whisper", "1.0.0",
 		server.WithToolCapabilities(true),
 		server.WithResourceCapabilities(false, false), // Not implementing resources yet
 		server.WithPromptCapabilities(false),          // Not implementing prompts yet
 		server.WithLogging(),
+		server.WithTitle("Audiobook Processor"),
+		server.WithDescription("Semantic and keyword search over audiobook transcripts, plus full-transcript reading and library browsing."),
 	)
 
 	// Build the metadata provider from config. NewPathProvider handles parse
@@ -83,6 +89,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"Use this to find passages about a concept; use list_books to discover titles, "+
 			"get_chunk_context to expand around a hit, and get_transcript to read full text."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
+		mcp.WithOutputSchema[SearchResultsOutput](),
 		mcp.WithString("query",
 			mcp.Description("The search query to find relevant content"),
 			mcp.Required(),
@@ -115,6 +122,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"label, NOT a semantic-similarity score. "+
 			"Use this for exact phrases or names; use semantic_search_audiobooks for conceptual queries."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
+		mcp.WithOutputSchema[SearchResultsOutput](),
 		mcp.WithString("query",
 			mcp.Description("The search query to find exact text matches"),
 			mcp.Required(),
@@ -141,6 +149,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"search or fetching a transcript. Pass format=tree to group the same books under their "+
 			"authors instead of a flat list."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
+		mcp.WithOutputSchema[ListBooksOutput](),
 		mcp.WithString("author",
 			mcp.Description("Optional: filter to books whose path/author matches this substring (case-insensitive)."),
 		),
@@ -168,6 +177,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"offset/limit; the response footer tells you the next offset. If a book has multiple tracks, this "+
 			"returns the track list so you can pick one by trackID."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
+		mcp.WithOutputSchema[TranscriptOutput](),
 		mcp.WithString("book",
 			mcp.Description("A book title or directory substring to read (e.g. \"Project Hail Mary\"). Either this or trackID is required."),
 		),
@@ -190,6 +200,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"Operates on CHUNKS (the search/embedding unit — a chunk is tens of consecutive ASR segments grouped "+
 			"together; use get_transcript to page raw segments instead). Pass the chunk's UUID from a search result."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
+		mcp.WithOutputSchema[SearchResultsOutput](),
 		mcp.WithString("chunkID",
 			mcp.Description("The chunk UUID returned in the `ID` field of semantic_search_audiobooks / "+
 				"text_search_audiobooks results."),

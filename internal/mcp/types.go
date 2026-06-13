@@ -12,14 +12,6 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// textResult wraps plain text in the MCP CallToolResult shape used everywhere in
-// this package.
-func textResult(s string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{mcp.TextContent{Type: "text", Text: s}},
-	}
-}
-
 // fmtHMS renders a second count as "Hh MMm SSs" (em dash when unknown), matching
 // the dashboard's humanizeSeconds style for the library list.
 func fmtHMS(secs *float64) string {
@@ -79,8 +71,13 @@ func librarySummaryLine(t db.LibraryTotals) string {
 // view keeps it); a leading summary line reports whole-library totals.
 func formatBookList(ctx context.Context, books []db.BookSummary, total, offset int, totals db.LibraryTotals, meta metaprovider.MetadataProvider) *mcp.CallToolResult {
 	if len(books) == 0 {
-		return textResult("No books found.")
+		return mcp.NewToolResultStructured(
+			ListBooksOutput{Format: "flat", Books: []BookEntry{}, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset},
+			"No books found.",
+		)
 	}
+
+	entries := make([]BookEntry, 0, len(books))
 
 	var b strings.Builder
 	if summary := librarySummaryLine(totals); summary != "" {
@@ -102,6 +99,7 @@ func formatBookList(ctx context.Context, books []db.BookSummary, total, offset i
 		if author == "" {
 			author = "Unknown"
 		}
+		entries = append(entries, bookEntry(bk, author, title))
 		fmt.Fprintf(&b, "**%s** by %s\n", title, author)
 		fmt.Fprintf(&b, "  tracks: %d/%d done", bk.Done, bk.Total)
 		if bk.Pending > 0 {
@@ -119,22 +117,61 @@ func formatBookList(ctx context.Context, books []db.BookSummary, total, offset i
 			fmtHMS(bk.DurationSeconds), intOrDash(bk.WordCount), intOrDash(bk.EmbedChunkCount))
 	}
 
+	var nextOffset *int
 	if offset+len(books) < total {
-		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, offset+len(books))
+		n := offset + len(books)
+		nextOffset = &n
+		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, n)
 	}
 
-	return textResult(strings.TrimRight(b.String(), "\n"))
+	return mcp.NewToolResultStructured(
+		ListBooksOutput{Format: "flat", Books: entries, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset, NextOffset: nextOffset},
+		strings.TrimRight(b.String(), "\n"),
+	)
+}
+
+// bookEntry builds the structured BookEntry for one book row, using the
+// provider-resolved author/title (already defaulted by the caller).
+func bookEntry(bk db.BookSummary, author, title string) BookEntry {
+	return BookEntry{
+		Dir:             bk.Dir,
+		Author:          author,
+		Title:           title,
+		Total:           bk.Total,
+		Pending:         bk.Pending,
+		Claimed:         bk.Claimed,
+		Done:            bk.Done,
+		Failed:          bk.Failed,
+		DurationSeconds: bk.DurationSeconds,
+		WordCount:       bk.WordCount,
+		EmbedChunkCount: bk.EmbedChunkCount,
+	}
+}
+
+// libraryTotalsOutput maps the tagless db.LibraryTotals to the JSON-tagged
+// structured-output type.
+func libraryTotalsOutput(t db.LibraryTotals) LibraryTotalsOutput {
+	return LibraryTotalsOutput{
+		TotalBooks:       t.TotalBooks,
+		FullyTranscribed: t.FullyTranscribed,
+		WithPending:      t.WithPending,
+	}
 }
 
 // formatTrackChooser lists a multi-track book's tracks so the caller can pick one
 // (by trackID) for get_transcript.
 func formatTrackChooser(book string, tracks []db.RecentJob) *mcp.CallToolResult {
+	refs := make([]TrackRef, 0, len(tracks))
 	var b strings.Builder
 	fmt.Fprintf(&b, "%q has %d tracks. Call get_transcript again with one of these trackID values:\n\n", book, len(tracks))
 	for _, t := range tracks {
+		refs = append(refs, TrackRef{TrackID: t.ID, FilePath: t.FilePath, Status: t.Status})
 		fmt.Fprintf(&b, "  • %s  [%s]  trackID=%s\n", filepath.Base(t.FilePath), t.Status, t.ID)
 	}
-	return textResult(strings.TrimRight(b.String(), "\n"))
+	return mcp.NewToolResultStructured(
+		TranscriptOutput{Kind: "trackChooser", Book: book, Tracks: refs},
+		strings.TrimRight(b.String(), "\n"),
+	)
 }
 
 // formatTranscriptPage renders a page of a track's transcript as timestamped
@@ -154,6 +191,20 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int) *mcp.CallToolRes
 		limit = 50
 	}
 
+	// Common header fields for the structured payload (shared by both the
+	// past-the-end and the normal-page returns below).
+	base := TranscriptOutput{
+		Kind:            "transcript",
+		FilePath:        d.FilePath,
+		Language:        d.Language,
+		ModelName:       d.ModelName,
+		DurationSeconds: d.DurationSeconds,
+		Offset:          offset,
+		Limit:           limit,
+		TotalSegments:   totalSegs,
+		Segments:        []TranscriptSegment{},
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "Transcript: %s\n", d.FilePath)
 	fmt.Fprintf(&b, "Language: %s | Model: %s | Duration: %s\n\n",
@@ -161,24 +212,29 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int) *mcp.CallToolRes
 
 	if offset >= totalSegs {
 		fmt.Fprintf(&b, "(offset %d is past the end — %d segments total)", offset, totalSegs)
-		return textResult(b.String())
+		return mcp.NewToolResultStructured(base, b.String())
 	}
 
 	end := offset + limit
 	if end > totalSegs {
 		end = totalSegs
 	}
+	segs := make([]TranscriptSegment, 0, end-offset)
 	for _, seg := range d.Segments[offset:end] {
+		segs = append(segs, TranscriptSegment{Start: seg.Start, End: seg.End, Text: strings.TrimSpace(seg.Text)})
 		fmt.Fprintf(&b, "[%s → %s] %s\n", mmss(seg.Start), mmss(seg.End), strings.TrimSpace(seg.Text))
 	}
+	base.Segments = segs
 
 	b.WriteString("\n")
 	if end < totalSegs {
+		next := end
+		base.NextOffset = &next
 		fmt.Fprintf(&b, "Showing segments %d–%d of %d. Next page: offset=%d.", offset+1, end, totalSegs, end)
 	} else {
 		fmt.Fprintf(&b, "Showing segments %d–%d of %d (end of transcript).", offset+1, end, totalSegs)
 	}
-	return textResult(b.String())
+	return mcp.NewToolResultStructured(base, b.String())
 }
 
 // searchKind labels how a result set was ranked, so the formatter can render an
@@ -196,6 +252,20 @@ const (
 	// searchText ranks by pg_trgm trigram match (text_search_audiobooks).
 	searchText
 )
+
+// label returns the stable string used in structured output's `kind` field, so a
+// consumer can tell how the rows were ranked without re-deriving it from the tool
+// name.
+func (k searchKind) label() string {
+	switch k {
+	case searchSemantic:
+		return "semantic"
+	case searchText:
+		return "trigram"
+	default:
+		return "context"
+	}
+}
 
 // formatSearchResults renders results with no query-relative relevance line —
 // used by get_chunk_context, whose rows are positional neighbours, not ranked
@@ -218,7 +288,12 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 //     get_chunk_context for the full surrounding text.
 func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchKind, query string, snippet int) *mcp.CallToolResult {
 	if len(results) == 0 {
-		return textResult("No results found.")
+		// Even the empty case emits structured content so a consumer can rely on
+		// the shape unconditionally (results: []).
+		return mcp.NewToolResultStructured(
+			SearchResultsOutput{Kind: kind.label(), Query: query, Count: 0, Results: []db.SearchResultWithMetadata{}},
+			"No results found.",
+		)
 	}
 
 	var output strings.Builder
@@ -280,7 +355,13 @@ func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchK
 		}
 	}
 
-	return textResult(output.String())
+	// Structured payload mirrors the text: the raw typed rows plus the ranking
+	// kind. The text rendering above remains the spec-required back-compat
+	// fallback (Content[0]).
+	return mcp.NewToolResultStructured(
+		SearchResultsOutput{Kind: kind.label(), Query: query, Count: len(results), Results: results},
+		output.String(),
+	)
 }
 
 // makeSnippet trims content to roughly max characters. For text search it centres
@@ -357,8 +438,16 @@ type authorGroup struct {
 // produced — no new queries — so author → books, books in their original order.
 func formatBookTree(ctx context.Context, books []db.BookSummary, total, offset int, totals db.LibraryTotals, meta metaprovider.MetadataProvider) *mcp.CallToolResult {
 	if len(books) == 0 {
-		return textResult("No books found.")
+		return mcp.NewToolResultStructured(
+			ListBooksOutput{Format: "tree", Books: []BookEntry{}, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset},
+			"No books found.",
+		)
 	}
+
+	// The structured payload is the same flat book list regardless of text
+	// grouping — `format` records which text shape was rendered. Collected in
+	// page order alongside the per-author grouping below.
+	entries := make([]BookEntry, 0, len(books))
 
 	// Group books by provider-derived author, preserving first-seen order.
 	var groups []authorGroup
@@ -369,6 +458,11 @@ func formatBookTree(ctx context.Context, books []db.BookSummary, total, offset i
 		if author == "" {
 			author = "Unknown"
 		}
+		entryTitle := bookMeta.Title
+		if entryTitle == "" {
+			entryTitle = filepath.Base(bk.Dir)
+		}
+		entries = append(entries, bookEntry(bk, author, entryTitle))
 		if i, ok := index[author]; ok {
 			groups[i].books = append(groups[i].books, bk)
 		} else {
@@ -410,9 +504,15 @@ func formatBookTree(ctx context.Context, books []db.BookSummary, total, offset i
 		b.WriteString("\n")
 	}
 
+	var nextOffset *int
 	if offset+len(books) < total {
-		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, offset+len(books))
+		n := offset + len(books)
+		nextOffset = &n
+		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, n)
 	}
 
-	return textResult(strings.TrimRight(b.String(), "\n"))
+	return mcp.NewToolResultStructured(
+		ListBooksOutput{Format: "tree", Books: entries, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset, NextOffset: nextOffset},
+		strings.TrimRight(b.String(), "\n"),
+	)
 }
