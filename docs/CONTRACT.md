@@ -454,6 +454,19 @@ raw **segments**.
 | `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments) |
 | `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (**default 1** → ~3 chunks; clamped to 0–50 to bound the response size) |
 
+**Structured output**: every tool advertises an `outputSchema` and returns
+`structuredContent` (machine-readable) **in addition to** the existing
+human-readable text, which is kept as the spec-required back-compat fallback
+(`content[0]`). The structured payloads are: the two search tools +
+`get_chunk_context` → `{ kind, query?, count, results[] }` (`kind` is
+`semantic` \| `trigram` \| `context`; `results` are the raw chunk rows);
+`list_books` → `{ format, books[], totals, total, offset, nextOffset? }`;
+`get_transcript` → `{ kind: "transcript", filePath, language, modelName,
+durationSeconds, segments[], offset, limit, totalSegments, nextOffset? }` for a
+page, or `{ kind: "trackChooser", book, tracks[] }` when a book has multiple
+tracks. Bad user input (missing/unmatched `book`, bad `chunkID`, etc.) returns a
+tool-execution error (`isError`), never a protocol error.
+
 **Snippet windows** (`snippet` on both search tools): omitted → the full ~400-word
 chunk (backward-compatible). When set, the hit's quoted text is truncated to
 ~`snippet` chars with a `…(truncated, use get_chunk_context for full text)`
