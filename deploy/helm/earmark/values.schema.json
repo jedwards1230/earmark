@@ -98,7 +98,8 @@
               "host":  { "type": "string" },
               "model": { "type": "string" },
               "role":  { "type": "string" },
-              "match": { "type": "string" }
+              "match": { "type": "string" },
+              "gpuArbiterUrl": { "type": "string" }
             }
           }
         }

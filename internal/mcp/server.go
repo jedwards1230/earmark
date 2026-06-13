@@ -42,6 +42,10 @@ type MCPServer struct {
 	// asrServers is the static ASR_SERVERS registry (may be empty) the Servers
 	// page merges with observed runner activity. Read-only; not used for routing.
 	asrServers []config.ASRServer
+
+	// prober polls gpu-arbiter for the live readiness of servers that declare a
+	// gpuArbiterUrl (TTL-cached). Swapped for a static fake in the demo.
+	prober gpuProber
 }
 
 // NewMCPServer creates a new MCP server instance
@@ -226,6 +230,9 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		meta:             meta,
 		controlToken:     cfg.ControlAPIToken,
 		asrServers:       cfg.ASRServers,
+		// 2s timeout keeps a slow/unreachable gpu-arbiter from stalling the page;
+		// 5s TTL coalesces the /servers + /api/v1/status probes within one refresh.
+		prober: newHTTPGPUProber(2*time.Second, 5*time.Second),
 	}
 }
 

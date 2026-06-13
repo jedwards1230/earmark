@@ -559,25 +559,38 @@ warning and falls back, never failing startup. Example:
  {"root":"audio-libro","layout":"author"}]
 ```
 
-`ASR_SERVERS` is a JSON array of `{"name","host","model","role","match"}` objects;
-only `name` is required. `match` is a case-insensitive substring tested against
-both `transcription_jobs.claimed_by` and `run_metrics.runner_host` to attribute
+`ASR_SERVERS` is a JSON array of
+`{"name","host","model","role","match","gpuArbiterUrl"}` objects; only `name` is
+required. `match` is a case-insensitive substring tested against both
+`transcription_jobs.claimed_by` and `run_metrics.runner_host` to attribute
 observed activity to the server (defaults to `name`). `role` is free-form
-(conventionally `primary`/`fallback`) and informational. The Servers dashboard
-page (and the `servers` array in `GET /api/v1/status`) merges this list with
-observed runner activity; an observed runner with no matching entry is still
-shown, marked *unconfigured*. Example:
+(conventionally `primary`/`fallback`) and informational. `gpuArbiterUrl` is an
+optional [gpu-arbiter](https://github.com/jedwards1230/gpu-arbiter) `/status`
+endpoint the dashboard polls (2s timeout, 5s TTL cache) for **live readiness**:
+
+| gpu-arbiter `/status` | Servers-page state | API `state` |
+|---|---|---|
+| reachable, `state=available`, runner unit up | `READY` (green) | `ready` |
+| reachable, `state=gaming`/`evicting` (or runner unit down) | `BUSY` — "connected but not usable" (amber) | `busy` |
+| unreachable | `OFFLINE` (grey) | `offline` |
+
+A fresh DB claim still wins (`TRANSCRIBING`); without a `gpuArbiterUrl` the state
+falls back to history inference (`idle`/`not_seen`). The Servers dashboard page
+and the `servers` array in `GET /api/v1/status` merge the configured list with
+observed activity; an observed runner with no matching entry is still shown,
+marked *unconfigured*. Example:
 
 ```json
-[{"name":"desktop-1","host":"192.168.8.10","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary"},
- {"name":"linux-1","host":"192.168.8.31","model":"nvidia/parakeet-tdt-0.6b-v3","role":"fallback"}]
+[{"name":"gpu-1","host":"gpu-1","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary","gpuArbiterUrl":"http://gpu-1:48750/status"},
+ {"name":"gpu-2","host":"gpu-2","model":"nvidia/parakeet-tdt-0.6b-v3","role":"fallback"}]
 ```
 
-> **Not routing.** This is observability only. There is no per-runner registry
-> or heartbeat table (§1.4), so an idle-but-online runner is indistinguishable
-> from an offline one — the page reports `idle — last active <t>`, never a false
-> "ready". Routing different job types to specific servers, and primary/fallback
-> selection, would require runner-side changes and a contract amendment.
+> **Not routing.** This is observability only. earmark does not move work between
+> servers — the runner claims its own jobs. The readiness probe is the intended
+> *signal* for a future fallback automation (read `gpuState`/`gpuReachable` from
+> `/api/v1/status`), but actually routing job types to specific servers and
+> primary/fallback selection still require runner-side changes and a contract
+> amendment.
 
 #### Python ASR runner — NeMo Parakeet-TDT (GPU/ASR host native service)
 
@@ -740,7 +753,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 
 | Method | Path | Auth | Body | Result |
 |--------|------|------|------|--------|
-| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone) |
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured) |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |

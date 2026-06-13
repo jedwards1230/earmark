@@ -27,14 +27,21 @@ var logger = log.NewLogger("config")
 // Live status is matched against observed data by Match (a case-insensitive
 // substring tested against both transcription_jobs.claimed_by and
 // run_metrics.runner_host). Match defaults to Name when omitted — e.g. a server
-// named "desktop-1" matches claimed_by "asr-runner-desktop-1" and runner_host
-// "desktop-1".
+// named "gpu-1" matches claimed_by "asr-runner-gpu-1" and runner_host
+// "gpu-1".
 type ASRServer struct {
-	Name  string `json:"name"`            // display name, e.g. "desktop-1"
-	Host  string `json:"host,omitempty"`  // host/address (informational), e.g. "192.168.8.10"
+	Name  string `json:"name"`            // display name, e.g. "gpu-1"
+	Host  string `json:"host,omitempty"`  // host/address (informational), e.g. "gpu-1"
 	Model string `json:"model,omitempty"` // expected ASR model, e.g. "nvidia/parakeet-tdt-0.6b-v3"
 	Role  string `json:"role,omitempty"`  // "primary" | "fallback" (free-form; informational)
 	Match string `json:"match,omitempty"` // token matched against claimed_by/runner_host; defaults to Name
+
+	// GPUArbiterURL is an optional gpu-arbiter /status endpoint (e.g.
+	// "http://gpu-1:48750/status") the dashboard polls for live
+	// readiness: reachable + GPU available → ready; reachable + GPU in a game →
+	// busy (the fallback signal); unreachable → offline. Empty → readiness is
+	// inferred from job activity only (idle/not-seen). See internal/mcp/servers.go.
+	GPUArbiterURL string `json:"gpuArbiterUrl,omitempty"`
 }
 
 // MatchToken is the lower-cased substring used to attribute observed runner
@@ -119,7 +126,7 @@ type Config struct {
 	// (ASR runners) declared for this deployment, so the dashboard can show a
 	// configured-but-idle server (e.g. a fallback) instead of only servers it
 	// has observed. Empty → the Servers page lists only observed runners.
-	// Example: [{"name":"desktop-1","host":"192.168.8.10",
+	// Example: [{"name":"gpu-1","host":"gpu-1",
 	//            "model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary"}]
 	// This does NOT influence job routing — the runner claims work itself.
 	ASRServers []ASRServer

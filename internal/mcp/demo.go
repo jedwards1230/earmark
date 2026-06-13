@@ -105,7 +105,7 @@ func (d demoDB) GetFailedJobs(context.Context) ([]db.FailedJob, error) {
 		"RuntimeError: CUDA out of memory. Tried to allocate 2.40 GiB " +
 		"(GPU 0; 31.49 GiB total; 28.12 GiB allocated; 1.05 GiB free)"
 	codecErr := "ffmpeg: unsupported codec in chapter 3; file skipped"
-	runner := "asr-runner-desktop-1"
+	runner := "asr-runner-gpu-1"
 	return []db.FailedJob{
 		{ID: "f1", FilePath: "/books/audio-libation/Author Seven/An Epic/An Epic.m4b",
 			Error: &cudaErr, Attempts: 3, ClaimedBy: &runner, UpdatedAt: now.Add(-15 * time.Second)},
@@ -115,16 +115,38 @@ func (d demoDB) GetFailedJobs(context.Context) ([]db.FailedJob, error) {
 }
 
 // demoASRServers is the synthetic ASR_SERVERS registry for the demo: a primary
-// (desktop-1) and a declared fallback (linux-1), so the Servers page shows the
-// configured-vs-observed merge including a configured-but-idle fallback.
+// (gpu-1, GPU ready), a fallback (gpu-2, GPU busy/gaming), and an offline
+// one (gpu-3), so the Servers page shows every gpu-arbiter readiness state. The
+// gpuArbiterUrl values are demo sentinels routed by demoGPUProber, not real
+// endpoints (the demo swaps in a static prober, so no network call is made).
 var demoASRServers = []config.ASRServer{
-	{Name: "desktop-1", Host: "192.168.8.10", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "primary"},
-	{Name: "linux-1", Host: "192.168.8.31", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback"},
+	{Name: "gpu-1", Host: "gpu-1", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "primary", GPUArbiterURL: "http://demo/gpu-1/ready"},
+	{Name: "gpu-2", Host: "gpu-2", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback", GPUArbiterURL: "http://demo/gpu-2/busy"},
+	{Name: "gpu-3", Host: "gpu-3", Model: "nvidia/parakeet-tdt-0.6b-v3", Role: "fallback", GPUArbiterURL: "http://demo/gpu-3/offline"},
+}
+
+// demoGPUProber is a static gpuProber for the demo, routing by a sentinel in the
+// URL so the page renders ready / busy / offline without any network call.
+type demoGPUProber struct{}
+
+func (demoGPUProber) Probe(_ context.Context, url string) arbiterStatus {
+	ip := func(n int) *int { return &n }
+	bp := func(b bool) *bool { return &b }
+	switch {
+	case strings.Contains(url, "busy"):
+		return arbiterStatus{Reachable: true, State: "gaming", Claims: []string{"steam:413150"},
+			ASRRunning: bp(false), VRAMUsedMB: ip(7338), VRAMTotalMB: ip(32607)}
+	case strings.Contains(url, "offline"):
+		return arbiterStatus{Reachable: false}
+	default: // ready
+		return arbiterStatus{Reachable: true, State: "available",
+			ASRRunning: bp(true), VRAMUsedMB: ip(512), VRAMTotalMB: ip(32607)}
+	}
 }
 
 // GetServerObservation returns synthetic runner activity for the Servers page.
-// active/failed: desktop-1 transcribing, linux-1 idle (fallback), plus an
-// unconfigured host (mini-1, a model with no size token). stale: desktop-1's
+// active/failed: gpu-1 transcribing, gpu-2 idle (fallback), plus an
+// unconfigured host (gpu-9, a model with no size token). stale: gpu-1's
 // claim heartbeat is hours old → STALLED. empty: nothing observed, so the
 // configured servers render as NOT SEEN.
 func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, error) {
@@ -142,28 +164,28 @@ func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, er
 	case "stale":
 		return &db.ServerObservation{
 			LiveRunners: []db.LiveRunner{
-				{ClaimedBy: "asr-runner-desktop-1", ClaimedCount: 1, LastHeartbeat: now.Add(-2 * time.Hour),
+				{ClaimedBy: "asr-runner-gpu-1", ClaimedCount: 1, LastHeartbeat: now.Add(-2 * time.Hour),
 					CurrentFile: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]/01 - Chapter 1.mp3"},
 			},
 			Hosts: []db.HostMetrics{
-				{Host: "desktop-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 120,
+				{Host: "gpu-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 120,
 					LastFinished: tp(now.Add(-2 * time.Hour)), AvgProcessingSeconds: fp(498.0)},
 			},
 		}, nil
 	default: // active / failed
 		return &db.ServerObservation{
 			LiveRunners: []db.LiveRunner{
-				{ClaimedBy: "asr-runner-desktop-1", ClaimedCount: 1, LastHeartbeat: now.Add(-12 * time.Second),
+				{ClaimedBy: "asr-runner-gpu-1", ClaimedCount: 1, LastHeartbeat: now.Add(-12 * time.Second),
 					CurrentFile: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]/01 - Chapter 1.mp3"},
 			},
 			Hosts: []db.HostMetrics{
-				{Host: "desktop-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 311,
+				{Host: "gpu-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 311,
 					LastFinished: tp(now.Add(-3 * time.Minute)), AvgProcessingSeconds: fp(487.5)},
-				{Host: "linux-1", ASRModel: &parakeet, ComputeType: &f16, JobsDone: 24,
+				{Host: "gpu-2", ASRModel: &parakeet, ComputeType: &f16, JobsDone: 24,
 					LastFinished: tp(now.Add(-6 * time.Hour)), AvgProcessingSeconds: fp(902.0)},
 				// Unconfigured host: not in demoASRServers; whisper-large-v3 has no
 				// param-size token, so the Size column shows an em dash.
-				{Host: "mini-1", ASRModel: &whisper, ComputeType: sp(int8), JobsDone: 5,
+				{Host: "gpu-9", ASRModel: &whisper, ComputeType: sp(int8), JobsDone: 5,
 					LastFinished: tp(now.Add(-48 * time.Hour)), AvgProcessingSeconds: fp(1840.0)},
 			},
 		}, nil
@@ -532,7 +554,7 @@ func (d demoDB) GetTrackDetail(_ context.Context, jobID string) (*db.TrackDetail
 	format := "m4b"
 	proc := 95.0 + float64(idx)*30
 	compute := "bfloat16"
-	host := "asr-runner-desktop-1"
+	host := "asr-runner-gpu-1"
 	chunkedF := false
 	words := 14200 + idx*800
 	chars := 84000 + idx*4000
@@ -627,6 +649,9 @@ func StartDemoDashboard(addr string) error {
 		ASRServers:      demoASRServers,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
+	// Swap the real HTTP gpu-arbiter prober for the static demo one so the
+	// readiness states render without any network call.
+	srv.prober = demoGPUProber{}
 	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",
 		"address", addr, "scenario", scenario)
 	return srv.StartHTTP(addr)

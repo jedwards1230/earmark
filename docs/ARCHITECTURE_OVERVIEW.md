@@ -16,7 +16,7 @@ NFS audiobooks (read-only)
         │                                              │
         │ SELECT … FOR UPDATE SKIP LOCKED              │ heartbeat / mark done/failed
         ▼                                              │
-  Python ASR runner (desktop-1, CUDA)                 │
+  Python ASR runner (gpu-1, CUDA)                 │
   NeMo Parakeet-TDT-0.6b-v3                           │
   reads audio over NFS                                │
         │ INSERT INTO transcripts (segments JSONB)    │
@@ -43,7 +43,7 @@ Walks `BOOKS_DIR` on NFS. For each audio file not yet in the DB, computes a SHA-
 
 ### Python ASR runner (external, GPU host)
 
-Runs natively on desktop-1 (CUDA, RTX 5090). Uses **NeMo Parakeet-TDT-0.6b-v3** (`bfloat16`). Polls `transcription_jobs` for `pending` rows via an atomic `FOR UPDATE SKIP LOCKED` claim, transcribes audio from NFS, and writes a structured `transcripts` row (segments as JSONB with word-level timestamps). Sends a heartbeat every 60s while running; the Go service resets stale claims after 30m. The runner honors a `runner_control` DB row (pause / bounded run) and a local busy-flag file (`/tmp/earmark-busy`) for GPU-contention gating.
+Runs natively on gpu-1 (CUDA, RTX 5090). Uses **NeMo Parakeet-TDT-0.6b-v3** (`bfloat16`). Polls `transcription_jobs` for `pending` rows via an atomic `FOR UPDATE SKIP LOCKED` claim, transcribes audio from NFS, and writes a structured `transcripts` row (segments as JSONB with word-level timestamps). Sends a heartbeat every 60s while running; the Go service resets stale claims after 30m. The runner honors a `runner_control` DB row (pause / bounded run) and a local busy-flag file (`/tmp/earmark-busy`) for GPU-contention gating.
 
 ### embed worker (`internal/worker`)
 
@@ -82,4 +82,4 @@ Two Kubernetes Deployments rendered by the in-repo OCI Helm chart (`deploy/helm/
 - **ingest**: monitor + embed worker (reads NFS, writes DB)
 - **mcp**: MCP server + dashboard (serves `:8081`)
 
-Both run in the `earmark` namespace. Image: `ghcr.io/jedwards1230/earmark`. ArgoCD auto-syncs from `homelab-k8s`. The Python ASR runner is a native host service on desktop-1, not a K8s pod — it connects to CNPG directly over the LAN.
+Both run in the `earmark` namespace. Image: `ghcr.io/jedwards1230/earmark`. ArgoCD auto-syncs from `homelab-k8s`. The Python ASR runner is a native host service on gpu-1, not a K8s pod — it connects to CNPG directly over the LAN.
