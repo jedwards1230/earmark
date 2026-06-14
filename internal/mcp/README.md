@@ -82,15 +82,15 @@ search result's `ID` field.
 
 | Env var | Default | Values |
 |---------|---------|--------|
-| `MCP_TRANSPORT` | `http` | `http`, `stdio` |
+| `MCP_TRANSPORT` | `stdio` | `stdio`, `http` |
 | `MCP_HTTP_ADDR` | `:8081` | |
 
 ```bash
-# HTTP (default in K8s)
-MCP_TRANSPORT=http ./earmark mcp
-
-# stdio (local testing / Claude Desktop)
+# stdio (default — Claude Desktop / local testing)
 ./earmark mcp
+
+# HTTP (set MCP_TRANSPORT=http, e.g. in K8s)
+MCP_TRANSPORT=http ./earmark mcp
 
 # Demo mode — no database required
 go run . mcp --demo

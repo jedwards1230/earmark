@@ -16,8 +16,8 @@ NFS audiobooks (read-only)
         │                                              │
         │ SELECT … FOR UPDATE SKIP LOCKED              │ heartbeat / mark done/failed
         ▼                                              │
-  Python ASR runner (gpu-1, CUDA)                 │
-  NeMo Parakeet-TDT-0.6b-v3                           │
+  Python ASR runner (GPU host, CUDA)               │
+  configured via ASR_SERVERS                           │
   reads audio over NFS                                │
         │ INSERT INTO transcripts (segments JSONB)    │
         └────────────────────────────────────────────→┘
@@ -43,7 +43,7 @@ Walks `BOOKS_DIR` on NFS. For each audio file not yet in the DB, computes a SHA-
 
 ### Python ASR runner (external, GPU host)
 
-Runs natively on gpu-1 (CUDA, RTX 5090). Uses **NeMo Parakeet-TDT-0.6b-v3** (`bfloat16`). Polls `transcription_jobs` for `pending` rows via an atomic `FOR UPDATE SKIP LOCKED` claim, transcribes audio from NFS, and writes a structured `transcripts` row (segments as JSONB with word-level timestamps). Sends a heartbeat every 60s while running; the Go service resets stale claims after 30m. The runner honors a `runner_control` DB row (pause / bounded run) and a local busy-flag file (`/tmp/earmark-busy`) for GPU-contention gating.
+One or more Python runners on GPU hosts (configured via `ASR_SERVERS`; current default: NeMo Parakeet-TDT-0.6b-v3 on a CUDA host). Each runner polls `transcription_jobs` for `pending` rows via an atomic `FOR UPDATE SKIP LOCKED` claim, transcribes audio from NFS, and writes a structured `transcripts` row (segments as JSONB with word-level timestamps). Sends a heartbeat every 60s while running; the Go service resets stale claims after 30m. The runner honors a `runner_control` DB row (pause / bounded run) and a local busy-flag file (`/tmp/earmark-busy`) for GPU-contention gating. ASR backend family, runtime, and applied capabilities are recorded in `run_metrics` (CONTRACT §2.13, §1.5).
 
 ### embed worker (`internal/worker`)
 
@@ -75,6 +75,14 @@ Streamable-HTTP MCP server on `:8081/mcp`. Status dashboard (htmx, auto-refresh)
 
 Exposed to AI clients via mcp-proxy upstream key `"audiobooks"` at `http://earmark.earmark:8081/mcp`.
 
+### AI endpoint registry (`internal/config`, CONTRACT §2.14)
+
+`AI_ENDPOINTS` + `AI_ROLES` declare named AI service endpoints (Ollama, vLLM, etc.) and bind them to roles (`embeddings`, `eval`). The embed worker resolves its Ollama endpoint through the `embeddings` role; the eval layer resolves its chat endpoint through the `eval` role. When `AI_ENDPOINTS` is unset the legacy `EMBEDDINGS_BASE_URL`/`EMBEDDINGS_MODEL` vars are synthesized into a `_legacy` endpoint. A malformed `AI_ENDPOINTS` is fatal (fail-closed).
+
+### eval layer (`internal/eval`, CONTRACT §2.15)
+
+Read-only LLM-as-judge: reads `transcript_chunks`, calls an OpenAI-compatible chat endpoint (resolved via the `eval` AI role), and records suspected transcription errors as advisory `transcript_findings`. Never edits transcripts — `suggested_correction` is informational only. Run via `earmark eval` (dry-run unless `--write`).
+
 ## Deployment
 
 Two Kubernetes Deployments rendered by the in-repo OCI Helm chart (`deploy/helm/earmark/`):
@@ -82,4 +90,4 @@ Two Kubernetes Deployments rendered by the in-repo OCI Helm chart (`deploy/helm/
 - **ingest**: monitor + embed worker (reads NFS, writes DB)
 - **mcp**: MCP server + dashboard (serves `:8081`)
 
-Both run in the `earmark` namespace. Image: `ghcr.io/jedwards1230/earmark`. ArgoCD auto-syncs from `homelab-k8s`. The Python ASR runner is a native host service on gpu-1, not a K8s pod — it connects to CNPG directly over the LAN.
+Both run in the `earmark` namespace. Image: `ghcr.io/jedwards1230/earmark`. ArgoCD auto-syncs from `homelab-k8s`. Python ASR runners are native host services (not K8s pods) — they connect to CNPG directly over the LAN and are declared in `ASR_SERVERS` for observability.

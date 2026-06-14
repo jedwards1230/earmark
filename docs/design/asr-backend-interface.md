@@ -1,11 +1,10 @@
 # Design: Swappable Multi-Backend ASR Interface
 
-> **Status: DESIGN / PROPOSAL.** No application code is changed by this document.
-> It proposes amendments to `docs/CONTRACT.md`, additive DB migrations, config
-> schema evolution, and UI/observability changes, sequenced into independently
-> shippable phases. Anything that touches a CONTRACT-governed value (§4 Change
-> Control) is called out and must land in `CONTRACT.md` before the implementing
-> code.
+> **Status: IMPLEMENTED (Phases 1–2 shipped; Phase 3 routing deferred).** The
+> shipped capability model and telemetry columns are governed by `docs/CONTRACT.md`
+> §2.13 (ASR capability vocabulary) and §1.5 (`run_metrics` ASR descriptor
+> columns) — those sections are the source of truth. This document is retained as
+> design history; refer to CONTRACT.md for current spec.
 
 ## 1. Background & current state (what exists today)
 

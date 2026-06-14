@@ -147,6 +147,10 @@ CREATE TABLE run_metrics (
     -- transcription (runner)
     transcribe_started_at TIMESTAMPTZ, transcribe_finished_at TIMESTAMPTZ, asr_model TEXT, compute_type TEXT,
     runner_host TEXT, chunked BOOLEAN, n_windows INT, char_count INT, word_count INT, segment_count INT,
+    -- ASR backend descriptor (runner, CONTRACT §2.13 / §1.5)
+    asr_family TEXT, asr_runtime TEXT,
+    caps_applied JSONB, caps_requested JSONB, caps_skipped_reason JSONB,
+    mean_word_confidence FLOAT8,
     -- embedding (Go embed worker)
     embed_started_at TIMESTAMPTZ, embed_finished_at TIMESTAMPTZ, embed_model TEXT, embed_chunk_count INT,
     embed_prompt_tokens INT, embed_total_tokens INT,

@@ -984,8 +984,8 @@ only — earmark does **not** route work between endpoints.
 
 ### 2.15 Eval Layer (read-only LLM judge)
 
-> §2.14 is reserved for the AI endpoint registry (issue #48). This section (#49)
-> documents the read-only eval layer, which depends on it.
+> §2.14 defines the AI endpoint registry (#48/#50). This section (#49)
+> documents the read-only eval layer, which binds to it.
 
 The eval layer is a **read-only LLM-as-judge** (`internal/eval`, `earmark eval`)
 that READS transcript chunks and records **suspected** transcription errors as
@@ -999,22 +999,20 @@ applied**.
 `transcript_chunks`. Its only write is `INSERT INTO transcript_findings`. The
 findings table carries no foreign key that cascade-mutates the transcript tables.
 
-#### Env vars (the #48 stub)
+#### Env vars
 
-Until the endpoint registry (§2.14, #48) lands, the chat endpoint is resolved
-from standalone env vars (config endpoint structs are intentionally left
-untouched to avoid a merge conflict). The call uses the OpenAI-compatible
-`POST {base}/chat/completions` shape.
+The chat endpoint is resolved in priority order:
+
+1. `AI_ROLES["eval"]` bound to a `chat` entry in `AI_ENDPOINTS` (preferred — see §2.14).
+2. Standalone `EVAL_CHAT_*` env vars (fallback when no `eval` role is bound).
+
+The call uses the OpenAI-compatible `POST {base}/chat/completions` shape.
 
 | Env var | Required | Meaning |
 |---------|----------|---------|
-| `EVAL_CHAT_BASE_URL` | to run `eval` | OpenAI-compatible base URL, e.g. `http://vllm:8000/v1` |
-| `EVAL_CHAT_MODEL` | to run `eval` | judge model id |
+| `EVAL_CHAT_BASE_URL` | if no `eval` role in `AI_ROLES` | OpenAI-compatible base URL, e.g. `http://vllm:8000/v1` |
+| `EVAL_CHAT_MODEL` | if no `eval` role in `AI_ROLES` | judge model id |
 | `EVAL_CHAT_API_KEY` | no | bearer token if the endpoint requires one |
-
-> **Migration note:** when #48 lands, the chat client is resolved from
-> `AI_ROLES["eval"]` instead (see the `TODO(#48)` at `eval.ResolveChatClient`);
-> these env vars become the fallback.
 
 #### `transcript_findings` table
 

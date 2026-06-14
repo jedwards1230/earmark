@@ -5,7 +5,7 @@
 | Secret | Required | Purpose |
 |--------|----------|---------|
 | `GITHUB_TOKEN` | Auto-provided | Tag pushing, GHCR login, release creation |
-| `ANTHROPIC_API_KEY` | Required | AI-generated release notes (Claude); falls back to GitHub's native notes if absent |
+| `ANTHROPIC_API_KEY` | Optional | AI-generated release notes (Claude); falls back to GitHub's native notes if absent |
 
 ## Repository Permissions
 

@@ -26,7 +26,7 @@ Go monitor + worker (K8s Deployment)
 Key facts:
 - **No local transcription** — the Go service only enqueues jobs and processes results.
 - **Embeddings**: Ollama (`nomic-embed-text`, 768-dim) via OpenAI-compatible API.
-- **MCP transport**: `streamable-http` (default); `stdio` for local testing.
+- **MCP transport**: `stdio` (default); set `MCP_TRANSPORT=http` for HTTP (e.g. in K8s).
 - **Database schema**: Three tables — `transcription_jobs`, `transcripts`,
   `transcript_chunks`. See `docs/DATABASE_SCHEMA.md` and `docs/CONTRACT.md`.
 
@@ -87,8 +87,9 @@ go run . mcp --demo     # serves http://localhost:8081/ with synthetic data
 `--demo` backs the dashboard with an in-memory fixture (`internal/mcp/demo.go`)
 so the page renders fully with no Postgres, no DATABASE_URL, and no ASR runner.
 Set `DEMO_SCENARIO` to render a specific state: `active` (default), `empty`
-(fresh install), `stale` (crashed runner — old heartbeat), or `failed` (failures
-incl. a long multi-line error). To see the connection-lost banner, open the page
+(fresh install), `stale` (crashed runner — old heartbeat), `failed` (failures
+incl. a long multi-line error), or `multibackend` (three ASR families —
+Parakeet/Whisper/Canary — across three servers). To see the connection-lost banner, open the page
 then stop the server — htmx flags the data stale instead of freezing silently.
 
 Playwright is wired for AI agents via `.claude/mcp.json` (the `playwright` MCP
@@ -127,13 +128,12 @@ Debug-only (both must be set):
 | `internal/db` | pgxpool-based DB handle; schema init; job queue; search; chunks |
 | `internal/worker` | Polls completed transcripts, chunks via segments, embeds, stores |
 | `internal/monitor` | Walks BOOKS_DIR, inserts pending jobs (dedup by SHA-256) |
-| `internal/mcp` | MCP server + tool handlers — 5 tools: semantic/text search (optional per-book scope + `snippet` excerpt window; text hits labelled "trigram match", not similarity; ASIN-aware `book` resolution — bracketed `[B0…]`/`[digits]` matches ASIN exactly, else title+author substring with ASIN stripped), `list_books` (`format=flat\|tree`; transcribed-first ordering, whole-library summary line, flat omits `dir:`), `get_transcript` (paginates segments), `get_chunk_context` (chunk UUID → neighbours; `contextWindow` default 1). No `browse` tool. Result formatter suppresses the dead `Chapter 0:` label. |
+| `internal/mcp` | MCP server (5 tools), status dashboard, control API, `/servers` Models/Services page. See [`internal/mcp/README.md`](internal/mcp/README.md) and [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for full details. |
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client; resolves its endpoint through the AI registry's `embeddings` role (CONTRACT §2.14) |
 | `internal/asr` | ASR backend capability vocabulary (CONTRACT §2.13): closed capability enum + `ParseCapabilities` (drops unknown keys), recommended `family`/`runtime` ids + `KnownFamily`/`KnownRuntime` label helpers. Pure leaf package (no DB/HTTP deps). |
-| `internal/eval` | Read-only LLM-as-judge (CONTRACT §2.15, `earmark eval`): READS transcript chunks, calls an OpenAI-compatible chat endpoint behind the `ChatClient` interface, parses suspected errors + confidence, INSERTs advisory `transcript_findings`. NEVER edits transcripts. Chat endpoint resolved via `EVAL_CHAT_*` env vars (TODO(#48): bind to the AI endpoint registry). |
+| `internal/eval` | Read-only LLM-as-judge (CONTRACT §2.15, `earmark eval`): READS transcript chunks, INSERTs advisory `transcript_findings`. NEVER edits transcripts. Chat endpoint resolved via `AI_ROLES["eval"]` (registry, CONTRACT §2.14) falling back to `EVAL_CHAT_*` env vars. |
 | `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry + per-server backend descriptor; and the `AI_ENDPOINTS`/`AI_ROLES` AI endpoint registry, CONTRACT §2.14, with legacy `EMBEDDINGS_*` synthesis + role resolution) |
-| `internal/mcp` (servers.go, gpuprobe.go, endpoints.go, endpointprobe.go) | **Models/Services** dashboard page (`/servers`) + `servers[]`/`endpoints[]` in `/api/v1/status`: merges the configured `ASR_SERVERS` list with observed runner activity + a gpu-arbiter readiness probe, and lists every `AI_ENDPOINTS` entry with a `GET /models` liveness probe. Observability only — no job routing. |
 
 ## Development Notes
 
