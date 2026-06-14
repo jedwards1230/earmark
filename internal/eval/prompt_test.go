@@ -1,6 +1,9 @@
 package eval
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseFindings_ValidJSON(t *testing.T) {
 	raw := `{"findings":[
@@ -74,6 +77,14 @@ func TestParseFindings_ConfidenceClampedAndIssueCoerced(t *testing.T) {
 	}
 	if got[2].IssueType != issueOther {
 		t.Errorf("unknown issue_type not coerced to 'other': %q", got[2].IssueType)
+	}
+}
+
+func TestParseFindings_RejectsOversizedResponse(t *testing.T) {
+	// A response above the size cap is rejected before unmarshal (OOM guard).
+	huge := "{" + strings.Repeat("a", maxJudgeResponseBytes) + "}"
+	if _, err := parseFindings(huge); err == nil {
+		t.Fatal("expected error for oversized judge response")
 	}
 }
 

@@ -58,7 +58,12 @@ func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		model:   cfg.Model,
 		apiKey:  cfg.APIKey,
-		http:    &http.Client{Timeout: 120 * time.Second},
+		// Timeout is only a backstop for a hung endpoint (120s ≈ typical LLM
+		// latency ceiling). The caller's context takes precedence: Complete builds
+		// the request with http.NewRequestWithContext, so Do() returns the context
+		// error as soon as ctx is cancelled or its deadline passes, regardless of
+		// this timeout.
+		http: &http.Client{Timeout: 120 * time.Second},
 	}
 }
 

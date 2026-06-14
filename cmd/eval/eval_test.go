@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
@@ -91,5 +92,32 @@ func TestRun_RejectsBookAndSample(t *testing.T) {
 	}
 	if f.called {
 		t.Error("runner should not be called when scope is ambiguous")
+	}
+}
+
+func TestTruncate_RuneSafe(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{"ascii under limit", "hello", 60, "hello"},
+		{"ascii over limit", "abcdef", 3, "abc…"},
+		// "Atréïdes Bʁöñ" is multi-byte; truncating at a rune boundary must not
+		// split a codepoint (a byte slice at n=5 would corrupt the é/ï).
+		{"multibyte not split", "Atréïdes Brön", 5, "Atréï…"},
+		{"multibyte under limit", "café", 60, "café"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncate(tc.in, tc.n)
+			if got != tc.want {
+				t.Errorf("truncate(%q,%d) = %q, want %q", tc.in, tc.n, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("truncate(%q,%d) produced invalid UTF-8: %q", tc.in, tc.n, got)
+			}
+		})
 	}
 }

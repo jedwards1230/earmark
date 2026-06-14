@@ -2,6 +2,7 @@ package eval
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jedwards1230/earmark/internal/db"
@@ -24,7 +25,8 @@ type RunOptions struct {
 
 // RunStats summarizes a judge run for the operator-facing report.
 type RunStats struct {
-	ChunksEvaluated int
+	ChunksEvaluated int // chunks the judge successfully evaluated
+	ChunksSkipped   int // chunks skipped due to a transient judge error
 	FindingsFound   int
 	Persisted       bool
 }
@@ -33,6 +35,15 @@ type RunStats struct {
 // findings, and — only when opts.Write — persists them in one insert-only
 // transaction. It NEVER mutates the transcript tables; the only write it can
 // perform is the InsertFindings call, and only under the Write gate.
+//
+// A transient judge error on one chunk (endpoint glitch, timeout on a single
+// request) does NOT discard the run: the chunk is skipped (logged, counted in
+// ChunksSkipped) and the run continues, so a mid-stream blip can't silently wipe
+// the advisory findings already collected — partial results beat nothing for
+// quality observability. This mirrors the malformed-response soft-fail in
+// JudgeChunk. Only a cancelled/expired context aborts (returning the findings
+// collected so far plus the context error), since continuing past that is
+// pointless and the caller asked to stop.
 //
 // The returned findings are always populated (so a dry-run can print exactly
 // what it would record); Persisted reports whether they were written.
@@ -43,17 +54,28 @@ func Run(ctx context.Context, reader ChunkReader, judge *Judge, writer FindingWr
 	}
 
 	var all []db.Finding
+	var stats RunStats
 	for _, c := range chunks {
 		res, jerr := judge.JudgeChunk(ctx, c)
 		if jerr != nil {
-			// A hard chat error (endpoint down, context cancelled) aborts the run
-			// rather than silently under-reporting quality.
-			return nil, RunStats{}, jerr
+			// Cancellation/deadline is a deliberate stop: abort, but return the
+			// findings gathered so far rather than discarding them.
+			if errors.Is(jerr, context.Canceled) || errors.Is(jerr, context.DeadlineExceeded) {
+				stats.FindingsFound = len(all)
+				return all, stats, jerr
+			}
+			// A transient per-chunk judge error (network glitch, single-request
+			// timeout): skip this chunk and keep going.
+			judge.logger.Warn("skipping chunk due to judge error",
+				"chunk_id", c.ChunkID, "error", jerr)
+			stats.ChunksSkipped++
+			continue
 		}
+		stats.ChunksEvaluated++
 		all = append(all, res.Findings...)
 	}
 
-	stats := RunStats{ChunksEvaluated: len(chunks), FindingsFound: len(all)}
+	stats.FindingsFound = len(all)
 
 	if opts.Write && len(all) > 0 {
 		if err := writer.InsertFindings(ctx, all); err != nil {

@@ -136,6 +136,9 @@ func run(ctx context.Context, out io.Writer, r runner, book string, o options) e
 	}
 	p("Evaluated %d chunk(s) from %s — %d suspected error(s) found.\n",
 		stats.ChunksEvaluated, scope, stats.FindingsFound)
+	if stats.ChunksSkipped > 0 {
+		p("(%d chunk(s) skipped due to transient judge errors — partial results below.)\n", stats.ChunksSkipped)
+	}
 
 	for _, f := range findings {
 		conf := f.Confidence
@@ -154,10 +157,13 @@ func run(ctx context.Context, out io.Writer, r runner, book string, o options) e
 	return nil
 }
 
-// truncate shortens a string for the preview line, appending an ellipsis.
+// truncate shortens a string to n runes for the preview line, appending an
+// ellipsis. It slices by rune (not byte) so a multi-byte codepoint — accented
+// proper nouns, CJK, emoji — is never split mid-encoding.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(runes[:n]) + "…"
 }

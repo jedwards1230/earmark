@@ -2447,8 +2447,15 @@ type JobMatch struct {
 	Status   string
 }
 
-// likePattern wraps a user substring for a case-insensitive ILIKE match.
-func likePattern(substr string) string { return "%" + substr + "%" }
+// likePattern wraps a user substring for a case-insensitive ILIKE match. It
+// escapes the LIKE metacharacters (%, _, \) in the user input via likePrefix
+// before adding the surrounding % wildcards, so a substring containing % or _
+// matches those characters literally instead of widening the match. This keeps
+// the match a true substring (preserving the title-fragment ergonomics) while
+// closing the unbounded-wildcard hole that would otherwise let `eval`/`requeue`
+// scope explode. The escaping assumes the default Postgres LIKE escape char (\),
+// which the bare `ILIKE $1` call sites all use.
+func likePattern(substr string) string { return "%" + likePrefix(substr) + "%" }
 
 // FindJobs returns jobs whose file_path contains substr (case-insensitive),
 // for previewing a requeue before it runs.

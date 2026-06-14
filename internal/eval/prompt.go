@@ -99,12 +99,26 @@ type parsedFinding struct {
 	Confidence          float64
 }
 
+// maxJudgeResponseBytes caps the judge response we will attempt to parse. A
+// misbehaving or hostile endpoint returning a huge body could otherwise drive
+// an unbounded allocation in json.Unmarshal. The openAIChatClient already caps
+// its HTTP read at 1 MiB; this is a second, transport-independent guard so any
+// ChatClient (incl. a future one) can't OOM the judge. 10 MiB is far above any
+// legitimate findings array for a single chunk.
+const maxJudgeResponseBytes = 10 << 20 // 10 MiB
+
 // parseFindings extracts and normalizes findings from the model's raw text.
-// It is defensive: it tolerates surrounding prose / markdown fences by scanning
-// for the JSON object, clamps confidence to [0,1], coerces an unknown issue_type
-// to "other", and drops findings with an empty original_text. A response with no
-// extractable JSON object returns an error (the caller treats it as no findings).
+// It is defensive: it rejects an oversized response (OOM guard), tolerates
+// surrounding prose / markdown fences by scanning for the JSON object, clamps
+// confidence to [0,1], coerces an unknown issue_type to "other", and drops
+// findings with an empty original_text. A response with no extractable JSON
+// object (or an oversized one) returns an error, which the caller treats as no
+// findings (soft-fail).
 func parseFindings(raw string) ([]parsedFinding, error) {
+	if len(raw) > maxJudgeResponseBytes {
+		return nil, fmt.Errorf("judge response exceeds size limit (%d > %d bytes)", len(raw), maxJudgeResponseBytes)
+	}
+
 	jsonText, ok := extractJSONObject(raw)
 	if !ok {
 		return nil, fmt.Errorf("no JSON object found in judge response")
