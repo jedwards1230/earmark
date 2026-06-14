@@ -106,6 +106,45 @@ the two Deployments.
 - name: ASR_SERVERS
   value: {{ toJson . | quote }}
 {{- end }}
+{{- /*
+  AI endpoint registry (CONTRACT §2.14). Pass-through JSON, same precedent as
+  ASR_SERVERS above. When aiEndpoints is empty the env vars are omitted and the
+  app synthesizes a `_legacy` embeddings endpoint from EMBEDDINGS_BASE_URL/
+  EMBEDDINGS_MODEL — so the legacy path stays intact. When aiEndpoints is set,
+  aiRoles.embeddings is required (the app fails closed without it); guard at
+  render time, mirroring the absURL/absToken guard below.
+*/}}
+{{- if and .Values.config.aiEndpoints (not (and .Values.config.aiRoles .Values.config.aiRoles.embeddings)) }}
+{{- fail "config.aiEndpoints is set but config.aiRoles.embeddings is empty. AI_ROLES.embeddings is required when AI_ENDPOINTS is set (CONTRACT §2.14): set config.aiRoles.embeddings to the id of an embeddings endpoint, or clear config.aiEndpoints to use the legacy EMBEDDINGS_* path." }}
+{{- end }}
+{{- with .Values.config.aiEndpoints }}
+- name: AI_ENDPOINTS
+  value: {{ toJson . | quote }}
+{{- end }}
+{{- with .Values.config.aiRoles }}
+- name: AI_ROLES
+  value: {{ toJson . | quote }}
+{{- end }}
+{{- /*
+  Eval-layer chat endpoint (CONTRACT §2.15). Standalone EVAL_CHAT_* env vars
+  consumed by internal/eval when a chat endpoint (e.g. vLLM) exists. Each is
+  emitted only when set, so an unset evalChat leaves the eval layer unconfigured
+  (eval is on-demand and degrades gracefully). EVAL_CHAT_API_KEY is a plain value
+  passthrough for now — move it to a secretKeyRef if the endpoint needs a real
+  credential.
+*/}}
+{{- with .Values.config.evalChat.baseURL }}
+- name: EVAL_CHAT_BASE_URL
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.config.evalChat.model }}
+- name: EVAL_CHAT_MODEL
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.config.evalChat.apiKey }}
+- name: EVAL_CHAT_API_KEY
+  value: {{ . | quote }}
+{{- end }}
 - name: METADATA_PROVIDER
   value: {{ .Values.config.metadataProvider | quote }}
 {{- /*

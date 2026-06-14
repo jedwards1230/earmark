@@ -39,6 +39,11 @@ booksPvcName: books-ro
 
 # ── Application config ─────────────────────────────────────────────────────────
 config:
+  # ── Legacy embeddings endpoint (CONTRACT §2.4) ─────────────────────────────
+  # EMBEDDINGS_BASE_URL/EMBEDDINGS_MODEL are the deprecated single-endpoint vars.
+  # When aiEndpoints (below) is empty, the app synthesizes a `_legacy` embeddings
+  # endpoint from these two — which is exactly why the live dashboard shows the
+  # endpoint as `_legacy`. Set aiEndpoints + aiRoles to give it a real id.
   embeddingsBaseURL: "http://ollama:11434/v1"
   embeddingsModel: "nomic-embed-text"
   booksDir: "/books"
@@ -82,6 +87,42 @@ config:
   #     - {name: cpu-1, host: cpu-1, role: fallback, family: whisper, runtime: whisper.cpp,
   #        capabilities: {word_timestamps: true}}
   asrServers: []
+
+  # ── AI endpoint registry (CONTRACT §2.14) ──────────────────────────────────
+  # aiEndpoints is pass-through JSON → the AI_ENDPOINTS env var (same precedent
+  # as asrServers): the set of OpenAI-compatible AI endpoints this deployment
+  # talks to. Each entry: {id, type: embeddings|chat, backend: ollama|vllm|
+  # openai-compat, baseURL, model, options?{...string}}; id/type/backend/baseURL/
+  # model are required by the app's validator.
+  #
+  # When aiEndpoints is EMPTY (the default), AI_ENDPOINTS/AI_ROLES are omitted and
+  # the app synthesizes a `_legacy` embeddings endpoint from embeddingsBaseURL/
+  # embeddingsModel above — that legacy fallback is why the dashboard shows
+  # `_legacy`. Populate aiEndpoints to give the embeddings endpoint a real id and
+  # to register a chat endpoint for the eval layer.
+  #
+  # aiRoles is pass-through JSON → AI_ROLES, binding roles to endpoint ids:
+  # {embeddings: <id>, eval?: <id>}. aiRoles.embeddings is REQUIRED whenever
+  # aiEndpoints is non-empty (the chart fails to render otherwise, mirroring the
+  # app's fail-closed behavior); eval is optional (omit → no eval layer).
+  # Example:
+  #   aiEndpoints:
+  #     - {id: ollama-embed, type: embeddings, backend: ollama,
+  #        baseURL: "http://ollama:11434/v1", model: nomic-embed-text}
+  #     - {id: vllm-eval, type: chat, backend: vllm,
+  #        baseURL: "http://vllm:8000/v1", model: qwen2.5-7b-instruct}
+  #   aiRoles: {embeddings: ollama-embed, eval: vllm-eval}
+  aiEndpoints: []
+  aiRoles: {}
+
+  # ── Eval-layer chat endpoint (CONTRACT §2.15) ──────────────────────────────
+  # Standalone EVAL_CHAT_* vars for internal/eval's read-only LLM judge, for when
+  # a chat endpoint (e.g. vLLM) exists but the AI registry isn't wired yet. Each
+  # field is emitted only when set; an empty evalChat leaves the eval layer
+  # unconfigured (eval is on-demand, so this is fine). apiKey is a plain value
+  # passthrough for now — move it to a secret if the endpoint needs a credential.
+  #   evalChat: {baseURL: "http://vllm:8000/v1", model: qwen2.5-7b-instruct, apiKey: ""}
+  evalChat: {}
 
   # ── Metadata provider (CONTRACT §2.4) ──────────────────────────────────────
   # METADATA_PROVIDER selects how the ingest monitor derives book metadata:
