@@ -125,6 +125,7 @@ Debug-only (both must be set):
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client (pointed at Ollama) |
 | `internal/asr` | ASR backend capability vocabulary (CONTRACT §2.13): closed capability enum + `ParseCapabilities` (drops unknown keys), recommended `family`/`runtime` ids + `KnownFamily`/`KnownRuntime` label helpers. Pure leaf package (no DB/HTTP deps). |
+| `internal/eval` | Read-only LLM-as-judge (CONTRACT §2.15, `earmark eval`): READS transcript chunks, calls an OpenAI-compatible chat endpoint behind the `ChatClient` interface, parses suspected errors + confidence, INSERTs advisory `transcript_findings`. NEVER edits transcripts. Chat endpoint resolved via `EVAL_CHAT_*` env vars (TODO(#48): bind to the AI endpoint registry). |
 | `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry + per-server backend descriptor: family/runtime/capabilities/languages) |
 | `internal/mcp` (servers.go, gpuprobe.go) | **Servers** dashboard page (`/servers`) + `servers[]` in `/api/v1/status`: merges the configured `ASR_SERVERS` list with observed runner activity (live claims + per-host `run_metrics`) and an optional gpu-arbiter readiness probe (per-server `gpuArbiterUrl` → ready/busy/offline) into status + a models/modes table. Observability only — no job routing. |
 

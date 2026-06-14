@@ -201,6 +201,39 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 
 `bias_terms` is re-derived from metadata on every write (never COALESCE-guarded).
 
+### 7. `transcript_findings` — Read-only Eval Layer (CONTRACT §2.15)
+
+Advisory suspected-error findings recorded by the read-only LLM judge
+(`internal/eval`, `earmark eval`). The eval layer is **strictly read-then-insert**:
+it READS `transcripts`/`transcript_chunks` and INSERTs here; it NEVER updates,
+deletes, or alters the transcript tables, and this table has no FK that could
+cascade a mutation back into them. `suggested_correction` is informational only —
+never applied.
+
+```sql
+CREATE TABLE IF NOT EXISTS transcript_findings (
+    id                   UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+    transcript_id        UUID        NOT NULL,
+    file_path            TEXT        NOT NULL,
+    chunk_id             UUID,
+    chunk_index          INTEGER,
+    start_sec            FLOAT8      NOT NULL,
+    end_sec              FLOAT8      NOT NULL,
+    original_text        TEXT        NOT NULL,
+    issue_type           TEXT        NOT NULL,
+    suggested_correction TEXT,
+    confidence           FLOAT8      NOT NULL,
+    model                TEXT        NOT NULL,
+    transcription_run_id UUID,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- indexes: file_path, transcript_id, transcription_run_id, issue_type
+```
+
+`confidence` is the judge's self-score (0–1, the triage/scoring signal).
+`transcription_run_id` is the `transcription_jobs.id` of the run that produced
+the transcript, so findings are attributable per ASR backend/run.
+
 ## Relationships
 
 ```

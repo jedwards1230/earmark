@@ -903,6 +903,98 @@ stores/displays it as-is.
 
 ---
 
+### 2.15 Eval Layer (read-only LLM judge)
+
+> §2.14 is reserved for the AI endpoint registry (issue #48). This section (#49)
+> documents the read-only eval layer, which depends on it.
+
+The eval layer is a **read-only LLM-as-judge** (`internal/eval`, `earmark eval`)
+that READS transcript chunks and records **suspected** transcription errors as
+**advisory metadata** — it NEVER edits transcripts. The asymmetry is the whole
+point: a wrong flag is harmless (triage by confidence), a wrong *correction*
+would corrupt the corpus, so `suggested_correction` is recorded but **never
+applied**.
+
+**Read-only / advisory contract (binding):** the eval layer issues no
+`UPDATE`/`DELETE`/`ALTER`/`DROP`/`TRUNCATE` against `transcripts`, `segments`, or
+`transcript_chunks`. Its only write is `INSERT INTO transcript_findings`. The
+findings table carries no foreign key that cascade-mutates the transcript tables.
+
+#### Env vars (the #48 stub)
+
+Until the endpoint registry (§2.14, #48) lands, the chat endpoint is resolved
+from standalone env vars (config endpoint structs are intentionally left
+untouched to avoid a merge conflict). The call uses the OpenAI-compatible
+`POST {base}/chat/completions` shape.
+
+| Env var | Required | Meaning |
+|---------|----------|---------|
+| `EVAL_CHAT_BASE_URL` | to run `eval` | OpenAI-compatible base URL, e.g. `http://vllm:8000/v1` |
+| `EVAL_CHAT_MODEL` | to run `eval` | judge model id |
+| `EVAL_CHAT_API_KEY` | no | bearer token if the endpoint requires one |
+
+> **Migration note:** when #48 lands, the chat client is resolved from
+> `AI_ROLES["eval"]` instead (see the `TODO(#48)` at `eval.ResolveChatClient`);
+> these env vars become the fallback.
+
+#### `transcript_findings` table
+
+```sql
+CREATE TABLE transcript_findings (
+    id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    transcript_id        UUID        NOT NULL,   -- no cascade-mutate into transcripts
+    file_path            TEXT        NOT NULL,
+    chunk_id             UUID,                    -- the evaluated chunk (nullable)
+    chunk_index          INTEGER,
+    start_sec            FLOAT8      NOT NULL,
+    end_sec              FLOAT8      NOT NULL,
+    original_text        TEXT        NOT NULL,    -- the suspected-wrong span, verbatim
+    issue_type           TEXT        NOT NULL,    -- see vocabulary below
+    suggested_correction TEXT,                    -- ADVISORY ONLY — never applied
+    confidence           FLOAT8      NOT NULL,    -- judge self-score 0..1 (the triage/scoring signal)
+    model                TEXT        NOT NULL,    -- judge model id (attribution)
+    transcription_run_id UUID,                    -- transcription_jobs.id — per-backend/run attribution
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- indexes: file_path, transcript_id, transcription_run_id, issue_type
+```
+
+`issue_type` is a closed vocabulary the judge prompt advertises; an unknown value
+returned by the model is coerced to `other`:
+
+| `issue_type` | Meaning |
+|--------------|---------|
+| `misheard_proper_noun` | a name/place likely mis-recognized |
+| `run_on` | a sentence/segment boundary was lost |
+| `number_artifact` | digits/dates/units garbled |
+| `homophone` | wrong word, right sound |
+| `dropped_word` | likely omission |
+| `other` | any other suspected error |
+
+#### Sampling / cost
+
+The judge is **sampled or on-demand**, never an always-on pass: `earmark eval
+"<book>"` evaluates one book; `earmark eval --sample N` judges N random chunks
+library-wide. The unit of evaluation is the **chunk**. The command is dry-run by
+default (prints what it would record) and persists only with `--write` (alias
+`--yes`).
+
+#### Two payoffs
+
+1. **Quality observability** — error counts/types and a confidence spread per
+   book, on the read-only `/findings` dashboard page.
+2. **Backend eval harness** — `transcription_run_id` attributes each finding to
+   the ASR run (hence backend) that produced the transcript, so running the same
+   judge over Parakeet vs Whisper vs Granite output yields a comparative quality
+   metric; `confidence` is the scoring signal. This is the measurement the
+   deferred multi-backend A/B needs.
+
+The judge has false positives and misses; because findings are advisory-only
+that is harmless. Track judge precision over time by spot-checking high-confidence
+findings.
+
+---
+
 ## 3. SCHEMA — pgvector chunks table
 
 The Go service reads completed transcripts, chunks them, and embeds each chunk.
