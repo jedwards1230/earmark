@@ -3,6 +3,8 @@ package eval
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jedwards1230/earmark/internal/db"
@@ -79,6 +81,74 @@ func TestJudgeChunk_MalformedResponseIsSoftFailure(t *testing.T) {
 	}
 	if len(res.Findings) != 0 {
 		t.Fatalf("want 0 findings for malformed response, got %d", len(res.Findings))
+	}
+}
+
+// manyFindingsJSON builds a judge response with n findings whose confidence
+// descends from 0.99 (finding 0) toward 0, so the highest-confidence findings
+// are easy to identify by their original_text marker.
+func manyFindingsJSON(n int) string {
+	var b strings.Builder
+	b.WriteString(`{"findings":[`)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		conf := 0.99 - float64(i)*0.01
+		fmt.Fprintf(&b, `{"original_text":"finding-%02d","issue_type":"other","suggested_correction":"","confidence":%.2f}`, i, conf)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+func TestJudgeChunk_CapsPerChunkKeepingHighestConfidence(t *testing.T) {
+	// Default cap is 8. Feed 12 findings (confidence 0.99 desc) and expect the
+	// top 8 by confidence (finding-00..finding-07) to survive.
+	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "") // exercise the default
+	chat := &fakeChat{resp: manyFindingsJSON(12)}
+	j := NewJudge(chat)
+	res, err := j.JudgeChunk(context.Background(), sampleChunk())
+	if err != nil {
+		t.Fatalf("JudgeChunk: %v", err)
+	}
+	if len(res.Findings) != defaultMaxFindingsPerChunk {
+		t.Fatalf("want %d findings after cap, got %d", defaultMaxFindingsPerChunk, len(res.Findings))
+	}
+	// The retained set must be the highest-confidence ones: every kept finding's
+	// confidence >= every dropped one's. finding-00 (0.99) must be present;
+	// finding-11 (0.88, the lowest) must be gone.
+	kept := map[string]bool{}
+	for _, f := range res.Findings {
+		kept[f.OriginalText] = true
+		if f.Confidence < 0.99-float64(defaultMaxFindingsPerChunk-1)*0.01-1e-9 {
+			t.Errorf("kept a low-confidence finding %q (conf %.2f) — cap must keep the highest", f.OriginalText, f.Confidence)
+		}
+	}
+	if !kept["finding-00"] {
+		t.Error("highest-confidence finding (finding-00) was dropped")
+	}
+	if kept["finding-11"] {
+		t.Error("lowest-confidence finding (finding-11) was kept — should have been truncated")
+	}
+}
+
+func TestJudgeChunk_CapEnvOverrideAndDisable(t *testing.T) {
+	// Override the cap to 2.
+	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "2")
+	chat := &fakeChat{resp: manyFindingsJSON(5)}
+	if res, err := NewJudge(chat).JudgeChunk(context.Background(), sampleChunk()); err != nil {
+		t.Fatalf("JudgeChunk: %v", err)
+	} else if len(res.Findings) != 2 {
+		t.Fatalf("want 2 findings with cap=2, got %d", len(res.Findings))
+	}
+
+	// A negative value disables the cap entirely (all findings retained).
+	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "-1")
+	chat2 := &fakeChat{resp: manyFindingsJSON(5)}
+	if res, err := NewJudge(chat2).JudgeChunk(context.Background(), sampleChunk()); err != nil {
+		t.Fatalf("JudgeChunk: %v", err)
+	} else if len(res.Findings) != 5 {
+		t.Fatalf("want 5 findings with cap disabled, got %d", len(res.Findings))
 	}
 }
 

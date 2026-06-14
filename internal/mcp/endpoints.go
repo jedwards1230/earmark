@@ -150,17 +150,20 @@ func (s *MCPServer) probeEndpoints(ctx context.Context) map[string]endpointProbe
 	return out
 }
 
-// roleNote renders the assigned-role suffix on a card ("role: embeddings
-// (assigned)"), or "" when the endpoint is unbound.
-func (v endpointView) roleNote() string {
+// RoleNote renders the assigned-role suffix on a card ("role: embeddings
+// (assigned)"), or "" when the endpoint is unbound. Exported because
+// html/template only invokes exported methods — an unexported method name is
+// treated as a (missing) field lookup and errors at execute time.
+func (v endpointView) RoleNote() string {
 	if v.Role == "" {
 		return ""
 	}
 	return "role: " + v.Role + " (assigned)"
 }
 
-// optionsLine renders the options as "k=v k=v …" for the card, or "" when none.
-func (v endpointView) optionsLine() string {
+// OptionsLine renders the options as "k=v k=v …" for the card, or "" when none.
+// Exported for the same reason as RoleNote (template method dispatch).
+func (v endpointView) OptionsLine() string {
 	if len(v.Options) == 0 {
 		return ""
 	}

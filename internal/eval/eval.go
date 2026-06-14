@@ -15,10 +15,39 @@ package eval
 import (
 	"context"
 	"fmt"
+	"os"
+	"sort"
+	"strconv"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
 )
+
+// defaultMaxFindingsPerChunk bounds how many findings the judge keeps for a
+// single chunk. The judge over-flags in practice (one chunk produced 31;
+// llama3.2:3b and qwen2.5:7b both averaged ~3/chunk over a 50-chunk sample, but
+// the tail is long), so a per-chunk cap keeps the highest-confidence signal and
+// drops the noisy remainder. Tunable via EVAL_MAX_FINDINGS_PER_CHUNK; a value
+// <= 0 disables the cap.
+const defaultMaxFindingsPerChunk = 8
+
+// maxFindingsPerChunk resolves the per-chunk cap from EVAL_MAX_FINDINGS_PER_CHUNK,
+// falling back to defaultMaxFindingsPerChunk. A blank/invalid value uses the
+// default; an explicit <= 0 disables capping (returned as 0).
+func maxFindingsPerChunk() int {
+	raw := os.Getenv("EVAL_MAX_FINDINGS_PER_CHUNK")
+	if raw == "" {
+		return defaultMaxFindingsPerChunk
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultMaxFindingsPerChunk
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
 
 // ChatClient is the small abstraction over the chat-LLM endpoint the judge
 // needs. Implemented by openAIChatClient (OpenAI-compatible /v1/chat/completions)
@@ -51,11 +80,15 @@ type FindingWriter interface {
 type Judge struct {
 	chat   ChatClient
 	logger log.Logger
+	// maxPerChunk caps findings kept per chunk (highest-confidence first); 0
+	// disables the cap. Resolved once from EVAL_MAX_FINDINGS_PER_CHUNK at
+	// construction so a single value applies for the whole run.
+	maxPerChunk int
 }
 
 // NewJudge constructs a Judge backed by the given chat client.
 func NewJudge(chat ChatClient) *Judge {
-	return &Judge{chat: chat, logger: log.NewLogger("eval")}
+	return &Judge{chat: chat, logger: log.NewLogger("eval"), maxPerChunk: maxFindingsPerChunk()}
 }
 
 // Result is the outcome of judging one chunk: the findings derived from it and
@@ -86,6 +119,8 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		return Result{Chunk: c}, nil
 	}
 
+	parsed = j.capFindings(c, parsed)
+
 	model := j.chat.Model()
 	findings := make([]db.Finding, 0, len(parsed))
 	chunkID := c.ChunkID
@@ -108,6 +143,25 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		})
 	}
 	return Result{Chunk: c, Findings: findings}, nil
+}
+
+// capFindings bounds a single chunk's findings to j.maxPerChunk, keeping the
+// highest-confidence ones (the judge over-flags, and a wrong flag is only noise
+// — so when forced to drop, drop the least-confident). It sorts by confidence
+// descending (stable, so equal-confidence findings keep their original order
+// for a deterministic result) and truncates. A cap of 0 (disabled) or a set
+// already within the cap is returned unchanged. Logs at DEBUG when it truncates.
+func (j *Judge) capFindings(c db.EvalChunk, parsed []parsedFinding) []parsedFinding {
+	if j.maxPerChunk <= 0 || len(parsed) <= j.maxPerChunk {
+		return parsed
+	}
+	sort.SliceStable(parsed, func(a, b int) bool {
+		return parsed[a].Confidence > parsed[b].Confidence
+	})
+	dropped := len(parsed) - j.maxPerChunk
+	j.logger.Debug("capping over-flagged chunk findings",
+		"chunk_id", c.ChunkID, "kept", j.maxPerChunk, "dropped", dropped, "cap", j.maxPerChunk)
+	return parsed[:j.maxPerChunk]
 }
 
 // optionalStr maps an empty string to nil (NULL), else a pointer to the value.

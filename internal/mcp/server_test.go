@@ -36,6 +36,11 @@ type SimpleMockDB struct {
 	lastBookDir     string // last dir passed to GetBookTracks
 	lastSearchDir   string // last dir passed to TextSearchInBook
 	lastSearchQuery string // last query passed to TextSearchInBook
+
+	clearFindingsCalled bool   // ClearFindings was called
+	clearFindingsDir    string // last dir passed to ClearFindings
+	clearFindingsN      int64  // rows ClearFindings reports deleted
+	clearFindingsErr    error  // if set, ClearFindings returns it
 }
 
 func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error {
@@ -144,6 +149,15 @@ func (m *SimpleMockDB) SampleEvalChunks(_ context.Context, _ int) ([]db.EvalChun
 }
 
 func (m *SimpleMockDB) InsertFindings(_ context.Context, _ []db.Finding) error { return nil }
+
+func (m *SimpleMockDB) ClearFindings(_ context.Context, dir string) (int64, error) {
+	m.clearFindingsCalled = true
+	m.clearFindingsDir = dir
+	if m.clearFindingsErr != nil {
+		return 0, m.clearFindingsErr
+	}
+	return m.clearFindingsN, nil
+}
 
 func (m *SimpleMockDB) GetFailedJobs(_ context.Context) ([]db.FailedJob, error) {
 	err := "RuntimeError: CUDA out of memory"
@@ -1217,5 +1231,90 @@ func TestEvalActionInFlightGuard(t *testing.T) {
 	}
 	if srv.eval.inFlight.Load() {
 		t.Fatal("in-flight flag did not clear after run finished")
+	}
+}
+
+// ─── Clear-findings action (CONTRACT §2.12) ──────────────────────────────────
+
+// clearMux wires a server with the given control token and a mock DB, returning
+// the handler and the mock so a test can assert ClearFindings was invoked.
+func clearMux(token string, mock *SimpleMockDB) http.Handler {
+	srv := NewMCPServer(mock, &config.Config{ControlAPIToken: token})
+	return srv.buildMux()
+}
+
+// TestFindingsClearAction: POST /actions/findings-clear (htmx + token) deletes
+// findings and re-renders the findings fragment.
+func TestFindingsClearAction(t *testing.T) {
+	mock := &SimpleMockDB{clearFindingsN: 37}
+	h := clearMux("tok", mock)
+
+	req := httptest.NewRequest(http.MethodPost, "/actions/findings-clear", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("clear findings: want 200, got %d", w.Code)
+	}
+	if !mock.clearFindingsCalled {
+		t.Fatal("ClearFindings was not called")
+	}
+	if mock.clearFindingsDir != "" {
+		t.Errorf("unscoped clear should pass empty dir, got %q", mock.clearFindingsDir)
+	}
+	// Re-renders the findings fragment (the mock summary is empty → zero state).
+	if !strings.Contains(w.Body.String(), "updated ") {
+		t.Errorf("clear should re-render the findings fragment:\n%s", w.Body.String())
+	}
+}
+
+// TestFindingsClearScoped: an optional ?dir= scopes the clear to one book.
+func TestFindingsClearScoped(t *testing.T) {
+	mock := &SimpleMockDB{}
+	h := clearMux("tok", mock)
+	req := httptest.NewRequest(http.MethodPost, "/actions/findings-clear?dir=/books/Author/Book", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("scoped clear: want 200, got %d", w.Code)
+	}
+	if mock.clearFindingsDir != "/books/Author/Book" {
+		t.Errorf("scoped clear dir = %q, want the book dir", mock.clearFindingsDir)
+	}
+}
+
+// TestFindingsClearGuards: non-htmx → 403 (no delete); unset token → fail-closed
+// banner (no delete).
+func TestFindingsClearGuards(t *testing.T) {
+	// Missing HX-Request → 403, no delete.
+	mock := &SimpleMockDB{}
+	h := clearMux("tok", mock)
+	req := httptest.NewRequest(http.MethodPost, "/actions/findings-clear", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("non-htmx clear: want 403, got %d", w.Code)
+	}
+	if mock.clearFindingsCalled {
+		t.Error("non-htmx request must not delete findings")
+	}
+
+	// Unset token → fail-closed banner (200 + retarget), no delete.
+	mock2 := &SimpleMockDB{}
+	h2 := clearMux("", mock2)
+	req = httptest.NewRequest(http.MethodPost, "/actions/findings-clear", nil)
+	req.Header.Set("HX-Request", "true")
+	w = httptest.NewRecorder()
+	h2.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("fail-closed clear: want 200 (banner), got %d", w.Code)
+	}
+	if w.Header().Get("HX-Retarget") != "#action-error" {
+		t.Errorf("expected action-error retarget, headers=%v", w.Header())
+	}
+	if mock2.clearFindingsCalled {
+		t.Error("must not delete findings without a control token")
 	}
 }

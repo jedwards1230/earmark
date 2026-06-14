@@ -2295,6 +2295,38 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 	return tx.Commit(ctx)
 }
 
+// clearFindingsSQL deletes findings. Package var (like insertFindingSQL) so a
+// test can assert it touches ONLY transcript_findings — the read-only-over-
+// transcripts invariant (§2.15) holds: findings are advisory metadata, never
+// the transcripts/segments/transcript_chunks themselves. An optional book-dir
+// prefix scopes the delete; the unscoped form clears everything.
+var (
+	clearFindingsAllSQL = `DELETE FROM transcript_findings`
+	clearFindingsDirSQL = `DELETE FROM transcript_findings WHERE file_path LIKE $1 || '/%' OR file_path = $1`
+)
+
+// ClearFindings deletes recorded findings and returns the number of rows
+// removed. It writes to NO table other than transcript_findings — it never
+// touches transcripts, segments, or transcript_chunks, so re-running eval
+// simply regenerates the advisory rows. When dir is non-empty the delete is
+// scoped to that book directory (prefix match); empty dir clears all findings.
+func (db *DB) ClearFindings(ctx context.Context, dir string) (int64, error) {
+	dir = strings.TrimRight(strings.TrimSpace(dir), "/")
+	var (
+		tag pgconn.CommandTag
+		err error
+	)
+	if dir == "" {
+		tag, err = db.pool.Exec(ctx, clearFindingsAllSQL)
+	} else {
+		tag, err = db.pool.Exec(ctx, clearFindingsDirSQL, dir)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("clear findings: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // FindingsSummary is the dashboard's per-book + library findings rollup.
 type FindingsSummary struct {
 	TotalFindings    int
