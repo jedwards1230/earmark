@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"os"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/asr"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 )
 
 // doneRatio is the fraction of a book's tracks that are done (0 when no tracks),
@@ -348,6 +350,64 @@ func (d demoDB) GetFindingsSummary(context.Context) (*db.FindingsSummary, error)
 				Count: 16, MeanConfidence: 0.54, TopIssueType: "number_artifact"},
 		},
 	}, nil
+}
+
+// GetEvalChunksForBook / SampleEvalChunks return synthetic chunks so the
+// "run eval" dashboard actions are exercisable with no database. The demo judge
+// (a static fake chat client wired in StartDemoDashboard) turns these into
+// findings; here we just hand back a couple of plausible chunks.
+func (demoDB) GetEvalChunksForBook(_ context.Context, dir string, limit int) ([]db.EvalChunk, error) {
+	chunks := demoEvalChunks(dir)
+	if limit > 0 && len(chunks) > limit {
+		chunks = chunks[:limit]
+	}
+	return chunks, nil
+}
+
+func (demoDB) SampleEvalChunks(_ context.Context, limit int) ([]db.EvalChunk, error) {
+	chunks := demoEvalChunks("/books/Author One/A Long Title")
+	if limit > 0 && len(chunks) > limit {
+		chunks = chunks[:limit]
+	}
+	return chunks, nil
+}
+
+// InsertFindings is a no-op in the demo: the synthetic GetFindingsSummary is
+// fixed, so a demo eval run reports "evaluated N chunks" without changing the
+// rollup. The button + async indicator are what we're verifying, not persistence.
+func (demoDB) InsertFindings(context.Context, []db.Finding) error { return nil }
+
+// demoEvalRun builds an eval runner backed by a static fake chat client, so the
+// "run eval" dashboard buttons are exercisable in --demo with no network call
+// (the demo's vLLM endpoint is intentionally offline). It runs the real
+// eval.Run orchestration over the demo chunks, just with a canned judge reply.
+func demoEvalRun(database DBInterface) evalRunFunc {
+	judge := eval.NewJudge(demoFakeChat{})
+	return func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {
+		_, stats, err := eval.Run(ctx, database, judge, database, opts)
+		return stats, err
+	}
+}
+
+// demoFakeChat is a static eval.ChatClient: it returns one plausible finding per
+// chunk so a demo run "completes" deterministically without a real endpoint.
+type demoFakeChat struct{}
+
+func (demoFakeChat) Model() string { return "demo-judge" }
+func (demoFakeChat) Complete(context.Context, string, string) (string, error) {
+	return `{"findings":[{"original_text":"sea shells","issue_type":"homophone","suggested_correction":"seashells","confidence":0.62}]}`, nil
+}
+
+// demoEvalChunks builds two synthetic chunks under the given book dir.
+func demoEvalChunks(dir string) []db.EvalChunk {
+	return []db.EvalChunk{
+		{ChunkID: "demo-chunk-1", TranscriptID: "demo-tr-1", TranscriptionRunID: "demo-job-1",
+			FilePath: dir + "/01.m4b", ChunkIndex: 0, StartSec: 0, EndSec: 30,
+			Text: "the quick brown fox jumps over the lazy dog"},
+		{ChunkID: "demo-chunk-2", TranscriptID: "demo-tr-1", TranscriptionRunID: "demo-job-1",
+			FilePath: dir + "/01.m4b", ChunkIndex: 1, StartSec: 30, EndSec: 60,
+			Text: "she sells sea shells by the sea shore"},
+	}
 }
 
 // SetPaused flips the in-memory demo pause flag so the toggle is exercisable.
@@ -796,23 +856,43 @@ func StartDemoDashboard(addr string) error {
 	if scenario == "" {
 		scenario = "active"
 	}
+	// The "empty" scenario models a fresh install: no eval role bound, so the
+	// /findings page shows the honest "Eval endpoint not configured" state and
+	// the per-book "run eval" button is hidden. Every other scenario keeps the
+	// eval role bound so the trigger surface renders.
+	aiRoles := demoAIRoles
+	// #nosec G101 - demo fixture string, not a real credential
+	demoEvalToken := "demo-eval-token"
+	if scenario == "empty" {
+		aiRoles = &config.AIRoles{Embeddings: "embed-1"} // no Eval binding
+		demoEvalToken = ""
+	}
 	cfg := &config.Config{
 		MCPHTTPAddr:        addr,
 		StaleJobTimeout:    30 * time.Minute,
 		BooksDir:           "/books",
 		LibraryCollections: demoCollections,
 		// Honor CONTROL_API_TOKEN so the control-API mutations are exercisable
-		// against the demo (otherwise they fail closed with 503).
-		ControlAPIToken: os.Getenv("CONTROL_API_TOKEN"),
+		// against the demo (otherwise they fail closed with 503). The eval-run
+		// actions also fail closed without a token, so default one in for the demo
+		// (unless the operator set their own) so the buttons are clickable.
+		ControlAPIToken: cmp.Or(os.Getenv("CONTROL_API_TOKEN"), demoEvalToken),
 		ASRServers:      demoServersFor(scenario),
 		AIEndpoints:     demoAIEndpoints,
-		AIRoles:         demoAIRoles,
+		AIRoles:         aiRoles,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	// Swap the real HTTP probers for the static demo ones so the readiness states
 	// render without any network call.
 	srv.prober = demoGPUProber{}
 	srv.endpointProber = demoEndpointProber{}
+	// Swap the live chat client for a static fake judge so clicking "run eval"
+	// exercises the trigger + async indicator with no network call (the demo
+	// vLLM endpoint is intentionally offline). Only when the scenario configured
+	// an eval endpoint in the first place.
+	if srv.eval.configured {
+		srv.eval.run = demoEvalRun(srv.db)
+	}
 	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",
 		"address", addr, "scenario", scenario)
 	return srv.StartHTTP(addr)

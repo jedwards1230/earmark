@@ -67,6 +67,13 @@ type DBInterface interface {
 	// (totals, confidence buckets, issue-type tally, per-book) for the /findings
 	// dashboard page (CONTRACT §2.15).
 	GetFindingsSummary(ctx context.Context) (*db.FindingsSummary, error)
+	// GetEvalChunksForBook / SampleEvalChunks / InsertFindings back the on-demand
+	// "run eval" dashboard actions (CONTRACT §2.15). The first two are the
+	// read-only eval.ChunkReader; the third is the insert-only eval.FindingWriter.
+	// The judge never mutates transcripts — its only write is InsertFindings.
+	GetEvalChunksForBook(ctx context.Context, dir string, limit int) ([]db.EvalChunk, error)
+	SampleEvalChunks(ctx context.Context, limit int) ([]db.EvalChunk, error)
+	InsertFindings(ctx context.Context, findings []db.Finding) error
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
@@ -54,7 +56,29 @@ type MCPServer struct {
 	// endpointProber probes each AI endpoint's /models for liveness (TTL-cached).
 	// Swapped for a static fake in the demo.
 	endpointProber endpointProber
+
+	// eval holds the on-demand LLM-as-judge wiring for the "run eval" dashboard
+	// actions (CONTRACT §2.15). Nil-judge / unconfigured → the buttons are hidden
+	// with an explanation rather than POSTing into a guaranteed failure.
+	eval evalState
 }
+
+// evalState carries the dashboard's on-demand eval-run wiring. configured
+// reflects whether ResolveChatClient succeeded at construction (an eval chat
+// endpoint resolves); run is the bound runner (nil when unconfigured or in a
+// test that doesn't exercise it). inFlight guards against overlapping runs — the
+// judge issues real LLM calls, so a second click while one is running is
+// rejected rather than doubling cost.
+type evalState struct {
+	configured bool
+	run        evalRunFunc
+	inFlight   atomic.Bool
+}
+
+// evalRunFunc runs the judge over the selected chunks and persists findings.
+// Mirrors eval.Run's signature minus the reader/judge/writer (bound at
+// construction). Injectable so handler tests don't need a live LLM.
+type evalRunFunc func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error)
 
 // NewMCPServer creates a new MCP server instance
 func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
@@ -228,7 +252,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		),
 	), handlers.handleGetContext)
 
-	return &MCPServer{
+	s := &MCPServer{
 		server:           mcpServer,
 		handlers:         handlers,
 		logger:           logger,
@@ -245,6 +269,29 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		// AI endpoint /models probe: same timeout/TTL budget as the gpu-arbiter
 		// prober so a slow upstream can't stall the Models/Services page.
 		endpointProber: newHTTPEndpointProber(2*time.Second, 5*time.Second),
+	}
+	s.initEval(cfg)
+	return s
+}
+
+// initEval resolves the LLM-as-judge chat endpoint once at construction and
+// binds the on-demand eval runner. When no eval endpoint resolves (no
+// AI_ROLES.eval and no EVAL_CHAT_* fallback), eval.configured stays false and
+// the "run eval" buttons are hidden — the dashboard never POSTs into a
+// guaranteed failure. The runner binds s.db as the read-only ChunkReader and
+// insert-only FindingWriter; the judge issues no transcript mutations.
+func (s *MCPServer) initEval(cfg *config.Config) {
+	chat, err := eval.ResolveChatClient(eval.ConfigSource(cfg))
+	if err != nil {
+		s.logger.Info("eval layer disabled (no chat endpoint configured)", "reason", err)
+		return
+	}
+	judge := eval.NewJudge(chat)
+	db := s.db
+	s.eval.configured = true
+	s.eval.run = func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {
+		_, stats, err := eval.Run(ctx, db, judge, db, opts)
+		return stats, err
 	}
 }
 
@@ -283,6 +330,8 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	GET  /static/htmx.min.js   — vendored htmx library
 //	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
 //	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)
+//	POST /actions/eval         — run the LLM judge over one book (htmx + token, async)
+//	POST /actions/eval-sample  — run the LLM judge over a library sample (htmx + token, async)
 //	GET  /api/v1/status              — pipeline status snapshot (JSON, no auth)
 //	GET  /api/v1/pipeline/pause      — current pause/run-limit state (JSON, no auth)
 //	PUT  /api/v1/pipeline/pause      — pause/resume (JSON, bearer token)
@@ -335,6 +384,10 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("POST /actions/book-requeue", s.handleBookRequeue)
 	mux.HandleFunc("POST /actions/pause", s.handlePause)
 	mux.HandleFunc("POST /actions/resume", s.handleResume)
+	// On-demand LLM-as-judge runs (CONTRACT §2.15): htmx-guarded, fail-closed on
+	// an unset CONTROL_API_TOKEN, async (background goroutine).
+	mux.HandleFunc("POST /actions/eval", s.handleEvalBook)
+	mux.HandleFunc("POST /actions/eval-sample", s.handleEvalSample)
 
 	// JSON control API (script/agent-facing) — distinct from the htmx dashboard
 	// actions above. Reads are unauthenticated; mutations require the bearer token

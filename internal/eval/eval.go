@@ -22,9 +22,9 @@ import (
 
 // ChatClient is the small abstraction over the chat-LLM endpoint the judge
 // needs. Implemented by openAIChatClient (OpenAI-compatible /v1/chat/completions)
-// and faked in tests. Keeping the judge behind this interface means swapping the
-// endpoint binding to #48's AI endpoint registry is a one-line change at the
-// resolution point (see ResolveChatClient), not a rewrite of the judge.
+// and faked in tests. Keeping the judge behind this interface means the endpoint
+// binding (AI registry vs env-var fallback) is resolved in one place
+// (ResolveChatClient) rather than threaded through the judge.
 type ChatClient interface {
 	// Complete sends a system + user prompt and returns the model's raw text
 	// response. The judge is responsible for parsing JSON out of it.

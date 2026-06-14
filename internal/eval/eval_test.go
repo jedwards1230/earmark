@@ -149,23 +149,92 @@ func TestRun_RequiresScope(t *testing.T) {
 	}
 }
 
+// fakeSource is a tiny EvalEndpointSource for the resolver tests — no full
+// config build, no import cycle.
+type fakeSource struct {
+	ep EvalEndpoint
+	ok bool
+}
+
+func (f fakeSource) EvalEndpoint() (EvalEndpoint, bool) { return f.ep, f.ok }
+
 func TestResolveChatClient_MissingConfig(t *testing.T) {
 	t.Setenv("EVAL_CHAT_BASE_URL", "")
 	t.Setenv("EVAL_CHAT_MODEL", "")
-	if _, err := ResolveChatClient(); err == nil {
-		t.Fatal("expected error when chat endpoint env vars are unset")
+	// neither a registry eval role nor the env-var fallback → clear error.
+	if _, err := ResolveChatClient(nil); err == nil {
+		t.Fatal("expected error when chat endpoint env vars are unset and no eval role")
 	}
 }
 
 func TestResolveChatClient_OK(t *testing.T) {
 	t.Setenv("EVAL_CHAT_BASE_URL", "http://vllm:8000/v1")
 	t.Setenv("EVAL_CHAT_MODEL", "judge-model")
-	c, err := ResolveChatClient()
+	c, err := ResolveChatClient(nil)
 	if err != nil {
 		t.Fatalf("ResolveChatClient: %v", err)
 	}
 	if c.Model() != "judge-model" {
 		t.Errorf("model = %q", c.Model())
+	}
+}
+
+// When the registry binds an eval role, the resolver uses that endpoint and
+// IGNORES the EVAL_CHAT_* env vars (registry wins).
+func TestResolveChatClient_RegistryRoleWins(t *testing.T) {
+	t.Setenv("EVAL_CHAT_BASE_URL", "http://env-fallback:9999/v1")
+	t.Setenv("EVAL_CHAT_MODEL", "env-model")
+	src := fakeSource{ok: true, ep: EvalEndpoint{
+		BaseURL: "http://registry-vllm:8000/v1",
+		Model:   "registry-judge",
+		Options: map[string]string{"apiKey": "sk-test"},
+	}}
+	c, err := ResolveChatClient(src)
+	if err != nil {
+		t.Fatalf("ResolveChatClient: %v", err)
+	}
+	if c.Model() != "registry-judge" {
+		t.Errorf("model = %q; want the registry endpoint's model, not the env fallback", c.Model())
+	}
+	if oc, ok := c.(*openAIChatClient); !ok {
+		t.Fatalf("want *openAIChatClient, got %T", c)
+	} else if oc.baseURL != "http://registry-vllm:8000/v1" {
+		t.Errorf("baseURL = %q; want the registry endpoint baseURL", oc.baseURL)
+	} else if oc.apiKey != "sk-test" {
+		t.Errorf("apiKey = %q; want the registry endpoint's options[apiKey]", oc.apiKey)
+	}
+}
+
+// No eval role bound → fall back to the EVAL_CHAT_* env vars.
+func TestResolveChatClient_FallsBackToEnvWhenNoRole(t *testing.T) {
+	t.Setenv("EVAL_CHAT_BASE_URL", "http://env-fallback:9000/v1")
+	t.Setenv("EVAL_CHAT_MODEL", "env-model")
+	src := fakeSource{ok: false}
+	c, err := ResolveChatClient(src)
+	if err != nil {
+		t.Fatalf("ResolveChatClient: %v", err)
+	}
+	if c.Model() != "env-model" {
+		t.Errorf("model = %q; want the env fallback model", c.Model())
+	}
+}
+
+// A registry eval role missing baseURL/model is an error (don't silently fall
+// through to env vars — a bound-but-broken role is a misconfiguration to surface).
+func TestResolveChatClient_RegistryRoleIncomplete(t *testing.T) {
+	t.Setenv("EVAL_CHAT_BASE_URL", "http://env-fallback:9000/v1")
+	t.Setenv("EVAL_CHAT_MODEL", "env-model")
+	src := fakeSource{ok: true, ep: EvalEndpoint{BaseURL: "", Model: "x"}}
+	if _, err := ResolveChatClient(src); err == nil {
+		t.Fatal("expected error when bound eval endpoint is missing baseURL")
+	}
+}
+
+// SSRF guard still applies to the registry path.
+func TestResolveChatClient_RegistryRoleRejectsBadBaseURL(t *testing.T) {
+	src := fakeSource{ok: true, ep: EvalEndpoint{BaseURL: "file:///etc/passwd", Model: "judge"}}
+	if _, err := ResolveChatClient(src); err == nil {
+		t.Fatal("expected error for non-http registry baseURL")
 	}
 }
 
@@ -186,7 +255,7 @@ func TestResolveChatClient_RejectsBadBaseURL(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("EVAL_CHAT_BASE_URL", tc.url)
 			t.Setenv("EVAL_CHAT_MODEL", "judge-model")
-			if _, err := ResolveChatClient(); err == nil {
+			if _, err := ResolveChatClient(nil); err == nil {
 				t.Fatalf("expected error for bad base URL %q", tc.url)
 			}
 		})
@@ -197,7 +266,7 @@ func TestResolveChatClient_AcceptsValidBaseURLs(t *testing.T) {
 	for _, u := range []string{"http://vllm:8000/v1", "https://api.example.com/v1"} {
 		t.Setenv("EVAL_CHAT_BASE_URL", u)
 		t.Setenv("EVAL_CHAT_MODEL", "judge-model")
-		if _, err := ResolveChatClient(); err != nil {
+		if _, err := ResolveChatClient(nil); err != nil {
 			t.Errorf("ResolveChatClient(%q): unexpected error %v", u, err)
 		}
 	}

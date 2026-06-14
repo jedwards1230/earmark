@@ -1,11 +1,14 @@
 package mcp
 
 import (
+	"context"
 	"html/template"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 )
 
 // ─── Findings page (read-only eval-layer surface, CONTRACT §2.15) ─────────────
@@ -21,11 +24,20 @@ import (
 type findingsData struct {
 	Summary    *db.FindingsSummary
 	RenderedAt string
+	// EvalConfigured gates the "run sample eval" trigger and the honest
+	// empty-state (CONTRACT §2.15): true only when a judge chat endpoint resolves.
+	// When false the empty-state points at the Models/Services page instead of
+	// printing an unrunnable CLI command.
+	EvalConfigured bool
+	// EvalSampleN is the chunk count the sample-eval button requests.
+	EvalSampleN int
 }
 
 // findingsPage is the page shell (layout + content) for GET /findings.
 var findingsPage = mustPage(`{{define "content"}}
 <p class="subtitle">transcript findings &nbsp;·&nbsp; read-only LLM judge &nbsp;·&nbsp; auto-refreshes every 5 s</p>
+<div id="action-error" aria-live="assertive"></div>
+<div id="eval-notice" role="status" aria-live="polite"></div>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 <div id="findings-region"
      hx-get="/findings/data" hx-trigger="load, every 5s" hx-swap="innerHTML"
@@ -41,8 +53,18 @@ var findingsPage = mustPage(`{{define "content"}}
 // findingsFragmentTmpl is the htmx-refreshed data fragment.
 var findingsFragmentTmpl = template.Must(template.New("findings").Funcs(tmplFuncs).Parse(`
 <div class="updated">updated {{.RenderedAt}}</div>
+{{if .EvalConfigured}}
+<div class="findings-actions">
+  <button class="btn" hx-post="/actions/eval-sample?n={{.EvalSampleN}}" hx-target="#findings-region" hx-swap="afterbegin"
+          hx-confirm="Run the read-only LLM judge over a {{.EvalSampleN}}-chunk library sample? It flags suspected transcription errors (advisory only — transcripts are never edited) and may take a minute.">run sample eval ({{.EvalSampleN}} chunks)</button>
+</div>
+{{end}}
 {{if eq .Summary.TotalFindings 0}}
-<p class="lib-empty">No findings recorded yet. The eval layer is read-only and on-demand — run <code>earmark eval "&lt;book&gt;"</code> or <code>earmark eval --sample N</code> to record suspected transcription errors (advisory only; transcripts are never edited).</p>
+{{if .EvalConfigured}}
+<p class="lib-empty">No findings recorded yet. The eval layer is read-only and on-demand — use <strong>run sample eval</strong> above (or the per-book <strong>run eval</strong> on a book page) to record suspected transcription errors (advisory only; transcripts are never edited).</p>
+{{else}}
+<p class="lib-empty">Eval endpoint not configured. The LLM-as-judge needs a chat endpoint bound to the <code>eval</code> role — configure it on the <a href="/servers">Models &amp; Services</a> page (<code>AI_ROLES.eval</code> → a <code>chat</code> endpoint), then the <strong>run sample eval</strong> trigger appears here.</p>
+{{end}}
 {{else}}
 <div class="card-group grid">
   <div class="card"><div class="card-label">Findings</div><div class="card-value">{{commafy .Summary.TotalFindings}}</div></div>
@@ -109,10 +131,141 @@ func (s *MCPServer) handleFindingsData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	data := findingsData{Summary: summary, RenderedAt: time.Now().UTC().Format("2006-01-02 15:04:05 UTC")}
+	data := findingsData{
+		Summary:        summary,
+		RenderedAt:     time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
+		EvalConfigured: s.eval.configured,
+		EvalSampleN:    defaultEvalSampleN,
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := findingsFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("findings fragment render error", "error", err)
 	}
 }
+
+// ─── On-demand eval-run action handlers (CONTRACT §2.15) ─────────────────────
+//
+// These mirror the requeue action handlers (dashboard.go): htmx-guarded via the
+// HX-Request header, and additionally fail-closed (503) when CONTROL_API_TOKEN is
+// unset — running the judge issues real (billable) LLM calls, so the trigger is
+// gated like the other mutating control surfaces rather than left open. Unlike
+// requeue, the work is NOT done synchronously: the LLM calls run in a background
+// goroutine so the HTTP request returns immediately with an "evaluating…"
+// indicator, and the page's auto-refresh surfaces findings as they land.
+
+const (
+	// defaultEvalSampleN is the library-sample size the /findings button requests.
+	defaultEvalSampleN = 50
+	// maxEvalSampleN is the hard ceiling on a sample run (cost bound) — a larger
+	// requested n is clamped down to this.
+	maxEvalSampleN = 200
+	// perBookEvalLimit caps the chunks judged in a per-book run (cost bound).
+	perBookEvalLimit = 200
+	// evalRunTimeout bounds a background run so a hung endpoint can't pin the
+	// in-flight flag forever (the judge's per-request client also has its own
+	// 120s backstop).
+	evalRunTimeout = 30 * time.Minute
+)
+
+// evalGate enforces the shared preconditions for the eval-run actions: htmx
+// origin, a configured endpoint, and a configured control token (fail-closed).
+// It returns false (after writing the response) when the request must not run.
+func (s *MCPServer) evalGate(w http.ResponseWriter, r *http.Request) bool {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	if s.controlToken == "" {
+		// Same fail-closed posture as the JSON control API: an unauthenticated
+		// deployment cannot trigger billable LLM runs.
+		writeActionError(w, "eval is disabled: CONTROL_API_TOKEN is not configured")
+		return false
+	}
+	if !s.eval.configured || s.eval.run == nil {
+		writeActionError(w, "no eval chat endpoint configured — see Models & Services")
+		return false
+	}
+	return true
+}
+
+// startEvalRun kicks the judge off in the background (its own context, generous
+// timeout) and reports whether it started. It guards against overlapping runs:
+// a second trigger while one is in flight returns started=false so the caller
+// can say so rather than doubling LLM cost.
+func (s *MCPServer) startEvalRun(opts eval.RunOptions, scope string) (started bool) {
+	if !s.eval.inFlight.CompareAndSwap(false, true) {
+		return false
+	}
+	run := s.eval.run
+	go func() {
+		defer s.eval.inFlight.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), evalRunTimeout)
+		defer cancel()
+		stats, err := run(ctx, opts)
+		if err != nil {
+			s.logger.Error("eval run failed", "scope", scope, "error", err)
+			return
+		}
+		s.logger.Info("eval run complete", "scope", scope,
+			"chunksEvaluated", stats.ChunksEvaluated, "chunksSkipped", stats.ChunksSkipped,
+			"findings", stats.FindingsFound, "persisted", stats.Persisted)
+	}()
+	return true
+}
+
+// handleEvalBook runs the judge over one book's chunks (POST /actions/eval?dir=…)
+// and re-renders the book fragment with an "evaluating…" notice.
+func (s *MCPServer) handleEvalBook(w http.ResponseWriter, r *http.Request) {
+	if !s.evalGate(w, r) {
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		http.Error(w, "missing dir", http.StatusBadRequest)
+		return
+	}
+	notice := ""
+	if s.startEvalRun(eval.RunOptions{Book: dir, Limit: perBookEvalLimit, Write: true}, "book "+dir) {
+		s.logger.Info("eval run started via dashboard", "scope", "book", "dir", dir)
+		notice = "Evaluating up to " + itoa(perBookEvalLimit) + " chunk(s)… findings will appear on the Findings page as they land."
+	} else {
+		notice = "An eval run is already in flight — wait for it to finish before starting another."
+	}
+	s.renderBookFragmentWithNotice(w, r, dir, notice)
+}
+
+// handleEvalSample runs the judge over a library sample (POST /actions/eval-sample?n=N)
+// and returns a small banner prepended to the findings region.
+func (s *MCPServer) handleEvalSample(w http.ResponseWriter, r *http.Request) {
+	if !s.evalGate(w, r) {
+		return
+	}
+	n := clampSampleN(r.URL.Query().Get("n"))
+	var notice string
+	if s.startEvalRun(eval.RunOptions{Sample: n, Write: true}, "sample") {
+		s.logger.Info("eval run started via dashboard", "scope", "sample", "n", n)
+		notice = "Evaluating a " + itoa(n) + "-chunk sample… findings will appear below as the page refreshes."
+	} else {
+		notice = "An eval run is already in flight — wait for it to finish before starting another."
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<div class="eval-notice" role="status">` + template.HTMLEscapeString(notice) + `</div>`))
+}
+
+// clampSampleN parses the requested sample size and clamps it to [1, maxEvalSampleN].
+// A missing/invalid value falls back to the default.
+func clampSampleN(raw string) int {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		n = defaultEvalSampleN
+	}
+	if n > maxEvalSampleN {
+		n = maxEvalSampleN
+	}
+	return n
+}
+
+// itoa is strconv.Itoa under a short name for the notice strings above.
+func itoa(n int) string { return strconv.Itoa(n) }
