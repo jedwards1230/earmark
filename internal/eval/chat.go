@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -50,7 +51,33 @@ func ResolveChatClient() (ChatClient, error) {
 	if cfg.BaseURL == "" || cfg.Model == "" {
 		return nil, fmt.Errorf("eval chat endpoint not configured: set EVAL_CHAT_BASE_URL and EVAL_CHAT_MODEL")
 	}
+	if err := validateBaseURL(cfg.BaseURL); err != nil {
+		return nil, fmt.Errorf("invalid EVAL_CHAT_BASE_URL: %w", err)
+	}
 	return newOpenAIChatClient(cfg), nil
+}
+
+// validateBaseURL requires a parseable http/https URL with a host, rejecting
+// schemes like file://, gopher://, or a bare host. This is the same guard
+// internal/config applies to AI_ENDPOINTS baseURLs and that endpointprobe.go
+// applies before probing — it stops a mis- or maliciously-set EVAL_CHAT_BASE_URL
+// (env injection) from steering the judge's request at a non-http target. It is
+// inlined here (rather than importing internal/config) so the eval package stays
+// independent of config's endpoint structs, which #48 is reshaping in parallel.
+// Note this is a baseline scheme/host check, not an allowlist: an operator can
+// still point it at any reachable http(s) host by design.
+func validateBaseURL(raw string) error {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("baseURL %q is not a valid URL: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("baseURL %q must be http:// or https://", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("baseURL %q has no host", raw)
+	}
+	return nil
 }
 
 func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {

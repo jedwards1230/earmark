@@ -168,3 +168,37 @@ func TestResolveChatClient_OK(t *testing.T) {
 		t.Errorf("model = %q", c.Model())
 	}
 }
+
+// A malformed EVAL_CHAT_BASE_URL must be rejected at resolution time (the SSRF
+// consistency guard) — a non-http(s) scheme or a host-less URL can't reach the
+// chat endpoint and shouldn't be passed to the HTTP client.
+func TestResolveChatClient_RejectsBadBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"non-http scheme", "file:///etc/passwd"},
+		{"gopher scheme", "gopher://internal:70/"},
+		{"no host", "http:///v1"},
+		{"not a url", "://nope"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EVAL_CHAT_BASE_URL", tc.url)
+			t.Setenv("EVAL_CHAT_MODEL", "judge-model")
+			if _, err := ResolveChatClient(); err == nil {
+				t.Fatalf("expected error for bad base URL %q", tc.url)
+			}
+		})
+	}
+}
+
+func TestResolveChatClient_AcceptsValidBaseURLs(t *testing.T) {
+	for _, u := range []string{"http://vllm:8000/v1", "https://api.example.com/v1"} {
+		t.Setenv("EVAL_CHAT_BASE_URL", u)
+		t.Setenv("EVAL_CHAT_MODEL", "judge-model")
+		if _, err := ResolveChatClient(); err != nil {
+			t.Errorf("ResolveChatClient(%q): unexpected error %v", u, err)
+		}
+	}
+}
