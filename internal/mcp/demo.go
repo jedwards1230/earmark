@@ -177,6 +177,35 @@ func demoServersFor(scenario string) []config.ASRServer {
 	return demoASRServers
 }
 
+// demoAIEndpoints is the synthetic AI endpoint registry for the demo: an
+// embeddings endpoint (Ollama, bound to the embeddings role, ready) and a chat
+// endpoint (vLLM, bound to eval, offline) so the Models/Services page shows both
+// types, the role badge, options, and two health states. baseURLs are generic
+// placeholders only (per the shareable-repo rule); the demo swaps in a static
+// prober (demoEndpointProber) keyed by a sentinel in the URL, so no network call
+// is made.
+var demoAIEndpoints = []config.AIEndpoint{
+	{ID: "embed-1", Type: config.AIEndpointTypeEmbeddings, Backend: config.AIBackendOllama,
+		BaseURL: "http://ollama.example.com:11434/v1", Model: "nomic-embed-text"},
+	{ID: "eval-1", Type: config.AIEndpointTypeChat, Backend: config.AIBackendVLLM,
+		BaseURL: "http://vllm.example.com:8000/v1", Model: "Qwen2.5-7B-Instruct",
+		Options: map[string]string{"temperature": "0", "max_tokens": "256"}},
+}
+
+var demoAIRoles = &config.AIRoles{Embeddings: "embed-1", Eval: "eval-1"}
+
+// demoEndpointProber is a static endpointProber for the demo: the embeddings
+// endpoint is ready, the eval (chat) endpoint is offline, routed by a substring
+// of the base URL so the page renders both states with no network call.
+type demoEndpointProber struct{}
+
+func (demoEndpointProber) Probe(_ context.Context, baseURL, _ string) endpointProbe {
+	if strings.Contains(baseURL, "vllm") {
+		return endpointProbe{Probed: true, State: epStateOffline}
+	}
+	return endpointProbe{Probed: true, State: epStateReady}
+}
+
 // demoGPUProber is a static gpuProber for the demo, routing by a sentinel in the
 // URL so the page renders ready / busy / offline without any network call.
 type demoGPUProber struct{}
@@ -776,11 +805,14 @@ func StartDemoDashboard(addr string) error {
 		// against the demo (otherwise they fail closed with 503).
 		ControlAPIToken: os.Getenv("CONTROL_API_TOKEN"),
 		ASRServers:      demoServersFor(scenario),
+		AIEndpoints:     demoAIEndpoints,
+		AIRoles:         demoAIRoles,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
-	// Swap the real HTTP gpu-arbiter prober for the static demo one so the
-	// readiness states render without any network call.
+	// Swap the real HTTP probers for the static demo ones so the readiness states
+	// render without any network call.
 	srv.prober = demoGPUProber{}
+	srv.endpointProber = demoEndpointProber{}
 	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",
 		"address", addr, "scenario", scenario)
 	return srv.StartHTTP(addr)

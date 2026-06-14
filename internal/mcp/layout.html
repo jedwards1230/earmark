@@ -225,6 +225,9 @@
   .badge.role-primary  { background: #0a2a1a; color: var(--green); }
   .badge.role-fallback { background: #15233a; color: var(--blue); }
   .badge.unconfigured  { background: #2a2a1a; color: var(--amber); }
+  /* AI endpoint type badges (Models/Services page) */
+  .badge.role-embeddings { background: #15233a; color: var(--blue); }
+  .badge.role-chat       { background: #2a1a2a; color: #c08fd9; }
   .server-note { color: var(--muted); font-size: 11px; line-height: 1.5; margin-top: 16px; max-width: 760px; }
   /* per-family grouping header inside the Models & modes table */
   .family-row td { background: var(--surface2); padding: 6px 12px; }
@@ -252,7 +255,7 @@
   <nav class="nav">
     <a href="/" class="{{if eq .Nav "overview"}}active{{end}}">Overview</a>
     <a href="/library" class="{{if eq .Nav "library"}}active{{end}}">Library</a>
-    <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Servers</a>
+    <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Models/Services</a>
     <a href="/findings" class="{{if eq .Nav "findings"}}active{{end}}">Findings</a>
     <a href="/failed" class="{{if eq .Nav "failed"}}active{{end}}">Failed</a>
   </nav>

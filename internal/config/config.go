@@ -6,6 +6,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	neturl "net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -65,6 +66,63 @@ type ASRServer struct {
 	Languages []string `json:"languages,omitempty"`
 }
 
+// ─── AI endpoint registry (CONTRACT §2.14) ─────────────────────────────────────
+//
+// The registry decouples "what AI endpoint exists" from "which function uses
+// it". The operator can swap an embeddings backend (e.g. Ollama on one host →
+// vLLM on another) by changing config, not code. AIRoles binds a function name
+// (e.g. "embeddings") to an endpoint id.
+
+// AIEndpointType distinguishes an embeddings endpoint from a chat/generation
+// endpoint. Only these two values are valid; LoadConfig rejects others.
+type AIEndpointType string
+
+const (
+	AIEndpointTypeEmbeddings AIEndpointType = "embeddings"
+	AIEndpointTypeChat       AIEndpointType = "chat"
+)
+
+// AIBackend names the provider's wire protocol. All three speak the
+// OpenAI-compatible REST API; the distinction is used only for the dashboard
+// label and the health-probe path — there is no behavioral difference yet.
+type AIBackend string
+
+const (
+	AIBackendOllama AIBackend = "ollama"
+	AIBackendVLLM   AIBackend = "vllm"
+	AIBackendOpenAI AIBackend = "openai-compat" // generic fallback
+)
+
+// AIEndpoint is one entry in the AI_ENDPOINTS registry.
+type AIEndpoint struct {
+	ID      string         `json:"id"`      // unique within this deployment
+	Type    AIEndpointType `json:"type"`    // "embeddings" | "chat"
+	Backend AIBackend      `json:"backend"` // "ollama" | "vllm" | "openai-compat"
+	BaseURL string         `json:"baseURL"` // OpenAI-compatible base, no trailing slash
+	Model   string         `json:"model"`   // model id passed to the API
+	// Options are backend-specific key/value pairs (all strings on the wire).
+	// Known keys: temperature, max_tokens, top_p. Unknown keys are forwarded
+	// as-is so future backends don't require code changes.
+	Options map[string]string `json:"options,omitempty"`
+}
+
+// AIRoles binds function names to endpoint IDs. The "embeddings" role is
+// required when AI_ROLES is set; "eval" is optional (no eval layer when absent).
+type AIRoles struct {
+	Embeddings string `json:"embeddings"` // id of the embeddings endpoint (required)
+	Eval       string `json:"eval"`       // id of a chat endpoint for the eval layer; "" = disabled
+}
+
+// validAIType reports whether t is a recognized endpoint type.
+func validAIType(t AIEndpointType) bool {
+	return t == AIEndpointTypeEmbeddings || t == AIEndpointTypeChat
+}
+
+// validAIBackend reports whether b is a recognized backend adapter.
+func validAIBackend(b AIBackend) bool {
+	return b == AIBackendOllama || b == AIBackendVLLM || b == AIBackendOpenAI
+}
+
 // MatchToken is the lower-cased substring used to attribute observed runner
 // activity to this server. Falls back to the (lower-cased) name.
 func (a ASRServer) MatchToken() string {
@@ -119,6 +177,106 @@ func parseASRServers(raw string) ([]ASRServer, error) {
 	}
 	return servers, nil
 }
+
+// parseAIEndpoints decodes the AI_ENDPOINTS JSON array and validates every
+// entry. Unlike ASR_SERVERS (cosmetic, warn-and-degrade), the AI endpoint
+// registry gates a critical path (embeddings), so any error here is fatal —
+// the caller fails startup rather than silently embedding into the void.
+func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
+	var eps []AIEndpoint
+	if err := json.Unmarshal([]byte(raw), &eps); err != nil {
+		return nil, fmt.Errorf("AI_ENDPOINTS is not valid JSON: %w", err)
+	}
+	seen := map[string]bool{}
+	for i, ep := range eps {
+		where := fmt.Sprintf("AI_ENDPOINTS[%d]", i)
+		if ep.ID == "" {
+			return nil, fmt.Errorf("%s: id is required", where)
+		}
+		if seen[ep.ID] {
+			return nil, fmt.Errorf("%s: duplicate id %q", where, ep.ID)
+		}
+		seen[ep.ID] = true
+		if !validAIType(ep.Type) {
+			return nil, fmt.Errorf("%s (%q): invalid type %q (want %q or %q)",
+				where, ep.ID, ep.Type, AIEndpointTypeEmbeddings, AIEndpointTypeChat)
+		}
+		if !validAIBackend(ep.Backend) {
+			return nil, fmt.Errorf("%s (%q): invalid backend %q (want %q, %q, or %q)",
+				where, ep.ID, ep.Backend, AIBackendOllama, AIBackendVLLM, AIBackendOpenAI)
+		}
+		if err := validateBaseURL(ep.BaseURL); err != nil {
+			return nil, fmt.Errorf("%s (%q): %w", where, ep.ID, err)
+		}
+		if ep.Model == "" {
+			return nil, fmt.Errorf("%s (%q): model is required", where, ep.ID)
+		}
+	}
+	return eps, nil
+}
+
+// parseAIRoles decodes the AI_ROLES JSON object.
+func parseAIRoles(raw string) (*AIRoles, error) {
+	var roles AIRoles
+	if err := json.Unmarshal([]byte(raw), &roles); err != nil {
+		return nil, fmt.Errorf("AI_ROLES is not valid JSON: %w", err)
+	}
+	return &roles, nil
+}
+
+// validateBaseURL requires a parseable http/https URL with a host, so a
+// mis-typed endpoint fails at startup rather than at first embed.
+func validateBaseURL(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("baseURL is required")
+	}
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("baseURL %q is not a valid URL: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("baseURL %q must be http:// or https://", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("baseURL %q has no host", raw)
+	}
+	return nil
+}
+
+// validateAIRoles checks that the role bindings resolve to endpoints of the
+// right type. Called after both AI_ENDPOINTS and AI_ROLES are parsed.
+func validateAIRoles(roles *AIRoles, eps []AIEndpoint) error {
+	byID := map[string]AIEndpoint{}
+	for _, ep := range eps {
+		byID[ep.ID] = ep
+	}
+	if roles.Embeddings == "" {
+		return fmt.Errorf("AI_ROLES.embeddings is required when AI_ENDPOINTS is set")
+	}
+	emb, ok := byID[roles.Embeddings]
+	if !ok {
+		return fmt.Errorf("AI_ROLES.embeddings %q does not match any AI_ENDPOINTS id", roles.Embeddings)
+	}
+	if emb.Type != AIEndpointTypeEmbeddings {
+		return fmt.Errorf("AI_ROLES.embeddings %q resolves to a %q endpoint, want %q",
+			roles.Embeddings, emb.Type, AIEndpointTypeEmbeddings)
+	}
+	if roles.Eval != "" {
+		ev, ok := byID[roles.Eval]
+		if !ok {
+			return fmt.Errorf("AI_ROLES.eval %q does not match any AI_ENDPOINTS id", roles.Eval)
+		}
+		if ev.Type != AIEndpointTypeChat {
+			return fmt.Errorf("AI_ROLES.eval %q resolves to a %q endpoint, want %q",
+				roles.Eval, ev.Type, AIEndpointTypeChat)
+		}
+	}
+	return nil
+}
+
+// legacyEmbeddingsID is the synthetic endpoint id used when AI_ENDPOINTS is
+// absent and the deployment relies on the deprecated EMBEDDINGS_* vars.
+const legacyEmbeddingsID = "_legacy"
 
 // Config holds all runtime configuration for the earmark Go service.
 // Field names mirror the canonical env var names from CONTRACT.md §2.4.
@@ -197,6 +355,18 @@ type Config struct {
 	// This does NOT influence job routing — the runner claims work itself.
 	ASRServers []ASRServer
 
+	// AIEndpoints — the AI endpoint registry (CONTRACT §2.14), parsed from
+	// AI_ENDPOINTS. When AI_ENDPOINTS is absent, LoadConfig synthesizes a single
+	// "_legacy" embeddings endpoint from EMBEDDINGS_BASE_URL / EMBEDDINGS_MODEL,
+	// so existing deployments keep working with no config change. Always non-empty
+	// after LoadConfig (it has at least the embeddings endpoint).
+	AIEndpoints []AIEndpoint
+
+	// AIRoles — role→endpoint-id bindings, parsed from AI_ROLES. When the legacy
+	// path is used it is synthesized as {Embeddings:"_legacy"}. Always non-nil
+	// after LoadConfig.
+	AIRoles *AIRoles
+
 	// Debug enables verbose structured logging.
 	Debug bool
 
@@ -265,10 +435,116 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
+	// AI endpoint registry (CONTRACT §2.14). Priority:
+	//   1. AI_ENDPOINTS + AI_ROLES — the structured registry (fail-closed on error).
+	//   2. EMBEDDINGS_BASE_URL + EMBEDDINGS_MODEL — synthesized "_legacy" endpoint.
+	// Unlike ASR_SERVERS, a malformed AI_ENDPOINTS is fatal: embeddings is the
+	// critical path and a silent degrade would cause invisible embed failures.
+	if err := cfg.loadAIRegistry(); err != nil {
+		return nil, err
+	}
+
 	cfg.Debug = parseBoolEnv("DEBUG")
 	cfg.DebugDBReset = parseBoolEnv("DEBUG_DB_RESET")
 
 	return cfg, nil
+}
+
+// loadAIRegistry populates AIEndpoints + AIRoles from AI_ENDPOINTS / AI_ROLES,
+// or synthesizes the legacy single-embeddings-endpoint registry from the
+// deprecated EMBEDDINGS_* vars. After it returns nil, AIEndpoints is non-empty
+// and AIRoles is non-nil with a resolvable Embeddings binding.
+func (c *Config) loadAIRegistry() error {
+	rawEndpoints := strings.TrimSpace(os.Getenv("AI_ENDPOINTS"))
+	if rawEndpoints == "" {
+		// Legacy path: synthesize one embeddings endpoint from EMBEDDINGS_*.
+		c.AIEndpoints = []AIEndpoint{{
+			ID:      legacyEmbeddingsID,
+			Type:    AIEndpointTypeEmbeddings,
+			Backend: AIBackendOllama,
+			BaseURL: c.EmbeddingsBaseURL,
+			Model:   c.EmbeddingsModel,
+		}}
+		c.AIRoles = &AIRoles{Embeddings: legacyEmbeddingsID}
+		logger.Debug("AI_ENDPOINTS absent; using legacy EMBEDDINGS_* as the _legacy endpoint")
+		return nil
+	}
+
+	eps, err := parseAIEndpoints(rawEndpoints)
+	if err != nil {
+		return err
+	}
+	if len(eps) == 0 {
+		return fmt.Errorf("AI_ENDPOINTS is an empty array; set at least an embeddings endpoint or unset it to use EMBEDDINGS_*")
+	}
+
+	rawRoles := strings.TrimSpace(os.Getenv("AI_ROLES"))
+	if rawRoles == "" {
+		return fmt.Errorf("AI_ROLES is required when AI_ENDPOINTS is set")
+	}
+	roles, err := parseAIRoles(rawRoles)
+	if err != nil {
+		return err
+	}
+	if err := validateAIRoles(roles, eps); err != nil {
+		return err
+	}
+
+	c.AIEndpoints = eps
+	c.AIRoles = roles
+	return nil
+}
+
+// EmbeddingsEndpoint returns the endpoint bound to the "embeddings" role.
+// It is always present after LoadConfig (the legacy synth guarantees it), but
+// returns ok=false defensively if the registry was constructed by hand without
+// a valid binding.
+func (c *Config) EmbeddingsEndpoint() (AIEndpoint, bool) {
+	return c.endpointForRole(roleEmbeddings)
+}
+
+// RoleForEndpoint returns the AI_ROLES key bound to an endpoint id, or "" when
+// the endpoint is registered but unbound. Used by the dashboard to label which
+// role an endpoint serves.
+func (c *Config) RoleForEndpoint(id string) string {
+	if c.AIRoles == nil {
+		return ""
+	}
+	switch id {
+	case c.AIRoles.Embeddings:
+		return roleEmbeddings
+	case c.AIRoles.Eval:
+		return roleEval
+	}
+	return ""
+}
+
+const (
+	roleEmbeddings = "embeddings"
+	roleEval       = "eval"
+)
+
+// endpointForRole resolves a role name to its bound endpoint.
+func (c *Config) endpointForRole(role string) (AIEndpoint, bool) {
+	if c.AIRoles == nil {
+		return AIEndpoint{}, false
+	}
+	var id string
+	switch role {
+	case roleEmbeddings:
+		id = c.AIRoles.Embeddings
+	case roleEval:
+		id = c.AIRoles.Eval
+	}
+	if id == "" {
+		return AIEndpoint{}, false
+	}
+	for _, ep := range c.AIEndpoints {
+		if ep.ID == id {
+			return ep, true
+		}
+	}
+	return AIEndpoint{}, false
 }
 
 // MaskSecret redacts all but the length of a secret string for logging.
@@ -306,6 +582,10 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("ABS Token", "value", MaskSecret(c.ABSToken))
 	logger.Debug("ABS Library ID", "value", c.ABSLibraryID)
 	logger.Debug("ASR Servers", "count", len(c.ASRServers))
+	logger.Debug("AI Endpoints", "count", len(c.AIEndpoints))
+	if emb, ok := c.EmbeddingsEndpoint(); ok {
+		logger.Debug("Embeddings endpoint (resolved)", "id", emb.ID, "model", emb.Model, "baseURL", emb.BaseURL)
+	}
 }
 
 // GetMetadataProvider satisfies metaprovider.providerConfig.
