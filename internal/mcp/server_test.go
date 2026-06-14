@@ -8,11 +8,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 )
 
 // SimpleMockDB implements DBInterface for simple testing.
@@ -132,6 +134,16 @@ func (m *SimpleMockDB) GetServerObservation(_ context.Context) (*db.ServerObserv
 func (m *SimpleMockDB) GetFindingsSummary(_ context.Context) (*db.FindingsSummary, error) {
 	return &db.FindingsSummary{}, nil
 }
+
+func (m *SimpleMockDB) GetEvalChunksForBook(_ context.Context, _ string, _ int) ([]db.EvalChunk, error) {
+	return nil, nil
+}
+
+func (m *SimpleMockDB) SampleEvalChunks(_ context.Context, _ int) ([]db.EvalChunk, error) {
+	return nil, nil
+}
+
+func (m *SimpleMockDB) InsertFindings(_ context.Context, _ []db.Finding) error { return nil }
 
 func (m *SimpleMockDB) GetFailedJobs(_ context.Context) ([]db.FailedJob, error) {
 	err := "RuntimeError: CUDA out of memory"
@@ -1009,5 +1021,201 @@ func TestTrackSegmentsEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "seg-text") {
 		t.Errorf("track segments should render seg rows:\n%s", w.Body.String())
+	}
+}
+
+// ─── Eval-run action handlers (CONTRACT §2.15) ───────────────────────────────
+
+// buildEvalTestMux wires a server with the eval layer "configured" (a recorded
+// synchronous run func substituted for the real LLM call) and the given control
+// token. recorded captures the RunOptions each triggered run saw; the WaitGroup
+// lets a test wait out the background goroutine deterministically.
+func buildEvalTestMux(t *testing.T, mockDB DBInterface, token string, configured bool) (http.Handler, *evalRunRecorder) {
+	t.Helper()
+	srv := NewMCPServer(mockDB, &config.Config{ControlAPIToken: token})
+	rec := &evalRunRecorder{}
+	if configured {
+		srv.eval.configured = true
+		srv.eval.run = rec.run
+	} else {
+		srv.eval.configured = false
+		srv.eval.run = nil
+	}
+	return srv.buildMux(), rec
+}
+
+type evalRunRecorder struct {
+	mu   sync.Mutex
+	opts []eval.RunOptions
+	done chan struct{}
+}
+
+func (r *evalRunRecorder) run(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {
+	r.mu.Lock()
+	r.opts = append(r.opts, opts)
+	ch := r.done
+	r.mu.Unlock()
+	if ch != nil {
+		<-ch // block until the test releases, to exercise the in-flight guard
+	}
+	return eval.RunStats{ChunksEvaluated: 1, FindingsFound: 1, Persisted: true}, nil
+}
+
+func (r *evalRunRecorder) calls() []eval.RunOptions {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]eval.RunOptions, len(r.opts))
+	copy(out, r.opts)
+	return out
+}
+
+// waitForCalls polls until at least n runs have been recorded (the run is async).
+func (r *evalRunRecorder) waitForCalls(t *testing.T, n int) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if len(r.calls()) >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d eval run(s), saw %d", n, len(r.calls()))
+}
+
+// TestEvalBookAction: POST /actions/eval?dir=… kicks a per-book run with the
+// chunk cap, returns the book fragment with an "Evaluating" notice, and is
+// htmx-guarded.
+func TestEvalBookAction(t *testing.T) {
+	h, rec := buildEvalTestMux(t, &SimpleMockDB{}, "tok", true)
+
+	req := httptest.NewRequest(http.MethodPost, "/actions/eval?dir=/books/Author/Book", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("eval book: want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Evaluating") {
+		t.Errorf("eval book should return an evaluating notice:\n%s", w.Body.String())
+	}
+	rec.waitForCalls(t, 1)
+	got := rec.calls()[0]
+	if got.Book != "/books/Author/Book" {
+		t.Errorf("Book = %q, want the dir", got.Book)
+	}
+	if got.Limit != perBookEvalLimit || !got.Write {
+		t.Errorf("opts = %+v, want Limit=%d Write=true", got, perBookEvalLimit)
+	}
+
+	// Missing HX-Request header → 403, no run.
+	h2, rec2 := buildEvalTestMux(t, &SimpleMockDB{}, "tok", true)
+	req = httptest.NewRequest(http.MethodPost, "/actions/eval?dir=/x", nil)
+	w = httptest.NewRecorder()
+	h2.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("non-htmx eval: want 403, got %d", w.Code)
+	}
+	if len(rec2.calls()) != 0 {
+		t.Error("non-htmx request must not run the judge")
+	}
+}
+
+// TestEvalSampleAction: POST /actions/eval-sample?n=N clamps n and kicks a
+// sample run.
+func TestEvalSampleAction(t *testing.T) {
+	h, rec := buildEvalTestMux(t, &SimpleMockDB{}, "tok", true)
+	req := httptest.NewRequest(http.MethodPost, "/actions/eval-sample?n=999", nil) // over the ceiling
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("eval sample: want 200, got %d", w.Code)
+	}
+	rec.waitForCalls(t, 1)
+	got := rec.calls()[0]
+	if got.Sample != maxEvalSampleN {
+		t.Errorf("Sample = %d, want clamped to %d", got.Sample, maxEvalSampleN)
+	}
+	if !got.Write {
+		t.Error("sample run should persist (Write=true)")
+	}
+}
+
+// TestEvalActionFailClosedWithoutToken: an unset CONTROL_API_TOKEN disables the
+// eval triggers (fail-closed) even when an endpoint is configured.
+func TestEvalActionFailClosedWithoutToken(t *testing.T) {
+	h, rec := buildEvalTestMux(t, &SimpleMockDB{}, "", true) // no token
+	req := httptest.NewRequest(http.MethodPost, "/actions/eval-sample?n=10", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	// writeActionError returns 200 + HX-Retarget so htmx surfaces the banner.
+	if w.Code != http.StatusOK {
+		t.Fatalf("fail-closed: want 200 (banner), got %d", w.Code)
+	}
+	if w.Header().Get("HX-Retarget") != "#action-error" {
+		t.Errorf("expected an action-error retarget, headers=%v", w.Header())
+	}
+	if len(rec.calls()) != 0 {
+		t.Error("must not run the judge without a control token")
+	}
+}
+
+// TestEvalActionNotConfigured: with no eval endpoint, the trigger reports the
+// missing endpoint rather than running.
+func TestEvalActionNotConfigured(t *testing.T) {
+	h, _ := buildEvalTestMux(t, &SimpleMockDB{}, "tok", false) // not configured
+	req := httptest.NewRequest(http.MethodPost, "/actions/eval-sample?n=10", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("not-configured: want 200 (banner), got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "no eval chat endpoint") {
+		t.Errorf("expected a not-configured banner:\n%s", w.Body.String())
+	}
+}
+
+// TestEvalActionInFlightGuard: a second trigger while one run is in flight is
+// rejected (no overlapping run), then allowed again once the first finishes.
+func TestEvalActionInFlightGuard(t *testing.T) {
+	srv := NewMCPServer(&SimpleMockDB{}, &config.Config{ControlAPIToken: "tok"})
+	rec := &evalRunRecorder{done: make(chan struct{})}
+	srv.eval.configured = true
+	srv.eval.run = rec.run
+	h := srv.buildMux()
+
+	post := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/actions/eval-sample?n=10", nil)
+		req.Header.Set("HX-Request", "true")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	w1 := post()
+	if !strings.Contains(w1.Body.String(), "Evaluating") {
+		t.Errorf("first run should start:\n%s", w1.Body.String())
+	}
+	rec.waitForCalls(t, 1) // first run is now blocked inside run()
+
+	w2 := post()
+	if !strings.Contains(w2.Body.String(), "already in flight") {
+		t.Errorf("second run should be rejected as in-flight:\n%s", w2.Body.String())
+	}
+	if len(rec.calls()) != 1 {
+		t.Errorf("in-flight guard breached: %d runs started", len(rec.calls()))
+	}
+
+	close(rec.done) // let the first run finish
+	// in-flight flag clears in the goroutine's defer; poll for it.
+	for i := 0; i < 200; i++ {
+		if !srv.eval.inFlight.Load() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if srv.eval.inFlight.Load() {
+		t.Fatal("in-flight flag did not clear after run finished")
 	}
 }

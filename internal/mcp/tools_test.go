@@ -143,6 +143,16 @@ func (m *MockDBInterface) GetFindingsSummary(context.Context) (*db.FindingsSumma
 	return &db.FindingsSummary{}, nil
 }
 
+func (m *MockDBInterface) GetEvalChunksForBook(context.Context, string, int) ([]db.EvalChunk, error) {
+	return nil, nil
+}
+
+func (m *MockDBInterface) SampleEvalChunks(context.Context, int) ([]db.EvalChunk, error) {
+	return nil, nil
+}
+
+func (m *MockDBInterface) InsertFindings(context.Context, []db.Finding) error { return nil }
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

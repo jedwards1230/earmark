@@ -449,7 +449,14 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
   <div class="book-actions">
     <button class="btn btn-warn" hx-post="/actions/book-requeue?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
             hx-confirm="Re-transcribe all {{.Total}} track(s) of this book? Deletes their transcripts + embeddings and re-runs the runner.">requeue entire book</button>
+    {{if .EvalConfigured}}
+    <button class="btn" hx-post="/actions/eval?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
+            hx-confirm="Run the read-only LLM judge over this book's chunks? It flags suspected transcription errors (advisory only — transcripts are never edited) and may take a minute.">run eval</button>
+    {{else}}
+    <span class="eval-disabled" title="No eval chat endpoint is configured (AI_ROLES.eval / EVAL_CHAT_*).">run eval (no endpoint — <a href="/servers">configure</a>)</span>
+    {{end}}
   </div>
+  {{if .EvalNotice}}<div class="eval-notice" role="status">{{.EvalNotice}}</div>{{end}}
 </div>
 
 <form class="lib-search" hx-post="/search/book?dir={{.DirQuery}}" hx-target="#book-search-results" hx-swap="innerHTML">
@@ -719,6 +726,13 @@ type bookData struct {
 	Done     int
 	Failed   int
 	Tracks   []db.RecentJob
+	// EvalConfigured gates the "run eval" button: true only when a judge chat
+	// endpoint resolves (CONTRACT §2.15). When false the button is hidden with a
+	// pointer to the Models/Services page rather than POSTing into a failure.
+	EvalConfigured bool
+	// EvalNotice is a transient post-action banner ("evaluating N chunks…" or
+	// "an eval run is already in flight"). Empty on a normal fragment load.
+	EvalNotice string
 }
 
 type failedData struct {
@@ -1146,6 +1160,12 @@ func (s *MCPServer) handleBookData(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *MCPServer) renderBookFragment(w http.ResponseWriter, r *http.Request, dir string) {
+	s.renderBookFragmentWithNotice(w, r, dir, "")
+}
+
+// renderBookFragmentWithNotice renders the book fragment with an optional
+// transient eval notice (e.g. "evaluating N chunks…" after the run-eval button).
+func (s *MCPServer) renderBookFragmentWithNotice(w http.ResponseWriter, r *http.Request, dir, evalNotice string) {
 	tracks, err := s.db.GetBookTracks(r.Context(), dir)
 	if err != nil {
 		s.logger.Error("GetBookTracks error", "dir", dir, "error", err)
@@ -1153,7 +1173,8 @@ func (s *MCPServer) renderBookFragment(w http.ResponseWriter, r *http.Request, d
 		return
 	}
 
-	d := bookData{Dir: dir, DirQuery: url.QueryEscape(dir), Tracks: tracks, Total: len(tracks)}
+	d := bookData{Dir: dir, DirQuery: url.QueryEscape(dir), Tracks: tracks, Total: len(tracks),
+		EvalConfigured: s.eval.configured, EvalNotice: evalNotice}
 	for _, t := range tracks {
 		switch t.Status {
 		case "pending":

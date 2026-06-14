@@ -45,8 +45,9 @@ advisory metadata you triage by confidence (CONTRACT §2.15).
 Cost is bounded: evaluate one book, or a random --sample of N chunks. Nothing is
 recorded unless you pass --write (alias --yes).
 
-Endpoint: set EVAL_CHAT_BASE_URL and EVAL_CHAT_MODEL (OpenAI-compatible chat
-endpoint, e.g. vLLM). EVAL_CHAT_API_KEY is optional.
+Endpoint: bind AI_ROLES.eval to a chat AI_ENDPOINTS entry (preferred), or set
+EVAL_CHAT_BASE_URL and EVAL_CHAT_MODEL (OpenAI-compatible chat endpoint, e.g.
+vLLM) as a fallback. EVAL_CHAT_API_KEY is optional.
 
 Examples:
   earmark eval "Project Hail Mary"           # preview findings for one book
@@ -80,8 +81,9 @@ func runEval(cmd *cobra.Command, args []string) {
 	}
 	defer database.Close()
 
-	// Resolve the chat endpoint (the #48 stub — standalone env vars for now).
-	chat, err := evalpkg.ResolveChatClient()
+	// Resolve the chat endpoint: AI_ROLES["eval"] from the registry when set,
+	// else the standalone EVAL_CHAT_* env vars (#48 resolved).
+	chat, err := evalpkg.ResolveChatClient(evalpkg.ConfigSource(cfg))
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)

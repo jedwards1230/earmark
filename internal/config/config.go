@@ -503,6 +503,16 @@ func (c *Config) EmbeddingsEndpoint() (AIEndpoint, bool) {
 	return c.endpointForRole(roleEmbeddings)
 }
 
+// EvalEndpoint returns the chat endpoint bound to the "eval" role (the
+// LLM-as-judge, CONTRACT §2.15). Unlike embeddings it is optional: when no
+// AI_ROLES.eval binding exists ok=false, and the caller falls back to the
+// standalone EVAL_CHAT_* env vars (CONTRACT §2.15 "the #48 stub"). validateAIRoles
+// already guarantees the bound endpoint is type "chat", so a returned endpoint is
+// always a chat endpoint.
+func (c *Config) EvalEndpoint() (AIEndpoint, bool) {
+	return c.endpointForRole(roleEval)
+}
+
 // RoleForEndpoint returns the AI_ROLES key bound to an endpoint id, or "" when
 // the endpoint is registered but unbound. Used by the dashboard to label which
 // role an endpoint serves.
