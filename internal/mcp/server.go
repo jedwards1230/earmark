@@ -46,6 +46,14 @@ type MCPServer struct {
 	// prober polls gpu-arbiter for the live readiness of servers that declare a
 	// gpuArbiterUrl (TTL-cached). Swapped for a static fake in the demo.
 	prober gpuProber
+
+	// cfg is retained so the Models/Services page can read the AI endpoint
+	// registry (CONTRACT §2.14). Read-only after construction.
+	cfg *config.Config
+
+	// endpointProber probes each AI endpoint's /models for liveness (TTL-cached).
+	// Swapped for a static fake in the demo.
+	endpointProber endpointProber
 }
 
 // NewMCPServer creates a new MCP server instance
@@ -230,9 +238,13 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		meta:             meta,
 		controlToken:     cfg.ControlAPIToken,
 		asrServers:       cfg.ASRServers,
+		cfg:              cfg,
 		// 2s timeout keeps a slow/unreachable gpu-arbiter from stalling the page;
 		// 5s TTL coalesces the /servers + /api/v1/status probes within one refresh.
 		prober: newHTTPGPUProber(2*time.Second, 5*time.Second),
+		// AI endpoint /models probe: same timeout/TTL budget as the gpu-arbiter
+		// prober so a slow upstream can't stall the Models/Services page.
+		endpointProber: newHTTPEndpointProber(2*time.Second, 5*time.Second),
 	}
 }
 

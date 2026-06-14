@@ -60,6 +60,25 @@ type apiStatus struct {
 	// Servers is the configured-vs-observed transcription-server view (see the
 	// Servers dashboard page). Empty when no servers are configured or observed.
 	Servers []apiServer `json:"servers"`
+	// Endpoints is the AI endpoint registry (CONTRACT §2.14) with health probes.
+	// Always non-empty (at least the embeddings endpoint after config load).
+	Endpoints []apiEndpoint `json:"endpoints"`
+}
+
+// apiEndpoint is the JSON shape of one AI endpoint in GET /api/v1/status.
+// state is a machine token: "ready" | "model_not_loaded" | "offline" |
+// "unknown". baseURL is included because it is a LAN-internal, non-secret
+// address useful to operators debugging connectivity (see CONTRACT §2.14).
+type apiEndpoint struct {
+	ID      string            `json:"id"`
+	Type    string            `json:"type"`
+	Backend string            `json:"backend"`
+	BaseURL string            `json:"baseURL"`
+	Model   string            `json:"model"`
+	Options map[string]string `json:"options,omitempty"`
+	Role    string            `json:"role,omitempty"`
+	State   string            `json:"state"`
+	Probed  bool              `json:"probed"`
 }
 
 // apiServer is the JSON shape of one transcription server in GET /api/v1/status.
@@ -195,6 +214,28 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 				VRAMTotalMB:        v.VRAMTotalMB,
 			})
 		}
+	}
+
+	// AI endpoint registry (CONTRACT §2.14), merged with liveness probes. Options
+	// are emitted from the raw registry (the view drops the map for rendering).
+	optsByID := map[string]map[string]string{}
+	if s.cfg != nil {
+		for _, ep := range s.cfg.AIEndpoints {
+			optsByID[ep.ID] = ep.Options
+		}
+	}
+	for _, v := range buildEndpointViews(s.cfg, s.probeEndpoints(r.Context())) {
+		out.Endpoints = append(out.Endpoints, apiEndpoint{
+			ID:      v.ID,
+			Type:    v.Type,
+			Backend: v.Backend,
+			BaseURL: v.BaseURL,
+			Model:   v.Model,
+			Options: optsByID[v.ID],
+			Role:    v.Role,
+			State:   v.StateToken,
+			Probed:  v.Probed,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, out)
