@@ -151,6 +151,9 @@ var tmplFuncs = template.FuncMap{
 		}
 		return fmt.Sprintf("%.0f%%", *c*100)
 	},
+	// confPctF renders a plain (non-nullable) confidence (0–1) as a percentage.
+	// Used by the Findings per-book table where the mean is always present.
+	"confPctF": func(c float64) string { return fmt.Sprintf("%.0f%%", c*100) },
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.

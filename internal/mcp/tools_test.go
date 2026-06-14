@@ -139,6 +139,10 @@ func (m *MockDBInterface) GetServerObservation(context.Context) (*db.ServerObser
 	return &db.ServerObservation{}, nil
 }
 
+func (m *MockDBInterface) GetFindingsSummary(context.Context) (*db.FindingsSummary, error) {
+	return &db.FindingsSummary{}, nil
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

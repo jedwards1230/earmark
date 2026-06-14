@@ -63,6 +63,10 @@ type DBInterface interface {
 	// GetServerObservation returns observed runner activity (live claims + per-host
 	// run_metrics) the Servers page merges with the configured ASR_SERVERS list.
 	GetServerObservation(ctx context.Context) (*db.ServerObservation, error)
+	// GetFindingsSummary returns the read-only eval-layer findings rollup
+	// (totals, confidence buckets, issue-type tally, per-book) for the /findings
+	// dashboard page (CONTRACT §2.15).
+	GetFindingsSummary(ctx context.Context) (*db.FindingsSummary, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

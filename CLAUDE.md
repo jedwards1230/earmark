@@ -131,6 +131,7 @@ Debug-only (both must be set):
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client; resolves its endpoint through the AI registry's `embeddings` role (CONTRACT §2.14) |
 | `internal/asr` | ASR backend capability vocabulary (CONTRACT §2.13): closed capability enum + `ParseCapabilities` (drops unknown keys), recommended `family`/`runtime` ids + `KnownFamily`/`KnownRuntime` label helpers. Pure leaf package (no DB/HTTP deps). |
+| `internal/eval` | Read-only LLM-as-judge (CONTRACT §2.15, `earmark eval`): READS transcript chunks, calls an OpenAI-compatible chat endpoint behind the `ChatClient` interface, parses suspected errors + confidence, INSERTs advisory `transcript_findings`. NEVER edits transcripts. Chat endpoint resolved via `EVAL_CHAT_*` env vars (TODO(#48): bind to the AI endpoint registry). |
 | `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry + per-server backend descriptor; and the `AI_ENDPOINTS`/`AI_ROLES` AI endpoint registry, CONTRACT §2.14, with legacy `EMBEDDINGS_*` synthesis + role resolution) |
 | `internal/mcp` (servers.go, gpuprobe.go, endpoints.go, endpointprobe.go) | **Models/Services** dashboard page (`/servers`) + `servers[]`/`endpoints[]` in `/api/v1/status`: merges the configured `ASR_SERVERS` list with observed runner activity + a gpu-arbiter readiness probe, and lists every `AI_ENDPOINTS` entry with a `GET /models` liveness probe. Observability only — no job routing. |
 

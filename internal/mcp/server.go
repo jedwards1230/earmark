@@ -315,6 +315,8 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/failed", getOnly(s.handleFailedPage))
 	mux.HandleFunc("/servers", getOnly(s.handleServersPage))
 	mux.HandleFunc("/servers/data", getOnly(s.handleServersData))
+	mux.HandleFunc("/findings", getOnly(s.handleFindingsPage))
+	mux.HandleFunc("/findings/data", getOnly(s.handleFindingsData))
 
 	// Per-book transcript search (read-only; accepts the htmx form POST or a GET).
 	// Specific path → method patterns are safe (no "/" catch-all conflict).
