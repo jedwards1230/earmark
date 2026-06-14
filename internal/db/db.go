@@ -382,6 +382,43 @@ func (db *DB) initialize(ctx context.Context) error {
 			source      TEXT,
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
+
+		-- transcript_findings: read-only LLM-as-judge output (CONTRACT §2.15).
+		-- Each row is an ADVISORY suspected transcription error recorded by the
+		-- eval layer (internal/eval). The eval layer is strictly read-then-insert:
+		-- it READS transcripts/segments/transcript_chunks and INSERTs here; it
+		-- NEVER updates/deletes/alters the transcript tables, and this table has
+		-- no FK that could cascade a mutation back into them (the immutability
+		-- asymmetry — a wrong flag is harmless, a wrong correction corrupts the
+		-- corpus, so corrections are never applied). suggested_correction is
+		-- informational only. transcription_run_id ties a finding to the job/run
+		-- (hence the ASR backend) that produced the transcript, so the same judge
+		-- over different backends yields a comparative quality metric (§2.15).
+		CREATE TABLE IF NOT EXISTS transcript_findings (
+			id                    UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+			transcript_id         UUID        NOT NULL,
+			file_path             TEXT        NOT NULL,
+			chunk_id              UUID,
+			chunk_index           INTEGER,
+			start_sec             FLOAT8      NOT NULL,
+			end_sec               FLOAT8      NOT NULL,
+			original_text         TEXT        NOT NULL,
+			issue_type            TEXT        NOT NULL,
+			suggested_correction  TEXT,
+			confidence            FLOAT8      NOT NULL,
+			model                 TEXT        NOT NULL,
+			transcription_run_id  UUID,
+			created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+
+		CREATE INDEX IF NOT EXISTS transcript_findings_file_path_idx
+			ON transcript_findings (file_path);
+		CREATE INDEX IF NOT EXISTS transcript_findings_transcript_id_idx
+			ON transcript_findings (transcript_id);
+		CREATE INDEX IF NOT EXISTS transcript_findings_run_id_idx
+			ON transcript_findings (transcription_run_id);
+		CREATE INDEX IF NOT EXISTS transcript_findings_issue_type_idx
+			ON transcript_findings (issue_type);
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -2115,6 +2152,248 @@ func (db *DB) getTrackChunks(ctx context.Context, q rowQuerier, jobID string) ([
 		return nil, fmt.Errorf("rows error (track chunks): %w", err)
 	}
 	return out, nil
+}
+
+// ─── Eval layer (read-only LLM judge, CONTRACT §2.15) ────────────────────────
+//
+// The methods in this section are the eval layer's ONLY contact with the
+// database. They fall into exactly two kinds:
+//   - READ a chunk (with its transcript + run ids) to feed the judge.
+//   - INSERT a finding row.
+// There is intentionally NO UpdateFinding/DeleteFinding and NO method here that
+// writes to transcripts/segments/transcript_chunks — the read-only contract is
+// enforced structurally by the absence of such methods, not just by convention.
+
+// EvalChunk is one unit of work for the judge: a chunk's text plus the
+// addressing it needs to attribute a finding (transcript, run, ordinal, span).
+type EvalChunk struct {
+	ChunkID            string
+	TranscriptID       string
+	TranscriptionRunID string // transcription_jobs.id — the run/backend that produced the transcript
+	FilePath           string
+	ChunkIndex         int
+	StartSec           float64
+	EndSec             float64
+	Text               string
+}
+
+// evalChunkSelectSQL is the shared SELECT/JOIN shape used to pull eval chunks.
+// It joins each chunk back to its transcript's originating job so a finding can
+// carry transcription_run_id (per-backend attribution). It is a package var so
+// tests can assert it never contains a write verb against the transcript tables.
+var evalChunkSelectSQL = `
+	SELECT c.id, c.transcript_id, t.job_id, c.file_path,
+	       c.chunk_index, c.start_sec, c.end_sec, c.text
+	FROM transcript_chunks c
+	JOIN transcripts t ON t.id = c.transcript_id
+`
+
+// GetEvalChunksForBook returns the chunks whose file_path contains substr
+// (case-insensitive), in path/chunk order, capped at limit (≤0 → a sane
+// default). Read-only. The substring match mirrors `requeue` ergonomics so the
+// operator can pass a title fragment (e.g. "Project Hail Mary").
+func (db *DB) GetEvalChunksForBook(ctx context.Context, substr string, limit int) ([]EvalChunk, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := db.pool.Query(ctx, evalChunkSelectSQL+`
+		WHERE c.file_path ILIKE $1
+		ORDER BY c.file_path, c.chunk_index
+		LIMIT $2
+	`, likePattern(substr), limit)
+	if err != nil {
+		return nil, fmt.Errorf("eval chunks for book query: %w", err)
+	}
+	defer rows.Close()
+	return scanEvalChunks(rows)
+}
+
+// SampleEvalChunks returns up to limit randomly-sampled chunks across the whole
+// library (read-only). Used by `earmark eval --sample N` to bound cost to N
+// judge calls regardless of library size while staying representative.
+func (db *DB) SampleEvalChunks(ctx context.Context, limit int) ([]EvalChunk, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.pool.Query(ctx, evalChunkSelectSQL+`
+		ORDER BY random()
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("sample eval chunks query: %w", err)
+	}
+	defer rows.Close()
+	return scanEvalChunks(rows)
+}
+
+func scanEvalChunks(rows pgx.Rows) ([]EvalChunk, error) {
+	var out []EvalChunk
+	for rows.Next() {
+		var c EvalChunk
+		if err := rows.Scan(&c.ChunkID, &c.TranscriptID, &c.TranscriptionRunID,
+			&c.FilePath, &c.ChunkIndex, &c.StartSec, &c.EndSec, &c.Text); err != nil {
+			return nil, fmt.Errorf("scan eval chunk: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (eval chunks): %w", err)
+	}
+	return out, nil
+}
+
+// Finding is one advisory suspected-error row to INSERT into transcript_findings.
+// suggested_correction is informational only and is never applied (§2.15).
+type Finding struct {
+	TranscriptID        string
+	FilePath            string
+	ChunkID             *string
+	ChunkIndex          *int
+	StartSec            float64
+	EndSec              float64
+	OriginalText        string
+	IssueType           string
+	SuggestedCorrection *string
+	Confidence          float64
+	Model               string
+	TranscriptionRunID  *string
+}
+
+// insertFindingSQL is the INSERT for one finding. Package var so a test can
+// assert it is an INSERT into transcript_findings and touches no other table —
+// the read-only-over-transcripts guard at the SQL level.
+var insertFindingSQL = `
+	INSERT INTO transcript_findings
+	       (transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
+	        original_text, issue_type, suggested_correction, confidence, model,
+	        transcription_run_id)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+`
+
+// InsertFindings stores judge findings in one transaction. Insert-only: it never
+// updates or deletes any row, and writes to no table other than
+// transcript_findings. A nil/empty slice is a no-op.
+func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
+	if len(findings) == 0 {
+		return nil
+	}
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin findings tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for i, f := range findings {
+		if _, err := tx.Exec(ctx, insertFindingSQL,
+			f.TranscriptID, f.FilePath, f.ChunkID, f.ChunkIndex, f.StartSec, f.EndSec,
+			f.OriginalText, f.IssueType, f.SuggestedCorrection, f.Confidence, f.Model,
+			f.TranscriptionRunID,
+		); err != nil {
+			return fmt.Errorf("insert finding %d: %w", i, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// FindingsSummary is the dashboard's per-book + library findings rollup.
+type FindingsSummary struct {
+	TotalFindings    int
+	MeanConfidence   *float64 // nil when no findings yet
+	HighConfidence   int      // confidence >= 0.8
+	MediumConfidence int      // 0.4 <= confidence < 0.8
+	LowConfidence    int      // confidence < 0.4
+	ByIssueType      []IssueTypeCount
+	ByBook           []BookFindings
+}
+
+// IssueTypeCount is one issue-type tally for the library-wide breakdown.
+type IssueTypeCount struct {
+	IssueType string
+	Count     int
+}
+
+// BookFindings is one book's findings rollup for the dashboard's per-book table.
+type BookFindings struct {
+	FilePath       string // a representative track path within the book
+	BookDir        string
+	Count          int
+	MeanConfidence float64
+	TopIssueType   string
+}
+
+// GetFindingsSummary returns the library-wide findings rollup (read-only) used by
+// the dashboard /findings page: totals, confidence buckets, an issue-type tally,
+// and a per-book breakdown. Empty (not nil-erroring) on a fresh install.
+func (db *DB) GetFindingsSummary(ctx context.Context) (*FindingsSummary, error) {
+	s := &FindingsSummary{}
+
+	// Totals + confidence buckets in one pass. MeanConfidence is nil when there
+	// are zero findings (AVG over no rows is NULL → nilable pointer).
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       AVG(confidence),
+		       COUNT(*) FILTER (WHERE confidence >= 0.8),
+		       COUNT(*) FILTER (WHERE confidence >= 0.4 AND confidence < 0.8),
+		       COUNT(*) FILTER (WHERE confidence < 0.4)
+		FROM transcript_findings
+	`).Scan(&s.TotalFindings, &s.MeanConfidence,
+		&s.HighConfidence, &s.MediumConfidence, &s.LowConfidence); err != nil {
+		return nil, fmt.Errorf("findings totals query: %w", err)
+	}
+
+	// Issue-type tally, most common first.
+	typeRows, err := db.pool.Query(ctx, `
+		SELECT issue_type, COUNT(*) AS n
+		FROM transcript_findings
+		GROUP BY issue_type
+		ORDER BY n DESC, issue_type
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("findings issue-type query: %w", err)
+	}
+	defer typeRows.Close()
+	for typeRows.Next() {
+		var it IssueTypeCount
+		if err := typeRows.Scan(&it.IssueType, &it.Count); err != nil {
+			return nil, fmt.Errorf("scan issue-type count: %w", err)
+		}
+		s.ByIssueType = append(s.ByIssueType, it)
+	}
+	if err := typeRows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (issue-type): %w", err)
+	}
+
+	// Per-book rollup: group by book directory (dirname of file_path).
+	bookRows, err := db.pool.Query(ctx, `
+		WITH per_book AS (
+			SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir,
+			       MIN(file_path)        AS sample_path,
+			       COUNT(*)              AS n,
+			       AVG(confidence)       AS mean_conf,
+			       mode() WITHIN GROUP (ORDER BY issue_type) AS top_issue
+			FROM transcript_findings
+			GROUP BY book_dir
+		)
+		SELECT book_dir, sample_path, n, mean_conf, top_issue
+		FROM per_book
+		ORDER BY n DESC, book_dir
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("findings per-book query: %w", err)
+	}
+	defer bookRows.Close()
+	for bookRows.Next() {
+		var b BookFindings
+		if err := bookRows.Scan(&b.BookDir, &b.FilePath, &b.Count, &b.MeanConfidence, &b.TopIssueType); err != nil {
+			return nil, fmt.Errorf("scan book findings: %w", err)
+		}
+		s.ByBook = append(s.ByBook, b)
+	}
+	if err := bookRows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (per-book findings): %w", err)
+	}
+
+	return s, nil
 }
 
 // ─── Checksum helper ─────────────────────────────────────────────────────────
