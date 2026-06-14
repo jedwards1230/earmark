@@ -861,6 +861,7 @@ func StartDemoDashboard(addr string) error {
 	// the per-book "run eval" button is hidden. Every other scenario keeps the
 	// eval role bound so the trigger surface renders.
 	aiRoles := demoAIRoles
+	// #nosec G101 - demo fixture string, not a real credential
 	demoEvalToken := "demo-eval-token"
 	if scenario == "empty" {
 		aiRoles = &config.AIRoles{Embeddings: "embed-1"} // no Eval binding
