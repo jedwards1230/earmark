@@ -18,7 +18,7 @@ func clearContractEnvVars(t *testing.T) {
 		"EMBEDDINGS_BASE_URL", "EMBEDDINGS_MODEL",
 		"MCP_HTTP_ADDR", "STALE_JOB_TIMEOUT",
 		"CHUNK_SIZE", "DEBUG", "DEBUG_DB_RESET",
-		"ASR_SERVERS",
+		"ASR_SERVERS", "AI_ENDPOINTS", "AI_ROLES",
 	}
 	for _, k := range vars {
 		t.Setenv(k, "") // t.Setenv restores on cleanup
@@ -244,4 +244,178 @@ func TestLoadConfig_ASRServersBackCompatNoNewFields(t *testing.T) {
 	assert.Empty(t, s.Runtime)
 	assert.Nil(t, s.Capabilities)
 	assert.Nil(t, s.Languages)
+}
+
+// ─── AI endpoint registry (CONTRACT §2.14) ──────────────────────────────────────
+
+func TestLoadConfig_LegacyEmbeddingsSynth(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	// No AI_ENDPOINTS: the deprecated EMBEDDINGS_* vars synthesize a _legacy endpoint.
+	t.Setenv("EMBEDDINGS_BASE_URL", "http://custom-ollama:11434/v1")
+	t.Setenv("EMBEDDINGS_MODEL", "mxbai-embed-large")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.AIEndpoints, 1)
+	ep := cfg.AIEndpoints[0]
+	assert.Equal(t, legacyEmbeddingsID, ep.ID)
+	assert.Equal(t, AIEndpointTypeEmbeddings, ep.Type)
+	assert.Equal(t, AIBackendOllama, ep.Backend)
+	assert.Equal(t, "http://custom-ollama:11434/v1", ep.BaseURL)
+	assert.Equal(t, "mxbai-embed-large", ep.Model)
+
+	require.NotNil(t, cfg.AIRoles)
+	assert.Equal(t, legacyEmbeddingsID, cfg.AIRoles.Embeddings)
+
+	got, ok := cfg.EmbeddingsEndpoint()
+	require.True(t, ok)
+	assert.Equal(t, legacyEmbeddingsID, got.ID)
+	assert.Equal(t, "mxbai-embed-large", got.Model)
+}
+
+func TestLoadConfig_LegacyDefaults(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	// Neither AI_ENDPOINTS nor EMBEDDINGS_* set: defaults flow into the _legacy endpoint.
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.AIEndpoints, 1)
+	assert.Equal(t, "http://ollama:11434/v1", cfg.AIEndpoints[0].BaseURL)
+	assert.Equal(t, "nomic-embed-text", cfg.AIEndpoints[0].Model)
+}
+
+func TestLoadConfig_AIEndpointsValid(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("AI_ENDPOINTS", `[
+		{"id":"embed-1","type":"embeddings","backend":"ollama","baseURL":"http://ollama:11434/v1","model":"nomic-embed-text"},
+		{"id":"eval-1","type":"chat","backend":"vllm","baseURL":"http://gpu-host:8000/v1","model":"Qwen2.5-7B-Instruct","options":{"temperature":"0","max_tokens":"256"}}
+	]`)
+	t.Setenv("AI_ROLES", `{"embeddings":"embed-1","eval":"eval-1"}`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.AIEndpoints, 2)
+	assert.Equal(t, map[string]string{"temperature": "0", "max_tokens": "256"}, cfg.AIEndpoints[1].Options)
+
+	emb, ok := cfg.EmbeddingsEndpoint()
+	require.True(t, ok)
+	assert.Equal(t, "embed-1", emb.ID)
+
+	assert.Equal(t, "embeddings", cfg.RoleForEndpoint("embed-1"))
+	assert.Equal(t, "eval", cfg.RoleForEndpoint("eval-1"))
+	assert.Equal(t, "", cfg.RoleForEndpoint("unbound"))
+}
+
+func TestLoadConfig_AIEndpoints_AIRolesRequired(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("AI_ENDPOINTS", `[{"id":"embed-1","type":"embeddings","backend":"ollama","baseURL":"http://ollama:11434/v1","model":"m"}]`)
+	// AI_ROLES intentionally unset.
+	_, err := LoadConfig()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AI_ROLES is required")
+}
+
+func TestLoadConfig_AIEndpoints_MalformedJSONFailsClosed(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("AI_ENDPOINTS", `[{"id":"embed-1",`) // truncated JSON
+	t.Setenv("AI_ROLES", `{"embeddings":"embed-1"}`)
+	_, err := LoadConfig()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AI_ENDPOINTS is not valid JSON")
+}
+
+func TestLoadConfig_AIEndpoints_ValidationErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		endpoints string
+		roles     string
+		wantErr   string
+	}{
+		{
+			name:      "duplicate id",
+			endpoints: `[{"id":"x","type":"embeddings","backend":"ollama","baseURL":"http://h/v1","model":"m"},{"id":"x","type":"chat","backend":"vllm","baseURL":"http://h/v1","model":"m"}]`,
+			roles:     `{"embeddings":"x"}`,
+			wantErr:   "duplicate id",
+		},
+		{
+			name:      "invalid type",
+			endpoints: `[{"id":"x","type":"speech","backend":"ollama","baseURL":"http://h/v1","model":"m"}]`,
+			roles:     `{"embeddings":"x"}`,
+			wantErr:   "invalid type",
+		},
+		{
+			name:      "invalid backend",
+			endpoints: `[{"id":"x","type":"embeddings","backend":"tensorrt","baseURL":"http://h/v1","model":"m"}]`,
+			roles:     `{"embeddings":"x"}`,
+			wantErr:   "invalid backend",
+		},
+		{
+			name:      "bad url scheme",
+			endpoints: `[{"id":"x","type":"embeddings","backend":"ollama","baseURL":"ftp://h/v1","model":"m"}]`,
+			roles:     `{"embeddings":"x"}`,
+			wantErr:   "must be http",
+		},
+		{
+			name:      "missing model",
+			endpoints: `[{"id":"x","type":"embeddings","backend":"ollama","baseURL":"http://h/v1"}]`,
+			roles:     `{"embeddings":"x"}`,
+			wantErr:   "model is required",
+		},
+		{
+			name:      "embeddings role points at nonexistent id",
+			endpoints: `[{"id":"x","type":"embeddings","backend":"ollama","baseURL":"http://h/v1","model":"m"}]`,
+			roles:     `{"embeddings":"nope"}`,
+			wantErr:   "does not match any AI_ENDPOINTS id",
+		},
+		{
+			name:      "embeddings role points at a chat endpoint",
+			endpoints: `[{"id":"c","type":"chat","backend":"vllm","baseURL":"http://h/v1","model":"m"}]`,
+			roles:     `{"embeddings":"c"}`,
+			wantErr:   `want "embeddings"`,
+		},
+		{
+			name:      "eval role points at an embeddings endpoint",
+			endpoints: `[{"id":"e","type":"embeddings","backend":"ollama","baseURL":"http://h/v1","model":"m"}]`,
+			roles:     `{"embeddings":"e","eval":"e"}`,
+			wantErr:   `want "chat"`,
+		},
+		{
+			name:      "embeddings role empty",
+			endpoints: `[{"id":"e","type":"embeddings","backend":"ollama","baseURL":"http://h/v1","model":"m"}]`,
+			roles:     `{}`,
+			wantErr:   "AI_ROLES.embeddings is required",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearContractEnvVars(t)
+			t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+			t.Setenv("AI_ENDPOINTS", tc.endpoints)
+			t.Setenv("AI_ROLES", tc.roles)
+			_, err := LoadConfig()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestLoadConfig_AIEndpointsWinsOverLegacy(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	// Both set: AI_ENDPOINTS wins, EMBEDDINGS_* is ignored.
+	t.Setenv("EMBEDDINGS_BASE_URL", "http://legacy:11434/v1")
+	t.Setenv("EMBEDDINGS_MODEL", "legacy-model")
+	t.Setenv("AI_ENDPOINTS", `[{"id":"e","type":"embeddings","backend":"ollama","baseURL":"http://new:11434/v1","model":"new-model"}]`)
+	t.Setenv("AI_ROLES", `{"embeddings":"e"}`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	emb, ok := cfg.EmbeddingsEndpoint()
+	require.True(t, ok)
+	assert.Equal(t, "new-model", emb.Model)
+	assert.Equal(t, "http://new:11434/v1", emb.BaseURL)
 }

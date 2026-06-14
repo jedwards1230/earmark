@@ -502,7 +502,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 // ─── Templates ────────────────────────────────────────────────────────────────
 
 var serversPage = mustPage(`{{define "content"}}
-<p class="subtitle">transcription servers &nbsp;·&nbsp; auto-refreshes every 5 s</p>
+<p class="subtitle">transcription servers &amp; AI endpoints &nbsp;·&nbsp; auto-refreshes every 5 s</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 <div id="servers-region"
      hx-get="/servers/data" hx-trigger="load, every 5s" hx-swap="innerHTML"
@@ -518,10 +518,11 @@ var serversPage = mustPage(`{{define "content"}}
 var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs).Parse(`
 <div class="updated">updated {{.RenderedAt}}</div>
 
-{{if not .Servers}}
+{{if and (not .Servers) (not .Endpoints)}}
 <p class="lib-empty">No servers configured or observed yet. Set <code>ASR_SERVERS</code> to declare your transcription servers, or wait for a runner to claim its first job.</p>
 {{else}}
 
+{{if .Servers}}
 <div class="section">
   <div class="section-title">Status ({{len .Servers}})</div>
   <div class="panels">
@@ -574,7 +575,31 @@ var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs)
 <p class="server-note">Models &amp; modes prefers <em>observed</em> values (what a run actually reported in <code>run_metrics</code>) over the <em>configured</em> <code>ASR_SERVERS</code> expectation, marked <em>(expected)</em> until a run reports. Capability badges show what each backend applied: <code class="cap-badge cap-on">words</code> = applied, <code class="cap-badge cap-off">bias✗</code> = requested but declined or absent (hover for the reason). This is the honest-degradation surface for A/B comparison — two backends on the same library are grouped by family side&nbsp;by&nbsp;side.</p>
 
 <p class="server-note">Servers with a <code>gpuArbiterUrl</code> show live readiness from gpu-arbiter: <em>ready</em> (GPU free), <em>busy</em> (GPU held by a game — connected but not usable, the fallback signal), or <em>offline</em> (host unreachable). Servers without a probe fall back to <em>idle</em>/<em>not&nbsp;seen</em> inferred from job history. Routing work to a specific server (primary/fallback by job type) is not yet implemented; the runner claims jobs itself.</p>
-{{end}}
+{{end}}{{/* if .Servers */}}
+
+{{if .Endpoints}}
+<div class="section">
+  <div class="section-title">AI endpoints ({{len .Endpoints}})</div>
+  <div class="panels">
+  {{range .Endpoints}}
+    <div class="panel server-card {{.State.Class}}">
+      <div class="server-head">
+        <span class="server-name"><span class="dot {{.State.Dot}}"></span>{{.ID}}</span>
+        <span class="badge role-{{.Type}}">{{.Type}}</span>
+        {{if .Role}}<span class="badge role-primary" title="bound to the {{.Role}} role in AI_ROLES">{{.roleNote}}</span>{{end}}
+      </div>
+      <div class="server-state {{.State.Class}}">{{.State.Label}}</div>
+      <div class="server-sub">{{.State.Sub}}</div>
+      <div class="server-host">{{.Model}} &middot; {{.Backend}} &middot; {{.HostOnly}}</div>
+      {{if .Options}}<div class="server-host time-muted">Options: {{.optionsLine}}</div>{{end}}
+    </div>
+  {{end}}
+  </div>
+</div>
+
+<p class="server-note">AI endpoints are the embeddings (and any chat) services earmark talks to, from the <code>AI_ENDPOINTS</code> registry (<code>AI_ROLES</code> binds each to a function). Liveness is a <code>GET /models</code> probe: <em>ready</em> (reachable, model present), <em>model not loaded</em> (reachable but the configured model isn't listed), or <em>offline</em> (unreachable). Observability only — earmark does not route between endpoints. The legacy <code>EMBEDDINGS_BASE_URL</code>/<code>EMBEDDINGS_MODEL</code> vars appear here as a synthesized <code>_legacy</code> endpoint.</p>
+{{end}}{{/* if .Endpoints */}}
+{{end}}{{/* if (and (not .Servers) (not .Endpoints)) ... else */}}
 
 {{define "serverModesRow"}}
 <tr>
@@ -605,12 +630,15 @@ type serversData struct {
 	Servers      []serverView
 	FamilyGroups []familyGroup
 	MultiFamily  bool
+	// Endpoints is the AI endpoint registry (CONTRACT §2.14) merged with health
+	// probes — the AI Endpoints section of the Models/Services page.
+	Endpoints []endpointView
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 func (s *MCPServer) handleServersPage(w http.ResponseWriter, _ *http.Request) {
-	s.renderPage(w, serversPage, pageShell{Title: "servers", Nav: "servers"})
+	s.renderPage(w, serversPage, pageShell{Title: "models / services", Nav: "servers"})
 }
 
 func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
@@ -627,6 +655,7 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 		Servers:      views,
 		FamilyGroups: groups,
 		MultiFamily:  multiFamily(groups),
+		Endpoints:    buildEndpointViews(s.cfg, s.probeEndpoints(r.Context())),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

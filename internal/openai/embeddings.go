@@ -22,16 +22,25 @@ type Embeddings struct {
 	baseURL string
 }
 
-// NewEmbeddings creates an Embeddings client pointed at the Ollama-compatible
-// endpoint specified by cfg.EmbeddingsBaseURL, using cfg.EmbeddingsModel.
+// NewEmbeddings creates an Embeddings client for the endpoint bound to the
+// "embeddings" role in the AI endpoint registry (CONTRACT §2.14). After
+// config.LoadConfig the registry always has this binding — either from
+// AI_ENDPOINTS/AI_ROLES or synthesized from the legacy EMBEDDINGS_* vars — so a
+// missing binding only happens when a Config is hand-built in a test; in that
+// case we fall back to the flat EmbeddingsBaseURL/EmbeddingsModel fields to
+// preserve the previous behavior.
 func NewEmbeddings(cfg *config.Config) *Embeddings {
+	baseURL, model := cfg.EmbeddingsBaseURL, cfg.EmbeddingsModel
+	if emb, ok := cfg.EmbeddingsEndpoint(); ok {
+		baseURL, model = emb.BaseURL, emb.Model
+	}
 	oaiCfg := openai.DefaultConfig("ollama") // key value unused by Ollama but required by the client
-	oaiCfg.BaseURL = cfg.EmbeddingsBaseURL
+	oaiCfg.BaseURL = baseURL
 	client := openai.NewClientWithConfig(oaiCfg)
 	return &Embeddings{
 		c:       client,
-		model:   cfg.EmbeddingsModel,
-		baseURL: cfg.EmbeddingsBaseURL,
+		model:   model,
+		baseURL: baseURL,
 	}
 }
 

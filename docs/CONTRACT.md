@@ -558,8 +558,10 @@ All env var names are fixed. No synonyms, no alternatives.
 | `PGUSER` | no | Convenience alias |
 | `PGPASSWORD` | no | Convenience alias |
 | `PGDATABASE` | no | Convenience alias |
-| `EMBEDDINGS_BASE_URL` | no | `http://ollama:11434/v1` |
-| `EMBEDDINGS_MODEL` | no | `nomic-embed-text` |
+| `EMBEDDINGS_BASE_URL` | no | **Deprecated** — `http://ollama:11434/v1`. Superseded by `AI_ENDPOINTS` (§2.14); still honored (synthesized into a `_legacy` embeddings endpoint) when `AI_ENDPOINTS` is unset. |
+| `EMBEDDINGS_MODEL` | no | **Deprecated** — `nomic-embed-text`. See `EMBEDDINGS_BASE_URL` above and §2.14. |
+| `AI_ENDPOINTS` | no | JSON array of AI endpoint descriptors (the AI endpoint registry, §2.14). When set, `AI_ROLES` is required and the `EMBEDDINGS_*` vars are ignored. **Malformed value is fatal** (fail-closed). Empty → the `EMBEDDINGS_*` legacy path applies. |
+| `AI_ROLES` | no | JSON object binding role names (`embeddings`, `eval`) to endpoint IDs (§2.14). Required when `AI_ENDPOINTS` is set. |
 | `BOOKS_DIR` | no | `/books` (read-only NFS mount inside container) |
 | `MCP_HTTP_ADDR` | no | `:8081` |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
@@ -804,7 +806,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 
 | Method | Path | Auth | Body | Result |
 |--------|------|------|------|--------|
-| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured) |
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured) and an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed — the AI endpoint registry with health probes, §2.14) |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
@@ -901,6 +903,83 @@ on so the same backend reports the same id everywhere:
 These ids are **recommendations**; a runner may report any string and earmark
 stores/displays it as-is.
 
+### 2.14 AI Endpoint Registry
+
+earmark talks to a pluggable registry of AI endpoints for embeddings (and, in
+future, chat/generation) tasks. The registry decouples *which endpoints exist*
+from *which function uses each one*, so an operator can swap a backend by
+changing config, not code. It is configured via the `AI_ENDPOINTS` and
+`AI_ROLES` environment variables. The legacy `EMBEDDINGS_BASE_URL` /
+`EMBEDDINGS_MODEL` vars (§2.4) remain valid but **deprecated**: when
+`AI_ENDPOINTS` is unset they are synthesized into a single `_legacy` embeddings
+endpoint bound to the `embeddings` role, so existing deployments keep working
+with no change.
+
+#### `AI_ENDPOINTS` (JSON array)
+
+```jsonc
+[
+  {
+    "id": "embed-1",                 // unique within this deployment (required)
+    "type": "embeddings",            // "embeddings" | "chat" (required)
+    "backend": "ollama",             // "ollama" | "vllm" | "openai-compat" (required)
+    "baseURL": "http://ollama:11434/v1", // OpenAI-compatible base (http/https, required)
+    "model": "nomic-embed-text",     // model id passed to the API (required)
+    "options": { "temperature": "0", "max_tokens": "256" } // optional; string values
+  }
+]
+```
+
+All three backends speak the OpenAI-compatible REST API; `backend` selects the
+dashboard label only (no behavioral difference today). `options` keys are
+forwarded as-is — known keys are `temperature`, `max_tokens`, `top_p`; unknown
+keys are preserved so a future backend needs no code change.
+
+#### `AI_ROLES` (JSON object)
+
+```jsonc
+{ "embeddings": "embed-1", "eval": "eval-1" }
+```
+
+`embeddings` is **required** when `AI_ENDPOINTS` is set and MUST resolve to an
+endpoint of type `embeddings` — it is the endpoint the worker embeds chunks
+with. `eval` is **optional** and MUST resolve to a `chat` endpoint when present
+(it is reserved for a future read-only eval layer; absent → no eval).
+
+#### Validation (fail-closed)
+
+Unlike `ASR_SERVERS` (cosmetic; warn-and-degrade), a malformed AI registry is a
+**startup error** — embeddings is the critical path and a silent degrade would
+cause invisible embed failures. earmark refuses to start when:
+
+- `AI_ENDPOINTS` is not valid JSON, or any entry has a missing `id`, duplicate
+  `id`, missing `model`, unknown `type`/`backend`, or a `baseURL` that is not a
+  valid http/https URL with a host.
+- `AI_ENDPOINTS` is set but `AI_ROLES` is absent.
+- `AI_ROLES.embeddings` is empty, points at an unknown id, or points at a
+  non-`embeddings` endpoint.
+- `AI_ROLES.eval` is set but points at an unknown id or a non-`chat` endpoint.
+
+(When `AI_ENDPOINTS` is **absent**, a malformed `EMBEDDINGS_BASE_URL` is not
+re-validated — the legacy path preserves the prior behavior.)
+
+#### Health probe + dashboard
+
+Each endpoint is probed for liveness on every Models/Services page refresh and
+in `GET /api/v1/status` (§2.12): a `GET <baseURL>/models` request with a 2s
+timeout, TTL-cached so both render paths share one upstream call. State tokens:
+
+| Condition | Page label | API `state` |
+|---|---|---|
+| 200 OK + model present (or empty model list) | `READY` (green) | `ready` |
+| 200 OK but configured model not in `/models` | `MODEL NOT LOADED` (amber) | `model_not_loaded` |
+| non-200 / timeout / unreachable | `OFFLINE` (grey) | `offline` |
+| not probed yet | `UNKNOWN` (grey) | `unknown` |
+
+The Models/Services dashboard page (the former Servers page; URL stays
+`/servers`) lists ASR runners and every configured AI endpoint. Observability
+only — earmark does **not** route work between endpoints.
+
 ---
 
 ## 3. SCHEMA — pgvector chunks table
@@ -942,6 +1021,7 @@ Any change to:
 - The mcp-proxy upstream key or URL in section 2.2
 - The embedding model or vector dimension in section 2.3
 - The capability enum or the `caps_*` JSON shapes in section 2.13
+- The `AI_ENDPOINTS` / `AI_ROLES` JSON shapes or role names in section 2.14
 
 ...requires updating this file **before** writing implementation code. All
 three repos (earmark Go, homelab-ansible runner, homelab-k8s manifests)
