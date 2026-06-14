@@ -405,7 +405,7 @@ func (db *DB) initialize(ctx context.Context) error {
 			original_text         TEXT        NOT NULL,
 			issue_type            TEXT        NOT NULL,
 			suggested_correction  TEXT,
-			confidence            FLOAT8      NOT NULL,
+			confidence            FLOAT8      NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
 			model                 TEXT        NOT NULL,
 			transcription_run_id  UUID,
 			created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
