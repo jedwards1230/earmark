@@ -28,6 +28,8 @@ Go "mcp" Deployment (K8s)
 | `earmark list` | List embedded books |
 | `earmark search <query>` | Quick semantic search from the CLI |
 | `earmark requeue [title]` | Re-transcribe or re-embed a book (preview unless `--yes`) |
+| `earmark eval [book]` | Read-only LLM judge — flags suspected transcript errors (dry-run unless `--write`) |
+| `earmark update` | Update earmark binary to the latest GitHub release |
 | `earmark backfill-metadata` | Re-derive book metadata for all jobs without re-transcribing |
 
 ## MCP Tools (5)
@@ -58,8 +60,10 @@ Key variables:
 |----------|---------|-------|
 | `DATABASE_URL` | — | **Required.** `postgres://earmark:<pass>@earmark-pg-rw.earmark:5432/earmark` |
 | `BOOKS_DIR` | `/books` | Read-only NFS mount |
-| `EMBEDDINGS_BASE_URL` | `http://ollama:11434/v1` | Ollama endpoint |
-| `EMBEDDINGS_MODEL` | `nomic-embed-text` | 768-dim vectors |
+| `AI_ENDPOINTS` | — | JSON array of AI endpoint descriptors (CONTRACT §2.14). When set, `AI_ROLES` is required and `EMBEDDINGS_*` vars are ignored. Malformed value is fatal. |
+| `AI_ROLES` | — | JSON object mapping role names (e.g. `"embeddings"`, `"eval"`) to endpoint names in `AI_ENDPOINTS`. Required when `AI_ENDPOINTS` is set. |
+| `EMBEDDINGS_BASE_URL` | `http://ollama:11434/v1` | **Deprecated** — use `AI_ENDPOINTS`/`AI_ROLES` instead. Synthesized into a `_legacy` endpoint when `AI_ENDPOINTS` is unset. |
+| `EMBEDDINGS_MODEL` | `nomic-embed-text` | **Deprecated** — use `AI_ENDPOINTS`/`AI_ROLES` instead. 768-dim vectors. |
 | `MCP_HTTP_ADDR` | `:8081` | HTTP transport bind address |
 | `CHUNK_SIZE` | `512` | Target tokens per chunk |
 | `CONTROL_API_TOKEN` | — | Bearer token for mutating control API; unset → fail closed |
@@ -72,7 +76,7 @@ go run . mcp --demo     # http://localhost:8081/
 # or: make dashboard
 ```
 
-Renders the htmx status dashboard with synthetic data. Set `DEMO_SCENARIO` to `active` (default), `empty`, `stale`, or `failed`.
+Renders the htmx status dashboard with synthetic data. Set `DEMO_SCENARIO` to `active` (default), `empty`, `stale`, `failed`, or `multibackend` (three ASR families across three servers).
 
 ## Reference
 
