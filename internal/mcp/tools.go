@@ -67,6 +67,13 @@ type DBInterface interface {
 	// (totals, confidence buckets, issue-type tally, per-book) for the /findings
 	// dashboard page (CONTRACT §2.15).
 	GetFindingsSummary(ctx context.Context) (*db.FindingsSummary, error)
+	// ClearFindings deletes recorded findings (advisory eval metadata) and
+	// returns the rows removed, for the /findings "clear findings" button. It
+	// touches ONLY transcript_findings — never transcripts/segments/chunks — so
+	// the read-only-over-transcripts invariant holds (§2.15) and a clear can
+	// always be undone by re-running eval. An empty dir clears all findings; a
+	// non-empty dir scopes the delete to one book.
+	ClearFindings(ctx context.Context, dir string) (int64, error)
 	// GetEvalChunksForBook / SampleEvalChunks / InsertFindings back the on-demand
 	// "run eval" dashboard actions (CONTRACT §2.15). The first two are the
 	// read-only eval.ChunkReader; the third is the insert-only eval.FindingWriter.

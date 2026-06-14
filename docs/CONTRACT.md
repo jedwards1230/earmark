@@ -568,6 +568,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
+| `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `8`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
 | `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.example.com`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
@@ -825,6 +826,22 @@ curl -fsS -X POST https://<host>/api/v1/pipeline/run \
   -H 'Content-Type: application/json' -d '{"limit":1}'
 ```
 
+**Dashboard mutating actions** (`/actions/*`) are the htmx-driven counterpart to
+the JSON API above: each is guarded by the `HX-Request` header (so a cross-origin
+form can't drive it) and re-renders an htmx fragment rather than returning JSON.
+The findings/eval actions additionally **fail closed** (banner, no-op) when
+`CONTROL_API_TOKEN` is unset, matching the JSON API's posture:
+
+| Method | Path | Auth | Effect |
+|--------|------|------|--------|
+| `POST` | `/actions/requeue?id=…` | htmx | re-transcribe one job; re-render status fragment |
+| `POST` | `/actions/retry-failed` | htmx | re-transcribe all failed jobs |
+| `POST` | `/actions/book-requeue?dir=…` | htmx | re-transcribe one book |
+| `POST` | `/actions/pause` / `/actions/resume` | htmx | toggle the runner pause flag |
+| `POST` | `/actions/eval?dir=…` | htmx + token | run the LLM judge over one book (async, §2.15) |
+| `POST` | `/actions/eval-sample?n=N` | htmx + token | run the LLM judge over an N-chunk sample (async, §2.15) |
+| `POST` | `/actions/findings-clear[?dir=…]` | htmx + token | **delete** recorded findings (advisory metadata only; §2.15), then re-render the `/findings` fragment. Optional `dir` scopes the delete to one book; absent clears all. Touches only `transcript_findings` — transcripts are never modified, so a clear is always recoverable by re-running eval. |
+
 ### 2.13 ASR Backend Capability Vocabulary
 
 earmark supports multiple, swappable ASR backends that vary by **model family**,
@@ -1055,6 +1072,21 @@ The judge is **sampled or on-demand**, never an always-on pass: `earmark eval
 library-wide. The unit of evaluation is the **chunk**. The command is dry-run by
 default (prints what it would record) and persists only with `--write` (alias
 `--yes`).
+
+**Per-chunk cap.** The judge over-flags on some chunks (one observed chunk
+produced 31 findings). To keep the signal and drop the noise, each chunk's
+findings are capped at `EVAL_MAX_FINDINGS_PER_CHUNK` (default **8**, `<= 0`
+disables) — when a chunk exceeds the cap the **highest-confidence** findings are
+kept and the remainder dropped (logged at DEBUG). The cap is per-chunk, applied
+before persistence, so it bounds noise without affecting how many chunks are
+evaluated.
+
+**Clearing.** Findings only accumulate (re-running eval appends); the `/findings`
+dashboard page exposes a token-gated **clear findings** button (and the
+`POST /actions/findings-clear` action, §2.12) that deletes recorded findings.
+This is the one place the findings subsystem `DELETE`s — and it deletes ONLY
+`transcript_findings`, never the transcript tables, so the read-only-transcripts
+contract holds and a clear is recoverable by re-running eval.
 
 #### Two payoffs
 

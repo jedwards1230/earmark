@@ -153,6 +153,8 @@ func (m *MockDBInterface) SampleEvalChunks(context.Context, int) ([]db.EvalChunk
 
 func (m *MockDBInterface) InsertFindings(context.Context, []db.Finding) error { return nil }
 
+func (m *MockDBInterface) ClearFindings(context.Context, string) (int64, error) { return 0, nil }
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

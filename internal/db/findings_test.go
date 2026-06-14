@@ -97,6 +97,39 @@ func TestInsertFindingSQL_ColumnOrder(t *testing.T) {
 	}
 }
 
+// TestClearFindingsSQL_DeletesOnlyFindings guards the clear-findings feature
+// against the same read-only-transcripts invariant: clearing is the one place
+// the findings subsystem legitimately DELETEs, but it must DELETE only from
+// transcript_findings — never transcripts/segments/transcript_chunks. A clear
+// is recoverable (re-run eval); a stray delete against a transcript table would
+// not be.
+func TestClearFindingsSQL_DeletesOnlyFindings(t *testing.T) {
+	transcriptTables := []string{"transcripts", "segments", "transcript_chunks"}
+	for name, sql := range map[string]string{
+		"clearFindingsAllSQL": clearFindingsAllSQL,
+		"clearFindingsDirSQL": clearFindingsDirSQL,
+	} {
+		upper := strings.ToUpper(sql)
+		if !strings.HasPrefix(strings.TrimSpace(upper), "DELETE FROM TRANSCRIPT_FINDINGS") {
+			t.Errorf("%s must DELETE FROM transcript_findings, got:\n%s", name, sql)
+		}
+		for _, tbl := range transcriptTables {
+			// transcript_findings contains "transcript" — only flag the bare table
+			// as a delete target (followed by whitespace/EOL, not "_findings").
+			if strings.Contains(upper, "FROM "+strings.ToUpper(tbl)+" ") ||
+				strings.HasSuffix(upper, "FROM "+strings.ToUpper(tbl)) {
+				t.Errorf("%s must not delete from transcript table %q:\n%s", name, tbl, sql)
+			}
+		}
+		// No other write verb should appear (e.g. a smuggled UPDATE/cascade).
+		for _, verb := range []string{"UPDATE", "ALTER", "DROP", "TRUNCATE"} {
+			if strings.Contains(upper, verb+" ") {
+				t.Errorf("%s contains unexpected write verb %q:\n%s", name, verb, sql)
+			}
+		}
+	}
+}
+
 // FindingsSummary buckets must be mutually exclusive and exhaustive over [0,1].
 func TestFindingsConfidenceBucketsType(t *testing.T) {
 	mean := 0.5

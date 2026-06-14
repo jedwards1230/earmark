@@ -586,12 +586,12 @@ var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs)
       <div class="server-head">
         <span class="server-name"><span class="dot {{.State.Dot}}"></span>{{.ID}}</span>
         <span class="badge role-{{.Type}}">{{.Type}}</span>
-        {{if .Role}}<span class="badge role-primary" title="bound to the {{.Role}} role in AI_ROLES">{{.roleNote}}</span>{{end}}
+        {{if .Role}}<span class="badge role-primary" title="bound to the {{.Role}} role in AI_ROLES">{{.RoleNote}}</span>{{end}}
       </div>
       <div class="server-state {{.State.Class}}">{{.State.Label}}</div>
       <div class="server-sub">{{.State.Sub}}</div>
       <div class="server-host">{{.Model}} &middot; {{.Backend}} &middot; {{.HostOnly}}</div>
-      {{if .Options}}<div class="server-host time-muted">Options: {{.optionsLine}}</div>{{end}}
+      {{if .Options}}<div class="server-host time-muted">Options: {{.OptionsLine}}</div>{{end}}
     </div>
   {{end}}
   </div>

@@ -377,6 +377,17 @@ func (demoDB) SampleEvalChunks(_ context.Context, limit int) ([]db.EvalChunk, er
 // rollup. The button + async indicator are what we're verifying, not persistence.
 func (demoDB) InsertFindings(context.Context, []db.Finding) error { return nil }
 
+// ClearFindings is a no-op in the demo (the synthetic rollup is fixed), but it
+// reports a plausible row count so the "clear findings" button's confirm +
+// re-render path is exercisable with no database. The empty scenario has no
+// findings to clear, so it reports 0.
+func (d demoDB) ClearFindings(context.Context, string) (int64, error) {
+	if d.scenario == "empty" {
+		return 0, nil
+	}
+	return 37, nil // matches the demo TotalFindings
+}
+
 // demoEvalRun builds an eval runner backed by a static fake chat client, so the
 // "run eval" dashboard buttons are exercisable in --demo with no network call
 // (the demo's vLLM endpoint is intentionally offline). It runs the real

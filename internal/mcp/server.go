@@ -388,6 +388,10 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	// an unset CONTROL_API_TOKEN, async (background goroutine).
 	mux.HandleFunc("POST /actions/eval", s.handleEvalBook)
 	mux.HandleFunc("POST /actions/eval-sample", s.handleEvalSample)
+	// Clear recorded findings (htmx-guarded, fail-closed on an unset
+	// CONTROL_API_TOKEN like the eval actions). Deletes only advisory
+	// transcript_findings rows, then re-renders the /findings fragment.
+	mux.HandleFunc("POST /actions/findings-clear", s.handleFindingsClear)
 
 	// JSON control API (script/agent-facing) — distinct from the htmx dashboard
 	// actions above. Reads are unauthenticated; mutations require the bearer token

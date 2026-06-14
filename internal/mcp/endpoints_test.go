@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,12 +74,12 @@ func TestBuildEndpointViews(t *testing.T) {
 	assert.Equal(t, "eval", ev.Role)
 	assert.Equal(t, "MODEL NOT LOADED", ev.State.Label)
 	assert.Equal(t, "model_not_loaded", ev.StateToken)
-	assert.Equal(t, "temperature=0", ev.optionsLine())
-	assert.Equal(t, "role: eval (assigned)", ev.roleNote())
+	assert.Equal(t, "temperature=0", ev.OptionsLine())
+	assert.Equal(t, "role: eval (assigned)", ev.RoleNote())
 
 	sp := views[2]
 	assert.Equal(t, "", sp.Role) // unbound
-	assert.Equal(t, "", sp.roleNote())
+	assert.Equal(t, "", sp.RoleNote())
 	assert.Equal(t, "UNKNOWN", sp.State.Label)
 	assert.Equal(t, "unknown", sp.StateToken)
 	assert.False(t, sp.Probed)
@@ -86,6 +87,35 @@ func TestBuildEndpointViews(t *testing.T) {
 
 func TestBuildEndpointViews_NilCfg(t *testing.T) {
 	assert.Nil(t, buildEndpointViews(nil, nil))
+}
+
+// TestServersFragmentRendersEndpointMethods is the regression guard for the
+// /servers roleNote bug: html/template only dispatches EXPORTED methods, so the
+// template's {{.RoleNote}} / {{.OptionsLine}} calls must hit exported names. A
+// lowercase method silently became a (missing) field lookup and errored at
+// execute time ("can't evaluate field roleNote"). The buildEndpointViews unit
+// test calls the methods directly from Go and so can't catch this — only an
+// actual template execution against an endpoint that HAS a role + options
+// exercises the dispatch path the live page took.
+func TestServersFragmentRendersEndpointMethods(t *testing.T) {
+	data := serversData{
+		RenderedAt: "00:00:00 UTC",
+		Endpoints: []endpointView{{
+			ID:      "eval-1",
+			Type:    "chat",
+			Backend: "vllm",
+			Model:   "Qwen2.5-7B-Instruct",
+			Role:    "eval", // → triggers the {{if .Role}}{{.RoleNote}} branch
+			Options: []optionKV{{Key: "temperature", Value: "0"}},
+			State:   endpointStateMeta{Label: "READY", Class: "state-running", Dot: "green"},
+		}},
+	}
+	var buf strings.Builder
+	require.NoError(t, serversFragmentTmpl.Execute(&buf, data),
+		"servers fragment must render an endpoint with a bound role without a template error")
+	out := buf.String()
+	assert.Contains(t, out, "role: eval (assigned)")
+	assert.Contains(t, out, "temperature=0")
 }
 
 func TestHTTPEndpointProber_Ready(t *testing.T) {
