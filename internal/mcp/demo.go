@@ -290,6 +290,37 @@ func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, er
 	}
 }
 
+// GetFindingsSummary returns a synthetic eval-layer findings rollup for the
+// /findings page so it renders with no database (CONTRACT §2.15). Empty
+// scenarios show the fresh-install zero state; everything else shows a
+// representative spread of issue types and confidence buckets.
+func (d demoDB) GetFindingsSummary(context.Context) (*db.FindingsSummary, error) {
+	if d.scenario == "empty" {
+		return &db.FindingsSummary{}, nil
+	}
+	mean := 0.61
+	return &db.FindingsSummary{
+		TotalFindings:    37,
+		MeanConfidence:   &mean,
+		HighConfidence:   11,
+		MediumConfidence: 18,
+		LowConfidence:    8,
+		ByIssueType: []db.IssueTypeCount{
+			{IssueType: "misheard_proper_noun", Count: 15},
+			{IssueType: "number_artifact", Count: 9},
+			{IssueType: "homophone", Count: 7},
+			{IssueType: "run_on", Count: 4},
+			{IssueType: "other", Count: 2},
+		},
+		ByBook: []db.BookFindings{
+			{BookDir: "/books/Author One/A Long Title", FilePath: "/books/Author One/A Long Title/01.m4b",
+				Count: 21, MeanConfidence: 0.66, TopIssueType: "misheard_proper_noun"},
+			{BookDir: "/books/Author Two/Another Book", FilePath: "/books/Author Two/Another Book/01.m4b",
+				Count: 16, MeanConfidence: 0.54, TopIssueType: "number_artifact"},
+		},
+	}, nil
+}
+
 // SetPaused flips the in-memory demo pause flag so the toggle is exercisable.
 func (d demoDB) SetPaused(_ context.Context, paused bool, _ string) error {
 	if d.paused != nil {

@@ -129,6 +129,10 @@ func (m *SimpleMockDB) GetServerObservation(_ context.Context) (*db.ServerObserv
 	return &db.ServerObservation{}, nil
 }
 
+func (m *SimpleMockDB) GetFindingsSummary(_ context.Context) (*db.FindingsSummary, error) {
+	return &db.FindingsSummary{}, nil
+}
+
 func (m *SimpleMockDB) GetFailedJobs(_ context.Context) ([]db.FailedJob, error) {
 	err := "RuntimeError: CUDA out of memory"
 	runner := "asr-runner-test"
