@@ -26,6 +26,10 @@ type DBInterface interface {
 	GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
 	RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 	UpsertEmbedMetrics(ctx context.Context, m db.EmbedMetrics) error
+	// GetPipelinePhase reports the batched-pipeline phase (CONTRACT §1.4). The
+	// embed worker idles during the "transcribe" phase (ASR owns the GPU) and
+	// processes normally for "idle"/"analyze"/NULL.
+	GetPipelinePhase(ctx context.Context) (string, error)
 	// InsertFindings persists eval findings — used only by the in-pipeline eval
 	// path (EvalInPipeline). *db.DB already satisfies this (it is the eval
 	// FindingWriter).
@@ -100,6 +104,22 @@ func (w *Worker) Start(cfg *config.Config) {
 				w.log.Error("stale job recovery failed", "error", err)
 			}
 			lastStale = time.Now()
+		}
+
+		// Phase gate (CONTRACT §1.4): during the ASR-only "transcribe" phase the
+		// embed worker idles so eval/embed don't contend for the GPU the ASR runner
+		// owns. For "idle"/"analyze"/NULL it processes normally (today's behavior).
+		// A read error defaults to "idle" (process) + logs, so a DB hiccup never
+		// wedges the worker.
+		phase, err := w.db.GetPipelinePhase(w.ctx)
+		if err != nil {
+			w.log.Error("read pipeline phase failed; defaulting to idle (processing)", "error", err)
+			phase = db.PhaseIdle
+		}
+		if phase == db.PhaseTranscribe {
+			w.log.Debug("pipeline in transcribe phase; embed worker idling this cycle")
+			w.sleep(pollInterval)
+			continue
 		}
 
 		transcripts, err := w.db.GetCompletedTranscripts(w.ctx)

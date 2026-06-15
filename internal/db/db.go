@@ -309,11 +309,17 @@ func (db *DB) initialize(ctx context.Context) error {
 		--   run_limit — NULL means unlimited; a non-negative integer is a bounded run
 		--               (e.g. a single-job smoke test). The runner decrements it as
 		--               part of each claim and declines once it reaches 0.
+		--   phase     — batched two-phase pipeline selector (CONTRACT §1.4). NULL or
+		--               'idle' = normal (both ASR runner and embed worker run freely,
+		--               today's behavior); 'transcribe' = ASR-only phase (embed worker
+		--               idles); 'analyze' = embed-only phase (ASR paused). A future
+		--               coordinator flips this; default NULL keeps backward compat.
 		-- Gate: claim iff (NOT paused) AND (run_limit IS NULL OR run_limit > 0).
 		CREATE TABLE IF NOT EXISTS runner_control (
 			id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 			paused     BOOLEAN     NOT NULL DEFAULT false,
 			run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
+			phase      TEXT            CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze')),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_by TEXT
 		);
@@ -442,6 +448,27 @@ func (db *DB) initialize(ctx context.Context) error {
 		END $$;
 	`); err != nil {
 		return fmt.Errorf("run_limit migration: %w", err)
+	}
+
+	// phase migration (CONTRACT §1.4): add the nullable phase column + its CHECK to
+	// an existing runner_control table. ADD COLUMN IF NOT EXISTS is a no-op when
+	// present; the CHECK is guarded by pg_constraint and swallows the duplicate-on-
+	// race SQLSTATEs (same pattern as run_limit above). Default NULL keeps the
+	// existing single-phase behavior (both runner and embed worker run freely).
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS phase TEXT;
+		DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = 'runner_control_phase_valid'
+			) THEN
+				ALTER TABLE runner_control
+					ADD CONSTRAINT runner_control_phase_valid
+					CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze'));
+			END IF;
+		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+		END $$;
+	`); err != nil {
+		return fmt.Errorf("phase migration: %w", err)
 	}
 
 	// Path-level dedup migration: the original dedup was checksum-only, so a file
@@ -1750,6 +1777,73 @@ func (db *DB) SetRunLimit(ctx context.Context, limit *int, by string) error {
 	`, limit, by)
 	if err != nil {
 		return fmt.Errorf("set run limit: %w", err)
+	}
+	return nil
+}
+
+// PipelinePhase values gate the batched two-phase pipeline (CONTRACT §1.4).
+// PhaseIdle is the default (both ASR runner and embed worker run freely);
+// PhaseTranscribe is the ASR-only phase (embed worker idles); PhaseAnalyze is
+// the embed-only phase (ASR runner paused/off-GPU).
+const (
+	PhaseIdle       = "idle"
+	PhaseTranscribe = "transcribe"
+	PhaseAnalyze    = "analyze"
+)
+
+// validPhases is the closed set SetPipelinePhase validates against. The empty
+// string is accepted by SetPipelinePhase as an alias for "idle" (stored NULL).
+var validPhases = map[string]bool{
+	PhaseIdle:       true,
+	PhaseTranscribe: true,
+	PhaseAnalyze:    true,
+}
+
+// GetPipelinePhase returns the pipeline phase from runner_control, normalizing a
+// NULL column (the default) to PhaseIdle. A missing row (the Go service not yet
+// initialized) is likewise treated as PhaseIdle so callers degrade to today's
+// run-both behavior. Returns one of "idle", "transcribe", or "analyze".
+func (db *DB) GetPipelinePhase(ctx context.Context) (string, error) {
+	var phase *string
+	err := db.pool.QueryRow(ctx, `SELECT phase FROM runner_control WHERE id = 1`).Scan(&phase)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PhaseIdle, nil
+	}
+	if err != nil {
+		return PhaseIdle, fmt.Errorf("get pipeline phase: %w", err)
+	}
+	if phase == nil || *phase == "" {
+		return PhaseIdle, nil
+	}
+	return *phase, nil
+}
+
+// SetPipelinePhase writes the pipeline phase, validating it against the closed
+// set {"idle","transcribe","analyze"}. The empty string and "idle" both store
+// NULL (normal operation, the default). by records who set it for the audit
+// column. Upserts the singleton row so it works even if the seed insert was
+// somehow skipped. The future batched-pipeline coordinator uses this setter; no
+// pipeline code calls it today.
+func (db *DB) SetPipelinePhase(ctx context.Context, phase, by string) error {
+	if phase != "" && !validPhases[phase] {
+		return fmt.Errorf("invalid pipeline phase %q (want one of idle, transcribe, analyze)", phase)
+	}
+	// "idle"/"" → NULL so the default and the explicit idle phase are stored
+	// identically (both mean "run both freely").
+	var arg *string
+	if phase != "" && phase != PhaseIdle {
+		arg = &phase
+	}
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO runner_control (id, paused, phase, updated_at, updated_by)
+		VALUES (1, false, $1, now(), $2)
+		ON CONFLICT (id) DO UPDATE
+			SET phase = EXCLUDED.phase,
+			    updated_at = EXCLUDED.updated_at,
+			    updated_by = EXCLUDED.updated_by
+	`, arg, by)
+	if err != nil {
+		return fmt.Errorf("set pipeline phase: %w", err)
 	}
 	return nil
 }

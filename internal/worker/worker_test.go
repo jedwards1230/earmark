@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,7 +34,14 @@ func TestWorkerCreation(t *testing.T) {
 // ─── processTranscript tests ─────────────────────────────────────────────────
 
 // fakeDB implements DBInterface for unit tests.
+//
+// mu guards the fields mutated by DBInterface methods (chunks,
+// getCompletedCalls, …). The single-goroutine processTranscript tests touch
+// these fields directly and never contend; only the Start-loop tests
+// (TestStart_*) run the worker on a separate goroutine, so they read state
+// through the locked snapshot helpers below to stay race-free.
 type fakeDB struct {
+	mu          sync.Mutex
 	transcripts []*db.Transcript
 	chunks      []db.Chunk
 	embedErr    error
@@ -43,18 +51,45 @@ type fakeDB struct {
 	metricsErr  error
 	findings    []db.Finding // captured by InsertFindings (in-pipeline eval)
 	findingsErr error        // error returned by InsertFindings
+	// phase is returned by GetPipelinePhase. The zero value ("") normalizes to
+	// "idle" so existing tests are unaffected. phaseErr forces a read error.
+	phase    string
+	phaseErr error
+	// getCompletedCalls counts GetCompletedTranscripts invocations so the phase
+	// gate can be observed: in the "transcribe" phase the worker idles BEFORE
+	// polling, so the count stays 0.
+	getCompletedCalls int
 }
 
 func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getCompletedCalls++
 	return f.transcripts, nil
 }
 
 func (f *fakeDB) InsertChunks(_ context.Context, chunks []db.Chunk) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.insertErr != nil {
 		return f.insertErr
 	}
 	f.chunks = append(f.chunks, chunks...)
 	return nil
+}
+
+// chunkCount and completedCalls are locked snapshot helpers for the Start-loop
+// tests, which observe fakeDB state from a goroutine other than the worker's.
+func (f *fakeDB) chunkCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.chunks)
+}
+
+func (f *fakeDB) completedCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCompletedCalls
 }
 
 func (f *fakeDB) GetEmbeddings(texts []string) ([][]float32, error) {
@@ -75,6 +110,8 @@ func (f *fakeDB) GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.Emb
 }
 
 func (f *fakeDB) UpsertEmbedMetrics(_ context.Context, m db.EmbedMetrics) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.metricsErr != nil {
 		return f.metricsErr
 	}
@@ -84,7 +121,21 @@ func (f *fakeDB) UpsertEmbedMetrics(_ context.Context, m db.EmbedMetrics) error 
 
 func (f *fakeDB) RecoverStaleJobs(_ context.Context, _ time.Duration) error { return nil }
 
+func (f *fakeDB) GetPipelinePhase(_ context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.phaseErr != nil {
+		return db.PhaseIdle, f.phaseErr
+	}
+	if f.phase == "" {
+		return db.PhaseIdle, nil
+	}
+	return f.phase, nil
+}
+
 func (f *fakeDB) InsertFindings(_ context.Context, findings []db.Finding) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.findingsErr != nil {
 		return f.findingsErr
 	}
@@ -446,4 +497,79 @@ func TestProcessTranscript_EmbedErrorWithSegments(t *testing.T) {
 	err := w.processTranscript(cfg, transcript)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "ollama timeout")
+}
+
+// ─── Phase gate (CONTRACT §1.4) ──────────────────────────────────────────────
+
+// startWorkerWith spins up a Worker over the given fakeDB and runs its Start
+// loop in a goroutine. The caller gets the worker (to Stop) and is responsible
+// for stopping it. The fake's first cycle runs immediately (no initial sleep),
+// so a short wait + Stop deterministically observes exactly one cycle's effect.
+func startWorkerWith(fdb *fakeDB) *Worker {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{
+		done:   make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
+		db:     fdb,
+		log:    log.NewLogger("worker-test"),
+	}
+	go w.Start(&config.Config{ChunkSize: 10})
+	return w
+}
+
+func TestStart_TranscribePhaseSkipsProcessing(t *testing.T) {
+	// phase=="transcribe": the worker idles — it must NOT poll for completed
+	// transcripts and must NOT insert any chunks, even though one is available.
+	fdb := &fakeDB{
+		phase: db.PhaseTranscribe,
+		transcripts: []*db.Transcript{
+			{ID: "tid-skip", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."},
+		},
+	}
+	w := startWorkerWith(fdb)
+	time.Sleep(150 * time.Millisecond) // let the first cycle run + hit the gate
+	w.Stop()
+
+	require.Zero(t, fdb.completedCalls(), "transcribe phase must idle before polling transcripts")
+	require.Zero(t, fdb.chunkCount(), "transcribe phase must not process/insert chunks")
+}
+
+func TestStart_IdleAndAnalyzePhasesProcess(t *testing.T) {
+	// For idle (default ""), explicit "idle", "analyze", the worker processes as
+	// today: it polls and embeds the available transcript.
+	for _, phase := range []string{"", db.PhaseIdle, db.PhaseAnalyze} {
+		t.Run("phase="+phase, func(t *testing.T) {
+			fdb := &fakeDB{
+				phase: phase,
+				transcripts: []*db.Transcript{
+					{ID: "tid-go", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."},
+				},
+			}
+			w := startWorkerWith(fdb)
+			require.Eventually(t, func() bool {
+				return fdb.chunkCount() > 0
+			}, 2*time.Second, 10*time.Millisecond,
+				"phase %q must process transcripts (chunks inserted)", phase)
+			w.Stop()
+			require.Positive(t, fdb.completedCalls(), "phase %q must poll for transcripts", phase)
+		})
+	}
+}
+
+func TestStart_PhaseReadErrorDefaultsToProcessing(t *testing.T) {
+	// A phase-read DB error must default to idle (process) — never wedge the
+	// worker. The transcript is still polled and embedded.
+	fdb := &fakeDB{
+		phaseErr: fmt.Errorf("phase column unavailable"),
+		transcripts: []*db.Transcript{
+			{ID: "tid-err", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."},
+		},
+	}
+	w := startWorkerWith(fdb)
+	require.Eventually(t, func() bool {
+		return fdb.chunkCount() > 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"a phase-read error must default to processing, not idle/wedge")
+	w.Stop()
 }

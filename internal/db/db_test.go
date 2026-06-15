@@ -1105,3 +1105,26 @@ func TestUpsertBookMetadataBiasTermsNilWhenEmpty(t *testing.T) {
 		t.Errorf("expected nil biasTermsArg for empty terms, got %v", biasTermsArg)
 	}
 }
+
+// TestSetPipelinePhaseRejectsInvalid verifies SetPipelinePhase validates against
+// the closed phase set BEFORE touching the pool — an invalid value returns an
+// error without any DB access (so a nil-pool *DB is safe to exercise here). The
+// closed set guards the future coordinator (CONTRACT §1.4) from writing a bad
+// phase that would silently mis-gate the worker.
+func TestSetPipelinePhaseRejectsInvalid(t *testing.T) {
+	d := &DB{} // no pool: validation must fail-fast before any pool use
+
+	for _, bad := range []string{"paused", "transcribing", "ANALYZE", "garbage"} {
+		if err := d.SetPipelinePhase(context.Background(), bad, "test"); err == nil {
+			t.Errorf("SetPipelinePhase(%q) = nil error, want validation error", bad)
+		}
+	}
+
+	// The three valid phases (and the empty-string alias for idle) must be in the
+	// closed set so the setter accepts them.
+	for _, ok := range []string{PhaseIdle, PhaseTranscribe, PhaseAnalyze} {
+		if !validPhases[ok] {
+			t.Errorf("validPhases[%q] = false, want true", ok)
+		}
+	}
+}
