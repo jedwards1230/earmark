@@ -568,7 +568,8 @@ All env var names are fixed. No synonyms, no alternatives.
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
-| `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `8`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
+| `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
+| `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
 | `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.example.com`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
@@ -1058,12 +1059,21 @@ returned by the model is coerced to `other`:
 
 | `issue_type` | Meaning |
 |--------------|---------|
-| `misheard_proper_noun` | a name/place likely mis-recognized |
-| `run_on` | a sentence/segment boundary was lost |
-| `number_artifact` | digits/dates/units garbled |
-| `homophone` | wrong word, right sound |
-| `dropped_word` | likely omission |
-| `other` | any other suspected error |
+| `misheard_proper_noun` | a name/place/brand/title mis-recognized (e.g. "auto sebo" → "Arecibo") |
+| `misheard_word` | an ordinary (non-name) word/phrase mis-recognized, or words wrongly fused/split (e.g. "Placenes" → "place names") |
+| `repeated_text` | a word/phrase accidentally duplicated, visible in the span (e.g. "the the" → "the") |
+| `number_artifact` | a number/date/unit that came out wrong (NOT numeral-vs-spelled-out style) |
+| `homophone` | wrong word, right sound (e.g. "pin name" → "pen name") |
+| `dropped_word` | likely omission leaving the sentence broken |
+| `other` | coercion sink for an unknown model value — the prompt instructs the judge **never** to choose it |
+
+> **Taxonomy rev 2 (2026-06).** `run_on` was removed: an audit found it over-fired
+> on normal long sentences (the genuine, detectable subset — literal duplication —
+> is now `repeated_text`). `misheard_word` was added so non-proper-noun
+> mis-recognitions get a real category instead of `other`. A model emitting
+> `run_on` (or any retired value) coerces to `other`. **Every finding now requires
+> a non-empty `suggested_correction`** — the prompt mandates it and the parser
+> drops findings without one (the dominant noise class was "flagged, no fix").
 
 #### Sampling / cost
 
@@ -1073,13 +1083,22 @@ library-wide. The unit of evaluation is the **chunk**. The command is dry-run by
 default (prints what it would record) and persists only with `--write` (alias
 `--yes`).
 
-**Per-chunk cap.** The judge over-flags on some chunks (one observed chunk
-produced 31 findings). To keep the signal and drop the noise, each chunk's
-findings are capped at `EVAL_MAX_FINDINGS_PER_CHUNK` (default **8**, `<= 0`
-disables) — when a chunk exceeds the cap the **highest-confidence** findings are
-kept and the remainder dropped (logged at DEBUG). The cap is per-chunk, applied
-before persistence, so it bounds noise without affecting how many chunks are
-evaluated.
+**Noise filters (applied per chunk, before persistence).** Two precision filters
+trim the judge's over-flagging, in this order:
+
+1. **Confidence floor.** Findings below `EVAL_MIN_CONFIDENCE` (default **0.6**,
+   `<= 0` disables) are dropped. A ground-truth audit found high-confidence
+   findings were ~100% real while the low tail was mostly noise, so the floor
+   trades a little recall for precision.
+2. **Per-chunk cap.** The survivors are capped at `EVAL_MAX_FINDINGS_PER_CHUNK`
+   (default **5**, `<= 0` disables) — when a chunk exceeds the cap the
+   **highest-confidence** findings are kept and the remainder dropped (logged at
+   DEBUG).
+
+Both are per-chunk and applied before persistence, so they bound noise without
+affecting how many chunks are evaluated. (Findings with an empty
+`suggested_correction` are dropped earlier, at parse time — see the vocabulary
+note above.)
 
 **Clearing.** Findings only accumulate (re-running eval appends); the `/findings`
 dashboard page exposes a token-gated **clear findings** button (and the
