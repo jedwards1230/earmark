@@ -42,6 +42,7 @@ type fakeDB struct {
 	metrics     []db.EmbedMetrics     // captured by UpsertEmbedMetrics
 	metricsErr  error
 	findings    []db.Finding // captured by InsertFindings (in-pipeline eval)
+	findingsErr error        // error returned by InsertFindings
 }
 
 func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, error) {
@@ -84,6 +85,9 @@ func (f *fakeDB) UpsertEmbedMetrics(_ context.Context, m db.EmbedMetrics) error 
 func (f *fakeDB) RecoverStaleJobs(_ context.Context, _ time.Duration) error { return nil }
 
 func (f *fakeDB) InsertFindings(_ context.Context, findings []db.Finding) error {
+	if f.findingsErr != nil {
+		return f.findingsErr
+	}
 	f.findings = append(f.findings, findings...)
 	return nil
 }
@@ -175,6 +179,40 @@ func TestProcessTranscript_NoJudgeSkipsEval(t *testing.T) {
 	require.NoError(t, w.processTranscript(&config.Config{ChunkSize: 10}, transcript))
 	require.NotEmpty(t, fdb.chunks)
 	require.Empty(t, fdb.findings, "no judge → no findings")
+}
+
+func TestProcessTranscript_EmbedFailureDoesNotPersistFindings(t *testing.T) {
+	// The orphan-prevention guarantee: when embedding fails, the findings the
+	// judge computed must NOT be persisted (they'd reference chunk UUIDs never
+	// inserted). processTranscript returns the embed error and the findings table
+	// stays empty.
+	fdb := &fakeDB{embedErr: fmt.Errorf("ollama offline")}
+	judge := eval.NewJudge(workerFakeChat{
+		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+	})
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), judge: judge}
+	transcript := &db.Transcript{ID: "tid-embedfail", JobID: "job-embedfail", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world this is a test."}
+
+	require.Error(t, w.processTranscript(&config.Config{ChunkSize: 10}, transcript))
+	require.Empty(t, fdb.chunks, "embed failed → no chunks inserted")
+	require.Empty(t, fdb.findings, "embed failed → findings must not be persisted (no orphans)")
+}
+
+func TestProcessTranscript_FindingsWriteFailureStillEmbeds(t *testing.T) {
+	// A findings-write failure is best-effort: chunks are already inserted and the
+	// transcript is considered embedded (no error returned) — the safe direction
+	// (searchable-but-unflagged), never a failed embed.
+	fdb := &fakeDB{findingsErr: fmt.Errorf("findings table down")}
+	judge := eval.NewJudge(workerFakeChat{
+		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+	})
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), judge: judge}
+	transcript := &db.Transcript{ID: "tid-findfail", JobID: "job-findfail", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world this is a test."}
+
+	require.NoError(t, w.processTranscript(&config.Config{ChunkSize: 10}, transcript),
+		"a findings-write failure must not fail the embed")
+	require.NotEmpty(t, fdb.chunks, "chunks must still be inserted")
+	require.Empty(t, fdb.findings, "findings write failed → none captured")
 }
 
 func TestProcessTranscript_RecordsEmbedMetrics(t *testing.T) {
