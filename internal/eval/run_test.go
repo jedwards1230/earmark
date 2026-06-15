@@ -41,7 +41,7 @@ func threeChunks() []db.EvalChunk {
 	return out
 }
 
-const oneFinding = `{"findings":[{"original_text":"span","issue_type":"other","confidence":0.5}]}`
+const oneFinding = `{"findings":[{"original_text":"span","issue_type":"misheard_word","suggested_correction":"spawn","confidence":0.8}]}`
 
 // A transient judge error mid-stream must NOT discard the run: the bad chunk is
 // skipped (counted) and the surrounding successes are still collected.

@@ -27,9 +27,18 @@ import (
 // single chunk. The judge over-flags in practice (one chunk produced 31;
 // llama3.2:3b and qwen2.5:7b both averaged ~3/chunk over a 50-chunk sample, but
 // the tail is long), so a per-chunk cap keeps the highest-confidence signal and
-// drops the noisy remainder. Tunable via EVAL_MAX_FINDINGS_PER_CHUNK; a value
-// <= 0 disables the cap.
-const defaultMaxFindingsPerChunk = 8
+// drops the noisy remainder. Lowered 8 → 5 with taxonomy rev 2: a ~10-minute
+// chunk with more than a handful of genuine ASR errors is rare, so a tighter cap
+// trims the over-flagged tail. Tunable via EVAL_MAX_FINDINGS_PER_CHUNK; <= 0
+// disables the cap.
+const defaultMaxFindingsPerChunk = 5
+
+// defaultMinConfidence is the floor below which a finding is dropped. A
+// ground-truth audit found high-confidence (≥0.8) findings were ~100% real while
+// the low tail was mostly noise, so a floor trades a little recall for precision.
+// 0.6 keeps the "looks wrong, correction is a guess" band and up; tune via
+// EVAL_MIN_CONFIDENCE. A value <= 0 disables the floor.
+const defaultMinConfidence = 0.6
 
 // maxFindingsPerChunk resolves the per-chunk cap from EVAL_MAX_FINDINGS_PER_CHUNK,
 // falling back to defaultMaxFindingsPerChunk. A blank/invalid value uses the
@@ -47,6 +56,26 @@ func maxFindingsPerChunk() int {
 		return 0
 	}
 	return n
+}
+
+// minConfidence resolves the confidence floor from EVAL_MIN_CONFIDENCE, falling
+// back to defaultMinConfidence. A blank/invalid value uses the default; an
+// explicit <= 0 disables the floor (returned as 0). Values are not clamped to
+// [0,1] here — a floor above 1 simply drops everything, which is a valid (if
+// extreme) operator choice.
+func minConfidence() float64 {
+	raw := os.Getenv("EVAL_MIN_CONFIDENCE")
+	if raw == "" {
+		return defaultMinConfidence
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return defaultMinConfidence
+	}
+	if f < 0 {
+		return 0
+	}
+	return f
 }
 
 // ChatClient is the small abstraction over the chat-LLM endpoint the judge
@@ -84,11 +113,19 @@ type Judge struct {
 	// disables the cap. Resolved once from EVAL_MAX_FINDINGS_PER_CHUNK at
 	// construction so a single value applies for the whole run.
 	maxPerChunk int
+	// minConf drops findings whose confidence is below this floor; 0 disables.
+	// Resolved once from EVAL_MIN_CONFIDENCE at construction.
+	minConf float64
 }
 
 // NewJudge constructs a Judge backed by the given chat client.
 func NewJudge(chat ChatClient) *Judge {
-	return &Judge{chat: chat, logger: log.NewLogger("eval"), maxPerChunk: maxFindingsPerChunk()}
+	return &Judge{
+		chat:        chat,
+		logger:      log.NewLogger("eval"),
+		maxPerChunk: maxFindingsPerChunk(),
+		minConf:     minConfidence(),
+	}
 }
 
 // Result is the outcome of judging one chunk: the findings derived from it and
@@ -119,6 +156,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		return Result{Chunk: c}, nil
 	}
 
+	parsed = j.floorFindings(c, parsed)
 	parsed = j.capFindings(c, parsed)
 
 	model := j.chat.Model()
@@ -143,6 +181,26 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		})
 	}
 	return Result{Chunk: c, Findings: findings}, nil
+}
+
+// floorFindings drops findings below the confidence floor (j.minConf). Applied
+// before capFindings so the cap operates on the survivors. A floor of 0
+// (disabled) returns the input unchanged. Logs at DEBUG when it drops any.
+func (j *Judge) floorFindings(c db.EvalChunk, parsed []parsedFinding) []parsedFinding {
+	if j.minConf <= 0 || len(parsed) == 0 {
+		return parsed
+	}
+	kept := parsed[:0:0]
+	for _, p := range parsed {
+		if p.Confidence >= j.minConf {
+			kept = append(kept, p)
+		}
+	}
+	if dropped := len(parsed) - len(kept); dropped > 0 {
+		j.logger.Debug("dropping low-confidence chunk findings",
+			"chunk_id", c.ChunkID, "kept", len(kept), "dropped", dropped, "floor", j.minConf)
+	}
+	return kept
 }
 
 // capFindings bounds a single chunk's findings to j.maxPerChunk, keeping the

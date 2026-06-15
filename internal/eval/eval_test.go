@@ -95,15 +95,15 @@ func manyFindingsJSON(n int) string {
 			b.WriteByte(',')
 		}
 		conf := 0.99 - float64(i)*0.01
-		fmt.Fprintf(&b, `{"original_text":"finding-%02d","issue_type":"other","suggested_correction":"","confidence":%.2f}`, i, conf)
+		fmt.Fprintf(&b, `{"original_text":"finding-%02d","issue_type":"misheard_word","suggested_correction":"fix-%02d","confidence":%.2f}`, i, i, conf)
 	}
 	b.WriteString(`]}`)
 	return b.String()
 }
 
 func TestJudgeChunk_CapsPerChunkKeepingHighestConfidence(t *testing.T) {
-	// Default cap is 8. Feed 12 findings (confidence 0.99 desc) and expect the
-	// top 8 by confidence (finding-00..finding-07) to survive.
+	// Feed 12 findings (confidence 0.99 desc, all above the floor) and expect
+	// the top defaultMaxFindingsPerChunk by confidence to survive.
 	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "") // exercise the default
 	chat := &fakeChat{resp: manyFindingsJSON(12)}
 	j := NewJudge(chat)
@@ -152,6 +152,40 @@ func TestJudgeChunk_CapEnvOverrideAndDisable(t *testing.T) {
 	}
 }
 
+func TestJudgeChunk_ConfidenceFloorDropsLow(t *testing.T) {
+	// Four findings spanning the floor; all carry corrections so only confidence
+	// decides survival. Default floor is 0.6 → keep 0.90 and 0.65, drop 0.55/0.30.
+	resp := `{"findings":[
+		{"original_text":"cat","issue_type":"misheard_word","suggested_correction":"cot","confidence":0.90},
+		{"original_text":"dog","issue_type":"misheard_word","suggested_correction":"dig","confidence":0.65},
+		{"original_text":"fish","issue_type":"misheard_word","suggested_correction":"wish","confidence":0.55},
+		{"original_text":"bird","issue_type":"misheard_word","suggested_correction":"beard","confidence":0.30}
+	]}`
+	t.Setenv("EVAL_MIN_CONFIDENCE", "") // exercise the default (0.6)
+	res, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), sampleChunk())
+	if err != nil {
+		t.Fatalf("JudgeChunk: %v", err)
+	}
+	if len(res.Findings) != 2 {
+		t.Fatalf("want 2 findings above the 0.6 floor, got %d", len(res.Findings))
+	}
+	for _, f := range res.Findings {
+		if f.Confidence < defaultMinConfidence {
+			t.Errorf("kept a sub-floor finding %q (conf %.2f)", f.OriginalText, f.Confidence)
+		}
+	}
+
+	// EVAL_MIN_CONFIDENCE=0 disables the floor → all four survive (the cap is 5).
+	t.Setenv("EVAL_MIN_CONFIDENCE", "0")
+	res2, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), sampleChunk())
+	if err != nil {
+		t.Fatalf("JudgeChunk: %v", err)
+	}
+	if len(res2.Findings) != 4 {
+		t.Fatalf("want 4 findings with floor disabled, got %d", len(res2.Findings))
+	}
+}
+
 func TestJudgeChunk_ChatErrorPropagates(t *testing.T) {
 	chat := &fakeChat{err: errors.New("endpoint down")}
 	j := NewJudge(chat)
@@ -179,7 +213,7 @@ func (f *fakeWriter) InsertFindings(_ context.Context, findings []db.Finding) er
 
 func TestRun_DryRunDoesNotPersist(t *testing.T) {
 	reader := fakeReader{chunks: []db.EvalChunk{sampleChunk()}}
-	chat := &fakeChat{resp: `{"findings":[{"original_text":"fox","issue_type":"other","confidence":0.5}]}`}
+	chat := &fakeChat{resp: `{"findings":[{"original_text":"fox","issue_type":"misheard_word","suggested_correction":"folks","confidence":0.7}]}`}
 	writer := &fakeWriter{}
 
 	findings, stats, err := Run(context.Background(), reader, NewJudge(chat), writer, RunOptions{Book: "Book", Write: false})
@@ -199,7 +233,7 @@ func TestRun_DryRunDoesNotPersist(t *testing.T) {
 
 func TestRun_WritePersists(t *testing.T) {
 	reader := fakeReader{chunks: []db.EvalChunk{sampleChunk()}}
-	chat := &fakeChat{resp: `{"findings":[{"original_text":"fox","issue_type":"other","confidence":0.5}]}`}
+	chat := &fakeChat{resp: `{"findings":[{"original_text":"fox","issue_type":"misheard_word","suggested_correction":"folks","confidence":0.7}]}`}
 	writer := &fakeWriter{}
 
 	_, stats, err := Run(context.Background(), reader, NewJudge(chat), writer, RunOptions{Book: "Book", Write: true})
