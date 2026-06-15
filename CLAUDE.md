@@ -60,6 +60,11 @@ MCP_TRANSPORT=http ./earmark mcp  # HTTP transport on :8081
 ./earmark requeue "Project Hail Mary" --yes    # re-transcribe (drops transcript+chunks, job→pending)
 ./earmark requeue --failed --yes               # retry all failed jobs
 ./earmark requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
+
+# Batched two-phase pipeline coordinator (GPU time-sharing; CONTRACT §1.4):
+./earmark batch                                # batches of 10 until queue drains
+./earmark batch --batch-size 25 --max-batches 3
+GPU_ARBITER_URL=http://gpu-host:48750/status ./earmark batch  # yield to games
 ```
 
 The status dashboard also exposes requeue as buttons: a per-row **requeue** on
@@ -133,6 +138,7 @@ Debug-only (both must be set):
 | `internal/openai` | OpenAI-compatible embeddings client; resolves its endpoint through the AI registry's `embeddings` role (CONTRACT §2.14) |
 | `internal/asr` | ASR backend capability vocabulary (CONTRACT §2.13): closed capability enum + `ParseCapabilities` (drops unknown keys), recommended `family`/`runtime` ids + `KnownFamily`/`KnownRuntime` label helpers. Pure leaf package (no DB/HTTP deps). |
 | `internal/eval` | Read-only LLM-as-judge (CONTRACT §2.15, `earmark eval`): READS transcript chunks, INSERTs advisory `transcript_findings`. NEVER edits transcripts. Chat endpoint resolved via `AI_ROLES["eval"]` (registry, CONTRACT §2.14) falling back to `EVAL_CHAT_*` env vars. |
+| `internal/batch` | `earmark batch` coordinator core (CONTRACT §1.4): drives `runner_control.phase` + `run_limit` to run the pipeline in transcribe→analyze batches so the ASR model and eval judge time-share one GPU. Reads gpu-arbiter `/status` (read-only) to yield to games. Dependency-injected (`PhaseStore`, `Arbiter`) so phase transitions are unit-testable; always restores idle on exit; DB-driven/resumable. |
 | `internal/config` | Env-var configuration loader (incl. `ASR_SERVERS` registry + per-server backend descriptor; and the `AI_ENDPOINTS`/`AI_ROLES` AI endpoint registry, CONTRACT §2.14, with legacy `EMBEDDINGS_*` synthesis + role resolution) |
 
 ## Development Notes

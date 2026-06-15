@@ -6,6 +6,7 @@ import (
 
 	"github.com/jedwards1230/earmark/cmd"
 	"github.com/jedwards1230/earmark/cmd/backfill"
+	"github.com/jedwards1230/earmark/cmd/batch"
 	"github.com/jedwards1230/earmark/cmd/eval"
 	"github.com/jedwards1230/earmark/cmd/list"
 	"github.com/jedwards1230/earmark/cmd/mcp"
@@ -27,6 +28,7 @@ func main() {
 	rootCmd.AddCommand(search.SearchCmd)
 	rootCmd.AddCommand(requeue.RequeueCmd)
 	rootCmd.AddCommand(eval.EvalCmd)
+	rootCmd.AddCommand(batch.BatchCmd)
 	rootCmd.AddCommand(backfill.BackfillCmd)
 	rootCmd.AddCommand(mcp.MCPCmd)
 	rootCmd.AddCommand(version.VersionCmd)
