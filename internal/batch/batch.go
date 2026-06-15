@@ -123,7 +123,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 			}
 			return
 		}
-		p("Restored pipeline to idle (run budget cleared).\n")
+		p("Restored pipeline to idle (run budget set to 0).\n")
 	}()
 
 	// Resume reconciliation: if a previous run died mid-batch in analyze, finish
@@ -134,11 +134,12 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	}
 	if phase == db.PhaseAnalyze {
 		p("Resuming: found phase=analyze; finishing the in-flight analyze batch first.\n")
-		// Clear any residual run budget left by a crash mid-Phase-A. In the
+		// Clear any residual run budget left by a crash mid-Phase-A to 0. In the
 		// analyze phase the runner is off-GPU so a lingering run_limit is inert,
-		// but clearing it now keeps the resumed state clean and matches the
-		// transcribe phase's invariant that the budget is coordinator-owned.
-		if err := store.SetRunLimit(ctx, nil, actor); err != nil {
+		// but resetting it now keeps the resumed state clean and upholds the
+		// invariant that the coordinator never leaves run_limit NULL (=unlimited).
+		zero := 0
+		if err := store.SetRunLimit(ctx, &zero, actor); err != nil {
 			return fmt.Errorf("clear run limit (resume): %w", err)
 		}
 		// Re-assert analyze so the resume path and a normal Phase B share one
@@ -298,15 +299,22 @@ func waitForAnalyzeDrained(ctx context.Context, p func(string, ...any), store Ph
 	}
 }
 
-// restoreIdle returns the pipeline to normal continuous mode: phase=idle and
-// run_limit cleared. Called from the deferred cleanup on every exit path.
+// restoreIdle returns the pipeline to a SAFE idle resting state: phase=idle and
+// run_limit=0. Called from the deferred cleanup on every exit path.
+//
+// run_limit is set to 0 (NOT cleared to NULL): the runner's claim gate treats
+// NULL as *unlimited*, so leaving it NULL would let the runner drain the entire
+// backlog the moment it isn't paused — the opposite of the batched model.
+// run_limit=0 leaves the runner idle-but-armed: it claims nothing until the next
+// batch sets a budget, and never runs unbounded between batches.
 func restoreIdle(ctx context.Context, store PhaseStore) error {
 	var errs []error
 	if err := store.SetPipelinePhase(ctx, db.PhaseIdle, actor); err != nil {
 		errs = append(errs, fmt.Errorf("clear phase: %w", err))
 	}
-	if err := store.SetRunLimit(ctx, nil, actor); err != nil {
-		errs = append(errs, fmt.Errorf("clear run limit: %w", err))
+	zero := 0
+	if err := store.SetRunLimit(ctx, &zero, actor); err != nil {
+		errs = append(errs, fmt.Errorf("set run limit to 0: %w", err))
 	}
 	return errors.Join(errs...)
 }

@@ -290,8 +290,11 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
    Wait until the embed backlog (completed transcripts with no chunks) is 0.
 
 **Robustness contract:** the coordinator **always restores `phase='idle'` and
-clears `run_limit`** on exit — normal completion, error, AND `SIGINT`/`SIGTERM` —
-so the system returns to normal continuous mode and never gets stuck mid-phase.
+sets `run_limit=0`** on exit — normal completion, error, AND `SIGINT`/`SIGTERM` —
+leaving the runner idle-but-armed (claims nothing until the next batch sets a
+budget) and never gets stuck mid-phase. It sets `run_limit=0`, **not** `NULL`:
+`NULL` means *unlimited*, so clearing it would let the runner drain the whole
+backlog the moment it isn't paused — the opposite of the batched model.
 It is **DB-driven and resumable**: it holds no critical state in memory and
 derives everything (current phase, job counts, backlog) from the DB. On restart
 it reconciles — if it finds `phase='analyze'`, it finishes Phase B before
