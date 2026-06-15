@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jedwards1230/earmark/internal/chunker"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/queue"
@@ -24,6 +26,10 @@ type DBInterface interface {
 	GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
 	RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 	UpsertEmbedMetrics(ctx context.Context, m db.EmbedMetrics) error
+	// InsertFindings persists eval findings — used only by the in-pipeline eval
+	// path (EvalInPipeline). *db.DB already satisfies this (it is the eval
+	// FindingWriter).
+	InsertFindings(ctx context.Context, findings []db.Finding) error
 }
 
 // Worker polls for completed transcripts and embeds them.
@@ -34,13 +40,22 @@ type Worker struct {
 	cancel context.CancelFunc
 	db     DBInterface
 	log    log.Logger
+	// judge is non-nil only when EvalInPipeline is set AND a chat endpoint
+	// resolved; when nil the worker skips the in-pipeline eval step entirely.
+	judge *eval.Judge
 }
 
 // NewWorker creates a Worker. The queue parameter is accepted for API
 // compatibility with the monitor wiring but is not used by the embed loop.
+//
+// When cfg.EvalInPipeline is set, the worker resolves the eval chat endpoint and
+// builds a judge so each transcript is evaluated before embedding. A resolution
+// failure is non-fatal: it logs a warning and leaves the judge nil (the worker
+// embeds as usual, just without inline eval) — the pipeline must not stall
+// because the judge endpoint is misconfigured.
 func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Worker{
+	w := &Worker{
 		queue:  q,
 		done:   make(chan struct{}),
 		ctx:    ctx,
@@ -48,6 +63,17 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 		db:     database,
 		log:    log.NewLogger("worker"),
 	}
+	if cfg.EvalInPipeline {
+		chat, err := eval.ResolveChatClient(eval.ConfigSource(cfg))
+		if err != nil {
+			w.log.Warn("EVAL_IN_PIPELINE set but no eval chat endpoint resolved — inline eval disabled",
+				"error", err)
+		} else {
+			w.judge = eval.NewJudge(chat)
+			w.log.Info("in-pipeline eval enabled", "judge_model", chat.Model())
+		}
+	}
+	return w
 }
 
 // Start runs the embed loop until Stop is called.
@@ -156,6 +182,25 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		}
 	}
 
+	// Pre-assign chunk UUIDs so the in-pipeline eval below can attribute findings
+	// to chunks before they are inserted. InsertChunks persists these ids; the
+	// column default still applies for any caller that leaves ID empty.
+	for i := range chunks {
+		chunks[i].ID = uuid.NewString()
+	}
+
+	// In-pipeline eval (repositioned per the batched-pipeline design): judge the
+	// chunks BEFORE embedding so findings are produced from the same text. Gated
+	// on EvalInPipeline (judge is nil otherwise). The findings are COMPUTED here
+	// but PERSISTED only after the chunks are inserted (below) — otherwise an
+	// embedding failure would leave findings referencing chunk UUIDs that were
+	// never inserted (orphans), and the retry would re-chunk with fresh UUIDs and
+	// double up. Best-effort: a judge error yields no findings, never blocks embed.
+	var inlineFindings []db.Finding
+	if w.judge != nil {
+		inlineFindings = w.judgeChunks(t, chunks)
+	}
+
 	// Collect texts for batch embedding.
 	texts := make([]string, len(chunks))
 	for i, c := range chunks {
@@ -179,6 +224,20 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	}
 	finished := time.Now()
 
+	// Persist in-pipeline findings now that their chunks exist. Best-effort: a
+	// findings-write failure leaves chunks searchable but un-flagged (advisory),
+	// which is the safe direction — the reverse (findings without chunks) is what
+	// the post-insert ordering exists to prevent.
+	if len(inlineFindings) > 0 {
+		if err := w.db.InsertFindings(w.ctx, inlineFindings); err != nil {
+			w.log.Warn("persist in-pipeline findings failed (chunks inserted; findings dropped)",
+				"transcript_id", t.ID, "file", t.FilePath, "findings", len(inlineFindings), "error", err)
+		} else {
+			w.log.Info("in-pipeline eval findings persisted",
+				"transcript_id", t.ID, "findings", len(inlineFindings))
+		}
+	}
+
 	w.log.Info("transcript embedded",
 		"file", t.FilePath,
 		"transcript_id", t.ID,
@@ -190,6 +249,41 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	w.recordEmbedMetrics(t, texts, usage, start, finished, len(chunks),
 		embedModel(cfg))
 	return nil
+}
+
+// judgeChunks runs the judge over the transcript's chunks and RETURNS the
+// findings WITHOUT persisting them (write=false) — the caller persists after the
+// chunks are inserted, so a later embedding failure can't leave orphaned
+// findings. Best-effort: any error is logged and yields nil findings so the
+// embed step always proceeds (eval is advisory; the corpus must stay searchable
+// even if the judge endpoint is down). Chunks must already have their IDs
+// assigned so the returned findings reference the rows the worker will insert.
+func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
+	evalChunks := make([]db.EvalChunk, len(chunks))
+	for i, c := range chunks {
+		evalChunks[i] = db.EvalChunk{
+			ChunkID:            c.ID,
+			TranscriptID:       t.ID,
+			TranscriptionRunID: t.JobID,
+			FilePath:           c.FilePath,
+			ChunkIndex:         c.ChunkIndex,
+			StartSec:           c.StartSec,
+			EndSec:             c.EndSec,
+			Text:               c.Text,
+		}
+	}
+
+	findings, stats, err := eval.RunOnChunks(w.ctx, w.judge, nil, evalChunks, false)
+	if err != nil {
+		w.log.Warn("in-pipeline eval failed (continuing to embed)",
+			"transcript_id", t.ID, "file", t.FilePath, "error", err)
+		return nil
+	}
+	w.log.Info("in-pipeline eval judged",
+		"transcript_id", t.ID,
+		"chunks", stats.ChunksEvaluated,
+		"findings", stats.FindingsFound)
+	return findings
 }
 
 // recordEmbedMetrics UPSERTs the embed worker's slice of run_metrics for a
