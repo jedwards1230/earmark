@@ -12,6 +12,13 @@ timestamps native — no separate alignment stage), and writes `transcripts` +
 `run_metrics` rows in the JSON shape `docs/CONTRACT.md` specifies. The Go service
 never transcribes; it only enqueues jobs and indexes the results.
 
+It also reacts to the `runner_control` gate (CONTRACT §1.4): besides the
+`paused`/`run_limit` claim gate, when `paused` or `phase='analyze'` it **parks its
+GPU model to host RAM** (`asr_model.cpu()` + `torch.cuda.empty_cache()`) so a
+different GPU tenant can use the card, and restores it (`asr_model.cuda()`) when
+active again. The `phase` column is read defensively — a DB without it behaves
+exactly as before.
+
 `docs/CONTRACT.md` is **authoritative** for column names, env-var names, the
 capability vocabulary (§2.13), and the result shape. This file is just orientation.
 

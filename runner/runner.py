@@ -14,6 +14,16 @@ original runner design. Claims are gated by runner_control (CONTRACT
 that the runner decrements per claim for bounded runs (e.g. a single-job smoke
 test driven by the Go control API).
 
+GPU self-parking (CONTRACT §1.4): when the runner is paused or runner_control.phase
+is 'analyze', it moves its NeMo model OFF the GPU (asr_model.cpu() +
+torch.cuda.empty_cache(), parking weights in host RAM — seconds, not a from-disk
+reload) so a different GPU tenant (a future eval-judge LLM) can use the card. When
+active again (not paused AND phase in NULL/'idle'/'transcribe') it restores the
+model (asr_model.cuda()). The park/unpark only happen at the gate between jobs,
+never mid-transcription, and only on a state change. The `phase` column is read
+defensively (it may not exist yet in the deployed DB — a separate PR adds it);
+a missing column/row degrades to 'idle' (model stays on GPU, today's behavior).
+
 Verified on RTX 5090 (Blackwell, torch 2.12.0+cu130, 2026-06-07): model load,
 transcribe(timestamps=True), word timestamps in seconds (hyp.timestamp['word']),
 segment text (hyp.timestamp['segment']), bfloat16, and the contract mapping all
@@ -296,6 +306,78 @@ def _control_values(row: Any) -> tuple[bool, int | None]:
     if isinstance(row, dict):
         return bool(row["paused"]), row["run_limit"]
     return bool(row[0]), row[1]
+
+
+def _read_control_row(conn: psycopg2.extensions.connection) -> Any:
+    """
+    Read the runner_control row (paused, run_limit) for the GPU-park decision,
+    WITHOUT a FOR UPDATE lock — this is an advisory read, not the authoritative
+    claim gate (that lives in _claim_job and re-reads under a lock). A missing
+    row/table degrades to None → not-paused/unlimited. Transaction state is left
+    clean (commit on success, rollback on error).
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT paused, run_limit FROM runner_control WHERE id = 1")
+            row = cur.fetchone()
+        conn.commit()
+        return row
+    except Exception as exc:  # noqa: BLE001 — degrade safe on missing table/row
+        log.debug("control read failed (%s) — defaulting to not-paused", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
+# Phase values the runner understands (CONTRACT §1.4). NULL / 'idle' / 'transcribe'
+# all mean "ASR may use the GPU"; only 'analyze' means "step off the GPU".
+_PHASE_DEFAULT = "idle"
+_PHASE_ON_GPU = {None, "idle", "transcribe"}
+
+
+def _read_phase(conn: psycopg2.extensions.connection) -> str:
+    """
+    Read runner_control.phase defensively (CONTRACT §1.4).
+
+    The `phase` column is additive and may not exist in the deployed DB yet (a
+    separate PR adds it). A missing column, a missing row, or any DB/schema error
+    degrades to the default phase ('idle') so the runner keeps its model on the
+    GPU and behaves exactly as it does today. Each call uses its own transaction
+    (committed on success, rolled back on error) so the connection's transaction
+    state is left clean for the caller's subsequent work.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT phase FROM runner_control WHERE id = 1")
+            row = cur.fetchone()
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 — degrade safe on missing column/row/table
+        log.debug("phase read failed (%s) — defaulting to %r", exc, _PHASE_DEFAULT)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return _PHASE_DEFAULT
+    if row is None:
+        return _PHASE_DEFAULT
+    value = row["phase"] if isinstance(row, dict) else row[0]
+    return _PHASE_DEFAULT if value is None else str(value)
+
+
+def _should_park(paused: bool, phase: str | None) -> bool:
+    """
+    Decide whether the ASR model should be parked OFF the GPU (CONTRACT §1.4).
+
+    Pure function (no side effects) so the decision is unit-testable without a
+    GPU. The model stays ON the GPU when NOT paused AND phase in
+    (NULL/'idle'/'transcribe'); it parks to host RAM when paused OR phase is
+    'analyze' (or any other non-GPU phase value), freeing VRAM for the eval judge.
+    """
+    if paused:
+        return True
+    return phase not in _PHASE_ON_GPU
 
 
 def _claim_one(conn: psycopg2.extensions.connection) -> dict[str, Any] | None:
@@ -1643,6 +1725,25 @@ class ASRProvider(abc.ABC):
                                  when ASR_BIASING_ENABLED=true.
         """
 
+    def park(self) -> None:
+        """
+        Free GPU VRAM by moving the loaded model OFF the GPU (CONTRACT §1.4).
+
+        Called at the gate between jobs (never mid-transcription) when the runner
+        is paused or phase='analyze', so another GPU tenant (the eval judge) can
+        use the card. Default is a no-op for CPU-only backends. Implementations
+        must be idempotent (the caller only calls this on a state change, but a
+        redundant call must not corrupt state).
+        """
+
+    def unpark(self) -> None:
+        """
+        Restore the model TO the GPU after a park (CONTRACT §1.4).
+
+        The inverse of park(); default no-op. Must be idempotent and never leave
+        the model half-moved.
+        """
+
 
 # ---------------------------------------------------------------------------
 # NeMo Parakeet-TDT provider
@@ -1741,6 +1842,7 @@ class NeMoParakeetProvider(ASRProvider):
     def __init__(self) -> None:
         self._asr_model: Any = None
         self._diarize_model: Any | None = None
+        self._parked: bool = False
 
     def load(self) -> None:
         """
@@ -1895,6 +1997,40 @@ class NeMoParakeetProvider(ASRProvider):
             caps.add("biasing")
         return caps
 
+    def park(self) -> None:
+        """
+        Move the loaded model(s) to host RAM and release the GPU cache.
+
+        Parks weights in CPU memory (~seconds) — NOT a from-disk reload — so the
+        next unpark() is fast. Idempotent: a no-op if no model is loaded or the
+        model is already parked. Calls torch.cuda.empty_cache() so the freed VRAM
+        is actually returned to the driver (so the eval judge can allocate it).
+        """
+        if self._asr_model is None or self._parked:
+            return
+        import torch
+
+        self._asr_model.cpu()
+        if self._diarize_model is not None:
+            self._diarize_model.cpu()
+        torch.cuda.empty_cache()
+        self._parked = True
+        log.info("freed GPU, model parked to CPU")
+
+    def unpark(self) -> None:
+        """
+        Move the parked model(s) back onto the GPU.
+
+        Idempotent: a no-op if no model is loaded or the model is not parked.
+        """
+        if self._asr_model is None or not self._parked:
+            return
+        self._asr_model.cuda()
+        if self._diarize_model is not None:
+            self._diarize_model.cuda()
+        self._parked = False
+        log.info("model restored to GPU")
+
 
 # ---------------------------------------------------------------------------
 # Provider factory
@@ -1942,6 +2078,30 @@ def main() -> None:
         conn: psycopg2.extensions.connection | None = None
         try:
             conn = _connect()
+
+            # Gate the GPU first (CONTRACT §1.4): when paused or phase='analyze'
+            # the model parks off the GPU so the eval judge can use the card; when
+            # active again it is restored. The park/unpark only fire on a state
+            # change (the provider tracks parked/loaded state), and only here at
+            # the gate between jobs — never mid-transcription. When parked, skip
+            # the claim entirely: there's no point claiming a job we won't run.
+            paused, _ = _control_values(
+                _read_control_row(conn)
+            )
+            phase = _read_phase(conn)
+            if _should_park(paused, phase):
+                provider.park()
+                conn.close()
+                log.debug(
+                    "GPU parked (paused=%s phase=%s) — sleeping %ds",
+                    paused,
+                    phase,
+                    POLL_INTERVAL,
+                )
+                _shutdown.wait(POLL_INTERVAL)
+                continue
+            provider.unpark()
+
             job = _claim_job(conn)
         except Exception as exc:
             log.error("DB error during claim: %s", exc)

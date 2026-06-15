@@ -169,6 +169,186 @@ class GateTests(unittest.TestCase):
         self.assertFalse(conn.claim_ran())
 
 
+class ShouldParkTests(unittest.TestCase):
+    """_should_park is a pure decision: paused/phase → park the GPU model?"""
+
+    def test_active_unlimited_stays_on_gpu(self) -> None:
+        # Not paused + the GPU-allowed phases → model stays loaded (do not park).
+        for phase in (None, "idle", "transcribe"):
+            self.assertFalse(runner._should_park(False, phase), f"phase={phase!r}")
+
+    def test_paused_parks_regardless_of_phase(self) -> None:
+        # Paused dominates: park even on an otherwise-on-GPU phase.
+        for phase in (None, "idle", "transcribe", "analyze"):
+            self.assertTrue(runner._should_park(True, phase), f"phase={phase!r}")
+
+    def test_analyze_phase_parks_when_not_paused(self) -> None:
+        self.assertTrue(runner._should_park(False, "analyze"))
+
+    def test_unknown_phase_parks_failsafe(self) -> None:
+        # An unrecognised phase value is treated as "not safe to use the GPU".
+        self.assertTrue(runner._should_park(False, "something-new"))
+
+
+class _PhaseCursor:
+    """Cursor whose fetchone routes SELECT phase / SELECT paused queries."""
+
+    def __init__(self, conn: "_PhaseConn") -> None:
+        self.conn = conn
+
+    def __enter__(self) -> "_PhaseCursor":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def execute(self, sql: str, params: object = None) -> None:
+        if self.conn.raise_on is not None and self.conn.raise_on in sql:
+            raise RuntimeError('column "phase" does not exist')
+        self.conn.last_sql = sql
+
+    def fetchone(self) -> object:
+        if "phase" in self.conn.last_sql:
+            return self.conn.phase_row
+        if "paused" in self.conn.last_sql:
+            return self.conn.control_row
+        return None
+
+
+class _PhaseConn:
+    def __init__(
+        self,
+        phase_row: object = None,
+        control_row: object = None,
+        raise_on: str | None = None,
+    ) -> None:
+        self.phase_row = phase_row
+        self.control_row = control_row
+        self.raise_on = raise_on
+        self.last_sql = ""
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self) -> _PhaseCursor:
+        return _PhaseCursor(self)
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+class ReadPhaseTests(unittest.TestCase):
+    """_read_phase reads runner_control.phase defensively (column may be absent)."""
+
+    def test_present_value(self) -> None:
+        conn = _PhaseConn(phase_row={"phase": "analyze"})
+        self.assertEqual(runner._read_phase(conn), "analyze")
+        self.assertEqual(conn.commits, 1)
+
+    def test_tuple_row(self) -> None:
+        conn = _PhaseConn(phase_row=("transcribe",))
+        self.assertEqual(runner._read_phase(conn), "transcribe")
+
+    def test_null_value_defaults_to_idle(self) -> None:
+        # phase column exists but the row's value is NULL → default 'idle'.
+        conn = _PhaseConn(phase_row={"phase": None})
+        self.assertEqual(runner._read_phase(conn), "idle")
+
+    def test_missing_row_defaults_to_idle(self) -> None:
+        conn = _PhaseConn(phase_row=None)
+        self.assertEqual(runner._read_phase(conn), "idle")
+
+    def test_missing_column_degrades_to_idle(self) -> None:
+        # The separate schema PR hasn't landed: SELECT phase raises. Must not crash.
+        conn = _PhaseConn(raise_on="phase")
+        self.assertEqual(runner._read_phase(conn), "idle")
+        self.assertEqual(conn.rollbacks, 1)  # failed read rolled back, state clean
+
+
+class ReadControlRowTests(unittest.TestCase):
+    """_read_control_row is the advisory (unlocked) paused/run_limit read."""
+
+    def test_present_row(self) -> None:
+        conn = _PhaseConn(control_row={"paused": True, "run_limit": None})
+        row = runner._read_control_row(conn)
+        self.assertEqual(runner._control_values(row), (True, None))
+        self.assertEqual(conn.commits, 1)
+
+    def test_missing_table_degrades_to_none(self) -> None:
+        conn = _PhaseConn(raise_on="paused")
+        self.assertIsNone(runner._read_control_row(conn))
+        self.assertEqual(runner._control_values(None), (False, None))
+        self.assertEqual(conn.rollbacks, 1)
+
+
+class ParkUnparkTests(unittest.TestCase):
+    """NeMoParakeetProvider.park/unpark move the model and are idempotent."""
+
+    def _provider_with_fake_torch(self):
+        """A provider holding a fake model, with torch.cuda.empty_cache stubbed."""
+        import unittest.mock as mock
+
+        provider = runner.NeMoParakeetProvider()
+        provider._asr_model = mock.MagicMock()
+        # Stub the runtime `import torch` inside park() via sys.modules.
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(empty_cache=mock.MagicMock())
+        return provider, fake_torch
+
+    def test_park_moves_to_cpu_and_empties_cache(self) -> None:
+        import unittest.mock as mock
+
+        provider, fake_torch = self._provider_with_fake_torch()
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            provider.park()
+        provider._asr_model.cpu.assert_called_once()
+        fake_torch.cuda.empty_cache.assert_called_once()
+        self.assertTrue(provider._parked)
+
+    def test_park_is_idempotent(self) -> None:
+        import unittest.mock as mock
+
+        provider, fake_torch = self._provider_with_fake_torch()
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            provider.park()
+            provider.park()  # second call must be a no-op
+        provider._asr_model.cpu.assert_called_once()
+        self.assertEqual(fake_torch.cuda.empty_cache.call_count, 1)
+
+    def test_unpark_restores_to_gpu(self) -> None:
+        import unittest.mock as mock
+
+        provider, fake_torch = self._provider_with_fake_torch()
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            provider.park()
+        provider.unpark()
+        provider._asr_model.cuda.assert_called_once()
+        self.assertFalse(provider._parked)
+
+    def test_unpark_without_park_is_noop(self) -> None:
+        provider, _ = self._provider_with_fake_torch()
+        provider.unpark()  # never parked → no move
+        provider._asr_model.cuda.assert_not_called()
+
+    def test_park_with_no_model_is_noop(self) -> None:
+        provider = runner.NeMoParakeetProvider()  # _asr_model is None
+        provider.park()  # must not raise / not import torch
+        self.assertFalse(provider._parked)
+
+    def test_diarize_model_parks_too(self) -> None:
+        import unittest.mock as mock
+
+        provider, fake_torch = self._provider_with_fake_torch()
+        provider._diarize_model = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            provider.park()
+        provider._diarize_model.cpu.assert_called_once()
+        provider.unpark()
+        provider._diarize_model.cuda.assert_called_once()
+
+
 class ResolveAudioPathTests(unittest.TestCase):
     """_resolve_audio_path re-roots the producer's file_path onto BOOKS_MOUNT."""
 
