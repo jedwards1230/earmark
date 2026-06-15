@@ -101,6 +101,22 @@ func (c workerFakeChat) Complete(_ context.Context, _, _ string) (string, error)
 }
 func (c workerFakeChat) Model() string { return "fake-judge" }
 
+// flakyChat errors on the first Complete call, then returns resp — used to
+// exercise the transient per-chunk judge error (soft-fail) path.
+type flakyChat struct {
+	resp  string
+	calls int
+}
+
+func (c *flakyChat) Complete(_ context.Context, _, _ string) (string, error) {
+	c.calls++
+	if c.calls == 1 {
+		return "", fmt.Errorf("transient judge glitch")
+	}
+	return c.resp, nil
+}
+func (c *flakyChat) Model() string { return "flaky-judge" }
+
 func TestProcessTranscript_Success(t *testing.T) {
 	fdb := &fakeDB{}
 	w := &Worker{
@@ -213,6 +229,48 @@ func TestProcessTranscript_FindingsWriteFailureStillEmbeds(t *testing.T) {
 		"a findings-write failure must not fail the embed")
 	require.NotEmpty(t, fdb.chunks, "chunks must still be inserted")
 	require.Empty(t, fdb.findings, "findings write failed → none captured")
+}
+
+func TestNewWorker_EvalInPipelineNoEndpointLeavesJudgeNil(t *testing.T) {
+	// EVAL_IN_PIPELINE on but no eval endpoint resolves → judge stays nil
+	// (non-fatal fallback), and the worker still embeds normally.
+	t.Setenv("EVAL_CHAT_BASE_URL", "")
+	t.Setenv("EVAL_CHAT_MODEL", "")
+	cfg := &config.Config{ChunkSize: 10, EvalInPipeline: true}
+	w := NewWorker(&queue.Queue{}, &fakeDB{}, cfg)
+	require.Nil(t, w.judge, "no eval endpoint → judge must be nil, not a panic/fatal")
+
+	// And processing still works (no eval, chunks embedded).
+	fdb := &fakeDB{}
+	w.db = fdb
+	transcript := &db.Transcript{ID: "tid-nojudge", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."}
+	require.NoError(t, w.processTranscript(cfg, transcript))
+	require.NotEmpty(t, fdb.chunks)
+	require.Empty(t, fdb.findings)
+}
+
+func TestProcessTranscript_TransientJudgeErrorSkipsChunkAndPersistsRest(t *testing.T) {
+	// A per-chunk judge error is soft-fail: that chunk is skipped, the run
+	// continues, partial findings are persisted, and embedding is unaffected.
+	fdb := &fakeDB{}
+	judge := eval.NewJudge(&flakyChat{
+		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+	})
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), judge: judge}
+	cfg := &config.Config{ChunkSize: 8}
+	// Long enough to split into several chunks so the first (failing) chunk is a
+	// strict subset — the survivors still yield findings.
+	transcript := &db.Transcript{
+		ID: "tid-flaky", JobID: "job-flaky", FilePath: "/b/a/t/ch.mp3",
+		RawText: "Hello world this is a fairly long test transcript with plenty of words so the token chunker emits multiple chunks for the judge to evaluate one by one.",
+	}
+
+	require.NoError(t, w.processTranscript(cfg, transcript),
+		"a transient judge error must not fail the transcript")
+	require.Greater(t, len(fdb.chunks), 1, "expected multiple chunks for this test")
+	require.NotEmpty(t, fdb.findings, "surviving chunks should still yield persisted findings")
+	require.Less(t, len(fdb.findings), len(fdb.chunks),
+		"the first chunk's judge error should have skipped its finding (partial result)")
 }
 
 func TestProcessTranscript_RecordsEmbedMetrics(t *testing.T) {
