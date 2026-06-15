@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
@@ -38,9 +40,11 @@ type PhaseStore interface {
 // Arbiter reports gpu-arbiter readiness. The coordinator only ever reads it
 // (GET /status) — it never tells the arbiter to do anything.
 type Arbiter interface {
-	// Gaming reports whether the GPU is currently held by a game. ok=false means
-	// the arbiter was unreachable / not configured (the caller then proceeds,
-	// degrading gracefully — arbiter absence must never wedge the coordinator).
+	// Gaming reports whether the GPU is currently busy with a game — actively
+	// gaming OR mid-eviction (a game just launched and the arbiter is tearing
+	// down GPU tenants). ok=false means the arbiter was unreachable / not
+	// configured (the caller then proceeds, degrading gracefully — arbiter
+	// absence must never wedge the coordinator).
 	Gaming(ctx context.Context) (gaming bool, ok bool)
 }
 
@@ -76,14 +80,29 @@ func (o *Options) normalize() error {
 }
 
 // Run executes the batch coordinator until the queue drains, MaxBatches is hit,
-// or ctx is cancelled (SIGINT/SIGTERM). It ALWAYS restores the pipeline to idle
-// and clears the run budget on exit — normal completion, error, or cancel —
-// via a deferred restore, so the system never gets stuck mid-phase.
+// or the run is cancelled (SIGINT/SIGTERM, or the parent ctx). It ALWAYS
+// restores the pipeline to idle and clears the run budget on exit — normal
+// completion, error, or cancel — via a deferred restore, so the system never
+// gets stuck mid-phase.
+//
+// The SIGINT/SIGTERM handler is installed *inside* Run (not by the caller) so
+// that the signal-aware scope strictly encloses the restore-idle defer: there
+// is no window where a signal could arrive after the handler is torn down but
+// before the restore runs. The parent ctx is still honored — cancelling it (or
+// using a test context) unwinds the loop the same way a signal does.
 func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Options) (err error) {
 	if nerr := o.normalize(); nerr != nil {
 		return nerr
 	}
 	p := func(format string, a ...any) { _, _ = fmt.Fprintf(out, format, a...) }
+
+	// Install the signal handler first, then defer the restore. Defers run
+	// LIFO, so on return the restore-idle cleanup runs BEFORE stop() releases
+	// the signal handler — the handler stays armed across the entire cleanup,
+	// closing the "signal at return time" race.
+	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx = sigCtx
 
 	// Robustness: restore idle + clear budget on EVERY exit path. Uses
 	// context.Background() (not ctx) so the cleanup still runs after a
@@ -152,21 +171,22 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	return nil
 }
 
-// yieldToGames blocks while gpu-arbiter reports gaming, polling every poll
-// interval. An unreachable/unset arbiter (ok=false) returns immediately — the
-// coordinator proceeds, degrading gracefully.
+// yieldToGames blocks while gpu-arbiter reports the GPU is busy with a game
+// (gaming or evicting; see arbiter.go), polling every poll interval. An
+// unreachable/unset arbiter (ok=false) returns immediately — the coordinator
+// proceeds, degrading gracefully.
 func yieldToGames(ctx context.Context, p func(string, ...any), arb Arbiter, poll time.Duration) error {
 	announced := false
 	for {
-		gaming, ok := arb.Gaming(ctx)
-		if !ok || !gaming {
+		busy, ok := arb.Gaming(ctx)
+		if !ok || !busy {
 			if announced {
-				p("gpu-arbiter no longer gaming — resuming.\n")
+				p("gpu-arbiter GPU free again — resuming.\n")
 			}
 			return nil
 		}
 		if !announced {
-			p("gpu-arbiter reports gaming — waiting for the GPU (polling every %s)...\n", poll)
+			p("gpu-arbiter reports the GPU busy with a game — waiting (polling every %s)...\n", poll)
 			announced = true
 		}
 		if err := sleep(ctx, poll); err != nil {

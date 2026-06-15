@@ -15,15 +15,29 @@ import (
 // the GPU box that treats the machine as a gaming PC first: when a game launches
 // it evicts GPU tenants (the ASR runner, the eval judge) and restores them when
 // gaming ends. It serves an unauthenticated LAN GET /status. The coordinator
-// reads it before each batch and waits while it reports gaming — this is the
-// ONLY gpu-arbiter interaction and it is strictly read-only (never POSTs).
+// reads it before each batch and waits while the GPU is busy with a game — this
+// is the ONLY gpu-arbiter interaction and it is strictly read-only (never POSTs).
 //
 // Mirrors internal/mcp/gpuprobe.go's JSON shape and SSRF guards, kept local so
 // the coordinator stays a standalone, hardware-agnostic phase driver.
 
-// gamingState is the gpu-arbiter /status state that means "the GPU is held by a
-// game right now"; the coordinator waits while this is reported.
-const gamingState = "gaming"
+// gpu-arbiter /status states the coordinator must NOT start GPU work during:
+//   - "gaming"   — a game holds the GPU.
+//   - "evicting" — a game just launched and gpu-arbiter is tearing down the GPU
+//     tenants; starting work now would race the eviction.
+//
+// Any other state ("available", "", unknown) is treated as not-busy → proceed.
+const (
+	stateGaming   = "gaming"
+	stateEvicting = "evicting"
+)
+
+// gpuBusyForGame reports whether the GPU is unavailable because of a game —
+// either actively gaming or mid-eviction. The coordinator yields (waits) while
+// this is true.
+func gpuBusyForGame(state string) bool {
+	return state == stateGaming || state == stateEvicting
+}
 
 // arbiterRaw mirrors the gpu-arbiter /status JSON (only the field we use).
 type arbiterRaw struct {
@@ -60,8 +74,9 @@ func NewHTTPArbiter(url string, timeout time.Duration) Arbiter {
 	}
 }
 
-// Gaming reports whether gpu-arbiter currently has the GPU held by a game.
-// ok=false means the arbiter is unconfigured or unreachable (caller proceeds).
+// Gaming reports whether gpu-arbiter currently has the GPU busy with a game —
+// either actively gaming or mid-eviction (see gpuBusyForGame). ok=false means
+// the arbiter is unconfigured or unreachable (caller proceeds).
 func (a *httpArbiter) Gaming(ctx context.Context) (gaming bool, ok bool) {
 	if a.url == "" {
 		return false, false
@@ -87,5 +102,5 @@ func (a *httpArbiter) Gaming(ctx context.Context) (gaming bool, ok bool) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxStatusBody)).Decode(&raw); err != nil {
 		return false, false
 	}
-	return raw.State == gamingState, true
+	return gpuBusyForGame(raw.State), true
 }

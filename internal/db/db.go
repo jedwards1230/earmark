@@ -1791,8 +1791,13 @@ const (
 	PhaseAnalyze    = "analyze"
 )
 
-// validPhases is the closed set SetPipelinePhase validates against. The empty
-// string is accepted by SetPipelinePhase as an alias for "idle" (stored NULL).
+// validPhases is the closed set of explicit phase names SetPipelinePhase
+// validates against. NOTE: the empty string "" is intentionally NOT a member,
+// yet SetPipelinePhase still accepts it — it special-cases "" *before* the map
+// lookup as an alias for "idle" (both store NULL). So the set of values
+// SetPipelinePhase accepts is {"", "idle", "transcribe", "analyze"}; this map
+// only covers the three non-empty ones. Don't read the map's omission of "" as
+// "" being rejected.
 var validPhases = map[string]bool{
 	PhaseIdle:       true,
 	PhaseTranscribe: true,
@@ -1821,9 +1826,12 @@ func (db *DB) GetPipelinePhase(ctx context.Context) (string, error) {
 // SetPipelinePhase writes the pipeline phase, validating it against the closed
 // set {"idle","transcribe","analyze"}. The empty string and "idle" both store
 // NULL (normal operation, the default). by records who set it for the audit
-// column. Upserts the singleton row so it works even if the seed insert was
-// somehow skipped. The future batched-pipeline coordinator uses this setter; no
-// pipeline code calls it today.
+// column. This is an UPDATE of the phase column only — it touches neither
+// paused nor run_limit (the three are independent axes; CONTRACT §1.4) — so it
+// can never clobber pause/run-budget intent. The singleton row is seeded at
+// init (`initialize`), so the UPDATE always matches; a missing row (which would
+// only happen pre-init) is a no-op, consistent with GetPipelinePhase treating
+// it as idle.
 func (db *DB) SetPipelinePhase(ctx context.Context, phase, by string) error {
 	if phase != "" && !validPhases[phase] {
 		return fmt.Errorf("invalid pipeline phase %q (want one of idle, transcribe, analyze)", phase)
@@ -1835,12 +1843,11 @@ func (db *DB) SetPipelinePhase(ctx context.Context, phase, by string) error {
 		arg = &phase
 	}
 	_, err := db.pool.Exec(ctx, `
-		INSERT INTO runner_control (id, paused, phase, updated_at, updated_by)
-		VALUES (1, false, $1, now(), $2)
-		ON CONFLICT (id) DO UPDATE
-			SET phase = EXCLUDED.phase,
-			    updated_at = EXCLUDED.updated_at,
-			    updated_by = EXCLUDED.updated_by
+		UPDATE runner_control
+		SET phase = $1,
+		    updated_at = now(),
+		    updated_by = $2
+		WHERE id = 1
 	`, arg, by)
 	if err != nil {
 		return fmt.Errorf("set pipeline phase: %w", err)

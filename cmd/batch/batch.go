@@ -19,8 +19,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/batch"
@@ -103,11 +101,6 @@ func runBatch(_ *cobra.Command, _ []string) {
 		arbiterURL = os.Getenv("GPU_ARBITER_URL")
 	}
 
-	// Context cancelled on SIGINT/SIGTERM so an interrupt unwinds the loop and
-	// hits the deferred phase restore (CONTRACT §1.4 robustness requirement).
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	cfgOpts := batch.Options{
 		BatchSize:    opts.batchSize,
 		MaxBatches:   opts.maxBatches,
@@ -116,7 +109,9 @@ func runBatch(_ *cobra.Command, _ []string) {
 	}
 	arbiter := batch.NewHTTPArbiter(arbiterURL, opts.arbiterTimeout)
 
-	if err := batch.Run(ctx, os.Stdout, database, arbiter, cfgOpts); err != nil {
+	// SIGINT/SIGTERM handling lives inside batch.Run so the signal-aware scope
+	// strictly encloses its restore-idle defer (no signal-at-return-time race).
+	if err := batch.Run(context.Background(), os.Stdout, database, arbiter, cfgOpts); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}

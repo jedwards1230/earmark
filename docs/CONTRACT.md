@@ -273,8 +273,10 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
 `--max-batches` is reached, or it is interrupted:
 
 1. **Yield to games.** If `GPU_ARBITER_URL` (§2.4) is set and gpu-arbiter
-   reports `state == "gaming"`, wait (poll every `--arbiter-poll`, default 15s)
-   until it is not, before doing GPU work. The arbiter read is a **read-only
+   reports the GPU is busy with a game — `state == "gaming"` (a game holds the
+   GPU) OR `state == "evicting"` (a game just launched and the arbiter is
+   tearing down GPU tenants) — wait (poll every `--arbiter-poll`, default 15s)
+   until it is neither, before doing GPU work. The arbiter read is a **read-only
    `GET /status`** — the coordinator never `POST`s to it. An unset or unreachable
    arbiter is logged and the coordinator proceeds (degrades gracefully — arbiter
    absence never wedges it).
