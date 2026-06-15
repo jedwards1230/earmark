@@ -261,10 +261,43 @@ of each poll cycle. When `phase = 'transcribe'` it SKIPS that cycle (idles for
 the poll interval, processes nothing) so the ASR runner has the GPU to itself.
 For `'idle'`/`'analyze'`/`NULL` it processes completed transcripts as usual. A
 phase-read error defaults to `'idle'` (process) and is logged — a DB hiccup must
-never wedge the worker. A missing row is treated as `'idle'`. **No coordinator
-ships today**; with `phase` left `NULL` the pipeline behaves exactly as before
-(both stages run concurrently). A future, separately-shipped coordinator flips
-`phase` to orchestrate transcribe-batches and analyze-batches.
+never wedge the worker. A missing row is treated as `'idle'`. With `phase` left
+`NULL` the pipeline behaves exactly as before (both stages run concurrently);
+the **`earmark batch` coordinator** (below) is what flips `phase` to orchestrate
+transcribe- and analyze-batches.
+
+**The `earmark batch` coordinator.** A standalone, hardware-agnostic command
+that runs the pipeline in batches so the ASR model and the eval-judge LLM
+time-share one GPU. It only flips `phase` + `run_limit` and reads queue status —
+it never touches CUDA. Per batch, repeated until no pending jobs remain,
+`--max-batches` is reached, or it is interrupted:
+
+1. **Yield to games.** If `GPU_ARBITER_URL` (§2.4) is set and gpu-arbiter
+   reports the GPU is busy with a game — `state == "gaming"` (a game holds the
+   GPU) OR `state == "evicting"` (a game just launched and the arbiter is
+   tearing down GPU tenants) — wait (poll every `--arbiter-poll`, default 15s)
+   until it is neither, before doing GPU work. The arbiter read is a **read-only
+   `GET /status`** — the coordinator never `POST`s to it. An unset or unreachable
+   arbiter is logged and the coordinator proceeds (degrades gracefully — arbiter
+   absence never wedges it).
+2. **Phase A — transcribe.** Set `phase='transcribe'` and `run_limit=N`
+   (`--batch-size`, default 10). The runner claims up to N jobs then stops; the
+   embed worker idles. Wait until nothing is `claimed` AND the run budget is
+   exhausted (`run_limit==0`) or no `pending` jobs remain.
+3. **Phase B — analyze.** Set `phase='analyze'`. The runner parks its model
+   (freeing the GPU) and the embed worker drains the just-transcribed
+   transcripts (chunk → embed, with inline eval when `EVAL_IN_PIPELINE=true`).
+   Wait until the embed backlog (completed transcripts with no chunks) is 0.
+
+**Robustness contract:** the coordinator **always restores `phase='idle'` and
+clears `run_limit`** on exit — normal completion, error, AND `SIGINT`/`SIGTERM` —
+so the system returns to normal continuous mode and never gets stuck mid-phase.
+It is **DB-driven and resumable**: it holds no critical state in memory and
+derives everything (current phase, job counts, backlog) from the DB. On restart
+it reconciles — if it finds `phase='analyze'`, it finishes Phase B before
+starting a new Phase A. If a game starts mid-batch, gpu-arbiter stops the runner
+and judge; the coordinator's per-batch yield-check handles re-entry and the
+existing stale-job recovery (§1.3) reclaims interrupted jobs.
 
 **Gate (the load-bearing rule):** the runner claims a job only when
 
@@ -637,6 +670,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
 | `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval). Default off → eval stays on-demand and the worker is unchanged. Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. |
+| `GPU_ARBITER_URL` | no | gpu-arbiter `/status` URL (e.g. `http://gpu-host:48750/status`) read by the `earmark batch` coordinator (§1.4) to yield the GPU to games. **Read-only** — the coordinator only `GET`s it, never `POST`s. Unset or unreachable → the coordinator logs it and proceeds (degrades gracefully). The `batch --gpu-arbiter-url` flag overrides it. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
 | `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.example.com`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
