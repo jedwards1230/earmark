@@ -182,6 +182,9 @@ func TestRun_RestoresIdleOnNormalCompletionWithNoWork(t *testing.T) {
 	if len(got) != 1 || got[0] != db.PhaseIdle {
 		t.Errorf("with no work, only an idle restore should occur, got %v", got)
 	}
+	if store.runLimit == nil || *store.runLimit != 0 {
+		t.Errorf("run_limit should be 0 on the no-work exit path, got %v", store.runLimit)
+	}
 }
 
 // TestRun_GamingMakesItWait verifies the coordinator polls the arbiter while it
@@ -302,6 +305,9 @@ func TestRun_RestoresIdleOnCancel(t *testing.T) {
 	got := store.transitions()
 	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
 		t.Errorf("idle must be restored on cancel; transitions=%v", got)
+	}
+	if store.runLimit == nil || *store.runLimit != 0 {
+		t.Errorf("run_limit should be 0 on the cancel exit path, got %v", store.runLimit)
 	}
 }
 
