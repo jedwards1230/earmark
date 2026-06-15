@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS runner_control (
     id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     paused     BOOLEAN     NOT NULL DEFAULT false,
     run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
+    phase      TEXT            CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze')),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by TEXT
 );
@@ -243,6 +244,27 @@ INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NO
 - **`run_limit`** — `NULL` means unlimited (normal operation); a non-negative
   integer is a **bounded run** with that many claims remaining (e.g. `1` for a
   single-job smoke test).
+- **`phase`** — the **batched two-phase pipeline** selector. `NULL` or `'idle'`
+  is normal operation (both the ASR runner and the Go embed worker run freely —
+  the default, fully backward-compatible); `'transcribe'` is the ASR-only phase
+  (the embed worker idles so eval/embed don't contend for the GPU the ASR runner
+  owns); `'analyze'` is the embed-only phase (the ASR runner is paused/off-GPU
+  and the embed worker drains the just-transcribed transcripts). The two valid
+  non-default values let a single GPU host a large ASR model **or** a large eval
+  judge, never both at once. The column is gated by a CHECK to the closed set
+  `{idle, transcribe, analyze}`; `NULL`/`idle` are equivalent and `idle` is
+  stored as `NULL`. `paused`/`run_limit` and `phase` are **independent axes**: a
+  paused pipeline in `transcribe` phase claims nothing AND idles the worker.
+
+**Phase semantics (worker gate):** the Go embed worker reads `phase` at the top
+of each poll cycle. When `phase = 'transcribe'` it SKIPS that cycle (idles for
+the poll interval, processes nothing) so the ASR runner has the GPU to itself.
+For `'idle'`/`'analyze'`/`NULL` it processes completed transcripts as usual. A
+phase-read error defaults to `'idle'` (process) and is logged — a DB hiccup must
+never wedge the worker. A missing row is treated as `'idle'`. **No coordinator
+ships today**; with `phase` left `NULL` the pipeline behaves exactly as before
+(both stages run concurrently). A future, separately-shipped coordinator flips
+`phase` to orchestrate transcribe-batches and analyze-batches.
 
 **Gate (the load-bearing rule):** the runner claims a job only when
 
