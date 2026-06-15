@@ -191,10 +191,14 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 
 	// In-pipeline eval (repositioned per the batched-pipeline design): judge the
 	// chunks BEFORE embedding so findings are produced from the same text. Gated
-	// on EvalInPipeline (judge is nil otherwise) and best-effort — a judge or
-	// findings-write failure is logged and never blocks embedding.
+	// on EvalInPipeline (judge is nil otherwise). The findings are COMPUTED here
+	// but PERSISTED only after the chunks are inserted (below) — otherwise an
+	// embedding failure would leave findings referencing chunk UUIDs that were
+	// never inserted (orphans), and the retry would re-chunk with fresh UUIDs and
+	// double up. Best-effort: a judge error yields no findings, never blocks embed.
+	var inlineFindings []db.Finding
 	if w.judge != nil {
-		w.runInlineEval(t, chunks)
+		inlineFindings = w.judgeChunks(t, chunks)
 	}
 
 	// Collect texts for batch embedding.
@@ -220,6 +224,20 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	}
 	finished := time.Now()
 
+	// Persist in-pipeline findings now that their chunks exist. Best-effort: a
+	// findings-write failure leaves chunks searchable but un-flagged (advisory),
+	// which is the safe direction — the reverse (findings without chunks) is what
+	// the post-insert ordering exists to prevent.
+	if len(inlineFindings) > 0 {
+		if err := w.db.InsertFindings(w.ctx, inlineFindings); err != nil {
+			w.log.Warn("persist in-pipeline findings failed (chunks inserted; findings dropped)",
+				"transcript_id", t.ID, "file", t.FilePath, "findings", len(inlineFindings), "error", err)
+		} else {
+			w.log.Info("in-pipeline eval findings persisted",
+				"transcript_id", t.ID, "findings", len(inlineFindings))
+		}
+	}
+
 	w.log.Info("transcript embedded",
 		"file", t.FilePath,
 		"transcript_id", t.ID,
@@ -233,12 +251,14 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	return nil
 }
 
-// runInlineEval judges the transcript's chunks and persists findings, before
-// embedding. Best-effort: any error is logged and swallowed so the embed step
-// always proceeds (eval is advisory; the corpus must stay searchable even if the
-// judge endpoint is down). Chunks must already have their IDs assigned so the
-// findings reference the same rows the worker is about to insert.
-func (w *Worker) runInlineEval(t *db.Transcript, chunks []db.Chunk) {
+// judgeChunks runs the judge over the transcript's chunks and RETURNS the
+// findings WITHOUT persisting them (write=false) — the caller persists after the
+// chunks are inserted, so a later embedding failure can't leave orphaned
+// findings. Best-effort: any error is logged and yields nil findings so the
+// embed step always proceeds (eval is advisory; the corpus must stay searchable
+// even if the judge endpoint is down). Chunks must already have their IDs
+// assigned so the returned findings reference the rows the worker will insert.
+func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 	evalChunks := make([]db.EvalChunk, len(chunks))
 	for i, c := range chunks {
 		evalChunks[i] = db.EvalChunk{
@@ -253,17 +273,17 @@ func (w *Worker) runInlineEval(t *db.Transcript, chunks []db.Chunk) {
 		}
 	}
 
-	_, stats, err := eval.RunOnChunks(w.ctx, w.judge, w.db, evalChunks, true)
+	findings, stats, err := eval.RunOnChunks(w.ctx, w.judge, nil, evalChunks, false)
 	if err != nil {
 		w.log.Warn("in-pipeline eval failed (continuing to embed)",
 			"transcript_id", t.ID, "file", t.FilePath, "error", err)
-		return
+		return nil
 	}
-	w.log.Info("in-pipeline eval complete",
+	w.log.Info("in-pipeline eval judged",
 		"transcript_id", t.ID,
 		"chunks", stats.ChunksEvaluated,
-		"findings", stats.FindingsFound,
-		"persisted", stats.Persisted)
+		"findings", stats.FindingsFound)
+	return findings
 }
 
 // recordEmbedMetrics UPSERTs the embed worker's slice of run_metrics for a
