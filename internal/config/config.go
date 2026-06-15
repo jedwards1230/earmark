@@ -309,6 +309,13 @@ type Config struct {
 	// Overlap is 64 tokens (implementation constant in the chunker).
 	ChunkSize int
 
+	// EvalInPipeline — when true, the embed worker runs the eval judge on each
+	// transcript's chunks BEFORE embedding (the repositioned, in-pipeline eval
+	// of the batched-pipeline design). Default false: eval stays on-demand
+	// (`earmark eval` / `/actions/eval*`) and the worker behaves as before. The
+	// batch coordinator turns this on per batch. Source: EVAL_IN_PIPELINE.
+	EvalInPipeline bool
+
 	// LIBRARY_COLLECTIONS — optional JSON describing how each library root is
 	// shaped, so author/title labels are derived from configuration rather than
 	// hardcoded path assumptions. Empty → a generic fallback is used.
@@ -421,6 +428,12 @@ func LoadConfig() (*Config, error) {
 		}
 	} else {
 		cfg.ChunkSize = 512
+	}
+
+	// EVAL_IN_PIPELINE: run the eval judge inline (before embed) in the worker.
+	// Default false. Accepts the usual truthy strings via strconv.ParseBool.
+	if v := os.Getenv("EVAL_IN_PIPELINE"); v != "" {
+		cfg.EvalInPipeline, _ = strconv.ParseBool(v)
 	}
 
 	// ASR_SERVERS is best-effort, like LIBRARY_COLLECTIONS: a parse error logs a

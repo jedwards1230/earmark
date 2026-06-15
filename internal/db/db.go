@@ -639,15 +639,20 @@ func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	for _, c := range chunks {
+		// id is supplied by the caller when chunks were pre-identified (e.g. the
+		// worker generates UUIDs so in-pipeline eval findings can reference the
+		// chunk before it is inserted). An empty id falls back to the column
+		// default — COALESCE(NULLIF(...)) keeps both callers working.
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO transcript_chunks
-			       (transcript_id, file_path, chunk_index, start_sec, end_sec,
+			       (id, transcript_id, file_path, chunk_index, start_sec, end_sec,
 			        text, speaker, embedding)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			VALUES (COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()),
+			        $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (transcript_id, chunk_index) DO UPDATE
 			SET text      = EXCLUDED.text,
 			    embedding = EXCLUDED.embedding
-		`, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
+		`, c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
 			c.Text, c.Speaker, pgvector.NewVector(c.Embedding),
 		); err != nil {
 			return fmt.Errorf("insert chunk %d: %w", c.ChunkIndex, err)

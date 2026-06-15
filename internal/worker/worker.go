@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jedwards1230/earmark/internal/chunker"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/queue"
@@ -24,6 +26,10 @@ type DBInterface interface {
 	GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
 	RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 	UpsertEmbedMetrics(ctx context.Context, m db.EmbedMetrics) error
+	// InsertFindings persists eval findings — used only by the in-pipeline eval
+	// path (EvalInPipeline). *db.DB already satisfies this (it is the eval
+	// FindingWriter).
+	InsertFindings(ctx context.Context, findings []db.Finding) error
 }
 
 // Worker polls for completed transcripts and embeds them.
@@ -34,13 +40,22 @@ type Worker struct {
 	cancel context.CancelFunc
 	db     DBInterface
 	log    log.Logger
+	// judge is non-nil only when EvalInPipeline is set AND a chat endpoint
+	// resolved; when nil the worker skips the in-pipeline eval step entirely.
+	judge *eval.Judge
 }
 
 // NewWorker creates a Worker. The queue parameter is accepted for API
 // compatibility with the monitor wiring but is not used by the embed loop.
+//
+// When cfg.EvalInPipeline is set, the worker resolves the eval chat endpoint and
+// builds a judge so each transcript is evaluated before embedding. A resolution
+// failure is non-fatal: it logs a warning and leaves the judge nil (the worker
+// embeds as usual, just without inline eval) — the pipeline must not stall
+// because the judge endpoint is misconfigured.
 func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Worker{
+	w := &Worker{
 		queue:  q,
 		done:   make(chan struct{}),
 		ctx:    ctx,
@@ -48,6 +63,17 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 		db:     database,
 		log:    log.NewLogger("worker"),
 	}
+	if cfg.EvalInPipeline {
+		chat, err := eval.ResolveChatClient(eval.ConfigSource(cfg))
+		if err != nil {
+			w.log.Warn("EVAL_IN_PIPELINE set but no eval chat endpoint resolved — inline eval disabled",
+				"error", err)
+		} else {
+			w.judge = eval.NewJudge(chat)
+			w.log.Info("in-pipeline eval enabled", "judge_model", chat.Model())
+		}
+	}
+	return w
 }
 
 // Start runs the embed loop until Stop is called.
@@ -156,6 +182,21 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		}
 	}
 
+	// Pre-assign chunk UUIDs so the in-pipeline eval below can attribute findings
+	// to chunks before they are inserted. InsertChunks persists these ids; the
+	// column default still applies for any caller that leaves ID empty.
+	for i := range chunks {
+		chunks[i].ID = uuid.NewString()
+	}
+
+	// In-pipeline eval (repositioned per the batched-pipeline design): judge the
+	// chunks BEFORE embedding so findings are produced from the same text. Gated
+	// on EvalInPipeline (judge is nil otherwise) and best-effort — a judge or
+	// findings-write failure is logged and never blocks embedding.
+	if w.judge != nil {
+		w.runInlineEval(t, chunks)
+	}
+
 	// Collect texts for batch embedding.
 	texts := make([]string, len(chunks))
 	for i, c := range chunks {
@@ -190,6 +231,39 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	w.recordEmbedMetrics(t, texts, usage, start, finished, len(chunks),
 		embedModel(cfg))
 	return nil
+}
+
+// runInlineEval judges the transcript's chunks and persists findings, before
+// embedding. Best-effort: any error is logged and swallowed so the embed step
+// always proceeds (eval is advisory; the corpus must stay searchable even if the
+// judge endpoint is down). Chunks must already have their IDs assigned so the
+// findings reference the same rows the worker is about to insert.
+func (w *Worker) runInlineEval(t *db.Transcript, chunks []db.Chunk) {
+	evalChunks := make([]db.EvalChunk, len(chunks))
+	for i, c := range chunks {
+		evalChunks[i] = db.EvalChunk{
+			ChunkID:            c.ID,
+			TranscriptID:       t.ID,
+			TranscriptionRunID: t.JobID,
+			FilePath:           c.FilePath,
+			ChunkIndex:         c.ChunkIndex,
+			StartSec:           c.StartSec,
+			EndSec:             c.EndSec,
+			Text:               c.Text,
+		}
+	}
+
+	_, stats, err := eval.RunOnChunks(w.ctx, w.judge, w.db, evalChunks, true)
+	if err != nil {
+		w.log.Warn("in-pipeline eval failed (continuing to embed)",
+			"transcript_id", t.ID, "file", t.FilePath, "error", err)
+		return
+	}
+	w.log.Info("in-pipeline eval complete",
+		"transcript_id", t.ID,
+		"chunks", stats.ChunksEvaluated,
+		"findings", stats.FindingsFound,
+		"persisted", stats.Persisted)
 }
 
 // recordEmbedMetrics UPSERTs the embed worker's slice of run_metrics for a

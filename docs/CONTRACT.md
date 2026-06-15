@@ -570,6 +570,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
+| `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval). Default off → eval stays on-demand and the worker is unchanged. Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See `docs/design/batched-pipeline.md`. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
 | `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.example.com`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
@@ -1077,11 +1078,14 @@ returned by the model is coerced to `other`:
 
 #### Sampling / cost
 
-The judge is **sampled or on-demand**, never an always-on pass: `earmark eval
-"<book>"` evaluates one book; `earmark eval --sample N` judges N random chunks
-library-wide. The unit of evaluation is the **chunk**. The command is dry-run by
-default (prints what it would record) and persists only with `--write` (alias
-`--yes`).
+The judge is **sampled, on-demand, or in-pipeline** — never an unbounded
+always-on pass: `earmark eval "<book>"` evaluates one book; `earmark eval
+--sample N` judges N random chunks library-wide; and with `EVAL_IN_PIPELINE` the
+embed worker evaluates each transcript's chunks before embedding (bounded by the
+batch the coordinator drives — see `docs/design/batched-pipeline.md`). The unit
+of evaluation is the **chunk**. The CLI is dry-run by default (prints what it
+would record) and persists only with `--write` (alias `--yes`); the in-pipeline
+path always persists.
 
 **Noise filters (applied per chunk, before persistence).** Two precision filters
 trim the judge's over-flagging, in this order:

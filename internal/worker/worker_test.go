@@ -8,6 +8,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/queue"
@@ -40,6 +41,7 @@ type fakeDB struct {
 	usage       openai.EmbeddingUsage // returned by GetEmbeddingsWithUsage
 	metrics     []db.EmbedMetrics     // captured by UpsertEmbedMetrics
 	metricsErr  error
+	findings    []db.Finding // captured by InsertFindings (in-pipeline eval)
 }
 
 func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, error) {
@@ -81,6 +83,20 @@ func (f *fakeDB) UpsertEmbedMetrics(_ context.Context, m db.EmbedMetrics) error 
 
 func (f *fakeDB) RecoverStaleJobs(_ context.Context, _ time.Duration) error { return nil }
 
+func (f *fakeDB) InsertFindings(_ context.Context, findings []db.Finding) error {
+	f.findings = append(f.findings, findings...)
+	return nil
+}
+
+// workerFakeChat implements eval.ChatClient so a test can inject a judge into
+// the worker without a real endpoint.
+type workerFakeChat struct{ resp string }
+
+func (c workerFakeChat) Complete(_ context.Context, _, _ string) (string, error) {
+	return c.resp, nil
+}
+func (c workerFakeChat) Model() string { return "fake-judge" }
+
 func TestProcessTranscript_Success(t *testing.T) {
 	fdb := &fakeDB{}
 	w := &Worker{
@@ -104,6 +120,61 @@ func TestProcessTranscript_Success(t *testing.T) {
 		require.Equal(t, "/books/author/title/ch1.mp3", c.FilePath)
 		require.Len(t, c.Embedding, 768)
 	}
+}
+
+func TestProcessTranscript_InlineEvalWritesFindingsLinkedToChunks(t *testing.T) {
+	// With a judge set (EvalInPipeline path), processTranscript evaluates the
+	// chunks before embedding, persists findings, AND still embeds. Each finding
+	// must reference a chunk_id that matches an inserted chunk (the pre-assigned
+	// UUID), proving eval-before-embed linkage.
+	fdb := &fakeDB{}
+	judge := eval.NewJudge(workerFakeChat{
+		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+	})
+	w := &Worker{
+		ctx:   context.Background(),
+		db:    fdb,
+		log:   log.NewLogger("worker-test"),
+		judge: judge,
+	}
+
+	cfg := &config.Config{ChunkSize: 10}
+	transcript := &db.Transcript{
+		ID:       "tid-eval",
+		JobID:    "job-eval",
+		FilePath: "/books/author/title/ch1.mp3",
+		RawText:  "Hello world this is a test transcript for chunking.",
+	}
+
+	require.NoError(t, w.processTranscript(cfg, transcript))
+
+	// Embedding still happened.
+	require.NotEmpty(t, fdb.chunks)
+	// Eval ran and persisted findings.
+	require.NotEmpty(t, fdb.findings, "in-pipeline eval should have written findings")
+
+	chunkIDs := map[string]bool{}
+	for _, c := range fdb.chunks {
+		require.NotEmpty(t, c.ID, "chunk should have a pre-assigned UUID")
+		chunkIDs[c.ID] = true
+	}
+	for _, f := range fdb.findings {
+		require.NotNil(t, f.ChunkID)
+		require.True(t, chunkIDs[*f.ChunkID],
+			"finding chunk_id %q must match an inserted chunk", *f.ChunkID)
+		require.Equal(t, "job-eval", *f.TranscriptionRunID)
+	}
+}
+
+func TestProcessTranscript_NoJudgeSkipsEval(t *testing.T) {
+	// Default (judge nil): no findings written, chunks still inserted — behavior
+	// identical to before the in-pipeline eval was added.
+	fdb := &fakeDB{}
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test")}
+	transcript := &db.Transcript{ID: "tid-noeval", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test."}
+	require.NoError(t, w.processTranscript(&config.Config{ChunkSize: 10}, transcript))
+	require.NotEmpty(t, fdb.chunks)
+	require.Empty(t, fdb.findings, "no judge → no findings")
 }
 
 func TestProcessTranscript_RecordsEmbedMetrics(t *testing.T) {

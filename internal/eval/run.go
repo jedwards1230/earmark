@@ -52,7 +52,25 @@ func Run(ctx context.Context, reader ChunkReader, judge *Judge, writer FindingWr
 	if err != nil {
 		return nil, RunStats{}, err
 	}
+	return runChunks(ctx, judge, writer, chunks, opts.Write)
+}
 
+// RunOnChunks judges an already-resolved set of chunks (e.g. the in-memory
+// chunks the embed worker produces before embedding, per the batched-pipeline
+// design) and, when write is true, persists the findings. It shares the
+// per-chunk judging + soft-fail semantics with Run; it just skips the reader.
+// Used by the in-pipeline eval path so eval can run on chunks that are not yet
+// in transcript_chunks (their UUIDs are caller-assigned and consistent with the
+// rows the worker subsequently inserts).
+func RunOnChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks []db.EvalChunk, write bool) ([]db.Finding, RunStats, error) {
+	return runChunks(ctx, judge, writer, chunks, write)
+}
+
+// runChunks is the shared judge-collect-persist core behind Run and RunOnChunks.
+// A transient per-chunk judge error skips that chunk (logged) and the run
+// continues; a cancelled/expired context aborts but returns the findings
+// gathered so far. Findings are persisted only under the write gate.
+func runChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks []db.EvalChunk, write bool) ([]db.Finding, RunStats, error) {
 	var all []db.Finding
 	var stats RunStats
 	for _, c := range chunks {
@@ -77,7 +95,7 @@ func Run(ctx context.Context, reader ChunkReader, judge *Judge, writer FindingWr
 
 	stats.FindingsFound = len(all)
 
-	if opts.Write && len(all) > 0 {
+	if write && len(all) > 0 {
 		if err := writer.InsertFindings(ctx, all); err != nil {
 			return all, stats, fmt.Errorf("persist findings: %w", err)
 		}
