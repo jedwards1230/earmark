@@ -166,8 +166,8 @@ func TestRun_FullCycleDrivesPhaseTransitions(t *testing.T) {
 			t.Fatalf("phase transitions = %v, want %v", got, want)
 		}
 	}
-	if store.runLimit != nil {
-		t.Errorf("run_limit should be cleared (nil) on exit, got %v", *store.runLimit)
+	if store.runLimit == nil || *store.runLimit != 0 {
+		t.Errorf("run_limit should be set to 0 (idle-but-armed, never unlimited) on exit, got %v", store.runLimit)
 	}
 }
 
@@ -274,8 +274,8 @@ func TestRun_RestoresIdleOnError(t *testing.T) {
 	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
 		t.Errorf("idle must be restored even on error; transitions=%v", got)
 	}
-	if store.runLimit != nil {
-		t.Errorf("run_limit must be cleared on error, got %v", *store.runLimit)
+	if store.runLimit == nil || *store.runLimit != 0 {
+		t.Errorf("run_limit must be set to 0 on error exit, got %v", store.runLimit)
 	}
 }
 
@@ -341,9 +341,9 @@ func TestRun_ResumeFromAnalyzeFinishesPhaseBFirst(t *testing.T) {
 	if !store.hadFirstStatus {
 		t.Fatal("expected at least one status poll")
 	}
-	if store.runLimitAtFirstStatus != nil {
-		t.Errorf("resume must clear the residual run budget before polling Phase B; run_limit at first status = %v",
-			*store.runLimitAtFirstStatus)
+	if store.runLimitAtFirstStatus == nil || *store.runLimitAtFirstStatus != 0 {
+		t.Errorf("resume must reset the residual run budget to 0 before polling Phase B; run_limit at first status = %v",
+			store.runLimitAtFirstStatus)
 	}
 }
 
