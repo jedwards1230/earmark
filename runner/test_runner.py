@@ -348,6 +348,46 @@ class ParkUnparkTests(unittest.TestCase):
         provider.unpark()
         provider._diarize_model.cuda.assert_called_once()
 
+    def test_repeated_transitions_track_state(self) -> None:
+        # Drive ONE provider through park → unpark → park → unpark and assert the
+        # _parked flag and the underlying .cpu()/.cuda()/empty_cache() call counts
+        # land in the right state at each step. Catches a stuck/inverted flag where
+        # a second transition silently no-ops because state wasn't toggled.
+        import unittest.mock as mock
+
+        provider, fake_torch = self._provider_with_fake_torch()
+        cpu, cuda = provider._asr_model.cpu, provider._asr_model.cuda
+        empty_cache = fake_torch.cuda.empty_cache
+
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            # 1) park
+            provider.park()
+            self.assertTrue(provider._parked)
+            self.assertEqual(cpu.call_count, 1)
+            self.assertEqual(cuda.call_count, 0)
+            self.assertEqual(empty_cache.call_count, 1)
+
+            # 2) unpark
+            provider.unpark()
+            self.assertFalse(provider._parked)
+            self.assertEqual(cpu.call_count, 1)
+            self.assertEqual(cuda.call_count, 1)
+            self.assertEqual(empty_cache.call_count, 1)  # unpark does not empty cache
+
+            # 3) park again — must actually move (not a stuck-flag no-op)
+            provider.park()
+            self.assertTrue(provider._parked)
+            self.assertEqual(cpu.call_count, 2)
+            self.assertEqual(cuda.call_count, 1)
+            self.assertEqual(empty_cache.call_count, 2)
+
+            # 4) unpark again
+            provider.unpark()
+            self.assertFalse(provider._parked)
+            self.assertEqual(cpu.call_count, 2)
+            self.assertEqual(cuda.call_count, 2)
+            self.assertEqual(empty_cache.call_count, 2)
+
 
 class _RecordingProvider:
     """A stub ASRProvider that records park/unpark calls (no real GPU)."""
