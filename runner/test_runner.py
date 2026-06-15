@@ -349,6 +349,99 @@ class ParkUnparkTests(unittest.TestCase):
         provider._diarize_model.cuda.assert_called_once()
 
 
+class _RecordingProvider:
+    """A stub ASRProvider that records park/unpark calls (no real GPU)."""
+
+    def __init__(self, park_raises: bool = False, unpark_raises: bool = False) -> None:
+        self.parked = 0
+        self.unparked = 0
+        self.park_raises = park_raises
+        self.unpark_raises = unpark_raises
+
+    def park(self) -> None:
+        self.parked += 1
+        if self.park_raises:
+            raise RuntimeError("simulated torch/CUDA failure")
+
+    def unpark(self) -> None:
+        self.unparked += 1
+        if self.unpark_raises:
+            raise RuntimeError("simulated torch/CUDA failure")
+
+
+class GateGpuTests(unittest.TestCase):
+    """_gate_gpu orchestrates the per-cycle sequence: read paused+phase →
+    _should_park → park-and-skip-claim vs unpark-then-proceed. No real torch/GPU/DB."""
+
+    def test_active_unparks_and_proceeds_to_claim(self) -> None:
+        # not paused + on-GPU phase → unpark, do not skip the claim.
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            phase_row={"phase": "transcribe"},
+        )
+        provider = _RecordingProvider()
+        skip = runner._gate_gpu(conn, provider)
+        self.assertFalse(skip)  # claiming proceeds this cycle
+        self.assertEqual(provider.unparked, 1)
+        self.assertEqual(provider.parked, 0)
+
+    def test_paused_parks_and_skips_claim(self) -> None:
+        conn = _PhaseConn(
+            control_row={"paused": True, "run_limit": None},
+            phase_row={"phase": "idle"},
+        )
+        provider = _RecordingProvider()
+        skip = runner._gate_gpu(conn, provider)
+        self.assertTrue(skip)  # claim skipped this cycle
+        self.assertEqual(provider.parked, 1)
+        self.assertEqual(provider.unparked, 0)
+
+    def test_analyze_phase_parks_and_skips_claim(self) -> None:
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            phase_row={"phase": "analyze"},
+        )
+        provider = _RecordingProvider()
+        skip = runner._gate_gpu(conn, provider)
+        self.assertTrue(skip)
+        self.assertEqual(provider.parked, 1)
+
+    def test_missing_phase_column_keeps_model_active(self) -> None:
+        # phase read raises (column not deployed yet) → defaults to 'idle' → active.
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            raise_on="phase",
+        )
+        provider = _RecordingProvider()
+        skip = runner._gate_gpu(conn, provider)
+        self.assertFalse(skip)
+        self.assertEqual(provider.unparked, 1)
+
+    def test_park_failure_is_isolated_and_skips_claim(self) -> None:
+        # A park() failure (e.g. torch unavailable) must NOT propagate to the
+        # caller's DB/claim handler. _gate_gpu catches it and still skips the claim.
+        conn = _PhaseConn(
+            control_row={"paused": True, "run_limit": None},
+            phase_row={"phase": "idle"},
+        )
+        provider = _RecordingProvider(park_raises=True)
+        skip = runner._gate_gpu(conn, provider)  # must not raise
+        self.assertTrue(skip)
+        self.assertEqual(provider.parked, 1)
+
+    def test_unpark_failure_is_isolated_and_skips_claim(self) -> None:
+        # An unpark() failure means we couldn't reclaim the card → skip the claim
+        # (don't transcribe on a card we don't own) rather than crash the loop.
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            phase_row={"phase": "transcribe"},
+        )
+        provider = _RecordingProvider(unpark_raises=True)
+        skip = runner._gate_gpu(conn, provider)  # must not raise
+        self.assertTrue(skip)
+        self.assertEqual(provider.unparked, 1)
+
+
 class ResolveAudioPathTests(unittest.TestCase):
     """_resolve_audio_path re-roots the producer's file_path onto BOOKS_MOUNT."""
 

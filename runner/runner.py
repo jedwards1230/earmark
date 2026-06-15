@@ -380,6 +380,52 @@ def _should_park(paused: bool, phase: str | None) -> bool:
     return phase not in _PHASE_ON_GPU
 
 
+def _gate_gpu(
+    conn: psycopg2.extensions.connection,
+    provider: "ASRProvider",
+) -> bool:
+    """
+    Run one per-cycle GPU gate decision (CONTRACT §1.4) and return whether the
+    caller should SKIP claiming a job this cycle.
+
+    Reads paused (advisory, unlocked) + phase (defensive), decides via
+    _should_park, and applies the park/unpark side-effect on the provider — but
+    only on a state change (the provider tracks parked/loaded state, so a
+    steady-state poll does no redundant .cpu()/.cuda()). Returns:
+        True  → park the GPU; skip the claim this cycle (model is off the card).
+        False → model is active; proceed to claim a job.
+
+    A park()/unpark() failure (e.g. torch unavailable, a CUDA error) is caught
+    and logged HERE with accurate context ("GPU park/unpark failed") rather than
+    propagating to the main loop's claim handler, where it would be mislabeled a
+    "DB error during claim". On a park failure we still skip the claim (fail safe:
+    do not start a job we were told not to run); on an unpark failure we skip the
+    claim too (don't transcribe on a card we couldn't reclaim) and retry next poll.
+    The decision (paused/phase) is computed via the pure helpers, so this function
+    is testable with stubs and no real GPU.
+    """
+    paused, _ = _control_values(_read_control_row(conn))
+    phase = _read_phase(conn)
+    should_park = _should_park(paused, phase)
+    try:
+        if should_park:
+            provider.park()
+        else:
+            provider.unpark()
+    except Exception as exc:  # noqa: BLE001 — isolate GPU faults from the claim path
+        log.error(
+            "GPU %s failed (paused=%s phase=%s): %s — skipping claim this cycle",
+            "park" if should_park else "unpark",
+            paused,
+            phase,
+            exc,
+        )
+        return True  # skip the claim; do not let a GPU fault masquerade as a DB error
+    if should_park:
+        log.debug("GPU parked (paused=%s phase=%s) — skipping claim", paused, phase)
+    return should_park
+
+
 def _claim_one(conn: psycopg2.extensions.connection) -> dict[str, Any] | None:
     """
     Claim a single pending job in the current transaction without gating, then
@@ -2081,26 +2127,15 @@ def main() -> None:
 
             # Gate the GPU first (CONTRACT §1.4): when paused or phase='analyze'
             # the model parks off the GPU so the eval judge can use the card; when
-            # active again it is restored. The park/unpark only fire on a state
-            # change (the provider tracks parked/loaded state), and only here at
-            # the gate between jobs — never mid-transcription. When parked, skip
-            # the claim entirely: there's no point claiming a job we won't run.
-            paused, _ = _control_values(
-                _read_control_row(conn)
-            )
-            phase = _read_phase(conn)
-            if _should_park(paused, phase):
-                provider.park()
+            # active again it is restored. _gate_gpu applies the park/unpark only
+            # on a state change and only here at the gate between jobs — never
+            # mid-transcription — and isolates any GPU fault from the claim path.
+            # When it returns True the model is parked (or could not be reclaimed):
+            # skip the claim entirely, there's no point claiming a job we won't run.
+            if _gate_gpu(conn, provider):
                 conn.close()
-                log.debug(
-                    "GPU parked (paused=%s phase=%s) — sleeping %ds",
-                    paused,
-                    phase,
-                    POLL_INTERVAL,
-                )
                 _shutdown.wait(POLL_INTERVAL)
                 continue
-            provider.unpark()
 
             job = _claim_job(conn)
         except Exception as exc:
