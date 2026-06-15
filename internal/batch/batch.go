@@ -70,6 +70,12 @@ func (o *Options) normalize() error {
 	if o.BatchSize < 1 {
 		return fmt.Errorf("batch size must be >= 1, got %d", o.BatchSize)
 	}
+	// 0 means "until the queue drains"; a negative value would make the batch
+	// loop's `batchNum <= MaxBatches` guard never enter, silently skipping all
+	// work — reject it as a user mistake rather than no-op.
+	if o.MaxBatches < 0 {
+		return fmt.Errorf("max batches must be >= 0, got %d", o.MaxBatches)
+	}
 	if o.PollInterval <= 0 {
 		o.PollInterval = defaultPollInterval
 	}

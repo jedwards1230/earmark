@@ -360,6 +360,20 @@ func TestRun_RejectsBadBatchSize(t *testing.T) {
 	}
 }
 
+// TestRun_RejectsNegativeMaxBatches: a negative --max-batches must error rather
+// than silently skip all work (the loop guard would never enter).
+func TestRun_RejectsNegativeMaxBatches(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle, &db.QueueStats{Pending: 5})
+	o := fastOpts()
+	o.MaxBatches = -1
+	if err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o); err == nil {
+		t.Fatal("expected an error for negative max-batches")
+	}
+	if len(store.transitions()) != 0 {
+		t.Error("no phase writes should happen when options are invalid")
+	}
+}
+
 // TestTranscribeDone covers the batch-complete predicate.
 func TestTranscribeDone(t *testing.T) {
 	cases := []struct {
