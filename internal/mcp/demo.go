@@ -340,8 +340,8 @@ func (d demoDB) GetFindingsSummary(context.Context) (*db.FindingsSummary, error)
 			{IssueType: "misheard_proper_noun", Count: 15},
 			{IssueType: "number_artifact", Count: 9},
 			{IssueType: "homophone", Count: 7},
-			{IssueType: "run_on", Count: 4},
-			{IssueType: "other", Count: 2},
+			{IssueType: "misheard_word", Count: 4},
+			{IssueType: "repeated_text", Count: 2},
 		},
 		ByBook: []db.BookFindings{
 			{BookDir: "/books/Author One/A Long Title", FilePath: "/books/Author One/A Long Title/01.m4b",
