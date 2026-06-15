@@ -128,6 +128,13 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	}
 	if phase == db.PhaseAnalyze {
 		p("Resuming: found phase=analyze; finishing the in-flight analyze batch first.\n")
+		// Clear any residual run budget left by a crash mid-Phase-A. In the
+		// analyze phase the runner is off-GPU so a lingering run_limit is inert,
+		// but clearing it now keeps the resumed state clean and matches the
+		// transcribe phase's invariant that the budget is coordinator-owned.
+		if err := store.SetRunLimit(ctx, nil, actor); err != nil {
+			return fmt.Errorf("clear run limit (resume): %w", err)
+		}
 		// Re-assert analyze so the resume path and a normal Phase B share one
 		// setter call each (keeps the transition log clean) before the wait loop.
 		if err := store.SetPipelinePhase(ctx, db.PhaseAnalyze, actor); err != nil {
@@ -137,6 +144,10 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 			return err
 		}
 	}
+
+	// arbiterWarned guards the one-time "arbiter unavailable" notice across all
+	// batches in this run (passed by pointer into yieldToGames).
+	arbiterWarned := false
 
 	for batchNum := 1; o.MaxBatches == 0 || batchNum <= o.MaxBatches; batchNum++ {
 		// Is there anything left to transcribe?
@@ -152,7 +163,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 		p("=== Batch %d (pending=%d) ===\n", batchNum, st.Pending)
 
 		// 1. Yield to games before any GPU work.
-		if err := yieldToGames(ctx, p, arb, o.ArbiterPoll); err != nil {
+		if err := yieldToGames(ctx, p, arb, o.ArbiterPoll, &arbiterWarned); err != nil {
 			return err
 		}
 
@@ -174,12 +185,24 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 // yieldToGames blocks while gpu-arbiter reports the GPU is busy with a game
 // (gaming or evicting; see arbiter.go), polling every poll interval. An
 // unreachable/unset arbiter (ok=false) returns immediately — the coordinator
-// proceeds, degrading gracefully.
-func yieldToGames(ctx context.Context, p func(string, ...any), arb Arbiter, poll time.Duration) error {
+// proceeds, degrading gracefully. arbiterWarned (owned by Run) ensures the
+// "arbiter unavailable" notice is logged at most once per run, not per batch.
+func yieldToGames(ctx context.Context, p func(string, ...any), arb Arbiter, poll time.Duration, arbiterWarned *bool) error {
 	announced := false
 	for {
 		busy, ok := arb.Gaming(ctx)
-		if !ok || !busy {
+		if !ok {
+			// Unconfigured or unreachable arbiter: degrade gracefully (proceed
+			// without game-yield). Log once for the whole run (the flag is owned
+			// by Run) so the operator knows GPU contention isn't being guarded
+			// against, without spamming every batch's yield check.
+			if !*arbiterWarned {
+				p("gpu-arbiter unreachable or unconfigured — proceeding without game-yield (GPU contention not guarded).\n")
+				*arbiterWarned = true
+			}
+			return nil
+		}
+		if !busy {
 			if announced {
 				p("gpu-arbiter GPU free again — resuming.\n")
 			}
@@ -224,16 +247,19 @@ func runTranscribePhase(ctx context.Context, p func(string, ...any), store Phase
 	}
 }
 
-// transcribeDone reports whether a transcribe batch has finished: nothing is
-// actively being claimed, AND either the run budget is exhausted (the runner
-// claimed its N and stopped) or there is no pending work left. Requiring
-// Claimed==0 prevents declaring "done" while a job is still mid-transcription.
+// transcribeDone reports whether a transcribe batch has finished. The predicate
+// is: nothing is actively claimed AND (the run budget is spent OR there is no
+// pending work left).
+//
+//   - nothingClaimed: requiring Claimed==0 prevents declaring "done" while a job
+//     is still mid-transcription.
+//   - runBudgetSpent: run_limit reached 0 — the runner claimed its N and stopped.
+//   - queueEmpty: no pending jobs remain — the batch drained the queue early.
 func transcribeDone(st *db.QueueStats) bool {
-	if st.Claimed > 0 {
-		return false
-	}
-	budgetExhausted := st.RunLimit != nil && *st.RunLimit == 0
-	return budgetExhausted || st.Pending == 0
+	nothingClaimed := st.Claimed == 0
+	runBudgetSpent := st.RunLimit != nil && *st.RunLimit == 0
+	queueEmpty := st.Pending == 0
+	return nothingClaimed && (runBudgetSpent || queueEmpty)
 }
 
 // runAnalyzePhase sets phase=analyze (the runner parks its model, freeing the

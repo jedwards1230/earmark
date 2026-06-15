@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,13 @@ type fakeStore struct {
 	phaseLog  []string // every phase passed to SetPipelinePhase, in order
 	statuses  []*db.QueueStats
 	statusIdx int
+
+	// runLimitAtFirstStatus captures f.runLimit at the moment of the first
+	// GetServiceStatus call, so a test can assert the budget was already cleared
+	// by the time the coordinator started polling (e.g. the resume path clears it
+	// before the analyze wait loop). hadFirstStatus marks it as populated.
+	runLimitAtFirstStatus *int
+	hadFirstStatus        bool
 
 	// optional error injections
 	setPhaseErr    error
@@ -65,6 +73,10 @@ func (f *fakeStore) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statusCalls++
+	if !f.hadFirstStatus {
+		f.hadFirstStatus = true
+		f.runLimitAtFirstStatus = f.runLimit
+	}
 	if f.getStatusErr != nil && f.statusCalls >= f.getStatusAfter {
 		return nil, f.getStatusErr
 	}
@@ -218,6 +230,35 @@ func TestRun_UnreachableArbiterDoesNotWait(t *testing.T) {
 	}
 }
 
+// TestRun_UnreachableArbiterLogsOnce: an unreachable/unconfigured arbiter must
+// log a degrade notice, exactly once, even across multiple batches (no per-batch
+// spam).
+func TestRun_UnreachableArbiterLogsOnce(t *testing.T) {
+	// Two batches' worth of scripted status: pending → transcribed → (next batch)
+	// pending → transcribed → drained → no pending (stop).
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 4},                               // pre-batch 1
+		&db.QueueStats{Pending: 2, Claimed: 0, RunLimit: ptr(0)}, // batch 1 transcribe done
+		&db.QueueStats{Pending: 2, Claimed: 0, EmbedBacklog: 0},  // batch 1 analyze drained
+		&db.QueueStats{Pending: 2},                               // pre-batch 2
+		&db.QueueStats{Pending: 0, Claimed: 0, RunLimit: ptr(0)}, // batch 2 transcribe done
+		&db.QueueStats{Pending: 0, Claimed: 0, EmbedBacklog: 0},  // batch 2 analyze drained
+		&db.QueueStats{Pending: 0, Claimed: 0},                   // pre-batch 3 → stop
+	)
+	arb := &fakeArbiter{results: []arbiterResult{{gaming: false, ok: false}}} // always unreachable
+
+	var out strings.Builder
+	o := fastOpts()
+	o.MaxBatches = 0 // run until the queue drains (two batches above)
+	if err := Run(context.Background(), &out, store, arb, o); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	const notice = "gpu-arbiter unreachable or unconfigured"
+	if n := strings.Count(out.String(), notice); n != 1 {
+		t.Errorf("arbiter-unavailable notice should be logged exactly once across batches, got %d:\n%s", n, out.String())
+	}
+}
+
 // TestRun_RestoresIdleOnError: a status read error mid-batch must still leave
 // the pipeline restored to idle (the deferred cleanup runs on the error path).
 func TestRun_RestoresIdleOnError(t *testing.T) {
@@ -265,7 +306,9 @@ func TestRun_RestoresIdleOnCancel(t *testing.T) {
 }
 
 // TestRun_ResumeFromAnalyzeFinishesPhaseBFirst: starting with phase=analyze, the
-// coordinator drains the in-flight analyze batch before any transcribe phase.
+// coordinator drains the in-flight analyze batch before any transcribe phase,
+// and clears any residual run budget left by a crashed mid-Phase-A run before
+// it starts polling Phase B.
 func TestRun_ResumeFromAnalyzeFinishesPhaseBFirst(t *testing.T) {
 	store := newFakeStore(db.PhaseAnalyze,
 		// resume analyze poll: backlog still draining, then drained
@@ -274,6 +317,8 @@ func TestRun_ResumeFromAnalyzeFinishesPhaseBFirst(t *testing.T) {
 		// pre-batch check after resume: no pending work → stop
 		&db.QueueStats{Pending: 0, Claimed: 0},
 	)
+	// Simulate a residual run budget from a crash mid-Phase-A.
+	store.runLimit = ptr(7)
 
 	if err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, fastOpts()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -290,6 +335,15 @@ func TestRun_ResumeFromAnalyzeFinishesPhaseBFirst(t *testing.T) {
 	}
 	if got[len(got)-1] != db.PhaseIdle {
 		t.Errorf("idle must be restored on exit; transitions=%v", got)
+	}
+	// The residual run budget must have been cleared on the resume path, BEFORE
+	// the analyze wait loop started polling (i.e. by the first GetServiceStatus).
+	if !store.hadFirstStatus {
+		t.Fatal("expected at least one status poll")
+	}
+	if store.runLimitAtFirstStatus != nil {
+		t.Errorf("resume must clear the residual run budget before polling Phase B; run_limit at first status = %v",
+			*store.runLimitAtFirstStatus)
 	}
 }
 
