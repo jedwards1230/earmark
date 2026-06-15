@@ -296,6 +296,50 @@ The Go service exposes these write shapes (see §2.7 Control API):
 resume/run set `run_limit` **before** flipping `paused=false`, so the runner is
 never momentarily unbounded.
 
+#### GPU phase control + self-parking — `runner_control.phase`
+
+To let a single GPU host **time-share** between the ASR model and a (future)
+eval-judge LLM, `runner_control` carries an optional `phase` column. It is
+**additive** — the runner reads it defensively, so a deployment whose DB does not
+yet have the column (or row) behaves exactly as before. The runner never creates
+or writes `phase`; a future coordinator/Go service owns those writes.
+
+```sql
+-- additive column (not yet created by the runner; a separate migration adds it):
+ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS phase TEXT;
+```
+
+Phase values **as the runner interprets them**:
+
+| `phase` | Meaning to the runner | GPU model |
+|---------|-----------------------|-----------|
+| `NULL` (absent column/row too) | normal, continuous operation (today's behavior) | **on GPU** |
+| `'idle'` | no special directive | **on GPU** |
+| `'transcribe'` | ASR phase — the runner may use the GPU | **on GPU** |
+| `'analyze'` | judge phase — the runner must step off the GPU | **parked to CPU** |
+| any other value | unrecognised → fail safe (treat as "do not use the GPU") | **parked to CPU** |
+
+**Self-parking rule.** Between jobs (never mid-transcription) the runner decides:
+
+```
+park the model OFF the GPU  iff  paused  OR  phase NOT IN (NULL, 'idle', 'transcribe')
+```
+
+When parking, the runner moves its model to host RAM (`asr_model.cpu()` +
+`torch.cuda.empty_cache()`) — parking weights in RAM in seconds, **not** a
+from-disk reload — so the freed VRAM is returned to the driver for the judge.
+When it becomes active again (not paused **and** phase in NULL/`idle`/`transcribe`)
+it restores the model (`asr_model.cuda()`). The transition fires **only on a state
+change** (the runner tracks its parked/loaded state), so a steady-state poll does
+no redundant `.cpu()`/`.cuda()`. While parked, the runner skips claiming entirely.
+A restart while parked simply loads fresh on startup (no special recovery). A
+missing `phase` column/row, or any read error, degrades to `'idle'` (model stays
+on the GPU).
+
+This is independent of `paused`/`run_limit`: `paused=true` always parks (and
+declines claims); `phase` adds the `'analyze'` axis for GPU hand-off without
+pausing the broader pipeline semantics.
+
 #### Operator requeue (out-of-band, `earmark requeue`)
 
 In addition to the runner/service transitions above, an operator may move a job
