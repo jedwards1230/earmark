@@ -183,11 +183,14 @@ func (s *MCPServer) renderFindingsFragment(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// The worklist rows are advisory (read-only eval output), not load-bearing
+	// for this page. Match the book page (renderBookFragmentWithNotice): a
+	// ListFindings error is logged and the worklist degrades to its empty state
+	// rather than failing the whole page with a 503.
 	findings, err := s.db.ListFindings(r.Context(), "", findingsWorklistLimit)
 	if err != nil {
 		s.logger.Error("ListFindings error", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		findings = nil
 	}
 	data := findingsData{
 		Summary:        summary,
