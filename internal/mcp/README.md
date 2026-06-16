@@ -1,7 +1,11 @@
 # MCP Server
 
 Streamable-HTTP MCP server for earmark. Serves 5 read-only tools on `:8081/mcp`
-plus a status dashboard at `/`.
+plus a status dashboard at `/`. The dashboard's `/findings` page and per-book
+`/book` section render individual finding rows (read-only eval worklist, CONTRACT
+§2.15) — confidence, issue type, `original → correction`, sorted highest-first —
+with links into the book each finding belongs to; the Book page also offers a
+token-gated scoped clear (`/actions/findings-clear?dir=…`).
 
 ## Files
 

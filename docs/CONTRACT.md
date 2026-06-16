@@ -1214,6 +1214,17 @@ This is the one place the findings subsystem `DELETE`s — and it deletes ONLY
 `transcript_findings`, never the transcript tables, so the read-only-transcripts
 contract holds and a clear is recoverable by re-running eval.
 
+#### Dashboard surfaces (read-only)
+
+The `/findings` page and the per-book Book section both render the **individual
+finding rows** (the triage worklist: confidence, issue type, `original →
+suggested correction`, and where), not just the per-book roll-up counts — sorted
+by confidence DESC. Rows link to the **book** they belong to (`/book?dir=…`); the
+deeper track-segment jump is deferred. The Book page's per-book section also
+exposes the scoped clear (`POST /actions/findings-clear?dir=…`, token-gated,
+re-renders the Book fragment). All of this is read-only/advisory surfacing — no
+new route, env var, or column; informational only.
+
 #### Two payoffs
 
 1. **Quality observability** — error counts/types and a confidence spread per

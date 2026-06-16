@@ -428,6 +428,93 @@ func TestGetBookTracksPopulatesDetail(t *testing.T) {
 	}
 }
 
+// findingRowColumns are the 11 columns SELECTed by ListFindings (global + scoped),
+// in the exact order listFindings scans them. Co-locating with the test makes a
+// SELECT/Scan reorder regression obvious.
+var findingRowColumns = []string{
+	"id", "file_path", "book_dir", "job_id",
+	"chunk_index", "start_sec", "end_sec", "original_text",
+	"issue_type", "suggested_correction", "confidence",
+}
+
+// TestListFindingsScopedSQL drives listFindings at execution level with pgxmock
+// for both the global and scoped paths: it asserts each path uses the matching
+// SQL byte-for-byte (QueryMatcherEqual), that the scoped path binds (limit, prefix)
+// with the LIKE-escaped "<dir>/%" prefix, and that all 11 columns scan — including
+// a NULL job_id (LEFT JOIN miss → nil) and a NULL suggested_correction.
+func TestListFindingsScopedSQL(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	job := "job-uuid-1"
+	ci := 4
+	corr := "Arecibo"
+
+	// Global path: limit only ($1).
+	globalRows := pgxmock.NewRows(findingRowColumns).
+		AddRow("f1", "/books/audio-libation/A/B/01.m4b", "/books/audio-libation/A/B",
+			&job, &ci, 73.5, 81.0, "auto sebo", "misheard_proper_noun", &corr, 0.92).
+		// Second row: NULL job_id (no matching job) + NULL suggested_correction.
+		AddRow("f2", "/books/audio-libation/A/B/02.m4b", "/books/audio-libation/A/B",
+			nil, nil, 12.0, 15.0, "free hundred", "number_artifact", nil, 0.71)
+	mock.ExpectQuery(listFindingsSQL).WithArgs(100).WillReturnRows(globalRows)
+
+	got, err := db.listFindings(context.Background(), mock, "", 100)
+	if err != nil {
+		t.Fatalf("listFindings (global): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("global: got %d rows, want 2", len(got))
+	}
+	if got[0].JobID == nil || *got[0].JobID != job {
+		t.Errorf("row0 JobID = %v, want %q", got[0].JobID, job)
+	}
+	if got[0].ChunkIndex == nil || *got[0].ChunkIndex != ci {
+		t.Errorf("row0 ChunkIndex = %v, want %d", got[0].ChunkIndex, ci)
+	}
+	if got[0].SuggestedCorrection == nil || *got[0].SuggestedCorrection != corr {
+		t.Errorf("row0 SuggestedCorrection = %v, want %q", got[0].SuggestedCorrection, corr)
+	}
+	if got[0].Confidence != 0.92 || got[0].IssueType != "misheard_proper_noun" {
+		t.Errorf("row0 = %+v, unexpected confidence/issue", got[0])
+	}
+	if got[1].JobID != nil {
+		t.Errorf("row1 JobID = %v, want nil (LEFT JOIN miss → nil)", got[1].JobID)
+	}
+	if got[1].SuggestedCorrection != nil {
+		t.Errorf("row1 SuggestedCorrection = %v, want nil (NULL)", got[1].SuggestedCorrection)
+	}
+	if got[1].ChunkIndex != nil {
+		t.Errorf("row1 ChunkIndex = %v, want nil (NULL)", got[1].ChunkIndex)
+	}
+
+	// Scoped path: binds (limit, "<dir>/%"); the prefix is LIKE-escaped exactly as
+	// textSearchInBook / the scoped clear do, so the three select the same set.
+	dir := "/books/audio-libation/A/B"
+	wantPrefix := likePrefix(dir) + "/%"
+	scopedRows := pgxmock.NewRows(findingRowColumns).
+		AddRow("f1", dir+"/01.m4b", dir, &job, &ci, 73.5, 81.0, "auto sebo",
+			"misheard_proper_noun", &corr, 0.92)
+	mock.ExpectQuery(listFindingsInBookSQL).WithArgs(50, wantPrefix).WillReturnRows(scopedRows)
+
+	scoped, err := db.listFindings(context.Background(), mock, dir, 50)
+	if err != nil {
+		t.Fatalf("listFindings (scoped): %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].BookDir != dir {
+		t.Fatalf("scoped: got %+v, want one row in %q", scoped, dir)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // bookSummaryColumns are the 12 columns SELECTed by GetBookSummaries, in scan
 // order. The dynamic HAVING clause doesn't change the SELECT list.
 var bookSummaryColumns = []string{

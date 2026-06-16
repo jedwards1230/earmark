@@ -285,6 +285,160 @@ func TestBookFragmentRendersDetailAndEmDash(t *testing.T) {
 	}
 }
 
+// TestBookFragmentRendersFindings renders bookFragmentTmpl with a per-book
+// findings summary + two individual rows and asserts the Findings section shows
+// the confidence %, issue type, the "original → corrected" correction, the ⚑
+// per-track flag cell, and the #book-findings anchor. It also asserts the em-dash
+// empty-state when a book has no findings, mirroring
+// TestBookFragmentRendersDetailAndEmDash.
+func TestBookFragmentRendersFindings(t *testing.T) {
+	dir := "/books/audio-libation/A/B"
+	job := "job-1"
+	ci := 4
+	corr1 := "Arecibo"
+	summary := &db.BookFindings{
+		BookDir: dir, FilePath: dir + "/01.m4b", Count: 2,
+		MeanConfidence: 0.73, TopIssueType: "misheard_proper_noun",
+	}
+	findings := []db.FindingRow{
+		{ID: "f1", FilePath: dir + "/01.m4b", BookDir: dir, JobID: &job, ChunkIndex: &ci,
+			StartSec: 73.5, EndSec: 81.0, OriginalText: "auto sebo",
+			IssueType: "misheard_proper_noun", SuggestedCorrection: &corr1, Confidence: 0.92},
+		{ID: "f2", FilePath: dir + "/01.m4b", BookDir: dir,
+			StartSec: 612.0, EndSec: 618.4, OriginalText: "free hundred",
+			IssueType: "number_artifact", SuggestedCorrection: nil, Confidence: 0.71},
+	}
+	d := bookData{
+		Dir: dir, DirQuery: "x", Title: "B", Author: "A", Total: 1, Done: 1,
+		Tracks: []db.RecentJob{
+			{ID: "t1", FilePath: dir + "/01.m4b", Status: "done", UpdatedAt: time.Now()},
+		},
+		FindingsSummary: summary,
+		Findings:        findings,
+		FindingsByTrack: map[string]int{dir + "/01.m4b": 2},
+		ControlEnabled:  false, // clear-book-findings button must NOT render
+	}
+	var buf bytes.Buffer
+	if err := bookFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		`id="book-findings"`,    // findings section anchor
+		"2 suspected errors",    // summary count line
+		"73%",                   // mean conf 0.73 → 73%
+		"misheard_proper_noun",  // top issue + finding issue type
+		"92%",                   // finding confidence
+		"auto sebo",             // original span
+		"Arecibo",               // suggested correction
+		"&#9873; 2",             // ⚑ 2 flag cell on the tracks table
+		`href="#book-findings"`, // flag cell links to the findings section
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in book fragment output:\n%s", want, out)
+		}
+	}
+	// f2 has a nil correction → em-dash via strPtr.
+	if !strings.Contains(out, "free hundred &#8594; —") {
+		t.Errorf("expected em-dash empty correction for f2:\n%s", out)
+	}
+	// ControlEnabled is false → no clear-book-findings button.
+	if strings.Contains(out, "clear book findings") {
+		t.Error("clear-book-findings button must not render when ControlEnabled is false")
+	}
+
+	// Empty-state: a book with no findings renders the em-dash/empty notice and no
+	// findings table.
+	dEmpty := bookData{Dir: dir, DirQuery: "x", Title: "B", Author: "A", Total: 1, Done: 1,
+		Tracks: []db.RecentJob{{ID: "t1", FilePath: dir + "/01.m4b", Status: "done", UpdatedAt: time.Now()}}}
+	var bufE bytes.Buffer
+	if err := bookFragmentTmpl.Execute(&bufE, dEmpty); err != nil {
+		t.Fatalf("execute (empty): %v", err)
+	}
+	outE := bufE.String()
+	if !strings.Contains(outE, "No findings recorded for this book") {
+		t.Errorf("expected per-book findings empty-state:\n%s", outE)
+	}
+	if !strings.Contains(outE, "—") {
+		t.Errorf("expected em-dash in empty Flags cell:\n%s", outE)
+	}
+}
+
+// TestFindingsFragmentRendersWorklistAndBookLinks renders findingsFragmentTmpl
+// with a populated summary (per-book roll-up) AND the individual worklist rows,
+// and asserts: the per-book table name is now a `/book?dir=` link (not plain
+// text), the "Findings (worklist)" section renders its rows (confidence, issue,
+// original → correction), and each worklist row links to its book.
+func TestFindingsFragmentRendersWorklistAndBookLinks(t *testing.T) {
+	dir := "/books/Author One/A Long Title"
+	mean := 0.66
+	job := "job-1"
+	corr := "Arecibo"
+	d := findingsData{
+		RenderedAt: "2026-01-01 00:00:00 UTC",
+		Summary: &db.FindingsSummary{
+			TotalFindings: 2, MeanConfidence: &mean, HighConfidence: 1, MediumConfidence: 1,
+			ByBook: []db.BookFindings{
+				{BookDir: dir, FilePath: dir + "/01.m4b", Count: 2, MeanConfidence: 0.66, TopIssueType: "misheard_proper_noun"},
+			},
+		},
+		Findings: []db.FindingRow{
+			{ID: "f1", FilePath: dir + "/01.m4b", BookDir: dir, JobID: &job, StartSec: 73.5, EndSec: 81.0,
+				OriginalText: "auto sebo", IssueType: "misheard_proper_noun", SuggestedCorrection: &corr, Confidence: 0.92},
+		},
+	}
+	var buf bytes.Buffer
+	if err := findingsFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		`href="/book?dir=`,          // per-book table name is a link now
+		"Findings (worklist)",       // worklist section title
+		"auto sebo &#8594; Arecibo", // original → correction
+		"92%",                       // worklist row confidence
+		"misheard_proper_noun",      // issue type
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in findings fragment output:\n%s", want, out)
+		}
+	}
+}
+
+// TestBookFragmentFindingsXSSEscaping verifies html/template auto-escapes the
+// model-generated finding text (original span, suggested correction, issue type)
+// in the book fragment — findings are LLM output, so this is the same XSS guard as
+// TestTrackFragmentXSSEscaping applies to transcript segments.
+func TestBookFragmentFindingsXSSEscaping(t *testing.T) {
+	dir := "/books/A/B"
+	malicious := `<script>alert(1)</script>`
+	maliciousCorr := `"><img src=x onerror=alert(1)>`
+	corr := maliciousCorr
+	d := bookData{
+		Dir: dir, DirQuery: "x", Title: "B", Author: "A", Total: 1, Done: 1,
+		Tracks: []db.RecentJob{{ID: "t1", FilePath: dir + "/01.m4b", Status: "done", UpdatedAt: time.Now()}},
+		Findings: []db.FindingRow{
+			{ID: "f1", FilePath: dir + "/01.m4b", BookDir: dir, StartSec: 1, EndSec: 2,
+				OriginalText: malicious, IssueType: malicious, SuggestedCorrection: &corr, Confidence: 0.5},
+		},
+	}
+	var buf bytes.Buffer
+	if err := bookFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "<script>alert(1)</script>") {
+		t.Error("finding text: raw <script> must not appear — html/template must escape it")
+	}
+	if strings.Contains(out, `"><img src=x onerror=alert(1)>`) {
+		t.Error("finding correction: raw attribute-injection payload must not appear")
+	}
+	if !strings.Contains(out, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Error("expected HTML-escaped finding text in output")
+	}
+}
+
 // TestTrackFragmentRendersDetail renders trackFragmentTmpl for a done track with
 // transcript + chunks and asserts the 3 panels, the timestamped reader (mm:ss),
 // and the chunk list all appear, plus the back-to-book link.

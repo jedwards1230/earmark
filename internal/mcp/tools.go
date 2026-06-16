@@ -67,6 +67,10 @@ type DBInterface interface {
 	// (totals, confidence buckets, issue-type tally, per-book) for the /findings
 	// dashboard page (CONTRACT §2.15).
 	GetFindingsSummary(ctx context.Context) (*db.FindingsSummary, error)
+	// ListFindings returns individual finding rows (the triage worklist) sorted by
+	// confidence DESC, for the /findings worklist and the per-book Book section. An
+	// empty dir returns the whole library; a non-empty dir scopes to one book.
+	ListFindings(ctx context.Context, dir string, limit int) ([]db.FindingRow, error)
 	// ClearFindings deletes recorded findings (advisory eval metadata) and
 	// returns the rows removed, for the /findings "clear findings" button. It
 	// touches ONLY transcript_findings — never transcripts/segments/chunks — so

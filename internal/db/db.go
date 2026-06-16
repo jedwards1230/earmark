@@ -2534,6 +2534,111 @@ func (db *DB) GetFindingsSummary(ctx context.Context) (*FindingsSummary, error) 
 	return s, nil
 }
 
+// FindingRow is one individual finding for the triage worklist (global + per-book).
+// It is the row-level companion to FindingsSummary's roll-up: the /findings page
+// and per-book Book section render these so the operator can read each suspected
+// error (not just per-book counts) and jump to the book it belongs to. JobID is
+// the transcription_jobs.id of the track this finding's file_path belongs to,
+// carried now so a later PR can deep-link to the track reader without a schema or
+// query change; it scans to nil when no job row matches (LEFT JOIN).
+type FindingRow struct {
+	ID                  string
+	FilePath            string // track path
+	BookDir             string // regexp_replace(file_path,'/[^/]+$','')
+	JobID               *string
+	ChunkIndex          *int
+	StartSec            float64
+	EndSec              float64
+	OriginalText        string
+	IssueType           string
+	SuggestedCorrection *string
+	Confidence          float64
+}
+
+// listFindingsSQL / listFindingsInBookSQL are the worklist queries, package-level
+// vars so a test can assert their shape (SELECT-only, scoped vs global). The
+// scoped form adds a single `file_path LIKE $2 ESCAPE '\'` clause; the prefix is
+// built with likePrefix EXACTLY as textSearchInBookSQL and the scoped clear path
+// do, so "show this book's findings" selects the identical set "search this book"
+// and "clear this book's findings" do. The LEFT JOIN to transcription_jobs lets a
+// finding still surface (with JobID nil) if its job row is gone.
+var (
+	listFindingsSQL = `
+		SELECT tf.id, tf.file_path,
+		       regexp_replace(tf.file_path, '/[^/]+$', '') AS book_dir,
+		       j.id AS job_id,
+		       tf.chunk_index, tf.start_sec, tf.end_sec, tf.original_text,
+		       tf.issue_type, tf.suggested_correction, tf.confidence
+		FROM transcript_findings tf
+		LEFT JOIN transcription_jobs j ON j.file_path = tf.file_path
+		ORDER BY tf.confidence DESC, tf.file_path, tf.start_sec
+		LIMIT $1
+	`
+	listFindingsInBookSQL = `
+		SELECT tf.id, tf.file_path,
+		       regexp_replace(tf.file_path, '/[^/]+$', '') AS book_dir,
+		       j.id AS job_id,
+		       tf.chunk_index, tf.start_sec, tf.end_sec, tf.original_text,
+		       tf.issue_type, tf.suggested_correction, tf.confidence
+		FROM transcript_findings tf
+		LEFT JOIN transcription_jobs j ON j.file_path = tf.file_path
+		WHERE tf.file_path LIKE $2 ESCAPE '\'
+		ORDER BY tf.confidence DESC, tf.file_path, tf.start_sec
+		LIMIT $1
+	`
+)
+
+// defaultFindingsListLimit caps a worklist query when the caller passes limit <= 0.
+const defaultFindingsListLimit = 200
+
+// ListFindings returns individual finding rows sorted by confidence DESC (highest
+// first — the triage order). dir == "" returns the whole-library worklist; a
+// non-empty dir scopes to one book (file_path under "<dir>/"). limit caps the rows
+// (<= 0 → defaultFindingsListLimit). Read-only: it never touches any table other
+// than transcript_findings (joined read-only to transcription_jobs for the JobID).
+func (db *DB) ListFindings(ctx context.Context, dir string, limit int) ([]FindingRow, error) {
+	return db.listFindings(ctx, db.pool, dir, limit)
+}
+
+// listFindings is the querier-parameterized core of ListFindings, split out so the
+// query execution + scan path is testable against a mock pool (mirrors
+// getBookTracks / textSearchInBook).
+func (db *DB) listFindings(ctx context.Context, q rowQuerier, dir string, limit int) ([]FindingRow, error) {
+	if limit <= 0 {
+		limit = defaultFindingsListLimit
+	}
+	dir = strings.TrimRight(strings.TrimSpace(dir), "/")
+
+	var rows pgx.Rows
+	var err error
+	if dir == "" {
+		rows, err = q.Query(ctx, listFindingsSQL, limit)
+	} else {
+		prefix := likePrefix(dir) + "/%"
+		rows, err = q.Query(ctx, listFindingsInBookSQL, limit, prefix)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list findings query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []FindingRow
+	for rows.Next() {
+		var f FindingRow
+		if err := rows.Scan(&f.ID, &f.FilePath, &f.BookDir, &f.JobID,
+			&f.ChunkIndex, &f.StartSec, &f.EndSec, &f.OriginalText,
+			&f.IssueType, &f.SuggestedCorrection, &f.Confidence,
+		); err != nil {
+			return nil, fmt.Errorf("scan finding row: %w", err)
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (list findings): %w", err)
+	}
+	return out, nil
+}
+
 // ─── Checksum helper ─────────────────────────────────────────────────────────
 
 // ComputeFileChecksum returns the SHA-256 hex digest of a file.

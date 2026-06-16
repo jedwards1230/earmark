@@ -155,6 +155,14 @@ func (m *MockDBInterface) InsertFindings(context.Context, []db.Finding) error { 
 
 func (m *MockDBInterface) ClearFindings(context.Context, string) (int64, error) { return 0, nil }
 
+func (m *MockDBInterface) ListFindings(ctx context.Context, dir string, limit int) ([]db.FindingRow, error) {
+	if !m.hasExpect("ListFindings") {
+		return nil, nil
+	}
+	args := m.Called(ctx, dir, limit)
+	return args.Get(0).([]db.FindingRow), args.Error(1)
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string
