@@ -143,6 +143,15 @@ var tmplFuncs = template.FuncMap{
 	},
 	// sub subtracts b from a (small arithmetic for the "N remaining" reader label).
 	"sub": func(a, b int) int { return a - b },
+	// pct renders an integer percentage (done/total) for a progress-bar width,
+	// guarding division by zero (total == 0 → 0). Mirrors the handler's DonePct
+	// computation so the pipeline-panel bars match the library list's progress bar.
+	"pct": func(done, total int) int {
+		if total <= 0 {
+			return 0
+		}
+		return done * 100 / total
+	},
 	// confPct renders a nullable mean word-confidence (0–1) as a percentage, or an
 	// em dash when the backend emitted no scores (NULL). Used by the Servers table.
 	"confPct": func(c *float64) string {
@@ -393,6 +402,7 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
     <th title="total audio duration across done tracks">Duration</th>
     <th title="total transcript words across done tracks">Words</th>
     <th title="total embedded chunks across done tracks">Chunks</th>
+    <th title="suspected-error findings recorded for this book (read-only eval)">Findings</th>
     <th>Breakdown</th><th>Updated</th><th></th></tr></thead>
   <tbody>
   {{range .Books}}
@@ -408,6 +418,7 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
       <td class="time-muted">{{durTime .DurationSeconds}}</td>
       <td class="time-muted">{{commafyPtr .WordCount}}</td>
       <td class="time-muted">{{commafyPtr .EmbedChunkCount}}</td>
+      <td class="time-muted">{{if gt .FindingCount 0}}<a class="findings-link" href="/book?dir={{.Dir}}#book-findings" onclick="event.stopPropagation()" title="{{.FindingCount}} suspected-error finding(s)">&#9873; {{commafy .FindingCount}}</a>{{else}}—{{end}}</td>
       <td class="mini-badges">
         {{if gt .Pending 0}}<span class="badge pending">{{commafy .Pending}} pend</span>{{end}}
         {{if gt .Claimed 0}}<span class="badge claimed">{{commafy .Claimed}} transcribing</span>{{end}}
@@ -457,6 +468,36 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
     {{end}}
   </div>
   {{if .EvalNotice}}<div class="eval-notice" role="status">{{.EvalNotice}}</div>{{end}}
+</div>
+
+<div class="pipeline-panel">
+  <div class="panel-title">Pipeline</div>
+  <div class="pipeline-row">
+    <span class="pipeline-label">Transcribe</span>
+    <div class="progress" title="{{commafy .Done}}/{{commafy .Total}} tracks transcribed">
+      <div class="progress-bar{{if gt .Failed 0}} has-failed{{end}}" style="width:{{pct .Done .Total}}%"></div>
+    </div>
+    <span class="progress-text">{{commafy .Done}}/{{commafy .Total}}</span>
+  </div>
+  <div class="pipeline-row">
+    <span class="pipeline-label">Embed</span>
+    {{if gt .EmbedTotal 0}}
+    <div class="progress" title="{{commafy .EmbedDone}}/{{commafy .EmbedTotal}} transcribed tracks embedded">
+      <div class="progress-bar" style="width:{{pct .EmbedDone .EmbedTotal}}%"></div>
+    </div>
+    <span class="progress-text">{{commafy .EmbedDone}}/{{commafy .EmbedTotal}}</span>
+    {{else}}
+    <span class="progress-text" title="no transcribed tracks to embed yet">—</span>
+    {{end}}
+  </div>
+  <div class="pipeline-row">
+    <span class="pipeline-label">Judge</span>
+    {{if gt .FindingsCount 0}}
+    <a class="judge-chip" href="#book-findings" title="jump to this book's findings">&#9873; {{commafy .FindingsCount}} finding{{if ne .FindingsCount 1}}s{{end}}</a>
+    {{else}}
+    <span class="judge-chip judge-clean" title="no suspected-error findings recorded; the eval judge records no &quot;evaluated&quot; marker, so this is not a claim that the book was judged clean">no findings yet</span>
+    {{end}}
+  </div>
 </div>
 
 <form class="lib-search" hx-post="/search/book?dir={{.DirQuery}}" hx-target="#book-search-results" hx-swap="innerHTML">
@@ -740,6 +781,11 @@ type bookRow struct {
 	DurationSeconds *float64
 	WordCount       *int
 	EmbedChunkCount *int
+
+	// FindingCount is this book's recorded findings count (the ⚑ column), looked
+	// up from the one-shot GetFindingsCountByBook aggregate by the book's Dir; 0
+	// when the book has no findings.
+	FindingCount int
 }
 
 type libraryData struct {
@@ -787,6 +833,21 @@ type bookData struct {
 	// FindingsByTrack maps a track file_path → its finding count, for the ⚑ N cell
 	// on the per-book Tracks table (built from Findings — no extra query).
 	FindingsByTrack map[string]int
+
+	// Pipeline panel (the three honest pipeline elements above the tracks table).
+	// Transcribe and Embed are real progress bars derived from the per-track list;
+	// Judge is an honest status/count, not a bar — the schema has no "evaluated"
+	// marker, so a judged-clean book is indistinguishable from a never-judged one.
+	//
+	//   - Transcribe: TranscribeDone/Total (== Done/Total; tracks status=="done").
+	//   - Embed:      EmbedDone/EmbedTotal, where EmbedTotal == count(done tracks)
+	//                 and EmbedDone == count(done tracks with EmbedChunkCount set).
+	//                 When EmbedTotal == 0 (no done tracks) the bar is omitted (—).
+	//   - Judge:      FindingsCount findings (chip). 0 → "no findings yet" (NOT a
+	//                 claim of "evaluated" — we cannot know).
+	EmbedDone     int
+	EmbedTotal    int
+	FindingsCount int
 }
 
 type failedData struct {
@@ -1169,6 +1230,16 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One whole-library findings-count aggregate, keyed by book dir, so the ⚑
+	// column on each (paged) row is a map lookup rather than an N+1 per row. A
+	// findings error must not break the library list, so it's logged and the
+	// column just renders 0 (em dash) everywhere.
+	findingsByBook, err := s.db.GetFindingsCountByBook(r.Context())
+	if err != nil {
+		s.logger.Error("GetFindingsCountByBook error", "error", err)
+		findingsByBook = nil
+	}
+
 	rows := make([]bookRow, 0, len(books))
 	for _, b := range books {
 		bookMeta, _ := s.meta.Lookup(r.Context(), b.SamplePath, b.SamplePath)
@@ -1182,6 +1253,7 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 			Total: b.Total, Pending: b.Pending, Claimed: b.Claimed, Done: b.Done, Failed: b.Failed,
 			LastUpdated:     b.LastUpdated,
 			DurationSeconds: b.DurationSeconds, WordCount: b.WordCount, EmbedChunkCount: b.EmbedChunkCount,
+			FindingCount: findingsByBook[b.Dir],
 		})
 	}
 
@@ -1237,6 +1309,14 @@ func (s *MCPServer) renderBookFragmentWithNotice(w http.ResponseWriter, r *http.
 			d.Claimed++
 		case "done":
 			d.Done++
+			// Embed progress is measured over done tracks only: a track is embedded
+			// once its run_metrics.embed_chunk_count is set (non-nil). EmbedTotal ==
+			// done-track count so the bar reads "of the transcribed tracks, how many
+			// are embedded" — never a fake fraction against pending/failed tracks.
+			d.EmbedTotal++
+			if t.EmbedChunkCount != nil {
+				d.EmbedDone++
+			}
 		case "failed":
 			d.Failed++
 		}
@@ -1273,6 +1353,15 @@ func (s *MCPServer) renderBookFragmentWithNotice(w http.ResponseWriter, r *http.
 				break
 			}
 		}
+	}
+	// Judge element count: prefer the roll-up Count (whole-book total) over
+	// len(Findings) (capped at perBookFindingsLimit), falling back to the worklist
+	// length when no roll-up entry exists. This is a status/count, not a bar — see
+	// the bookData pipeline-panel comment for why a judge % is not derivable.
+	if d.FindingsSummary != nil {
+		d.FindingsCount = d.FindingsSummary.Count
+	} else {
+		d.FindingsCount = len(d.Findings)
 	}
 	d.ControlEnabled = s.controlToken != ""
 

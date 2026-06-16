@@ -163,6 +163,14 @@ func (m *MockDBInterface) ListFindings(ctx context.Context, dir string, limit in
 	return args.Get(0).([]db.FindingRow), args.Error(1)
 }
 
+func (m *MockDBInterface) GetFindingsCountByBook(ctx context.Context) (map[string]int, error) {
+	if !m.hasExpect("GetFindingsCountByBook") {
+		return nil, nil
+	}
+	args := m.Called(ctx)
+	return args.Get(0).(map[string]int), args.Error(1)
+}
+
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string

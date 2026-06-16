@@ -2639,6 +2639,52 @@ func (db *DB) listFindings(ctx context.Context, q rowQuerier, dir string, limit 
 	return out, nil
 }
 
+// findingsCountByBookSQL is the whole-library findings-count aggregate, keyed by
+// book directory exactly as GetFindingsSummary's per_book CTE — one GROUP BY over
+// transcript_findings rather than one query per book row (the library list is
+// paged, so a per-row count would be N+1). Package-level so a test can assert the
+// SQL shape, mirroring listFindingsSQL.
+var findingsCountByBookSQL = `
+	SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir, COUNT(*)
+	FROM transcript_findings
+	GROUP BY book_dir
+`
+
+// GetFindingsCountByBook returns the number of recorded findings keyed by book
+// directory (dirname of file_path), for the ⚑ findings-count column on the
+// library list. It runs ONE aggregate query for the whole library so the paged
+// list can look up each row's count by its Dir without an N+1. Read-only: it
+// touches only transcript_findings. The map is empty (not nil-erroring) on a
+// fresh install.
+func (db *DB) GetFindingsCountByBook(ctx context.Context) (map[string]int, error) {
+	return db.getFindingsCountByBook(ctx, db.pool)
+}
+
+// getFindingsCountByBook is the querier-parameterized core of
+// GetFindingsCountByBook, split out so the query + scan path is testable against
+// a mock pool (mirrors listFindings / getBookTracks).
+func (db *DB) getFindingsCountByBook(ctx context.Context, q rowQuerier) (map[string]int, error) {
+	rows, err := q.Query(ctx, findingsCountByBookSQL)
+	if err != nil {
+		return nil, fmt.Errorf("findings count by book query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]int)
+	for rows.Next() {
+		var dir string
+		var n int
+		if err := rows.Scan(&dir, &n); err != nil {
+			return nil, fmt.Errorf("scan findings count: %w", err)
+		}
+		out[dir] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (findings count by book): %w", err)
+	}
+	return out, nil
+}
+
 // ─── Checksum helper ─────────────────────────────────────────────────────────
 
 // ComputeFileChecksum returns the SHA-256 hex digest of a file.

@@ -435,6 +435,20 @@ func (d demoDB) ListFindings(_ context.Context, dir string, limit int) ([]db.Fin
 	return out, nil
 }
 
+// GetFindingsCountByBook returns the per-book findings counts for the library
+// ⚑ column. The dirs and counts MUST match GetFindingsSummary.ByBook above so the
+// library column agrees with the per-book roll-up (PHM 21, Dune 16); books with
+// no findings are simply absent (looked up → 0). Empty on a fresh install.
+func (d demoDB) GetFindingsCountByBook(context.Context) (map[string]int, error) {
+	if d.scenario == "empty" {
+		return map[string]int{}, nil
+	}
+	return map[string]int{
+		"/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]": 21,
+		"/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]":          16,
+	}, nil
+}
+
 // demoEvalRun builds an eval runner backed by a static fake chat client, so the
 // "run eval" dashboard buttons are exercisable in --demo with no network call
 // (the demo's vLLM endpoint is intentionally offline). It runs the real

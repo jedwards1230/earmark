@@ -7,6 +7,16 @@ plus a status dashboard at `/`. The dashboard's `/findings` page and per-book
 with links into the book each finding belongs to; the Book page also offers a
 token-gated scoped clear (`/actions/findings-clear?dir=…`).
 
+The Book page leads with a **pipeline panel** of three honest elements: a
+**Transcribe** progress bar (done/total tracks), an **Embed** progress bar (of the
+done tracks, how many are embedded — `run_metrics.embed_chunk_count` set; em-dash
+when no tracks are done), and a **Judge** status — `⚑ N findings` or `no findings
+yet`. Judge is deliberately a status/count, **not** a progress bar: the schema
+records no "evaluated" marker, so a judged-clean book is indistinguishable from a
+never-judged one and a percentage would be a lie. The library list carries a
+matching `⚑ N` **Findings** column (one whole-library aggregate, no N+1) linking
+each book to its `#book-findings` section.
+
 ## Files
 
 - `server.go` — server setup and tool registration

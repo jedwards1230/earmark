@@ -515,6 +515,45 @@ func TestListFindingsScopedSQL(t *testing.T) {
 	}
 }
 
+// TestGetFindingsCountByBook drives getFindingsCountByBook against pgxmock,
+// asserting the GROUP BY aggregate SQL byte-for-byte (QueryMatcherEqual) and that
+// the (book_dir, count) rows scan into the keyed map the ⚑ library column reads.
+func TestGetFindingsCountByBook(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows([]string{"book_dir", "count"}).
+		AddRow("/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]", 21).
+		AddRow("/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]", 16)
+	mock.ExpectQuery(findingsCountByBookSQL).WillReturnRows(rows)
+
+	got, err := db.getFindingsCountByBook(context.Background(), mock)
+	if err != nil {
+		t.Fatalf("getFindingsCountByBook: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2: %v", len(got), got)
+	}
+	if got["/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]"] != 21 {
+		t.Errorf("PHM count = %d, want 21", got["/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]"])
+	}
+	if got["/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]"] != 16 {
+		t.Errorf("Dune count = %d, want 16", got["/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]"])
+	}
+	// A book absent from the aggregate looks up to the zero value (em-dash cell).
+	if got["/books/audio-libation/no/findings"] != 0 {
+		t.Errorf("absent book = %d, want 0", got["/books/audio-libation/no/findings"])
+	}
+}
+
 // bookSummaryColumns are the 12 columns SELECTed by GetBookSummaries, in scan
 // order. The dynamic HAVING clause doesn't change the SELECT list.
 var bookSummaryColumns = []string{

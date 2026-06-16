@@ -41,6 +41,8 @@ type SimpleMockDB struct {
 	clearFindingsDir    string // last dir passed to ClearFindings
 	clearFindingsN      int64  // rows ClearFindings reports deleted
 	clearFindingsErr    error  // if set, ClearFindings returns it
+
+	findingsCountByBook map[string]int // GetFindingsCountByBook result (⚑ column)
 }
 
 func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error {
@@ -142,6 +144,10 @@ func (m *SimpleMockDB) GetFindingsSummary(_ context.Context) (*db.FindingsSummar
 
 func (m *SimpleMockDB) ListFindings(_ context.Context, _ string, _ int) ([]db.FindingRow, error) {
 	return nil, nil
+}
+
+func (m *SimpleMockDB) GetFindingsCountByBook(_ context.Context) (map[string]int, error) {
+	return m.findingsCountByBook, nil
 }
 
 func (m *SimpleMockDB) GetEvalChunksForBook(_ context.Context, _ string, _ int) ([]db.EvalChunk, error) {

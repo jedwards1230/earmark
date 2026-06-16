@@ -71,6 +71,10 @@ type DBInterface interface {
 	// confidence DESC, for the /findings worklist and the per-book Book section. An
 	// empty dir returns the whole library; a non-empty dir scopes to one book.
 	ListFindings(ctx context.Context, dir string, limit int) ([]db.FindingRow, error)
+	// GetFindingsCountByBook returns the findings count keyed by book directory,
+	// in one aggregate query, for the ⚑ findings-count column on the library list
+	// (avoids an N+1 over the paged book rows).
+	GetFindingsCountByBook(ctx context.Context) (map[string]int, error)
 	// ClearFindings deletes recorded findings (advisory eval metadata) and
 	// returns the rows removed, for the /findings "clear findings" button. It
 	// touches ONLY transcript_findings — never transcripts/segments/chunks — so
