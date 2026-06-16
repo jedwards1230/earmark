@@ -934,18 +934,48 @@ curl -fsS -X POST https://<host>/api/v1/pipeline/run \
 **Dashboard mutating actions** (`/actions/*`) are the htmx-driven counterpart to
 the JSON API above: each is guarded by the `HX-Request` header (so a cross-origin
 form can't drive it) and re-renders an htmx fragment rather than returning JSON.
-The findings/eval actions additionally **fail closed** (banner, no-op) when
-`CONTROL_API_TOKEN` is unset, matching the JSON API's posture:
+The pipeline-control, findings, and eval actions additionally **fail closed**
+(banner, no-op) when `CONTROL_API_TOKEN` is unset, matching the JSON API's
+posture — and their buttons render as a disabled affordance rather than a button
+that would 503 on click. (`requeue`/`retry-failed`/`book-requeue` stay htmx-only,
+unchanged.):
 
 | Method | Path | Auth | Effect |
 |--------|------|------|--------|
 | `POST` | `/actions/requeue?id=…` | htmx | re-transcribe one job; re-render status fragment |
 | `POST` | `/actions/retry-failed` | htmx | re-transcribe all failed jobs |
 | `POST` | `/actions/book-requeue?dir=…` | htmx | re-transcribe one book |
-| `POST` | `/actions/pause` / `/actions/resume` | htmx | toggle the runner pause flag |
+| `POST` | `/actions/pause` / `/actions/resume` | htmx + token | toggle the runner pause flag (Pipeline page) |
+| `POST` | `/actions/run` (form/query `n≥1`) | htmx + token | arm a bounded run of N claims then auto-pause — sets `run_limit=N` then unpauses (limit before unpause, mirroring `POST /api/v1/pipeline/run`) |
+| `POST` | `/actions/run-clear` | htmx + token | clear the bounded run (`run_limit→NULL`) without touching the pause flag |
 | `POST` | `/actions/eval?dir=…` | htmx + token | run the LLM judge over one book (async, §2.15) |
 | `POST` | `/actions/eval-sample?n=N` | htmx + token | run the LLM judge over an N-chunk sample (async, §2.15) |
 | `POST` | `/actions/findings-clear[?dir=…]` | htmx + token | **delete** recorded findings (advisory metadata only; §2.15), then re-render the `/findings` fragment. Optional `dir` scopes the delete to one book; absent clears all. Touches only `transcript_findings` — transcripts are never modified, so a clear is always recoverable by re-running eval. |
+
+#### 2.12.1 Dashboard page routes (HTML)
+
+The htmx dashboard's page shells and their data fragments. All are GET and
+LAN-only; only reachable under the HTTP transport.
+
+| Path | Purpose |
+|------|---------|
+| `GET /` | **Home — the Library page** (book list with search, status chips, sort + ⚑ has-findings filter). The `/` route is a catch-all, so an unmatched path 404s. |
+| `GET /pipeline` | **Pipeline ops page** — the auto-refreshing status fragment (counts, pipeline state, read-only phase badge, pause + run-budget controls) with the **Failed jobs view folded in** as a second region. |
+| `GET /library` | Same Library page as `/` (kept so existing `?status=…` deep links and the book back-link resolve). |
+| `GET /library/data` | Library fragment. Query: `status`, `q`, `sort` (`recent`\|`title`\|`progress`\|`findings`), `findings` (`1` → only books with recorded findings), `offset`. Sort + has-findings filter are applied **all-in-Go** over the full filtered set. |
+| `GET /status/data` | Status fragment (htmx-refreshed every 3 s): counts, pipeline state, read-only phase badge, and the token-gated pause + run-budget controls. |
+| `GET /failed/data` | Failed-jobs fragment. **No standalone `/failed` page** — it renders inside `/pipeline`. |
+| `GET /servers` · `/servers/data` | Models/Services page + fragment (§2.14). |
+| `GET /findings` · `/findings/data` | Findings page + fragment (§2.15). |
+| `GET /book` · `/book/data` | Per-book detail page + fragment. |
+| `GET /track?id=…[&t=<startSec>]` | Per-track detail page. The optional **`t`** (seconds) is the finding "Where" deep-jump: the reader preloads pages `[0 .. the page containing the segment spanning t]`, marks that segment active, and scrolls to it. |
+| `GET /track/data` · `/track/segments` | Track fragment + reader "load more" page. |
+
+> **The dashboard READS `runner_control.phase` but never WRITES it.** The phase
+> badge on every page (topbar) and on the status fragment is read-only; the
+> `earmark batch` coordinator owns all phase transitions (§1.4). Only `paused`
+> and `run_limit` are dashboard-writable (pause/resume + run-budget actions). A
+> phase read error degrades to `idle` and is logged; it never blocks a page.
 
 ### 2.13 ASR Backend Capability Vocabulary
 

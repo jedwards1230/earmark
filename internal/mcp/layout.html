@@ -45,6 +45,21 @@
   }
   .nav a:hover { color: var(--text); border-color: var(--border); }
   .nav a.active { color: var(--blue); border-color: var(--blue); background: #15233a; }
+  /* secondary nav item: still reachable, visually demoted (Findings) */
+  .nav a.nav-secondary { opacity: 0.72; font-size: 12px; }
+  .nav a.nav-secondary:hover { opacity: 1; }
+  /* topbar phase + paused badge: read-only state surfaced on every page, links
+     to the Pipeline page where the live controls live (D2). */
+  .topbar-phase { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
+  .phase-badge {
+    display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+    padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+    white-space: nowrap;
+  }
+  .phase-badge.phase-idle       { border-color: var(--border); color: var(--muted); }
+  .phase-badge.phase-transcribe { border-color: var(--blue);  color: var(--blue); }
+  .phase-badge.phase-analyze    { border-color: var(--purple); color: var(--purple); }
+  .phase-badge.phase-paused     { border-color: var(--amber); color: var(--amber); }
   main { padding: 24px; max-width: 1400px; }
 
   h1 { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
@@ -96,6 +111,28 @@
   .state-stalled .pipe-label { color: var(--red); }
   .pipe-sub { color: var(--muted); font-size: 12px; }
   .pipe-meta { color: var(--muted); font-size: 11px; margin-top: 4px; width: 100%; }
+  /* honest "disabled" affordance: shown where a control would be when no
+     CONTROL_API_TOKEN is configured, so the page never offers a button that
+     would fail-close (503) on click. */
+  .ctrl-disabled { color: var(--muted); font-size: 12px; font-style: italic; cursor: help; }
+  /* in-status-fragment phase badge sits inline with the state label */
+  .pipe-main .phase-badge { align-self: center; }
+
+  /* ── run-budget controls (Pipeline page) ───────────────────────── */
+  .run-budget {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 18px; margin-bottom: 20px;
+  }
+  .rb-state { display: flex; align-items: baseline; gap: 8px; }
+  .rb-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .rb-value { font-size: 13px; font-weight: 600; }
+  .rb-form { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .rb-form input[type=number] {
+    width: 80px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; font: inherit; font-size: 13px;
+  }
+  .rb-form input[type=number]:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
 
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
   .dot.green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
@@ -170,6 +207,12 @@
   .chip { cursor: pointer; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); user-select: none; }
   .chip:hover { border-color: var(--blue); color: var(--text); }
   .chip.active { border-color: var(--blue); color: var(--blue); background: #15233a; }
+  .chip-sep { color: var(--border); user-select: none; align-self: center; }
+  .chip-findings { color: var(--amber); border-color: var(--border); }
+  .chip-findings:hover { border-color: var(--amber); color: var(--amber); }
+  .chip-findings.active { border-color: var(--amber); color: var(--amber); background: #2a1c08; }
+  .lib-sort { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .lib-sort-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
   .progress { display: inline-block; vertical-align: middle; width: 90px; height: 7px; background: #2a2a3a; border-radius: 4px; overflow: hidden; }
   .progress-bar { height: 100%; background: var(--green); }
   .progress-bar.has-failed { background: linear-gradient(90deg, var(--green), var(--amber)); }
@@ -216,6 +259,8 @@
   .seg-time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; margin-right: 6px; }
   .seg-speaker { color: var(--purple); font-size: 11px; margin-right: 6px; }
   .seg-text { color: var(--text); }
+  /* deep-jump target: the segment a finding "Where" link scrolled to */
+  .seg.seg-active { background: #15233a; border-left: 3px solid var(--blue); padding-left: 8px; border-radius: 4px; }
   .load-more { margin-top: 10px; }
 
   /* ── servers page ──────────────────────────────────────────────── */
@@ -268,12 +313,17 @@
 <header class="topbar">
   <div class="brand">earmark</div>
   <nav class="nav">
-    <a href="/" class="{{if eq .Nav "overview"}}active{{end}}">Overview</a>
-    <a href="/library" class="{{if eq .Nav "library"}}active{{end}}">Library</a>
+    <a href="/" class="{{if eq .Nav "library"}}active{{end}}">Library</a>
+    <a href="/pipeline" class="{{if eq .Nav "pipeline"}}active{{end}}">Pipeline</a>
     <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Models/Services</a>
-    <a href="/findings" class="{{if eq .Nav "findings"}}active{{end}}">Findings</a>
-    <a href="/failed" class="{{if eq .Nav "failed"}}active{{end}}">Failed</a>
+    <a href="/findings" class="nav-secondary {{if eq .Nav "findings"}}active{{end}}">Findings</a>
   </nav>
+  {{if .PhaseKnown}}
+  <a class="topbar-phase" href="/pipeline" title="coordinator phase — read-only (the `earmark batch` coordinator owns it). Click for the Pipeline ops page.">
+    <span class="phase-badge {{.PhaseClass}}">phase: {{.Phase}}</span>
+    {{if .Paused}}<span class="phase-badge phase-paused">paused</span>{{end}}
+  </a>
+  {{end}}
 </header>
 <main>
 {{block "content" .}}{{end}}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -143,6 +144,17 @@ var tmplFuncs = template.FuncMap{
 	},
 	// sub subtracts b from a (small arithmetic for the "N remaining" reader label).
 	"sub": func(a, b int) int { return a - b },
+	// add adds a+b (segment anchor index = page start offset + loop index, for
+	// the "load more" continuation page).
+	"add": func(a, b int) int { return a + b },
+	// deref returns the value of an *int (0 when nil); used to compare the
+	// deep-jump target index inside the reader loop.
+	"deref": func(p *int) int {
+		if p == nil {
+			return 0
+		}
+		return *p
+	},
 	// pct renders an integer percentage (done/total) for a progress-bar width,
 	// guarding division by zero (total == 0 → 0). Mirrors the handler's DonePct
 	// computation so the pipeline-panel bars match the library list's progress bar.
@@ -173,7 +185,10 @@ func mustPage(content string) *template.Template {
 
 // ─── Page shells (layout + content) ──────────────────────────────────────────
 
-var overviewPage = mustPage(`{{define "content"}}
+// pipelinePage is the Pipeline ops page (GET /pipeline): the auto-refreshing
+// status fragment (counts, pipeline state, pause + run-budget controls) plus the
+// Failed view folded in as a second htmx region loading /failed/data.
+var pipelinePage = mustPage(`{{define "content"}}
 <p class="subtitle">pipeline status &nbsp;·&nbsp; auto-refreshes every 3 s</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 <div id="action-error" aria-live="assertive"></div>
@@ -185,6 +200,9 @@ var overviewPage = mustPage(`{{define "content"}}
      hx-on::timeout="document.getElementById('conn').hidden = false"
      hx-on::after-request="if (event.detail.successful) document.getElementById('conn').hidden = true">
   <p class="htmx-indicator">loading…</p>
+</div>
+<div id="failed-region" class="section" hx-get="/failed/data" hx-trigger="load" hx-swap="innerHTML">
+  <p class="htmx-indicator">loading failed jobs…</p>
 </div>
 {{end}}`)
 
@@ -203,16 +221,9 @@ var bookPage = mustPage(`{{define "content"}}
 </div>
 {{end}}`)
 
-var failedPage = mustPage(`{{define "content"}}
-<div id="action-error" aria-live="assertive"></div>
-<div id="failed-region" hx-get="/failed/data" hx-trigger="load" hx-swap="innerHTML">
-  <p class="htmx-indicator">loading…</p>
-</div>
-{{end}}`)
-
 var trackPage = mustPage(`{{define "content"}}
 <div id="action-error" aria-live="assertive"></div>
-<div id="track-region" hx-get="/track/data?id={{.IDQuery}}" hx-trigger="load" hx-swap="innerHTML">
+<div id="track-region" hx-get="/track/data?id={{.IDQuery}}{{.TQuery}}" hx-trigger="load" hx-swap="innerHTML">
   <p class="htmx-indicator">loading…</p>
 </div>
 {{end}}`)
@@ -258,15 +269,40 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   <div class="pipe-main">
     <span class="dot {{.DotClass}}"></span>
     <span class="pipe-label">{{.StateLabel}}</span>
+    <span class="phase-badge {{.PhaseClass}}" title="coordinator phase (read-only — the earmark batch coordinator owns phase; the dashboard never writes it)">phase: {{.Phase}}</span>
     <span class="pipe-sub">{{.SubText}}</span>
     {{if .MetaText}}<div class="pipe-meta">{{.MetaText}}</div>{{end}}
   </div>
+  {{if .ControlEnabled}}
   {{if .Stats.Paused}}
   <button class="btn btn-go" hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Resume the pipeline? The runner will start claiming pending jobs.">&#9654;&nbsp;Resume pipeline</button>
   {{else}}
   <button class="btn btn-warn" hx-post="/actions/pause" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Pause the pipeline? The runner finishes its current job, then stops claiming new work.">&#10073;&#10073;&nbsp;Pause pipeline</button>
+  {{end}}
+  {{else}}
+  <span class="ctrl-disabled" title="Pipeline controls are disabled: CONTROL_API_TOKEN is not configured on this deployment.">controls disabled — no CONTROL_API_TOKEN</span>
+  {{end}}
+</div>
+
+<div class="run-budget">
+  <div class="rb-state">
+    <span class="rb-label">run budget</span>
+    <span class="rb-value">{{.RunBudgetText}}</span>
+  </div>
+  {{if .ControlEnabled}}
+  <form class="rb-form" hx-post="/actions/run" hx-target="#data-region" hx-swap="innerHTML"
+        hx-confirm="Arm a bounded run? The runner claims that many jobs then auto-pauses.">
+    <input type="number" name="n" min="1" value="1" aria-label="number of jobs to run" required>
+    <button type="submit" class="btn btn-go">&#9654;&nbsp;run N then pause</button>
+  </form>
+  {{if .RunLimit}}
+  <button class="btn" hx-post="/actions/run-clear" hx-target="#data-region" hx-swap="innerHTML"
+          hx-confirm="Clear the bounded run (back to unlimited)? The pause flag is left unchanged.">clear budget</button>
+  {{end}}
+  {{else}}
+  <span class="ctrl-disabled" title="Run controls are disabled: CONTROL_API_TOKEN is not configured.">disabled — no CONTROL_API_TOKEN</span>
   {{end}}
 </div>
 
@@ -338,7 +374,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 
 {{if gt .Stats.Failed 0}}
 <div class="failed-callout">
-  <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} &nbsp;<a href="/failed">view failed jobs &#8250;</a></span>
+  <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} &nbsp;<a href="#failed-region">view failed jobs &#8250;</a></span>
   <button class="btn btn-warn" hx-post="/actions/retry-failed" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Retry all {{.Stats.Failed}} failed job(s)? Each is reset to pending and re-transcribed.">retry all failed</button>
 </div>
@@ -382,16 +418,29 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
 <div class="lib-bar">
   <form class="lib-search" hx-get="/library/data" hx-target="#library-region" hx-swap="innerHTML">
     <input type="hidden" name="status" value="{{.Status}}">
+    <input type="hidden" name="sort" value="{{.Sort}}">
+    {{if .HasFindings}}<input type="hidden" name="findings" value="1">{{end}}
     <input type="search" name="q" value="{{.Query}}" placeholder="search author / title / track…" autocomplete="off">
     <button type="submit" class="btn">search</button>
-    {{if or .Query .Status}}<a class="lib-clear" hx-get="/library/data" hx-target="#library-region" hx-swap="innerHTML">clear</a>{{end}}
+    {{if or .Query .Status}}<a class="lib-clear" hx-get="/library/data?sort={{.Sort}}{{if .HasFindings}}&findings=1{{end}}" hx-target="#library-region" hx-swap="innerHTML">clear</a>{{end}}
   </form>
   <div class="lib-chips">
-    <a class="chip{{if eq .Status ""}} active{{end}}"        hx-get="/library/data?q={{.QueryEscaped}}"                hx-target="#library-region" hx-swap="innerHTML">all</a>
-    <a class="chip{{if eq .Status "pending"}} active{{end}}" hx-get="/library/data?status=pending&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">pending</a>
-    <a class="chip{{if eq .Status "claimed"}} active{{end}}" hx-get="/library/data?status=claimed&q={{.QueryEscaped}}" hx-target="#library-region" hx-swap="innerHTML">transcribing</a>
-    <a class="chip{{if eq .Status "done"}} active{{end}}"    hx-get="/library/data?status=done&q={{.QueryEscaped}}"    hx-target="#library-region" hx-swap="innerHTML">done</a>
-    <a class="chip{{if eq .Status "failed"}} active{{end}}"  hx-get="/library/data?status=failed&q={{.QueryEscaped}}"  hx-target="#library-region" hx-swap="innerHTML">failed</a>
+    <a class="chip{{if eq .Status ""}} active{{end}}"        hx-get="/library/data?q={{.QueryEscaped}}{{.FilterParams}}"                hx-target="#library-region" hx-swap="innerHTML">all</a>
+    <a class="chip{{if eq .Status "pending"}} active{{end}}" hx-get="/library/data?status=pending&q={{.QueryEscaped}}{{.FilterParams}}" hx-target="#library-region" hx-swap="innerHTML">pending</a>
+    <a class="chip{{if eq .Status "claimed"}} active{{end}}" hx-get="/library/data?status=claimed&q={{.QueryEscaped}}{{.FilterParams}}" hx-target="#library-region" hx-swap="innerHTML">transcribing</a>
+    <a class="chip{{if eq .Status "done"}} active{{end}}"    hx-get="/library/data?status=done&q={{.QueryEscaped}}{{.FilterParams}}"    hx-target="#library-region" hx-swap="innerHTML">done</a>
+    <a class="chip{{if eq .Status "failed"}} active{{end}}"  hx-get="/library/data?status=failed&q={{.QueryEscaped}}{{.FilterParams}}"  hx-target="#library-region" hx-swap="innerHTML">failed</a>
+    <span class="chip-sep">·</span>
+    <a class="chip chip-findings{{if .HasFindings}} active{{end}}" title="show only books with recorded findings"
+       hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if not .HasFindings}}&findings=1{{end}}{{if ne .Sort "recent"}}&sort={{.Sort}}{{end}}"
+       hx-target="#library-region" hx-swap="innerHTML">&#9873; has findings</a>
+  </div>
+  <div class="lib-sort">
+    <span class="lib-sort-label">sort</span>
+    <a class="chip{{if eq .Sort "recent"}} active{{end}}"   hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}"             hx-target="#library-region" hx-swap="innerHTML">recent</a>
+    <a class="chip{{if eq .Sort "title"}} active{{end}}"    hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=title"    hx-target="#library-region" hx-swap="innerHTML">title</a>
+    <a class="chip{{if eq .Sort "progress"}} active{{end}}" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=progress" hx-target="#library-region" hx-swap="innerHTML">progress</a>
+    <a class="chip{{if eq .Sort "findings"}} active{{end}}" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=findings" hx-target="#library-region" hx-swap="innerHTML">findings</a>
   </div>
 </div>
 
@@ -434,9 +483,9 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
 </div>
 
 <div class="lib-pager">
-  {{if .HasPrev}}<a class="btn" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}&offset={{.PrevOffset}}" hx-target="#library-region" hx-swap="innerHTML">&#8592;&nbsp;prev</a>{{end}}
+  {{if .HasPrev}}<a class="btn" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{.FilterParams}}&offset={{.PrevOffset}}" hx-target="#library-region" hx-swap="innerHTML">&#8592;&nbsp;prev</a>{{end}}
   <span class="lib-meta">{{commafy .TotalBooks}} book{{if ne .TotalBooks 1}}s{{end}} &nbsp;·&nbsp; page {{.Page}} / {{.TotalPages}}</span>
-  {{if .HasNext}}<a class="btn" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}&offset={{.NextOffset}}" hx-target="#library-region" hx-swap="innerHTML">next&nbsp;&#8594;</a>{{end}}
+  {{if .HasNext}}<a class="btn" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{.FilterParams}}&offset={{.NextOffset}}" hx-target="#library-region" hx-swap="innerHTML">next&nbsp;&#8594;</a>{{end}}
 </div>
 {{else}}
 <p class="lib-empty">No books match this filter{{if .Query}} for &ldquo;{{.Query}}&rdquo;{{end}}.</p>
@@ -573,7 +622,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
         <td>{{confPctF .Confidence}}</td>
         <td>{{.IssueType}}</td>
         <td>{{.OriginalText}} &#8594; {{strPtr .SuggestedCorrection}}</td>
-        <td><span class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</span> &#183; {{timestamp .StartSec}}</td>
+        <td>{{if .JobID}}<a class="file-name" href="/track?id={{derefStr .JobID}}&t={{.StartSec}}" title="open the transcript at this point">{{shortName .FilePath}}</a>{{else}}<span class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</span>{{end}} &#183; {{timestamp .StartSec}}</td>
       </tr>
     {{end}}
     </tbody>
@@ -618,11 +667,12 @@ var bookSearchFragmentTmpl = template.Must(template.New("booksearch").Funcs(tmpl
 // clicked is swapped out (hx-swap="outerHTML"), so appending rows + a new button
 // here continues the chain cleanly.
 var segmentsFragmentTmpl = template.Must(template.New("segments").Funcs(tmplFuncs).Parse(`
-{{range .Segments}}
-<div class="seg">
-  <span class="seg-time">[{{timestamp .Start}} &#8594; {{timestamp .End}}]</span>
-  {{if .Speaker}}<span class="seg-speaker">{{derefStr .Speaker}}</span>{{end}}
-  <span class="seg-text">{{.Text}}</span>
+{{$start := .StartOffset}}
+{{range $i, $seg := .Segments}}
+<div id="seg-{{add $start $i}}" class="seg">
+  <span class="seg-time">[{{timestamp $seg.Start}} &#8594; {{timestamp $seg.End}}]</span>
+  {{if $seg.Speaker}}<span class="seg-speaker">{{derefStr $seg.Speaker}}</span>{{end}}
+  <span class="seg-text">{{$seg.Text}}</span>
 </div>
 {{end}}
 {{if .HasMore}}
@@ -690,11 +740,12 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
     <div class="section-title">Transcript ({{commafy .TotalSegments}} segment{{if ne .TotalSegments 1}}s{{end}})</div>
     {{if .PageSegments}}
     <div class="reader">
-      {{range .PageSegments}}
-      <div class="seg">
-        <span class="seg-time">[{{timestamp .Start}} &#8594; {{timestamp .End}}]</span>
-        {{if .Speaker}}<span class="seg-speaker">{{derefStr .Speaker}}</span>{{end}}
-        <span class="seg-text">{{.Text}}</span>
+      {{$target := .TargetSeg}}
+      {{range $i, $seg := .PageSegments}}
+      <div id="seg-{{$i}}" class="seg{{if and $target (eq $i (deref $target))}} seg-active{{end}}">
+        <span class="seg-time">[{{timestamp $seg.Start}} &#8594; {{timestamp $seg.End}}]</span>
+        {{if $seg.Speaker}}<span class="seg-speaker">{{derefStr $seg.Speaker}}</span>{{end}}
+        <span class="seg-text">{{$seg.Text}}</span>
       </div>
       {{end}}
       {{if .HasMore}}
@@ -702,6 +753,17 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
               hx-swap="outerHTML" hx-target="this">load more ({{commafy (sub .TotalSegments .NextOffset)}} remaining)</button>
       {{end}}
     </div>
+    {{if .TargetSeg}}
+    <script>
+      // Deep-jump: scroll the preloaded target segment into view after the
+      // fragment settles. The #seg-N anchor is already in the initial DOM
+      // (handleTrackData preloaded pages [0..target]), so no extra fetch.
+      (function () {
+        var el = document.getElementById('seg-{{deref .TargetSeg}}');
+        if (el) { el.scrollIntoView({block: 'center'}); }
+      })();
+    </script>
+    {{end}}
     {{else}}<p class="lib-empty">Transcript has no segments.</p>{{end}}
   </div>
 
@@ -739,7 +801,18 @@ type pageShell struct {
 	Nav       string
 	DirQuery  string // book page: URL-escaped dir for the hx-get fragment load
 	IDQuery   string // track page only: URL-escaped job id for the hx-get fragment load
+	TQuery    string // track page only: "&t=<startSec>" deep-jump suffix (empty when absent)
 	DataQuery string // library page only: "?status=…&q=…" for the initial fragment load
+
+	// Topbar phase + paused badge (read-only — see statusData.Phase). Populated by
+	// renderPage on every page so pipeline state is visible everywhere while the
+	// live controls stay on the Pipeline page (D2). PhaseKnown is false when the
+	// phase read failed, so the badge is suppressed rather than showing a stale
+	// default.
+	Phase      string
+	PhaseClass string
+	Paused     bool
+	PhaseKnown bool
 }
 
 type statusData struct {
@@ -763,6 +836,23 @@ type statusData struct {
 	DotClass   string
 	SubText    string
 	MetaText   string
+
+	// Coordinator phase (read-only — the dashboard READS runner_control.phase but
+	// never writes it; the `earmark batch` coordinator owns transitions, CONTRACT
+	// §1.4). Phase is the raw word ("idle"|"transcribe"|"analyze") and PhaseClass
+	// the matching CSS modifier ("phase-idle" etc.) for the badge tint.
+	Phase      string
+	PhaseClass string
+
+	// Run-budget control state (the Pipeline page's bounded-run controls). RunLimit
+	// is the current bound (nil = unlimited); RunBudgetText is the human label.
+	// ControlEnabled gates the live control writes: true only when a
+	// CONTROL_API_TOKEN is configured, so the controls render honestly disabled
+	// (with an explanation) on an unauthenticated deployment instead of POSTing
+	// into a guaranteed 503.
+	RunLimit       *int
+	RunBudgetText  string
+	ControlEnabled bool
 }
 
 type bookRow struct {
@@ -800,6 +890,16 @@ type libraryData struct {
 	HasNext      bool
 	PrevOffset   int
 	NextOffset   int
+
+	// Sort is the active sort mode ("recent"|"title"|"progress"|"findings");
+	// HasFindings is the ⚑ has-findings filter chip state. Both are threaded
+	// through every pager + chip link (FilterParams) so the controls persist
+	// across navigation.
+	Sort        string
+	HasFindings bool
+	// FilterParams is the "&sort=…&findings=…" suffix appended to every chip and
+	// pager link so the active sort + findings filter survive a status/page change.
+	FilterParams template.URL
 }
 
 type bookData struct {
@@ -875,15 +975,28 @@ type trackData struct {
 	HasMore       bool
 	NextOffset    int
 	IDQuery       string // URL-escaped job id for the "load more" hx-get
+
+	// Deep-jump (D3): when a finding "Where" link carried &t=<startSec>,
+	// TargetSeg is the slice index of the segment to scroll to / highlight, and
+	// the reader preloads pages [0..target page] so the #seg-N anchor is in the
+	// initial DOM. Nil when no t param was given (the normal first-page load).
+	// Keyed off slice position (NOT db.Segment.ID, which is the ASR runner's
+	// JSON id and not guaranteed contiguous), so it matches the offset-based
+	// pagination cursor.
+	TargetSeg *int
 }
 
 // segmentsData backs the segment-page fragment (the htmx "load more" target):
-// one page of segments plus the link to the next page.
+// one page of segments plus the link to the next page. StartOffset is the
+// absolute slice index of this page's first segment, so each row's #seg-N anchor
+// stays consistent with the initial-page anchors (a deep-jump target may live in
+// a later page if the operator pages forward manually).
 type segmentsData struct {
-	Segments   []db.Segment
-	HasMore    bool
-	NextOffset int
-	IDQuery    string
+	Segments    []db.Segment
+	HasMore     bool
+	NextOffset  int
+	StartOffset int
+	IDQuery     string
 }
 
 // newStatusData derives the unified pipeline state from the pause flag and the
@@ -1097,6 +1210,37 @@ func humanizeSeconds(secs float64) string {
 	}
 }
 
+// phaseClass maps a coordinator phase word to its CSS badge modifier. An unknown
+// phase falls back to the idle tint so a future phase value never renders
+// unstyled.
+func phaseClass(phase string) string {
+	switch phase {
+	case db.PhaseTranscribe:
+		return "phase-transcribe"
+	case db.PhaseAnalyze:
+		return "phase-analyze"
+	default:
+		return "phase-idle"
+	}
+}
+
+// runBudgetText renders the current bounded-run state for the Pipeline page: the
+// remaining-claim count when a run_limit is set, or "unlimited" when nil. A
+// run_limit of 0 means a bounded run has drained (the runner declines further
+// claims until re-armed), so it reads "exhausted" rather than "0 jobs".
+func runBudgetText(limit *int) string {
+	if limit == nil {
+		return "unlimited"
+	}
+	if *limit <= 0 {
+		return "exhausted (0 left)"
+	}
+	if *limit == 1 {
+		return "1 job left"
+	}
+	return commafy(*limit) + " jobs left"
+}
+
 // validStatus is the allow-list for the library status filter; anything else is
 // treated as "no filter".
 func validStatus(s string) string {
@@ -1107,6 +1251,36 @@ func validStatus(s string) string {
 		return ""
 	}
 }
+
+// validSort is the allow-list for the library sort control; anything else is
+// treated as the default "recent" (the SQL transcribed-first ordering).
+func validSort(s string) string {
+	switch s {
+	case "title", "progress", "findings":
+		return s
+	default:
+		return "recent"
+	}
+}
+
+// isTruthy parses a checkbox/flag query param ("1"/"true"/"on"/"yes") to a bool.
+func isTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// libraryFetchCap bounds the all-in-Go library sort/filter (D1): we fetch the
+// full filtered book set so the sort + has-findings filter operate over the
+// whole library (not just one SQL page), then paginate in Go. A library beyond
+// this bound is logged as a warning and the excess rows are NOT silently
+// dropped from correctness — they're simply not fetched in one pass; the warning
+// tells an operator the cap needs raising. 5000 books is far above any real
+// homelab library.
+const libraryFetchCap = 5000
 
 // isHTMX guards mutating endpoints against drive-by/CSRF posts (htmx sets the
 // HX-Request header, which cross-origin forms cannot without a CORS preflight).
@@ -1132,17 +1306,20 @@ func (s *MCPServer) handleHTMX(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(htmxJS)
 }
 
-// handleOverviewPage serves the Overview page shell (GET /). The "/" route is a
-// catch-all, so 404 any other path.
-func (s *MCPServer) handleOverviewPage(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	s.renderPage(w, overviewPage, pageShell{Title: "overview", Nav: "overview"})
+// handlePipelinePage serves the Pipeline ops page shell (GET /pipeline): the
+// status fragment plus the folded-in Failed view.
+func (s *MCPServer) handlePipelinePage(w http.ResponseWriter, r *http.Request) {
+	s.renderPage(w, r, pipelinePage, pageShell{Title: "pipeline", Nav: "pipeline"})
 }
 
 func (s *MCPServer) handleLibraryPage(w http.ResponseWriter, r *http.Request) {
+	// The Library is now the home page (GET /), which is a catch-all route — so
+	// 404 any unmatched path that falls through to "/". A real /library request
+	// has Path=="/library" and passes this guard unchanged.
+	if r.URL.Path != "/" && r.URL.Path != "/library" {
+		http.NotFound(w, r)
+		return
+	}
 	// Thread the status/search filter (e.g. from an Overview stat-card link) into
 	// the initial fragment load, so /library?status=pending actually shows the
 	// pending books instead of the whole library.
@@ -1153,11 +1330,17 @@ func (s *MCPServer) handleLibraryPage(w http.ResponseWriter, r *http.Request) {
 	if q := strings.TrimSpace(r.URL.Query().Get("q")); q != "" {
 		vals.Set("q", q)
 	}
+	if sort := validSort(r.URL.Query().Get("sort")); sort != "recent" {
+		vals.Set("sort", sort)
+	}
+	if isTruthy(r.URL.Query().Get("findings")) {
+		vals.Set("findings", "1")
+	}
 	dataQuery := ""
 	if enc := vals.Encode(); enc != "" {
 		dataQuery = "?" + enc
 	}
-	s.renderPage(w, libraryPage, pageShell{Title: "library", Nav: "library", DataQuery: dataQuery})
+	s.renderPage(w, r, libraryPage, pageShell{Title: "library", Nav: "library", DataQuery: dataQuery})
 }
 
 func (s *MCPServer) handleBookPage(w http.ResponseWriter, r *http.Request) {
@@ -1166,10 +1349,28 @@ func (s *MCPServer) handleBookPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing dir", http.StatusBadRequest)
 		return
 	}
-	s.renderPage(w, bookPage, pageShell{Title: "book", Nav: "library", DirQuery: url.QueryEscape(dir)})
+	s.renderPage(w, r, bookPage, pageShell{Title: "book", Nav: "library", DirQuery: url.QueryEscape(dir)})
 }
 
-func (s *MCPServer) renderPage(w http.ResponseWriter, tmpl *template.Template, data pageShell) {
+func (s *MCPServer) renderPage(w http.ResponseWriter, r *http.Request, tmpl *template.Template, data pageShell) {
+	// Populate the topbar phase + paused badge (read-only, every page — D2). The
+	// dashboard never writes phase; the `earmark batch` coordinator owns it
+	// (CONTRACT §1.4). A read error suppresses the badge (PhaseKnown stays false)
+	// rather than showing a misleading default, and never blocks the page. The
+	// pause flag comes from GetControl (same source the control API re-reads).
+	ctx := r.Context()
+	if phase, err := s.db.GetPipelinePhase(ctx); err != nil {
+		s.logger.Error("GetPipelinePhase (shell) error", "error", err)
+	} else {
+		data.Phase = phase
+		data.PhaseClass = phaseClass(phase)
+		data.PhaseKnown = true
+	}
+	if paused, _, err := s.db.GetControl(ctx); err != nil {
+		s.logger.Error("GetControl (shell) error", "error", err)
+	} else {
+		data.Paused = paused
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := tmpl.Execute(w, data); err != nil {
@@ -1198,6 +1399,24 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	data := newStatusData(stats, jobs, time.Now(), s.runnerStaleAfter, s.embedURL)
+
+	// Read-only coordinator phase for the phase badge. The dashboard never writes
+	// phase (the `earmark batch` coordinator owns it, CONTRACT §1.4); a read error
+	// degrades to "idle" + a log line rather than failing the fragment.
+	phase, perr := s.db.GetPipelinePhase(ctx)
+	if perr != nil {
+		s.logger.Error("GetPipelinePhase error", "error", perr)
+		phase = db.PhaseIdle
+	}
+	data.Phase = phase
+	data.PhaseClass = phaseClass(phase)
+	// Run-budget control state. RunLimit comes from the same GetServiceStatus read
+	// (no extra query). ControlEnabled gates the live writes so the controls render
+	// honestly disabled on a token-less deployment.
+	data.RunLimit = stats.RunLimit
+	data.RunBudgetText = runBudgetText(stats.RunLimit)
+	data.ControlEnabled = s.controlToken != ""
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := statusFragmentTmpl.Execute(w, data); err != nil {
@@ -1210,6 +1429,8 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 	status := validStatus(r.URL.Query().Get("status"))
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	sort := validSort(r.URL.Query().Get("sort"))
+	hasFindings := isTruthy(r.URL.Query().Get("findings"))
 	// offset is the htmx "load more" cursor. A missing or malformed value
 	// intentionally falls back to the first page (0) rather than erroring —
 	// this is a UI pagination control, not an API, so a bad cursor should
@@ -1221,19 +1442,34 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// All-in-Go sort/filter (D1): fetch the FULL status/query-filtered book set in
+	// one pass (up to the defensive cap), then merge findings, apply the
+	// has-findings filter, sort, and paginate in Go. This keeps the sort + ⚑
+	// filter operating over the whole library rather than just one SQL page. The
+	// SQL already returns the "recent" (transcribed-first) order, so the default
+	// sort is a no-op re-sort; the other modes re-order the fetched slice.
 	books, total, err := s.db.GetBookSummaries(r.Context(), db.BookFilter{
-		Status: status, Query: query, Limit: libraryPageSize, Offset: offset,
+		Status: status, Query: query, Limit: libraryFetchCap, Offset: 0,
 	})
 	if err != nil {
 		s.logger.Error("GetBookSummaries error", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	if total > libraryFetchCap {
+		// Never silently truncate: warn so an operator knows the cap needs raising.
+		// The visible list is still correct for the fetched set; only books beyond
+		// the cap are missing from this in-Go pass.
+		s.logger.Warn("library exceeds the in-Go sort/filter fetch cap — raise libraryFetchCap",
+			"total", total, "cap", libraryFetchCap)
+	}
 
 	// One whole-library findings-count aggregate, keyed by book dir, so the ⚑
-	// column on each (paged) row is a map lookup rather than an N+1 per row. A
-	// findings error must not break the library list, so it's logged and the
-	// column just renders 0 (em dash) everywhere.
+	// column is a map lookup rather than an N+1 per row, and the has-findings
+	// filter has the counts it needs. A findings error must not break the library
+	// list, so it's logged and the column just renders 0 (em dash) everywhere
+	// (with the has-findings filter then matching nothing — an honest empty list,
+	// not a crash).
 	findingsByBook, err := s.db.GetFindingsCountByBook(r.Context())
 	if err != nil {
 		s.logger.Error("GetFindingsCountByBook error", "error", err)
@@ -1242,6 +1478,10 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 
 	rows := make([]bookRow, 0, len(books))
 	for _, b := range books {
+		fc := findingsByBook[b.Dir]
+		if hasFindings && fc == 0 {
+			continue // ⚑ filter: drop books with no recorded findings
+		}
 		bookMeta, _ := s.meta.Lookup(r.Context(), b.SamplePath, b.SamplePath)
 		author, title := bookMeta.Author, bookMeta.Title
 		pct := 0
@@ -1253,18 +1493,33 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 			Total: b.Total, Pending: b.Pending, Claimed: b.Claimed, Done: b.Done, Failed: b.Failed,
 			LastUpdated:     b.LastUpdated,
 			DurationSeconds: b.DurationSeconds, WordCount: b.WordCount, EmbedChunkCount: b.EmbedChunkCount,
-			FindingCount: findingsByBook[b.Dir],
+			FindingCount: fc,
 		})
 	}
 
-	totalPages := (total + libraryPageSize - 1) / libraryPageSize
+	sortBookRows(rows, sort)
+
+	// Paginate the filtered+sorted slice in Go.
+	filteredTotal := len(rows)
+	if offset > filteredTotal {
+		offset = filteredTotal
+	}
+	end := offset + libraryPageSize
+	if end > filteredTotal {
+		end = filteredTotal
+	}
+	pageRows := rows[offset:end]
+
+	totalPages := (filteredTotal + libraryPageSize - 1) / libraryPageSize
 	if totalPages < 1 {
 		totalPages = 1
 	}
 	data := libraryData{
-		Books: rows, Status: status, Query: query, QueryEscaped: url.QueryEscape(query),
-		Page: offset/libraryPageSize + 1, TotalPages: totalPages, TotalBooks: total,
-		HasPrev: offset > 0, HasNext: offset+libraryPageSize < total,
+		Books: pageRows, Status: status, Query: query, QueryEscaped: url.QueryEscape(query),
+		Sort: sort, HasFindings: hasFindings,
+		FilterParams: libraryFilterParams(sort, hasFindings),
+		Page:         offset/libraryPageSize + 1, TotalPages: totalPages, TotalBooks: filteredTotal,
+		HasPrev: offset > 0, HasNext: end < filteredTotal,
 		PrevOffset: max(0, offset-libraryPageSize), NextOffset: offset + libraryPageSize,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1272,6 +1527,77 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 	if err := libraryFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("library render error", "error", err)
 	}
+}
+
+// sortBookRows orders the library rows for the chosen sort mode, in place:
+//   - recent   — no-op: the SQL already returned transcribed-first/most-recent.
+//   - title    — by resolved "Author — Title" label, case-insensitively.
+//   - progress — by done fraction DESC (most-complete first), ties by title.
+//   - findings — by recorded finding count DESC (most-flagged first), ties by title.
+//
+// A stable sort preserves the SQL "recent" order within ties.
+func sortBookRows(rows []bookRow, mode string) {
+	switch mode {
+	case "title":
+		sortStable(rows, func(a, b bookRow) bool { return titleKey(a) < titleKey(b) })
+	case "progress":
+		sortStable(rows, func(a, b bookRow) bool {
+			ra, rb := doneFrac(a), doneFrac(b)
+			if ra != rb {
+				return ra > rb
+			}
+			return titleKey(a) < titleKey(b)
+		})
+	case "findings":
+		sortStable(rows, func(a, b bookRow) bool {
+			if a.FindingCount != b.FindingCount {
+				return a.FindingCount > b.FindingCount
+			}
+			return titleKey(a) < titleKey(b)
+		})
+	default: // recent — keep the SQL order
+	}
+}
+
+// sortStable stable-sorts rows by a less predicate (thin wrapper over
+// sort.SliceStable so the callers read as a/b comparisons).
+func sortStable(rows []bookRow, less func(a, b bookRow) bool) {
+	sort.SliceStable(rows, func(i, j int) bool { return less(rows[i], rows[j]) })
+}
+
+// titleKey is the case-insensitive sort key for the title sort: "author title"
+// from the metadata-resolved labels, falling back to the dir when both are empty.
+func titleKey(b bookRow) string {
+	k := strings.ToLower(strings.TrimSpace(b.Author + " " + b.Title))
+	if k == "" {
+		return strings.ToLower(b.Dir)
+	}
+	return k
+}
+
+// doneFrac is the done/total fraction (0 when total==0), for the progress sort.
+func doneFrac(b bookRow) float64 {
+	if b.Total <= 0 {
+		return 0
+	}
+	return float64(b.Done) / float64(b.Total)
+}
+
+// libraryFilterParams builds the "&sort=…&findings=1" suffix appended to chip and
+// pager links so the active sort + findings filter persist across navigation.
+// Returns template.URL since it is interpolated into an href that already has a
+// leading "?…"; both components are fixed allow-listed tokens (no user text), so
+// this is not an injection vector.
+func libraryFilterParams(sort string, hasFindings bool) template.URL {
+	var b strings.Builder
+	if sort != "recent" {
+		b.WriteString("&sort=")
+		b.WriteString(sort)
+	}
+	if hasFindings {
+		b.WriteString("&findings=1")
+	}
+	return template.URL(b.String())
 }
 
 // ─── Book data handler ───────────────────────────────────────────────────────
@@ -1427,8 +1753,17 @@ func (s *MCPServer) handleTrackPage(w http.ResponseWriter, r *http.Request) {
 	// The id goes into an hx-get attribute, which html/template does NOT
 	// URL-filter, so it is pre-escaped. The "back to book" link is derived in the
 	// fragment from the track's own file_path, so no dir param is threaded here.
-	s.renderPage(w, trackPage, pageShell{
-		Title: "track", Nav: "library", IDQuery: url.QueryEscape(id),
+	// Thread a valid &t=<startSec> deep-jump param into the fragment load so a
+	// full-page navigation to /track?id=…&t=… still lands on the right segment; an
+	// absent/invalid t is dropped.
+	tQuery := ""
+	if raw := strings.TrimSpace(r.URL.Query().Get("t")); raw != "" {
+		if t, err := strconv.ParseFloat(raw, 64); err == nil && t >= 0 {
+			tQuery = "&t=" + url.QueryEscape(raw)
+		}
+	}
+	s.renderPage(w, r, trackPage, pageShell{
+		Title: "track", Nav: "library", IDQuery: url.QueryEscape(id), TQuery: tQuery,
 	})
 }
 
@@ -1463,8 +1798,28 @@ func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
 	// Transcript reader pagination (P7): render only the first page of segments;
 	// the rest load on demand via the htmx "load more" button.
 	d.TotalSegments = len(detail.Segments)
-	page, hasMore, next := paginateSegments(detail.Segments, 0)
-	d.PageSegments, d.HasMore, d.NextOffset = page, hasMore, next
+
+	// Deep-jump (D3): a finding "Where" link carries &t=<startSec>. Resolve it to
+	// the target segment's slice index and preload pages [0 .. target page] so the
+	// #seg-N anchor is already in the initial DOM (no N+1, no extra round-trip):
+	// the reader scrolls to it after htmx settles. Without t, render just the
+	// first page. A malformed t is ignored (degrade to first page) — this is a UI
+	// convenience link, not an API.
+	preloadEnd := segmentPageSize
+	if raw := strings.TrimSpace(r.URL.Query().Get("t")); raw != "" && len(detail.Segments) > 0 {
+		if t, perr := strconv.ParseFloat(raw, 64); perr == nil && t >= 0 {
+			idx := segmentIndexForTime(detail.Segments, t)
+			d.TargetSeg = &idx
+			targetPage := idx / segmentPageSize
+			preloadEnd = (targetPage + 1) * segmentPageSize
+		}
+	}
+	if preloadEnd > len(detail.Segments) {
+		preloadEnd = len(detail.Segments)
+	}
+	d.PageSegments = detail.Segments[:preloadEnd]
+	d.HasMore = preloadEnd < len(detail.Segments)
+	d.NextOffset = preloadEnd
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -1504,13 +1859,38 @@ func (s *MCPServer) handleTrackSegments(w http.ResponseWriter, r *http.Request) 
 	}
 
 	page, hasMore, next := paginateSegments(detail.Segments, offset)
-	data := segmentsData{Segments: page, HasMore: hasMore, NextOffset: next, IDQuery: url.QueryEscape(id)}
+	// next == clampedStart + len(page); recover the clamped start so each row's
+	// #seg-N anchor uses its absolute slice index (consistent with the first page).
+	data := segmentsData{
+		Segments: page, HasMore: hasMore, NextOffset: next,
+		StartOffset: next - len(page), IDQuery: url.QueryEscape(id),
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := segmentsFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("segments fragment render error", "error", err)
 	}
+}
+
+// segmentIndexForTime returns the slice index of the first segment whose End is
+// at or after t (the segment that contains, or first follows, time t). It is the
+// deep-jump target: a finding's start_sec lands on the segment spanning it.
+// Returns 0 for t<=0 or an empty slice, and the last index when t is past the
+// end (clamp), so the result is always a valid index into a non-empty slice.
+func segmentIndexForTime(segs []db.Segment, t float64) int {
+	if len(segs) == 0 {
+		return 0
+	}
+	if t <= 0 {
+		return 0
+	}
+	for i, s := range segs {
+		if s.End >= t {
+			return i
+		}
+	}
+	return len(segs) - 1
 }
 
 // paginateSegments returns the page of segments starting at offset (size
@@ -1531,10 +1911,6 @@ func paginateSegments(segs []db.Segment, offset int) (page []db.Segment, hasMore
 }
 
 // ─── Failed jobs view ────────────────────────────────────────────────────────
-
-func (s *MCPServer) handleFailedPage(w http.ResponseWriter, _ *http.Request) {
-	s.renderPage(w, failedPage, pageShell{Title: "failed", Nav: "failed"})
-}
 
 func (s *MCPServer) handleFailedData(w http.ResponseWriter, r *http.Request) {
 	s.renderFailedFragment(w, r)
@@ -1657,5 +2033,69 @@ func (s *MCPServer) handleResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("pipeline resumed via dashboard")
+	s.renderStatusFragment(w, r)
+}
+
+// handleRunBudget starts a bounded run of N≥1 claims from the Pipeline page
+// (POST /actions/run?n=N): set run_limit=N then unpause, so the runner processes
+// exactly N jobs and then declines further claims. Mirrors the JSON control
+// API's handleAPIRun (api.go) — limit before unpause, so the runner stays gated
+// by paused until the final write and can never claim beyond N. It is
+// htmx-guarded and fail-closed on an unset CONTROL_API_TOKEN (like the eval
+// actions), since arming a run is a control mutation.
+func (s *MCPServer) handleRunBudget(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if s.controlToken == "" {
+		writeActionError(w, "run controls are disabled: CONTROL_API_TOKEN is not configured")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeActionError(w, "bad form")
+		return
+	}
+	// r.Form merges query + POST body, so the htmx form (which posts n in the
+	// body) and a ?n= query both work.
+	n, err := strconv.Atoi(strings.TrimSpace(r.Form.Get("n")))
+	if err != nil || n < 1 {
+		writeActionError(w, "run budget must be an integer ≥ 1")
+		return
+	}
+	// Limit before unpause (mirror api.go:312-324): the runner stays gated by
+	// paused until the final write, so it can never claim beyond N.
+	if err := s.db.SetRunLimit(r.Context(), &n, "dashboard"); err != nil {
+		s.logger.Error("run budget (set limit) error", "error", err)
+		writeActionError(w, "set run budget failed — see server logs")
+		return
+	}
+	if err := s.db.SetPaused(r.Context(), false, "dashboard"); err != nil {
+		s.logger.Error("run budget (unpause) error", "error", err)
+		writeActionError(w, "set run budget failed — see server logs")
+		return
+	}
+	s.logger.Info("bounded run armed via dashboard", "limit", n)
+	s.renderStatusFragment(w, r)
+}
+
+// handleClearBudget clears a bounded run (run_limit→NULL) without touching the
+// pause flag (POST /actions/run-clear) — back to an unlimited run. htmx-guarded
+// and fail-closed on an unset token like handleRunBudget.
+func (s *MCPServer) handleClearBudget(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if s.controlToken == "" {
+		writeActionError(w, "run controls are disabled: CONTROL_API_TOKEN is not configured")
+		return
+	}
+	if err := s.db.SetRunLimit(r.Context(), nil, "dashboard"); err != nil {
+		s.logger.Error("clear run budget error", "error", err)
+		writeActionError(w, "clear run budget failed — see server logs")
+		return
+	}
+	s.logger.Info("bounded run cleared via dashboard")
 	s.renderStatusFragment(w, r)
 }

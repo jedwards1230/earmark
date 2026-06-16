@@ -44,6 +44,12 @@ type DBInterface interface {
 	// SetRunLimit writes the bounded-run counter without touching the pause flag
 	// (nil = unlimited). Used by the control API's "run N jobs then auto-pause".
 	SetRunLimit(ctx context.Context, limit *int, by string) error
+	// GetPipelinePhase returns the coordinator's current pipeline phase
+	// ("idle"|"transcribe"|"analyze") from runner_control, normalizing NULL/missing
+	// to "idle". The dashboard READS this for a read-only phase badge — it never
+	// writes it; the `earmark batch` coordinator owns phase transitions (CONTRACT
+	// §1.4). A NULL/missing row degrades to "idle".
+	GetPipelinePhase(ctx context.Context) (string, error)
 	// GetBookSummaries returns one row per book directory (the library view),
 	// plus the total matching-book count for pagination.
 	GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error)

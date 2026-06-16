@@ -151,7 +151,7 @@ var findingsFragmentTmpl = template.Must(template.New("findings").Funcs(tmplFunc
         <td>{{confPctF .Confidence}}</td>
         <td>{{.IssueType}}</td>
         <td>{{.OriginalText}} &#8594; {{strPtr .SuggestedCorrection}}</td>
-        <td><span class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</span> &#183; {{timestamp .StartSec}}
+        <td>{{if .JobID}}<a class="file-name" href="/track?id={{derefStr .JobID}}&t={{.StartSec}}" title="open the transcript at this point">{{shortName .FilePath}}</a>{{else}}<span class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</span>{{end}} &#183; {{timestamp .StartSec}}
             &#183; <a class="file-name" href="/book?dir={{.BookDir}}" title="{{.BookDir}}">{{shortName .BookDir}}</a></td>
       </tr>
     {{end}}
@@ -164,8 +164,8 @@ var findingsFragmentTmpl = template.Must(template.New("findings").Funcs(tmplFunc
 `))
 
 // handleFindingsPage serves the Findings page shell (GET /findings).
-func (s *MCPServer) handleFindingsPage(w http.ResponseWriter, _ *http.Request) {
-	s.renderPage(w, findingsPage, pageShell{Title: "findings", Nav: "findings"})
+func (s *MCPServer) handleFindingsPage(w http.ResponseWriter, r *http.Request) {
+	s.renderPage(w, r, findingsPage, pageShell{Title: "findings", Nav: "findings"})
 }
 
 // handleFindingsData serves the htmx findings fragment (GET /findings/data).
