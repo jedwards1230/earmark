@@ -145,6 +145,16 @@ the two Deployments.
 - name: EVAL_CHAT_API_KEY
   value: {{ . | quote }}
 {{- end }}
+{{- /*
+  In-pipeline eval (CONTRACT §2.15): when true, the embed worker runs the eval
+  judge on each transcript's chunks BEFORE embedding. Emitted only when enabled;
+  unset → the app default (false; eval stays on-demand). Cost is bounded by the
+  batch coordinator (run_limit) — leave off unless running the batched pipeline.
+*/}}
+{{- if .Values.config.evalInPipeline }}
+- name: EVAL_IN_PIPELINE
+  value: "true"
+{{- end }}
 - name: METADATA_PROVIDER
   value: {{ .Values.config.metadataProvider | quote }}
 {{- /*
