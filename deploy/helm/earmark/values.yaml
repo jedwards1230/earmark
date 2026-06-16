@@ -124,6 +124,13 @@ config:
   #   evalChat: {baseURL: "http://vllm:8000/v1", model: qwen2.5-7b-instruct, apiKey: ""}
   evalChat: {}
 
+  # In-pipeline eval (EVAL_IN_PIPELINE, CONTRACT §2.15): when true, the embed
+  # worker runs the eval judge on each transcript's chunks BEFORE embedding,
+  # instead of eval being a separate on-demand pass. Cost is bounded by the
+  # batch coordinator's run_limit — only enable when running the batched
+  # pipeline (CONTRACT §1.4). Default false (eval stays on-demand).
+  evalInPipeline: false
+
   # ── Metadata provider (CONTRACT §2.4) ──────────────────────────────────────
   # METADATA_PROVIDER selects how the ingest monitor derives book metadata:
   #   path           — filesystem path only (default; no external dependency)
