@@ -130,6 +130,37 @@ func TestClearFindingsSQL_DeletesOnlyFindings(t *testing.T) {
 	}
 }
 
+// TestListFindingsSQL_ReadOnly guards the worklist queries against the same
+// read-only-over-transcripts invariant (§2.15): ListFindings only ever SELECTs
+// (joined read-only to transcription_jobs for the JobID) — it must issue no write
+// verb. It also pins the scoped form's LIKE clause + ESCAPE, so the "show this
+// book's findings" set stays identical to the scoped clear / text-search set.
+func TestListFindingsSQL_ReadOnly(t *testing.T) {
+	writeVerbs := []string{"UPDATE", "DELETE", "ALTER", "DROP", "TRUNCATE", "INSERT"}
+	for name, sql := range map[string]string{
+		"listFindingsSQL":       listFindingsSQL,
+		"listFindingsInBookSQL": listFindingsInBookSQL,
+	} {
+		upper := strings.ToUpper(sql)
+		if !strings.HasPrefix(strings.TrimSpace(upper), "SELECT") {
+			t.Errorf("%s must start with SELECT (read-only):\n%s", name, sql)
+		}
+		for _, verb := range writeVerbs {
+			if strings.Contains(upper, verb+" ") {
+				t.Errorf("%s contains write verb %q — list path must be read-only:\n%s", name, verb, sql)
+			}
+		}
+	}
+	// The scoped form must filter file_path with the LIKE-escape, matching
+	// clearFindingsDirSQL/textSearchInBookSQL so the three select the same book set.
+	if !strings.Contains(listFindingsInBookSQL, `file_path LIKE $2 ESCAPE '\'`) {
+		t.Errorf("listFindingsInBookSQL must scope via `file_path LIKE $2 ESCAPE '\\'`:\n%s", listFindingsInBookSQL)
+	}
+	if strings.Contains(listFindingsSQL, "WHERE") {
+		t.Errorf("listFindingsSQL (global) must not be scoped:\n%s", listFindingsSQL)
+	}
+}
+
 // FindingsSummary buckets must be mutually exclusive and exhaustive over [0,1].
 func TestFindingsConfidenceBucketsType(t *testing.T) {
 	mean := 0.5

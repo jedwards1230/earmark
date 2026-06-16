@@ -344,10 +344,12 @@ func (d demoDB) GetFindingsSummary(context.Context) (*db.FindingsSummary, error)
 			{IssueType: "repeated_text", Count: 2},
 		},
 		ByBook: []db.BookFindings{
-			{BookDir: "/books/Author One/A Long Title", FilePath: "/books/Author One/A Long Title/01.m4b",
-				Count: 21, MeanConfidence: 0.66, TopIssueType: "misheard_proper_noun"},
-			{BookDir: "/books/Author Two/Another Book", FilePath: "/books/Author Two/Another Book/01.m4b",
-				Count: 16, MeanConfidence: 0.54, TopIssueType: "number_artifact"},
+			{BookDir: "/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]",
+				FilePath: "/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]/Project Hail Mary.m4b",
+				Count:    21, MeanConfidence: 0.66, TopIssueType: "misheard_proper_noun"},
+			{BookDir: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]",
+				FilePath: "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]/01 - Chapter 1.mp3",
+				Count:    16, MeanConfidence: 0.54, TopIssueType: "number_artifact"},
 		},
 	}, nil
 }
@@ -386,6 +388,51 @@ func (d demoDB) ClearFindings(context.Context, string) (int64, error) {
 		return 0, nil
 	}
 	return 37, nil // matches the demo TotalFindings
+}
+
+// ListFindings returns synthetic individual finding rows for the /findings
+// worklist and the per-book Book section. The book dirs MUST match
+// GetFindingsSummary.ByBook above so the worklist's book links resolve to the
+// same demo books the per-book roll-up names. An empty (fresh-install) scenario
+// returns nil; a non-empty dir scopes to one of the two demo books.
+func (d demoDB) ListFindings(_ context.Context, dir string, limit int) ([]db.FindingRow, error) {
+	if d.scenario == "empty" {
+		return nil, nil
+	}
+	job1, job2 := "demo-job-1", "demo-job-2"
+	ci0, ci1, ci2 := 0, 4, 7
+	corr1 := "Arecibo"
+	corr2 := "three hundred"
+	corr3 := "pen name"
+	phmDir := "/books/audio-libation/Andy Weir/Project Hail Mary [B08GB58KD5]"
+	phmFile := phmDir + "/Project Hail Mary.m4b" // == demoBooks SamplePath → track 0 (⚑ matches)
+	duneDir := "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]"
+	duneFile := duneDir + "/01 - Chapter 1.mp3" // == demoBooks SamplePath → track 0 (⚑ matches)
+	all := []db.FindingRow{
+		{ID: "f1", FilePath: phmFile,
+			BookDir: phmDir, JobID: &job1, ChunkIndex: &ci0,
+			StartSec: 73.5, EndSec: 81.0, OriginalText: "auto sebo",
+			IssueType: "misheard_proper_noun", SuggestedCorrection: &corr1, Confidence: 0.92},
+		{ID: "f2", FilePath: phmFile,
+			BookDir: phmDir, JobID: &job1, ChunkIndex: &ci1,
+			StartSec: 612.0, EndSec: 618.4, OriginalText: "free hundred",
+			IssueType: "number_artifact", SuggestedCorrection: &corr2, Confidence: 0.71},
+		{ID: "f3", FilePath: duneFile,
+			BookDir: duneDir, JobID: &job2, ChunkIndex: &ci2,
+			StartSec: 145.2, EndSec: 150.9, OriginalText: "pin name",
+			IssueType: "homophone", SuggestedCorrection: &corr3, Confidence: 0.55},
+	}
+
+	var out []db.FindingRow
+	for _, f := range all {
+		if dir == "" || f.BookDir == strings.TrimRight(strings.TrimSpace(dir), "/") {
+			out = append(out, f)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // demoEvalRun builds an eval runner backed by a static fake chat client, so the

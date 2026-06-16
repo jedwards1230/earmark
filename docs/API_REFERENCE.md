@@ -124,6 +124,8 @@ The runner claims a new job only when `NOT paused AND (run_limit IS NULL OR run_
 
 The MCP HTTP transport also serves a status dashboard at `/` (htmx, auto-refreshes the `/status/data` fragment every 3 s). The dashboard exposes requeue buttons (`/actions/requeue?id=…`, `/actions/retry-failed`) guarded by the `HX-Request` header.
 
+The **`/findings`** page (read-only eval layer, CONTRACT §2.15) and the per-book **`/book`** detail section both render the **individual finding rows** — confidence, issue type, `original → suggested correction`, and where — sorted by confidence DESC, in addition to the per-book roll-up. Rows link to the book they belong to (`/book?dir=…`). The Book page also exposes the scoped clear (`POST /actions/findings-clear?dir=…`, token-gated) which re-renders the Book fragment, and a `⚑ N` per-track flag column linking into the book's findings section. All read-only/advisory — no transcript is ever modified.
+
 **Demo mode** (no database required):
 
 ```bash

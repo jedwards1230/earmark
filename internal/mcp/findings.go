@@ -36,7 +36,14 @@ type findingsData struct {
 	// would fail-close (503) on click — same honesty rule the eval triggers
 	// follow. Clearing needs the token but NOT a configured eval endpoint.
 	ControlEnabled bool
+	// Findings is the individual-finding triage worklist (highest-confidence
+	// first), rendered below the per-book roll-up. Each row links to the book it
+	// belongs to (the track-segment deep jump is deferred to a later PR).
+	Findings []db.FindingRow
 }
+
+// findingsWorklistLimit caps the global findings worklist on the /findings page.
+const findingsWorklistLimit = 200
 
 // findingsPage is the page shell (layout + content) for GET /findings.
 var findingsPage = mustPage(`{{define "content"}}
@@ -115,10 +122,37 @@ var findingsFragmentTmpl = template.Must(template.New("findings").Funcs(tmplFunc
     <tbody>
     {{range .Summary.ByBook}}
       <tr>
-        <td>{{shortName .BookDir}}</td>
+        <td><a class="file-name" href="/book?dir={{.BookDir}}" title="{{.BookDir}}">{{shortName .BookDir}}</a></td>
         <td>{{commafy .Count}}</td>
         <td>{{confPctF .MeanConfidence}}</td>
         <td>{{.TopIssueType}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+</div>
+{{end}}
+
+{{if .Findings}}
+<div class="section">
+  <div class="section-title">Findings (worklist)</div>
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th title="judge self-scored confidence (triage highest-first)">Confidence</th>
+      <th>Issue</th>
+      <th title="suspected span → suggested correction (advisory only)">Correction</th>
+      <th title="track · timestamp, and the book it belongs to">Where</th>
+    </tr></thead>
+    <tbody>
+    {{range .Findings}}
+      <tr>
+        <td>{{confPctF .Confidence}}</td>
+        <td>{{.IssueType}}</td>
+        <td>{{.OriginalText}} &#8594; {{strPtr .SuggestedCorrection}}</td>
+        <td><span class="file-name" title="{{.FilePath}}">{{shortName .FilePath}}</span> &#183; {{timestamp .StartSec}}
+            &#183; <a class="file-name" href="/book?dir={{.BookDir}}" title="{{.BookDir}}">{{shortName .BookDir}}</a></td>
       </tr>
     {{end}}
     </tbody>
@@ -149,12 +183,22 @@ func (s *MCPServer) renderFindingsFragment(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// The worklist rows are advisory (read-only eval output), not load-bearing
+	// for this page. Match the book page (renderBookFragmentWithNotice): a
+	// ListFindings error is logged and the worklist degrades to its empty state
+	// rather than failing the whole page with a 503.
+	findings, err := s.db.ListFindings(r.Context(), "", findingsWorklistLimit)
+	if err != nil {
+		s.logger.Error("ListFindings error", "error", err)
+		findings = nil
+	}
 	data := findingsData{
 		Summary:        summary,
 		RenderedAt:     time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
 		EvalConfigured: s.eval.configured,
 		EvalSampleN:    defaultEvalSampleN,
 		ControlEnabled: s.controlToken != "",
+		Findings:       findings,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -190,6 +234,13 @@ func (s *MCPServer) handleFindingsClear(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.logger.Info("cleared findings via dashboard", "dir", dir, "deleted", n)
+	// A dir-scoped clear is reachable from the Book page (its clear-book-findings
+	// button targets #book-region), so re-render the book fragment in that case;
+	// an unscoped clear comes from the /findings page and re-renders it.
+	if dir != "" {
+		s.renderBookFragment(w, r, dir)
+		return
+	}
 	s.renderFindingsFragment(w, r)
 }
 

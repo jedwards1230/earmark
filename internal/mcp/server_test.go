@@ -140,6 +140,10 @@ func (m *SimpleMockDB) GetFindingsSummary(_ context.Context) (*db.FindingsSummar
 	return &db.FindingsSummary{}, nil
 }
 
+func (m *SimpleMockDB) ListFindings(_ context.Context, _ string, _ int) ([]db.FindingRow, error) {
+	return nil, nil
+}
+
 func (m *SimpleMockDB) GetEvalChunksForBook(_ context.Context, _ string, _ int) ([]db.EvalChunk, error) {
 	return nil, nil
 }
