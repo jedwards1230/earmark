@@ -126,6 +126,8 @@ The MCP HTTP transport also serves a status dashboard at `/` (htmx, auto-refresh
 
 The **`/findings`** page (read-only eval layer, CONTRACT §2.15) and the per-book **`/book`** detail section both render the **individual finding rows** — confidence, issue type, `original → suggested correction`, and where — sorted by confidence DESC, in addition to the per-book roll-up. Rows link to the book they belong to (`/book?dir=…`). The Book page also exposes the scoped clear (`POST /actions/findings-clear?dir=…`, token-gated) which re-renders the Book fragment, and a `⚑ N` per-track flag column linking into the book's findings section. All read-only/advisory — no transcript is ever modified.
 
+The **`/book`** page leads with a **pipeline panel** of three honest elements derived from the book's tracks (and its findings): a **Transcribe** progress bar (done/total tracks), an **Embed** progress bar (of the done tracks, how many are embedded — `run_metrics.embed_chunk_count` set; em-dash when no track is done), and a **Judge** status (`⚑ N findings` or `no findings yet`). Judge is a status/count, **not** a progress bar — the schema records no "evaluated" marker, so a judged-clean book can't be distinguished from a never-judged one and a percentage would be misleading. The **`/library`** list carries a matching `⚑ N` **Findings** column, computed from a single whole-library findings-count aggregate (no per-row N+1), with each populated cell linking to that book's `#book-findings` section.
+
 **Demo mode** (no database required):
 
 ```bash

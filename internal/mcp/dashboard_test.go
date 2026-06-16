@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -362,6 +363,154 @@ func TestBookFragmentRendersFindings(t *testing.T) {
 	}
 	if !strings.Contains(outE, "—") {
 		t.Errorf("expected em-dash in empty Flags cell:\n%s", outE)
+	}
+}
+
+// TestBookFragmentRendersPipelinePanel renders bookFragmentTmpl and asserts the
+// three honest pipeline elements: Transcribe + Embed as real Done/Total progress
+// bars, and Judge as an honest status/count (NOT a bar). It covers the populated
+// case (Dune-shaped: 8/8 transcribed, 4/8 embedded, findings present → "⚑ N
+// findings"), the zero-findings case (judge "no findings yet", NEVER a fake "0%"
+// or "evaluated" claim), and the empty-embed case (0 done tracks → em-dash, no
+// Embed bar).
+func TestBookFragmentRendersPipelinePanel(t *testing.T) {
+	dir := "/books/audio-libation/A/B"
+	chunks := 36
+	// 8 tracks all done; even-index tracks (4 of 8) have EmbedChunkCount set →
+	// Transcribe 8/8, Embed 4/8.
+	tracks := make([]db.RecentJob, 0, 8)
+	for i := 0; i < 8; i++ {
+		rj := db.RecentJob{ID: "t" + strconv.Itoa(i), FilePath: dir + "/0" + strconv.Itoa(i) + ".m4b",
+			Status: "done", UpdatedAt: time.Now()}
+		if i%2 == 0 {
+			rj.EmbedChunkCount = &chunks
+		}
+		tracks = append(tracks, rj)
+	}
+	d := bookData{
+		Dir: dir, DirQuery: "x", Title: "B", Author: "A", Total: 8, Done: 8,
+		Tracks:        tracks,
+		EmbedDone:     4,
+		EmbedTotal:    8,
+		FindingsCount: 16,
+		FindingsSummary: &db.BookFindings{
+			BookDir: dir, FilePath: dir + "/00.m4b", Count: 16,
+			MeanConfidence: 0.54, TopIssueType: "number_artifact",
+		},
+		Findings: []db.FindingRow{
+			{ID: "f1", FilePath: dir + "/00.m4b", BookDir: dir, StartSec: 1, EndSec: 2,
+				OriginalText: "x", IssueType: "number_artifact", Confidence: 0.5},
+		},
+	}
+	var buf bytes.Buffer
+	if err := bookFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		`class="pipeline-panel"`,                 // the panel renders
+		"Transcribe",                             // transcribe element label
+		"Embed",                                  // embed element label
+		"Judge",                                  // judge element label
+		`<span class="progress-text">8/8</span>`, // transcribe bar fraction
+		`<span class="progress-text">4/8</span>`, // embed bar fraction
+		"&#9873; 16 findings",                    // honest judge count (NOT a percentage)
+		`href="#book-findings"`,                  // judge chip links to findings
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in pipeline panel output:\n%s", want, out)
+		}
+	}
+	// The judge element must never render a percentage — it's a status/count.
+	if strings.Contains(out, "judge-chip") && strings.Contains(out, "% judged") {
+		t.Error("judge element must not render a percentage — schema has no eval-completion marker")
+	}
+
+	// Zero-findings case: judge shows "no findings yet" (NOT "evaluated"/"0%").
+	dClean := bookData{
+		Dir: dir, DirQuery: "x", Title: "B", Author: "A", Total: 1, Done: 1,
+		Tracks:    []db.RecentJob{{ID: "t1", FilePath: dir + "/01.m4b", Status: "done", UpdatedAt: time.Now(), EmbedChunkCount: &chunks}},
+		EmbedDone: 1, EmbedTotal: 1, FindingsCount: 0,
+	}
+	var bufClean bytes.Buffer
+	if err := bookFragmentTmpl.Execute(&bufClean, dClean); err != nil {
+		t.Fatalf("execute (clean): %v", err)
+	}
+	outClean := bufClean.String()
+	if !strings.Contains(outClean, "no findings yet") {
+		t.Errorf("zero-findings judge must read 'no findings yet':\n%s", outClean)
+	}
+	// The judge element must render the honest "no findings yet" label and the
+	// distinct judge-clean chip class — never a findings-present "⚑ N findings"
+	// label, an "evaluated (0)" claim, or a fake percentage. The schema has no
+	// eval-completion marker, so a never-judged book is indistinguishable from a
+	// judged-clean one; the label must not pretend otherwise.
+	if !strings.Contains(outClean, `class="judge-chip judge-clean"`) {
+		t.Errorf("zero-findings judge must use the judge-clean chip:\n%s", outClean)
+	}
+	if strings.Contains(outClean, "finding") && !strings.Contains(outClean, "no findings yet") {
+		t.Errorf("zero-findings judge must not render a findings count:\n%s", outClean)
+	}
+	if !strings.Contains(outClean, `<span class="progress-text">1/1</span>`) {
+		t.Errorf("clean book embed bar should read 1/1:\n%s", outClean)
+	}
+
+	// Empty-embed case: 0 done tracks → no Embed bar, em-dash instead.
+	dEmpty := bookData{
+		Dir: dir, DirQuery: "x", Title: "B", Author: "A", Total: 2, Pending: 2,
+		Tracks: []db.RecentJob{
+			{ID: "t1", FilePath: dir + "/01.m4b", Status: "pending", UpdatedAt: time.Now()},
+			{ID: "t2", FilePath: dir + "/02.m4b", Status: "pending", UpdatedAt: time.Now()},
+		},
+		EmbedDone: 0, EmbedTotal: 0, FindingsCount: 0,
+	}
+	var bufEmpty bytes.Buffer
+	if err := bookFragmentTmpl.Execute(&bufEmpty, dEmpty); err != nil {
+		t.Fatalf("execute (empty embed): %v", err)
+	}
+	outEmpty := bufEmpty.String()
+	if !strings.Contains(outEmpty, "no transcribed tracks to embed yet") {
+		t.Errorf("0 done tracks → embed should show the em-dash empty state:\n%s", outEmpty)
+	}
+	if !strings.Contains(outEmpty, `<span class="progress-text">0/2</span>`) {
+		t.Errorf("empty book transcribe bar should read 0/2:\n%s", outEmpty)
+	}
+}
+
+// TestLibraryFragmentRendersFindingsColumn renders libraryFragmentTmpl with two
+// books — one with findings, one without — and asserts the ⚑ Findings column:
+// the header, a count cell linking to that book's #book-findings, and an em-dash
+// for the zero-findings book.
+func TestLibraryFragmentRendersFindingsColumn(t *testing.T) {
+	d := libraryData{
+		Books: []bookRow{
+			{Dir: "/books/A/Has Findings", Title: "Has Findings", Author: "A",
+				DonePct: 100, Total: 2, Done: 2, LastUpdated: time.Now(), FindingCount: 12},
+			{Dir: "/books/A/No Findings", Title: "No Findings", Author: "A",
+				DonePct: 50, Total: 2, Done: 1, Pending: 1, LastUpdated: time.Now(), FindingCount: 0},
+		},
+		TotalBooks: 2, Page: 1, TotalPages: 1,
+	}
+	var buf bytes.Buffer
+	if err := libraryFragmentTmpl.Execute(&buf, d); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		">Findings</th>", // the column header
+		"&#9873; 12",     // the count cell
+		"#book-findings", // links to the book's findings anchor
+		`class="findings-link"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in library fragment output:\n%s", want, out)
+		}
+	}
+	// The zero-findings book renders an em-dash, not a ⚑ link.
+	if strings.Count(out, "findings-link") != 1 {
+		t.Errorf("expected exactly one ⚑ findings link (the book with findings):\n%s", out)
 	}
 }
 
