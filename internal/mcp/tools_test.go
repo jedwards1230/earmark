@@ -93,6 +93,9 @@ func (m *MockDBInterface) GetControl(context.Context) (bool, *int, error) {
 	return false, nil, nil
 }
 func (m *MockDBInterface) SetRunLimit(context.Context, *int, string) error { return nil }
+func (m *MockDBInterface) GetPipelinePhase(context.Context) (string, error) {
+	return "idle", nil
+}
 
 func (m *MockDBInterface) GetBookSummaries(ctx context.Context, f db.BookFilter) ([]db.BookSummary, int, error) {
 	if !m.hasExpect("GetBookSummaries") {

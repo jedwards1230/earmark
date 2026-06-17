@@ -43,6 +43,13 @@ type SimpleMockDB struct {
 	clearFindingsErr    error  // if set, ClearFindings returns it
 
 	findingsCountByBook map[string]int // GetFindingsCountByBook result (⚑ column)
+
+	phase string // GetPipelinePhase result ("" → defaults to "idle")
+
+	bookSummaries  []db.BookSummary // when non-nil, GetBookSummaries returns this set (post status/query filter applied here)
+	lastBookFilter db.BookFilter    // last filter passed to GetBookSummaries (asserts the all-in-Go fetch uses a high cap)
+
+	findingsList []db.FindingRow // when non-nil, ListFindings returns this set
 }
 
 func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error {
@@ -56,6 +63,13 @@ func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error
 
 func (m *SimpleMockDB) GetControl(_ context.Context) (bool, *int, error) {
 	return m.paused, m.runLimit, nil
+}
+
+func (m *SimpleMockDB) GetPipelinePhase(_ context.Context) (string, error) {
+	if m.phase == "" {
+		return "idle", nil
+	}
+	return m.phase, nil
 }
 
 func (m *SimpleMockDB) SetRunLimit(_ context.Context, limit *int, _ string) error {
@@ -74,6 +88,10 @@ func (m *SimpleMockDB) SetRunLimit(_ context.Context, limit *int, _ string) erro
 }
 
 func (m *SimpleMockDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookSummary, int, error) {
+	m.lastBookFilter = f
+	if m.bookSummaries != nil {
+		return m.bookSummaries, len(m.bookSummaries), nil
+	}
 	books := []db.BookSummary{
 		{Dir: "/books/Author One/Book A", Title: "Book A", Author: "Author One",
 			Total: 3, Done: 1, Pending: 2, LastUpdated: time.Now().UTC()},
@@ -143,7 +161,7 @@ func (m *SimpleMockDB) GetFindingsSummary(_ context.Context) (*db.FindingsSummar
 }
 
 func (m *SimpleMockDB) ListFindings(_ context.Context, _ string, _ int) ([]db.FindingRow, error) {
-	return nil, nil
+	return m.findingsList, nil
 }
 
 func (m *SimpleMockDB) GetFindingsCountByBook(_ context.Context) (map[string]int, error) {
@@ -307,6 +325,13 @@ func buildTestMux(mockDB DBInterface) http.Handler {
 	return NewMCPServer(mockDB, &config.Config{}).buildMux()
 }
 
+// buildTestMuxWithToken wires the mux with a CONTROL_API_TOKEN set, so the
+// token-gated pipeline controls (pause/resume, run-budget) render enabled rather
+// than as the honest "disabled — no CONTROL_API_TOKEN" affordance.
+func buildTestMuxWithToken(mockDB DBInterface) http.Handler {
+	return NewMCPServer(mockDB, &config.Config{ControlAPIToken: "tok"}).buildMux()
+}
+
 // TestHealthEndpoint verifies that GET /health always returns 200 "ok".
 func TestHealthEndpoint(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
@@ -413,6 +438,8 @@ func TestStartMCPServiceConfiguration(t *testing.T) {
 // ─── Dashboard tests ──────────────────────────────────────────────────────────
 
 // TestDashboardPage verifies that GET / returns 200 with the HTML shell.
+// TestDashboardPage verifies the home page (GET /) is now the Library shell, and
+// that it still serves the vendored htmx (no external CDN).
 func TestDashboardPage(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -430,8 +457,8 @@ func TestDashboardPage(t *testing.T) {
 	for _, marker := range []string{
 		"earmark",
 		`src="/static/htmx.min.js"`, // vendored, not a CDN
-		`hx-get="/status/data"`,
-		`hx-trigger="load, every 3s"`,
+		`id="library-region"`,       // home is now the Library
+		`hx-get="/library/data`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("GET /: body missing expected marker %q", marker)
@@ -439,6 +466,31 @@ func TestDashboardPage(t *testing.T) {
 	}
 	if strings.Contains(body, "unpkg.com") || strings.Contains(body, "//cdn") {
 		t.Error("GET /: dashboard must not reference an external CDN")
+	}
+}
+
+// TestPipelinePageShell verifies GET /pipeline serves the Pipeline ops shell:
+// the auto-refreshing status region plus the folded-in Failed region.
+func TestPipelinePageShell(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/pipeline", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /pipeline: want 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, marker := range []string{
+		`id="data-region"`,
+		`hx-get="/status/data"`,
+		`hx-trigger="load, every 3s"`,
+		`id="failed-region"`, // Failed view folded in as a 2nd region
+		`hx-get="/failed/data"`,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Errorf("GET /pipeline: body missing expected marker %q", marker)
+		}
 	}
 }
 
@@ -665,11 +717,12 @@ func TestStatusLabel(t *testing.T) {
 func TestPauseResumeActions(t *testing.T) {
 	mock := &SimpleMockDB{}
 
-	// Pause: POST /actions/pause with the htmx header.
+	// Pause: POST /actions/pause with the htmx header. The control buttons are
+	// token-gated, so wire a token so the resume button renders in the fragment.
 	req := httptest.NewRequest(http.MethodPost, "/actions/pause", nil)
 	req.Header.Set("HX-Request", "true")
 	w := httptest.NewRecorder()
-	buildTestMux(mock).ServeHTTP(w, req)
+	buildTestMuxWithToken(mock).ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("pause: want 200, got %d", w.Code)
 	}
@@ -685,7 +738,7 @@ func TestPauseResumeActions(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/actions/resume", nil)
 	req.Header.Set("HX-Request", "true")
 	w = httptest.NewRecorder()
-	buildTestMux(mock).ServeHTTP(w, req)
+	buildTestMuxWithToken(mock).ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("resume: want 200, got %d", w.Code)
 	}
@@ -921,17 +974,27 @@ func TestLibraryPageThreadsStatusFilter(t *testing.T) {
 	}
 }
 
-// TestFailedPageShell verifies the /failed page shell renders + nav.
-func TestFailedPageShell(t *testing.T) {
+// TestFailedPageRemoved verifies the standalone /failed page route is gone (the
+// Failed view is folded into /pipeline), while the /failed/data fragment it loads
+// is kept. An unmatched path under the "/" catch-all still 404s.
+func TestFailedPageRemoved(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
-	req := httptest.NewRequest(http.MethodGet, "/failed", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("GET /failed: want 200, got %d", w.Code)
-	}
-	if !strings.Contains(w.Body.String(), "failed-region") {
-		t.Error("failed page shell should contain the failed-region container")
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/failed", http.StatusNotFound}, // page route removed
+		{"/failed/data", http.StatusOK},  // fragment kept (rendered inside /pipeline)
+		{"/pipeline", http.StatusOK},     // the page that now hosts the Failed view
+		{"/not-a-real-path", http.StatusNotFound},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Errorf("GET %s: want %d, got %d", tc.path, tc.want, w.Code)
+		}
 	}
 }
 
@@ -1327,4 +1390,405 @@ func TestFindingsClearGuards(t *testing.T) {
 	if mock2.clearFindingsCalled {
 		t.Error("must not delete findings without a control token")
 	}
+}
+
+// ─── Pipeline ops page: phase badge + run-budget controls ────────────────────
+
+// TestStatusFragmentPhaseBadge verifies the status fragment renders the read-only
+// coordinator phase badge with the phase word and matching CSS class.
+func TestStatusFragmentPhaseBadge(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{phase: "transcribe"})
+	req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /status/data: want 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`phase-badge`, `phase-transcribe`, `phase: transcribe`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("status fragment missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
+// TestStatusFragmentControlsDisabledWithoutToken verifies the honesty rule: with
+// no CONTROL_API_TOKEN the pause + run-budget controls render disabled-with-
+// explanation rather than as buttons that would fail-close (503) on click.
+func TestStatusFragmentControlsDisabledWithoutToken(t *testing.T) {
+	h := buildTestMux(&SimpleMockDB{}) // empty config → no control token
+	req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, "ctrl-disabled") {
+		t.Errorf("expected a disabled-controls affordance:\n%s", body)
+	}
+	// No live control buttons should be offered.
+	for _, banned := range []string{`/actions/pause`, `/actions/run"`, `/actions/resume`} {
+		if strings.Contains(body, banned) {
+			t.Errorf("token-less fragment must not offer control button %q", banned)
+		}
+	}
+}
+
+// TestStatusFragmentControlsEnabledWithToken verifies the controls render enabled
+// (pause/run buttons present) once a token is configured.
+func TestStatusFragmentControlsEnabledWithToken(t *testing.T) {
+	h := buildTestMuxWithToken(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	for _, want := range []string{`/actions/pause`, `/actions/run"`, `run budget`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("token fragment missing enabled control %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
+// TestRunBudgetAction verifies POST /actions/run arms a bounded run: SetRunLimit(n)
+// THEN SetPaused(false) (limit before unpause), htmx-guarded + token-gated.
+func TestRunBudgetAction(t *testing.T) {
+	mock := &SimpleMockDB{}
+	req := httptest.NewRequest(http.MethodPost, "/actions/run?n=3", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMuxWithToken(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("run budget: want 200, got %d", w.Code)
+	}
+	if mock.runLimitSetTo == nil || *mock.runLimitSetTo != 3 {
+		t.Errorf("run budget did not SetRunLimit(3); got %v", mock.runLimitSetTo)
+	}
+	if mock.pausedSetTo == nil || *mock.pausedSetTo {
+		t.Error("run budget must unpause (SetPaused(false)) after setting the limit")
+	}
+
+	// Non-htmx → 403, no writes.
+	mock2 := &SimpleMockDB{}
+	req = httptest.NewRequest(http.MethodPost, "/actions/run?n=2", nil)
+	w = httptest.NewRecorder()
+	buildTestMuxWithToken(mock2).ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("non-htmx run: want 403, got %d", w.Code)
+	}
+	if mock2.runLimitSet {
+		t.Error("non-htmx run must not set a limit")
+	}
+
+	// Invalid n → action-error banner, no writes.
+	mock3 := &SimpleMockDB{}
+	req = httptest.NewRequest(http.MethodPost, "/actions/run?n=0", nil)
+	req.Header.Set("HX-Request", "true")
+	w = httptest.NewRecorder()
+	buildTestMuxWithToken(mock3).ServeHTTP(w, req)
+	if mock3.runLimitSet {
+		t.Error("invalid n must not set a limit")
+	}
+	if w.Header().Get("HX-Retarget") != "#action-error" {
+		t.Errorf("invalid n: expected action-error retarget, got %v", w.Header())
+	}
+}
+
+// TestRunBudgetFailClosedWithoutToken verifies the run controls fail closed
+// (no write, banner) when CONTROL_API_TOKEN is unset.
+func TestRunBudgetFailClosedWithoutToken(t *testing.T) {
+	mock := &SimpleMockDB{}
+	req := httptest.NewRequest(http.MethodPost, "/actions/run?n=1", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMux(mock).ServeHTTP(w, req) // no token
+	if mock.runLimitSet {
+		t.Error("run must not set a limit without a control token")
+	}
+	if w.Header().Get("HX-Retarget") != "#action-error" {
+		t.Errorf("expected fail-closed banner, got %v", w.Header())
+	}
+}
+
+// TestClearBudgetAction verifies POST /actions/run-clear clears the bound
+// (SetRunLimit(nil)) without touching the pause flag.
+func TestClearBudgetAction(t *testing.T) {
+	mock := &SimpleMockDB{}
+	req := httptest.NewRequest(http.MethodPost, "/actions/run-clear", nil)
+	req.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	buildTestMuxWithToken(mock).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("clear budget: want 200, got %d", w.Code)
+	}
+	if !mock.runLimitSet || mock.runLimitSetTo != nil {
+		t.Errorf("clear budget should SetRunLimit(nil); set=%v val=%v", mock.runLimitSet, mock.runLimitSetTo)
+	}
+	if mock.pausedSetTo != nil {
+		t.Error("clear budget must not touch the pause flag")
+	}
+}
+
+// ─── Topbar phase badge (every page) ─────────────────────────────────────────
+
+// TestTopbarPhaseBadge verifies the read-only phase + paused badge renders in the
+// shared topbar on a non-pipeline page (the Library home), linking to /pipeline.
+func TestTopbarPhaseBadge(t *testing.T) {
+	mock := &SimpleMockDB{phase: "analyze", paused: true}
+	h := buildTestMux(mock)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	for _, want := range []string{`topbar-phase`, `href="/pipeline"`, `phase: analyze`, `phase-paused`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("topbar missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
+// ─── Library sort + has-findings filter (all-in-Go) ──────────────────────────
+
+// libBooks is a fixture exercising the all-in-Go sort/filter: three books with
+// distinct finding counts, progress, and titles. SamplePath drives the metadata
+// resolver; the dirs are generic (no real lab paths).
+func libBooks() []db.BookSummary {
+	return []db.BookSummary{
+		{Dir: "/books/Andy Weir/Project Hail Mary", SamplePath: "/books/Andy Weir/Project Hail Mary/01.m4b",
+			Total: 4, Done: 2, Pending: 2},
+		{Dir: "/books/Frank Herbert/Dune", SamplePath: "/books/Frank Herbert/Dune/01.m4b",
+			Total: 2, Done: 2},
+		{Dir: "/books/Carl Sagan/Cosmos", SamplePath: "/books/Carl Sagan/Cosmos/01.m4b",
+			Total: 4, Done: 1, Pending: 3},
+	}
+}
+
+// libFindings is the ⚑ count map: PHM 21, Dune 16, Cosmos 0 (absent → 0).
+func libFindingsCounts() map[string]int {
+	return map[string]int{
+		"/books/Andy Weir/Project Hail Mary": 21,
+		"/books/Frank Herbert/Dune":          16,
+	}
+}
+
+// firstBookDirs extracts the ordered list of distinct book dirs from a library
+// fragment body, in render order (the title-link href on each row).
+func firstBookDirs(body string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(body, "\n") {
+		i := strings.Index(line, `class="file-name" href="/book?dir=`)
+		if i < 0 {
+			continue
+		}
+		rest := line[i+len(`class="file-name" href="/book?dir=`):]
+		j := strings.IndexByte(rest, '"')
+		if j < 0 {
+			continue
+		}
+		dir := rest[:j]
+		if !seen[dir] {
+			seen[dir] = true
+			out = append(out, dir)
+		}
+	}
+	return out
+}
+
+func TestLibrarySortFindings(t *testing.T) {
+	mock := &SimpleMockDB{bookSummaries: libBooks(), findingsCountByBook: libFindingsCounts()}
+	h := buildTestMux(mock)
+	req := httptest.NewRequest(http.MethodGet, "/library/data?sort=findings", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("sort=findings: want 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	// PHM (21) must render before Dune (16); both before Cosmos (0).
+	iPHM := strings.Index(body, "Project%20Hail%20Mary")
+	iDune := strings.Index(body, "Dune")
+	iCosmos := strings.Index(body, "Cosmos")
+	if iPHM < 0 || iDune < 0 || iCosmos < 0 || iPHM >= iDune || iDune >= iCosmos {
+		t.Errorf("sort=findings order wrong: PHM=%d Dune=%d Cosmos=%d", iPHM, iDune, iCosmos)
+	}
+	// The all-in-Go fetch must pull the full set (high cap), offset 0.
+	if mock.lastBookFilter.Limit < 1000 || mock.lastBookFilter.Offset != 0 {
+		t.Errorf("expected a full-set fetch (high limit, offset 0); got %+v", mock.lastBookFilter)
+	}
+}
+
+func TestLibraryHasFindingsFilter(t *testing.T) {
+	mock := &SimpleMockDB{bookSummaries: libBooks(), findingsCountByBook: libFindingsCounts()}
+	h := buildTestMux(mock)
+	req := httptest.NewRequest(http.MethodGet, "/library/data?findings=1", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	dirs := firstBookDirs(body)
+	if len(dirs) != 2 {
+		t.Errorf("findings=1 should keep exactly the 2 books with findings, got %d: %v", len(dirs), dirs)
+	}
+	if strings.Contains(body, "Cosmos") {
+		t.Error("findings=1 must drop the zero-finding book (Cosmos)")
+	}
+	// The active ⚑ chip should be marked active.
+	if !strings.Contains(body, "chip-findings active") {
+		t.Error("has-findings chip should render active under findings=1")
+	}
+}
+
+func TestLibrarySortTitle(t *testing.T) {
+	mock := &SimpleMockDB{bookSummaries: libBooks(), findingsCountByBook: libFindingsCounts()}
+	h := buildTestMux(mock)
+	req := httptest.NewRequest(http.MethodGet, "/library/data?sort=title", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	// Title sort keys on the resolved "author title": Andy Weir < Carl Sagan < Frank Herbert.
+	iAndy := strings.Index(body, "Project%20Hail%20Mary")
+	iCarl := strings.Index(body, "Cosmos")
+	iFrank := strings.Index(body, "Dune")
+	if iAndy >= iCarl || iCarl >= iFrank {
+		t.Errorf("sort=title order wrong: Andy=%d Carl=%d Frank=%d", iAndy, iCarl, iFrank)
+	}
+}
+
+func TestLibraryPagerCarriesFilters(t *testing.T) {
+	// Enough books to force a second page, all with findings so the filter keeps them.
+	var books []db.BookSummary
+	counts := map[string]int{}
+	for i := 0; i < libraryPageSize+5; i++ {
+		dir := fmt.Sprintf("/books/Author %02d/Title %02d", i, i)
+		books = append(books, db.BookSummary{Dir: dir, SamplePath: dir + "/01.m4b", Total: 1, Done: 1})
+		counts[dir] = i + 1
+	}
+	mock := &SimpleMockDB{bookSummaries: books, findingsCountByBook: counts}
+	h := buildTestMux(mock)
+	req := httptest.NewRequest(http.MethodGet, "/library/data?sort=findings&findings=1", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	// The next-page pager link must carry the active sort + findings filter.
+	if !strings.Contains(body, "sort=findings") || !strings.Contains(body, "findings=1") {
+		t.Errorf("pager/chip links must carry sort + findings filter:\n%s", body)
+	}
+	if !strings.Contains(body, "&offset=") {
+		t.Error("expected a next-page pager link (offset) for a multi-page result")
+	}
+}
+
+// ─── Track deep-jump (&t=) ───────────────────────────────────────────────────
+
+// deepJumpMock backs the deep-jump tests with a 72-segment transcript so the
+// target lands on a later page (exercising the preload-to-target-page path).
+type deepJumpMock struct {
+	*SimpleMockDB
+}
+
+func (m *deepJumpMock) GetTrackDetail(_ context.Context, jobID string) (*db.TrackDetail, error) {
+	segs := make([]db.Segment, 72)
+	for i := range segs {
+		start := float64(i) * 5.0
+		segs[i] = db.Segment{ID: i, Start: start, End: start + 5.0, Text: "seg text"}
+	}
+	return &db.TrackDetail{
+		ID: jobID, FilePath: "/books/A/B/track.m4b", Status: "done", HasTranscript: true,
+		Language: "en", DurationSeconds: 360, ModelName: "m", Segments: segs,
+	}, nil
+}
+
+func TestTrackDeepJumpPreloadsTargetPage(t *testing.T) {
+	mock := &deepJumpMock{SimpleMockDB: &SimpleMockDB{}}
+	h := NewMCPServer(mock, &config.Config{}).buildMux()
+	// t=200 → segment index 39 (segment [195,200) has End==200 ≥ 200), on page 1
+	// (39/30); the reader preloads pages [0..1] = segments [0,60).
+	req := httptest.NewRequest(http.MethodGet, "/track/data?id=job-1&t=200", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("track deep-jump: want 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	// Pages [0..target page] preloaded → seg-0 and the target seg-39 are present.
+	if !strings.Contains(body, `id="seg-0"`) || !strings.Contains(body, `id="seg-39"`) {
+		t.Errorf("deep-jump should preload through the target segment anchor\n%s", body)
+	}
+	if strings.Contains(body, `id="seg-60"`) {
+		t.Error("deep-jump should not preload beyond the target page")
+	}
+	// The target segment is highlighted.
+	if !strings.Contains(body, `id="seg-39" class="seg seg-active"`) {
+		t.Error("deep-jump target segment should carry .seg-active")
+	}
+	// A scroll script targets the anchor.
+	if !strings.Contains(body, `getElementById('seg-39')`) {
+		t.Error("deep-jump should emit a scroll-to-anchor script")
+	}
+}
+
+func TestTrackNoDeepJumpFirstPageOnly(t *testing.T) {
+	mock := &deepJumpMock{SimpleMockDB: &SimpleMockDB{}}
+	h := NewMCPServer(mock, &config.Config{}).buildMux()
+	req := httptest.NewRequest(http.MethodGet, "/track/data?id=job-1", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, `id="seg-29"`) {
+		t.Error("first page should include seg-29")
+	}
+	if strings.Contains(body, `id="seg-30"`) {
+		t.Error("without t, only the first page should render (no seg-30)")
+	}
+	if strings.Contains(body, "seg-active") {
+		t.Error("without t, no segment should be marked active")
+	}
+}
+
+// TestFindingsWhereDeepLink verifies the global worklist "Where" cell links to
+// /track?id=…&t=startSec when JobID is set, and falls back to a plain span when nil.
+func TestFindingsWhereDeepLink(t *testing.T) {
+	job := "job-42"
+	withJob := []db.FindingRow{{
+		ID: "f1", FilePath: "/books/A/B/01.m4b", BookDir: "/books/A/B", JobID: &job,
+		StartSec: 145.2, OriginalText: "pin name", IssueType: "homophone", Confidence: 0.6,
+	}}
+	mock := &SimpleMockDB{
+		findingsList: withJob,
+	}
+	// Give the summary a finding so the worklist renders (TotalFindings>0).
+	h := newFindingsTestMux(mock, 1)
+	req := httptest.NewRequest(http.MethodGet, "/findings/data", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/track?id=job-42&t=145.2"`) {
+		t.Errorf("Where cell should deep-link to the track with t=startSec:\n%s", body)
+	}
+
+	// JobID nil → plain span, no /track link.
+	noJob := []db.FindingRow{{
+		ID: "f2", FilePath: "/books/A/B/02.m4b", BookDir: "/books/A/B", JobID: nil,
+		StartSec: 10, OriginalText: "x", IssueType: "homophone", Confidence: 0.6,
+	}}
+	mock2 := &SimpleMockDB{findingsList: noJob}
+	h2 := newFindingsTestMux(mock2, 1)
+	req = httptest.NewRequest(http.MethodGet, "/findings/data", nil)
+	w = httptest.NewRecorder()
+	h2.ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), `href="/track?id=`) {
+		t.Error("a nil-JobID finding must not render a /track deep link")
+	}
+}
+
+// findingsSummaryMock overrides GetFindingsSummary to report a non-zero total so
+// the findings worklist (gated on TotalFindings>0) renders.
+type findingsSummaryMock struct {
+	*SimpleMockDB
+	total int
+}
+
+func (m *findingsSummaryMock) GetFindingsSummary(context.Context) (*db.FindingsSummary, error) {
+	return &db.FindingsSummary{TotalFindings: m.total}, nil
+}
+
+func newFindingsTestMux(base *SimpleMockDB, total int) http.Handler {
+	return NewMCPServer(&findingsSummaryMock{SimpleMockDB: base, total: total}, &config.Config{}).buildMux()
 }

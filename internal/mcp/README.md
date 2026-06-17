@@ -1,11 +1,30 @@
 # MCP Server
 
 Streamable-HTTP MCP server for earmark. Serves 5 read-only tools on `:8081/mcp`
-plus a status dashboard at `/`. The dashboard's `/findings` page and per-book
-`/book` section render individual finding rows (read-only eval worklist, CONTRACT
-§2.15) — confidence, issue type, `original → correction`, sorted highest-first —
-with links into the book each finding belongs to; the Book page also offers a
-token-gated scoped clear (`/actions/findings-clear?dir=…`).
+plus an htmx dashboard. **Home (`/`) is the Library page**; the **Pipeline ops
+page** (`/pipeline`) carries the auto-refreshing status fragment — counts,
+pipeline state, a **read-only phase badge**, and token-gated **pause + run-budget**
+controls — with the Failed jobs view folded in (the old standalone `/failed` page
+is gone, but `/failed/data` is kept). A compact read-only phase + paused badge
+shows in the topbar on every page, linking to `/pipeline`. See CONTRACT §2.12.1
+for the full page-route inventory.
+
+> The dashboard READS `runner_control.phase` but **never writes it** — the
+> `earmark batch` coordinator owns phase transitions (CONTRACT §1.4). Only
+> `paused`/`run_limit` are dashboard-writable. Controls fail closed (render
+> disabled) when `CONTROL_API_TOKEN` is unset.
+
+The Library list supports a **sort** control (`recent` — the default
+transcribed-first order — / `title` / `progress` / `findings`) and a **⚑
+has-findings** filter; both are applied all-in-Go over the full filtered set so
+they span the whole library, not just one page.
+
+The dashboard's `/findings` page and per-book `/book` section render individual
+finding rows (read-only eval worklist, CONTRACT §2.15) — confidence, issue type,
+`original → correction`, sorted highest-first. Each finding's **Where** cell deep
+-links to the transcript at the suspected point (`/track?id=…&t=<startSec>`,
+falling back to a plain label when the finding has no job id); the Book page also
+offers a token-gated scoped clear (`/actions/findings-clear?dir=…`).
 
 The Book page leads with a **pipeline panel** of three honest elements: a
 **Transcribe** progress bar (done/total tracks), an **Embed** progress bar (of the

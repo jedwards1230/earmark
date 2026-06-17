@@ -399,7 +399,6 @@ func (d demoDB) ListFindings(_ context.Context, dir string, limit int) ([]db.Fin
 	if d.scenario == "empty" {
 		return nil, nil
 	}
-	job1, job2 := "demo-job-1", "demo-job-2"
 	ci0, ci1, ci2 := 0, 4, 7
 	corr1 := "Arecibo"
 	corr2 := "three hundred"
@@ -408,6 +407,11 @@ func (d demoDB) ListFindings(_ context.Context, dir string, limit int) ([]db.Fin
 	phmFile := phmDir + "/Project Hail Mary.m4b" // == demoBooks SamplePath → track 0 (⚑ matches)
 	duneDir := "/books/audio-libation/Frank Herbert/Dune [B0011UGNDG]"
 	duneFile := duneDir + "/01 - Chapter 1.mp3" // == demoBooks SamplePath → track 0 (⚑ matches)
+	// JobIDs are aligned to real demo track ids ("<dir>#<n>") so the finding
+	// "Where" deep-jump (/track?id=…&t=…) lands on the matching demo book's track
+	// 0 (an even index → demoDB.GetTrackDetail returns a full transcript), exercising
+	// the deep-jump end-to-end against a real demo book (D4).
+	job1, job2 := phmDir+"#0", duneDir+"#0"
 	all := []db.FindingRow{
 		{ID: "f1", FilePath: phmFile,
 			BookDir: phmDir, JobID: &job1, ChunkIndex: &ci0,
@@ -499,6 +503,21 @@ func (d demoDB) GetControl(context.Context) (bool, *int, error) {
 }
 
 func (d demoDB) SetRunLimit(context.Context, *int, string) error { return nil }
+
+// GetPipelinePhase reports a per-scenario coordinator phase so the read-only
+// phase badge renders a representative state with no database: the live "active"
+// scenario is mid-transcribe, the crashed-runner "stale" scenario is in the
+// analyze phase, and every other scenario is idle (the default).
+func (d demoDB) GetPipelinePhase(context.Context) (string, error) {
+	switch d.scenario {
+	case "active":
+		return db.PhaseTranscribe, nil
+	case "stale":
+		return db.PhaseAnalyze, nil
+	default:
+		return db.PhaseIdle, nil
+	}
+}
 
 // GetServiceStatus returns a synthetic snapshot for the selected scenario.
 func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {

@@ -321,15 +321,19 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //
 // Routes:
 //
-//	GET  /                     — status dashboard (full HTML shell)
+//	GET  /                     — home: the Library page (full HTML shell)
+//	GET  /pipeline             — Pipeline ops page (status fragment + folded-in Failed view)
 //	GET  /track                — per-track detail page (shell)
 //	GET  /track/data           — per-track detail fragment (header + reader + chunks)
-//	GET  /status/data          — htmx-refreshed fragment (counts + recent jobs)
+//	GET  /status/data          — htmx-refreshed fragment (counts + recent jobs + controls)
+//	GET  /failed/data          — failed-jobs fragment (no standalone page; rendered inside /pipeline)
 //	GET  /servers              — transcription-servers page (shell)
 //	GET  /servers/data         — servers fragment (status + models/modes)
 //	GET  /static/htmx.min.js   — vendored htmx library
 //	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
 //	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)
+//	POST /actions/run          — arm a bounded run of N claims then auto-pause (htmx + token)
+//	POST /actions/run-clear    — clear a bounded run / back to unlimited (htmx + token)
 //	POST /actions/eval         — run the LLM judge over one book (htmx + token, async)
 //	POST /actions/eval-sample  — run the LLM judge over a library sample (htmx + token, async)
 //	GET  /api/v1/status              — pipeline status snapshot (JSON, no auth)
@@ -347,12 +351,13 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 
 	mux := http.NewServeMux()
 
-	// Three pages share a header/nav: Overview (/), Library (/library), and Book
-	// detail (/book). Each page shell loads its data fragment via htmx. GET is
-	// enforced with a wrapper rather than a "GET /" method pattern, which would
-	// conflict with the method-less "/mcp" route and make ServeMux panic.
-	// Only reachable under HTTP transport.
-	mux.HandleFunc("/", getOnly(s.handleOverviewPage))
+	// The home page (/) is now the Library; the Pipeline ops page lives at
+	// /pipeline (status fragment + folded-in Failed view). Each page shell loads
+	// its data fragment via htmx. GET is enforced with a wrapper rather than a
+	// "GET /" method pattern, which would conflict with the method-less "/mcp"
+	// route and make ServeMux panic. Only reachable under HTTP transport.
+	mux.HandleFunc("/", getOnly(s.handleLibraryPage))
+	mux.HandleFunc("/pipeline", getOnly(s.handlePipelinePage))
 	mux.HandleFunc("/status/data", getOnly(s.handleStatusData))
 	mux.HandleFunc("/library", getOnly(s.handleLibraryPage))
 	mux.HandleFunc("/library/data", getOnly(s.handleLibraryData))
@@ -361,7 +366,6 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/track", getOnly(s.handleTrackPage))
 	mux.HandleFunc("/track/data", getOnly(s.handleTrackData))
 	mux.HandleFunc("/track/segments", getOnly(s.handleTrackSegments))
-	mux.HandleFunc("/failed", getOnly(s.handleFailedPage))
 	mux.HandleFunc("/servers", getOnly(s.handleServersPage))
 	mux.HandleFunc("/servers/data", getOnly(s.handleServersData))
 	mux.HandleFunc("/findings", getOnly(s.handleFindingsPage))
@@ -384,6 +388,10 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("POST /actions/book-requeue", s.handleBookRequeue)
 	mux.HandleFunc("POST /actions/pause", s.handlePause)
 	mux.HandleFunc("POST /actions/resume", s.handleResume)
+	// Bounded-run controls (Pipeline page): arm a run of N claims then auto-pause,
+	// or clear the bound. htmx-guarded + fail-closed on an unset CONTROL_API_TOKEN.
+	mux.HandleFunc("POST /actions/run", s.handleRunBudget)
+	mux.HandleFunc("POST /actions/run-clear", s.handleClearBudget)
 	// On-demand LLM-as-judge runs (CONTRACT §2.15): htmx-guarded, fail-closed on
 	// an unset CONTROL_API_TOKEN, async (background goroutine).
 	mux.HandleFunc("POST /actions/eval", s.handleEvalBook)

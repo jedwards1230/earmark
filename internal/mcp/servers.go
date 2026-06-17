@@ -637,8 +637,8 @@ type serversData struct {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-func (s *MCPServer) handleServersPage(w http.ResponseWriter, _ *http.Request) {
-	s.renderPage(w, serversPage, pageShell{Title: "models / services", Nav: "servers"})
+func (s *MCPServer) handleServersPage(w http.ResponseWriter, r *http.Request) {
+	s.renderPage(w, r, serversPage, pageShell{Title: "models / services", Nav: "servers"})
 }
 
 func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
