@@ -20,6 +20,7 @@ jobs:
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
+      draft_on_blocking: true
       focus: |
         earmark is a Go service: indexes audiobook transcripts into a
         CNPG Postgres (pgvector + pg_trgm) and serves semantic search over MCP.
