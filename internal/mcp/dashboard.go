@@ -741,6 +741,12 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
     {{if .PageSegments}}
     <div class="reader">
       {{$target := .TargetSeg}}
+      {{/* Anchor id == global segment index. The initial reader preload always
+           starts at global index 0 (handleTrackData loads [0, targetPage+1)), so
+           the slice index $i IS the global index here. The /track/segments
+           load-more fragment continues the sequence with {{add $start $i}}; if
+           this initial preload is ever changed to start at a non-zero offset,
+           switch this to the same $start+$i scheme. */}}
       {{range $i, $seg := .PageSegments}}
       <div id="seg-{{$i}}" class="seg{{if and $target (eq $i (deref $target))}} seg-active{{end}}">
         <span class="seg-time">[{{timestamp $seg.Start}} &#8594; {{timestamp $seg.End}}]</span>
@@ -1597,6 +1603,9 @@ func libraryFilterParams(sort string, hasFindings bool) template.URL {
 	if hasFindings {
 		b.WriteString("&findings=1")
 	}
+	// #nosec G203 -- sort is constrained to a fixed allow-list by validSort
+	// (recent/title/progress/findings) and findings is a fixed flag; the string
+	// contains no user-controlled input, so the unescaped template.URL is safe.
 	return template.URL(b.String())
 }
 
