@@ -81,27 +81,52 @@ Mutations require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed
 ## Visual Verification
 
 The `mcp` HTTP transport serves a status dashboard at `/` (htmx, auto-refreshing
-the `/status/data` fragment every 3s). For UI changes, verify it visually before
-opening a PR — no database required:
+the `/status/data` fragment every 3s). For UI/template/CSS changes, verify it
+visually before opening a PR (skip for backend-only changes) — **no database
+required**:
 
 ```bash
-go run . mcp --demo     # serves http://localhost:8081/ with synthetic data
-# or: make dashboard
+go build -o earmark .
+# Mock mode: `--demo` backs the dashboard with an in-memory fixture
+# (internal/mcp/demo.go) so the page renders fully POPULATED with no Postgres,
+# no DATABASE_URL, and no ASR runner. This is the canonical fixture for visual
+# checks — extend internal/mcp/demo.go when you add a dashboard feature.
+# The port comes from MCP_HTTP_ADDR (default :8081); pin it for verification:
+MCP_HTTP_ADDR=:9876 ./earmark mcp --demo      # http://localhost:9876/
+# or, on the default port:  make dashboard      # http://localhost:8081/
 ```
 
-`--demo` backs the dashboard with an in-memory fixture (`internal/mcp/demo.go`)
-so the page renders fully with no Postgres, no DATABASE_URL, and no ASR runner.
-Set `DEMO_SCENARIO` to render a specific state: `active` (default), `empty`
-(fresh install), `stale` (crashed runner — old heartbeat), `failed` (failures
-incl. a long multi-line error), or `multibackend` (three ASR families —
-Parakeet/Whisper/Canary — across three servers). To see the connection-lost banner, open the page
-then stop the server — htmx flags the data stale instead of freezing silently.
+Set `DEMO_SCENARIO` to render a specific state so every UI path is testable:
+`active` (default), `empty` (fresh install), `stale` (crashed runner — old
+heartbeat), `failed` (failures incl. a long multi-line error), or `multibackend`
+(three ASR families — Parakeet/Whisper/Canary — across three servers). To see the
+connection-lost banner, open the page then stop the server — htmx flags the data
+stale instead of freezing silently.
 
-Playwright is wired for AI agents via `.claude/mcp.json` (the `playwright` MCP
-server). With the demo server running, use Playwright (MCP) to navigate to
-`http://localhost:8081/`, then `browser_snapshot` / `browser_take_screenshot`.
-Drive the htmx refresh by waiting, or fetch the fragment directly at
-`http://localhost:8081/status/data`.
+```bash
+# Smoke-test the rendered HTML without a browser (server must be running):
+curl -sf http://localhost:9876/             # full dashboard page
+curl -sf http://localhost:9876/status/data  # htmx auto-refresh fragment
+curl -sf http://localhost:9876/servers      # Models/Services page
+```
+
+Then verify with the **Playwright MCP** server (declared in both `.mcp.json` and
+`.claude/mcp.json`, pinned to `--browser firefox`):
+
+- `browser_navigate` to `http://localhost:9876/` and the feature pages
+  (`/servers`, plus `?scenario=...` via `DEMO_SCENARIO` restarts), then
+  `browser_snapshot` / `browser_take_screenshot` for **light and dark** mode.
+- Toggle dark mode with the page's theme control, or
+  `document.documentElement.setAttribute('data-theme', 'dark')` via
+  `browser_evaluate`.
+- Drive the htmx refresh by waiting, or fetch the fragment directly at
+  `http://localhost:9876/status/data`.
+- Save screenshots under `.playwright-mcp/` (gitignored) so they are not
+  committed.
+
+On Claude Code on the web, `.claude/hooks/session-start.sh` installs the firefox
+browser binary so `browser_navigate` works without manual setup; locally, run
+`npx playwright install firefox` once.
 
 ## Environment Variables
 
