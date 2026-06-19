@@ -48,5 +48,13 @@
         ]
       }
     ]
+  },
+  "extraKnownMarketplaces": {
+    "jedwards1230-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "jedwards1230/claude-plugins"
+      }
+    }
   }
 }
