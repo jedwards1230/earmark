@@ -106,6 +106,9 @@ func runBatch(_ *cobra.Command, _ []string) {
 		MaxBatches:   opts.maxBatches,
 		PollInterval: opts.pollInterval,
 		ArbiterPoll:  opts.arbiterPoll,
+		// Record runner_availability transitions to pipeline_events (CONTRACT §1.7)
+		// so the availability windows feed the calendar ETA model. Best-effort.
+		Sink: database,
 	}
 	arbiter := batch.NewHTTPArbiter(arbiterURL, opts.arbiterTimeout)
 

@@ -25,6 +25,7 @@ CREATE TABLE transcription_jobs (
     claimed_at   TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,                     -- stamped by a trigger on the transition INTO status='done'; NULL otherwise (incl. old rows pre-dating this column)
     error        TEXT,                           -- last error message when status='failed'
     attempts     INTEGER     NOT NULL DEFAULT 0,
 
@@ -47,6 +48,29 @@ $$;
 CREATE TRIGGER transcription_jobs_updated_at
     BEFORE UPDATE ON transcription_jobs
     FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_updated_at();
+
+-- completed_at: stamp the exact completion time when a row transitions INTO
+-- 'done'. The runner owns the mark-done UPDATE (the Go side never marks jobs
+-- done), so a BEFORE UPDATE trigger is the Go-only way to record it. It clears
+-- completed_at when a row leaves 'done' (operator requeue), so the column always
+-- reflects the current run. Old 'done' rows keep NULL (no backfill — there is no
+-- historical completion time to recover); DoneLastHour uses
+-- COALESCE(completed_at, updated_at) so it stays correct on those old rows.
+CREATE OR REPLACE FUNCTION transcription_jobs_set_completed_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status = 'done' AND (OLD.status IS DISTINCT FROM 'done') THEN
+        NEW.completed_at = now();
+    ELSIF NEW.status <> 'done' AND OLD.status = 'done' THEN
+        NEW.completed_at = NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER transcription_jobs_completed_at
+    BEFORE UPDATE ON transcription_jobs
+    FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_completed_at();
 ```
 
 ### 1.2 Transcript Storage — `transcripts` table
@@ -400,9 +424,10 @@ runner) and is transactional:
 
 One row per job capturing telemetry across the whole run (probe → transcribe →
 embed). It is **additive**: nothing in §1.1–§1.4 or §3 depends on it, and a
-missing row never blocks the pipeline. Three independent writers each UPSERT
+missing row never blocks the pipeline. Four independent writers each UPSERT
 **only their own slice** of columns keyed on `job_id`, so they never clobber
-each other:
+each other (the Go monitor, the Python ASR runner, the Go embed worker, and the
+Go eval layer):
 
 ```sql
 CREATE TABLE IF NOT EXISTS run_metrics (
@@ -412,6 +437,10 @@ CREATE TABLE IF NOT EXISTS run_metrics (
   runner_host TEXT, chunked BOOLEAN, n_windows INT, char_count INT, word_count INT, segment_count INT,
   embed_started_at TIMESTAMPTZ, embed_finished_at TIMESTAMPTZ, embed_model TEXT, embed_chunk_count INT,
   embed_prompt_tokens INT, embed_total_tokens INT,
+  -- Eval slice (the LLM judge — a fourth column-selective writer). All nullable,
+  -- best-effort. eval_finished_at IS NOT NULL is the per-job eval-completion marker.
+  eval_started_at TIMESTAMPTZ, eval_finished_at TIMESTAMPTZ, eval_model TEXT,
+  eval_chunks INT, eval_skipped INT, eval_findings INT,
   -- ASR backend descriptor (§2.13). All nullable, runner-owned, best-effort.
   asr_family TEXT, asr_runtime TEXT,
   caps_applied JSONB, caps_requested JSONB, caps_skipped_reason JSONB,
@@ -441,6 +470,20 @@ no breaking change.** Their shapes and the capability vocabulary are defined in
 | **Go monitor** | at enqueue (file size from `os.Stat`) | `audio_bytes` |
 | **Python ASR runner** | after transcribing | `audio_channels`, `audio_sample_rate`, `audio_codec`, `audio_format`, `transcribe_started_at`, `transcribe_finished_at`, `asr_model`, `compute_type`, `runner_host`, `chunked`, `n_windows`, `char_count`, `word_count`, `segment_count`; **SHOULD also** `asr_family`, `asr_runtime`, `caps_applied`, `caps_requested`, `caps_skipped_reason`, `mean_word_confidence` (the §2.13 backend descriptor) |
 | **Go embed worker** | after `transcript_chunks` insert | `embed_started_at`, `embed_finished_at`, `embed_model`, `embed_chunk_count`, `embed_prompt_tokens`, `embed_total_tokens` |
+| **Go eval layer** | after the in-pipeline judge runs over a transcript's chunks (`EVAL_IN_PIPELINE`) | `eval_started_at`, `eval_finished_at`, `eval_model`, `eval_chunks`, `eval_skipped`, `eval_findings` |
+
+**Eval slice + completion marker.** `eval_finished_at IS NOT NULL` is the
+**per-job eval-completion marker** — a job has been judged iff its `run_metrics`
+row has a non-NULL `eval_finished_at`. Eval coverage is thus a real ratio
+(`COUNT(eval_finished_at) / COUNT(done jobs)`) rather than a findings-row count
+(a clean job has 0 findings but is still "evaluated"). `eval_model` is the judge
+model id; `eval_chunks`/`eval_skipped`/`eval_findings` are the run's
+`ChunksEvaluated`/`ChunksSkipped`/`FindingsFound`. The eval slice is written
+**only by the in-pipeline path** (`EVAL_IN_PIPELINE`), where the chunk set maps
+cleanly to one job (`job_id`). The **standalone** `earmark eval` / `/actions/eval*`
+paths evaluate a whole book (many jobs) or a library-wide sample, so they do
+**not** write the per-job `run_metrics` eval slice (the mapping to a single job
+is ambiguous); they emit a `pipeline_events` `stage='eval'` row instead (§1.7).
 
 The new runner-owned columns join the runner's existing single UPSERT slice — no
 clobber risk, since they are columns no other writer touches. Populating them is
@@ -524,6 +567,83 @@ Rules:
   metadata source is reflected on the next write.
 - `chapters` is nullable and left `NULL` when no ABS provider is configured.
 - The Go service creates the table in its schema-init transaction.
+
+### 1.7 Append-only pipeline audit log — `pipeline_events` table
+
+An **append-only** record of every Go-observable pipeline stage boundary —
+the immutable timeline (what happened, when, by whom, how long) that complements
+`run_metrics` (the current-state projection). It is **additive** and
+**best-effort**: a failed event insert logs and continues; it NEVER fails the
+pipeline stage that produced it. Writer: the **Go monitor**, **Go embed worker**,
+and **Go DB layer** (requeue/recovery). The Python runner's claim/transcribe/done
+events are **deferred** (see below).
+
+```sql
+CREATE TABLE IF NOT EXISTS pipeline_events (
+    id             BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_id         UUID        REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+    file_path      TEXT,                          -- denormalized so a timeline survives a job's requeue churn
+    stage          TEXT        NOT NULL CHECK (stage IN
+                     ('discover','enqueue','claim','transcribe','chunk','embed','eval',
+                      'done','fail','requeue','heartbeat','runner_availability')),
+    event          TEXT        NOT NULL CHECK (event IN
+                     ('start','finish','error','skip','retry','state')),
+    runner_host    TEXT,                          -- who: a runner id / 'go-worker' / 'go-monitor'
+    model          TEXT,                          -- asr/embed/eval model id for this stage
+    model_version  TEXT,                          -- family+runtime or chart/image version
+    duration_ms    BIGINT,                        -- set on 'finish'/'error'
+    item_count     INT,                           -- chunks/windows/findings, stage-dependent
+    token_count    BIGINT,                        -- prompt+total where applicable
+    attempt        INT,                           -- transcription_jobs.attempts at the time
+    reason         TEXT,                          -- failure/skip reason (free text)
+    detail         JSONB,                         -- stage-specific extras (eval stats, availability, …)
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS pipeline_events_job_id_idx  ON pipeline_events (job_id, created_at);
+CREATE INDEX IF NOT EXISTS pipeline_events_stage_idx   ON pipeline_events (stage, event, created_at);
+CREATE INDEX IF NOT EXISTS pipeline_events_created_idx ON pipeline_events (created_at);
+```
+
+Rules:
+- **`job_id` nullable** so `runner_availability` and `heartbeat` events (not tied
+  to a job) can be recorded; **`file_path` denormalized** so the timeline is
+  reconstructable even after a requeue mutates/clears the job.
+- **Append-only by convention** — no UPDATE/DELETE in Go except the retention
+  prune below and the `ON DELETE CASCADE` (a job's history dies with the job,
+  matching `run_metrics`; the denormalized `file_path` keeps the timeline legible
+  within the retention window even as a job is requeued).
+- **Best-effort** — same contract as `run_metrics`: a failed insert logs and
+  continues; it never fails the pipeline stage.
+- **Retention prune** — a periodic best-effort
+  `DELETE FROM pipeline_events WHERE created_at < now() - interval '180 days' AND
+  stage IN ('heartbeat','runner_availability')` (run from the monitor: once at
+  startup, then every 24h). Only the high-frequency heartbeat/availability rows
+  are pruned; per-job stage events are low-volume and kept indefinitely.
+
+#### Stages: Go-emitted vs deferred (runner-side)
+
+| Stage / event | Source | Status |
+|---|---|---|
+| `enqueue` / `finish` | Go monitor, at job creation | **Go-emitted** |
+| `embed` / `start`,`finish` | Go embed worker | **Go-emitted** (duration_ms, model, item_count=chunks) |
+| `eval` / `start`,`finish`,`error` | Go embed worker (in-pipeline judge) + standalone eval | **Go-emitted** (duration_ms, model, item_count=findings, detail={evaluated,skipped}) |
+| `requeue` / `retry` | Go: operator requeue + stale-claim recovery (reset-to-pending) | **Go-emitted** |
+| `fail` / `error` | Go: stale-claim recovery hitting the attempt cap | **Go-emitted** |
+| `runner_availability` / `state` | Go batch coordinator (gpu-arbiter poll, on transition) | **Go-emitted** (Phase 3, §1.4) |
+| `heartbeat` | derived from the runner's existing claimed-job heartbeat | **derived** — see the heartbeat caveat below |
+| `claim`, `transcribe`, `done` | Python runner | **DEFERRED** — requires runner.py changes + on-hardware validation (NeMo/CUDA). The runner owns the claim/transcribe/mark-done UPDATEs; emitting these from runner.py is a follow-up PR. `done` cannot be observed Go-side (the completion time is captured by the `completed_at` trigger, §1.1, but no Go code sees the transition). |
+
+> **Heartbeat is claim-activity, not idle liveness.** The runner only stamps
+> `transcription_jobs.updated_at` while a job is **claimed** (every
+> `RUNNER_HEARTBEAT_SECONDS`, default 60). There is **no idle heartbeat** — when
+> the queue is drained or the runner is paused, nothing is stamped. So a
+> heartbeat-derived liveness signal (and the `earmark_runner_last_heartbeat_seconds`
+> gauge, §2.16) reflects "time since last claim-activity," and **cannot**
+> distinguish "runner idle, queue empty" from "runner down." A **true idle
+> heartbeat is exactly the deferred runner.py work** — it is why that follow-up
+> matters. Consumers MUST pair this signal with a queue-non-empty + not-paused
+> condition before treating staleness as "down."
 
 ---
 
@@ -666,6 +786,8 @@ All env var names are fixed. No synonyms, no alternatives.
 | `AI_ROLES` | no | JSON object binding role names (`embeddings`, `eval`) to endpoint IDs (§2.14). Required when `AI_ENDPOINTS` is set. |
 | `BOOKS_DIR` | no | `/books` (read-only NFS mount inside container) |
 | `MCP_HTTP_ADDR` | no | `:8081` |
+| `INGEST_HTTP_ADDR` | no | `:8082`. The `earmark monitor` (ingest) process serves a minimal HTTP listener here for `/healthz` (liveness) and `/metrics` (Prometheus, §2.16). The mcp pod uses `MCP_HTTP_ADDR` for its surface; this is the ingest pod's only HTTP port. Chosen to avoid colliding with `:8081`. |
+| `LOG_FORMAT` | no | `pretty` (default — human-readable, ANSI-colored `PrettyHandler`). Set `json` for a `slog` JSON handler writing one JSON object per line to stdout (parseable in Loki). Both carry the `module` attribute and honor `LOG_DEBUG`/`LOG_VERBOSE`. Used by both Go pods. |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
@@ -912,7 +1034,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 
 | Method | Path | Auth | Body | Result |
 |--------|------|------|------|--------|
-| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured) and an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed — the AI endpoint registry with health probes, §2.14) |
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed — the AI endpoint registry with health probes, §2.14), and an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed) |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
@@ -1268,6 +1390,38 @@ new route, env var, or column; informational only.
 The judge has false positives and misses; because findings are advisory-only
 that is harmless. Track judge precision over time by spot-checking high-confidence
 findings.
+
+---
+
+### 2.16 Prometheus metrics
+
+Both Go pods expose a Prometheus `/metrics` endpoint (the mcp pod mounts it on
+its existing `:8081` mux; the ingest pod on its `INGEST_HTTP_ADDR` listener,
+§2.4). The surface is **gauges/counters only — NO per-job series** (high-
+cardinality per-job history belongs in Postgres/Grafana, not Prometheus). These
+metric **names are load-bearing** — the homelab-k8s companion PR (alert rules,
+dashboards, scrape config) depends on them verbatim; do not rename without
+updating that PR.
+
+The current-state gauges are produced by a scrape-time collector that reads the
+DB on each scrape (always fresh, no refresh goroutine). The counters and the
+histogram are incremented at the Go-emitted pipeline event sites.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `earmark_jobs` | gauge | `status` (`pending`/`claimed`/`done`/`failed`) | Current `transcription_jobs` count by status. |
+| `earmark_embed_backlog` | gauge | — | Completed transcripts with no chunks yet (the embed worker's needs-embedding set). |
+| `earmark_eval_coverage_ratio` | gauge | — | Done jobs judged (`run_metrics.eval_finished_at` non-NULL) ÷ done jobs; `0` when no done jobs. |
+| `earmark_runner_last_heartbeat_seconds` | gauge | — | Seconds since the runner's last **claim-activity**. The runner only stamps a heartbeat while a job is claimed (no idle heartbeat, §1.7), so this is NOT idle liveness and CANNOT distinguish "idle, queue empty" from "down". **Omitted entirely when there is no claim/completion history** (so an alert can't misread a multi-day age). Pair with `earmark_jobs{status="pending"}+earmark_jobs{status="claimed"}>0` before alerting. |
+| `earmark_runner_available` | gauge | — | `1` when the GPU host is free for transcription (gpu-arbiter not gaming), `0` when gaming/evicting. Omitted until a `runner_availability` event has been observed. |
+| `earmark_stage_duration_seconds` | histogram | `stage` | Per-stage processing duration, observed at Go-emitted finish events (`embed`, `eval`). |
+| `earmark_jobs_completed_total` | counter | — | Go-observable embed-stage completions (best-effort — the **runner** owns the job `done` transition, so this counts the worker's embed finishes, not the runner's mark-done). |
+| `earmark_jobs_failed_total` | counter | — | Go-observable job failures (the stale-claim attempt-cap path). Best-effort — runner-side failures are not counted here; `earmark_jobs{status="failed"}` is the authoritative current failed count. |
+| `earmark_eta_work_seconds` | gauge | — | Empirical busy-time ETA for the remaining chunks (§4). Omitted when there is no remaining work / no rate history. |
+| `earmark_eta_calendar_seconds` | gauge | — | Empirical calendar ETA (work ÷ runner-availability fraction, §4). Omitted when availability history is absent. |
+
+Standard `go_*` and `process_*` collectors are also registered for baseline
+observability. Both pods also serve `/healthz` (liveness, always-200).
 
 ---
 

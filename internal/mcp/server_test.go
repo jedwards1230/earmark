@@ -14,6 +14,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/predict"
 	"github.com/jedwards1230/earmark/internal/eval"
 )
 
@@ -298,6 +299,17 @@ func (m *SimpleMockDB) GetServiceStatus(_ context.Context) (*db.QueueStats, erro
 		RunnerActive:  true,
 		RunnerID:      runnerID,
 		LastHeartbeat: &now,
+	}, nil
+}
+
+func (m *SimpleMockDB) GetPredictInputs(_ context.Context) (predict.Inputs, error) {
+	return predict.Inputs{
+		RemainingChunks: 100,
+		Rates: predict.Rates{
+			TranscribeSecPerChunk: 7, EmbedSecPerChunk: 0.5,
+			EvalSecPerChunk: 1, EvalKnown: true,
+		},
+		AvailabilityFraction: 0.5,
 	}, nil
 }
 
@@ -646,7 +658,7 @@ func TestFragmentEscapesJobError(t *testing.T) {
 	var buf bytes.Buffer
 	data := newStatusData(&db.QueueStats{}, []db.RecentJob{
 		{ID: "x", FilePath: "/books/a/b.m4b", Status: "failed", Error: &evil},
-	}, time.Now(), 30*time.Minute, "")
+	}, time.Now(), 30*time.Minute, "", nil)
 	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
 		t.Fatalf("fragment execute: %v", err)
 	}

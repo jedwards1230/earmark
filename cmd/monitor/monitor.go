@@ -7,10 +7,13 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/ingesthttp"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/metrics"
 	"github.com/jedwards1230/earmark/internal/monitor"
 	"github.com/jedwards1230/earmark/internal/queue"
 	"github.com/jedwards1230/earmark/internal/worker"
@@ -59,6 +62,24 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	fileMonitor := monitor.NewFileMonitor(cfg, database, meta)
 	w := worker.NewWorker(workQueue, database, cfg)
 
+	// Prometheus metrics for the ingest pod (CONTRACT §2.16). The scrape-time
+	// collector reads the DB for current-state gauges; the worker records stage
+	// durations + counters through the same registry.
+	reg := metrics.New(database, 2*time.Second)
+	w.SetMetrics(reg)
+
+	// Minimal HTTP listener for the ingest pod: /healthz (liveness) + /metrics
+	// (Prometheus). The ingest process has no MCP server, so this is its only HTTP
+	// surface (replaces the broken `pgrep` liveness probe). A bind failure is
+	// logged but non-fatal — the worker/monitor are the real work and must not be
+	// blocked by a probe-only port being unavailable.
+	ingestSrv := ingesthttp.New(cfg.IngestHTTPAddr, reg.Handler())
+	go func() {
+		if err := ingestSrv.Start(); err != nil {
+			log.Printf("ingest HTTP listener error: %v", err)
+		}
+	}()
+
 	// Start monitor first and wait for initial scan to complete.
 	monitorReady := make(chan struct{})
 	go func() {
@@ -87,6 +108,12 @@ func runMonitor(cmd *cobra.Command, args []string) {
 
 	fileMonitor.Stop()
 	w.Stop()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := ingestSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("ingest HTTP listener shutdown error: %v", err)
+	}
 
 	log.Println("Waiting for all tasks to complete...")
 	wg.Wait()

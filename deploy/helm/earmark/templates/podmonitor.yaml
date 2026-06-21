@@ -1,0 +1,32 @@
+{{- if .Values.podMonitor.enabled }}
+# PodMonitor — scrapes /metrics (CONTRACT §2.16) on both earmark pods.
+#
+# The mcp pod exposes metrics on its `http` port (8081); the ingest pod on its
+# `metrics` port (8082). Both endpoints are listed; the Prometheus Operator only
+# scrapes a port endpoint on pods that actually declare that named port, so each
+# endpoint targets exactly its pod.
+#
+# Requires the Prometheus Operator (monitoring.coreos.com/v1 PodMonitor CRD).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "earmark.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "earmark.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "earmark.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    # mcp pod: /metrics on the http port.
+    - port: http
+      path: /metrics
+      interval: {{ .Values.podMonitor.interval }}
+      scrapeTimeout: {{ .Values.podMonitor.scrapeTimeout }}
+    # ingest pod: /metrics on the metrics port.
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.podMonitor.interval }}
+      scrapeTimeout: {{ .Values.podMonitor.scrapeTimeout }}
+{{- end }}

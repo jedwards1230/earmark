@@ -18,6 +18,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/transcribe"
@@ -39,6 +40,12 @@ type DBInterface interface {
 	// MetadataProvider at enqueue time (CONTRACT §1.6). Best-effort: a failure
 	// here must not fail enqueue.
 	UpsertBookMetadata(ctx context.Context, bookDir string, meta metaprovider.BookMeta) error
+	// AppendEvent records one pipeline_events row (CONTRACT §1.7). Best-effort:
+	// the monitor logs-and-continues; an event write never fails enqueue.
+	AppendEvent(ctx context.Context, e db.PipelineEvent) error
+	// PruneEvents removes high-frequency heartbeat/runner_availability events past
+	// the retention window. Best-effort; run periodically from the monitor.
+	PruneEvents(ctx context.Context) (int64, error)
 }
 
 // Default file-stability tuning. A new file is only hashed once its size has
@@ -120,6 +127,11 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 	fm.log.Info("monitor ready", "path", fm.cfg.BooksDir)
 	close(ready)
 
+	// Periodic retention prune of high-frequency pipeline_events
+	// (heartbeat/runner_availability) so they don't grow unbounded (CONTRACT §1.7).
+	// Best-effort + ctx-aware; runs once at startup and every 24h thereafter.
+	go fm.runRetentionPrune()
+
 	for {
 		select {
 		case event, ok := <-watcher.Events:
@@ -143,6 +155,37 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 			fm.log.Error("watcher error", "error", err)
 		case <-fm.ctx.Done():
 			return
+		}
+	}
+}
+
+// runRetentionPrune prunes high-frequency pipeline_events past their retention
+// window once at startup, then every 24h until the monitor's context is
+// cancelled. Best-effort: a prune failure is logged and the loop continues.
+func (fm *FileMonitor) runRetentionPrune() {
+	const interval = 24 * time.Hour
+	prune := func() {
+		ctx, cancel := context.WithTimeout(fm.ctx, 60*time.Second)
+		defer cancel()
+		n, err := fm.db.PruneEvents(ctx)
+		if err != nil {
+			fm.log.Warn("pipeline_events retention prune failed (continuing)", "error", err)
+			return
+		}
+		if n > 0 {
+			fm.log.Info("pruned old pipeline_events", "count", n)
+		}
+	}
+
+	prune()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-fm.ctx.Done():
+			return
+		case <-ticker.C:
+			prune()
 		}
 	}
 }
@@ -245,6 +288,17 @@ func (fm *FileMonitor) enqueueFile(filePath string) {
 	}
 	if created {
 		fm.log.Info("enqueued transcription job", "file", filePath, "job_id", jobID)
+		// Audit event for the enqueue boundary (CONTRACT §1.7). Best-effort:
+		// log-and-continue — an event write must never fail enqueue.
+		if err := fm.db.AppendEvent(ctx, db.PipelineEvent{
+			JobID:      jobID,
+			FilePath:   filePath,
+			Stage:      db.StageEnqueue,
+			Event:      db.EventFinish,
+			RunnerHost: db.HostGoMonitor,
+		}); err != nil {
+			fm.log.Warn("pipeline event (enqueue) write failed (continuing)", "file", filePath, "job_id", jobID, "error", err)
+		}
 	} else {
 		fm.log.Debug("job already exists", "file", filePath)
 	}

@@ -425,6 +425,41 @@ func (db *DB) initialize(ctx context.Context) error {
 			ON transcript_findings (transcription_run_id);
 		CREATE INDEX IF NOT EXISTS transcript_findings_issue_type_idx
 			ON transcript_findings (issue_type);
+
+		-- pipeline_events: append-only audit log of pipeline stage transitions
+		-- (CONTRACT §1.7). Every Go-observable stage boundary (enqueue, embed
+		-- start/finish, eval start/finish, fail/requeue, runner_availability,
+		-- heartbeat-derived) appends one immutable row. job_id is nullable so
+		-- runner_availability/heartbeat events (not tied to a job) can be recorded;
+		-- file_path is denormalized so a timeline survives a requeue mutating the
+		-- job row. Append-only by convention (no UPDATE/DELETE except the retention
+		-- prune of high-frequency heartbeat/availability rows and the ON DELETE
+		-- CASCADE that ties a job's history to the job). Writes are best-effort — a
+		-- failed insert logs and continues; it NEVER fails the pipeline stage.
+		CREATE TABLE IF NOT EXISTS pipeline_events (
+			id             BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			job_id         UUID        REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+			file_path      TEXT,
+			stage          TEXT        NOT NULL CHECK (stage IN
+			                 ('discover','enqueue','claim','transcribe','chunk','embed','eval',
+			                  'done','fail','requeue','heartbeat','runner_availability')),
+			event          TEXT        NOT NULL CHECK (event IN
+			                 ('start','finish','error','skip','retry','state')),
+			runner_host    TEXT,
+			model          TEXT,
+			model_version  TEXT,
+			duration_ms    BIGINT,
+			item_count     INT,
+			token_count    BIGINT,
+			attempt        INT,
+			reason         TEXT,
+			detail         JSONB,
+			created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+
+		CREATE INDEX IF NOT EXISTS pipeline_events_job_id_idx  ON pipeline_events (job_id, created_at);
+		CREATE INDEX IF NOT EXISTS pipeline_events_stage_idx   ON pipeline_events (stage, event, created_at);
+		CREATE INDEX IF NOT EXISTS pipeline_events_created_idx ON pipeline_events (created_at);
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -522,6 +557,57 @@ func (db *DB) initialize(ctx context.Context) error {
 			ADD COLUMN IF NOT EXISTS mean_word_confidence FLOAT8;
 	`); err != nil {
 		return fmt.Errorf("run_metrics asr-descriptor migration: %w", err)
+	}
+
+	// Eval-slice migration (CONTRACT §1.5): add the six eval_* columns to an
+	// existing run_metrics table — the LLM-judge's slice (a fourth column-selective
+	// writer, UpsertEvalMetrics). All additive + nullable, so a deployment that
+	// never runs eval keeps every column NULL. eval_finished_at IS NOT NULL is the
+	// per-job eval-completion marker (the first such marker — none existed before).
+	// ADD COLUMN IF NOT EXISTS is a no-op when already present, safe on every boot.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE run_metrics
+			ADD COLUMN IF NOT EXISTS eval_started_at  TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS eval_finished_at TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS eval_model       TEXT,
+			ADD COLUMN IF NOT EXISTS eval_chunks      INT,
+			ADD COLUMN IF NOT EXISTS eval_skipped     INT,
+			ADD COLUMN IF NOT EXISTS eval_findings    INT;
+	`); err != nil {
+		return fmt.Errorf("run_metrics eval-slice migration: %w", err)
+	}
+
+	// completed_at + trigger (CONTRACT §1.1): stamp completed_at = now() whenever a
+	// transcription_jobs row transitions INTO status='done'. The runner owns the
+	// mark-done UPDATE (the Go side never marks jobs done), so a trigger is the
+	// only Go-only way to record completion time. Old 'done' rows keep NULL (no
+	// backfill — there is no historical completion time to recover). DoneLastHour
+	// uses COALESCE(completed_at, updated_at) so it stays correct on old rows.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE transcription_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+		CREATE OR REPLACE FUNCTION transcription_jobs_set_completed_at()
+		RETURNS TRIGGER LANGUAGE plpgsql AS $$
+		BEGIN
+			-- Stamp only on the transition INTO 'done' (so a heartbeat UPDATE on an
+			-- already-done row, or a requeue out of 'done', never re-stamps it).
+			IF NEW.status = 'done' AND (OLD.status IS DISTINCT FROM 'done') THEN
+				NEW.completed_at = now();
+			-- Leaving 'done' (e.g. operator requeue back to 'pending') clears it so
+			-- the column always reflects the current run's completion, not a stale one.
+			ELSIF NEW.status <> 'done' AND OLD.status = 'done' THEN
+				NEW.completed_at = NULL;
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+
+		DROP TRIGGER IF EXISTS transcription_jobs_completed_at ON transcription_jobs;
+		CREATE TRIGGER transcription_jobs_completed_at
+			BEFORE UPDATE ON transcription_jobs
+			FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_completed_at();
+	`); err != nil {
+		return fmt.Errorf("completed_at migration: %w", err)
 	}
 
 	return tx.Commit(ctx)
@@ -622,14 +708,16 @@ func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error
 
 // RecoverStaleJobs resets jobs stuck in "claimed" state longer than the
 // configured stale timeout. Jobs that have reached max attempts are marked
-// failed. (CONTRACT §1.3 — stale-claim recovery.)
-func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error {
+// failed. (CONTRACT §1.3 — stale-claim recovery.) Returns the number of jobs
+// newly marked 'failed' (for the best-effort failed-jobs metric).
+func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) (int, error) {
 	// Use an integer-seconds interval to avoid PostgreSQL misreading Go duration
 	// strings (e.g. "30m0s" where bare 'm' means months in Postgres).
 	secs := int(timeout.Seconds())
 
-	// Reset below-max-attempts jobs to pending.
-	if _, err := db.pool.Exec(ctx, `
+	// Reset below-max-attempts jobs to pending. RETURNING the affected rows lets us
+	// emit best-effort requeue audit events (CONTRACT §1.7) without a second query.
+	reset, err := db.pool.Query(ctx, `
 		UPDATE transcription_jobs
 		SET    status     = 'pending',
 		       claimed_by = NULL,
@@ -637,22 +725,82 @@ func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 		WHERE  status     = 'claimed'
 		  AND  updated_at < now() - ($1 * interval '1 second')
 		  AND  attempts   < 3
-	`, secs); err != nil {
-		return fmt.Errorf("reset stale jobs: %w", err)
+		RETURNING id, file_path, attempts
+	`, secs)
+	if err != nil {
+		return 0, fmt.Errorf("reset stale jobs: %w", err)
+	}
+	requeued, rerr := scanStaleRows(reset)
+	if rerr != nil {
+		return 0, fmt.Errorf("scan reset stale jobs: %w", rerr)
 	}
 
 	// Mark max-attempts jobs failed.
-	if _, err := db.pool.Exec(ctx, `
+	failed, err := db.pool.Query(ctx, `
 		UPDATE transcription_jobs
 		SET    status = 'failed',
 		       error  = 'max attempts reached'
 		WHERE  status     = 'claimed'
 		  AND  updated_at < now() - ($1 * interval '1 second')
 		  AND  attempts   >= 3
-	`, secs); err != nil {
-		return fmt.Errorf("fail max-attempts jobs: %w", err)
+		RETURNING id, file_path, attempts
+	`, secs)
+	if err != nil {
+		return 0, fmt.Errorf("fail max-attempts jobs: %w", err)
 	}
-	return nil
+	failedRows, ferr := scanStaleRows(failed)
+	if ferr != nil {
+		return 0, fmt.Errorf("scan failed stale jobs: %w", ferr)
+	}
+
+	// Emit audit events for each recovered job (CONTRACT §1.7). Best-effort: a
+	// stale-recovery row that became 'pending' is a requeue; one that hit the
+	// attempt cap is a discarded failure. The reason+attempt distinguish them.
+	for _, r := range requeued {
+		db.emitEvent(ctx, PipelineEvent{
+			JobID: r.id, FilePath: r.filePath, Stage: StageRequeue, Event: EventRetry,
+			RunnerHost: HostGoWorker, Attempt: IntPtr(r.attempts),
+			Reason: "stale claim recovered (heartbeat expired); retryable",
+		})
+	}
+	for _, r := range failedRows {
+		db.emitEvent(ctx, PipelineEvent{
+			JobID: r.id, FilePath: r.filePath, Stage: StageFail, Event: EventError,
+			RunnerHost: HostGoWorker, Attempt: IntPtr(r.attempts),
+			Reason: "max attempts reached after stale-claim recovery; discarded",
+		})
+	}
+	return len(failedRows), nil
+}
+
+// staleRow is a recovered job row from RecoverStaleJobs' RETURNING clauses.
+type staleRow struct {
+	id       string
+	filePath string
+	attempts int
+}
+
+// scanStaleRows drains a RETURNING(id, file_path, attempts) result set.
+func scanStaleRows(rows pgx.Rows) ([]staleRow, error) {
+	defer rows.Close()
+	var out []staleRow
+	for rows.Next() {
+		var r staleRow
+		if err := rows.Scan(&r.id, &r.filePath, &r.attempts); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// emitEvent appends a pipeline event best-effort: a write failure is logged and
+// swallowed (CONTRACT §1.7 — events never fail the pipeline operation).
+func (db *DB) emitEvent(ctx context.Context, e PipelineEvent) {
+	if err := db.AppendEvent(ctx, e); err != nil {
+		db.log.Warn("pipeline event write failed (continuing)",
+			"stage", e.Stage, "event", e.Event, "job_id", e.JobID, "error", err)
+	}
 }
 
 // ─── Embedding pipeline ───────────────────────────────────────────────────────
@@ -712,6 +860,20 @@ type EmbedMetrics struct {
 	TotalTokens  *int // authoritative local tokenizer count; nil (NULL) when unknown — a chunk failed to tokenize
 }
 
+// EvalMetrics is the LLM-judge's slice of run_metrics columns (CONTRACT §1.5).
+// It is the fourth column-selective writer (after the monitor, runner, and embed
+// worker). FinishedAt is the per-job eval-completion marker: a job has been
+// judged iff run_metrics.eval_finished_at IS NOT NULL.
+type EvalMetrics struct {
+	JobID      string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Model      string // judge model id (chat client's Model())
+	Chunks     int    // ChunksEvaluated
+	Skipped    int    // ChunksSkipped (transient per-chunk judge errors)
+	Findings   int    // FindingsFound
+}
+
 // UpsertAudioBytes records the audio file size for a job (the monitor's slice of
 // run_metrics). Best-effort: callers should log-and-continue on error so a
 // metrics write never fails enqueue. Only the audio_bytes column is touched, so
@@ -759,6 +921,48 @@ func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 		m.ChunkCount, m.PromptTokens, m.TotalTokens)
 	if err != nil {
 		return fmt.Errorf("upsert embed metrics: %w", err)
+	}
+	return nil
+}
+
+// upsertEvalMetricsSQL is the column-selective UPSERT for the eval slice of
+// run_metrics. A package-level var (not a constant) so tests can assert its
+// shape — that it touches ONLY the eval_* columns + updated_at, never clobbering
+// the monitor's audio_bytes, the runner's transcription slice, or the embed
+// worker's columns on the same job_id row.
+//
+// Parameter order: $1=job_id $2=eval_started_at $3=eval_finished_at $4=eval_model
+//
+//	$5=eval_chunks $6=eval_skipped $7=eval_findings
+var upsertEvalMetricsSQL = `
+	INSERT INTO run_metrics
+	       (job_id, eval_started_at, eval_finished_at, eval_model,
+	        eval_chunks, eval_skipped, eval_findings)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)
+	ON CONFLICT (job_id) DO UPDATE
+	SET eval_started_at  = EXCLUDED.eval_started_at,
+	    eval_finished_at = EXCLUDED.eval_finished_at,
+	    eval_model       = EXCLUDED.eval_model,
+	    eval_chunks      = EXCLUDED.eval_chunks,
+	    eval_skipped     = EXCLUDED.eval_skipped,
+	    eval_findings    = EXCLUDED.eval_findings,
+	    updated_at       = now()
+`
+
+// UpsertEvalMetrics records eval timing, judge model, and chunk/skip/finding
+// counts for a job (the eval layer's slice of run_metrics, CONTRACT §1.5). Only
+// the eval_* columns are written, so it never clobbers the monitor's,  runner's,
+// or embed worker's columns on the same row. eval_finished_at is the per-job
+// eval-completion marker.
+//
+// Best-effort: callers should log-and-continue on error so a metrics write never
+// fails the underlying eval/embed step.
+func (db *DB) UpsertEvalMetrics(ctx context.Context, m EvalMetrics) error {
+	_, err := db.pool.Exec(ctx, upsertEvalMetricsSQL,
+		m.JobID, m.StartedAt, m.FinishedAt, m.Model,
+		m.Chunks, m.Skipped, m.Findings)
+	if err != nil {
+		return fmt.Errorf("upsert eval metrics: %w", err)
 	}
 	return nil
 }
@@ -1300,10 +1504,10 @@ type QueueStats struct {
 	// TotalJobs is Pending+Claimed+Done+Failed — the full backlog denominator.
 	TotalJobs int
 	// DoneLastHour is the number of jobs whose row entered 'done' in the last
-	// hour, a throughput proxy. (A 'done' row's updated_at is its completion
-	// time: the runner's mark-done UPDATE fires the updated_at trigger, and a
-	// requeue moves the row out of 'done' rather than re-stamping it. A future
-	// completed_at column would make this exact.)
+	// hour, a throughput proxy. It counts on COALESCE(completed_at, updated_at):
+	// completed_at is the exact completion time (a BEFORE UPDATE trigger stamps it
+	// on the transition into 'done', CONTRACT §1.1); updated_at is the fallback for
+	// rows that became 'done' before completed_at existed.
 	DoneLastHour int
 	// Paused mirrors runner_control.paused — true means the runner is declining
 	// to claim new work (set via the dashboard pause toggle).
@@ -1315,7 +1519,25 @@ type QueueStats struct {
 	// Runner fields — populated when at least one job has status='claimed'.
 	RunnerActive  bool
 	RunnerID      string     // claimed_by of the most-recently-updated claimed job
-	LastHeartbeat *time.Time // updated_at of that job
+	LastHeartbeat *time.Time // updated_at of the most-recently-updated claimed job
+	// LatestActivity is the newest of (most-recent claimed-job heartbeat,
+	// most-recent completion). It is the broadest "the runner did something
+	// recently" signal. nil only on a fresh install with no claims and no
+	// completions.
+	LatestActivity *time.Time
+
+	// EvalCoverageDone is the number of done jobs whose run_metrics row has a
+	// non-NULL eval_finished_at (i.e. has been judged). Paired with Done it gives
+	// the eval coverage ratio (CONTRACT §1.5). 0 when nothing is judged yet.
+	EvalCoverageDone int
+
+	// RunnerAvailable / RunnerAvailableKnown reflect the latest
+	// runner_availability event (CONTRACT §1.7): Available is true when the GPU
+	// host is free for transcription (not gaming). Known is false until any
+	// runner_availability event has been recorded (so a metric is only emitted
+	// when there is a real signal).
+	RunnerAvailable      bool
+	RunnerAvailableKnown bool
 
 	// Per-run aggregates (run_metrics). AvgProcessingSeconds is the mean
 	// transcription wall-clock over jobs the runner has timed; TotalEmbedTokens
@@ -1395,9 +1617,14 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 
 	// Backfill progress + throughput.
 	q.TotalJobs = q.Pending + q.Claimed + q.Done + q.Failed
+	// Throughput proxy: jobs completed in the last hour. Prefer the trigger-stamped
+	// completed_at (CONTRACT §1.1); fall back to updated_at for rows that became
+	// 'done' before the completed_at column existed (no backfill — COALESCE keeps
+	// the count correct and back-compatible on those old rows).
 	if err := db.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM transcription_jobs
-		WHERE status = 'done' AND updated_at > now() - interval '1 hour'
+		WHERE status = 'done'
+		  AND COALESCE(completed_at, updated_at) > now() - interval '1 hour'
 	`).Scan(&q.DoneLastHour); err != nil {
 		return nil, fmt.Errorf("done-last-hour count: %w", err)
 	}
@@ -1428,6 +1655,51 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		q.RunnerActive = true
 		q.RunnerID = *claimedBy
 		q.LastHeartbeat = updatedAt
+	}
+
+	// LatestActivity: the newest of (last claimed-job heartbeat, last completion).
+	// This is the broadest "the runner did something recently" signal and is what
+	// the runner-liveness metric derives from. NULL on a fresh install (no claims,
+	// no completions). NOTE: the runner only stamps updated_at while a job is
+	// CLAIMED — there is no idle heartbeat — so a large age here means
+	// claim-activity is old, NOT necessarily that the runner is down (CONTRACT §1.7).
+	if err := db.pool.QueryRow(ctx, `
+		SELECT GREATEST(
+		  (SELECT MAX(updated_at)  FROM transcription_jobs WHERE status = 'claimed'),
+		  (SELECT MAX(COALESCE(completed_at, updated_at)) FROM transcription_jobs WHERE status = 'done')
+		)
+	`).Scan(&q.LatestActivity); err != nil {
+		return nil, fmt.Errorf("latest activity query: %w", err)
+	}
+
+	// Eval coverage: done jobs whose run_metrics row has a non-NULL
+	// eval_finished_at (the per-job eval-completion marker, CONTRACT §1.5).
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM transcription_jobs j
+		JOIN run_metrics m ON m.job_id = j.id
+		WHERE j.status = 'done' AND m.eval_finished_at IS NOT NULL
+	`).Scan(&q.EvalCoverageDone); err != nil {
+		return nil, fmt.Errorf("eval coverage query: %w", err)
+	}
+
+	// Latest runner availability (CONTRACT §1.7): the most-recent
+	// runner_availability event's reason; available iff reason='idle'. Known is
+	// false until any such event exists (so the metric is only emitted on a real
+	// signal). Tolerate no-rows.
+	var availReason *string
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COALESCE(detail->>'reason', reason)
+		FROM pipeline_events
+		WHERE stage = 'runner_availability'
+		ORDER BY created_at DESC
+		LIMIT 1
+	`).Scan(&availReason); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("runner availability query: %w", err)
+	}
+	if availReason != nil {
+		q.RunnerAvailableKnown = true
+		q.RunnerAvailable = *availReason == "idle"
 	}
 
 	// Per-run aggregates from run_metrics. NULL-safe: AVG/SUM over zero matching
@@ -2945,7 +3217,7 @@ func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]str
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	paths, err := requeueTx(ctx, tx, plan, args...)
+	ids, paths, err := requeueTx(ctx, tx, plan, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2953,36 +3225,50 @@ func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]str
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit requeue tx: %w", err)
 	}
+
+	// Audit events for the operator requeue (CONTRACT §1.7). Emitted AFTER commit
+	// (the requeue is the source of truth; an event-write failure must not roll it
+	// back) and best-effort. The job moves back to 'pending', so this is a requeue.
+	for i, id := range ids {
+		var fp string
+		if i < len(paths) {
+			fp = paths[i]
+		}
+		db.emitEvent(ctx, PipelineEvent{
+			JobID: id, FilePath: fp, Stage: StageRequeue, Event: EventRetry,
+			RunnerHost: HostGoMonitor, Reason: "operator requeue (re-transcribe)",
+		})
+	}
 	return paths, nil
 }
 
 // requeueTx is the transaction-body core of requeue, split out so the
 // delete-transcripts → reset-jobs → clear-metrics sequence is testable against a
 // pgxmock transaction. It does NOT begin/commit — the caller owns the tx
-// lifecycle. Returns the reset jobs' file paths.
-func requeueTx(ctx context.Context, tx txQuerier, plan requeuePlan, args ...any) ([]string, error) {
+// lifecycle. Returns the reset jobs' ids and file paths (parallel slices).
+func requeueTx(ctx context.Context, tx txQuerier, plan requeuePlan, args ...any) (ids, paths []string, err error) {
 	if _, err := tx.Exec(ctx, plan.deleteTranscripts, args...); err != nil {
-		return nil, fmt.Errorf("delete transcripts: %w", err)
+		return nil, nil, fmt.Errorf("delete transcripts: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, plan.resetJobs, args...)
 	if err != nil {
-		return nil, fmt.Errorf("reset jobs: %w", err)
+		return nil, nil, fmt.Errorf("reset jobs: %w", err)
 	}
-	ids, paths, err := scanIDPaths(rows)
+	ids, paths, err = scanIDPaths(rows)
 	rows.Close()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Clear the orphaned run_metrics for the requeued jobs so the next run's
 	// telemetry starts clean. A no-op when nothing was reset.
 	if len(ids) > 0 {
 		if _, err := tx.Exec(ctx, requeueDeleteMetricsSQL, ids); err != nil {
-			return nil, fmt.Errorf("delete run_metrics: %w", err)
+			return nil, nil, fmt.Errorf("delete run_metrics: %w", err)
 		}
 	}
-	return paths, nil
+	return ids, paths, nil
 }
 
 // ReembedJobs deletes the embedded chunks for transcripts whose file_path

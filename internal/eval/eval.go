@@ -128,6 +128,15 @@ func NewJudge(chat ChatClient) *Judge {
 	}
 }
 
+// Model reports the judge's chat model id (for run_metrics.eval_model
+// attribution). Returns "" if the judge has no chat client.
+func (j *Judge) Model() string {
+	if j == nil || j.chat == nil {
+		return ""
+	}
+	return j.chat.Model()
+}
+
 // Result is the outcome of judging one chunk: the findings derived from it and
 // any error (the caller decides whether to abort the run or skip the chunk).
 type Result struct {

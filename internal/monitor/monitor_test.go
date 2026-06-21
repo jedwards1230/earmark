@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
@@ -65,6 +66,10 @@ type fakeDB struct {
 	bookMetadata  map[string]metaprovider.BookMeta // bookDir -> BookMeta last written
 	bookMetaErr   error                            // if set, UpsertBookMetadata returns this error
 	bookMetaCalls int                              // number of UpsertBookMetadata calls
+
+	// pipeline_events tracking
+	events     []db.PipelineEvent // captured by AppendEvent
+	pruneCalls int                // times PruneEvents was called
 }
 
 func (f *fakeDB) InsertJobIfAbsent(_ context.Context, filePath, checksum string) (string, bool, error) {
@@ -103,6 +108,16 @@ func (f *fakeDB) UpsertAudioBytes(_ context.Context, jobID string, bytes int64) 
 	}
 	f.audioBytes[jobID] = bytes
 	return nil
+}
+
+func (f *fakeDB) AppendEvent(_ context.Context, e db.PipelineEvent) error {
+	f.events = append(f.events, e)
+	return nil
+}
+
+func (f *fakeDB) PruneEvents(context.Context) (int64, error) {
+	f.pruneCalls++
+	return 0, nil
 }
 
 func (f *fakeDB) UpsertBookMetadata(_ context.Context, bookDir string, meta metaprovider.BookMeta) error {
@@ -187,10 +202,28 @@ func TestMonitorEnqueueFile(t *testing.T) {
 		}
 	}
 
-	// Second call — should be idempotent.
+	// A pipeline_events enqueue/finish row is emitted for the new job (CONTRACT §1.7).
+	if len(db.events) != 1 {
+		t.Fatalf("expected 1 enqueue event, got %d", len(db.events))
+	}
+	ev := db.events[0]
+	if ev.Stage != db.events[0].Stage || db.events[0].Stage != "enqueue" {
+		t.Errorf("event stage = %q, want enqueue", ev.Stage)
+	}
+	if ev.Event != "finish" {
+		t.Errorf("event verb = %q, want finish", ev.Event)
+	}
+	if ev.FilePath != filePath {
+		t.Errorf("event file_path = %q, want %q", ev.FilePath, filePath)
+	}
+
+	// Second call — should be idempotent (no new job, no new event).
 	fm.enqueueFile(filePath)
 	if len(db.inserted) != 1 {
 		t.Errorf("expected still 1 job after duplicate enqueue, got %d", len(db.inserted))
+	}
+	if len(db.events) != 1 {
+		t.Errorf("duplicate enqueue must not emit a second event; got %d events", len(db.events))
 	}
 }
 

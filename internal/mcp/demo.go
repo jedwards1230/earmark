@@ -13,6 +13,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/predict"
 )
 
 // doneRatio is the fraction of a book's tracks that are done (0 when no tracks),
@@ -573,6 +574,36 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 	q.Paused = d.isPaused()
 	q.RunLimit = d.runLimit
 	return q, nil
+}
+
+// GetPredictInputs returns synthetic ETA inputs so the demo dashboard renders a
+// populated ETA. The "stale"/"empty" scenarios omit availability history (→
+// work-time fallback label); "active"/"failed" supply a healthy availability
+// fraction (→ a calendar estimate).
+func (d demoDB) GetPredictInputs(context.Context) (predict.Inputs, error) {
+	switch d.scenario {
+	case "empty":
+		return predict.Inputs{}, nil
+	case "stale":
+		// Work known but no availability history → labeled work-time estimate.
+		return predict.Inputs{
+			RemainingChunks: 6 * 320,
+			Rates: predict.Rates{
+				TranscribeSecPerChunk: 7.1, EmbedSecPerChunk: 0.6,
+				EvalSecPerChunk: 0, EvalKnown: false,
+			},
+			AvailabilityFraction: 0, // no windows → calendar unknown
+		}, nil
+	default: // active / failed — full estimate incl. eval + a calendar figure
+		return predict.Inputs{
+			RemainingChunks: 43 * 360,
+			Rates: predict.Rates{
+				TranscribeSecPerChunk: 7.1, EmbedSecPerChunk: 0.6,
+				EvalSecPerChunk: 1.4, EvalKnown: true,
+			},
+			AvailabilityFraction: 0.45,
+		}, nil
+	}
 }
 
 // GetRecentJobs returns a synthetic job list for the selected scenario. File

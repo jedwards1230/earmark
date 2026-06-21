@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
@@ -90,7 +91,7 @@ func runEval(cmd *cobra.Command, args []string) {
 	}
 	judge := evalpkg.NewJudge(chat)
 
-	r := &dbRunner{reader: database, judge: judge, writer: database}
+	r := &dbRunner{reader: database, judge: judge, writer: database, events: database}
 	if err := run(context.Background(), os.Stdout, r, book, opts); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
@@ -102,10 +103,46 @@ type dbRunner struct {
 	reader evalpkg.ChunkReader
 	judge  *evalpkg.Judge
 	writer evalpkg.FindingWriter
+	// events records a book/sample-level eval pipeline_event (CONTRACT §1.7). The
+	// standalone eval path covers many jobs (a whole book or a library sample), so
+	// it emits ONE job_id=NULL eval event rather than the per-job run_metrics slice
+	// (which only the in-pipeline worker writes). nil → no event (e.g. tests).
+	events db.EventAppender
 }
 
 func (d *dbRunner) Run(ctx context.Context, o evalpkg.RunOptions) ([]db.Finding, evalpkg.RunStats, error) {
-	return evalpkg.Run(ctx, d.reader, d.judge, d.writer, o)
+	start := time.Now()
+	findings, stats, err := evalpkg.Run(ctx, d.reader, d.judge, d.writer, o)
+	if err != nil {
+		return findings, stats, err
+	}
+	// Best-effort audit event for the standalone eval run. job_id is NULL (the run
+	// spans many jobs); file_path carries the book scope when scoped to one.
+	if d.events != nil {
+		ev := db.PipelineEvent{
+			Stage:      db.StageEval,
+			Event:      db.EventFinish,
+			RunnerHost: db.HostGoMonitor,
+			Model:      d.judge.Model(),
+			DurationMS: db.Int64Ptr(time.Since(start).Milliseconds()),
+			ItemCount:  db.IntPtr(stats.FindingsFound),
+			Detail: map[string]any{
+				"evaluated": stats.ChunksEvaluated,
+				"skipped":   stats.ChunksSkipped,
+				"scope":     "standalone",
+				"sample":    o.Sample,
+				"book":      o.Book,
+				"persisted": stats.Persisted,
+			},
+		}
+		if o.Book != "" {
+			ev.FilePath = o.Book
+		}
+		if aerr := d.events.AppendEvent(ctx, ev); aerr != nil {
+			fmt.Printf("warning: eval pipeline event write failed (continuing): %v\n", aerr)
+		}
+	}
+	return findings, stats, err
 }
 
 // run holds the testable logic: validate flags, run the judge, and report.

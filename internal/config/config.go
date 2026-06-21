@@ -301,6 +301,12 @@ type Config struct {
 	// Default: :8081 (CONTRACT §2.2).
 	MCPHTTPAddr string
 
+	// INGEST_HTTP_ADDR — address for the ingest process's minimal HTTP listener,
+	// which serves /healthz (liveness) and /metrics (Prometheus). The ingest pod
+	// has no MCP server, so this is its only HTTP surface. Default: :8082 (chosen
+	// to avoid colliding with the mcp pod's :8081). CONTRACT §2.4.
+	IngestHTTPAddr string
+
 	// STALE_JOB_TIMEOUT — how long a claimed job may be silent before the Go
 	// service resets it to pending. Default: 30m (CONTRACT §1.3).
 	StaleJobTimeout time.Duration
@@ -406,6 +412,7 @@ func LoadConfig() (*Config, error) {
 	cfg.EmbeddingsBaseURL = getEnvOrDefault("EMBEDDINGS_BASE_URL", "http://ollama:11434/v1")
 	cfg.EmbeddingsModel = getEnvOrDefault("EMBEDDINGS_MODEL", "nomic-embed-text")
 	cfg.MCPHTTPAddr = getEnvOrDefault("MCP_HTTP_ADDR", ":8081")
+	cfg.IngestHTTPAddr = getEnvOrDefault("INGEST_HTTP_ADDR", ":8082")
 	cfg.LibraryCollections = os.Getenv("LIBRARY_COLLECTIONS")
 	cfg.ControlAPIToken = os.Getenv("CONTROL_API_TOKEN")
 	cfg.MetadataProvider = getEnvOrDefault("METADATA_PROVIDER", "path")
@@ -596,6 +603,7 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("Embeddings Base URL", "value", c.EmbeddingsBaseURL)
 	logger.Debug("Embeddings Model", "value", c.EmbeddingsModel)
 	logger.Debug("MCP HTTP Addr", "value", c.MCPHTTPAddr)
+	logger.Debug("Ingest HTTP Addr", "value", c.IngestHTTPAddr)
 	logger.Debug("Library Collections", "value", c.LibraryCollections)
 	logger.Debug("Control API Token", "value", MaskSecret(c.ControlAPIToken))
 	logger.Debug("Stale Job Timeout", "value", c.StaleJobTimeout)

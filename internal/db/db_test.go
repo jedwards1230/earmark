@@ -989,7 +989,7 @@ func TestRequeueTxClearsRunMetrics(t *testing.T) {
 		WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 
-	paths, err := requeueTx(context.Background(), tx, requeueByID, id)
+	_, paths, err := requeueTx(context.Background(), tx, requeueByID, id)
 	if err != nil {
 		t.Fatalf("requeueTx: %v", err)
 	}
@@ -1022,7 +1022,7 @@ func TestRequeueTxNoMetricsDeleteWhenNothingReset(t *testing.T) {
 	mock.ExpectQuery(requeueFailed.resetJobs).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"})) // no rows
 
-	paths, err := requeueTx(context.Background(), tx, requeueFailed)
+	_, paths, err := requeueTx(context.Background(), tx, requeueFailed)
 	if err != nil {
 		t.Fatalf("requeueTx: %v", err)
 	}
@@ -1166,6 +1166,49 @@ func TestComputeFileChecksum_DifferentFiles(t *testing.T) {
 // This is a regression guard: if the column is accidentally removed from the
 // SQL, or the parameter count shifts, this test catches it without a live DB.
 // A full round-trip test requires testcontainers (M-8).
+// TestUpsertEvalMetricsSQL_TouchesOnlyEvalSlice verifies the eval writer is a
+// clean fourth column-selective writer (CONTRACT §1.5): it writes only the
+// eval_* columns + updated_at and never references another writer's slice
+// (audio_*, transcribe_*, embed_*), so it can't clobber them on the shared row.
+func TestUpsertEvalMetricsSQL_TouchesOnlyEvalSlice(t *testing.T) {
+	// Normalize runs of whitespace to a single space so assertions don't depend on
+	// the SQL's column-alignment formatting.
+	sql := strings.Join(strings.Fields(upsertEvalMetricsSQL), " ")
+
+	wantCols := []string{
+		"eval_started_at", "eval_finished_at", "eval_model",
+		"eval_chunks", "eval_skipped", "eval_findings",
+	}
+	for _, c := range wantCols {
+		if !strings.Contains(sql, c) {
+			t.Errorf("upsertEvalMetricsSQL is missing the %s column", c)
+		}
+		if !strings.Contains(sql, c+" = EXCLUDED."+c) {
+			t.Errorf("upsertEvalMetricsSQL ON CONFLICT must assign %s = EXCLUDED.%s", c, c)
+		}
+	}
+	if !strings.Contains(sql, "updated_at = now()") {
+		t.Error("upsertEvalMetricsSQL must bump updated_at = now()")
+	}
+
+	// Must NOT reference any other writer's slice — that would clobber it.
+	foreignCols := []string{
+		"audio_bytes", "audio_channels",
+		"transcribe_started_at", "transcribe_finished_at", "asr_model",
+		"embed_started_at", "embed_finished_at", "embed_model",
+	}
+	for _, c := range foreignCols {
+		if strings.Contains(sql, c) {
+			t.Errorf("upsertEvalMetricsSQL must not touch %s (another writer's column)", c)
+		}
+	}
+
+	// It must be an UPSERT keyed on the job.
+	if !strings.Contains(sql, "ON CONFLICT (job_id) DO UPDATE") {
+		t.Error("upsertEvalMetricsSQL must UPSERT on job_id")
+	}
+}
+
 func TestUpsertBookMetadataSQL_IncludesBiasTerms(t *testing.T) {
 	if !strings.Contains(upsertBookMetadataSQL, "bias_terms") {
 		t.Error("upsertBookMetadataSQL is missing the bias_terms column")

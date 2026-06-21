@@ -48,6 +48,61 @@ type Arbiter interface {
 	Gaming(ctx context.Context) (gaming bool, ok bool)
 }
 
+// EventSink records pipeline_events for the coordinator (CONTRACT §1.7). It is a
+// seam so the coordinator stays unit-testable: tests inject a recording/no-op
+// sink. *db.DB satisfies AppendEvent; the coordinator wraps it. Best-effort —
+// the sink must log-and-continue on error, never wedge the coordinator.
+type EventSink interface {
+	AppendEvent(ctx context.Context, e db.PipelineEvent) error
+}
+
+// nopSink discards events. Used as the default when no sink is injected so the
+// coordinator core never needs a nil check.
+type nopSink struct{}
+
+func (nopSink) AppendEvent(context.Context, db.PipelineEvent) error { return nil }
+
+// availabilityEmitter emits a runner_availability event ONLY on a state change
+// (debounced), so a steady-state poll produces no rows. The three states map the
+// arbiter's (gaming, ok) result: ok=false → "unreachable", gaming=true →
+// "gaming", else → "idle" (GPU free for transcription).
+type availabilityEmitter struct {
+	sink EventSink
+	last string // last-emitted reason; "" until the first emit
+	p    func(string, ...any)
+}
+
+// arbiterReason maps the arbiter result to a runner_availability reason token.
+func arbiterReason(gaming, ok bool) (reason string, available bool) {
+	switch {
+	case !ok:
+		return "unreachable", false
+	case gaming:
+		return "gaming", false
+	default:
+		return "idle", true
+	}
+}
+
+// observe records the current arbiter state and emits a runner_availability
+// event if (and only if) it changed since the last emit. Best-effort.
+func (e *availabilityEmitter) observe(ctx context.Context, gaming, ok bool) {
+	reason, available := arbiterReason(gaming, ok)
+	if reason == e.last {
+		return
+	}
+	e.last = reason
+	if err := e.sink.AppendEvent(ctx, db.PipelineEvent{
+		Stage:      db.StageRunnerAvailability,
+		Event:      db.EventState,
+		RunnerHost: db.HostGoMonitor,
+		Reason:     reason,
+		Detail:     map[string]any{"available": available, "reason": reason},
+	}); err != nil && e.p != nil {
+		e.p("WARNING: runner_availability event write failed: %v\n", err)
+	}
+}
+
 // Options configures a coordinator run.
 type Options struct {
 	// BatchSize is the run_limit set for each Phase A (jobs transcribed per
@@ -59,6 +114,9 @@ type Options struct {
 	PollInterval time.Duration
 	// ArbiterPoll is how often gpu-arbiter is re-checked while it reports gaming.
 	ArbiterPoll time.Duration
+	// Sink records runner_availability events on arbiter-state transitions
+	// (CONTRACT §1.7). nil → a no-op sink (events disabled). Best-effort.
+	Sink EventSink
 }
 
 const (
@@ -81,6 +139,9 @@ func (o *Options) normalize() error {
 	}
 	if o.ArbiterPoll <= 0 {
 		o.ArbiterPoll = defaultArbiterPoll
+	}
+	if o.Sink == nil {
+		o.Sink = nopSink{}
 	}
 	return nil
 }
@@ -156,6 +217,12 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	// batches in this run (passed by pointer into yieldToGames).
 	arbiterWarned := false
 
+	// availability emitter: records a runner_availability event only when the
+	// arbiter state changes (debounced across the whole run), so the coordinator's
+	// gpu-arbiter poll becomes the source of the availability windows used for the
+	// calendar ETA (CONTRACT §1.7, §4.3).
+	avail := &availabilityEmitter{sink: o.Sink, p: p}
+
 	for batchNum := 1; o.MaxBatches == 0 || batchNum <= o.MaxBatches; batchNum++ {
 		// Is there anything left to transcribe?
 		st, err := store.GetServiceStatus(ctx)
@@ -170,7 +237,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 		p("=== Batch %d (pending=%d) ===\n", batchNum, st.Pending)
 
 		// 1. Yield to games before any GPU work.
-		if err := yieldToGames(ctx, p, arb, o.ArbiterPoll, &arbiterWarned); err != nil {
+		if err := yieldToGames(ctx, p, arb, o.ArbiterPoll, &arbiterWarned, avail); err != nil {
 			return err
 		}
 
@@ -194,10 +261,12 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 // unreachable/unset arbiter (ok=false) returns immediately — the coordinator
 // proceeds, degrading gracefully. arbiterWarned (owned by Run) ensures the
 // "arbiter unavailable" notice is logged at most once per run, not per batch.
-func yieldToGames(ctx context.Context, p func(string, ...any), arb Arbiter, poll time.Duration, arbiterWarned *bool) error {
+func yieldToGames(ctx context.Context, p func(string, ...any), arb Arbiter, poll time.Duration, arbiterWarned *bool, avail *availabilityEmitter) error {
 	announced := false
 	for {
 		busy, ok := arb.Gaming(ctx)
+		// Record the availability transition (debounced) before acting on it.
+		avail.observe(ctx, busy, ok)
 		if !ok {
 			// Unconfigured or unreachable arbiter: degrade gracefully (proceed
 			// without game-yield). Log once for the whole run (the flag is owned

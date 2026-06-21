@@ -4,7 +4,8 @@
 #   - Walks BOOKS_DIR and enqueues new audio files as transcription_jobs.
 #   - Polls for completed transcripts, chunks them, calls Ollama, stores embeddings.
 #
-# No HTTP port; no Service or Ingress. Liveness = exec pgrep.
+# Exposes a minimal HTTP listener on :8082 for /healthz (liveness) and /metrics
+# (Prometheus). No Service or Ingress — the port is pod-internal (probe + scrape).
 # Strategy: Recreate (single writer; only 1 replica meaningful).
 apiVersion: apps/v1
 kind: Deployment
@@ -43,17 +44,23 @@ spec:
           securityContext:
             {{- include "earmark.containerSecurityContext" . | nindent 12 }}
 
+          ports:
+            - name: metrics
+              containerPort: 8082
+              protocol: TCP
+
           env:
             {{- include "earmark.commonEnv" . | nindent 12 }}
+            - name: INGEST_HTTP_ADDR
+              value: {{ .Values.config.ingestHttpAddr | quote }}
 
-          # Liveness: confirm the process is still running.
-          # No HTTP port on this pod, so use an exec probe.
+          # Liveness: HTTP /healthz on the ingest pod's minimal listener (replaces
+          # the old `pgrep -f earmark` exec probe, which errored because pgrep is
+          # absent from the distroless image).
           livenessProbe:
-            exec:
-              command:
-                - pgrep
-                - "-f"
-                - earmark
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
