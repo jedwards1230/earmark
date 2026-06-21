@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -67,6 +68,10 @@ var tmplFuncs = template.FuncMap{
 	// statusLabel maps the internal job status to the operator-facing word. The
 	// DB/API/CSS value stays "claimed"; humans see "transcribing".
 	"statusLabel": statusLabel,
+	// statusBadge renders the inner HTML of a status badge — a small glyph plus the
+	// operator-facing word — so the badge never conveys state by color alone (1.4.1).
+	// Returns template.HTML (entities are fixed literals, not user input).
+	"statusBadge": statusBadge,
 	// bookDir is the book directory for a track path. Used to build the
 	// book-detail href: passed as a plain string into an href="…?dir={{…}}"
 	// URL-context interpolation, which html/template auto-escapes (no template.URL
@@ -176,6 +181,13 @@ var tmplFuncs = template.FuncMap{
 	// confPctF renders a plain (non-nullable) confidence (0–1) as a percentage.
 	// Used by the Findings per-book table where the mean is always present.
 	"confPctF": func(c float64) string { return fmt.Sprintf("%.0f%%", c*100) },
+	// worklistURL builds a /findings/data URL with one facet (conf|issue|book)
+	// changed to val, carrying the other two active facets — so clicking an
+	// Issue-Types or Per-Book row filters the worklist without losing the rest of
+	// the filter state. An empty val clears that facet. The output is a fixed-shape
+	// query string with url.QueryEscape'd values, returned as template.URL for
+	// interpolation into an hx-get attribute.
+	"worklistURL": worklistURL,
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.
@@ -236,7 +248,8 @@ var failedFragmentTmpl = template.Must(template.New("failed").Funcs(tmplFuncs).P
 {{if .Jobs}}
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Track</th><th>Error</th><th>Attempts</th><th>Runner</th><th>Updated</th><th></th></tr></thead>
+  <caption>Failed transcription jobs — each shows its error and a retry</caption>
+  <thead><tr><th scope="col">Track</th><th scope="col">Error</th><th scope="col" class="num">Attempts</th><th scope="col">Runner</th><th scope="col">Updated</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
   <tbody>
   {{range .Jobs}}
     <tr>
@@ -276,7 +289,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   </div>
   {{if .ControlEnabled}}
   {{if .Stats.Paused}}
-  <button class="btn btn-go" hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
+  <button class="btn btn-primary" hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Resume the pipeline? The runner will start claiming pending jobs.">&#9654;&nbsp;Resume pipeline</button>
   {{else}}
   <button class="btn btn-warn" hx-post="/actions/pause" hx-target="#data-region" hx-swap="innerHTML"
@@ -386,7 +399,8 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   {{if .Jobs}}
   <div class="table-wrap">
   <table>
-    <thead><tr><th>File</th><th>Status</th><th title="transcription wall-clock time (runner)">Proc</th><th title="embedding tokens (local tokenizer)">Tokens</th><th>Updated</th><th></th></tr></thead>
+    <caption>Most recent transcription jobs</caption>
+    <thead><tr><th scope="col">File</th><th scope="col">Status</th><th scope="col" class="num" title="transcription wall-clock time (runner)">Proc</th><th scope="col" class="num" title="embedding tokens (local tokenizer)">Tokens</th><th scope="col">Updated</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
     <tbody>
     {{range .Jobs}}
       <tr>
@@ -394,7 +408,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
           <a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}
         </td>
-        <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
+        <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
         <td class="time-muted" title="{{if .Chunked}}chunked{{if .NWindows}} ({{commafyPtr .NWindows}} windows){{end}}{{else}}single-pass{{end}}">{{procTime .ProcessingSeconds}}</td>
         <td class="time-muted">{{commafyPtr .EmbedTotalTokens}}</td>
         <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
@@ -416,6 +430,8 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 // ─── Library fragment ────────────────────────────────────────────────────────
 
 var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs).Parse(`
+{{if .Overview}}{{template "overviewBand" .Overview}}{{end}}
+<p class="subtitle">Your audiobook library — transcription progress per book. Open a book for tracks, transcript, and eval findings.</p>
 <div class="lib-bar">
   <form class="lib-search" hx-get="/library/data" hx-target="#library-region" hx-swap="innerHTML">
     <input type="hidden" name="status" value="{{.Status}}">
@@ -446,37 +462,53 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
 </div>
 
 {{if .Books}}
+<div class="lib-colbar">
+  {{if .MoreCols}}
+  <a class="lib-clear" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{.FilterParams}}" hx-target="#library-region" hx-swap="innerHTML">&#8722;&nbsp;fewer columns</a>
+  {{else}}
+  <a class="lib-clear" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{.FilterParams}}&cols=more" hx-target="#library-region" hx-swap="innerHTML">+&nbsp;more columns (duration · words · chunks)</a>
+  {{end}}
+</div>
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Book</th><th>Author</th><th>Progress</th>
-    <th title="total audio duration across done tracks">Duration</th>
-    <th title="total transcript words across done tracks">Words</th>
-    <th title="total embedded chunks across done tracks">Chunks</th>
-    <th title="suspected-error findings recorded for this book (read-only eval)">Findings</th>
-    <th>Breakdown</th><th>Updated</th><th></th></tr></thead>
+  <caption>Library — {{commafy .TotalBooks}} book{{if ne .TotalBooks 1}}s{{end}}, newest activity first</caption>
+  <thead><tr>
+    <th scope="col">Book</th>
+    <th scope="col">Author</th>
+    <th scope="col">Progress</th>
+    {{if .MoreCols}}
+    <th scope="col" class="num" title="total audio duration across done tracks">Duration</th>
+    <th scope="col" class="num" title="total transcript words across done tracks">Words</th>
+    <th scope="col" class="num" title="total embedded chunks across done tracks">Chunks</th>
+    {{end}}
+    <th scope="col">State</th>
+    <th scope="col">Updated</th>
+    <th scope="col"><span class="sr-only">Open</span></th>
+  </tr></thead>
   <tbody>
   {{range .Books}}
-    <tr class="clickable" onclick="window.location=this.querySelector('a.file-name').href">
-      <td><a class="file-name" href="/book?dir={{.Dir}}" title="{{.Dir}}">{{.Title}}</a></td>
+    <tr class="row-link">
+      <td><a class="row-a file-name" href="/book?dir={{.Dir}}" title="{{.Dir}}">{{.Title}}{{if gt .FindingCount 0}} <span class="flag-badge" title="{{.FindingCount}} suspected-error finding(s) recorded">&#9873;&nbsp;{{commafy .FindingCount}}</span>{{end}}</a></td>
       <td class="time-muted">{{if .Author}}{{.Author}}{{else}}—{{end}}</td>
       <td>
         <div class="progress" title="{{.Done}}/{{.Total}} tracks done">
           <div class="progress-bar{{if gt .Failed 0}} has-failed{{end}}" style="width:{{.DonePct}}%"></div>
         </div>
-        <span class="progress-text">{{commafy .Done}}/{{commafy .Total}}</span>
+        <span class="progress-text">{{.DonePct}}% &middot; {{commafy .Done}}/{{commafy .Total}}</span>
       </td>
-      <td class="time-muted">{{durTime .DurationSeconds}}</td>
-      <td class="time-muted">{{commafyPtr .WordCount}}</td>
-      <td class="time-muted">{{commafyPtr .EmbedChunkCount}}</td>
-      <td class="time-muted">{{if gt .FindingCount 0}}<a class="findings-link" href="/book?dir={{.Dir}}#book-findings" onclick="event.stopPropagation()" title="{{.FindingCount}} suspected-error finding(s)">&#9873; {{commafy .FindingCount}}</a>{{else}}—{{end}}</td>
+      {{if $.MoreCols}}
+      <td class="time-muted num">{{durTime .DurationSeconds}}</td>
+      <td class="time-muted num">{{commafyPtr .WordCount}}</td>
+      <td class="time-muted num">{{commafyPtr .EmbedChunkCount}}</td>
+      {{end}}
       <td class="mini-badges">
         {{if gt .Pending 0}}<span class="badge pending">{{commafy .Pending}} pend</span>{{end}}
         {{if gt .Claimed 0}}<span class="badge claimed">{{commafy .Claimed}} transcribing</span>{{end}}
-        {{if gt .Done 0}}<span class="badge done">{{commafy .Done}} done</span>{{end}}
+        {{if and (gt .Done 0) (eq .Pending 0) (eq .Claimed 0) (eq .Failed 0)}}<span class="badge done">{{statusBadge "done"}}</span>{{end}}
         {{if gt .Failed 0}}<span class="badge failed">{{commafy .Failed}} fail</span>{{end}}
       </td>
       <td class="time-muted" title="{{formatTime .LastUpdated}}">{{relTime .LastUpdated}}</td>
-      <td class="actions"><a class="btn" href="/book?dir={{.Dir}}">open&nbsp;&#8250;</a></td>
+      <td class="actions"><span class="open-cue" aria-hidden="true">&#8250;</span></td>
     </tr>
   {{end}}
   </tbody>
@@ -490,6 +522,53 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
 </div>
 {{else}}
 <p class="lib-empty">No books match this filter{{if .Query}} for &ldquo;{{.Query}}&rdquo;{{end}}.</p>
+{{end}}
+
+{{define "overviewBand"}}
+<section class="overview" aria-label="Library status overview">
+  <div class="ov-cards">
+    <a class="ov-card accent-blue" href="/library" title="all indexed books">
+      <span class="ov-label">Books</span>
+      <span class="ov-value">{{commafy .TotalBooks}}</span>
+    </a>
+    <a class="ov-card accent-green" href="/library?status=done" title="books whose every track is transcribed">
+      <span class="ov-label">Transcribed</span>
+      <span class="ov-value green">{{.TranscribedPct}}%</span>
+      <span class="ov-sub">{{commafy .FullyTranscribed}} of {{commafy .TotalBooks}} books</span>
+    </a>
+    <a class="ov-card{{if gt .FailedJobs 0}} accent-red{{else}} accent-green{{end}}" href="/library?status=failed" title="tracks that failed transcription">
+      <span class="ov-label">Failed</span>
+      <span class="ov-value{{if gt .FailedJobs 0}} red{{end}}"><span class="ov-glyph" aria-hidden="true">{{if gt .FailedJobs 0}}&#10007;{{else}}&#10003;{{end}}</span>{{commafy .FailedJobs}}</span>
+      <span class="ov-sub">{{if gt .FailedJobs 0}}{{commafy .FailedBooks}} book{{if ne .FailedBooks 1}}s{{end}} affected{{else}}no failures{{end}}</span>
+    </a>
+    <a class="ov-card accent-purple" href="/findings" title="suspected transcription errors (read-only eval)">
+      <span class="ov-label">Findings</span>
+      <span class="ov-value purple">{{commafy .Findings}}</span>
+      {{if gt .HighFindings 0}}<span class="ov-sub">{{commafy .HighFindings}} high-confidence</span>{{end}}
+    </a>
+    <a class="ov-card accent-{{.QueueAccent}}" href="/pipeline" title="pipeline queue + coordinator phase">
+      <span class="ov-label">Queue</span>
+      <span class="ov-value {{.QueueAccent}}">{{commafy .Queued}}</span>
+      <span class="ov-sub">{{.PhaseLabel}}</span>
+    </a>
+  </div>
+  <div class="ov-phase-line{{if .Attention}} attn{{end}}">
+    <span class="ov-phase-ico" aria-hidden="true">{{.StatusGlyph}}</span>
+    <span>{{.PlainStatus}}</span>
+  </div>
+  {{if .FailedBooks}}
+  <div class="ov-attn">
+    <span class="ov-attn-ico" aria-hidden="true">&#9888;&#xFE0F;</span>
+    <span>Needs attention: {{commafy .FailedBooks}} book{{if ne .FailedBooks 1}}s{{end}} with failed tracks ({{commafy .FailedJobs}} track{{if ne .FailedJobs 1}}s{{end}}). <a href="/library?status=failed">Review failed &#8250;</a> — each failed track shows its error and a retry.</span>
+  </div>
+  {{end}}
+  {{if and (not .FailedBooks) (gt .HighFindings 0)}}
+  <div class="ov-attn attn-soft">
+    <span class="ov-attn-ico" aria-hidden="true">&#9873;</span>
+    <span>{{commafy .HighFindings}} high-confidence finding{{if ne .HighFindings 1}}s{{end}} unreviewed. <a href="/findings">Open the worklist &#8250;</a></span>
+  </div>
+  {{end}}
+</section>
 {{end}}
 `))
 
@@ -511,7 +590,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
     <button class="btn btn-warn" hx-post="/actions/book-requeue?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
             hx-confirm="Re-transcribe all {{.Total}} track(s) of this book? Deletes their transcripts + embeddings and re-runs the runner.">requeue entire book</button>
     {{if .EvalConfigured}}
-    <button class="btn" hx-post="/actions/eval?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
+    <button class="btn btn-primary" hx-post="/actions/eval?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
             hx-confirm="Run the read-only LLM judge over this book's chunks? It flags suspected transcription errors (advisory only — transcripts are never edited) and may take a minute.">run eval</button>
     {{else}}
     <span class="eval-disabled" title="No eval chat endpoint is configured (AI_ROLES.eval / EVAL_CHAT_*).">run eval (no endpoint — <a href="/servers">configure</a>)</span>
@@ -559,20 +638,21 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
 {{if .Tracks}}
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Track</th><th>Status</th>
-    <th title="audio duration">Duration</th>
-    <th title="transcript word count (runner)">Words</th>
-    <th title="transcription wall-clock time (runner)">Proc</th>
-    <th title="audio codec · channel layout (runner)">Codec</th>
-    <th title="embedded chunks">Chunks</th>
-    <th title="suspected-error findings recorded for this track (read-only eval)">Flags</th>
-    <th>Updated</th><th></th></tr></thead>
+  <caption>Tracks in this book</caption>
+  <thead><tr><th scope="col">Track</th><th scope="col">Status</th>
+    <th scope="col" class="num" title="audio duration">Duration</th>
+    <th scope="col" class="num" title="transcript word count (runner)">Words</th>
+    <th scope="col" class="num" title="transcription wall-clock time (runner)">Proc</th>
+    <th scope="col" title="audio codec · channel layout (runner)">Codec</th>
+    <th scope="col" class="num" title="embedded chunks">Chunks</th>
+    <th scope="col" class="num" title="suspected-error findings recorded for this track (read-only eval)">Flags</th>
+    <th scope="col">Updated</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
   <tbody>
   {{range .Tracks}}
     <tr>
       <td><a class="file-name" href="/track?id={{.ID}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}</td>
-      <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
+      <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
       <td class="time-muted">{{durTime .DurationSeconds}}</td>
       <td class="time-muted">{{commafyPtr .WordCount}}</td>
       <td class="time-muted">{{procTime .ProcessingSeconds}}</td>
@@ -611,11 +691,12 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
   {{if .Findings}}
   <div class="table-wrap">
   <table>
+    <caption>Suspected errors in this book — advisory only, transcripts are never edited</caption>
     <thead><tr>
-      <th title="judge self-scored confidence (triage highest-first)">Confidence</th>
-      <th>Issue</th>
-      <th title="suspected span → suggested correction (advisory only)">Correction</th>
-      <th title="track · timestamp">Where</th>
+      <th scope="col" class="num" title="judge self-scored confidence (triage highest-first)">Conf</th>
+      <th scope="col">Issue</th>
+      <th scope="col" title="suspected span → suggested correction (advisory only)">Correction</th>
+      <th scope="col" title="track · timestamp">Where</th>
     </tr></thead>
     <tbody>
     {{range .Findings}}
@@ -644,7 +725,8 @@ var bookSearchFragmentTmpl = template.Must(template.New("booksearch").Funcs(tmpl
 {{if .Results}}
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Track</th><th>Time</th><th>Match</th></tr></thead>
+  <caption>Matching transcript chunks in this book</caption>
+  <thead><tr><th scope="col">Track</th><th scope="col">Time</th><th scope="col">Match</th></tr></thead>
   <tbody>
   {{range .Results}}
     <tr>
@@ -690,7 +772,7 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
   <div class="book-title">{{.Title}}</div>
   {{if .Author}}<div class="book-author">{{.Author}}</div>{{end}}
   <div class="book-stats">
-    <span><span class="badge {{.Detail.Status}}">{{statusLabel .Detail.Status}}</span></span>
+    <span><span class="badge {{.Detail.Status}}">{{statusBadge .Detail.Status}}</span></span>
     {{if .Detail.HasTranscript}}<span class="time-muted">{{durTime .DurationPtr}}</span>{{end}}
     <span class="time-muted" title="{{formatTime .Detail.UpdatedAt}}">updated {{relTime .Detail.UpdatedAt}}</span>
   </div>
@@ -779,7 +861,8 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
     {{if .Detail.Chunks}}
     <div class="table-wrap">
     <table>
-      <thead><tr><th>#</th><th>Time range</th><th>Chars</th><th>Speaker</th></tr></thead>
+      <caption>Embedding chunks for this track</caption>
+      <thead><tr><th scope="col" class="num">#</th><th scope="col">Time range</th><th scope="col" class="num">Chars</th><th scope="col">Speaker</th></tr></thead>
       <tbody>
       {{range .Detail.Chunks}}
         <tr>
@@ -796,7 +879,7 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
   </div>
 {{else}}
   <div class="section">
-    <p class="lib-empty">Not transcribed yet — this track is <span class="badge {{.Detail.Status}}">{{statusLabel .Detail.Status}}</span>. The transcript reader and chunk list appear once the runner completes it.</p>
+    <p class="lib-empty">Not transcribed yet — this track is <span class="badge {{.Detail.Status}}">{{statusBadge .Detail.Status}}</span>. The transcript reader and chunk list appear once the runner completes it.</p>
   </div>
 {{end}}
 `))
@@ -820,6 +903,11 @@ type pageShell struct {
 	PhaseClass string
 	Paused     bool
 	PhaseKnown bool
+	// PhaseIcon is a small glyph paired with the phase word so the pill reads at a
+	// glance without relying on the border tint alone (color-only avoidance, 1.4.1).
+	// PhaseReason is a one-line plain-language reason string for the title tooltip.
+	PhaseIcon   template.HTML
+	PhaseReason string
 }
 
 type statusData struct {
@@ -885,7 +973,35 @@ type bookRow struct {
 	FindingCount int
 }
 
+// overviewData backs the home status-overview band (the "is everything okay?"
+// rollup at the top of the library page). All counts are whole-library — the band
+// only renders on the unfiltered home view, so it answers the health question
+// independent of the active library filter. Cards link to their drill-down.
+type overviewData struct {
+	TotalBooks       int
+	FullyTranscribed int
+	TranscribedPct   int
+	FailedJobs       int    // failed transcription jobs (tracks)
+	FailedBooks      int    // distinct books with ≥1 failed track
+	Findings         int    // total recorded findings
+	HighFindings     int    // confidence ≥ 0.8 (the triage-first bucket)
+	Queued           int    // pending + claimed
+	QueueAccent      string // "blue" (work queued) / "green" (drained) — never red for paused
+	PhaseLabel       string // short queue-card sub: "idle" / "transcribing" / "paused"
+	PlainStatus      string // one-line plain-language status under the cards
+	StatusGlyph      template.HTML
+	Attention        bool // true → the phase line reads as needs-attention (failures only)
+}
+
 type libraryData struct {
+	// Overview is the home status-overview band, populated only on the unfiltered
+	// home view (nil on a filtered/searched library so it doesn't contradict the
+	// active filter).
+	Overview *overviewData
+	// MoreCols toggles the opt-in jargon columns (Duration/Words/Chunks) — off by
+	// default so the persona-essential columns lead (?cols=more turns them on).
+	MoreCols bool
+
 	Books        []bookRow
 	Status       string
 	Query        string
@@ -1093,6 +1209,30 @@ func statusLabel(status string) string {
 	return status
 }
 
+// statusBadge renders a status badge's inner HTML: a leading glyph paired with the
+// operator-facing label, so job state is conveyed by shape + text, not color alone
+// (WCAG 1.4.1). The glyphs are fixed entities (no user input), so the template.HTML
+// return is safe.
+func statusBadge(status string) template.HTML {
+	var ico string
+	switch status {
+	case "done":
+		ico = "&#10003;" // ✓
+	case "failed":
+		ico = "&#10007;" // ✗
+	case "claimed":
+		ico = "&#9658;" // ►
+	case "pending":
+		ico = "&#9675;" // ○
+	default:
+		ico = "&#9679;" // ●
+	}
+	// #nosec G203 -- ico is one of a fixed set of literal HTML entities (no user
+	// input) and the only variable part, statusLabel(status), is escaped with
+	// template.HTMLEscapeString; the result is safe to emit unescaped.
+	return template.HTML(`<span class="badge-ico" aria-hidden="true">` + ico + `</span>` + template.HTMLEscapeString(statusLabel(status)))
+}
+
 // timestamp renders a non-negative float seconds offset as a clock string:
 // "mm:ss" below an hour, "h:mm:ss" at or above one. Used by the transcript
 // reader and chunk list. Negative input is clamped to 0.
@@ -1243,6 +1383,38 @@ func phaseClass(phase string) string {
 	}
 }
 
+// phaseIcon returns the small glyph paired with a coordinator phase word so the
+// topbar pill is legible without relying on the border tint alone (1.4.1). It is
+// HTML (an entity) so the caller interpolates it unescaped; the values are fixed
+// literals, not user input.
+func phaseIcon(phase string) template.HTML {
+	switch phase {
+	case db.PhaseTranscribe:
+		return template.HTML("&#9658;") // ► running/transcribe
+	case db.PhaseAnalyze:
+		return template.HTML("&#9673;") // ◉ analyze
+	default:
+		return template.HTML("&#9679;") // ● idle
+	}
+}
+
+// phaseReason is the one-line plain-language reason string for the phase pill
+// tooltip. Paused is surfaced separately (its own neutral badge), so this only
+// describes the coordinator phase itself.
+func phaseReason(phase string, paused bool) string {
+	if paused {
+		return "Paused by intent — the runner is not claiming new work (a normal resting state)."
+	}
+	switch phase {
+	case db.PhaseTranscribe:
+		return "Transcribing — the runner is claiming and processing audio."
+	case db.PhaseAnalyze:
+		return "Analyzing — the eval judge is reviewing transcripts."
+	default:
+		return "Idle — nothing queued for the runner right now."
+	}
+}
+
 // runBudgetText renders the current bounded-run state for the Pipeline page: the
 // remaining-claim count when a run_limit is set, or "unlimited" when nil. A
 // run_limit of 0 means a bounded run has drained (the runner declines further
@@ -1383,6 +1555,7 @@ func (s *MCPServer) renderPage(w http.ResponseWriter, r *http.Request, tmpl *tem
 	} else {
 		data.Phase = phase
 		data.PhaseClass = phaseClass(phase)
+		data.PhaseIcon = phaseIcon(phase)
 		data.PhaseKnown = true
 	}
 	if paused, _, err := s.db.GetControl(ctx); err != nil {
@@ -1390,6 +1563,7 @@ func (s *MCPServer) renderPage(w http.ResponseWriter, r *http.Request, tmpl *tem
 	} else {
 		data.Paused = paused
 	}
+	data.PhaseReason = phaseReason(data.Phase, data.Paused)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := tmpl.Execute(w, data); err != nil {
@@ -1546,17 +1720,126 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 	}
 	data := libraryData{
 		Books: pageRows, Status: status, Query: query, QueryEscaped: url.QueryEscape(query),
-		Sort: sort, HasFindings: hasFindings,
+		Sort: sort, HasFindings: hasFindings, MoreCols: r.URL.Query().Get("cols") == "more",
 		FilterParams: libraryFilterParams(sort, hasFindings),
 		Page:         offset/libraryPageSize + 1, TotalPages: totalPages, TotalBooks: filteredTotal,
 		HasPrev: offset > 0, HasNext: end < filteredTotal,
 		PrevOffset: max(0, offset-libraryPageSize), NextOffset: offset + libraryPageSize,
 	}
+
+	// Home status-overview band: only on the unfiltered first page (the "is it
+	// okay?" home view). On any filter/search/paged view it's suppressed so the
+	// whole-library rollup never contradicts the narrowed list. `rows` here is the
+	// full library (status=="", query==""), so failed-book counting is exact.
+	if status == "" && query == "" && !hasFindings && offset == 0 {
+		data.Overview = s.buildOverview(r.Context(), rows, findingsByBook)
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := libraryFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("library render error", "error", err)
 	}
+}
+
+// buildOverview assembles the home status-overview band from the full library row
+// set (already fetched for the unfiltered view), the per-book findings counts, and
+// a fresh queue/phase read. It is best-effort: a queue or findings read error
+// degrades the affected cards to zero rather than failing the whole library page.
+// "Paused" is treated as a NORMAL resting state — the phase line and Queue card
+// read neutral (never red/attention) when paused-by-intent; only real failures
+// raise the attention flag.
+func (s *MCPServer) buildOverview(ctx context.Context, rows []bookRow, findingsByBook map[string]int) *overviewData {
+	o := &overviewData{TotalBooks: len(rows)}
+	for _, b := range rows {
+		if b.Total > 0 && b.Done == b.Total {
+			o.FullyTranscribed++
+		}
+		if b.Failed > 0 {
+			o.FailedBooks++
+		}
+	}
+	if o.TotalBooks > 0 {
+		o.TranscribedPct = o.FullyTranscribed * 100 / o.TotalBooks
+	}
+
+	stats, err := s.db.GetServiceStatus(ctx)
+	if err != nil {
+		s.logger.Error("GetServiceStatus (overview) error", "error", err)
+		stats = &db.QueueStats{}
+	}
+	o.FailedJobs = stats.Failed
+	o.Queued = stats.Pending + stats.Claimed
+
+	phase, perr := s.db.GetPipelinePhase(ctx)
+	if perr != nil {
+		s.logger.Error("GetPipelinePhase (overview) error", "error", perr)
+		phase = db.PhaseIdle
+	}
+
+	if summary, ferr := s.db.GetFindingsSummary(ctx); ferr != nil {
+		s.logger.Error("GetFindingsSummary (overview) error", "error", ferr)
+	} else if summary != nil {
+		o.Findings = summary.TotalFindings
+		o.HighFindings = summary.HighConfidence
+	}
+
+	o.fillStatusLine(stats.Paused, stats.Claimed > 0, phase)
+	return o
+}
+
+// fillStatusLine sets the overview's queue-card accent + sub-label, the
+// plain-language status line, and its glyph. Order of precedence in the prose:
+// failures first (the only "needs attention" case), then paused (neutral), then
+// active transcription, then idle.
+func (o *overviewData) fillStatusLine(paused, transcribing bool, phase string) {
+	// Queue card accent: blue when work is queued, green when drained. Never red
+	// for paused — paused is intentional, not an alert.
+	if o.Queued > 0 {
+		o.QueueAccent = "blue"
+	} else {
+		o.QueueAccent = "green"
+	}
+
+	switch {
+	case paused:
+		o.PhaseLabel = "paused"
+	case transcribing:
+		o.PhaseLabel = "transcribing"
+	default:
+		o.PhaseLabel = phase
+	}
+
+	// Plain-language one-liner. Failures are the lead when present (attention);
+	// otherwise the line is neutral.
+	transcribed := "All books transcribed"
+	if o.FullyTranscribed < o.TotalBooks {
+		transcribed = commafy(o.FullyTranscribed) + " of " + commafy(o.TotalBooks) + " books transcribed"
+	}
+	switch {
+	case o.FailedJobs > 0:
+		o.Attention = true
+		o.StatusGlyph = template.HTML("&#9888;&#xFE0F;") // ⚠️
+		o.PlainStatus = commafy(o.FailedJobs) + " track" + plural(o.FailedJobs) + " failed and need attention — " + transcribed + "."
+	case paused:
+		o.StatusGlyph = template.HTML("&#9208;") // ⏸ neutral
+		o.PlainStatus = "Paused (intentional) — runner is not claiming new work. " + transcribed + ", " + commafy(o.FailedJobs) + " failed."
+	case o.Queued > 0:
+		o.StatusGlyph = template.HTML("&#9658;") // ►
+		o.PlainStatus = commafy(o.Queued) + " track" + plural(o.Queued) + " queued — " + transcribed + ", 0 failed."
+	default:
+		o.StatusGlyph = template.HTML("&#9679;") // ●
+		o.PlainStatus = "Idle — nothing queued. " + transcribed + ", 0 failed."
+	}
+}
+
+// plural returns "s" for any count != 1 (small pluralization helper for the
+// overview status prose).
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // sortBookRows orders the library rows for the chosen sort mode, in place:
