@@ -1518,7 +1518,12 @@ type QueueStats struct {
 	// Runner fields — populated when at least one job has status='claimed'.
 	RunnerActive  bool
 	RunnerID      string     // claimed_by of the most-recently-updated claimed job
-	LastHeartbeat *time.Time // updated_at of that job
+	LastHeartbeat *time.Time // updated_at of the most-recently-updated claimed job
+	// LatestActivity is the newest of (most-recent claimed-job heartbeat,
+	// most-recent completion). It is the broadest "the runner did something
+	// recently" signal — see SecondsSinceActivity. nil only on a fresh install
+	// with no claims and no completions.
+	LatestActivity *time.Time
 
 	// Per-run aggregates (run_metrics). AvgProcessingSeconds is the mean
 	// transcription wall-clock over jobs the runner has timed; TotalEmbedTokens
@@ -1636,6 +1641,21 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		q.RunnerActive = true
 		q.RunnerID = *claimedBy
 		q.LastHeartbeat = updatedAt
+	}
+
+	// LatestActivity: the newest of (last claimed-job heartbeat, last completion).
+	// This is the broadest "the runner did something recently" signal and is what
+	// the runner-liveness metric derives from. NULL on a fresh install (no claims,
+	// no completions). NOTE: the runner only stamps updated_at while a job is
+	// CLAIMED — there is no idle heartbeat — so a large age here means
+	// claim-activity is old, NOT necessarily that the runner is down (CONTRACT §1.7).
+	if err := db.pool.QueryRow(ctx, `
+		SELECT GREATEST(
+		  (SELECT MAX(updated_at)  FROM transcription_jobs WHERE status = 'claimed'),
+		  (SELECT MAX(COALESCE(completed_at, updated_at)) FROM transcription_jobs WHERE status = 'done')
+		)
+	`).Scan(&q.LatestActivity); err != nil {
+		return nil, fmt.Errorf("latest activity query: %w", err)
 	}
 
 	// Per-run aggregates from run_metrics. NULL-safe: AVG/SUM over zero matching

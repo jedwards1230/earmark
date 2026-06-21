@@ -41,6 +41,13 @@ const (
 	HostGoWorker  = "go-worker"
 )
 
+// EventAppender is the single-method seam for emitting pipeline_events. *DB
+// satisfies it (AppendEvent). Callers that only need to record events (the eval
+// CLI, the batch coordinator) depend on this rather than the whole *DB.
+type EventAppender interface {
+	AppendEvent(ctx context.Context, e PipelineEvent) error
+}
+
 // PipelineEvent is one append-only row in pipeline_events (CONTRACT §1.7). All
 // fields except Stage and Event are optional (nil/zero-friendly): pointers are
 // written as NULL when nil, and Detail is marshaled to JSONB (nil → NULL).

@@ -401,3 +401,107 @@ func TestTranscribeDone(t *testing.T) {
 		})
 	}
 }
+
+// recordingSink captures AppendEvent calls for assertions.
+type recordingSink struct {
+	mu     sync.Mutex
+	events []db.PipelineEvent
+}
+
+func (s *recordingSink) AppendEvent(_ context.Context, e db.PipelineEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, e)
+	return nil
+}
+
+func (s *recordingSink) snapshot() []db.PipelineEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]db.PipelineEvent, len(s.events))
+	copy(out, s.events)
+	return out
+}
+
+func TestArbiterReason(t *testing.T) {
+	cases := []struct {
+		gaming, ok        bool
+		wantReason        string
+		wantAvail         bool
+	}{
+		{gaming: false, ok: false, wantReason: "unreachable", wantAvail: false},
+		{gaming: true, ok: true, wantReason: "gaming", wantAvail: false},
+		{gaming: false, ok: true, wantReason: "idle", wantAvail: true},
+	}
+	for _, c := range cases {
+		r, a := arbiterReason(c.gaming, c.ok)
+		if r != c.wantReason || a != c.wantAvail {
+			t.Errorf("arbiterReason(%v,%v) = (%q,%v), want (%q,%v)",
+				c.gaming, c.ok, r, a, c.wantReason, c.wantAvail)
+		}
+	}
+}
+
+// TestAvailabilityEmitter_DebouncesTransitions asserts an event is emitted only
+// when the arbiter state CHANGES — a steady-state poll produces no rows.
+func TestAvailabilityEmitter_DebouncesTransitions(t *testing.T) {
+	sink := &recordingSink{}
+	e := &availabilityEmitter{sink: sink}
+	ctx := context.Background()
+
+	// idle, idle, idle → one event (the first), then debounced.
+	e.observe(ctx, false, true)
+	e.observe(ctx, false, true)
+	e.observe(ctx, false, true)
+	if got := len(sink.snapshot()); got != 1 {
+		t.Fatalf("steady idle: expected 1 event, got %d", got)
+	}
+
+	// transition to gaming → a second event.
+	e.observe(ctx, true, true)
+	// back to idle → a third.
+	e.observe(ctx, false, true)
+	// unreachable → a fourth.
+	e.observe(ctx, false, false)
+	// unreachable again → no new event.
+	e.observe(ctx, false, false)
+
+	evs := sink.snapshot()
+	if len(evs) != 4 {
+		t.Fatalf("expected 4 events across transitions, got %d", len(evs))
+	}
+	wantReasons := []string{"idle", "gaming", "idle", "unreachable"}
+	for i, want := range wantReasons {
+		if evs[i].Reason != want {
+			t.Errorf("event[%d].Reason = %q, want %q", i, evs[i].Reason, want)
+		}
+		if evs[i].Stage != db.StageRunnerAvailability || evs[i].Event != db.EventState {
+			t.Errorf("event[%d] stage/event = %q/%q, want runner_availability/state",
+				i, evs[i].Stage, evs[i].Event)
+		}
+	}
+}
+
+// TestRun_EmitsAvailabilityEvent verifies the coordinator records a
+// runner_availability event during a normal batch (via the injected sink).
+func TestRun_EmitsAvailabilityEvent(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 2},
+		&db.QueueStats{Pending: 0, Claimed: 0, RunLimit: ptr(0), EmbedBacklog: 2},
+		&db.QueueStats{Pending: 0, Claimed: 0, EmbedBacklog: 0},
+	)
+	sink := &recordingSink{}
+	o := fastOpts()
+	o.Sink = sink
+
+	if err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	evs := sink.snapshot()
+	if len(evs) == 0 {
+		t.Fatal("expected at least one runner_availability event")
+	}
+	if evs[0].Stage != db.StageRunnerAvailability {
+		t.Errorf("first event stage = %q, want runner_availability", evs[0].Stage)
+	}
+}
