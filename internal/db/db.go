@@ -425,6 +425,41 @@ func (db *DB) initialize(ctx context.Context) error {
 			ON transcript_findings (transcription_run_id);
 		CREATE INDEX IF NOT EXISTS transcript_findings_issue_type_idx
 			ON transcript_findings (issue_type);
+
+		-- pipeline_events: append-only audit log of pipeline stage transitions
+		-- (CONTRACT §1.7). Every Go-observable stage boundary (enqueue, embed
+		-- start/finish, eval start/finish, fail/requeue, runner_availability,
+		-- heartbeat-derived) appends one immutable row. job_id is nullable so
+		-- runner_availability/heartbeat events (not tied to a job) can be recorded;
+		-- file_path is denormalized so a timeline survives a requeue mutating the
+		-- job row. Append-only by convention (no UPDATE/DELETE except the retention
+		-- prune of high-frequency heartbeat/availability rows and the ON DELETE
+		-- CASCADE that ties a job's history to the job). Writes are best-effort — a
+		-- failed insert logs and continues; it NEVER fails the pipeline stage.
+		CREATE TABLE IF NOT EXISTS pipeline_events (
+			id             BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			job_id         UUID        REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+			file_path      TEXT,
+			stage          TEXT        NOT NULL CHECK (stage IN
+			                 ('discover','enqueue','claim','transcribe','chunk','embed','eval',
+			                  'done','fail','requeue','heartbeat','runner_availability')),
+			event          TEXT        NOT NULL CHECK (event IN
+			                 ('start','finish','error','skip','retry','state')),
+			runner_host    TEXT,
+			model          TEXT,
+			model_version  TEXT,
+			duration_ms    BIGINT,
+			item_count     INT,
+			token_count    BIGINT,
+			attempt        INT,
+			reason         TEXT,
+			detail         JSONB,
+			created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+
+		CREATE INDEX IF NOT EXISTS pipeline_events_job_id_idx  ON pipeline_events (job_id, created_at);
+		CREATE INDEX IF NOT EXISTS pipeline_events_stage_idx   ON pipeline_events (stage, event, created_at);
+		CREATE INDEX IF NOT EXISTS pipeline_events_created_idx ON pipeline_events (created_at);
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -679,8 +714,9 @@ func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 	// strings (e.g. "30m0s" where bare 'm' means months in Postgres).
 	secs := int(timeout.Seconds())
 
-	// Reset below-max-attempts jobs to pending.
-	if _, err := db.pool.Exec(ctx, `
+	// Reset below-max-attempts jobs to pending. RETURNING the affected rows lets us
+	// emit best-effort requeue audit events (CONTRACT §1.7) without a second query.
+	reset, err := db.pool.Query(ctx, `
 		UPDATE transcription_jobs
 		SET    status     = 'pending',
 		       claimed_by = NULL,
@@ -688,22 +724,82 @@ func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 		WHERE  status     = 'claimed'
 		  AND  updated_at < now() - ($1 * interval '1 second')
 		  AND  attempts   < 3
-	`, secs); err != nil {
+		RETURNING id, file_path, attempts
+	`, secs)
+	if err != nil {
 		return fmt.Errorf("reset stale jobs: %w", err)
+	}
+	requeued, rerr := scanStaleRows(reset)
+	if rerr != nil {
+		return fmt.Errorf("scan reset stale jobs: %w", rerr)
 	}
 
 	// Mark max-attempts jobs failed.
-	if _, err := db.pool.Exec(ctx, `
+	failed, err := db.pool.Query(ctx, `
 		UPDATE transcription_jobs
 		SET    status = 'failed',
 		       error  = 'max attempts reached'
 		WHERE  status     = 'claimed'
 		  AND  updated_at < now() - ($1 * interval '1 second')
 		  AND  attempts   >= 3
-	`, secs); err != nil {
+		RETURNING id, file_path, attempts
+	`, secs)
+	if err != nil {
 		return fmt.Errorf("fail max-attempts jobs: %w", err)
 	}
+	failedRows, ferr := scanStaleRows(failed)
+	if ferr != nil {
+		return fmt.Errorf("scan failed stale jobs: %w", ferr)
+	}
+
+	// Emit audit events for each recovered job (CONTRACT §1.7). Best-effort: a
+	// stale-recovery row that became 'pending' is a requeue; one that hit the
+	// attempt cap is a discarded failure. The reason+attempt distinguish them.
+	for _, r := range requeued {
+		db.emitEvent(ctx, PipelineEvent{
+			JobID: r.id, FilePath: r.filePath, Stage: StageRequeue, Event: EventRetry,
+			RunnerHost: HostGoWorker, Attempt: IntPtr(r.attempts),
+			Reason: "stale claim recovered (heartbeat expired); retryable",
+		})
+	}
+	for _, r := range failedRows {
+		db.emitEvent(ctx, PipelineEvent{
+			JobID: r.id, FilePath: r.filePath, Stage: StageFail, Event: EventError,
+			RunnerHost: HostGoWorker, Attempt: IntPtr(r.attempts),
+			Reason: "max attempts reached after stale-claim recovery; discarded",
+		})
+	}
 	return nil
+}
+
+// staleRow is a recovered job row from RecoverStaleJobs' RETURNING clauses.
+type staleRow struct {
+	id       string
+	filePath string
+	attempts int
+}
+
+// scanStaleRows drains a RETURNING(id, file_path, attempts) result set.
+func scanStaleRows(rows pgx.Rows) ([]staleRow, error) {
+	defer rows.Close()
+	var out []staleRow
+	for rows.Next() {
+		var r staleRow
+		if err := rows.Scan(&r.id, &r.filePath, &r.attempts); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// emitEvent appends a pipeline event best-effort: a write failure is logged and
+// swallowed (CONTRACT §1.7 — events never fail the pipeline operation).
+func (db *DB) emitEvent(ctx context.Context, e PipelineEvent) {
+	if err := db.AppendEvent(ctx, e); err != nil {
+		db.log.Warn("pipeline event write failed (continuing)",
+			"stage", e.Stage, "event", e.Event, "job_id", e.JobID, "error", err)
+	}
 }
 
 // ─── Embedding pipeline ───────────────────────────────────────────────────────
@@ -3057,7 +3153,7 @@ func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]str
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	paths, err := requeueTx(ctx, tx, plan, args...)
+	ids, paths, err := requeueTx(ctx, tx, plan, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -3065,36 +3161,50 @@ func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]str
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit requeue tx: %w", err)
 	}
+
+	// Audit events for the operator requeue (CONTRACT §1.7). Emitted AFTER commit
+	// (the requeue is the source of truth; an event-write failure must not roll it
+	// back) and best-effort. The job moves back to 'pending', so this is a requeue.
+	for i, id := range ids {
+		var fp string
+		if i < len(paths) {
+			fp = paths[i]
+		}
+		db.emitEvent(ctx, PipelineEvent{
+			JobID: id, FilePath: fp, Stage: StageRequeue, Event: EventRetry,
+			RunnerHost: HostGoMonitor, Reason: "operator requeue (re-transcribe)",
+		})
+	}
 	return paths, nil
 }
 
 // requeueTx is the transaction-body core of requeue, split out so the
 // delete-transcripts → reset-jobs → clear-metrics sequence is testable against a
 // pgxmock transaction. It does NOT begin/commit — the caller owns the tx
-// lifecycle. Returns the reset jobs' file paths.
-func requeueTx(ctx context.Context, tx txQuerier, plan requeuePlan, args ...any) ([]string, error) {
+// lifecycle. Returns the reset jobs' ids and file paths (parallel slices).
+func requeueTx(ctx context.Context, tx txQuerier, plan requeuePlan, args ...any) (ids, paths []string, err error) {
 	if _, err := tx.Exec(ctx, plan.deleteTranscripts, args...); err != nil {
-		return nil, fmt.Errorf("delete transcripts: %w", err)
+		return nil, nil, fmt.Errorf("delete transcripts: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, plan.resetJobs, args...)
 	if err != nil {
-		return nil, fmt.Errorf("reset jobs: %w", err)
+		return nil, nil, fmt.Errorf("reset jobs: %w", err)
 	}
-	ids, paths, err := scanIDPaths(rows)
+	ids, paths, err = scanIDPaths(rows)
 	rows.Close()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Clear the orphaned run_metrics for the requeued jobs so the next run's
 	// telemetry starts clean. A no-op when nothing was reset.
 	if len(ids) > 0 {
 		if _, err := tx.Exec(ctx, requeueDeleteMetricsSQL, ids); err != nil {
-			return nil, fmt.Errorf("delete run_metrics: %w", err)
+			return nil, nil, fmt.Errorf("delete run_metrics: %w", err)
 		}
 	}
-	return paths, nil
+	return ids, paths, nil
 }
 
 // ReembedJobs deletes the embedded chunks for transcripts whose file_path

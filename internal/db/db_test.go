@@ -989,7 +989,7 @@ func TestRequeueTxClearsRunMetrics(t *testing.T) {
 		WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 
-	paths, err := requeueTx(context.Background(), tx, requeueByID, id)
+	_, paths, err := requeueTx(context.Background(), tx, requeueByID, id)
 	if err != nil {
 		t.Fatalf("requeueTx: %v", err)
 	}
@@ -1022,7 +1022,7 @@ func TestRequeueTxNoMetricsDeleteWhenNothingReset(t *testing.T) {
 	mock.ExpectQuery(requeueFailed.resetJobs).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"})) // no rows
 
-	paths, err := requeueTx(context.Background(), tx, requeueFailed)
+	_, paths, err := requeueTx(context.Background(), tx, requeueFailed)
 	if err != nil {
 		t.Fatalf("requeueTx: %v", err)
 	}

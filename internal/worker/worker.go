@@ -29,6 +29,9 @@ type DBInterface interface {
 	// UpsertEvalMetrics records the eval slice of run_metrics (timing, judge
 	// model, chunk/skip/finding counts) for the in-pipeline judge. Best-effort.
 	UpsertEvalMetrics(ctx context.Context, m db.EvalMetrics) error
+	// AppendEvent records one pipeline_events row (CONTRACT §1.7). Best-effort:
+	// the worker logs-and-continues; an event write never fails the embed/eval.
+	AppendEvent(ctx context.Context, e db.PipelineEvent) error
 	// GetPipelinePhase reports the batched-pipeline phase (CONTRACT §1.4). The
 	// embed worker idles during the "transcribe" phase (ASR owns the GPU) and
 	// processes normally for "idle"/"analyze"/NULL.
@@ -168,6 +171,13 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 
 	w.log.Info("embedding transcript", "file", t.FilePath, "transcript_id", t.ID)
 	start := time.Now()
+	w.appendEvent(db.PipelineEvent{
+		JobID:      t.JobID,
+		FilePath:   t.FilePath,
+		Stage:      db.StageEmbed,
+		Event:      db.EventStart,
+		RunnerHost: db.HostGoWorker,
+	})
 
 	chunkSize := cfg.ChunkSize
 	if chunkSize <= 0 {
@@ -246,6 +256,16 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		return fmt.Errorf("insert chunks: %w", err)
 	}
 	finished := time.Now()
+	w.appendEvent(db.PipelineEvent{
+		JobID:      t.JobID,
+		FilePath:   t.FilePath,
+		Stage:      db.StageEmbed,
+		Event:      db.EventFinish,
+		RunnerHost: db.HostGoWorker,
+		Model:      embedModel(cfg),
+		DurationMS: db.Int64Ptr(finished.Sub(start).Milliseconds()),
+		ItemCount:  db.IntPtr(len(chunks)),
+	})
 
 	// Persist in-pipeline findings now that their chunks exist. Best-effort: a
 	// findings-write failure leaves chunks searchable but un-flagged (advisory),
@@ -297,11 +317,29 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 	}
 
 	evalStart := time.Now()
+	w.appendEvent(db.PipelineEvent{
+		JobID:      t.JobID,
+		FilePath:   t.FilePath,
+		Stage:      db.StageEval,
+		Event:      db.EventStart,
+		RunnerHost: db.HostGoWorker,
+		Model:      w.judge.Model(),
+	})
 	findings, stats, err := eval.RunOnChunks(w.ctx, w.judge, nil, evalChunks, false)
 	evalFinished := time.Now()
 	if err != nil {
 		w.log.Warn("in-pipeline eval failed (continuing to embed)",
 			"transcript_id", t.ID, "file", t.FilePath, "error", err)
+		w.appendEvent(db.PipelineEvent{
+			JobID:      t.JobID,
+			FilePath:   t.FilePath,
+			Stage:      db.StageEval,
+			Event:      db.EventError,
+			RunnerHost: db.HostGoWorker,
+			Model:      w.judge.Model(),
+			DurationMS: db.Int64Ptr(evalFinished.Sub(evalStart).Milliseconds()),
+			Reason:     err.Error(),
+		})
 		return nil
 	}
 	w.log.Info("in-pipeline eval judged",
@@ -314,7 +352,30 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 	// slice attribution is unambiguous. Best-effort — a metrics write must not
 	// fail the embed step (eval is advisory).
 	w.recordEvalMetrics(t, stats, evalStart, evalFinished)
+	w.appendEvent(db.PipelineEvent{
+		JobID:      t.JobID,
+		FilePath:   t.FilePath,
+		Stage:      db.StageEval,
+		Event:      db.EventFinish,
+		RunnerHost: db.HostGoWorker,
+		Model:      w.judge.Model(),
+		DurationMS: db.Int64Ptr(evalFinished.Sub(evalStart).Milliseconds()),
+		ItemCount:  db.IntPtr(stats.FindingsFound),
+		Detail: map[string]any{
+			"evaluated": stats.ChunksEvaluated,
+			"skipped":   stats.ChunksSkipped,
+		},
+	})
 	return findings
+}
+
+// appendEvent records one pipeline_events row, best-effort: a write failure is
+// logged and swallowed so an audit-event failure never affects the pipeline.
+func (w *Worker) appendEvent(e db.PipelineEvent) {
+	if err := w.db.AppendEvent(w.ctx, e); err != nil {
+		w.log.Warn("pipeline event write failed (continuing)",
+			"stage", e.Stage, "event", e.Event, "job_id", e.JobID, "error", err)
+	}
 }
 
 // recordEvalMetrics UPSERTs the eval worker's slice of run_metrics for a

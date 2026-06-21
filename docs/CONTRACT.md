@@ -568,6 +568,83 @@ Rules:
 - `chapters` is nullable and left `NULL` when no ABS provider is configured.
 - The Go service creates the table in its schema-init transaction.
 
+### 1.7 Append-only pipeline audit log — `pipeline_events` table
+
+An **append-only** record of every Go-observable pipeline stage boundary —
+the immutable timeline (what happened, when, by whom, how long) that complements
+`run_metrics` (the current-state projection). It is **additive** and
+**best-effort**: a failed event insert logs and continues; it NEVER fails the
+pipeline stage that produced it. Writer: the **Go monitor**, **Go embed worker**,
+and **Go DB layer** (requeue/recovery). The Python runner's claim/transcribe/done
+events are **deferred** (see below).
+
+```sql
+CREATE TABLE IF NOT EXISTS pipeline_events (
+    id             BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_id         UUID        REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+    file_path      TEXT,                          -- denormalized so a timeline survives a job's requeue churn
+    stage          TEXT        NOT NULL CHECK (stage IN
+                     ('discover','enqueue','claim','transcribe','chunk','embed','eval',
+                      'done','fail','requeue','heartbeat','runner_availability')),
+    event          TEXT        NOT NULL CHECK (event IN
+                     ('start','finish','error','skip','retry','state')),
+    runner_host    TEXT,                          -- who: a runner id / 'go-worker' / 'go-monitor'
+    model          TEXT,                          -- asr/embed/eval model id for this stage
+    model_version  TEXT,                          -- family+runtime or chart/image version
+    duration_ms    BIGINT,                        -- set on 'finish'/'error'
+    item_count     INT,                           -- chunks/windows/findings, stage-dependent
+    token_count    BIGINT,                        -- prompt+total where applicable
+    attempt        INT,                           -- transcription_jobs.attempts at the time
+    reason         TEXT,                          -- failure/skip reason (free text)
+    detail         JSONB,                         -- stage-specific extras (eval stats, availability, …)
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS pipeline_events_job_id_idx  ON pipeline_events (job_id, created_at);
+CREATE INDEX IF NOT EXISTS pipeline_events_stage_idx   ON pipeline_events (stage, event, created_at);
+CREATE INDEX IF NOT EXISTS pipeline_events_created_idx ON pipeline_events (created_at);
+```
+
+Rules:
+- **`job_id` nullable** so `runner_availability` and `heartbeat` events (not tied
+  to a job) can be recorded; **`file_path` denormalized** so the timeline is
+  reconstructable even after a requeue mutates/clears the job.
+- **Append-only by convention** — no UPDATE/DELETE in Go except the retention
+  prune below and the `ON DELETE CASCADE` (a job's history dies with the job,
+  matching `run_metrics`; the denormalized `file_path` keeps the timeline legible
+  within the retention window even as a job is requeued).
+- **Best-effort** — same contract as `run_metrics`: a failed insert logs and
+  continues; it never fails the pipeline stage.
+- **Retention prune** — a periodic best-effort
+  `DELETE FROM pipeline_events WHERE created_at < now() - interval '180 days' AND
+  stage IN ('heartbeat','runner_availability')` (run from the monitor: once at
+  startup, then every 24h). Only the high-frequency heartbeat/availability rows
+  are pruned; per-job stage events are low-volume and kept indefinitely.
+
+#### Stages: Go-emitted vs deferred (runner-side)
+
+| Stage / event | Source | Status |
+|---|---|---|
+| `enqueue` / `finish` | Go monitor, at job creation | **Go-emitted** |
+| `embed` / `start`,`finish` | Go embed worker | **Go-emitted** (duration_ms, model, item_count=chunks) |
+| `eval` / `start`,`finish`,`error` | Go embed worker (in-pipeline judge) + standalone eval | **Go-emitted** (duration_ms, model, item_count=findings, detail={evaluated,skipped}) |
+| `requeue` / `retry` | Go: operator requeue + stale-claim recovery (reset-to-pending) | **Go-emitted** |
+| `fail` / `error` | Go: stale-claim recovery hitting the attempt cap | **Go-emitted** |
+| `runner_availability` / `state` | Go batch coordinator (gpu-arbiter poll, on transition) | **Go-emitted** (Phase 3, §1.4) |
+| `heartbeat` | derived from the runner's existing claimed-job heartbeat | **derived** — see the heartbeat caveat below |
+| `claim`, `transcribe`, `done` | Python runner | **DEFERRED** — requires runner.py changes + on-hardware validation (NeMo/CUDA). The runner owns the claim/transcribe/mark-done UPDATEs; emitting these from runner.py is a follow-up PR. `done` cannot be observed Go-side (the completion time is captured by the `completed_at` trigger, §1.1, but no Go code sees the transition). |
+
+> **Heartbeat is claim-activity, not idle liveness.** The runner only stamps
+> `transcription_jobs.updated_at` while a job is **claimed** (every
+> `RUNNER_HEARTBEAT_SECONDS`, default 60). There is **no idle heartbeat** — when
+> the queue is drained or the runner is paused, nothing is stamped. So a
+> heartbeat-derived liveness signal (and the `earmark_runner_last_heartbeat_seconds`
+> gauge, §2.16) reflects "time since last claim-activity," and **cannot**
+> distinguish "runner idle, queue empty" from "runner down." A **true idle
+> heartbeat is exactly the deferred runner.py work** — it is why that follow-up
+> matters. Consumers MUST pair this signal with a queue-non-empty + not-paused
+> condition before treating staleness as "down."
+
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT

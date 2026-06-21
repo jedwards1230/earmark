@@ -49,10 +49,11 @@ type fakeDB struct {
 	usage       openai.EmbeddingUsage // returned by GetEmbeddingsWithUsage
 	metrics     []db.EmbedMetrics     // captured by UpsertEmbedMetrics
 	metricsErr  error
-	evalMetrics []db.EvalMetrics // captured by UpsertEvalMetrics
-	evalMetErr  error            // error returned by UpsertEvalMetrics
-	findings    []db.Finding     // captured by InsertFindings (in-pipeline eval)
-	findingsErr error            // error returned by InsertFindings
+	evalMetrics []db.EvalMetrics   // captured by UpsertEvalMetrics
+	evalMetErr  error              // error returned by UpsertEvalMetrics
+	findings    []db.Finding       // captured by InsertFindings (in-pipeline eval)
+	findingsErr error              // error returned by InsertFindings
+	events      []db.PipelineEvent // captured by AppendEvent
 	// phase is returned by GetPipelinePhase. The zero value ("") normalizes to
 	// "idle" so existing tests are unaffected. phaseErr forces a read error.
 	phase    string
@@ -128,6 +129,13 @@ func (f *fakeDB) UpsertEvalMetrics(_ context.Context, m db.EvalMetrics) error {
 		return f.evalMetErr
 	}
 	f.evalMetrics = append(f.evalMetrics, m)
+	return nil
+}
+
+func (f *fakeDB) AppendEvent(_ context.Context, e db.PipelineEvent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, e)
 	return nil
 }
 
@@ -257,6 +265,17 @@ func TestProcessTranscript_InlineEvalWritesFindingsLinkedToChunks(t *testing.T) 
 	require.GreaterOrEqual(t, em.Chunks, 1, "at least one chunk evaluated")
 	require.False(t, em.FinishedAt.IsZero(), "eval_finished_at is the completion marker — must be set")
 	require.False(t, em.FinishedAt.Before(em.StartedAt), "finished must be >= started")
+
+	// Audit events: embed start+finish AND eval start+finish (CONTRACT §1.7).
+	stages := map[string]int{}
+	for _, e := range fdb.events {
+		stages[e.Stage+"/"+e.Event]++
+		require.Equal(t, "job-eval", e.JobID, "events must carry the job id")
+	}
+	require.Equal(t, 1, stages["embed/start"], "expected one embed start event")
+	require.Equal(t, 1, stages["embed/finish"], "expected one embed finish event")
+	require.Equal(t, 1, stages["eval/start"], "expected one eval start event")
+	require.Equal(t, 1, stages["eval/finish"], "expected one eval finish event")
 }
 
 func TestProcessTranscript_NoJudgeRecordsNoEvalMetrics(t *testing.T) {
