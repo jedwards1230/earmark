@@ -13,6 +13,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/metrics"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/queue"
 	"github.com/jedwards1230/earmark/internal/tokenizer"
@@ -24,7 +25,7 @@ type DBInterface interface {
 	InsertChunks(ctx context.Context, chunks []db.Chunk) error
 	GetEmbeddings(texts []string) ([][]float32, error)
 	GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
-	RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
+	RecoverStaleJobs(ctx context.Context, timeout time.Duration) (int, error)
 	UpsertEmbedMetrics(ctx context.Context, m db.EmbedMetrics) error
 	// UpsertEvalMetrics records the eval slice of run_metrics (timing, judge
 	// model, chunk/skip/finding counts) for the in-pipeline judge. Best-effort.
@@ -53,7 +54,15 @@ type Worker struct {
 	// judge is non-nil only when EvalInPipeline is set AND a chat endpoint
 	// resolved; when nil the worker skips the in-pipeline eval step entirely.
 	judge *eval.Judge
+	// metrics records Prometheus stage durations + counters (CONTRACT §2.16).
+	// nil-safe: a nil Registry makes the Record* calls no-ops.
+	metrics *metrics.Registry
 }
+
+// SetMetrics attaches a Prometheus registry so the worker records stage
+// durations and the completed/failed counters (CONTRACT §2.16). Optional —
+// the Record* calls are nil-safe when unset.
+func (w *Worker) SetMetrics(m *metrics.Registry) { w.metrics = m }
 
 // NewWorker creates a Worker. The queue parameter is accepted for API
 // compatibility with the monitor wiring but is not used by the embed loop.
@@ -106,8 +115,13 @@ func (w *Worker) Start(cfg *config.Config) {
 
 		// Recover stale jobs periodically.
 		if time.Since(lastStale) >= staleRecoveryInterval {
-			if err := w.db.RecoverStaleJobs(w.ctx, cfg.StaleJobTimeout); err != nil {
+			failed, err := w.db.RecoverStaleJobs(w.ctx, cfg.StaleJobTimeout)
+			if err != nil {
 				w.log.Error("stale job recovery failed", "error", err)
+			} else if failed > 0 && w.metrics != nil {
+				for i := 0; i < failed; i++ {
+					w.metrics.RecordJobFailed()
+				}
 			}
 			lastStale = time.Now()
 		}
@@ -266,6 +280,7 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		DurationMS: db.Int64Ptr(finished.Sub(start).Milliseconds()),
 		ItemCount:  db.IntPtr(len(chunks)),
 	})
+	w.metrics.RecordStageFinish(db.StageEmbed, finished.Sub(start))
 
 	// Persist in-pipeline findings now that their chunks exist. Best-effort: a
 	// findings-write failure leaves chunks searchable but un-flagged (advisory),
@@ -366,6 +381,7 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 			"skipped":   stats.ChunksSkipped,
 		},
 	})
+	w.metrics.RecordStageFinish(db.StageEval, evalFinished.Sub(evalStart))
 	return findings
 }
 

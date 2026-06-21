@@ -15,6 +15,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/metrics"
 )
 
 // MCPServer wraps the MCP server functionality for the earmark service
@@ -61,6 +62,10 @@ type MCPServer struct {
 	// actions (CONTRACT §2.15). Nil-judge / unconfigured → the buttons are hidden
 	// with an explanation rather than POSTing into a guaranteed failure.
 	eval evalState
+
+	// metrics is the Prometheus registry mounted at /metrics (CONTRACT §2.16).
+	// nil in the demo (no DB-backed scrape source).
+	metrics *metrics.Registry
 }
 
 // evalState carries the dashboard's on-demand eval-run wiring. configured
@@ -271,6 +276,9 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		endpointProber: newHTTPEndpointProber(2*time.Second, 5*time.Second),
 	}
 	s.initEval(cfg)
+	// Prometheus metrics (CONTRACT §2.16): the scrape-time collector reads the DB
+	// for current-state gauges. s.db satisfies metrics.StatsSource.
+	s.metrics = metrics.New(s.db, 2*time.Second)
 	return s
 }
 
@@ -421,6 +429,11 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	}
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/healthz", healthHandler)
+
+	// Prometheus metrics (CONTRACT §2.16). nil in the demo (no DB scrape source).
+	if s.metrics != nil {
+		mux.Handle("GET /metrics", s.metrics.Handler())
+	}
 
 	// Readiness — confirms the DB pool is reachable before accepting traffic.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {

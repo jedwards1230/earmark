@@ -1393,6 +1393,38 @@ findings.
 
 ---
 
+### 2.16 Prometheus metrics
+
+Both Go pods expose a Prometheus `/metrics` endpoint (the mcp pod mounts it on
+its existing `:8081` mux; the ingest pod on its `INGEST_HTTP_ADDR` listener,
+§2.4). The surface is **gauges/counters only — NO per-job series** (high-
+cardinality per-job history belongs in Postgres/Grafana, not Prometheus). These
+metric **names are load-bearing** — the homelab-k8s companion PR (alert rules,
+dashboards, scrape config) depends on them verbatim; do not rename without
+updating that PR.
+
+The current-state gauges are produced by a scrape-time collector that reads the
+DB on each scrape (always fresh, no refresh goroutine). The counters and the
+histogram are incremented at the Go-emitted pipeline event sites.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `earmark_jobs` | gauge | `status` (`pending`/`claimed`/`done`/`failed`) | Current `transcription_jobs` count by status. |
+| `earmark_embed_backlog` | gauge | — | Completed transcripts with no chunks yet (the embed worker's needs-embedding set). |
+| `earmark_eval_coverage_ratio` | gauge | — | Done jobs judged (`run_metrics.eval_finished_at` non-NULL) ÷ done jobs; `0` when no done jobs. |
+| `earmark_runner_last_heartbeat_seconds` | gauge | — | Seconds since the runner's last **claim-activity**. The runner only stamps a heartbeat while a job is claimed (no idle heartbeat, §1.7), so this is NOT idle liveness and CANNOT distinguish "idle, queue empty" from "down". **Omitted entirely when there is no claim/completion history** (so an alert can't misread a multi-day age). Pair with `earmark_jobs{status="pending"}+earmark_jobs{status="claimed"}>0` before alerting. |
+| `earmark_runner_available` | gauge | — | `1` when the GPU host is free for transcription (gpu-arbiter not gaming), `0` when gaming/evicting. Omitted until a `runner_availability` event has been observed. |
+| `earmark_stage_duration_seconds` | histogram | `stage` | Per-stage processing duration, observed at Go-emitted finish events (`embed`, `eval`). |
+| `earmark_jobs_completed_total` | counter | — | Go-observable embed-stage completions (best-effort — the **runner** owns the job `done` transition, so this counts the worker's embed finishes, not the runner's mark-done). |
+| `earmark_jobs_failed_total` | counter | — | Go-observable job failures (the stale-claim attempt-cap path). Best-effort — runner-side failures are not counted here; `earmark_jobs{status="failed"}` is the authoritative current failed count. |
+| `earmark_eta_work_seconds` | gauge | — | Empirical busy-time ETA for the remaining chunks (§4). Omitted when there is no remaining work / no rate history. |
+| `earmark_eta_calendar_seconds` | gauge | — | Empirical calendar ETA (work ÷ runner-availability fraction, §4). Omitted when availability history is absent. |
+
+Standard `go_*` and `process_*` collectors are also registered for baseline
+observability. Both pods also serve `/healthz` (liveness, always-200).
+
+---
+
 ## 3. SCHEMA — pgvector chunks table
 
 The Go service reads completed transcripts, chunks them, and embeds each chunk.

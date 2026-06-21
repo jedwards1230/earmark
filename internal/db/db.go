@@ -708,8 +708,9 @@ func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error
 
 // RecoverStaleJobs resets jobs stuck in "claimed" state longer than the
 // configured stale timeout. Jobs that have reached max attempts are marked
-// failed. (CONTRACT §1.3 — stale-claim recovery.)
-func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error {
+// failed. (CONTRACT §1.3 — stale-claim recovery.) Returns the number of jobs
+// newly marked 'failed' (for the best-effort failed-jobs metric).
+func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) (int, error) {
 	// Use an integer-seconds interval to avoid PostgreSQL misreading Go duration
 	// strings (e.g. "30m0s" where bare 'm' means months in Postgres).
 	secs := int(timeout.Seconds())
@@ -727,11 +728,11 @@ func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 		RETURNING id, file_path, attempts
 	`, secs)
 	if err != nil {
-		return fmt.Errorf("reset stale jobs: %w", err)
+		return 0, fmt.Errorf("reset stale jobs: %w", err)
 	}
 	requeued, rerr := scanStaleRows(reset)
 	if rerr != nil {
-		return fmt.Errorf("scan reset stale jobs: %w", rerr)
+		return 0, fmt.Errorf("scan reset stale jobs: %w", rerr)
 	}
 
 	// Mark max-attempts jobs failed.
@@ -745,11 +746,11 @@ func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 		RETURNING id, file_path, attempts
 	`, secs)
 	if err != nil {
-		return fmt.Errorf("fail max-attempts jobs: %w", err)
+		return 0, fmt.Errorf("fail max-attempts jobs: %w", err)
 	}
 	failedRows, ferr := scanStaleRows(failed)
 	if ferr != nil {
-		return fmt.Errorf("scan failed stale jobs: %w", ferr)
+		return 0, fmt.Errorf("scan failed stale jobs: %w", ferr)
 	}
 
 	// Emit audit events for each recovered job (CONTRACT §1.7). Best-effort: a
@@ -769,7 +770,7 @@ func (db *DB) RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 			Reason: "max attempts reached after stale-claim recovery; discarded",
 		})
 	}
-	return nil
+	return len(failedRows), nil
 }
 
 // staleRow is a recovered job row from RecoverStaleJobs' RETURNING clauses.
@@ -1521,9 +1522,22 @@ type QueueStats struct {
 	LastHeartbeat *time.Time // updated_at of the most-recently-updated claimed job
 	// LatestActivity is the newest of (most-recent claimed-job heartbeat,
 	// most-recent completion). It is the broadest "the runner did something
-	// recently" signal — see SecondsSinceActivity. nil only on a fresh install
-	// with no claims and no completions.
+	// recently" signal. nil only on a fresh install with no claims and no
+	// completions.
 	LatestActivity *time.Time
+
+	// EvalCoverageDone is the number of done jobs whose run_metrics row has a
+	// non-NULL eval_finished_at (i.e. has been judged). Paired with Done it gives
+	// the eval coverage ratio (CONTRACT §1.5). 0 when nothing is judged yet.
+	EvalCoverageDone int
+
+	// RunnerAvailable / RunnerAvailableKnown reflect the latest
+	// runner_availability event (CONTRACT §1.7): Available is true when the GPU
+	// host is free for transcription (not gaming). Known is false until any
+	// runner_availability event has been recorded (so a metric is only emitted
+	// when there is a real signal).
+	RunnerAvailable      bool
+	RunnerAvailableKnown bool
 
 	// Per-run aggregates (run_metrics). AvgProcessingSeconds is the mean
 	// transcription wall-clock over jobs the runner has timed; TotalEmbedTokens
@@ -1656,6 +1670,36 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		)
 	`).Scan(&q.LatestActivity); err != nil {
 		return nil, fmt.Errorf("latest activity query: %w", err)
+	}
+
+	// Eval coverage: done jobs whose run_metrics row has a non-NULL
+	// eval_finished_at (the per-job eval-completion marker, CONTRACT §1.5).
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM transcription_jobs j
+		JOIN run_metrics m ON m.job_id = j.id
+		WHERE j.status = 'done' AND m.eval_finished_at IS NOT NULL
+	`).Scan(&q.EvalCoverageDone); err != nil {
+		return nil, fmt.Errorf("eval coverage query: %w", err)
+	}
+
+	// Latest runner availability (CONTRACT §1.7): the most-recent
+	// runner_availability event's reason; available iff reason='idle'. Known is
+	// false until any such event exists (so the metric is only emitted on a real
+	// signal). Tolerate no-rows.
+	var availReason *string
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COALESCE(detail->>'reason', reason)
+		FROM pipeline_events
+		WHERE stage = 'runner_availability'
+		ORDER BY created_at DESC
+		LIMIT 1
+	`).Scan(&availReason); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("runner availability query: %w", err)
+	}
+	if availReason != nil {
+		q.RunnerAvailableKnown = true
+		q.RunnerAvailable = *availReason == "idle"
 	}
 
 	// Per-run aggregates from run_metrics. NULL-safe: AVG/SUM over zero matching

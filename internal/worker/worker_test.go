@@ -54,6 +54,7 @@ type fakeDB struct {
 	findings    []db.Finding       // captured by InsertFindings (in-pipeline eval)
 	findingsErr error              // error returned by InsertFindings
 	events      []db.PipelineEvent // captured by AppendEvent
+	staleFailed int                // returned by RecoverStaleJobs (newly-failed count)
 	// phase is returned by GetPipelinePhase. The zero value ("") normalizes to
 	// "idle" so existing tests are unaffected. phaseErr forces a read error.
 	phase    string
@@ -139,7 +140,9 @@ func (f *fakeDB) AppendEvent(_ context.Context, e db.PipelineEvent) error {
 	return nil
 }
 
-func (f *fakeDB) RecoverStaleJobs(_ context.Context, _ time.Duration) error { return nil }
+func (f *fakeDB) RecoverStaleJobs(_ context.Context, _ time.Duration) (int, error) {
+	return f.staleFailed, nil
+}
 
 func (f *fakeDB) GetPipelinePhase(_ context.Context) (string, error) {
 	f.mu.Lock()
