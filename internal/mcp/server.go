@@ -411,12 +411,16 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/pipeline/run", s.requireToken(s.handleAPIRun))
 	mux.HandleFunc("DELETE /api/v1/pipeline/run", s.requireToken(s.handleAPIRunClear))
 
-	// Liveness — no external deps.
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	// Liveness — no external deps. Both /health (back-compat) and /healthz (the
+	// uniform name the ingest pod also exposes) are served so Helm probes can use
+	// /healthz on both pods.
+	healthHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
-	})
+	}
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/healthz", healthHandler)
 
 	// Readiness — confirms the DB pool is reachable before accepting traffic.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {

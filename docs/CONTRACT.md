@@ -666,6 +666,8 @@ All env var names are fixed. No synonyms, no alternatives.
 | `AI_ROLES` | no | JSON object binding role names (`embeddings`, `eval`) to endpoint IDs (§2.14). Required when `AI_ENDPOINTS` is set. |
 | `BOOKS_DIR` | no | `/books` (read-only NFS mount inside container) |
 | `MCP_HTTP_ADDR` | no | `:8081` |
+| `INGEST_HTTP_ADDR` | no | `:8082`. The `earmark monitor` (ingest) process serves a minimal HTTP listener here for `/healthz` (liveness) and `/metrics` (Prometheus, §2.16). The mcp pod uses `MCP_HTTP_ADDR` for its surface; this is the ingest pod's only HTTP port. Chosen to avoid colliding with `:8081`. |
+| `LOG_FORMAT` | no | `pretty` (default — human-readable, ANSI-colored `PrettyHandler`). Set `json` for a `slog` JSON handler writing one JSON object per line to stdout (parseable in Loki). Both carry the `module` attribute and honor `LOG_DEBUG`/`LOG_VERBOSE`. Used by both Go pods. |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |

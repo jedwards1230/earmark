@@ -70,6 +70,7 @@
         "embeddingsModel":   { "type": "string" },
         "booksDir":          { "type": "string" },
         "mcpHttpAddr":       { "type": "string" },
+        "ingestHttpAddr":    { "type": "string" },
         "staleJobTimeout":   { "type": "string" },
         "chunkSize":         { "type": "string" },
         "evalInPipeline":    { "type": "boolean" },

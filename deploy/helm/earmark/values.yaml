@@ -48,6 +48,10 @@ config:
   embeddingsModel: "nomic-embed-text"
   booksDir: "/books"
   mcpHttpAddr: ":8081"
+  # ingestHttpAddr is the ingest pod's minimal HTTP listener (/healthz + /metrics).
+  # CONTRACT §2.4. The container port + probe are hard-coded to 8082; change both
+  # if you change this.
+  ingestHttpAddr: ":8082"
   staleJobTimeout: "30m"
   chunkSize: "512"
   # libraryCollections declares how each library root is shaped so the dashboard
