@@ -51,6 +51,15 @@
         "tlsSecretName": { "type": "string", "minLength": 1 }
       }
     },
+    "podMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled":       { "type": "boolean" },
+        "interval":      { "type": "string" },
+        "scrapeTimeout": { "type": "string" }
+      }
+    },
     "databaseSecret": {
       "type": "object",
       "required": ["name", "key"],
@@ -71,6 +80,7 @@
         "booksDir":          { "type": "string" },
         "mcpHttpAddr":       { "type": "string" },
         "ingestHttpAddr":    { "type": "string" },
+        "logFormat":         { "type": "string", "enum": ["pretty", "json"] },
         "staleJobTimeout":   { "type": "string" },
         "chunkSize":         { "type": "string" },
         "evalInPipeline":    { "type": "boolean" },

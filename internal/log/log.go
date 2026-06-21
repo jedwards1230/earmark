@@ -24,11 +24,30 @@ const LevelVerbose = slog.LevelDebug + 1
 var (
 	debugEnabled   bool
 	verboseEnabled bool
+	jsonFormat     bool
 )
 
 func init() {
 	debugEnabled = os.Getenv("LOG_DEBUG") == "1" || os.Getenv("LOG_DEBUG") == "true"
 	verboseEnabled = os.Getenv("LOG_VERBOSE") == "1" || os.Getenv("LOG_VERBOSE") == "true"
+	// LOG_FORMAT=json selects a structured slog JSON handler (one object per line,
+	// parseable in Loki); any other value (incl. unset / "pretty") keeps the
+	// human-readable PrettyHandler. CONTRACT §2.4.
+	jsonFormat = strings.EqualFold(os.Getenv("LOG_FORMAT"), "json")
+}
+
+// levelVar returns the minimum slog level for the current debug setting. The
+// custom verbose level sits just above Debug; when neither debug nor verbose is
+// on, Info is the floor. Used by the JSON handler (the PrettyHandler enforces the
+// debug/verbose gates itself in Enabled).
+func minLevel() slog.Level {
+	if debugEnabled {
+		return slog.LevelDebug
+	}
+	if verboseEnabled {
+		return LevelVerbose
+	}
+	return slog.LevelInfo
 }
 
 // PrettyHandler provides a more readable log format
@@ -52,6 +71,26 @@ func NewLogger(module string) Logger {
 	if debugEnabled {
 		logLevel = slog.LevelDebug
 	}
+
+	// LOG_FORMAT=json: emit structured slog JSON (one object per line) to stdout
+	// for Loki, instead of the ANSI PrettyHandler. It honors the same debug/verbose
+	// gates (via minLevel) and renders the custom Verbose level with a readable
+	// name. The module attribute is carried the same way as the pretty path.
+	if jsonFormat {
+		h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: minLevel(),
+			ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+				if a.Key == slog.LevelKey {
+					if lvl, ok := a.Value.Any().(slog.Level); ok && lvl == LevelVerbose {
+						a.Value = slog.StringValue("VERBOSE")
+					}
+				}
+				return a
+			},
+		})
+		return Logger{slog.New(h).With("module", module)}
+	}
+
 	prettyHandler := &PrettyHandler{
 		l:        log.New(os.Stdout, "", 0),
 		module:   module,

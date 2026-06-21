@@ -23,6 +23,16 @@ ingress:
   host: audiobooks-kb.example.com
   tlsSecretName: audiobooks-kb-tls
 
+# ── Prometheus PodMonitor ───────────────────────────────────────────────────────
+# Scrapes /metrics (CONTRACT §2.16) on BOTH pods: the mcp pod's http port (8081)
+# and the ingest pod's metrics port (8082). Requires the Prometheus Operator
+# (PodMonitor CRD). Disable if your cluster scrapes via a different mechanism.
+podMonitor:
+  enabled: true
+  # interval/scrapeTimeout are standard Prometheus scrape settings.
+  interval: 30s
+  scrapeTimeout: 10s
+
 # ── Credentials ────────────────────────────────────────────────────────────────
 # Existing Secret containing DATABASE_URL (created by the CNPG OnePasswordItem).
 # The chart references this secret by name; it does not create it.
@@ -54,6 +64,9 @@ config:
   ingestHttpAddr: ":8082"
   staleJobTimeout: "30m"
   chunkSize: "512"
+  # logFormat: "json" emits structured slog JSON (parseable in Loki) on both pods;
+  # "pretty" keeps the human-readable handler. CONTRACT §2.4. Default json in K8s.
+  logFormat: "json"
   # libraryCollections declares how each library root is shaped so the dashboard
   # derives author/title from configuration rather than a hardcoded path layout.
   # Serialized to the LIBRARY_COLLECTIONS env var (JSON). Empty → generic

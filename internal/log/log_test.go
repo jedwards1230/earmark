@@ -3,6 +3,7 @@ package log
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log"
 	"log/slog"
 	"os"
@@ -558,4 +559,73 @@ func BenchmarkPrettyHandlerHandle(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns what was
+// written. Used to assert the JSON handler's wire output.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	fn()
+	require.NoError(t, w.Close())
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	return buf.String()
+}
+
+func TestJSONFormatHandler(t *testing.T) {
+	// Toggle the package-level format flag (normally set from LOG_FORMAT at init).
+	orig := jsonFormat
+	jsonFormat = true
+	defer func() { jsonFormat = orig }()
+
+	out := captureStdout(t, func() {
+		l := NewLogger("testmod")
+		l.Info("hello json", "k", "v", "n", 7)
+	})
+
+	// Must be parseable JSON carrying the module attr, message, level, and fields.
+	var rec map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &rec), "JSON handler must emit valid JSON: %q", out)
+	assert.Equal(t, "hello json", rec["msg"])
+	assert.Equal(t, "testmod", rec["module"])
+	assert.Equal(t, "INFO", rec["level"])
+	assert.Equal(t, "v", rec["k"])
+	assert.EqualValues(t, 7, rec["n"])
+}
+
+func TestJSONFormatVerboseLevelName(t *testing.T) {
+	origFmt, origVerbose := jsonFormat, verboseEnabled
+	jsonFormat = true
+	verboseEnabled = true
+	defer func() { jsonFormat = origFmt; verboseEnabled = origVerbose }()
+
+	out := captureStdout(t, func() {
+		l := NewLogger("vmod")
+		l.Verbose("verbose line")
+	})
+	var rec map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &rec), "got: %q", out)
+	assert.Equal(t, "VERBOSE", rec["level"], "custom verbose level should render as VERBOSE")
+}
+
+func TestPrettyIsDefaultFormat(t *testing.T) {
+	orig := jsonFormat
+	jsonFormat = false
+	defer func() { jsonFormat = orig }()
+
+	out := captureStdout(t, func() {
+		l := NewLogger("pmod")
+		l.Info("pretty line")
+	})
+	// PrettyHandler output is not JSON (starts with an ANSI/level symbol + [mod]).
+	var rec map[string]any
+	assert.Error(t, json.Unmarshal([]byte(out), &rec), "pretty output must not be JSON")
+	assert.Contains(t, out, "[pmod]")
 }

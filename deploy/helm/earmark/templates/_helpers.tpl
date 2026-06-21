@@ -98,6 +98,13 @@ the two Deployments.
   value: {{ .Values.config.staleJobTimeout | quote }}
 - name: CHUNK_SIZE
   value: {{ .Values.config.chunkSize | quote }}
+{{- /*
+  LOG_FORMAT (CONTRACT §2.4): "json" selects the structured slog JSON handler
+  (parseable in Loki); "pretty" (or unset) keeps the human-readable handler.
+  Both pods share this via commonEnv.
+*/}}
+- name: LOG_FORMAT
+  value: {{ .Values.config.logFormat | quote }}
 {{- with .Values.config.libraryCollections }}
 - name: LIBRARY_COLLECTIONS
   value: {{ toJson . | quote }}
