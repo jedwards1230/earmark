@@ -524,6 +524,57 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("run_metrics asr-descriptor migration: %w", err)
 	}
 
+	// Eval-slice migration (CONTRACT §1.5): add the six eval_* columns to an
+	// existing run_metrics table — the LLM-judge's slice (a fourth column-selective
+	// writer, UpsertEvalMetrics). All additive + nullable, so a deployment that
+	// never runs eval keeps every column NULL. eval_finished_at IS NOT NULL is the
+	// per-job eval-completion marker (the first such marker — none existed before).
+	// ADD COLUMN IF NOT EXISTS is a no-op when already present, safe on every boot.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE run_metrics
+			ADD COLUMN IF NOT EXISTS eval_started_at  TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS eval_finished_at TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS eval_model       TEXT,
+			ADD COLUMN IF NOT EXISTS eval_chunks      INT,
+			ADD COLUMN IF NOT EXISTS eval_skipped     INT,
+			ADD COLUMN IF NOT EXISTS eval_findings    INT;
+	`); err != nil {
+		return fmt.Errorf("run_metrics eval-slice migration: %w", err)
+	}
+
+	// completed_at + trigger (CONTRACT §1.1): stamp completed_at = now() whenever a
+	// transcription_jobs row transitions INTO status='done'. The runner owns the
+	// mark-done UPDATE (the Go side never marks jobs done), so a trigger is the
+	// only Go-only way to record completion time. Old 'done' rows keep NULL (no
+	// backfill — there is no historical completion time to recover). DoneLastHour
+	// uses COALESCE(completed_at, updated_at) so it stays correct on old rows.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE transcription_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+		CREATE OR REPLACE FUNCTION transcription_jobs_set_completed_at()
+		RETURNS TRIGGER LANGUAGE plpgsql AS $$
+		BEGIN
+			-- Stamp only on the transition INTO 'done' (so a heartbeat UPDATE on an
+			-- already-done row, or a requeue out of 'done', never re-stamps it).
+			IF NEW.status = 'done' AND (OLD.status IS DISTINCT FROM 'done') THEN
+				NEW.completed_at = now();
+			-- Leaving 'done' (e.g. operator requeue back to 'pending') clears it so
+			-- the column always reflects the current run's completion, not a stale one.
+			ELSIF NEW.status <> 'done' AND OLD.status = 'done' THEN
+				NEW.completed_at = NULL;
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+
+		DROP TRIGGER IF EXISTS transcription_jobs_completed_at ON transcription_jobs;
+		CREATE TRIGGER transcription_jobs_completed_at
+			BEFORE UPDATE ON transcription_jobs
+			FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_completed_at();
+	`); err != nil {
+		return fmt.Errorf("completed_at migration: %w", err)
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -712,6 +763,20 @@ type EmbedMetrics struct {
 	TotalTokens  *int // authoritative local tokenizer count; nil (NULL) when unknown — a chunk failed to tokenize
 }
 
+// EvalMetrics is the LLM-judge's slice of run_metrics columns (CONTRACT §1.5).
+// It is the fourth column-selective writer (after the monitor, runner, and embed
+// worker). FinishedAt is the per-job eval-completion marker: a job has been
+// judged iff run_metrics.eval_finished_at IS NOT NULL.
+type EvalMetrics struct {
+	JobID      string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Model      string // judge model id (chat client's Model())
+	Chunks     int    // ChunksEvaluated
+	Skipped    int    // ChunksSkipped (transient per-chunk judge errors)
+	Findings   int    // FindingsFound
+}
+
 // UpsertAudioBytes records the audio file size for a job (the monitor's slice of
 // run_metrics). Best-effort: callers should log-and-continue on error so a
 // metrics write never fails enqueue. Only the audio_bytes column is touched, so
@@ -759,6 +824,48 @@ func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 		m.ChunkCount, m.PromptTokens, m.TotalTokens)
 	if err != nil {
 		return fmt.Errorf("upsert embed metrics: %w", err)
+	}
+	return nil
+}
+
+// upsertEvalMetricsSQL is the column-selective UPSERT for the eval slice of
+// run_metrics. A package-level var (not a constant) so tests can assert its
+// shape — that it touches ONLY the eval_* columns + updated_at, never clobbering
+// the monitor's audio_bytes, the runner's transcription slice, or the embed
+// worker's columns on the same job_id row.
+//
+// Parameter order: $1=job_id $2=eval_started_at $3=eval_finished_at $4=eval_model
+//
+//	$5=eval_chunks $6=eval_skipped $7=eval_findings
+var upsertEvalMetricsSQL = `
+	INSERT INTO run_metrics
+	       (job_id, eval_started_at, eval_finished_at, eval_model,
+	        eval_chunks, eval_skipped, eval_findings)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)
+	ON CONFLICT (job_id) DO UPDATE
+	SET eval_started_at  = EXCLUDED.eval_started_at,
+	    eval_finished_at = EXCLUDED.eval_finished_at,
+	    eval_model       = EXCLUDED.eval_model,
+	    eval_chunks      = EXCLUDED.eval_chunks,
+	    eval_skipped     = EXCLUDED.eval_skipped,
+	    eval_findings    = EXCLUDED.eval_findings,
+	    updated_at       = now()
+`
+
+// UpsertEvalMetrics records eval timing, judge model, and chunk/skip/finding
+// counts for a job (the eval layer's slice of run_metrics, CONTRACT §1.5). Only
+// the eval_* columns are written, so it never clobbers the monitor's,  runner's,
+// or embed worker's columns on the same row. eval_finished_at is the per-job
+// eval-completion marker.
+//
+// Best-effort: callers should log-and-continue on error so a metrics write never
+// fails the underlying eval/embed step.
+func (db *DB) UpsertEvalMetrics(ctx context.Context, m EvalMetrics) error {
+	_, err := db.pool.Exec(ctx, upsertEvalMetricsSQL,
+		m.JobID, m.StartedAt, m.FinishedAt, m.Model,
+		m.Chunks, m.Skipped, m.Findings)
+	if err != nil {
+		return fmt.Errorf("upsert eval metrics: %w", err)
 	}
 	return nil
 }
@@ -1300,10 +1407,10 @@ type QueueStats struct {
 	// TotalJobs is Pending+Claimed+Done+Failed — the full backlog denominator.
 	TotalJobs int
 	// DoneLastHour is the number of jobs whose row entered 'done' in the last
-	// hour, a throughput proxy. (A 'done' row's updated_at is its completion
-	// time: the runner's mark-done UPDATE fires the updated_at trigger, and a
-	// requeue moves the row out of 'done' rather than re-stamping it. A future
-	// completed_at column would make this exact.)
+	// hour, a throughput proxy. It counts on COALESCE(completed_at, updated_at):
+	// completed_at is the exact completion time (a BEFORE UPDATE trigger stamps it
+	// on the transition into 'done', CONTRACT §1.1); updated_at is the fallback for
+	// rows that became 'done' before completed_at existed.
 	DoneLastHour int
 	// Paused mirrors runner_control.paused — true means the runner is declining
 	// to claim new work (set via the dashboard pause toggle).
@@ -1395,9 +1502,14 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 
 	// Backfill progress + throughput.
 	q.TotalJobs = q.Pending + q.Claimed + q.Done + q.Failed
+	// Throughput proxy: jobs completed in the last hour. Prefer the trigger-stamped
+	// completed_at (CONTRACT §1.1); fall back to updated_at for rows that became
+	// 'done' before the completed_at column existed (no backfill — COALESCE keeps
+	// the count correct and back-compatible on those old rows).
 	if err := db.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM transcription_jobs
-		WHERE status = 'done' AND updated_at > now() - interval '1 hour'
+		WHERE status = 'done'
+		  AND COALESCE(completed_at, updated_at) > now() - interval '1 hour'
 	`).Scan(&q.DoneLastHour); err != nil {
 		return nil, fmt.Errorf("done-last-hour count: %w", err)
 	}

@@ -49,8 +49,10 @@ type fakeDB struct {
 	usage       openai.EmbeddingUsage // returned by GetEmbeddingsWithUsage
 	metrics     []db.EmbedMetrics     // captured by UpsertEmbedMetrics
 	metricsErr  error
-	findings    []db.Finding // captured by InsertFindings (in-pipeline eval)
-	findingsErr error        // error returned by InsertFindings
+	evalMetrics []db.EvalMetrics // captured by UpsertEvalMetrics
+	evalMetErr  error            // error returned by UpsertEvalMetrics
+	findings    []db.Finding     // captured by InsertFindings (in-pipeline eval)
+	findingsErr error            // error returned by InsertFindings
 	// phase is returned by GetPipelinePhase. The zero value ("") normalizes to
 	// "idle" so existing tests are unaffected. phaseErr forces a read error.
 	phase    string
@@ -116,6 +118,16 @@ func (f *fakeDB) UpsertEmbedMetrics(_ context.Context, m db.EmbedMetrics) error 
 		return f.metricsErr
 	}
 	f.metrics = append(f.metrics, m)
+	return nil
+}
+
+func (f *fakeDB) UpsertEvalMetrics(_ context.Context, m db.EvalMetrics) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.evalMetErr != nil {
+		return f.evalMetErr
+	}
+	f.evalMetrics = append(f.evalMetrics, m)
 	return nil
 }
 
@@ -235,6 +247,38 @@ func TestProcessTranscript_InlineEvalWritesFindingsLinkedToChunks(t *testing.T) 
 			"finding chunk_id %q must match an inserted chunk", *f.ChunkID)
 		require.Equal(t, "job-eval", *f.TranscriptionRunID)
 	}
+
+	// Eval metrics recorded for the job (CONTRACT §1.5 eval slice).
+	require.Len(t, fdb.evalMetrics, 1, "in-pipeline eval should record exactly one eval-metrics row")
+	em := fdb.evalMetrics[0]
+	require.Equal(t, "job-eval", em.JobID)
+	require.Equal(t, "fake-judge", em.Model, "eval_model comes from the judge's chat model")
+	require.Equal(t, len(fdb.findings), em.Findings)
+	require.GreaterOrEqual(t, em.Chunks, 1, "at least one chunk evaluated")
+	require.False(t, em.FinishedAt.IsZero(), "eval_finished_at is the completion marker — must be set")
+	require.False(t, em.FinishedAt.Before(em.StartedAt), "finished must be >= started")
+}
+
+func TestProcessTranscript_NoJudgeRecordsNoEvalMetrics(t *testing.T) {
+	// Without a judge, no eval metrics row is written (the eval slice stays NULL).
+	fdb := &fakeDB{}
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test")}
+	transcript := &db.Transcript{ID: "tid", JobID: "job", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test."}
+	require.NoError(t, w.processTranscript(&config.Config{ChunkSize: 10}, transcript))
+	require.Empty(t, fdb.evalMetrics, "no judge → no eval-metrics row")
+}
+
+func TestProcessTranscript_EvalMetricsWriteFailureStillEmbeds(t *testing.T) {
+	// A best-effort eval-metrics write failure must not fail the embed.
+	fdb := &fakeDB{evalMetErr: fmt.Errorf("run_metrics down")}
+	judge := eval.NewJudge(workerFakeChat{
+		resp: `{"findings":[]}`,
+	})
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), judge: judge}
+	transcript := &db.Transcript{ID: "tid", JobID: "job", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world this is a test."}
+	require.NoError(t, w.processTranscript(&config.Config{ChunkSize: 10}, transcript),
+		"an eval-metrics write failure must not fail the embed")
+	require.NotEmpty(t, fdb.chunks, "chunks must still be inserted")
 }
 
 func TestProcessTranscript_NoJudgeSkipsEval(t *testing.T) {

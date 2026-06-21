@@ -26,6 +26,9 @@ type DBInterface interface {
 	GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
 	RecoverStaleJobs(ctx context.Context, timeout time.Duration) error
 	UpsertEmbedMetrics(ctx context.Context, m db.EmbedMetrics) error
+	// UpsertEvalMetrics records the eval slice of run_metrics (timing, judge
+	// model, chunk/skip/finding counts) for the in-pipeline judge. Best-effort.
+	UpsertEvalMetrics(ctx context.Context, m db.EvalMetrics) error
 	// GetPipelinePhase reports the batched-pipeline phase (CONTRACT §1.4). The
 	// embed worker idles during the "transcribe" phase (ASR owns the GPU) and
 	// processes normally for "idle"/"analyze"/NULL.
@@ -293,7 +296,9 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 		}
 	}
 
+	evalStart := time.Now()
 	findings, stats, err := eval.RunOnChunks(w.ctx, w.judge, nil, evalChunks, false)
+	evalFinished := time.Now()
 	if err != nil {
 		w.log.Warn("in-pipeline eval failed (continuing to embed)",
 			"transcript_id", t.ID, "file", t.FilePath, "error", err)
@@ -303,7 +308,32 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 		"transcript_id", t.ID,
 		"chunks", stats.ChunksEvaluated,
 		"findings", stats.FindingsFound)
+
+	// Per-run observability: record eval timing, judge model, and counts. The
+	// chunk set maps cleanly to this one job (t.JobID), so the run_metrics eval
+	// slice attribution is unambiguous. Best-effort — a metrics write must not
+	// fail the embed step (eval is advisory).
+	w.recordEvalMetrics(t, stats, evalStart, evalFinished)
 	return findings
+}
+
+// recordEvalMetrics UPSERTs the eval worker's slice of run_metrics for a
+// transcript's job (CONTRACT §1.5). eval_finished_at is the per-job eval-
+// completion marker. Best-effort: a DB error is logged and swallowed.
+func (w *Worker) recordEvalMetrics(t *db.Transcript, stats eval.RunStats, started, finished time.Time) {
+	m := db.EvalMetrics{
+		JobID:      t.JobID,
+		StartedAt:  started,
+		FinishedAt: finished,
+		Model:      w.judge.Model(),
+		Chunks:     stats.ChunksEvaluated,
+		Skipped:    stats.ChunksSkipped,
+		Findings:   stats.FindingsFound,
+	}
+	if err := w.db.UpsertEvalMetrics(w.ctx, m); err != nil {
+		w.log.Warn("eval metrics write failed (continuing)",
+			"transcript_id", t.ID, "job_id", t.JobID, "error", err)
+	}
 }
 
 // recordEmbedMetrics UPSERTs the embed worker's slice of run_metrics for a

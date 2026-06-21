@@ -25,6 +25,7 @@ CREATE TABLE transcription_jobs (
     claimed_at   TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,                     -- stamped by a trigger on the transition INTO status='done'; NULL otherwise (incl. old rows pre-dating this column)
     error        TEXT,                           -- last error message when status='failed'
     attempts     INTEGER     NOT NULL DEFAULT 0,
 
@@ -47,6 +48,29 @@ $$;
 CREATE TRIGGER transcription_jobs_updated_at
     BEFORE UPDATE ON transcription_jobs
     FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_updated_at();
+
+-- completed_at: stamp the exact completion time when a row transitions INTO
+-- 'done'. The runner owns the mark-done UPDATE (the Go side never marks jobs
+-- done), so a BEFORE UPDATE trigger is the Go-only way to record it. It clears
+-- completed_at when a row leaves 'done' (operator requeue), so the column always
+-- reflects the current run. Old 'done' rows keep NULL (no backfill — there is no
+-- historical completion time to recover); DoneLastHour uses
+-- COALESCE(completed_at, updated_at) so it stays correct on those old rows.
+CREATE OR REPLACE FUNCTION transcription_jobs_set_completed_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status = 'done' AND (OLD.status IS DISTINCT FROM 'done') THEN
+        NEW.completed_at = now();
+    ELSIF NEW.status <> 'done' AND OLD.status = 'done' THEN
+        NEW.completed_at = NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER transcription_jobs_completed_at
+    BEFORE UPDATE ON transcription_jobs
+    FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_completed_at();
 ```
 
 ### 1.2 Transcript Storage — `transcripts` table
@@ -400,9 +424,10 @@ runner) and is transactional:
 
 One row per job capturing telemetry across the whole run (probe → transcribe →
 embed). It is **additive**: nothing in §1.1–§1.4 or §3 depends on it, and a
-missing row never blocks the pipeline. Three independent writers each UPSERT
+missing row never blocks the pipeline. Four independent writers each UPSERT
 **only their own slice** of columns keyed on `job_id`, so they never clobber
-each other:
+each other (the Go monitor, the Python ASR runner, the Go embed worker, and the
+Go eval layer):
 
 ```sql
 CREATE TABLE IF NOT EXISTS run_metrics (
@@ -412,6 +437,10 @@ CREATE TABLE IF NOT EXISTS run_metrics (
   runner_host TEXT, chunked BOOLEAN, n_windows INT, char_count INT, word_count INT, segment_count INT,
   embed_started_at TIMESTAMPTZ, embed_finished_at TIMESTAMPTZ, embed_model TEXT, embed_chunk_count INT,
   embed_prompt_tokens INT, embed_total_tokens INT,
+  -- Eval slice (the LLM judge — a fourth column-selective writer). All nullable,
+  -- best-effort. eval_finished_at IS NOT NULL is the per-job eval-completion marker.
+  eval_started_at TIMESTAMPTZ, eval_finished_at TIMESTAMPTZ, eval_model TEXT,
+  eval_chunks INT, eval_skipped INT, eval_findings INT,
   -- ASR backend descriptor (§2.13). All nullable, runner-owned, best-effort.
   asr_family TEXT, asr_runtime TEXT,
   caps_applied JSONB, caps_requested JSONB, caps_skipped_reason JSONB,
@@ -441,6 +470,20 @@ no breaking change.** Their shapes and the capability vocabulary are defined in
 | **Go monitor** | at enqueue (file size from `os.Stat`) | `audio_bytes` |
 | **Python ASR runner** | after transcribing | `audio_channels`, `audio_sample_rate`, `audio_codec`, `audio_format`, `transcribe_started_at`, `transcribe_finished_at`, `asr_model`, `compute_type`, `runner_host`, `chunked`, `n_windows`, `char_count`, `word_count`, `segment_count`; **SHOULD also** `asr_family`, `asr_runtime`, `caps_applied`, `caps_requested`, `caps_skipped_reason`, `mean_word_confidence` (the §2.13 backend descriptor) |
 | **Go embed worker** | after `transcript_chunks` insert | `embed_started_at`, `embed_finished_at`, `embed_model`, `embed_chunk_count`, `embed_prompt_tokens`, `embed_total_tokens` |
+| **Go eval layer** | after the in-pipeline judge runs over a transcript's chunks (`EVAL_IN_PIPELINE`) | `eval_started_at`, `eval_finished_at`, `eval_model`, `eval_chunks`, `eval_skipped`, `eval_findings` |
+
+**Eval slice + completion marker.** `eval_finished_at IS NOT NULL` is the
+**per-job eval-completion marker** — a job has been judged iff its `run_metrics`
+row has a non-NULL `eval_finished_at`. Eval coverage is thus a real ratio
+(`COUNT(eval_finished_at) / COUNT(done jobs)`) rather than a findings-row count
+(a clean job has 0 findings but is still "evaluated"). `eval_model` is the judge
+model id; `eval_chunks`/`eval_skipped`/`eval_findings` are the run's
+`ChunksEvaluated`/`ChunksSkipped`/`FindingsFound`. The eval slice is written
+**only by the in-pipeline path** (`EVAL_IN_PIPELINE`), where the chunk set maps
+cleanly to one job (`job_id`). The **standalone** `earmark eval` / `/actions/eval*`
+paths evaluate a whole book (many jobs) or a library-wide sample, so they do
+**not** write the per-job `run_metrics` eval slice (the mapping to a single job
+is ambiguous); they emit a `pipeline_events` `stage='eval'` row instead (§1.7).
 
 The new runner-owned columns join the runner's existing single UPSERT slice — no
 clobber risk, since they are columns no other writer touches. Populating them is
