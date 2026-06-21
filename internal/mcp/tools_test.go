@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/predict"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -69,6 +70,11 @@ func (m *MockDBInterface) Ping(ctx context.Context) error {
 func (m *MockDBInterface) GetServiceStatus(ctx context.Context) (*db.QueueStats, error) {
 	args := m.Called(ctx)
 	return args.Get(0).(*db.QueueStats), args.Error(1)
+}
+
+func (m *MockDBInterface) GetPredictInputs(ctx context.Context) (predict.Inputs, error) {
+	args := m.Called(ctx)
+	return args.Get(0).(predict.Inputs), args.Error(1)
 }
 
 func (m *MockDBInterface) GetRecentJobs(ctx context.Context, limit int) ([]db.RecentJob, error) {

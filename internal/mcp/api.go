@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jedwards1230/earmark/internal/predict"
 )
 
 // errInvalidJSON is returned for any malformed control-request body; the raw
@@ -57,6 +59,9 @@ type apiStatus struct {
 	// Per-run aggregates (run_metrics); null until the runner/worker populate them.
 	AvgProcessingSeconds *float64 `json:"avgProcessingSeconds"`
 	TotalEmbedTokens     *int64   `json:"totalEmbedTokens"`
+	// ETA is the empirical pipeline ETA (CONTRACT §4). null when no estimate could
+	// be computed (no history / predict-inputs read error).
+	ETA *apiETA `json:"eta"`
 	// Servers is the configured-vs-observed transcription-server view (see the
 	// Servers dashboard page). Empty when no servers are configured or observed.
 	Servers []apiServer `json:"servers"`
@@ -111,6 +116,21 @@ type apiServer struct {
 	GPUState     string `json:"gpuState,omitempty"`
 	VRAMUsedMB   *int   `json:"vramUsedMb,omitempty"`
 	VRAMTotalMB  *int   `json:"vramTotalMb,omitempty"`
+}
+
+// apiETA is the JSON shape of the empirical pipeline ETA (CONTRACT §4). It
+// exposes both the busy-time (workSeconds) and the calendar estimate
+// (calendarSeconds, only meaningful when calendarKnown). evalIncluded reports
+// whether eval time is part of the estimate (false → eval timing not yet
+// measured). label is the human-rendered string the dashboard shows.
+type apiETA struct {
+	RemainingChunks int     `json:"remainingChunks"`
+	WorkSeconds     float64 `json:"workSeconds"`
+	CalendarSeconds float64 `json:"calendarSeconds"`
+	CalendarKnown   bool    `json:"calendarKnown"`
+	EvalIncluded    bool    `json:"evalIncluded"`
+	HasWork         bool    `json:"hasWork"`
+	Label           string  `json:"label"`
 }
 
 // pauseState is the JSON shape of the pipeline pause endpoints.
@@ -184,6 +204,23 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	if stats.LastHeartbeat != nil {
 		hb := stats.LastHeartbeat.UTC().Format("2006-01-02T15:04:05Z07:00")
 		out.LastHeartbeat = &hb
+	}
+
+	// Empirical ETA (CONTRACT §4). Best-effort: a predict-inputs read error logs
+	// and leaves eta null rather than failing the status response.
+	if in, perr := s.db.GetPredictInputs(r.Context()); perr != nil {
+		s.logger.Warn("api status: predict inputs error; eta omitted", "error", perr)
+	} else {
+		e := predict.Compute(in)
+		out.ETA = &apiETA{
+			RemainingChunks: e.RemainingChunks,
+			WorkSeconds:     e.WorkSeconds,
+			CalendarSeconds: e.CalendarSeconds,
+			CalendarKnown:   e.CalendarKnown,
+			EvalIncluded:    e.EvalIncluded,
+			HasWork:         e.HasWork,
+			Label:           e.Label(),
+		}
 	}
 
 	// Servers view is supplementary: a query error here logs but does not fail the

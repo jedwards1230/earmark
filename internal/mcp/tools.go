@@ -11,6 +11,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/library"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/predict"
 )
 
 // DBInterface defines the database operations needed by MCP tools
@@ -29,6 +30,10 @@ type DBInterface interface {
 	// GetServiceStatus returns aggregate queue/transcript/chunk counts for the
 	// status dashboard.
 	GetServiceStatus(ctx context.Context) (*db.QueueStats, error)
+	// GetPredictInputs returns the empirical inputs (per-stage median rates,
+	// remaining chunks, runner availability fraction) for the ETA model
+	// (internal/predict, CONTRACT §4).
+	GetPredictInputs(ctx context.Context) (predict.Inputs, error)
 	// GetRecentJobs returns the most-recently-updated jobs for the dashboard
 	// activity table.
 	GetRecentJobs(ctx context.Context, limit int) ([]db.RecentJob, error)

@@ -69,14 +69,14 @@ func TestPipelineStateDerivation(t *testing.T) {
 
 	// Fresh heartbeat, not paused → RUNNING (green).
 	recent := now.Add(-10 * time.Second)
-	d := newStatusData(&db.QueueStats{RunnerActive: true, RunnerID: "r1", LastHeartbeat: &recent}, nil, now, stale, "")
+	d := newStatusData(&db.QueueStats{RunnerActive: true, RunnerID: "r1", LastHeartbeat: &recent}, nil, now, stale, "", nil)
 	if d.StateLabel != "RUNNING" || d.DotClass != "green" {
 		t.Errorf("fresh runner = (%q,%q), want (RUNNING,green)", d.StateLabel, d.DotClass)
 	}
 
 	// Old heartbeat, RunnerActive, but NO work waiting → IDLE (drained), not RUNNING.
 	old := now.Add(-2 * time.Hour)
-	d = newStatusData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old}, nil, now, stale, "")
+	d = newStatusData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old}, nil, now, stale, "", nil)
 	if d.StateLabel != "IDLE" {
 		t.Errorf("stale runner, no work = StateLabel %q, want IDLE", d.StateLabel)
 	}
@@ -85,13 +85,13 @@ func TestPipelineStateDerivation(t *testing.T) {
 	}
 
 	// Old heartbeat, RunnerActive, AND work waiting → STALLED (red) — an incident.
-	d = newStatusData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old, Pending: 5, Claimed: 1}, nil, now, stale, "")
+	d = newStatusData(&db.QueueStats{RunnerActive: true, LastHeartbeat: &old, Pending: 5, Claimed: 1}, nil, now, stale, "", nil)
 	if d.StateLabel != "STALLED" || d.DotClass != "red" {
 		t.Errorf("stale runner with work = (%q,%q), want (STALLED,red)", d.StateLabel, d.DotClass)
 	}
 
 	// Not paused, no runner ever seen → IDLE "no runner connected".
-	d = newStatusData(&db.QueueStats{Pending: 4069}, nil, now, stale, "")
+	d = newStatusData(&db.QueueStats{Pending: 4069}, nil, now, stale, "", nil)
 	if d.StateLabel != "IDLE" || d.DotClass != "blue" {
 		t.Errorf("no-runner = (%q,%q), want (IDLE,blue)", d.StateLabel, d.DotClass)
 	}
@@ -100,7 +100,7 @@ func TestPipelineStateDerivation(t *testing.T) {
 	}
 
 	// Paused wins regardless of runner liveness.
-	d = newStatusData(&db.QueueStats{Paused: true, RunnerActive: true, LastHeartbeat: &recent}, nil, now, stale, "")
+	d = newStatusData(&db.QueueStats{Paused: true, RunnerActive: true, LastHeartbeat: &recent}, nil, now, stale, "", nil)
 	if d.StateLabel != "PAUSED" || d.DotClass != "amber" {
 		t.Errorf("paused = (%q,%q), want (PAUSED,amber)", d.StateLabel, d.DotClass)
 	}
@@ -113,7 +113,7 @@ func TestStatusFragmentRendersIdleNotRunning(t *testing.T) {
 	now := time.Now()
 	data := newStatusData(
 		&db.QueueStats{Pending: 4069, Chunks: 12345}, // not paused, no runner
-		nil, now, 30*time.Minute, "",
+		nil, now, 30*time.Minute, "", nil,
 	)
 	var buf bytes.Buffer
 	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
@@ -141,7 +141,7 @@ func TestStatusFragmentRendersStalled(t *testing.T) {
 	old := now.Add(-2 * time.Hour)
 	data := newStatusData(
 		&db.QueueStats{RunnerActive: true, LastHeartbeat: &old, Pending: 5, Claimed: 1},
-		nil, now, 30*time.Minute, "",
+		nil, now, 30*time.Minute, "", nil,
 	)
 	var buf bytes.Buffer
 	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
@@ -158,7 +158,7 @@ func TestBackfillProgressDerivation(t *testing.T) {
 	// Active backfill: 317/362 done, 22/hr → finite ETA.
 	d := newStatusData(&db.QueueStats{
 		Pending: 42, Claimed: 1, Done: 317, Failed: 2, TotalJobs: 362, DoneLastHour: 22,
-	}, nil, now, 30*time.Minute, "")
+	}, nil, now, 30*time.Minute, "", nil)
 	if !d.ShowProgress {
 		t.Fatal("ShowProgress should be true when TotalJobs > 0")
 	}
@@ -178,13 +178,13 @@ func TestBackfillProgressDerivation(t *testing.T) {
 	}
 
 	// Zero throughput → ETA "—", no panic.
-	d = newStatusData(&db.QueueStats{Pending: 100, Done: 10, TotalJobs: 110, DoneLastHour: 0}, nil, now, 30*time.Minute, "")
+	d = newStatusData(&db.QueueStats{Pending: 100, Done: 10, TotalJobs: 110, DoneLastHour: 0}, nil, now, 30*time.Minute, "", nil)
 	if d.ETAText != "—" {
 		t.Errorf("zero-throughput ETAText = %q, want —", d.ETAText)
 	}
 
 	// Empty install → no progress shown, no divide-by-zero.
-	d = newStatusData(&db.QueueStats{}, nil, now, 30*time.Minute, "")
+	d = newStatusData(&db.QueueStats{}, nil, now, 30*time.Minute, "", nil)
 	if d.ShowProgress {
 		t.Error("ShowProgress should be false on an empty install")
 	}
@@ -838,7 +838,7 @@ func TestErrorRowIsExpandable(t *testing.T) {
 	evil := "Traceback line 1\n<script>alert(1)</script>\nRuntimeError: boom"
 	data := newStatusData(&db.QueueStats{TotalJobs: 1, Failed: 1}, []db.RecentJob{
 		{ID: "x", FilePath: "/books/a/b.m4b", Status: "failed", Error: &evil},
-	}, time.Now(), 30*time.Minute, "")
+	}, time.Now(), 30*time.Minute, "", nil)
 	var buf bytes.Buffer
 	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
 		t.Fatalf("execute: %v", err)

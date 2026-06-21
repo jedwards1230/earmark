@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/predict"
 )
 
 //go:embed layout.html htmx.min.js
@@ -1007,7 +1008,7 @@ type segmentsData struct {
 
 // newStatusData derives the unified pipeline state from the pause flag and the
 // runner heartbeat freshness, so the banner is never self-contradictory.
-func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, staleAfter time.Duration, embedURL string) statusData {
+func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, staleAfter time.Duration, embedURL string, est *predict.Estimate) statusData {
 	d := statusData{
 		Stats:      stats,
 		Jobs:       jobs,
@@ -1021,13 +1022,25 @@ func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, sta
 		d.ShowProgress = true
 		d.DonePct = stats.Done * 100 / stats.TotalJobs
 		d.ProgressText = fmt.Sprintf("%s / %s (%d%%)", commafy(stats.Done), commafy(stats.TotalJobs), d.DonePct)
-		remaining := stats.Pending + stats.Claimed
+
 		if stats.DoneLastHour > 0 {
 			d.ThroughputText = fmt.Sprintf("~%s done in the last hour", commafy(stats.DoneLastHour))
-			etaHours := float64(remaining) / float64(stats.DoneLastHour)
-			d.ETAText = humanizeETA(etaHours)
 		} else {
 			d.ThroughputText = "no completions in the last hour"
+		}
+
+		// ETA: prefer the empirical predict model (CONTRACT §4) when supplied — it
+		// degrades gracefully (calendar when availability history exists, else a
+		// labeled work-time estimate) instead of collapsing to "—" during a stall.
+		// Fall back to the legacy remaining/DoneLastHour calc only when no estimate
+		// is provided (e.g. older unit tests).
+		switch {
+		case est != nil:
+			d.ETAText = est.Label()
+		case stats.DoneLastHour > 0:
+			remaining := stats.Pending + stats.Claimed
+			d.ETAText = humanizeETA(float64(remaining) / float64(stats.DoneLastHour))
+		default:
 			d.ETAText = "—"
 		}
 	}
@@ -1404,7 +1417,18 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	data := newStatusData(stats, jobs, time.Now(), s.runnerStaleAfter, s.embedURL)
+	// Empirical ETA (CONTRACT §4). Best-effort: a predict-inputs read error
+	// degrades to no estimate (newStatusData then falls back / shows "—") rather
+	// than failing the fragment — the ETA is informational.
+	var est *predict.Estimate
+	if in, perr := s.db.GetPredictInputs(ctx); perr != nil {
+		s.logger.Warn("GetPredictInputs error; ETA degraded", "error", perr)
+	} else {
+		e := predict.Compute(in)
+		est = &e
+	}
+
+	data := newStatusData(stats, jobs, time.Now(), s.runnerStaleAfter, s.embedURL, est)
 
 	// Read-only coordinator phase for the phase badge. The dashboard never writes
 	// phase (the `earmark batch` coordinator owns it, CONTRACT §1.4); a read error
