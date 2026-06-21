@@ -105,6 +105,9 @@ spec:
       secretAccessKey:
         name: {{ .Values.secrets.garageSecret.name | quote }}
         key: ACCESS_SECRET_KEY
+      region:
+        name: {{ .Values.secrets.garageSecret.name | quote }}
+        key: REGION
     wal:
       compression: gzip
       maxParallel: 2
