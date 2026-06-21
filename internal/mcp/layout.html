@@ -35,6 +35,18 @@
     --accent-text: #ffffff;
     --focus: #60a5fa;       /* focus-visible ring */
 
+    /* ── recurring tints (themed in one place so the light block stays small) ── */
+    --row-hover: #1e2230;   /* table row hover */
+    --tint-blue: #15233a;   /* active chips / accent-tinted panels */
+    --tint-red: #2a0a0a;    /* danger callouts (failed / conn-lost) */
+    --tint-amber: #2a1c08;  /* warning callouts (stall / soft-attention) */
+    --tint-blue-soft: #0a1a2a; /* info notice (eval) */
+    --track-bg: #2a2a3a;    /* progress-bar track */
+    /* badge backgrounds (themed so light mode doesn't inherit dark pills) */
+    --badge-green: #0a2a1a;
+    --badge-amber: #2a2a1a;
+    --badge-purple: #2a1a2a;
+
     /* ── fonts: sans for UI/prose, mono reserved for data cells/timestamps */
     --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     --font-mono: ui-monospace, "Cascadia Code", "Fira Code", "SFMono-Regular", Menlo, monospace;
@@ -48,6 +60,49 @@
     --fs-xl:  1.5rem;    /* 24px — overview card values */
     --fs-2xl: 2rem;      /* 32px — hero numbers */
   }
+  /* ── light theme: honors the OS preference (prefers-color-scheme: light) ──
+     Re-points the semantic tokens at a light palette with the same hues darkened
+     to keep ≥ WCAG AA on a white surface. Because nearly every rule resolves a
+     token, this single block themes the whole app; only a handful of dark badge
+     tints + status callouts need a local override. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f9;
+      --surface-1: #ffffff;
+      --surface-2: #eef0f4;
+      --row-band: #f5f7fa;
+      --border: #d6dae3;
+
+      --text:   #1c1f2a;   /* 16.4:1 on white */
+      --text-2: #4a4f63;   /* 8.1:1 */
+      --muted:  #5e6377;   /* 6.0:1 (AA) */
+
+      /* hues darkened for a light background (all ≥ AA on white) */
+      --green:  #15803d;
+      --yellow: #a16207;
+      --red:    #dc2626;
+      --blue:   #1d4ed8;
+      --purple: #7c3aed;
+      --amber:  #b45309;
+
+      --accent: #2563eb;   /* white label = 5.2:1 */
+      --focus:  #1d4ed8;
+
+      --row-hover: #eef2fb;
+      --tint-blue: #e7eefc;       /* active chips / filtered rows */
+      --tint-red: #fdeaea;        /* danger callouts */
+      --tint-amber: #fdf2e2;      /* warning callouts */
+      --tint-blue-soft: #e8f1fb;  /* info notice */
+      --track-bg: #e2e6ee;
+      /* light badge tints (text hue already themed above) */
+      --badge-green: #e3f5ea;
+      --badge-amber: #fbf0dc;
+      --badge-purple: #f3e8fb;
+    }
+    .ov-attn             { background: var(--tint-red); }
+    .ov-attn.attn-soft   { background: var(--tint-amber); }
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background: var(--bg);
@@ -81,7 +136,7 @@
     font-size: var(--fs-sm); border: 1px solid transparent;
   }
   .nav a:hover { color: var(--text); border-color: var(--border); }
-  .nav a.active { color: var(--blue); border-color: var(--blue); background: #15233a; }
+  .nav a.active { color: var(--blue); border-color: var(--blue); background: var(--tint-blue); }
   /* topbar phase + paused badge: read-only state surfaced on every page, links
      to the Pipeline page where the live controls live (D2). */
   .topbar-phase { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
@@ -142,7 +197,7 @@
   .facet-x { color: var(--muted); cursor: pointer; line-height: 1; }
   .facet-x:hover { color: var(--red); }
   /* a row currently used as the active worklist filter */
-  tbody tr.facet-active td { background: #15233a; }
+  tbody tr.facet-active td { background: var(--tint-blue); }
   tbody tr.facet-active td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
   /* "show all locations" expander inside a deduplicated worklist row */
   .loc-details > summary { cursor: pointer; color: var(--blue); list-style: revert; min-height: 28px; }
@@ -188,13 +243,13 @@
   .ov-phase-line .ov-phase-ico { font-size: var(--fs-md); }
   /* needs-attention strip (failed books / unreviewed high-conf findings) */
   .ov-attn {
-    margin-top: 10px; background: #2a0a0a; border: 1px solid var(--red);
+    margin-top: 10px; background: var(--tint-red); border: 1px solid var(--red);
     border-radius: 8px; padding: 10px 16px; font-size: var(--fs-sm); color: var(--text);
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   }
   .ov-attn .ov-attn-ico { color: var(--red); font-size: var(--fs-md); }
   .ov-attn a { color: var(--red); text-decoration: underline; }
-  .ov-attn.attn-soft { background: #2a1c08; border-color: var(--amber); }
+  .ov-attn.attn-soft { background: var(--tint-amber); border-color: var(--amber); }
   .ov-attn.attn-soft .ov-attn-ico, .ov-attn.attn-soft a { color: var(--amber); }
 
   /* ── pipeline status / control ─────────────────────────────────── */
@@ -278,15 +333,15 @@
   /* row banding so dense tables de-fuse (1.4.x readability) */
   tbody tr:nth-child(even) td { background: var(--row-band); }
   /* clickable rows: legacy <tr class=clickable> AND the new whole-row <a> pattern */
-  tbody tr.clickable:hover td { background: #1e2230; cursor: pointer; }
-  tbody tr.row-link:hover td { background: #1e2230; }
+  tbody tr.clickable:hover td { background: var(--row-hover); cursor: pointer; }
+  tbody tr.row-link:hover td { background: var(--row-hover); }
   /* a whole-row link: the <a> fills the cell so keyboard/focus + click both work */
   td .row-a { display: block; color: inherit; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: var(--fs-xs); font-weight: 600; }
-  .badge.pending  { background: #2a2a3a; color: var(--blue); }
-  .badge.claimed  { background: #2a2a1a; color: var(--yellow); }
-  .badge.done     { background: #0a2a1a; color: var(--green); }
-  .badge.failed   { background: #2a0a0a; color: var(--red); }
+  .badge.pending  { background: var(--track-bg); color: var(--blue); }
+  .badge.claimed  { background: var(--badge-amber); color: var(--yellow); }
+  .badge.done     { background: var(--badge-green); color: var(--green); }
+  .badge.failed   { background: var(--tint-red); color: var(--red); }
   /* status badge with a leading glyph so state is never color-only (1.4.1) */
   .badge .badge-ico { margin-right: 3px; }
   .file-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
@@ -303,17 +358,17 @@
 
   /* overview backfill progress bar */
   .overview-progress { margin-bottom: 20px; }
-  .op-bar { height: 8px; background: #2a2a3a; border-radius: 4px; overflow: hidden; }
+  .op-bar { height: 8px; background: var(--track-bg); border-radius: 4px; overflow: hidden; }
   .op-fill { height: 100%; background: var(--green); }
   .op-meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; color: var(--text-2); font-size: var(--fs-sm); }
   .op-main { color: var(--text); font-weight: 600; }
 
   /* ── callouts ──────────────────────────────────────────────────── */
-  .stall-callout { background: #2a1c08; color: var(--amber); border: 1px solid var(--amber); border-radius: 6px; padding: 8px 14px; margin-bottom: 20px; font-size: var(--fs-sm); line-height: 1.5; }
+  .stall-callout { background: var(--tint-amber); color: var(--amber); border: 1px solid var(--amber); border-radius: 6px; padding: 8px 14px; margin-bottom: 20px; font-size: var(--fs-sm); line-height: 1.5; }
   .failed-callout { margin-top: 10px; color: var(--red); font-size: var(--fs-sm); display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-  .conn-lost { background: #2a0a0a; color: var(--red); border: 1px solid var(--red); border-radius: 6px; padding: 8px 14px; margin-bottom: 16px; font-size: var(--fs-sm); }
+  .conn-lost { background: var(--tint-red); color: var(--red); border: 1px solid var(--red); border-radius: 6px; padding: 8px 14px; margin-bottom: 16px; font-size: var(--fs-sm); }
   #action-error:empty { display: none; }
-  .action-err { background: #2a0a0a; color: var(--red); border: 1px solid var(--red); border-radius: 6px; padding: 8px 14px; margin-bottom: 16px; font-size: var(--fs-sm); animation: action-err-fade 0.5s ease 6s forwards; }
+  .action-err { background: var(--tint-red); color: var(--red); border: 1px solid var(--red); border-radius: 6px; padding: 8px 14px; margin-bottom: 16px; font-size: var(--fs-sm); animation: action-err-fade 0.5s ease 6s forwards; }
   @keyframes action-err-fade { to { opacity: 0; height: 0; padding: 0; margin: 0; border-width: 0; overflow: hidden; } }
   @media (prefers-reduced-motion: reduce) { .action-err { animation: none; } }
   .htmx-indicator { color: var(--muted); font-size: var(--fs-xs); }
@@ -327,14 +382,14 @@
   .lib-chips { display: flex; gap: 6px; flex-wrap: wrap; }
   .chip { display: inline-flex; align-items: center; min-height: 32px; cursor: pointer; font-size: var(--fs-sm); padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-2); user-select: none; }
   .chip:hover { border-color: var(--blue); color: var(--text); }
-  .chip.active { border-color: var(--blue); color: var(--blue); background: #15233a; }
+  .chip.active { border-color: var(--blue); color: var(--blue); background: var(--tint-blue); }
   .chip-sep { color: var(--border); user-select: none; align-self: center; }
   .chip-findings { color: var(--amber); border-color: var(--border); }
   .chip-findings:hover { border-color: var(--amber); color: var(--amber); }
-  .chip-findings.active { border-color: var(--amber); color: var(--amber); background: #2a1c08; }
+  .chip-findings.active { border-color: var(--amber); color: var(--amber); background: var(--tint-amber); }
   .lib-sort { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .lib-sort-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-  .progress { display: inline-block; vertical-align: middle; width: 90px; height: 7px; background: #2a2a3a; border-radius: 4px; overflow: hidden; }
+  .progress { display: inline-block; vertical-align: middle; width: 90px; height: 7px; background: var(--track-bg); border-radius: 4px; overflow: hidden; }
   .progress-bar { height: 100%; background: var(--green); }
   .progress-bar.has-failed { background: linear-gradient(90deg, var(--green), var(--amber)); }
   .progress-text { color: var(--text-2); font-size: var(--fs-sm); margin-left: 8px; font-family: var(--font-mono); }
@@ -363,7 +418,7 @@
   .book-actions { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .eval-disabled { color: var(--muted); font-size: var(--fs-sm); }
   .eval-disabled a { color: var(--blue); }
-  .eval-notice { background: #0a1a2a; color: var(--blue); border: 1px solid var(--blue); border-radius: 6px; padding: 8px 14px; margin-top: 12px; font-size: var(--fs-sm); }
+  .eval-notice { background: var(--tint-blue-soft); color: var(--blue); border: 1px solid var(--blue); border-radius: 6px; padding: 8px 14px; margin-top: 12px; font-size: var(--fs-sm); }
   .findings-actions { margin-bottom: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
   .back-link { color: var(--muted); font-size: var(--fs-sm); display: inline-block; margin-bottom: 12px; }
   .back-link:hover { color: var(--text); }
@@ -383,14 +438,14 @@
   .panel-title { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 10px; }
   dl.kv { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
   dl.kv dt { color: var(--muted); font-size: var(--fs-sm); }
-  dl.kv dd { margin: 0; font-size: var(--fs-sm); text-align: right; word-break: break-word; }
+  dl.kv dd { margin: 0; font-size: var(--fs-sm); text-align: right; word-break: break-word; font-family: var(--font-mono); }
   .reader { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; max-height: 60vh; overflow-y: auto; line-height: 1.55; }
   .seg { margin-bottom: 8px; font-size: var(--fs-sm); }
   .seg-time { color: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; margin-right: 6px; }
   .seg-speaker { color: var(--purple); font-size: var(--fs-xs); margin-right: 6px; }
   .seg-text { color: var(--text); }
   /* deep-jump target: the segment a finding "Where" link scrolled to */
-  .seg.seg-active { background: #15233a; border-left: 3px solid var(--blue); padding-left: 8px; border-radius: 4px; }
+  .seg.seg-active { background: var(--tint-blue); border-left: 3px solid var(--blue); padding-left: 8px; border-radius: 4px; }
   .load-more { margin-top: 10px; }
 
   /* ── servers page ──────────────────────────────────────────────── */
@@ -412,12 +467,12 @@
   .server-state.state-unknown { color: var(--muted); }
   .server-sub { color: var(--muted); font-size: var(--fs-sm); margin-top: 2px; word-break: break-word; }
   .server-host { color: var(--muted); font-size: var(--fs-xs); margin-top: 6px; }
-  .badge.role-primary  { background: #0a2a1a; color: var(--green); }
-  .badge.role-fallback { background: #15233a; color: var(--blue); }
-  .badge.unconfigured  { background: #2a2a1a; color: var(--amber); }
+  .badge.role-primary  { background: var(--badge-green); color: var(--green); }
+  .badge.role-fallback { background: var(--tint-blue); color: var(--blue); }
+  .badge.unconfigured  { background: var(--badge-amber); color: var(--amber); }
   /* AI endpoint type badges (Models/Services page) */
-  .badge.role-embeddings { background: #15233a; color: var(--blue); }
-  .badge.role-chat       { background: #2a1a2a; color: #c08fd9; }
+  .badge.role-embeddings { background: var(--tint-blue); color: var(--blue); }
+  .badge.role-chat       { background: var(--badge-purple); color: var(--purple); }
   .server-note { color: var(--text-2); font-size: var(--fs-sm); line-height: 1.5; margin-top: 12px; max-width: 760px; }
   /* collapsible "About this page" — routing prose folded out of the way */
   .about-page { margin-top: 14px; margin-bottom: 8px; }
@@ -430,8 +485,8 @@
   /* capability strip: applied (green), declined/absent (amber, ✗ + reason tooltip) */
   .cap-strip { display: inline-flex; gap: 4px; flex-wrap: wrap; }
   .cap-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: var(--fs-xs); font-weight: 600; font-family: inherit; white-space: nowrap; }
-  .cap-badge.cap-on  { background: #0a2a1a; color: var(--green); }
-  .cap-badge.cap-off { background: #2a1c08; color: var(--amber); cursor: help; }
+  .cap-badge.cap-on  { background: var(--badge-green); color: var(--green); }
+  .cap-badge.cap-off { background: var(--tint-amber); color: var(--amber); cursor: help; }
   .server-note code.cap-badge { font-size: var(--fs-xs); }
 
   @media (max-width: 560px) {
