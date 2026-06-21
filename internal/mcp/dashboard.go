@@ -1227,6 +1227,9 @@ func statusBadge(status string) template.HTML {
 	default:
 		ico = "&#9679;" // ●
 	}
+	// #nosec G203 -- ico is one of a fixed set of literal HTML entities (no user
+	// input) and the only variable part, statusLabel(status), is escaped with
+	// template.HTMLEscapeString; the result is safe to emit unescaped.
 	return template.HTML(`<span class="badge-ico" aria-hidden="true">` + ico + `</span>` + template.HTMLEscapeString(statusLabel(status)))
 }
 
