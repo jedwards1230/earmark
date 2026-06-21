@@ -68,7 +68,7 @@ var findingsFragmentTmpl = template.Must(template.New("findings").Funcs(tmplFunc
 {{if or .EvalConfigured (and .ControlEnabled (gt .Summary.TotalFindings 0))}}
 <div class="findings-actions">
   {{if .EvalConfigured}}
-  <button class="btn" hx-post="/actions/eval-sample?n={{.EvalSampleN}}" hx-target="#findings-region" hx-swap="afterbegin"
+  <button class="btn btn-primary" hx-post="/actions/eval-sample?n={{.EvalSampleN}}" hx-target="#findings-region" hx-swap="afterbegin"
           hx-confirm="Run the read-only LLM judge over a {{.EvalSampleN}}-chunk library sample? It flags suspected transcription errors (advisory only — transcripts are never edited) and may take a minute.">run sample eval ({{.EvalSampleN}} chunks)</button>
   {{end}}
   {{if and .ControlEnabled (gt .Summary.TotalFindings 0)}}

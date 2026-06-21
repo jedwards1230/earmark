@@ -67,6 +67,10 @@ var tmplFuncs = template.FuncMap{
 	// statusLabel maps the internal job status to the operator-facing word. The
 	// DB/API/CSS value stays "claimed"; humans see "transcribing".
 	"statusLabel": statusLabel,
+	// statusBadge renders the inner HTML of a status badge — a small glyph plus the
+	// operator-facing word — so the badge never conveys state by color alone (1.4.1).
+	// Returns template.HTML (entities are fixed literals, not user input).
+	"statusBadge": statusBadge,
 	// bookDir is the book directory for a track path. Used to build the
 	// book-detail href: passed as a plain string into an href="…?dir={{…}}"
 	// URL-context interpolation, which html/template auto-escapes (no template.URL
@@ -276,7 +280,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   </div>
   {{if .ControlEnabled}}
   {{if .Stats.Paused}}
-  <button class="btn btn-go" hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
+  <button class="btn btn-primary" hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
           hx-confirm="Resume the pipeline? The runner will start claiming pending jobs.">&#9654;&nbsp;Resume pipeline</button>
   {{else}}
   <button class="btn btn-warn" hx-post="/actions/pause" hx-target="#data-region" hx-swap="innerHTML"
@@ -394,7 +398,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
           <a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}
         </td>
-        <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
+        <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
         <td class="time-muted" title="{{if .Chunked}}chunked{{if .NWindows}} ({{commafyPtr .NWindows}} windows){{end}}{{else}}single-pass{{end}}">{{procTime .ProcessingSeconds}}</td>
         <td class="time-muted">{{commafyPtr .EmbedTotalTokens}}</td>
         <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
@@ -511,7 +515,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
     <button class="btn btn-warn" hx-post="/actions/book-requeue?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
             hx-confirm="Re-transcribe all {{.Total}} track(s) of this book? Deletes their transcripts + embeddings and re-runs the runner.">requeue entire book</button>
     {{if .EvalConfigured}}
-    <button class="btn" hx-post="/actions/eval?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
+    <button class="btn btn-primary" hx-post="/actions/eval?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
             hx-confirm="Run the read-only LLM judge over this book's chunks? It flags suspected transcription errors (advisory only — transcripts are never edited) and may take a minute.">run eval</button>
     {{else}}
     <span class="eval-disabled" title="No eval chat endpoint is configured (AI_ROLES.eval / EVAL_CHAT_*).">run eval (no endpoint — <a href="/servers">configure</a>)</span>
@@ -572,7 +576,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
     <tr>
       <td><a class="file-name" href="/track?id={{.ID}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
           {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}</td>
-      <td><span class="badge {{.Status}}">{{statusLabel .Status}}</span></td>
+      <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
       <td class="time-muted">{{durTime .DurationSeconds}}</td>
       <td class="time-muted">{{commafyPtr .WordCount}}</td>
       <td class="time-muted">{{procTime .ProcessingSeconds}}</td>
@@ -690,7 +694,7 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
   <div class="book-title">{{.Title}}</div>
   {{if .Author}}<div class="book-author">{{.Author}}</div>{{end}}
   <div class="book-stats">
-    <span><span class="badge {{.Detail.Status}}">{{statusLabel .Detail.Status}}</span></span>
+    <span><span class="badge {{.Detail.Status}}">{{statusBadge .Detail.Status}}</span></span>
     {{if .Detail.HasTranscript}}<span class="time-muted">{{durTime .DurationPtr}}</span>{{end}}
     <span class="time-muted" title="{{formatTime .Detail.UpdatedAt}}">updated {{relTime .Detail.UpdatedAt}}</span>
   </div>
@@ -796,7 +800,7 @@ var trackFragmentTmpl = template.Must(template.New("track").Funcs(tmplFuncs).Par
   </div>
 {{else}}
   <div class="section">
-    <p class="lib-empty">Not transcribed yet — this track is <span class="badge {{.Detail.Status}}">{{statusLabel .Detail.Status}}</span>. The transcript reader and chunk list appear once the runner completes it.</p>
+    <p class="lib-empty">Not transcribed yet — this track is <span class="badge {{.Detail.Status}}">{{statusBadge .Detail.Status}}</span>. The transcript reader and chunk list appear once the runner completes it.</p>
   </div>
 {{end}}
 `))
@@ -820,6 +824,11 @@ type pageShell struct {
 	PhaseClass string
 	Paused     bool
 	PhaseKnown bool
+	// PhaseIcon is a small glyph paired with the phase word so the pill reads at a
+	// glance without relying on the border tint alone (color-only avoidance, 1.4.1).
+	// PhaseReason is a one-line plain-language reason string for the title tooltip.
+	PhaseIcon   template.HTML
+	PhaseReason string
 }
 
 type statusData struct {
@@ -1093,6 +1102,27 @@ func statusLabel(status string) string {
 	return status
 }
 
+// statusBadge renders a status badge's inner HTML: a leading glyph paired with the
+// operator-facing label, so job state is conveyed by shape + text, not color alone
+// (WCAG 1.4.1). The glyphs are fixed entities (no user input), so the template.HTML
+// return is safe.
+func statusBadge(status string) template.HTML {
+	var ico string
+	switch status {
+	case "done":
+		ico = "&#10003;" // ✓
+	case "failed":
+		ico = "&#10007;" // ✗
+	case "claimed":
+		ico = "&#9658;" // ►
+	case "pending":
+		ico = "&#9675;" // ○
+	default:
+		ico = "&#9679;" // ●
+	}
+	return template.HTML(`<span class="badge-ico" aria-hidden="true">` + ico + `</span>` + template.HTMLEscapeString(statusLabel(status)))
+}
+
 // timestamp renders a non-negative float seconds offset as a clock string:
 // "mm:ss" below an hour, "h:mm:ss" at or above one. Used by the transcript
 // reader and chunk list. Negative input is clamped to 0.
@@ -1243,6 +1273,38 @@ func phaseClass(phase string) string {
 	}
 }
 
+// phaseIcon returns the small glyph paired with a coordinator phase word so the
+// topbar pill is legible without relying on the border tint alone (1.4.1). It is
+// HTML (an entity) so the caller interpolates it unescaped; the values are fixed
+// literals, not user input.
+func phaseIcon(phase string) template.HTML {
+	switch phase {
+	case db.PhaseTranscribe:
+		return template.HTML("&#9658;") // ► running/transcribe
+	case db.PhaseAnalyze:
+		return template.HTML("&#9673;") // ◉ analyze
+	default:
+		return template.HTML("&#9679;") // ● idle
+	}
+}
+
+// phaseReason is the one-line plain-language reason string for the phase pill
+// tooltip. Paused is surfaced separately (its own neutral badge), so this only
+// describes the coordinator phase itself.
+func phaseReason(phase string, paused bool) string {
+	if paused {
+		return "Paused by intent — the runner is not claiming new work (a normal resting state)."
+	}
+	switch phase {
+	case db.PhaseTranscribe:
+		return "Transcribing — the runner is claiming and processing audio."
+	case db.PhaseAnalyze:
+		return "Analyzing — the eval judge is reviewing transcripts."
+	default:
+		return "Idle — nothing queued for the runner right now."
+	}
+}
+
 // runBudgetText renders the current bounded-run state for the Pipeline page: the
 // remaining-claim count when a run_limit is set, or "unlimited" when nil. A
 // run_limit of 0 means a bounded run has drained (the runner declines further
@@ -1383,6 +1445,7 @@ func (s *MCPServer) renderPage(w http.ResponseWriter, r *http.Request, tmpl *tem
 	} else {
 		data.Phase = phase
 		data.PhaseClass = phaseClass(phase)
+		data.PhaseIcon = phaseIcon(phase)
 		data.PhaseKnown = true
 	}
 	if paused, _, err := s.db.GetControl(ctx); err != nil {
@@ -1390,6 +1453,7 @@ func (s *MCPServer) renderPage(w http.ResponseWriter, r *http.Request, tmpl *tem
 	} else {
 		data.Paused = paused
 	}
+	data.PhaseReason = phaseReason(data.Phase, data.Paused)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := tmpl.Execute(w, data); err != nil {
