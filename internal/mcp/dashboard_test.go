@@ -271,8 +271,8 @@ func TestBookFragmentRendersDetailAndEmDash(t *testing.T) {
 	out := buf.String()
 
 	for _, want := range []string{
-		"<th title=\"audio duration\">Duration</th>",
-		"<th title=\"embedded chunks\">Chunks</th>",
+		`title="audio duration">Duration</th>`,
+		`title="embedded chunks">Chunks</th>`,
 		"30m30s",       // duration 1830s
 		"1m36s",        // proc 95.5s rounds to 96s
 		"14,200",       // words
@@ -498,27 +498,32 @@ func TestLibraryFragmentRendersFindingsColumn(t *testing.T) {
 	}
 	out := buf.String()
 
+	// The dedicated Findings column is gone (it was empty for nearly every prod
+	// row); the count now rides inline on the book title as a ⚑ flag-badge, shown
+	// only when the count is > 0.
+	if strings.Contains(out, ">Findings</th>") {
+		t.Errorf("the dedicated Findings column should be dropped:\n%s", out)
+	}
 	for _, want := range []string{
-		">Findings</th>", // the column header
-		"&#9873; 12",     // the count cell
-		"#book-findings", // links to the book's findings anchor
-		`class="findings-link"`,
+		`class="flag-badge"`, // inline flag on the title
+		"&#9873;&nbsp;12",    // the count, on the book WITH findings
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in library fragment output:\n%s", want, out)
 		}
 	}
-	// The zero-findings book renders an em-dash, not a ⚑ link.
-	if strings.Count(out, "findings-link") != 1 {
-		t.Errorf("expected exactly one ⚑ findings link (the book with findings):\n%s", out)
+	// Exactly one ⚑ flag-badge — only the book with findings carries it; the
+	// zero-findings book shows no flag.
+	if strings.Count(out, "flag-badge") != 1 {
+		t.Errorf("expected exactly one ⚑ flag-badge (the book with findings):\n%s", out)
 	}
 }
 
 // TestFindingsFragmentRendersWorklistAndBookLinks renders findingsFragmentTmpl
-// with a populated summary (per-book roll-up) AND the individual worklist rows,
-// and asserts: the per-book table name is now a `/book?dir=` link (not plain
-// text), the "Findings (worklist)" section renders its rows (confidence, issue,
-// original → correction), and each worklist row links to its book.
+// with a populated summary (per-book roll-up) AND a grouped worklist, and asserts:
+// the per-book + issue-type rows are clickable filter links, the worklist renders
+// the deduplicated group (confidence, issue, original → correction), and each row
+// links to its book.
 func TestFindingsFragmentRendersWorklistAndBookLinks(t *testing.T) {
 	dir := "/books/Author One/A Long Title"
 	mean := 0.66
@@ -528,14 +533,17 @@ func TestFindingsFragmentRendersWorklistAndBookLinks(t *testing.T) {
 		RenderedAt: "2026-01-01 00:00:00 UTC",
 		Summary: &db.FindingsSummary{
 			TotalFindings: 2, MeanConfidence: &mean, HighConfidence: 1, MediumConfidence: 1,
+			ByIssueType: []db.IssueTypeCount{{IssueType: "misheard_proper_noun", Count: 2}},
 			ByBook: []db.BookFindings{
 				{BookDir: dir, FilePath: dir + "/01.m4b", Count: 2, MeanConfidence: 0.66, TopIssueType: "misheard_proper_noun"},
 			},
 		},
-		Findings: []db.FindingRow{
+		MatchedCount: 1,
+		TotalCount:   1,
+		Groups: groupFindings([]db.FindingRow{
 			{ID: "f1", FilePath: dir + "/01.m4b", BookDir: dir, JobID: &job, StartSec: 73.5, EndSec: 81.0,
 				OriginalText: "auto sebo", IssueType: "misheard_proper_noun", SuggestedCorrection: &corr, Confidence: 0.92},
-		},
+		}),
 	}
 	var buf bytes.Buffer
 	if err := findingsFragmentTmpl.Execute(&buf, d); err != nil {
@@ -543,8 +551,9 @@ func TestFindingsFragmentRendersWorklistAndBookLinks(t *testing.T) {
 	}
 	out := buf.String()
 	for _, want := range []string{
-		`href="/book?dir=`,          // per-book table name is a link now
-		"Findings (worklist)",       // worklist section title
+		`href="/book?dir=`,          // per-book table name is a link
+		`href="/findings?issue=`,    // issue-type row is a clickable worklist filter
+		"Worklist",                  // worklist section title
 		"auto sebo &#8594; Arecibo", // original → correction
 		"92%",                       // worklist row confidence
 		"misheard_proper_noun",      // issue type
@@ -552,6 +561,115 @@ func TestFindingsFragmentRendersWorklistAndBookLinks(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in findings fragment output:\n%s", want, out)
 		}
+	}
+}
+
+// TestOverviewStatusLine verifies the home overview's plain-language status line
+// and its "needs attention" flag: failures lead (attention), paused is NEUTRAL
+// (a normal intentional resting state, never red/attention), and idle/queued read
+// plainly. This encodes the owner's decision that paused ≠ alert.
+func TestOverviewStatusLine(t *testing.T) {
+	cases := []struct {
+		name            string
+		o               overviewData
+		paused, transcr bool
+		phase           string
+		wantSub         string // substring expected in PlainStatus
+		wantAttention   bool
+		wantQueueAccent string
+	}{
+		{
+			name:    "failures lead and raise attention",
+			o:       overviewData{TotalBooks: 6, FullyTranscribed: 2, FailedJobs: 2},
+			wantSub: "failed and need attention", wantAttention: true, wantQueueAccent: "green",
+		},
+		{
+			name: "paused is neutral, never attention",
+			o:    overviewData{TotalBooks: 6, FullyTranscribed: 6}, paused: true,
+			wantSub: "Paused (intentional)", wantAttention: false, wantQueueAccent: "green",
+		},
+		{
+			name: "queued work reads plainly",
+			o:    overviewData{TotalBooks: 6, FullyTranscribed: 4, Queued: 3}, transcr: true,
+			wantSub: "queued", wantAttention: false, wantQueueAccent: "blue",
+		},
+		{
+			name: "fully idle and drained",
+			o:    overviewData{TotalBooks: 6, FullyTranscribed: 6}, phase: "idle",
+			wantSub: "Idle — nothing queued", wantAttention: false, wantQueueAccent: "green",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			o := c.o
+			o.fillStatusLine(c.paused, c.transcr, c.phase)
+			if !strings.Contains(o.PlainStatus, c.wantSub) {
+				t.Errorf("PlainStatus = %q, want substring %q", o.PlainStatus, c.wantSub)
+			}
+			if o.Attention != c.wantAttention {
+				t.Errorf("Attention = %v, want %v (line: %q)", o.Attention, c.wantAttention, o.PlainStatus)
+			}
+			if o.QueueAccent != c.wantQueueAccent {
+				t.Errorf("QueueAccent = %q, want %q", o.QueueAccent, c.wantQueueAccent)
+			}
+		})
+	}
+}
+
+// TestGroupFindingsCollapsesDuplicates verifies that exact-duplicate corrections
+// (same original → suggestion → issue type) collapse into one group with an
+// occurrence count and every location, while a distinct correction stays its own
+// row; groups order by max confidence DESC.
+func TestGroupFindingsCollapsesDuplicates(t *testing.T) {
+	corrA := "Arecibo"
+	corrB := "three hundred"
+	dir := "/books/A/B"
+	rows := []db.FindingRow{
+		{FilePath: dir + "/01.m4b", BookDir: dir, OriginalText: "auto sebo", IssueType: "misheard_proper_noun", SuggestedCorrection: &corrA, Confidence: 0.92, StartSec: 10},
+		{FilePath: dir + "/02.m4b", BookDir: dir, OriginalText: "auto sebo", IssueType: "misheard_proper_noun", SuggestedCorrection: &corrA, Confidence: 0.81, StartSec: 20},
+		{FilePath: dir + "/03.m4b", BookDir: dir, OriginalText: "free hundred", IssueType: "number_artifact", SuggestedCorrection: &corrB, Confidence: 0.70, StartSec: 30},
+	}
+	groups := groupFindings(rows)
+	if len(groups) != 2 {
+		t.Fatalf("want 2 groups (one deduped, one distinct), got %d", len(groups))
+	}
+	// First group is the higher-confidence duplicated correction.
+	if groups[0].OriginalText != "auto sebo" || groups[0].Count != 2 {
+		t.Errorf("want the deduped 'auto sebo' group with count 2 first, got %+v", groups[0])
+	}
+	if groups[0].Confidence != 0.92 {
+		t.Errorf("group confidence should be the MAX across the group (0.92), got %v", groups[0].Confidence)
+	}
+	if len(groups[0].Locations) != 2 {
+		t.Errorf("deduped group should carry both locations, got %d", len(groups[0].Locations))
+	}
+	if groups[1].Count != 1 {
+		t.Errorf("distinct correction should be its own count-1 group, got %d", groups[1].Count)
+	}
+}
+
+// TestFilterFindings verifies the confidence-floor and issue-type facets compose
+// and preserve order.
+func TestFilterFindings(t *testing.T) {
+	rows := []db.FindingRow{
+		{OriginalText: "a", IssueType: "misheard_word", Confidence: 0.92},
+		{OriginalText: "b", IssueType: "number_artifact", Confidence: 0.50},
+		{OriginalText: "c", IssueType: "misheard_word", Confidence: 0.30},
+	}
+	// confidence ≥ 0.6 keeps only "a".
+	got := filterFindings(rows, findingsFilter{MinConfidence: 60})
+	if len(got) != 1 || got[0].OriginalText != "a" {
+		t.Errorf("conf≥60 should keep only 'a', got %+v", got)
+	}
+	// issue=misheard_word keeps "a" and "c".
+	got = filterFindings(rows, findingsFilter{IssueType: "misheard_word"})
+	if len(got) != 2 {
+		t.Errorf("issue=misheard_word should keep 2, got %d", len(got))
+	}
+	// composed: misheard_word AND conf≥60 keeps only "a".
+	got = filterFindings(rows, findingsFilter{IssueType: "misheard_word", MinConfidence: 60})
+	if len(got) != 1 || got[0].OriginalText != "a" {
+		t.Errorf("composed facets should keep only 'a', got %+v", got)
 	}
 }
 

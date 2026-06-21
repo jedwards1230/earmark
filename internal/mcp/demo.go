@@ -413,11 +413,24 @@ func (d demoDB) ListFindings(_ context.Context, dir string, limit int) ([]db.Fin
 	// 0 (an even index → demoDB.GetTrackDetail returns a full transcript), exercising
 	// the deep-jump end-to-end against a real demo book (D4).
 	job1, job2 := phmDir+"#0", duneDir+"#0"
+	ci3, ci4 := 11, 18
 	all := []db.FindingRow{
 		{ID: "f1", FilePath: phmFile,
 			BookDir: phmDir, JobID: &job1, ChunkIndex: &ci0,
 			StartSec: 73.5, EndSec: 81.0, OriginalText: "auto sebo",
 			IssueType: "misheard_proper_noun", SuggestedCorrection: &corr1, Confidence: 0.92},
+		// Two more occurrences of the SAME correction at different timestamps — the
+		// canonical recurring misheard proper noun. The /findings worklist collapses
+		// these three into one ×3 group with a "show all locations" expander, which is
+		// what makes the dedup feature visible in --demo.
+		{ID: "f1b", FilePath: phmFile,
+			BookDir: phmDir, JobID: &job1, ChunkIndex: &ci3,
+			StartSec: 1450.0, EndSec: 1456.2, OriginalText: "auto sebo",
+			IssueType: "misheard_proper_noun", SuggestedCorrection: &corr1, Confidence: 0.88},
+		{ID: "f1c", FilePath: phmFile,
+			BookDir: phmDir, JobID: &job1, ChunkIndex: &ci4,
+			StartSec: 2980.5, EndSec: 2986.0, OriginalText: "auto sebo",
+			IssueType: "misheard_proper_noun", SuggestedCorrection: &corr1, Confidence: 0.79},
 		{ID: "f2", FilePath: phmFile,
 			BookDir: phmDir, JobID: &job1, ChunkIndex: &ci1,
 			StartSec: 612.0, EndSec: 618.4, OriginalText: "free hundred",

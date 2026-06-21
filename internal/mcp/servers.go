@@ -502,7 +502,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 // ─── Templates ────────────────────────────────────────────────────────────────
 
 var serversPage = mustPage(`{{define "content"}}
-<p class="subtitle">transcription servers &amp; AI endpoints &nbsp;·&nbsp; auto-refreshes every 5 s</p>
+<p class="subtitle">Transcription servers (ASR runners) and AI endpoints earmark talks to — which are live, and what model and mode each is running. Read-only. Auto-refreshes every 5&thinsp;s.</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 <div id="servers-region"
      hx-get="/servers/data" hx-trigger="load, every 5s" hx-swap="innerHTML"
@@ -545,18 +545,19 @@ var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs)
   <div class="section-title">Models &amp; modes</div>
   <div class="table-wrap">
   <table>
+    <caption>Model, runtime, and capabilities per server — observed values win over configured</caption>
     <thead><tr>
-      <th>Server</th>
-      <th>Model</th>
-      <th title="parameter size derived from the model name">Size</th>
-      <th title="model family — observed from run_metrics, else the configured expectation">Family</th>
-      <th title="runtime — observed from run_metrics, else the configured expectation">Runtime</th>
-      <th title="capabilities this backend applied (observed) or declares (configured); ✗ = requested-but-declined or absent, hover for why">Caps</th>
-      <th title="compute precision the runner reported">Mode</th>
-      <th title="mean per-word confidence the model reported (blank when it emits no scores)">Conf</th>
-      <th title="transcripts this server has produced">Jobs</th>
-      <th title="mean transcription wall-clock">Avg proc</th>
-      <th>Last active</th>
+      <th scope="col">Server</th>
+      <th scope="col">Model</th>
+      <th scope="col" title="parameter size derived from the model name">Size</th>
+      <th scope="col" title="model family — observed from run_metrics, else the configured expectation">Family</th>
+      <th scope="col" title="runtime — observed from run_metrics, else the configured expectation">Runtime</th>
+      <th scope="col" title="capabilities this backend applied (observed) or declares (configured); ✗ = requested-but-declined or absent, hover for why">Caps</th>
+      <th scope="col" title="compute precision the runner reported">Mode</th>
+      <th scope="col" class="num" title="mean per-word confidence the model reported (blank when it emits no scores)">Conf</th>
+      <th scope="col" class="num" title="transcripts this server has produced">Jobs</th>
+      <th scope="col" class="num" title="mean transcription wall-clock">Avg proc</th>
+      <th scope="col">Last active</th>
     </tr></thead>
     <tbody>
     {{if .MultiFamily}}
@@ -572,9 +573,12 @@ var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs)
   </div>
 </div>
 
-<p class="server-note">Models &amp; modes prefers <em>observed</em> values (what a run actually reported in <code>run_metrics</code>) over the <em>configured</em> <code>ASR_SERVERS</code> expectation, marked <em>(expected)</em> until a run reports. Capability badges show what each backend applied: <code class="cap-badge cap-on">words</code> = applied, <code class="cap-badge cap-off">bias✗</code> = requested but declined or absent (hover for the reason). This is the honest-degradation surface for A/B comparison — two backends on the same library are grouped by family side&nbsp;by&nbsp;side.</p>
+<details class="about-page">
+  <summary>About this page</summary>
+  <p class="server-note">Models &amp; modes prefers <em>observed</em> values (what a run actually reported in <code>run_metrics</code>) over the <em>configured</em> <code>ASR_SERVERS</code> expectation, marked <em>(expected)</em> until a run reports. Capability badges show what each backend applied: <code class="cap-badge cap-on">words</code> = applied, <code class="cap-badge cap-off">bias✗</code> = requested but declined or absent (hover for the reason). This is the honest-degradation surface for A/B comparison — two backends on the same library are grouped by family side&nbsp;by&nbsp;side.</p>
 
-<p class="server-note">Servers with a <code>gpuArbiterUrl</code> show live readiness from gpu-arbiter: <em>ready</em> (GPU free), <em>busy</em> (GPU held by a game — connected but not usable, the fallback signal), or <em>offline</em> (host unreachable). Servers without a probe fall back to <em>idle</em>/<em>not&nbsp;seen</em> inferred from job history. Routing work to a specific server (primary/fallback by job type) is not yet implemented; the runner claims jobs itself.</p>
+  <p class="server-note">Servers with a <code>gpuArbiterUrl</code> show live readiness from gpu-arbiter: <em>ready</em> (GPU free), <em>busy</em> (GPU held by a game — connected but not usable, the fallback signal), or <em>offline</em> (host unreachable). Servers without a probe fall back to <em>idle</em>/<em>not&nbsp;seen</em> inferred from job history. Routing work to a specific server (primary/fallback by job type) is not yet implemented; the runner claims jobs itself.</p>
+</details>
 {{end}}{{/* if .Servers */}}
 
 {{if .Endpoints}}
@@ -597,7 +601,10 @@ var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs)
   </div>
 </div>
 
-<p class="server-note">AI endpoints are the embeddings (and any chat) services earmark talks to, from the <code>AI_ENDPOINTS</code> registry (<code>AI_ROLES</code> binds each to a function). Liveness is a <code>GET /models</code> probe: <em>ready</em> (reachable, model present), <em>model not loaded</em> (reachable but the configured model isn't listed), or <em>offline</em> (unreachable). Observability only — earmark does not route between endpoints. The legacy <code>EMBEDDINGS_BASE_URL</code>/<code>EMBEDDINGS_MODEL</code> vars appear here as a synthesized <code>_legacy</code> endpoint.</p>
+<details class="about-page">
+  <summary>About AI endpoints</summary>
+  <p class="server-note">AI endpoints are the embeddings (and any chat) services earmark talks to, from the <code>AI_ENDPOINTS</code> registry (<code>AI_ROLES</code> binds each to a function). Liveness is a <code>GET /models</code> probe: <em>ready</em> (reachable, model present), <em>model not loaded</em> (reachable but the configured model isn't listed), or <em>offline</em> (unreachable). Observability only — earmark does not route between endpoints. The legacy <code>EMBEDDINGS_BASE_URL</code>/<code>EMBEDDINGS_MODEL</code> vars appear here as a synthesized <code>_legacy</code> endpoint.</p>
+</details>
 {{end}}{{/* if .Endpoints */}}
 {{end}}{{/* if (and (not .Servers) (not .Endpoints)) ... else */}}
 

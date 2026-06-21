@@ -14,8 +14,8 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
-	"github.com/jedwards1230/earmark/internal/predict"
 	"github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/predict"
 )
 
 // SimpleMockDB implements DBInterface for simple testing.
@@ -1586,11 +1586,15 @@ func firstBookDirs(body string) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, line := range strings.Split(body, "\n") {
-		i := strings.Index(line, `class="file-name" href="/book?dir=`)
+		// The library row title is now a whole-row link: <a class="row-a file-name"
+		// href="/book?dir=…">. Match on the href anchor (stable across the markup
+		// change), preceded by the file-name class so only book-title links match.
+		const marker = `file-name" href="/book?dir=`
+		i := strings.Index(line, marker)
 		if i < 0 {
 			continue
 		}
-		rest := line[i+len(`class="file-name" href="/book?dir=`):]
+		rest := line[i+len(marker):]
 		j := strings.IndexByte(rest, '"')
 		if j < 0 {
 			continue
