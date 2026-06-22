@@ -207,7 +207,7 @@ var pipelinePage = mustPage(`{{define "content"}}
 <div id="action-error" aria-live="assertive"></div>
 <div id="data-region"
      hx-get="/status/data" hx-trigger="load, every 3s" hx-swap="innerHTML"
-     hx-sync="this:replace" hx-request='{"timeout": 5000}'
+     hx-sync="this:drop" hx-request='{"timeout": 5000}'
      hx-on::response-error="document.getElementById('conn').hidden = false"
      hx-on::send-error="document.getElementById('conn').hidden = false"
      hx-on::timeout="document.getElementById('conn').hidden = false"
@@ -278,7 +278,9 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 <div class="updated">updated {{.RenderedAt}}</div>
 
 <!-- unified pipeline state: combines the pause flag AND runner liveness into one
-     honest line, so it can never say "running" while no runner is connected. -->
+     honest line, so it can never say "running" while no runner is active. Runner
+     liveness here is claim ACTIVITY (claimed-job heartbeats), not socket
+     connectivity — live host/GPU connectivity lives on the Servers page. -->
 <div class="pipeline {{.StateClass}}">
   <div class="pipe-main">
     <span class="dot {{.DotClass}}"></span>
@@ -290,9 +292,11 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   {{if .ControlEnabled}}
   {{if .Stats.Paused}}
   <button class="btn btn-primary" hx-post="/actions/resume" hx-target="#data-region" hx-swap="innerHTML"
+          hx-sync="#data-region:replace"
           hx-confirm="Resume the pipeline? The runner will start claiming pending jobs.">&#9654;&nbsp;Resume pipeline</button>
   {{else}}
   <button class="btn btn-warn" hx-post="/actions/pause" hx-target="#data-region" hx-swap="innerHTML"
+          hx-sync="#data-region:replace"
           hx-confirm="Pause the pipeline? The runner finishes its current job, then stops claiming new work.">&#10073;&#10073;&nbsp;Pause pipeline</button>
   {{end}}
   {{else}}
@@ -307,12 +311,14 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   </div>
   {{if .ControlEnabled}}
   <form class="rb-form" hx-post="/actions/run" hx-target="#data-region" hx-swap="innerHTML"
+        hx-sync="#data-region:replace"
         hx-confirm="Arm a bounded run? The runner claims that many jobs then auto-pauses.">
-    <input type="number" name="n" min="1" value="1" aria-label="number of jobs to run" required>
+    <input id="rb-n" hx-preserve="true" type="number" name="n" min="1" value="1" aria-label="number of jobs to run" required>
     <button type="submit" class="btn btn-go">&#9654;&nbsp;run N then pause</button>
   </form>
   {{if .RunLimit}}
   <button class="btn" hx-post="/actions/run-clear" hx-target="#data-region" hx-swap="innerHTML"
+          hx-sync="#data-region:replace"
           hx-confirm="Clear the bounded run (back to unlimited)? The pause flag is left unchanged.">clear budget</button>
   {{end}}
   {{else}}
@@ -1185,13 +1191,24 @@ func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, sta
 		d.StateLabel, d.StateClass, d.DotClass = "STALLED", "state-stalled", "red"
 		d.SubText = "runner heartbeat is stale and work is waiting — runner may have crashed"
 	default:
-		// Not paused, no fresh runner, and nothing waiting — genuinely idle
-		// (queue drained) or a runner was never seen.
+		// Not paused and no fresh active runner. Two very different situations
+		// hide here, so distinguish them — and note this branch only knows claim
+		// ACTIVITY (claimed-job heartbeats), NOT socket connectivity, so it must
+		// not assert "no runner connected" (that contradicts the Servers page,
+		// which shows live gpu-arbiter connectivity).
 		d.StateLabel, d.StateClass, d.DotClass = "IDLE", "state-idle", "blue"
-		if stats.RunnerActive {
+		switch {
+		case stats.RunnerActive:
+			// A runner claimed a job but its heartbeat went stale; nothing waiting.
 			d.SubText = "enabled — runner heartbeat is stale (no work waiting)"
-		} else {
-			d.SubText = "enabled — no runner is currently connected"
+		case stats.Pending > 0:
+			// Work is queued but nothing is claiming it — the ASR runner is likely
+			// stopped/parked. Point at the Servers page for live runner status.
+			d.SubText = fmt.Sprintf("enabled — %s job%s queued, waiting for a runner to claim (see Servers for live runner status)",
+				commafy(stats.Pending), plural(stats.Pending))
+		default:
+			// Queue drained — genuinely, benignly idle.
+			d.SubText = "enabled — queue drained, nothing to transcribe"
 		}
 	}
 	return d
