@@ -651,6 +651,36 @@ func TestGetBookSummariesStatusFilter(t *testing.T) {
 	}
 }
 
+// TestGetBookSummariesSortFilter asserts Sort is validated against an allow-list
+// and mapped to a fixed ORDER BY literal: "activity" orders most-recently-updated
+// first, and an unknown sort is rejected before any query runs.
+func TestGetBookSummariesSortFilter(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(bookSummaryColumns)
+	// Sort=activity must order by last_updated DESC (the activity feed order).
+	mock.ExpectQuery(`ORDER BY last_updated DESC, book_dir`).
+		WithArgs("", 20, 0).WillReturnRows(rows)
+
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Sort: "activity"}); err != nil {
+		t.Fatalf("getBookSummaries(activity): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+
+	// An invalid sort is rejected before any query runs.
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Sort: "bogus"}); err == nil {
+		t.Error("expected error for invalid sort filter")
+	}
+}
+
 // TestGetLibraryTotals drives getLibraryTotals at execution level: it asserts the
 // whole-library book counts (total / fully-transcribed / with-pending) scan into
 // the right fields and the ILIKE filter arg is passed through.

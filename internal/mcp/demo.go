@@ -756,15 +756,21 @@ func (d demoDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookS
 		}
 		filtered = append(filtered, b)
 	}
-	// Mirror the real query's transcribed-first ORDER BY (done-ratio desc, then
-	// done count desc) so the demo shows the same ordering as production.
-	sort.SliceStable(filtered, func(i, j int) bool {
-		ri, rj := doneRatio(filtered[i]), doneRatio(filtered[j])
-		if ri != rj {
-			return ri > rj
-		}
-		return filtered[i].Done > filtered[j].Done
-	})
+	// Mirror the real query's ORDER BY. For Sort=="activity" order by most-recently
+	// updated first (activity feed). Default: transcribed-first order.
+	if f.Sort == "activity" {
+		sort.SliceStable(filtered, func(i, j int) bool {
+			return filtered[i].LastUpdated.After(filtered[j].LastUpdated)
+		})
+	} else {
+		sort.SliceStable(filtered, func(i, j int) bool {
+			ri, rj := doneRatio(filtered[i]), doneRatio(filtered[j])
+			if ri != rj {
+				return ri > rj
+			}
+			return filtered[i].Done > filtered[j].Done
+		})
+	}
 	total := len(filtered)
 	lim := f.Limit
 	if lim <= 0 {

@@ -603,19 +603,23 @@ func TestRequeueActionErrorSurfaces(t *testing.T) {
 	}
 }
 
-// TestRequeueButtonRendersForDoneFailedOnly verifies the per-row requeue button
-// appears for done/failed jobs (SimpleMockDB returns a done + a claimed job).
+// TestRequeueButtonRendersForDoneFailedOnly verifies that the activity feed
+// renders book-grouped rows (not a flat table with per-row requeue buttons).
+// Requeue actions live on the book-detail page and the failed view; the
+// activity feed is read-only and shows per-book progress.
 func TestRequeueButtonRendersForDoneFailedOnly(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
 	req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	body := w.Body.String()
-	if !strings.Contains(body, "/actions/requeue?id=job-1") { // job-1 is 'done'
-		t.Error("expected a requeue button for the done job")
+	// The activity feed should render book rows with data-book-id.
+	if !strings.Contains(body, "data-book-id") {
+		t.Error("expected book-grouped activity rows with data-book-id attribute")
 	}
-	if strings.Contains(body, "/actions/requeue?id=job-2") { // job-2 is 'claimed'
-		t.Error("claimed job should not get a requeue button")
+	// Requeue buttons are NOT in the activity feed (they're on the book page).
+	if strings.Contains(body, "/actions/requeue?id=job-") {
+		t.Error("requeue buttons should not appear in the pipeline activity feed")
 	}
 }
 
@@ -655,30 +659,33 @@ func TestDashboardRoutesGETOnly(t *testing.T) {
 	}
 }
 
-// TestFragmentEscapesJobError guards the claim that a job's error text is
-// HTML-escaped on the dashboard: derefStr returns a plain string, so
-// html/template auto-escapes it. A regression that returns template.HTML (or
-// otherwise marks it safe) would render the raw markup and fail this test.
+// TestFragmentEscapesJobError guards the claim that the status fragment does
+// not render raw HTML from user-supplied data. The activity feed no longer
+// shows per-track error text (errors are shown in the failed view), but we
+// verify that the fragment renders successfully and that the stats numbers
+// (which come from a job list) are still present.
 func TestFragmentEscapesJobError(t *testing.T) {
 	evil := `<script>alert(1)</script>`
 	var buf bytes.Buffer
-	data := newStatusData(&db.QueueStats{}, []db.RecentJob{
+	data := newStatusData(&db.QueueStats{Failed: 1}, []db.RecentJob{
 		{ID: "x", FilePath: "/books/a/b.m4b", Status: "failed", Error: &evil},
 	}, time.Now(), 30*time.Minute, "", nil)
 	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
 		t.Fatalf("fragment execute: %v", err)
 	}
 	out := buf.String()
+	// The raw evil string must never appear literally in the output.
 	if strings.Contains(out, evil) {
-		t.Error("job error rendered unescaped — XSS risk")
+		t.Error("evil string rendered unescaped — XSS risk")
 	}
-	if !strings.Contains(out, "&lt;script&gt;") {
-		t.Errorf("expected escaped error text in output; got:\n%s", out)
+	// The fragment should still render (has the failed-callout and stats cards).
+	if !strings.Contains(out, "failed-callout") {
+		t.Errorf("expected failed-callout in output; got:\n%s", out)
 	}
 }
 
 // TestStatusDataFragment verifies that GET /status/data returns 200 with the
-// counts rendered by the fake DB.
+// counts rendered by the fake DB and the book-grouped activity feed.
 func TestStatusDataFragment(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
 	req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
@@ -697,14 +704,16 @@ func TestStatusDataFragment(t *testing.T) {
 		">10<",            // Done / Transcripts
 		">450<",           // Chunks
 		"asr-runner-test", // RunnerID
-		"chapter01.m4b",   // shortName of first recent job
-		"chapter02.m4b",
-		`badge done`,
-		`badge claimed`,  // CSS class stays the internal status
-		`>transcribing<`, // ...but the visible badge text is the operator word
-		"Transcribing",   // card label (was "Claimed")
-		"transcription",  // card-group label
-		"embedding",      // card-group label
+		"Transcribing",    // card label (was "Claimed")
+		"transcription",   // card-group label
+		"embedding",       // card-group label
+		// Book-grouped activity feed (from SimpleMockDB.GetBookSummaries +
+		// GetBookTracks which return books under /books/Author One/Book A etc.).
+		"data-book-id",     // book row key
+		"activity-summary", // <details> summary row
+		"Track 1.mp3",      // track from GetBookTracks (/books/.../Track 1.mp3)
+		`badge done`,       // track status badge (Track 1 is done)
+		`badge pending`,    // Track 2 is pending
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("GET /status/data: body missing %q\nbody:\n%s", want, body)

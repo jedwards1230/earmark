@@ -2175,6 +2175,11 @@ type BookFilter struct {
 	Query  string // case-insensitive substring match on file_path (author/title/track)
 	Limit  int    // page size (defaulted if ≤ 0)
 	Offset int    // page offset
+	// Sort controls the ORDER BY: "" or "default" uses the standard transcribed-first
+	// order (done-ratio desc, done count desc, last_updated desc, book_dir).
+	// "activity" orders by most-recently-updated first (last_updated DESC, book_dir)
+	// so the activity feed surfaces the books that changed most recently.
+	Sort string
 }
 
 // GetBookSummaries returns one row per book directory, aggregating track-job
@@ -2213,6 +2218,25 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 	// nilable pointer here (em dash in the UI). The join multiplies job rows only
 	// by 0-or-1 (transcripts.job_id and run_metrics.job_id are both unique per
 	// job), so the status COUNTs are unaffected.
+	//
+	// Sort is validated against an allow-list and mapped to a fixed ORDER BY
+	// literal — same validate-then-map pattern as statusHaving above, so no
+	// caller-supplied value is ever interpolated into the SQL. "activity" orders
+	// most-recently-updated first (the pipeline activity feed); the default
+	// keeps the library's transcribed-first order. An unknown value fails loudly
+	// rather than silently defaulting.
+	var orderBy string
+	switch f.Sort {
+	case "", "default":
+		orderBy = `ORDER BY (done::float8 / NULLIF(total, 0)) DESC NULLS LAST,
+		         done DESC,
+		         last_updated DESC,
+		         book_dir`
+	case "activity":
+		orderBy = `ORDER BY last_updated DESC, book_dir`
+	default:
+		return nil, 0, fmt.Errorf("invalid sort filter: %q", f.Sort)
+	}
 	query := fmt.Sprintf(`
 		WITH books AS (
 			SELECT
@@ -2238,15 +2262,9 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 		       duration_seconds, word_count, embed_chunk_count,
 		       COUNT(*) OVER() AS total_books
 		FROM books
-		-- Lead with transcribed books: fully-done first (done-ratio = 1), then
-		-- partially-done, then fully-pending (ratio 0). Within a tier, the most
-		-- recently-updated book surfaces first, with book_dir as a stable tiebreak.
-		ORDER BY (done::float8 / NULLIF(total, 0)) DESC NULLS LAST,
-		         done DESC,
-		         last_updated DESC,
-		         book_dir
+		%s
 		LIMIT $2 OFFSET $3
-	`, statusHaving)
+	`, statusHaving, orderBy)
 
 	rows, err := qr.Query(ctx, query, f.Query, f.Limit, f.Offset)
 	if err != nil {

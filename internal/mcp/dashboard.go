@@ -411,35 +411,57 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 {{end}}
 
 <div class="section">
-  <div class="section-title">Recent Activity (last {{len .Jobs}})</div>
-  {{if .Jobs}}
-  <div class="table-wrap">
-  <table>
-    <caption>Most recent transcription jobs</caption>
-    <thead><tr><th scope="col">File</th><th scope="col">Status</th><th scope="col" class="num" title="transcription wall-clock time (runner)">Proc</th><th scope="col" class="num" title="embedding tokens (local tokenizer)">Tokens</th><th scope="col">Updated</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
-    <tbody>
-    {{range .Jobs}}
-      <tr>
-        <td>
-          <a class="file-name" href="/book?dir={{bookDir .FilePath}}" title="{{.FilePath}}">{{shortName .FilePath}}</a>
-          {{if .Error}}<details class="error-row"><summary>show error</summary><pre>{{derefStr .Error}}</pre></details>{{end}}
-        </td>
-        <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
-        <td class="time-muted" title="{{if .Chunked}}chunked{{if .NWindows}} ({{commafyPtr .NWindows}} windows){{end}}{{else}}single-pass{{end}}">{{procTime .ProcessingSeconds}}</td>
-        <td class="time-muted">{{commafyPtr .EmbedTotalTokens}}</td>
-        <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
-        <td class="actions">
-          {{if or (eq .Status "done") (eq .Status "failed")}}
-          <button class="btn" hx-post="/actions/requeue?id={{.ID}}" hx-target="#data-region" hx-swap="innerHTML"
-                  hx-confirm="Re-transcribe {{shortName .FilePath}}? This deletes its transcript + embeddings and re-runs the runner.">requeue</button>
-          {{end}}
-        </td>
-      </tr>
-    {{end}}
-    </tbody>
-  </table>
+  <div class="section-title">Recent Activity (last {{len .ActivityBooks}} books)</div>
+  {{if .ActivityBooks}}
+  <div class="activity-feed">
+  {{range .ActivityBooks}}
+  <details class="activity-book" data-book-id="{{.Dir}}">
+    <summary class="activity-summary">
+      <span class="activity-title">{{if .Title}}{{.Title}}{{else}}{{.Dir}}{{end}}{{if .Author}}<span class="activity-author time-muted"> · {{.Author}}</span>{{end}}</span>
+      <span class="activity-counters">
+        <span class="activity-tracks">{{commafy .Done}} / {{commafy .Total}} tracks done</span>
+        {{if gt .Claimed 0}}<span class="badge claimed"> · {{commafy .Claimed}} transcribing</span>{{end}}
+        {{if gt .Failed 0}}<span class="badge failed"> · {{commafy .Failed}} failed</span>{{end}}
+      </span>
+      <span class="activity-bar-wrap" title="{{.DonePct}}% done">
+        <span class="progress activity-bar"><span class="progress-bar{{if gt .Failed 0}} has-failed{{end}}" style="width:{{.DonePct}}%"></span></span>
+      </span>
+      <span class="time-muted activity-time" title="{{formatTime .LastUpdated}}">{{relTime .LastUpdated}}</span>
+    </summary>
+    <div class="activity-tracks-body">
+      {{if .Tracks}}
+      <div class="table-wrap">
+      <table>
+        <caption>Tracks for {{if .Title}}{{.Title}}{{else}}{{.Dir}}{{end}}</caption>
+        <thead><tr>
+          <th scope="col">Track</th>
+          <th scope="col">Status</th>
+          <th scope="col" class="num" title="audio duration">Duration</th>
+          <th scope="col" class="num" title="transcription wall-clock time (runner)">Proc</th>
+          <th scope="col" class="num" title="embedded chunks">Chunks</th>
+          <th scope="col">Updated</th>
+        </tr></thead>
+        <tbody>
+        {{range .Tracks}}
+          <tr>
+            <td><a class="file-name" href="/track?id={{.ID}}" title="{{.FilePath}}">{{.ShortName}}</a></td>
+            <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
+            <td class="time-muted">{{durTime .DurationSeconds}}</td>
+            <td class="time-muted">{{procTime .ProcessingSeconds}}</td>
+            <td class="time-muted">{{commafyPtr .EmbedChunkCount}}</td>
+            <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      </div>
+      {{else}}<p class="lib-empty">No tracks found.</p>{{end}}
+      <div class="activity-book-link"><a href="/book?dir={{.Dir}}">Open book &rarr;</a></div>
+    </div>
+  </details>
+  {{end}}
   </div>
-  {{else}}<p class="lib-empty">No jobs yet.</p>{{end}}
+  {{else}}<p class="lib-empty">No activity yet.</p>{{end}}
 </div>
 `))
 
@@ -926,9 +948,52 @@ type pageShell struct {
 	PhaseReason string
 }
 
+// activityTrack is a condensed per-track row for the book-grouped activity feed
+// (the inline expansion inside a <details> row).
+type activityTrack struct {
+	ID        string
+	FilePath  string
+	ShortName string // path.Base(FilePath)
+	Status    string
+	// Nullable metrics — nil renders as "—" in the template.
+	DurationSeconds   *float64
+	ProcessingSeconds *float64
+	EmbedChunkCount   *int
+	UpdatedAt         time.Time
+}
+
+// activityBook is one book row in the pipeline page's book-grouped activity feed.
+// It carries both the per-book summary counters (for the <summary> line) and
+// the full per-track list (for the inline expansion body). Both are rendered
+// server-side inside the 3s-polled fragment, so the counters and track status
+// tick live without re-fetching.
+type activityBook struct {
+	Dir     string // stable key written into data-book-id
+	Title   string
+	Author  string
+	Total   int
+	Pending int
+	Claimed int
+	Done    int
+	Failed  int
+	DonePct int
+	// LastUpdated is the max(updated_at) across all of the book's tracks.
+	LastUpdated time.Time
+	Tracks      []activityTrack
+}
+
+// activityBookFeedLimit is the maximum number of books shown in the pipeline
+// activity feed (bounded N+1: one GetBookTracks call per book).
+const activityBookFeedLimit = 12
+
 type statusData struct {
 	Stats *db.QueueStats
 	Jobs  []db.RecentJob
+
+	// ActivityBooks is the book-grouped activity feed replacing the flat Jobs
+	// table. It holds up to activityBookFeedLimit books ordered by most-recently
+	// updated, each carrying their per-track list for inline expansion.
+	ActivityBooks []activityBook
 
 	RenderedAt string
 	EmbedStall bool
@@ -1655,11 +1720,73 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 	data.RunBudgetText = runBudgetText(stats.RunLimit)
 	data.ControlEnabled = s.controlToken != ""
 
+	// Build the book-grouped activity feed. Fetch the most-recently-active books
+	// (Sort="activity", Limit=activityBookFeedLimit), then fetch per-book tracks.
+	// Bounded N+1: at most activityBookFeedLimit GetBookTracks calls per fragment
+	// render (capped at 12). A read error degrades the feed to empty rather than
+	// failing the whole fragment — the cards above remain accurate.
+	data.ActivityBooks = s.buildActivityFeed(ctx)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := statusFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("status fragment render error", "error", err)
 	}
+}
+
+// buildActivityFeed fetches the most-recently-updated books and their tracks for
+// the pipeline page's book-grouped activity feed. It is best-effort: errors are
+// logged and degrade the feed to empty rather than failing the fragment.
+func (s *MCPServer) buildActivityFeed(ctx context.Context) []activityBook {
+	summaries, _, err := s.db.GetBookSummaries(ctx, db.BookFilter{
+		Sort: "activity", Limit: activityBookFeedLimit,
+	})
+	if err != nil {
+		s.logger.Error("activity feed: GetBookSummaries error", "error", err)
+		return nil
+	}
+
+	out := make([]activityBook, 0, len(summaries))
+	for _, b := range summaries {
+		bookMeta, err := s.meta.Lookup(ctx, b.SamplePath, b.SamplePath)
+		if err != nil {
+			// Non-fatal: the template falls back to rendering b.Dir when Title is
+			// empty. Log at debug so metadata issues are diagnosable without
+			// breaking the feed.
+			s.logger.Debug("activity feed: meta lookup error", "dir", b.Dir, "error", err)
+		}
+		pct := 0
+		if b.Total > 0 {
+			pct = b.Done * 100 / b.Total
+		}
+		ab := activityBook{
+			Dir: b.Dir, Title: bookMeta.Title, Author: bookMeta.Author,
+			Total: b.Total, Pending: b.Pending, Claimed: b.Claimed, Done: b.Done, Failed: b.Failed,
+			DonePct:     pct,
+			LastUpdated: b.LastUpdated,
+		}
+
+		// Fetch per-book tracks for the inline expansion body.
+		tracks, terr := s.db.GetBookTracks(ctx, b.Dir)
+		if terr != nil {
+			s.logger.Error("activity feed: GetBookTracks error", "dir", b.Dir, "error", terr)
+		}
+		ab.Tracks = make([]activityTrack, 0, len(tracks))
+		for _, t := range tracks {
+			ab.Tracks = append(ab.Tracks, activityTrack{
+				ID:                t.ID,
+				FilePath:          t.FilePath,
+				ShortName:         path.Base(t.FilePath),
+				Status:            t.Status,
+				DurationSeconds:   t.DurationSeconds,
+				ProcessingSeconds: t.ProcessingSeconds,
+				EmbedChunkCount:   t.EmbedChunkCount,
+				UpdatedAt:         t.UpdatedAt,
+			})
+		}
+		out = append(out, ab)
+	}
+	return out
 }
 
 // ─── Library data handler ────────────────────────────────────────────────────

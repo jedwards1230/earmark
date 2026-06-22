@@ -428,6 +428,29 @@
   .back-link:hover { color: var(--text); }
   .book-path { color: var(--muted); font-size: var(--fs-xs); margin-top: 6px; word-break: break-all; }
 
+  /* ── pipeline activity feed (book-grouped collapsible rows) ─────── */
+  .activity-feed { display: flex; flex-direction: column; gap: 4px; }
+  .activity-book { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+  .activity-book[open] { border-color: var(--blue); }
+  .activity-summary { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    cursor: pointer; list-style: none; flex-wrap: wrap; min-height: 44px; }
+  .activity-summary::-webkit-details-marker { display: none; }
+  .activity-summary::before { content: '›'; color: var(--muted); font-size: 1.1em; flex: none;
+    transition: transform 0.15s; }
+  details[open] > .activity-summary::before { transform: rotate(90deg); }
+  .activity-title { font-weight: 600; font-size: var(--fs-sm); flex: 1 1 180px; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .activity-author { font-weight: 400; }
+  .activity-counters { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    font-size: var(--fs-sm); }
+  .activity-tracks { color: var(--text-2); }
+  .activity-bar-wrap { display: flex; align-items: center; }
+  .activity-bar { width: 80px; height: 6px; }
+  .activity-time { font-size: var(--fs-xs); white-space: nowrap; }
+  .activity-tracks-body { padding: 0 14px 12px; border-top: 1px solid var(--border); }
+  .activity-book-link { margin-top: 8px; font-size: var(--fs-sm); }
+  .activity-book-link a { color: var(--blue); }
+
   /* ── pipeline panel (book detail): two real bars + honest judge chip ─ */
   .pipeline-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; margin-bottom: 18px; }
   .pipeline-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
@@ -545,6 +568,32 @@
         if (s) { el.scrollLeft = s[0]; el.scrollTop = s[1]; }
       });
       saved = null;
+    });
+  })();
+
+  // Preserve <details open> state for book-grouped activity rows across htmx
+  // swaps. The 3s poll replaces #data-region's innerHTML, which collapses every
+  // <details> element. We record which data-book-id values were open before the
+  // swap and re-open them immediately after so expansions survive the poll while
+  // counters still tick.
+  (function () {
+    var openIds = null;
+    function bookDetails(target) { return target.querySelectorAll('details[data-book-id]'); }
+    document.body.addEventListener('htmx:beforeSwap', function (e) {
+      var t = e.detail && e.detail.target;
+      if (!t) return;
+      openIds = [];
+      bookDetails(t).forEach(function (el) {
+        if (el.open) { openIds.push(el.getAttribute('data-book-id')); }
+      });
+    });
+    document.body.addEventListener('htmx:afterSwap', function (e) {
+      var t = e.detail && e.detail.target;
+      if (!t || !openIds) { openIds = null; return; }
+      bookDetails(t).forEach(function (el) {
+        if (openIds.indexOf(el.getAttribute('data-book-id')) !== -1) { el.open = true; }
+      });
+      openIds = null;
     });
   })();
 </script>
