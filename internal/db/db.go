@@ -2219,15 +2219,23 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 	// by 0-or-1 (transcripts.job_id and run_metrics.job_id are both unique per
 	// job), so the status COUNTs are unaffected.
 	//
-	// Sort=="activity" orders by most-recently-updated first so the pipeline
-	// activity feed surfaces the books that changed most recently.  The default
-	// (empty or any other value) keeps the library's transcribed-first order.
-	orderBy := `ORDER BY (done::float8 / NULLIF(total, 0)) DESC NULLS LAST,
+	// Sort is validated against an allow-list and mapped to a fixed ORDER BY
+	// literal — same validate-then-map pattern as statusHaving above, so no
+	// caller-supplied value is ever interpolated into the SQL. "activity" orders
+	// most-recently-updated first (the pipeline activity feed); the default
+	// keeps the library's transcribed-first order. An unknown value fails loudly
+	// rather than silently defaulting.
+	var orderBy string
+	switch f.Sort {
+	case "", "default":
+		orderBy = `ORDER BY (done::float8 / NULLIF(total, 0)) DESC NULLS LAST,
 		         done DESC,
 		         last_updated DESC,
 		         book_dir`
-	if f.Sort == "activity" {
+	case "activity":
 		orderBy = `ORDER BY last_updated DESC, book_dir`
+	default:
+		return nil, 0, fmt.Errorf("invalid sort filter: %q", f.Sort)
 	}
 	query := fmt.Sprintf(`
 		WITH books AS (

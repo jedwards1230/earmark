@@ -1748,7 +1748,13 @@ func (s *MCPServer) buildActivityFeed(ctx context.Context) []activityBook {
 
 	out := make([]activityBook, 0, len(summaries))
 	for _, b := range summaries {
-		bookMeta, _ := s.meta.Lookup(ctx, b.SamplePath, b.SamplePath)
+		bookMeta, err := s.meta.Lookup(ctx, b.SamplePath, b.SamplePath)
+		if err != nil {
+			// Non-fatal: the template falls back to rendering b.Dir when Title is
+			// empty. Log at debug so metadata issues are diagnosable without
+			// breaking the feed.
+			s.logger.Debug("activity feed: meta lookup error", "dir", b.Dir, "error", err)
+		}
 		pct := 0
 		if b.Total > 0 {
 			pct = b.Done * 100 / b.Total
