@@ -34,16 +34,24 @@ func TestValidPageSize(t *testing.T) {
 func TestCompactNum(t *testing.T) {
 	// Below 1M stays exact (comma form); 1M+ abbreviates with a trailing .0 trimmed.
 	cases := map[int64]string{
-		0:             "0",
-		999:           "999",
-		10_460:        "10,460",
-		999_999:       "999,999",
-		1_000_000:     "1M",
-		1_050_000:     "1.1M", // rounds to one decimal
-		13_389_338:    "13.4M",
-		14_826_533:    "14.8M",
-		2_000_000_000: "2B",
-		-14_826_533:   "-14.8M",
+		0:                 "0",
+		999:               "999",
+		10_460:            "10,460",
+		999_999:           "999,999", // just under 1M → exact
+		-999_999:          "-999,999",
+		1_000_000:         "1M",   // exact M boundary
+		-1_000_000:        "-1M",  // negative M boundary
+		1_040_000:         "1M",   // rounds down (1.04 → 1.0 → trimmed)
+		1_050_000:         "1.1M", // rounds up to one decimal
+		13_389_338:        "13.4M",
+		14_826_533:        "14.8M",
+		-14_826_533:       "-14.8M",
+		999_999_999:       "1B", // rounding-overflow boundary: escalate, not "1000M"
+		-999_999_999:      "-1B",
+		1_000_000_000:     "1B", // exact B boundary
+		999_999_999_999:   "1T", // escalates B → T
+		1_000_000_000_000: "1T", // exact T boundary
+		2_000_000_000:     "2B",
 	}
 	for in, want := range cases {
 		if got := compactNum64(in); got != want {
