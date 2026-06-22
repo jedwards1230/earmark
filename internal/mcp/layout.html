@@ -522,5 +522,31 @@
 <main>
 {{block "content" .}}{{end}}
 </main>
+<script>
+  // Preserve scroll position of .table-wrap containers across htmx swaps.
+  // The 3s poll swaps #data-region's innerHTML, recreating the wrappers and
+  // resetting scrollLeft to 0 mid-scroll — jarring on wide horizontally-scrolled
+  // tables. Keyed by position within the swap target, so any .table-wrap in a
+  // polled fragment is covered with no per-table markup.
+  (function () {
+    var saved = null;
+    function wraps(target) { return target.querySelectorAll('.table-wrap'); }
+    document.body.addEventListener('htmx:beforeSwap', function (e) {
+      var t = e.detail && e.detail.target;
+      if (!t) return;
+      saved = [];
+      wraps(t).forEach(function (el) { saved.push([el.scrollLeft, el.scrollTop]); });
+    });
+    document.body.addEventListener('htmx:afterSwap', function (e) {
+      var t = e.detail && e.detail.target;
+      if (!t || !saved) { saved = null; return; }
+      wraps(t).forEach(function (el, i) {
+        var s = saved[i];
+        if (s) { el.scrollLeft = s[0]; el.scrollTop = s[1]; }
+      });
+      saved = null;
+    });
+  })();
+</script>
 </body>
 </html>
