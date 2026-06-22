@@ -35,6 +35,8 @@ type SimpleMockDB struct {
 	setRunLimErr    error      // if set, SetRunLimit returns it
 	embedBacklog    int        // EmbedBacklog reported by GetServiceStatus
 	lastEmbedAt     *time.Time // LastEmbedAt reported by GetServiceStatus (nil → never embedded)
+	booksTotal      int        // BooksTotal reported by GetServiceStatus
+	booksFullyDone  int        // BooksFullyDone reported by GetServiceStatus
 	lastBookDir     string     // last dir passed to GetBookTracks
 	lastSearchDir   string     // last dir passed to TextSearchInBook
 	lastSearchQuery string     // last query passed to TextSearchInBook
@@ -286,21 +288,23 @@ func (m *SimpleMockDB) GetServiceStatus(_ context.Context) (*db.QueueStats, erro
 	now := time.Now().UTC()
 	runnerID := "asr-runner-test"
 	return &db.QueueStats{
-		Pending:       2,
-		Claimed:       1,
-		Done:          10,
-		Failed:        0,
-		Transcripts:   10,
-		Chunks:        450,
-		EmbedBacklog:  m.embedBacklog,
-		LastEmbedAt:   m.lastEmbedAt,
-		TotalJobs:     13,
-		DoneLastHour:  3,
-		Paused:        m.paused,
-		RunLimit:      m.runLimit,
-		RunnerActive:  true,
-		RunnerID:      runnerID,
-		LastHeartbeat: &now,
+		Pending:        2,
+		Claimed:        1,
+		Done:           10,
+		Failed:         0,
+		Transcripts:    10,
+		Chunks:         450,
+		EmbedBacklog:   m.embedBacklog,
+		LastEmbedAt:    m.lastEmbedAt,
+		BooksTotal:     m.booksTotal,
+		BooksFullyDone: m.booksFullyDone,
+		TotalJobs:      13,
+		DoneLastHour:   3,
+		Paused:         m.paused,
+		RunLimit:       m.runLimit,
+		RunnerActive:   true,
+		RunnerID:       runnerID,
+		LastHeartbeat:  &now,
 	}, nil
 }
 

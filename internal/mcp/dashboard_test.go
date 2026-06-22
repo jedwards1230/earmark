@@ -121,6 +121,46 @@ func TestPipelineStateDerivation(t *testing.T) {
 	}
 }
 
+// TestEmbedStallBoundary documents the trend-aware embed-stall logic
+// deterministically (fixed `now`, so no wall-clock flakiness): a stall needs a
+// backlog at/over the threshold AND no embed progress for longer than
+// embedStallWindow. The window boundary is strict `>` — exactly embedStallWindow
+// with no progress is still within grace (no stall).
+func TestEmbedStallBoundary(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	stale := 30 * time.Minute
+	mk := func(backlog int, lastEmbed *time.Time) statusData {
+		return newStatusData(&db.QueueStats{EmbedBacklog: backlog, LastEmbedAt: lastEmbed}, nil, now, stale, "", nil)
+	}
+
+	old := now.Add(-2 * time.Hour)
+	if mk(embedStallThreshold-1, &old).EmbedStall {
+		t.Error("below threshold must not stall, even with no recent embed")
+	}
+
+	recent := now.Add(-1 * time.Minute)
+	if mk(embedStallThreshold, &recent).EmbedStall {
+		t.Error("recent embed must not stall (normal catch-up)")
+	}
+
+	// Exactly at the window: strict `>` means this is still grace, NOT a stall.
+	atWindow := now.Add(-embedStallWindow)
+	if mk(embedStallThreshold, &atWindow).EmbedStall {
+		t.Errorf("exactly at the %v window must NOT stall (boundary is strict >)", embedStallWindow)
+	}
+
+	// Just past the window → genuine stall.
+	pastWindow := now.Add(-embedStallWindow - time.Second)
+	if !mk(embedStallThreshold, &pastWindow).EmbedStall {
+		t.Errorf("just past the %v window must stall", embedStallWindow)
+	}
+
+	// Never embedded (nil) with a backlog → stall.
+	if !mk(embedStallThreshold, nil).EmbedStall {
+		t.Error("nil LastEmbedAt with a backlog must stall")
+	}
+}
+
 // TestStatusFragmentRendersIdleNotRunning is the regression guard for the
 // reported contradiction: an enabled pipeline with no live runner must render
 // IDLE (not "RUNNING — claiming jobs").
