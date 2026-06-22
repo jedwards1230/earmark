@@ -753,16 +753,44 @@ func (d demoDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]db.BookS
 			if b.Failed == 0 {
 				continue
 			}
+		case "queued":
+			// Books with remaining work: at least one pending or claimed track.
+			if b.Pending == 0 && b.Claimed == 0 {
+				continue
+			}
 		}
 		filtered = append(filtered, b)
 	}
-	// Mirror the real query's ORDER BY. For Sort=="activity" order by most-recently
-	// updated first (activity feed). Default: transcribed-first order.
-	if f.Sort == "activity" {
+	// Mirror the real query's ORDER BY for each sort mode.
+	switch f.Sort {
+	case "activity":
+		// Most-recently-updated first (activity feed).
 		sort.SliceStable(filtered, func(i, j int) bool {
 			return filtered[i].LastUpdated.After(filtered[j].LastUpdated)
 		})
-	} else {
+	case "queue":
+		// Active-first: (claimed>0) DESC, claimed DESC, pending DESC,
+		// last_updated ASC (longest-waiting first), book_dir.
+		sort.SliceStable(filtered, func(i, j int) bool {
+			bi, bj := filtered[i], filtered[j]
+			iActive := bi.Claimed > 0
+			jActive := bj.Claimed > 0
+			if iActive != jActive {
+				return iActive // active first
+			}
+			if bi.Claimed != bj.Claimed {
+				return bi.Claimed > bj.Claimed
+			}
+			if bi.Pending != bj.Pending {
+				return bi.Pending > bj.Pending
+			}
+			if !bi.LastUpdated.Equal(bj.LastUpdated) {
+				return bi.LastUpdated.Before(bj.LastUpdated) // oldest first
+			}
+			return bi.Dir < bj.Dir
+		})
+	default:
+		// Default: transcribed-first order.
 		sort.SliceStable(filtered, func(i, j int) bool {
 			ri, rj := doneRatio(filtered[i]), doneRatio(filtered[j])
 			if ri != rj {

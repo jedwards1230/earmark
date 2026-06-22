@@ -681,6 +681,61 @@ func TestGetBookSummariesSortFilter(t *testing.T) {
 	}
 }
 
+// TestGetBookSummariesQueuedStatus asserts that Status="queued" generates the
+// correct HAVING clause (books with pending OR claimed tracks) and that an
+// invalid status is rejected, consistent with the existing status filter tests.
+func TestGetBookSummariesQueuedStatus(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(bookSummaryColumns)
+	// The HAVING clause for status=queued must include both pending and claimed.
+	mock.ExpectQuery(`HAVING COUNT\(\*\) FILTER \(WHERE j\.status IN \('pending','claimed'\)\) > 0`).
+		WithArgs("", 20, 0).WillReturnRows(rows)
+
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Status: "queued"}); err != nil {
+		t.Fatalf("getBookSummaries(queued): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestGetBookSummariesQueueSort asserts Sort="queue" is accepted and maps to the
+// active-first ORDER BY: (claimed>0) DESC, claimed DESC, pending DESC,
+// last_updated ASC, book_dir. An unknown sort is still rejected.
+func TestGetBookSummariesQueueSort(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(bookSummaryColumns)
+	// Sort=queue must order by active-first: claimed>0 books lead.
+	mock.ExpectQuery(`ORDER BY \(claimed > 0\) DESC, claimed DESC, pending DESC, last_updated ASC, book_dir`).
+		WithArgs("", 20, 0).WillReturnRows(rows)
+
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Sort: "queue"}); err != nil {
+		t.Fatalf("getBookSummaries(queue): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+
+	// An invalid sort is still rejected before any query runs.
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Sort: "bogus2"}); err == nil {
+		t.Error("expected error for invalid sort filter")
+	}
+}
+
 // TestGetLibraryTotals drives getLibraryTotals at execution level: it asserts the
 // whole-library book counts (total / fully-transcribed / with-pending) scan into
 // the right fields and the ILIKE filter arg is passed through.

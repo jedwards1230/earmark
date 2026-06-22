@@ -2171,7 +2171,10 @@ type BookSummary struct {
 
 // BookFilter narrows and paginates GetBookSummaries.
 type BookFilter struct {
-	Status string // "", "pending", "claimed", "done", "failed" — books having ≥1 track in this status
+	// Status filters to books that have at least one track in the given status.
+	// Valid values: "", "pending", "claimed", "done", "failed", "queued".
+	// "queued" matches books with at least one pending OR claimed track (remaining work).
+	Status string
 	Query  string // case-insensitive substring match on file_path (author/title/track)
 	Limit  int    // page size (defaulted if ≤ 0)
 	Offset int    // page offset
@@ -2179,6 +2182,8 @@ type BookFilter struct {
 	// order (done-ratio desc, done count desc, last_updated desc, book_dir).
 	// "activity" orders by most-recently-updated first (last_updated DESC, book_dir)
 	// so the activity feed surfaces the books that changed most recently.
+	// "queue" orders by active-first: (claimed>0) DESC, claimed DESC, pending DESC,
+	// last_updated ASC, book_dir — putting actively-transcribing books at the top.
 	Sort string
 }
 
@@ -2205,6 +2210,9 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 	case "pending", "claimed", "done", "failed":
 		statusHaving = fmt.Sprintf(
 			"HAVING COUNT(*) FILTER (WHERE j.status = '%s') > 0", f.Status)
+	case "queued":
+		// Books with remaining work: at least one track that is pending or claimed.
+		statusHaving = "HAVING COUNT(*) FILTER (WHERE j.status IN ('pending','claimed')) > 0"
 	default:
 		return nil, 0, fmt.Errorf("invalid status filter: %q", f.Status)
 	}
@@ -2234,6 +2242,11 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 		         book_dir`
 	case "activity":
 		orderBy = `ORDER BY last_updated DESC, book_dir`
+	case "queue":
+		// Active books (claimed > 0) first, then most-claimed, then most-pending,
+		// then longest-waiting (oldest last_updated first), then stable book_dir.
+		// This puts actively-transcribing books at the top of the queue view.
+		orderBy = `ORDER BY (claimed > 0) DESC, claimed DESC, pending DESC, last_updated ASC, book_dir`
 	default:
 		return nil, 0, fmt.Errorf("invalid sort filter: %q", f.Sort)
 	}

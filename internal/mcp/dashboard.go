@@ -290,6 +290,57 @@ var failedFragmentTmpl = template.Must(template.New("failed").Funcs(tmplFuncs).P
 // ─── Status fragment (Overview) ──────────────────────────────────────────────
 
 var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).Parse(`
+{{- /* bookRow renders a single book row in the activity feed or queue section.
+       It takes an activityBook as its data. Defined once here and called from
+       both the Queue loop and the Recent Activity loop to avoid duplicating
+       ~45 lines of markup. */ -}}
+{{define "bookRow"}}
+<details class="activity-book" data-book-id="{{.Dir}}">
+  <summary class="activity-summary">
+    <span class="activity-title">{{if .Title}}{{.Title}}{{else}}{{.Dir}}{{end}}{{if .Author}}<span class="activity-author time-muted"> · {{.Author}}</span>{{end}}</span>
+    <span class="activity-counters">
+      <span class="activity-tracks">{{commafy .Done}} / {{commafy .Total}} tracks done</span>
+      {{if gt .Claimed 0}}<span class="badge claimed"> · {{commafy .Claimed}} transcribing</span>{{end}}
+      {{if gt .Failed 0}}<span class="badge failed"> · {{commafy .Failed}} failed</span>{{end}}
+    </span>
+    <span class="activity-bar-wrap" title="{{.DonePct}}% done">
+      <span class="progress activity-bar"><span class="progress-bar{{if gt .Failed 0}} has-failed{{end}}" style="width:{{.DonePct}}%"></span></span>
+    </span>
+    <span class="time-muted activity-time" title="{{formatTime .LastUpdated}}">{{relTime .LastUpdated}}</span>
+  </summary>
+  <div class="activity-tracks-body">
+    {{if .Tracks}}
+    <div class="table-wrap">
+    <table>
+      <caption>Tracks for {{if .Title}}{{.Title}}{{else}}{{.Dir}}{{end}}</caption>
+      <thead><tr>
+        <th scope="col">Track</th>
+        <th scope="col">Status</th>
+        <th scope="col" class="num" title="audio duration">Duration</th>
+        <th scope="col" class="num" title="transcription wall-clock time (runner)">Proc</th>
+        <th scope="col" class="num" title="embedded chunks">Chunks</th>
+        <th scope="col">Updated</th>
+      </tr></thead>
+      <tbody>
+      {{range .Tracks}}
+        <tr>
+          <td><a class="file-name" href="/track?id={{.ID}}" title="{{.FilePath}}">{{.ShortName}}</a></td>
+          <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
+          <td class="time-muted">{{durTime .DurationSeconds}}</td>
+          <td class="time-muted">{{procTime .ProcessingSeconds}}</td>
+          <td class="time-muted">{{commafyPtr .EmbedChunkCount}}</td>
+          <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    </div>
+    {{else}}<p class="lib-empty">No tracks found.</p>{{end}}
+    <div class="activity-book-link"><a href="/book?dir={{.Dir}}">Open book &rarr;</a></div>
+  </div>
+</details>
+{{end}}
+
 <div class="updated">updated {{.RenderedAt}}</div>
 
 <!-- unified pipeline state: combines the pause flag AND runner liveness into one
@@ -416,56 +467,40 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 </div>
 {{end}}
 
+<!-- Queue section: the PRIMARY section showing books with remaining work, ordered
+     active-first. This is the forward-looking view of what is in the pipeline. -->
 <div class="section">
-  <div class="section-title">Recent Activity (last {{len .ActivityBooks}} books)</div>
+  {{- $queueLen := len .QueueBooks -}}
+  {{- $queuePending := 0 -}}
+  {{- $queueClaimed := 0 -}}
+  {{- range .QueueBooks -}}
+    {{- $queuePending = add $queuePending .Pending -}}
+    {{- $queueClaimed = add $queueClaimed .Claimed -}}
+  {{- end -}}
+  <div class="section-title">Queue
+    <span class="section-meta"> · {{commafy $queueLen}} book{{if ne $queueLen 1}}s{{end}}
+    {{- if gt $queuePending 0}} · {{commafy $queuePending}} track{{if ne $queuePending 1}}s{{end}} pending{{end -}}
+    {{- if gt $queueClaimed 0}} · {{commafy $queueClaimed}} transcribing{{end -}}
+    </span>
+  </div>
+  {{if .QueueBooks}}
+  <div class="activity-feed">
+  {{range .QueueBooks}}{{template "bookRow" .}}{{end}}
+  </div>
+  {{if gt .QueueTotalBooks $queueLen}}
+  <p class="lib-empty queue-truncated">+ {{commafy (sub .QueueTotalBooks $queueLen)}} more queued (showing first {{commafy $queueLen}})</p>
+  {{end}}
+  {{else}}<p class="lib-empty">Queue is empty — all caught up.</p>{{end}}
+</div>
+
+<!-- Recent Activity section: SECONDARY subsection showing recently-updated books
+     that are NOT already in the queue above (deduped). Shows recently finished
+     books and other recent changes. -->
+<div class="section section-secondary">
+  <div class="section-title section-title-secondary">Recent Activity (last {{len .ActivityBooks}} books)</div>
   {{if .ActivityBooks}}
   <div class="activity-feed">
-  {{range .ActivityBooks}}
-  <details class="activity-book" data-book-id="{{.Dir}}">
-    <summary class="activity-summary">
-      <span class="activity-title">{{if .Title}}{{.Title}}{{else}}{{.Dir}}{{end}}{{if .Author}}<span class="activity-author time-muted"> · {{.Author}}</span>{{end}}</span>
-      <span class="activity-counters">
-        <span class="activity-tracks">{{commafy .Done}} / {{commafy .Total}} tracks done</span>
-        {{if gt .Claimed 0}}<span class="badge claimed"> · {{commafy .Claimed}} transcribing</span>{{end}}
-        {{if gt .Failed 0}}<span class="badge failed"> · {{commafy .Failed}} failed</span>{{end}}
-      </span>
-      <span class="activity-bar-wrap" title="{{.DonePct}}% done">
-        <span class="progress activity-bar"><span class="progress-bar{{if gt .Failed 0}} has-failed{{end}}" style="width:{{.DonePct}}%"></span></span>
-      </span>
-      <span class="time-muted activity-time" title="{{formatTime .LastUpdated}}">{{relTime .LastUpdated}}</span>
-    </summary>
-    <div class="activity-tracks-body">
-      {{if .Tracks}}
-      <div class="table-wrap">
-      <table>
-        <caption>Tracks for {{if .Title}}{{.Title}}{{else}}{{.Dir}}{{end}}</caption>
-        <thead><tr>
-          <th scope="col">Track</th>
-          <th scope="col">Status</th>
-          <th scope="col" class="num" title="audio duration">Duration</th>
-          <th scope="col" class="num" title="transcription wall-clock time (runner)">Proc</th>
-          <th scope="col" class="num" title="embedded chunks">Chunks</th>
-          <th scope="col">Updated</th>
-        </tr></thead>
-        <tbody>
-        {{range .Tracks}}
-          <tr>
-            <td><a class="file-name" href="/track?id={{.ID}}" title="{{.FilePath}}">{{.ShortName}}</a></td>
-            <td><span class="badge {{.Status}}">{{statusBadge .Status}}</span></td>
-            <td class="time-muted">{{durTime .DurationSeconds}}</td>
-            <td class="time-muted">{{procTime .ProcessingSeconds}}</td>
-            <td class="time-muted">{{commafyPtr .EmbedChunkCount}}</td>
-            <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
-          </tr>
-        {{end}}
-        </tbody>
-      </table>
-      </div>
-      {{else}}<p class="lib-empty">No tracks found.</p>{{end}}
-      <div class="activity-book-link"><a href="/book?dir={{.Dir}}">Open book &rarr;</a></div>
-    </div>
-  </details>
-  {{end}}
+  {{range .ActivityBooks}}{{template "bookRow" .}}{{end}}
   </div>
   {{else}}<p class="lib-empty">No activity yet.</p>{{end}}
 </div>
@@ -998,13 +1033,28 @@ type activityBook struct {
 // activity feed (bounded N+1: one GetBookTracks call per book).
 const activityBookFeedLimit = 12
 
+// queueBookFeedLimit is the maximum number of books shown in the queue section
+// (bounded N+1: one GetBookTracks call per book).
+const queueBookFeedLimit = 20
+
 type statusData struct {
 	Stats *db.QueueStats
 	Jobs  []db.RecentJob
 
-	// ActivityBooks is the book-grouped activity feed replacing the flat Jobs
-	// table. It holds up to activityBookFeedLimit books ordered by most-recently
-	// updated, each carrying their per-track list for inline expansion.
+	// QueueBooks is the forward-looking queue section (primary). It holds up to
+	// queueBookFeedLimit books that have remaining work (pending or claimed tracks),
+	// ordered by active-first (claimed > 0, then most-claimed, then most-pending,
+	// then longest-waiting). This is the primary focus of the Pipeline page.
+	QueueBooks []activityBook
+
+	// QueueTotalBooks is the total number of books in the queue (from the DB count),
+	// used to detect truncation when len(QueueBooks) < QueueTotalBooks.
+	QueueTotalBooks int
+
+	// ActivityBooks is the book-grouped activity feed (secondary subsection). It
+	// holds up to activityBookFeedLimit books ordered by most-recently updated,
+	// excluding books already shown in QueueBooks (so it reads as "recently
+	// finished / other recent changes" rather than duplicating the live queue).
 	ActivityBooks []activityBook
 
 	RenderedAt string
@@ -1754,12 +1804,11 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 	data.RunBudgetText = runBudgetText(stats.RunLimit)
 	data.ControlEnabled = s.controlToken != ""
 
-	// Build the book-grouped activity feed. Fetch the most-recently-active books
-	// (Sort="activity", Limit=activityBookFeedLimit), then fetch per-book tracks.
-	// Bounded N+1: at most activityBookFeedLimit GetBookTracks calls per fragment
-	// render (capped at 12). A read error degrades the feed to empty rather than
-	// failing the whole fragment — the cards above remain accurate.
-	data.ActivityBooks = s.buildActivityFeed(ctx)
+	// Build the queue and activity feeds. The queue is built first (primary section);
+	// the activity feed then excludes books already in the queue to avoid duplication.
+	// Both are best-effort: errors degrade to empty rather than failing the fragment.
+	data.QueueBooks, data.QueueTotalBooks = s.buildQueueFeed(ctx)
+	data.ActivityBooks = s.buildActivityFeed(ctx, data.QueueBooks)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -1768,10 +1817,35 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// buildQueueFeed fetches books with remaining work (pending or claimed tracks)
+// ordered active-first (claimed > 0 first, then most-claimed, most-pending,
+// longest-waiting). Returns the book rows and the total DB count of queued books
+// (which may exceed queueBookFeedLimit, surfacing truncation in the UI).
+// It is best-effort: errors are logged and degrade the feed to empty.
+func (s *MCPServer) buildQueueFeed(ctx context.Context) ([]activityBook, int) {
+	summaries, total, err := s.db.GetBookSummaries(ctx, db.BookFilter{
+		Status: "queued", Sort: "queue", Limit: queueBookFeedLimit,
+	})
+	if err != nil {
+		s.logger.Error("queue feed: GetBookSummaries error", "error", err)
+		return nil, 0
+	}
+	out := s.buildActivityBooks(ctx, summaries, "queue feed")
+	return out, total
+}
+
 // buildActivityFeed fetches the most-recently-updated books and their tracks for
-// the pipeline page's book-grouped activity feed. It is best-effort: errors are
-// logged and degrade the feed to empty rather than failing the fragment.
-func (s *MCPServer) buildActivityFeed(ctx context.Context) []activityBook {
+// the pipeline page's book-grouped activity feed. Books already present in the
+// queue feed (passed as queueBooks) are excluded so the two sections do not
+// repeat the same books. It is best-effort: errors are logged and degrade the
+// feed to empty rather than failing the fragment.
+func (s *MCPServer) buildActivityFeed(ctx context.Context, queueBooks []activityBook) []activityBook {
+	// Build a set of dirs already shown in the queue so we can exclude them.
+	queueDirs := make(map[string]struct{}, len(queueBooks))
+	for _, b := range queueBooks {
+		queueDirs[b.Dir] = struct{}{}
+	}
+
 	summaries, _, err := s.db.GetBookSummaries(ctx, db.BookFilter{
 		Sort: "activity", Limit: activityBookFeedLimit,
 	})
@@ -1780,6 +1854,21 @@ func (s *MCPServer) buildActivityFeed(ctx context.Context) []activityBook {
 		return nil
 	}
 
+	// Exclude books already in the queue section.
+	filtered := summaries[:0:0]
+	for _, b := range summaries {
+		if _, inQueue := queueDirs[b.Dir]; !inQueue {
+			filtered = append(filtered, b)
+		}
+	}
+	return s.buildActivityBooks(ctx, filtered, "activity feed")
+}
+
+// buildActivityBooks converts a slice of BookSummary into activityBook rows,
+// fetching per-book tracks and resolving metadata for each. label is used in
+// log messages to distinguish the caller (queue vs activity feed). It is
+// best-effort: per-book errors are logged but do not abort the whole slice.
+func (s *MCPServer) buildActivityBooks(ctx context.Context, summaries []db.BookSummary, label string) []activityBook {
 	out := make([]activityBook, 0, len(summaries))
 	for _, b := range summaries {
 		bookMeta, err := s.meta.Lookup(ctx, b.SamplePath, b.SamplePath)
@@ -1787,7 +1876,7 @@ func (s *MCPServer) buildActivityFeed(ctx context.Context) []activityBook {
 			// Non-fatal: the template falls back to rendering b.Dir when Title is
 			// empty. Log at debug so metadata issues are diagnosable without
 			// breaking the feed.
-			s.logger.Debug("activity feed: meta lookup error", "dir", b.Dir, "error", err)
+			s.logger.Debug(label+": meta lookup error", "dir", b.Dir, "error", err)
 		}
 		pct := 0
 		if b.Total > 0 {
@@ -1803,7 +1892,7 @@ func (s *MCPServer) buildActivityFeed(ctx context.Context) []activityBook {
 		// Fetch per-book tracks for the inline expansion body.
 		tracks, terr := s.db.GetBookTracks(ctx, b.Dir)
 		if terr != nil {
-			s.logger.Error("activity feed: GetBookTracks error", "dir", b.Dir, "error", terr)
+			s.logger.Error(label+": GetBookTracks error", "dir", b.Dir, "error", terr)
 		}
 		ab.Tracks = make([]activityTrack, 0, len(tracks))
 		for _, t := range tracks {
