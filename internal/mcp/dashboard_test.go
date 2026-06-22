@@ -10,6 +10,27 @@ import (
 	"github.com/jedwards1230/earmark/internal/db"
 )
 
+func TestValidPageSize(t *testing.T) {
+	// In-set values pass through; empty/malformed/out-of-set fall back to the default.
+	cases := map[string]int{
+		"":      libraryPageSize, // unset → default
+		"20":    20,
+		"50":    50,
+		"100":   100,
+		"200":   200,
+		"35":    libraryPageSize, // not in the allow-list
+		"500":   libraryPageSize, // above the max
+		"abc":   libraryPageSize, // malformed
+		"-50":   libraryPageSize, // negative
+		" 100 ": 100,             // trimmed
+	}
+	for in, want := range cases {
+		if got := validPageSize(in); got != want {
+			t.Errorf("validPageSize(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
 func TestCommafy(t *testing.T) {
 	cases := map[int]string{0: "0", 42: "42", 1000: "1,000", 18452: "18,452", 1234567: "1,234,567", -2500: "-2,500"}
 	for in, want := range cases {

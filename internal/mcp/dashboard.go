@@ -33,8 +33,14 @@ var htmxJS = func() []byte {
 	return b
 }()
 
-// libraryPageSize is the number of books per page in the library list.
+// libraryPageSize is the DEFAULT number of books per page in the library list.
+// The reader can raise it via the ?per= selector to one of libraryPageSizes.
 const libraryPageSize = 20
+
+// libraryPageSizes are the selectable library page sizes (the ?per= allow-list),
+// letting the reader expand the list in chunks up to 200. The first entry is the
+// default; any ?per= value outside this set falls back to libraryPageSize.
+var libraryPageSizes = []int{20, 50, 100, 200}
 
 // segmentPageSize is the number of transcript segments rendered per page in the
 // track-detail reader; beyond this an htmx "load more" button appends the next
@@ -477,7 +483,7 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
     {{if .HasFindings}}<input type="hidden" name="findings" value="1">{{end}}
     <input type="search" name="q" value="{{.Query}}" placeholder="search author / title / track…" autocomplete="off">
     <button type="submit" class="btn">search</button>
-    {{if or .Query .Status}}<a class="lib-clear" hx-get="/library/data?sort={{.Sort}}{{if .HasFindings}}&findings=1{{end}}" hx-target="#library-region" hx-swap="innerHTML">clear</a>{{end}}
+    {{if or .Query .Status}}<a class="lib-clear" hx-get="/library/data?sort={{.Sort}}{{if .HasFindings}}&findings=1{{end}}{{if ne .PageSize 20}}&per={{.PageSize}}{{end}}" hx-target="#library-region" hx-swap="innerHTML">clear</a>{{end}}
   </form>
   <div class="lib-chips">
     <a class="chip{{if eq .Status ""}} active{{end}}"        hx-get="/library/data?q={{.QueryEscaped}}{{.FilterParams}}"                hx-target="#library-region" hx-swap="innerHTML">all</a>
@@ -487,15 +493,15 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
     <a class="chip{{if eq .Status "failed"}} active{{end}}"  hx-get="/library/data?status=failed&q={{.QueryEscaped}}{{.FilterParams}}"  hx-target="#library-region" hx-swap="innerHTML">failed</a>
     <span class="chip-sep">·</span>
     <a class="chip chip-findings{{if .HasFindings}} active{{end}}" title="show only books with recorded findings"
-       hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if not .HasFindings}}&findings=1{{end}}{{if ne .Sort "recent"}}&sort={{.Sort}}{{end}}"
+       hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if not .HasFindings}}&findings=1{{end}}{{if ne .Sort "recent"}}&sort={{.Sort}}{{end}}{{if ne .PageSize 20}}&per={{.PageSize}}{{end}}"
        hx-target="#library-region" hx-swap="innerHTML">&#9873; has findings</a>
   </div>
   <div class="lib-sort">
     <span class="lib-sort-label">sort</span>
-    <a class="chip{{if eq .Sort "recent"}} active{{end}}"   hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}"             hx-target="#library-region" hx-swap="innerHTML">recent</a>
-    <a class="chip{{if eq .Sort "title"}} active{{end}}"    hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=title"    hx-target="#library-region" hx-swap="innerHTML">title</a>
-    <a class="chip{{if eq .Sort "progress"}} active{{end}}" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=progress" hx-target="#library-region" hx-swap="innerHTML">progress</a>
-    <a class="chip{{if eq .Sort "findings"}} active{{end}}" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=findings" hx-target="#library-region" hx-swap="innerHTML">findings</a>
+    <a class="chip{{if eq .Sort "recent"}} active{{end}}"   hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}{{if ne .PageSize 20}}&per={{.PageSize}}{{end}}"             hx-target="#library-region" hx-swap="innerHTML">recent</a>
+    <a class="chip{{if eq .Sort "title"}} active{{end}}"    hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=title{{if ne .PageSize 20}}&per={{.PageSize}}{{end}}"    hx-target="#library-region" hx-swap="innerHTML">title</a>
+    <a class="chip{{if eq .Sort "progress"}} active{{end}}" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=progress{{if ne .PageSize 20}}&per={{.PageSize}}{{end}}" hx-target="#library-region" hx-swap="innerHTML">progress</a>
+    <a class="chip{{if eq .Sort "findings"}} active{{end}}" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{if .HasFindings}}&findings=1{{end}}&sort=findings{{if ne .PageSize 20}}&per={{.PageSize}}{{end}}" hx-target="#library-region" hx-swap="innerHTML">findings</a>
   </div>
 </div>
 
@@ -506,6 +512,12 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
   {{else}}
   <a class="lib-clear" hx-get="/library/data?status={{.Status}}&q={{.QueryEscaped}}{{.FilterParams}}&cols=more" hx-target="#library-region" hx-swap="innerHTML">+&nbsp;more columns (duration · words · chunks)</a>
   {{end}}
+  <span class="lib-pagesize" title="books per page">
+    <span class="lib-sort-label">show</span>
+    {{range $sz := .PageSizes}}
+    <a class="chip{{if eq $.PageSize $sz}} active{{end}}" hx-get="/library/data?status={{$.Status}}&q={{$.QueryEscaped}}{{if $.HasFindings}}&findings=1{{end}}{{if ne $.Sort "recent"}}&sort={{$.Sort}}{{end}}{{if ne $sz 20}}&per={{$sz}}{{end}}" hx-target="#library-region" hx-swap="innerHTML">{{$sz}}</a>
+    {{end}}
+  </span>
 </div>
 <div class="table-wrap">
 <table>
@@ -1094,6 +1106,10 @@ type libraryData struct {
 	HasNext      bool
 	PrevOffset   int
 	NextOffset   int
+	// PageSize is the active per-page count (one of PageSizes); PageSizes are the
+	// selectable options rendered as the "show N" control.
+	PageSize  int
+	PageSizes []int
 
 	// Sort is the active sort mode ("recent"|"title"|"progress"|"findings");
 	// HasFindings is the ⚑ has-findings filter chip state. Both are threaded
@@ -1553,6 +1569,21 @@ func validSort(s string) string {
 	}
 }
 
+// validPageSize maps the ?per= query param to one of libraryPageSizes, falling
+// back to the default (libraryPageSize) for empty/malformed/out-of-set values.
+// Pagination is a UI control, not an API, so a bad value degrades to the default
+// rather than erroring.
+func validPageSize(s string) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+		for _, allowed := range libraryPageSizes {
+			if n == allowed {
+				return n
+			}
+		}
+	}
+	return libraryPageSize
+}
+
 // isTruthy parses a checkbox/flag query param ("1"/"true"/"on"/"yes") to a bool.
 func isTruthy(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -1625,6 +1656,9 @@ func (s *MCPServer) handleLibraryPage(w http.ResponseWriter, r *http.Request) {
 	}
 	if isTruthy(r.URL.Query().Get("findings")) {
 		vals.Set("findings", "1")
+	}
+	if ps := validPageSize(r.URL.Query().Get("per")); ps != libraryPageSize {
+		vals.Set("per", strconv.Itoa(ps))
 	}
 	dataQuery := ""
 	if enc := vals.Encode(); enc != "" {
@@ -1806,6 +1840,9 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 			offset = n
 		}
 	}
+	// pageSize is the reader-selectable list length (?per=), validated against
+	// libraryPageSizes with the default as the fallback.
+	pageSize := validPageSize(r.URL.Query().Get("per"))
 
 	// All-in-Go sort/filter (D1): fetch the FULL status/query-filtered book set in
 	// one pass (up to the defensive cap), then merge findings, apply the
@@ -1869,23 +1906,24 @@ func (s *MCPServer) handleLibraryData(w http.ResponseWriter, r *http.Request) {
 	if offset > filteredTotal {
 		offset = filteredTotal
 	}
-	end := offset + libraryPageSize
+	end := offset + pageSize
 	if end > filteredTotal {
 		end = filteredTotal
 	}
 	pageRows := rows[offset:end]
 
-	totalPages := (filteredTotal + libraryPageSize - 1) / libraryPageSize
+	totalPages := (filteredTotal + pageSize - 1) / pageSize
 	if totalPages < 1 {
 		totalPages = 1
 	}
 	data := libraryData{
 		Books: pageRows, Status: status, Query: query, QueryEscaped: url.QueryEscape(query),
 		Sort: sort, HasFindings: hasFindings, MoreCols: r.URL.Query().Get("cols") == "more",
-		FilterParams: libraryFilterParams(sort, hasFindings),
-		Page:         offset/libraryPageSize + 1, TotalPages: totalPages, TotalBooks: filteredTotal,
+		FilterParams: libraryFilterParams(sort, hasFindings, pageSize),
+		Page:         offset/pageSize + 1, TotalPages: totalPages, TotalBooks: filteredTotal,
+		PageSize: pageSize, PageSizes: libraryPageSizes,
 		HasPrev: offset > 0, HasNext: end < filteredTotal,
-		PrevOffset: max(0, offset-libraryPageSize), NextOffset: offset + libraryPageSize,
+		PrevOffset: max(0, offset-pageSize), NextOffset: offset + pageSize,
 	}
 
 	// Home status-overview band: only on the unfiltered first page (the "is it
@@ -2062,7 +2100,7 @@ func doneFrac(b bookRow) float64 {
 // Returns template.URL since it is interpolated into an href that already has a
 // leading "?…"; both components are fixed allow-listed tokens (no user text), so
 // this is not an injection vector.
-func libraryFilterParams(sort string, hasFindings bool) template.URL {
+func libraryFilterParams(sort string, hasFindings bool, pageSize int) template.URL {
 	var b strings.Builder
 	if sort != "recent" {
 		b.WriteString("&sort=")
@@ -2071,9 +2109,14 @@ func libraryFilterParams(sort string, hasFindings bool) template.URL {
 	if hasFindings {
 		b.WriteString("&findings=1")
 	}
+	if pageSize != libraryPageSize {
+		b.WriteString("&per=")
+		b.WriteString(strconv.Itoa(pageSize))
+	}
 	// #nosec G203 -- sort is constrained to a fixed allow-list by validSort
-	// (recent/title/progress/findings) and findings is a fixed flag; the string
-	// contains no user-controlled input, so the unescaped template.URL is safe.
+	// (recent/title/progress/findings), findings is a fixed flag, and pageSize is
+	// validated against libraryPageSizes by validPageSize; the string contains no
+	// user-controlled input, so the unescaped template.URL is safe.
 	return template.URL(b.String())
 }
 
