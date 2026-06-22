@@ -31,6 +31,27 @@ func TestValidPageSize(t *testing.T) {
 	}
 }
 
+func TestCompactNum(t *testing.T) {
+	// Below 1M stays exact (comma form); 1M+ abbreviates with a trailing .0 trimmed.
+	cases := map[int64]string{
+		0:             "0",
+		999:           "999",
+		10_460:        "10,460",
+		999_999:       "999,999",
+		1_000_000:     "1M",
+		1_050_000:     "1.1M", // rounds to one decimal
+		13_389_338:    "13.4M",
+		14_826_533:    "14.8M",
+		2_000_000_000: "2B",
+		-14_826_533:   "-14.8M",
+	}
+	for in, want := range cases {
+		if got := compactNum64(in); got != want {
+			t.Errorf("compactNum64(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestCommafy(t *testing.T) {
 	cases := map[int]string{0: "0", 42: "42", 1000: "1,000", 18452: "18,452", 1234567: "1,234,567", -2500: "-2,500"}
 	for in, want := range cases {
