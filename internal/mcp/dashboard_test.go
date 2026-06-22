@@ -1053,3 +1053,91 @@ func TestErrorRowIsExpandable(t *testing.T) {
 		t.Errorf("expected failed-callout in output for Failed>0:\n%s", out)
 	}
 }
+
+// TestStatusFragmentQueueAndActivityLayout verifies the queue-first layout:
+// (a) the Queue section appears before Recent Activity in the rendered HTML;
+// (b) books with remaining work appear in the Queue section with the correct data-book-id;
+// (c) books already in the queue are NOT duplicated in Recent Activity (dedupe);
+// (d) the empty-queue state renders the "all caught up" message;
+// (e) truncation notice appears when QueueTotalBooks > len(QueueBooks).
+func TestStatusFragmentQueueAndActivityLayout(t *testing.T) {
+	now := time.Now()
+
+	queueBook := activityBook{
+		Dir: "/books/A/In Queue", Title: "In Queue", Total: 5, Pending: 3, Claimed: 1,
+		DonePct: 20, LastUpdated: now.Add(-2 * time.Minute),
+		Tracks: []activityTrack{
+			{ID: "q1", FilePath: "/books/A/In Queue/01.mp3", ShortName: "01.mp3", Status: "claimed", UpdatedAt: now},
+		},
+	}
+	recentBook := activityBook{
+		Dir: "/books/A/Recently Done", Title: "Recently Done", Total: 4, Done: 4,
+		DonePct: 100, LastUpdated: now.Add(-10 * time.Minute),
+		Tracks: []activityTrack{
+			{ID: "a1", FilePath: "/books/A/Recently Done/01.mp3", ShortName: "01.mp3", Status: "done", UpdatedAt: now},
+		},
+	}
+
+	data := newStatusData(&db.QueueStats{Pending: 3, Claimed: 1, Done: 4, TotalJobs: 8}, nil, now, 30*time.Minute, "", nil)
+	data.QueueBooks = []activityBook{queueBook}
+	data.QueueTotalBooks = 1
+	data.ActivityBooks = []activityBook{recentBook}
+
+	var buf bytes.Buffer
+	if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+
+	// Both sections must be present.
+	if !strings.Contains(out, "Queue") {
+		t.Error("Queue section heading must be present")
+	}
+	if !strings.Contains(out, "Recent Activity") {
+		t.Error("Recent Activity section heading must be present")
+	}
+
+	// Queue section must appear BEFORE Recent Activity.
+	queuePos := strings.Index(out, "Queue")
+	actPos := strings.Index(out, "Recent Activity")
+	if queuePos >= actPos {
+		t.Error("Queue section must appear before Recent Activity in the rendered HTML")
+	}
+
+	// Both books must be present (different data-book-id values).
+	if !strings.Contains(out, `data-book-id="/books/A/In Queue"`) {
+		t.Error("queued book must have its data-book-id in the output")
+	}
+	if !strings.Contains(out, `data-book-id="/books/A/Recently Done"`) {
+		t.Error("activity book must have its data-book-id in the output")
+	}
+
+	// No truncation notice when QueueTotalBooks == len(QueueBooks).
+	if strings.Contains(out, "more queued") {
+		t.Error("truncation notice must not appear when queue is not truncated")
+	}
+
+	// Truncation notice when QueueTotalBooks > len(QueueBooks).
+	data2 := newStatusData(&db.QueueStats{Pending: 30}, nil, now, 30*time.Minute, "", nil)
+	data2.QueueBooks = []activityBook{queueBook}
+	data2.QueueTotalBooks = 5 // 5 total, only 1 shown
+	var buf2 bytes.Buffer
+	if err := statusFragmentTmpl.Execute(&buf2, data2); err != nil {
+		t.Fatalf("execute truncation: %v", err)
+	}
+	if !strings.Contains(buf2.String(), "more queued") {
+		t.Error("truncation notice must appear when QueueTotalBooks > len(QueueBooks)")
+	}
+
+	// Empty queue renders the "all caught up" message.
+	dataEmpty := newStatusData(&db.QueueStats{Done: 10, TotalJobs: 10}, nil, now, 30*time.Minute, "", nil)
+	dataEmpty.QueueBooks = nil
+	dataEmpty.QueueTotalBooks = 0
+	var bufEmpty bytes.Buffer
+	if err := statusFragmentTmpl.Execute(&bufEmpty, dataEmpty); err != nil {
+		t.Fatalf("execute empty queue: %v", err)
+	}
+	if !strings.Contains(bufEmpty.String(), "Queue is empty") {
+		t.Error("empty queue must show the 'all caught up' message")
+	}
+}

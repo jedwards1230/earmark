@@ -102,9 +102,12 @@ func (m *SimpleMockDB) GetBookSummaries(_ context.Context, f db.BookFilter) ([]d
 		{Dir: "/books/Author Two/Book B", Title: "Book B", Author: "Author Two",
 			Total: 2, Done: 2, LastUpdated: time.Now().UTC().Add(-time.Hour)},
 	}
-	// Honor the status filter minimally so the filter path is exercised in tests.
-	if f.Status == "pending" {
-		books = books[:1]
+	// Honor status filters minimally so the filter paths are exercised in tests.
+	switch f.Status {
+	case "pending":
+		books = books[:1] // only Book A has pending tracks
+	case "queued":
+		books = books[:1] // only Book A has pending/claimed tracks (remaining work)
 	}
 	return books, len(books), nil
 }
