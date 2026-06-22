@@ -128,6 +128,15 @@ var tmplFuncs = template.FuncMap{
 		}
 		return commafy64(*n)
 	},
+	// compactNum / compactNum64Ptr abbreviate millions+ (14.8M) so big stat-card
+	// values don't overflow; pair with commafy in a title for the exact value.
+	"compactNum": compactNum,
+	"compactNum64Ptr": func(n *int64) string {
+		if n == nil {
+			return "—"
+		}
+		return compactNum64(*n)
+	},
 	// timestamp renders a float seconds offset as mm:ss (or h:mm:ss past an hour)
 	// for the transcript reader and chunk list.
 	"timestamp": timestamp,
@@ -421,11 +430,11 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 <div class="card-group">
   <div class="group-label">embedding</div>
   <div class="grid">
-    <div class="card"><div class="card-label">Chunks</div><div class="card-value">{{commafy .Stats.Chunks}}</div></div>
+    <div class="card"><div class="card-label">Chunks</div><div class="card-value" title="{{commafy .Stats.Chunks}}" aria-label="{{commafy .Stats.Chunks}} chunks">{{compactNum .Stats.Chunks}}</div></div>
     <div class="card" title="completed transcripts not yet embedded (worker backlog)">
       <div class="card-label">Unembedded</div><div class="card-value{{if .EmbedStall}} amber{{end}}">{{commafy .Stats.EmbedBacklog}}</div></div>
     <div class="card" title="total embedding tokens (local tokenizer) across all embedded runs">
-      <div class="card-label">Embed tokens</div><div class="card-value purple">{{commafy64Ptr .Stats.TotalEmbedTokens}}</div></div>
+      <div class="card-label">Embed tokens</div><div class="card-value purple" title="{{commafy64Ptr .Stats.TotalEmbedTokens}}" aria-label="{{commafy64Ptr .Stats.TotalEmbedTokens}} embed tokens">{{compactNum64Ptr .Stats.TotalEmbedTokens}}</div></div>
   </div>
 </div>
 
@@ -445,7 +454,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
     <div class="card" title="total audio duration across all indexed transcripts">
       <div class="card-label">Duration indexed</div><div class="card-value">{{durTime .Stats.TotalDurationSeconds}}</div></div>
     <div class="card" title="total transcript words across all indexed transcripts">
-      <div class="card-label">Words indexed</div><div class="card-value">{{commafy64Ptr .Stats.TotalWords}}</div></div>
+      <div class="card-label">Words indexed</div><div class="card-value" title="{{commafy64Ptr .Stats.TotalWords}}" aria-label="{{commafy64Ptr .Stats.TotalWords}} words indexed">{{compactNum64Ptr .Stats.TotalWords}}</div></div>
     <div class="card" title="book directories whose every track is done, out of all books">
       <div class="card-label">Books complete</div><div class="card-value green">{{commafy .Stats.BooksFullyDone}}{{if .Stats.BooksTotal}} <span class="card-denom">/ {{commafy .Stats.BooksTotal}}</span>{{end}}</div></div>
   </div>
@@ -1480,6 +1489,40 @@ func commafy64(n int64) string {
 	}
 	return b.String()
 }
+
+// compactNum64 renders large magnitudes compactly so wide stat-card values
+// don't overflow their cards: below 1,000,000 it keeps the exact comma form;
+// at/above 1M it abbreviates to one decimal with a M/B/T suffix (e.g.
+// 14,826,533 → "14.8M", 13,000,000 → "13M"). Templates surface the exact value
+// in a tooltip alongside it.
+func compactNum64(n int64) string {
+	// Below 1M (either sign) keep the exact comma form.
+	if n > -1_000_000 && n < 1_000_000 {
+		return commafy64(n)
+	}
+	// Work in float64 to avoid the int64 abs overflow at math.MinInt64.
+	f := float64(n)
+	neg := f < 0
+	if neg {
+		f = -f
+	}
+	// Escalate to the next unit when one-decimal rounding would otherwise hit
+	// 1000 of the current unit (e.g. 999,999,999 must read "1B", not "1000M").
+	units := []string{"M", "B", "T"} // 1e6, 1e9, 1e12
+	div := 1e6
+	i := 0
+	for i < len(units)-1 && f/div >= 999.95 {
+		div *= 1000
+		i++
+	}
+	s := strings.TrimSuffix(strconv.FormatFloat(f/div, 'f', 1, 64), ".0") // 13.0M → 13M
+	if neg {
+		s = "-" + s
+	}
+	return s + units[i]
+}
+
+func compactNum(n int) string { return compactNum64(int64(n)) }
 
 // humanizeETA renders a rough remaining-time estimate from a count of hours.
 func humanizeETA(hours float64) string {
