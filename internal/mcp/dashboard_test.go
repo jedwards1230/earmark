@@ -90,13 +90,28 @@ func TestPipelineStateDerivation(t *testing.T) {
 		t.Errorf("stale runner with work = (%q,%q), want (STALLED,red)", d.StateLabel, d.DotClass)
 	}
 
-	// Not paused, no runner ever seen → IDLE "no runner connected".
+	// Not paused, no active runner, but work IS queued → IDLE; the line must
+	// describe the queued-but-not-claiming situation and point to Servers, NOT
+	// assert "no runner connected" (which contradicts the Servers page's live
+	// gpu-arbiter connectivity — this path only knows claim activity).
 	d = newStatusData(&db.QueueStats{Pending: 4069}, nil, now, stale, "", nil)
 	if d.StateLabel != "IDLE" || d.DotClass != "blue" {
-		t.Errorf("no-runner = (%q,%q), want (IDLE,blue)", d.StateLabel, d.DotClass)
+		t.Errorf("queued-no-runner = (%q,%q), want (IDLE,blue)", d.StateLabel, d.DotClass)
 	}
-	if !strings.Contains(d.SubText, "no runner") {
-		t.Errorf("no-runner SubText = %q, want it to mention no runner", d.SubText)
+	if !strings.Contains(d.SubText, "queued") || !strings.Contains(d.SubText, "Servers") {
+		t.Errorf("queued-no-runner SubText = %q, want it to mention queued work + Servers", d.SubText)
+	}
+	if strings.Contains(d.SubText, "no runner") {
+		t.Errorf("queued-no-runner SubText = %q, must NOT assert connectivity it cannot know", d.SubText)
+	}
+
+	// Not paused, no active runner, queue drained → IDLE, benign.
+	d = newStatusData(&db.QueueStats{Pending: 0}, nil, now, stale, "", nil)
+	if d.StateLabel != "IDLE" || d.DotClass != "blue" {
+		t.Errorf("drained = (%q,%q), want (IDLE,blue)", d.StateLabel, d.DotClass)
+	}
+	if !strings.Contains(d.SubText, "drained") {
+		t.Errorf("drained SubText = %q, want it to mention drained", d.SubText)
 	}
 
 	// Paused wins regardless of runner liveness.
