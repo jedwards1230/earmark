@@ -1501,6 +1501,12 @@ type QueueStats struct {
 	// down or model missing), which is otherwise invisible because the job rows
 	// stay 'done' and never flip to 'failed'.
 	EmbedBacklog int
+	// LastEmbedAt is the newest transcript_chunks.created_at — i.e. when the
+	// worker last finished embedding a transcript. Paired with EmbedBacklog it
+	// distinguishes a genuine stall (backlog high AND no embed in a while) from
+	// normal catch-up (backlog high but embeds still landing). nil when nothing
+	// has been embedded yet.
+	LastEmbedAt *time.Time
 	// TotalJobs is Pending+Claimed+Done+Failed — the full backlog denominator.
 	TotalJobs int
 	// DoneLastHour is the number of jobs whose row entered 'done' in the last
@@ -1549,11 +1555,16 @@ type QueueStats struct {
 	// Library-wide totals over indexed content (the overview "library" card).
 	// TotalDurationSeconds sums transcripts.duration_seconds across every
 	// transcript; TotalWords sums run_metrics.word_count; BooksFullyDone counts
-	// book directories whose every track job is 'done'. The first two are nil
-	// when nothing is transcribed/metered yet.
+	// book directories whose every track job is 'done'; BooksTotal is the total
+	// distinct book directories (the denominator for BooksFullyDone). The first
+	// two are nil when nothing is transcribed/metered yet.
+	//
+	// A "book" is a directory of track jobs — job/track counts (Pending/Done/…)
+	// are per audio file, so BooksTotal/BooksFullyDone are the book-level rollup.
 	TotalDurationSeconds *float64
 	TotalWords           *int64
 	BooksFullyDone       int
+	BooksTotal           int
 }
 
 // GetServiceStatus returns a single aggregate snapshot used by the status
@@ -1598,8 +1609,9 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		return nil, fmt.Errorf("transcript count: %w", err)
 	}
 
-	// Chunk count.
-	if err := db.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transcript_chunks`).Scan(&q.Chunks); err != nil {
+	// Chunk count + last embed time (newest chunk written). MAX(created_at) is
+	// NULL on an empty table, scanned into the nilable LastEmbedAt.
+	if err := db.pool.QueryRow(ctx, `SELECT COUNT(*), MAX(created_at) FROM transcript_chunks`).Scan(&q.Chunks, &q.LastEmbedAt); err != nil {
 		return nil, fmt.Errorf("chunk count: %w", err)
 	}
 
@@ -1728,8 +1740,10 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		     FROM transcription_jobs
 		     GROUP BY book_dir
 		     HAVING COUNT(*) FILTER (WHERE status <> 'done') = 0
-		   ) fully_done)
-	`).Scan(&q.TotalDurationSeconds, &q.TotalWords, &q.BooksFullyDone); err != nil {
+		   ) fully_done),
+		  (SELECT COUNT(DISTINCT regexp_replace(file_path, '/[^/]+$', ''))
+		     FROM transcription_jobs)
+	`).Scan(&q.TotalDurationSeconds, &q.TotalWords, &q.BooksFullyDone, &q.BooksTotal); err != nil {
 		return nil, fmt.Errorf("library totals: %w", err)
 	}
 
