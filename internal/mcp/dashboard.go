@@ -565,7 +565,7 @@ var libraryFragmentTmpl = template.Must(template.New("library").Funcs(tmplFuncs)
   {{if and (not .FailedBooks) (gt .HighFindings 0)}}
   <div class="ov-attn attn-soft">
     <span class="ov-attn-ico" aria-hidden="true">&#9873;</span>
-    <span>{{commafy .HighFindings}} high-confidence finding{{if ne .HighFindings 1}}s{{end}} unreviewed. <a href="/findings">Open the worklist &#8250;</a></span>
+    <span>{{commafy .HighFindings}} high-confidence finding{{if ne .HighFindings 1}}s{{end}} flagged by the eval judge (advisory). <a href="/findings">View findings &#8250;</a></span>
   </div>
   {{end}}
 </section>
