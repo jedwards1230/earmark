@@ -170,6 +170,10 @@
     font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.08em;
     color: var(--muted); margin-bottom: 8px;
   }
+  /* unit qualifier on a group label, e.g. "transcription · per track" */
+  .group-unit { text-transform: none; letter-spacing: 0; color: var(--text-2); font-weight: 400; }
+  /* denominator on a card value, e.g. "30 / 210" — de-emphasized vs the count */
+  .card-denom { color: var(--text-2); font-weight: 400; font-size: var(--fs-md); }
   .card {
     background: var(--surface-1); border: 1px solid var(--border);
     border-radius: 8px; padding: 14px 16px;

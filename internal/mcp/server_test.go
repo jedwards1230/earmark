@@ -22,21 +22,22 @@ import (
 // pingErr controls whether Ping returns an error (nil = healthy).
 type SimpleMockDB struct {
 	pingErr         error
-	requeueErr      error  // if set, RequeueByID/RequeueFailed return it
-	requeuedID      string // last id passed to RequeueByID
-	requeuedDir     string // last dir passed to RequeueByDir
-	retriedFailed   bool   // RequeueFailed was called
-	paused          bool   // current pause flag (mutated by SetPaused)
-	pausedSetTo     *bool  // last value passed to SetPaused
-	setPausedErr    error  // if set, SetPaused returns it
-	runLimit        *int   // current run_limit (mutated by SetRunLimit)
-	runLimitSetTo   *int   // last value passed to SetRunLimit (heap copy)
-	runLimitSet     bool   // SetRunLimit was called
-	setRunLimErr    error  // if set, SetRunLimit returns it
-	embedBacklog    int    // EmbedBacklog reported by GetServiceStatus
-	lastBookDir     string // last dir passed to GetBookTracks
-	lastSearchDir   string // last dir passed to TextSearchInBook
-	lastSearchQuery string // last query passed to TextSearchInBook
+	requeueErr      error      // if set, RequeueByID/RequeueFailed return it
+	requeuedID      string     // last id passed to RequeueByID
+	requeuedDir     string     // last dir passed to RequeueByDir
+	retriedFailed   bool       // RequeueFailed was called
+	paused          bool       // current pause flag (mutated by SetPaused)
+	pausedSetTo     *bool      // last value passed to SetPaused
+	setPausedErr    error      // if set, SetPaused returns it
+	runLimit        *int       // current run_limit (mutated by SetRunLimit)
+	runLimitSetTo   *int       // last value passed to SetRunLimit (heap copy)
+	runLimitSet     bool       // SetRunLimit was called
+	setRunLimErr    error      // if set, SetRunLimit returns it
+	embedBacklog    int        // EmbedBacklog reported by GetServiceStatus
+	lastEmbedAt     *time.Time // LastEmbedAt reported by GetServiceStatus (nil → never embedded)
+	lastBookDir     string     // last dir passed to GetBookTracks
+	lastSearchDir   string     // last dir passed to TextSearchInBook
+	lastSearchQuery string     // last query passed to TextSearchInBook
 
 	clearFindingsCalled bool   // ClearFindings was called
 	clearFindingsDir    string // last dir passed to ClearFindings
@@ -292,6 +293,7 @@ func (m *SimpleMockDB) GetServiceStatus(_ context.Context) (*db.QueueStats, erro
 		Transcripts:   10,
 		Chunks:        450,
 		EmbedBacklog:  m.embedBacklog,
+		LastEmbedAt:   m.lastEmbedAt,
 		TotalJobs:     13,
 		DoneLastHour:  3,
 		Paused:        m.paused,
@@ -810,13 +812,34 @@ func TestEmbedStallWarning(t *testing.T) {
 		t.Error("did not expect a stall callout below threshold")
 	}
 
-	// At/above threshold: callout appears.
+	// At/above threshold with NO embed ever (nil LastEmbedAt): callout appears.
 	h = buildTestMux(&SimpleMockDB{embedBacklog: embedStallThreshold})
 	req = httptest.NewRequest(http.MethodGet, "/status/data", nil)
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if !strings.Contains(w.Body.String(), "stall-callout") {
-		t.Errorf("expected a stall callout at/above threshold:\n%s", w.Body.String())
+		t.Errorf("expected a stall callout at/above threshold with no embed activity:\n%s", w.Body.String())
+	}
+
+	// Above threshold but embeds are STILL LANDING (recent LastEmbedAt): this is
+	// normal eval/embed catch-up, NOT a stall — no callout.
+	recent := time.Now().Add(-1 * time.Minute)
+	h = buildTestMux(&SimpleMockDB{embedBacklog: embedStallThreshold + 50, lastEmbedAt: &recent})
+	req = httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), "stall-callout") {
+		t.Error("recent embed activity must NOT raise a stall callout (normal catch-up)")
+	}
+
+	// Above threshold AND no embed for longer than the window: genuine stall.
+	old := time.Now().Add(-embedStallWindow - time.Minute)
+	h = buildTestMux(&SimpleMockDB{embedBacklog: embedStallThreshold, lastEmbedAt: &old})
+	req = httptest.NewRequest(http.MethodGet, "/status/data", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), "stall-callout") {
+		t.Errorf("expected a stall callout when embeds stopped for >%v:\n%s", embedStallWindow, w.Body.String())
 	}
 }
 

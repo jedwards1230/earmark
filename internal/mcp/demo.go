@@ -542,46 +542,49 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		q = &db.QueueStats{}
 	case "stale":
 		hb := now.Add(-2 * time.Hour) // older than the 30m stale window
+		emb := now.Add(-2 * time.Hour)
 		avg := 0.0
 		tok := int64(0)
 		libDur := 432000.0
 		libWords := int64(7_800_000)
 		q = &db.QueueStats{
 			Pending: 5, Claimed: 1, Done: 120, Failed: 0,
-			Transcripts: 120, Chunks: 7431, EmbedBacklog: 0,
+			Transcripts: 120, Chunks: 7431, EmbedBacklog: 0, LastEmbedAt: &emb,
 			TotalJobs: 126, DoneLastHour: 0, // stalled → no recent completions → ETA "—"
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			// run_metrics exist but predate this stall; avg over zero-duration → "—".
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
-			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 18,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 18, BooksTotal: 22,
 		}
 	case "failed":
 		hb := now.Add(-40 * time.Second)
+		emb := now.Add(-20 * time.Minute) // no embed for 20m + backlog → genuine stall
 		avg := 624.0
 		tok := int64(2_140_500)
 		libDur := 295200.0
 		libWords := int64(4_120_000)
 		q = &db.QueueStats{
 			Pending: 3, Claimed: 1, Done: 88, Failed: 7,
-			Transcripts: 88, Chunks: 5120, EmbedBacklog: 14, // large → exercises the stall warning
+			Transcripts: 88, Chunks: 5120, EmbedBacklog: 14, LastEmbedAt: &emb, // backlog + stale embed → exercises the stall warning
 			TotalJobs: 99, DoneLastHour: 4,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
-			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 12,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 12, BooksTotal: 15,
 		}
 	default: // active
 		hb := now.Add(-12 * time.Second)
+		emb := now.Add(-30 * time.Second) // embeds landing → backlog is normal catch-up, no stall
 		avg := 487.5
 		tok := int64(6_820_400)
 		libDur := 1_188_000.0
 		libWords := int64(12_400_000)
 		q = &db.QueueStats{
 			Pending: 42, Claimed: 1, Done: 317, Failed: 2,
-			Transcripts: 317, Chunks: 18452, EmbedBacklog: 3,
+			Transcripts: 317, Chunks: 18452, EmbedBacklog: 3, LastEmbedAt: &emb,
 			TotalJobs: 362, DoneLastHour: 22,
 			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
-			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 41,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 41, BooksTotal: 52,
 		}
 	}
 	q.Paused = d.isPaused()

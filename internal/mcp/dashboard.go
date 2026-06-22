@@ -41,17 +41,26 @@ const libraryPageSize = 20
 // page (P7), so a multi-thousand-segment transcript doesn't render all at once.
 const segmentPageSize = 30
 
-// embedStallThreshold is the embed backlog above which the dashboard warns that
-// embeddings are not draining. A few transcripts always sit briefly between
-// transcription and the worker's 30s embed poll, so a small backlog is normal;
-// a sustained large one means Ollama is down or the model isn't pulled.
+// embedStallThreshold is the embed backlog above which the dashboard *considers*
+// warning. A few transcripts always sit briefly between transcription and the
+// worker's embed poll, so a small backlog is normal. NOTE: crossing this alone is
+// NOT a stall — with in-pipeline eval enabled the worker runs the eval judge
+// before embedding, so an active run legitimately builds a transient backlog that
+// drains on its own. A real stall ALSO requires no embed progress for
+// embedStallWindow (see newStatusData / EmbedStall).
 const embedStallThreshold = 10
+
+// embedStallWindow is how long the embed worker must make NO progress (no new
+// chunk written) — while a backlog exists — before the dashboard calls it a
+// genuine stall rather than normal eval/embed catch-up.
+const embedStallWindow = 10 * time.Minute
 
 // tmplFuncs are shared across every dashboard template.
 var tmplFuncs = template.FuncMap{
-	"shortName":  func(fp string) string { return path.Base(fp) },
-	"relTime":    func(t time.Time) string { return humanizeSince(time.Since(t)) },
-	"formatTime": func(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05 UTC") },
+	"embedStallMins": func() int { return int(embedStallWindow.Minutes()) },
+	"shortName":      func(fp string) string { return path.Base(fp) },
+	"relTime":        func(t time.Time) string { return humanizeSince(time.Since(t)) },
+	"formatTime":     func(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05 UTC") },
 	"formatTimePtr": func(t *time.Time) string {
 		if t == nil {
 			return "—"
@@ -331,6 +340,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   <div class="op-bar"><div class="op-fill" style="width:{{.DonePct}}%"></div></div>
   <div class="op-meta">
     <span class="op-main">{{.ProgressText}}</span>
+    {{if .Stats.BooksTotal}}<span title="a book is a directory of tracks; track counts above are per audio file">{{commafy .Stats.BooksFullyDone}} / {{commafy .Stats.BooksTotal}} books</span>{{end}}
     <span>{{.ThroughputText}}</span>
     <span>{{.ETAText}}</span>
   </div>
@@ -338,16 +348,16 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 {{end}}
 
 <div class="card-group">
-  <div class="group-label">transcription</div>
+  <div class="group-label">transcription <span class="group-unit">· per track (audio file)</span></div>
   <div class="grid">
-    <a class="card card-click" href="/library?status=pending" title="show pending books">
-      <div class="card-label">Pending</div><div class="card-value blue">{{commafy .Stats.Pending}}</div></a>
-    <a class="card card-click" href="/library?status=claimed" title="show books being transcribed">
+    <a class="card card-click" href="/library?status=pending" title="tracks pending — opens the books that contain them">
+      <div class="card-label">Pending tracks</div><div class="card-value blue">{{commafy .Stats.Pending}}</div></a>
+    <a class="card card-click" href="/library?status=claimed" title="tracks being transcribed — opens the books that contain them">
       <div class="card-label">Transcribing</div><div class="card-value yellow">{{commafy .Stats.Claimed}}</div></a>
-    <a class="card card-click" href="/library?status=done" title="show completed books">
-      <div class="card-label">Done</div><div class="card-value green">{{commafy .Stats.Done}}</div></a>
-    <a class="card card-click" href="/library?status=failed" title="show books with failures">
-      <div class="card-label">Failed</div><div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{commafy .Stats.Failed}}</div></a>
+    <a class="card card-click" href="/library?status=done" title="tracks done — opens the books that contain them">
+      <div class="card-label">Done tracks</div><div class="card-value green">{{commafy .Stats.Done}}</div></a>
+    <a class="card card-click" href="/library?status=failed" title="tracks with failures — opens the books that contain them">
+      <div class="card-label">Failed tracks</div><div class="card-value{{if gt .Stats.Failed 0}} red{{end}}">{{commafy .Stats.Failed}}</div></a>
   </div>
 </div>
 
@@ -379,15 +389,15 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
       <div class="card-label">Duration indexed</div><div class="card-value">{{durTime .Stats.TotalDurationSeconds}}</div></div>
     <div class="card" title="total transcript words across all indexed transcripts">
       <div class="card-label">Words indexed</div><div class="card-value">{{commafy64Ptr .Stats.TotalWords}}</div></div>
-    <div class="card" title="book directories whose every track is done">
-      <div class="card-label">Books complete</div><div class="card-value green">{{commafy .Stats.BooksFullyDone}}</div></div>
+    <div class="card" title="book directories whose every track is done, out of all books">
+      <div class="card-label">Books complete</div><div class="card-value green">{{commafy .Stats.BooksFullyDone}}{{if .Stats.BooksTotal}} <span class="card-denom">/ {{commafy .Stats.BooksTotal}}</span>{{end}}</div></div>
   </div>
 </div>
 
 {{if .EmbedStall}}
 <div class="stall-callout">
-  &#9888;&#xFE0F;&nbsp;{{commafy .Stats.EmbedBacklog}} completed transcripts are waiting to be embedded and not draining.
-  Embedding (not transcription) is stalled — check Ollama{{if .EmbedURL}} at {{.EmbedURL}}{{end}} and that the embeddings model is pulled.
+  &#9888;&#xFE0F;&nbsp;{{commafy .Stats.EmbedBacklog}} completed transcripts are waiting to be embedded and the worker has made no progress for {{embedStallMins}}+ min — this is a real stall, not normal catch-up.
+  Embedding (not transcription) is stuck. Check two things: (1) the embeddings endpoint — Ollama{{if .EmbedURL}} at {{.EmbedURL}}{{end}} reachable and the model pulled; and (2) if in-pipeline eval is enabled, the <strong>eval judge</strong>, which runs <em>before</em> embedding and shares the GPU — a wedged/slow judge blocks the queue too.
   Job rows stay <em>done</em> during an embed stall, so this is the only place it shows.
 </div>
 {{end}}
@@ -1136,14 +1146,21 @@ func newStatusData(stats *db.QueueStats, jobs []db.RecentJob, now time.Time, sta
 		Jobs:       jobs,
 		RenderedAt: now.UTC().Format("15:04:05 UTC"),
 		EmbedURL:   embedURL,
-		EmbedStall: stats.EmbedBacklog >= embedStallThreshold,
+		// A genuine embed stall = a real backlog AND the worker has written no new
+		// chunk for embedStallWindow. Crossing the threshold alone is normal during
+		// an active run (in-pipeline eval runs before embedding, so the backlog
+		// rides up and drains on its own). Only flag it when embeds have actually
+		// stopped landing — a nil LastEmbedAt with a backlog means nothing has ever
+		// embedded, which also counts as stalled.
+		EmbedStall: stats.EmbedBacklog >= embedStallThreshold &&
+			(stats.LastEmbedAt == nil || now.Sub(*stats.LastEmbedAt) > embedStallWindow),
 	}
 
 	// Backfill progress / throughput / ETA.
 	if stats.TotalJobs > 0 {
 		d.ShowProgress = true
 		d.DonePct = stats.Done * 100 / stats.TotalJobs
-		d.ProgressText = fmt.Sprintf("%s / %s (%d%%)", commafy(stats.Done), commafy(stats.TotalJobs), d.DonePct)
+		d.ProgressText = fmt.Sprintf("%s / %s tracks (%d%%)", commafy(stats.Done), commafy(stats.TotalJobs), d.DonePct)
 
 		if stats.DoneLastHour > 0 {
 			d.ThroughputText = fmt.Sprintf("~%s done in the last hour", commafy(stats.DoneLastHour))
