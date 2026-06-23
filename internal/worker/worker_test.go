@@ -96,7 +96,7 @@ func (f *fakeDB) completedCalls() int {
 	return f.getCompletedCalls
 }
 
-func (f *fakeDB) GetEmbeddings(texts []string) ([][]float32, error) {
+func (f *fakeDB) EmbedDocuments(texts []string) ([][]float32, error) {
 	if f.embedErr != nil {
 		return nil, f.embedErr
 	}
@@ -108,8 +108,8 @@ func (f *fakeDB) GetEmbeddings(texts []string) ([][]float32, error) {
 	return result, nil
 }
 
-func (f *fakeDB) GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error) {
-	vecs, err := f.GetEmbeddings(texts)
+func (f *fakeDB) EmbedDocumentsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error) {
+	vecs, err := f.EmbedDocuments(texts)
 	return vecs, f.usage, err
 }
 

@@ -128,6 +128,14 @@ CREATE INDEX transcript_chunks_text_trgm_idx
 **Vector dimension**: 768 (nomic-embed-text). Any model change requires a full
 re-embed and a column type migration.
 
+**Task-instruction prefixes**: `nomic-embed-text` requires task prefixes (see
+CONTRACT §2.3). Stored passages in this column are embedded with the
+`search_document: ` prefix; search queries use `search_query: `. The prefixes do
+not change the column shape (still `VECTOR(768)`), but they DO change the vector
+values — changing prefix behavior requires a full re-embed
+(`earmark requeue --reembed "" --yes`) for stored and query vectors to stay
+compatible.
+
 **Chunk size**: 512 tokens, 64-token overlap (Go tokenizer). Controlled by
 `CHUNK_SIZE` env var.
 

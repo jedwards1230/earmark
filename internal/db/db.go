@@ -836,15 +836,26 @@ func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 	return tx.Commit(ctx)
 }
 
-// GetEmbeddings delegates to the openai.Embeddings client.
-func (db *DB) GetEmbeddings(texts []string) ([][]float32, error) {
-	return db.e.GetEmbeddings(texts)
+// EmbedDocuments delegates to the openai.Embeddings client's DOCUMENT path —
+// passages stored/indexed in transcript_chunks.embedding. For nomic-embed-text
+// each input is prefixed with "search_document: ". Never use this for a search
+// query (use EmbedQuery) — the two embedding sides must diverge.
+func (db *DB) EmbedDocuments(texts []string) ([][]float32, error) {
+	return db.e.EmbedDocuments(texts)
 }
 
-// GetEmbeddingsWithUsage delegates to the openai.Embeddings client, also
-// returning the provider-reported token usage (which Ollama may leave zeroed).
-func (db *DB) GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error) {
-	return db.e.GetEmbeddingsWithUsage(texts)
+// EmbedDocumentsWithUsage is EmbedDocuments plus the provider-reported token
+// usage (which Ollama may leave zeroed).
+func (db *DB) EmbedDocumentsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error) {
+	return db.e.EmbedDocumentsWithUsage(texts)
+}
+
+// EmbedQuery delegates to the openai.Embeddings client's QUERY path — a single
+// search query embedded for semantic search. For nomic-embed-text the query is
+// prefixed with "search_query: ". Never use this to embed a stored passage (use
+// EmbedDocuments).
+func (db *DB) EmbedQuery(query string) ([]float32, error) {
+	return db.e.EmbedQuery(query)
 }
 
 // ─── Run metrics (per-run observability, CONTRACT §1.5) ──────────────────────
@@ -1081,14 +1092,11 @@ func (db *DB) GetBookChapters(ctx context.Context, bookDir string) ([]metaprovid
 
 // Search performs a vector-similarity search over transcript_chunks.
 func (db *DB) Search(ctx context.Context, query string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	vecs, err := db.e.GetEmbeddings([]string{query})
+	vec, err := db.e.EmbedQuery(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
-	if len(vecs) == 0 {
-		return nil, fmt.Errorf("no embedding returned for query")
-	}
-	return db.findSimilar(ctx, vecs[0], limit, threshold)
+	return db.findSimilar(ctx, vec, limit, threshold)
 }
 
 func (db *DB) findSimilar(ctx context.Context, vec []float32, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
@@ -1152,14 +1160,11 @@ var searchInBookSQL = `
 // book's chunks — see searchInBookSQL for why HNSW is bypassed here. dir must be
 // an exact book_dir as returned by GetBookSummaries.
 func (db *DB) SearchInBook(ctx context.Context, query, dir string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	vecs, err := db.e.GetEmbeddings([]string{query})
+	vec, err := db.e.EmbedQuery(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
-	if len(vecs) == 0 {
-		return nil, fmt.Errorf("no embedding returned for query")
-	}
-	return db.searchInBook(ctx, db.pool, vecs[0], dir, limit, threshold)
+	return db.searchInBook(ctx, db.pool, vec, dir, limit, threshold)
 }
 
 // searchInBook is the querier-parameterized core of SearchInBook, split out so

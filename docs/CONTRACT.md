@@ -766,6 +766,30 @@ The `nomic-embed-text` model produces 768-dimensional vectors and is already
 available in the cluster's Ollama instance. Any change to the model requires
 a full re-embedding of all chunks and a column type migration.
 
+#### Task-instruction prefixes (nomic-embed-text)
+
+`nomic-embed-text` is trained with **task-instruction prefixes** and runs in an
+undefined regime without them. The two sides of the pipeline MUST use different
+prefixes so stored vectors and query vectors land in the same learned space:
+
+| Side | Prefix | Where applied |
+|------|--------|---------------|
+| Document (stored/indexed passages → `transcript_chunks.embedding`) | `search_document: ` | `Embeddings.EmbedDocuments` (worker embed path) |
+| Query (search query string) | `search_query: ` | `Embeddings.EmbedQuery` (`Search` / `SearchInBook`) |
+
+Prefixing is **model-gated**: it applies only when the resolved embeddings model
+name contains `nomic` (case-insensitive). A model not trained with these prefixes
+(e.g. `bge-m3`) receives the text verbatim, since the wrong prefix would degrade
+retrieval. The document/query divergence is enforced in `internal/openai`
+(`EmbedDocuments` vs `EmbedQuery`) — these two methods MUST NOT collapse to one
+prefix.
+
+**Operational note**: changing whether/which prefixes are applied makes existing
+stored vectors incompatible with new query vectors. After deploying a prefix
+change, run a full re-embed (`earmark requeue --reembed "" --yes`); until then
+semantic search is *more* wrong (query prefixed, stored not), so the re-embed
+must accompany the rollout. Dimension is unchanged (768) — no schema migration.
+
 ### 2.4 Environment Variables (canonical names)
 
 All env var names are fixed. No synonyms, no alternatives.
