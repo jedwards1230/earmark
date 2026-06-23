@@ -1034,11 +1034,32 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 
 | Method | Path | Auth | Body | Result |
 |--------|------|------|------|--------|
-| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed — the AI endpoint registry with health probes, §2.14), and an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed) |
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed — the AI endpoint registry with health probes, §2.14), an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed), and a **`pipeline`** object (see below) |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
 | `DELETE` | `/api/v1/pipeline/run` | bearer | — | `200` clears the bounded run (`run_limit→NULL`) |
+
+**`pipeline` object** — a derived 3-stage lifecycle view (Transcribe → Eval → Embed) computed at read-time from already-fetched signals:
+
+```jsonc
+{
+  "activity":        "transcribing" | "evaluating" | "embedding" | "winding-down" | "idle" | "paused",
+  "phase":           "idle" | "transcribe" | "analyze",   // raw coordinator phase (§1.4)
+  "transcribeDone":  317,   // done tracks
+  "transcribeTotal": 362,   // all tracks
+  "evalCoverage":    0.88,  // fraction of done jobs judged (0..1); -1 when evalInPipeline=false
+  "evalInPipeline":  true,  // whether EVAL_IN_PIPELINE is enabled
+  "embedBacklog":    3,     // completed transcripts not yet embedded
+  "gpuCommitted":    true,  // pipeline currently owns the GPU (transcribing or evaluating)
+  "gpuProbed":       true,  // gpu-arbiter probe is configured and reachable
+  "fullyDone":       false  // all stages complete (pending==0 && claimed==0 && embedBacklog==0 && eval covered)
+}
+```
+
+`activity` precedence: `paused` → `transcribing` → `evaluating` → `embedding` → `winding-down` → `idle`.
+`evalCoverage == -1` means eval is not in-pipeline (not applicable). `winding-down` is the key state the original dashboard missed: transcribe queue drained but GPU still busy (eval / embed catch-up).
+No new DB queries — all fields are derived from signals already fetched by `/api/v1/status`.
 
 **Auth**: mutating endpoints require `Authorization: Bearer <CONTROL_API_TOKEN>`
 (constant-time compared). When `CONTROL_API_TOKEN` is unset they **fail closed**

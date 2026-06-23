@@ -210,21 +210,48 @@ func (demoEndpointProber) Probe(_ context.Context, baseURL, _ string) endpointPr
 }
 
 // demoGPUProber is a static gpuProber for the demo, routing by a sentinel in the
-// URL so the page renders ready / busy / offline without any network call.
-type demoGPUProber struct{}
+// URL so the page renders ready / busy / offline without any network call. The
+// scenario field tweaks the *primary* (ready) GPU's resident-model story so the
+// two pipeline-lifecycle states are visually checkable:
+//
+//	winddown — transcribe drained but the eval judge still owns the GPU: high
+//	           VRAM, parakeet + gemma3 both running ("active on GPU").
+//	idle     — fully done: GPU util 0 but ~29 GB VRAM still occupied with the
+//	           models resident-but-not-active ("idle · models resident").
+type demoGPUProber struct{ scenario string }
 
-func (demoGPUProber) Probe(_ context.Context, url string) arbiterStatus {
+func (p demoGPUProber) Probe(_ context.Context, url string) arbiterStatus {
 	ip := func(n int) *int { return &n }
 	bp := func(b bool) *bool { return &b }
 	switch {
 	case strings.Contains(url, "busy"):
 		return arbiterStatus{Reachable: true, State: "gaming", Claims: []string{"steam:413150"},
-			ASRRunning: bp(false), VRAMUsedMB: ip(7338), VRAMTotalMB: ip(32607)}
+			ASRRunning: bp(false), VRAMUsedMB: ip(7338), VRAMTotalMB: ip(32607),
+			ResidentUnits: []residentUnit{
+				{Unit: "asr-runner.service", Running: false},
+				{Unit: "ollama.service", Running: false},
+			}}
 	case strings.Contains(url, "offline"):
 		return arbiterStatus{Reachable: false}
-	default: // ready
-		return arbiterStatus{Reachable: true, State: "available",
-			ASRRunning: bp(true), VRAMUsedMB: ip(512), VRAMTotalMB: ip(32607)}
+	default: // ready — primary GPU; resident story varies by scenario
+		switch p.scenario {
+		case "idle":
+			// Fully done: GPU util 0, but ~29 GB VRAM is still occupied — the models
+			// are resident-but-not-active (the "why is 29 GB held while idle" answer).
+			return arbiterStatus{Reachable: true, State: "available",
+				ASRRunning: bp(false), VRAMUsedMB: ip(28800), VRAMTotalMB: ip(32607),
+				ResidentUnits: []residentUnit{
+					{Unit: "asr-runner.service", Running: false},
+					{Unit: "ollama.service", Running: false},
+				}}
+		default: // winddown / active — eval judge actively owns the GPU (high VRAM)
+			return arbiterStatus{Reachable: true, State: "available",
+				ASRRunning: bp(true), VRAMUsedMB: ip(29696), VRAMTotalMB: ip(32607),
+				ResidentUnits: []residentUnit{
+					{Unit: "asr-runner.service", Running: true},
+					{Unit: "ollama.service", Running: true},
+				}}
+		}
 	}
 }
 
@@ -300,6 +327,23 @@ func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, er
 			Hosts: []db.HostMetrics{
 				{Host: "gpu-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 120,
 					LastFinished: tp(now.Add(-2 * time.Hour)), AvgProcessingSeconds: fp(498.0)},
+			},
+		}, nil
+	case "winddown", "idle":
+		// Transcribe has drained — no live runner claim. Hosts still report their
+		// finished-job history so the Servers page stays populated, but the live
+		// transcribe block is empty (consistent with the Pipeline page's drained
+		// transcribe stage).
+		lastDone := now.Add(-1 * time.Minute)
+		if d.scenario == "idle" {
+			lastDone = now.Add(-4 * time.Minute)
+		}
+		return &db.ServerObservation{
+			Hosts: []db.HostMetrics{
+				{Host: "gpu-1", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 317,
+					LastFinished: tp(lastDone), AvgProcessingSeconds: fp(489.0)},
+				{Host: "gpu-2", ASRModel: &parakeet, ComputeType: &f16, JobsDone: 24,
+					LastFinished: tp(now.Add(-6 * time.Hour)), AvgProcessingSeconds: fp(902.0)},
 			},
 		}, nil
 	default: // active / failed
@@ -526,9 +570,11 @@ func (d demoDB) GetPipelinePhase(context.Context) (string, error) {
 	switch d.scenario {
 	case "active":
 		return db.PhaseTranscribe, nil
-	case "stale":
+	case "winddown", "stale":
+		// winddown: transcribe drained, the eval judge is mid-analyze on the GPU.
+		// stale: crashed runner left the coordinator parked in analyze.
 		return db.PhaseAnalyze, nil
-	default:
+	default: // idle, empty, failed, multibackend → idle
 		return db.PhaseIdle, nil
 	}
 }
@@ -571,7 +617,51 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 12, BooksTotal: 15,
 		}
-	default: // active
+	case "winddown":
+		// The incident state: transcribe drained (pending 0, claimed 0, done==total),
+		// but the eval judge is still on the GPU (phase=analyze, EvalCoverageDone <
+		// done) and the embed worker has a backlog. This is exactly the gap the
+		// original dashboard mislabeled "IDLE" — it must render "Winding down — GPU
+		// still working (eval)" + the `active on GPU` marker under the Eval stage.
+		hb := now.Add(-90 * time.Second)  // runner heartbeat recent enough to not be STALLED
+		emb := now.Add(-20 * time.Second) // embeds still landing → backlog is catch-up, no stall
+		avg := 491.0
+		tok := int64(6_900_000)
+		libDur := 1_188_000.0
+		libWords := int64(12_400_000)
+		q = &db.QueueStats{
+			Pending: 0, Claimed: 0, Done: 317, Failed: 2,
+			Transcripts: 317, Chunks: 18452, EmbedBacklog: 12, LastEmbedAt: &emb,
+			TotalJobs: 317, DoneLastHour: 31, // transcribe just drained
+			// 290 of 317 done tracks judged → ~91% eval coverage; the eval judge owns
+			// the GPU until this hits 100%, which is the "winding down" story.
+			EvalCoverageDone: 290,
+			RunnerActive:     true, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 50, BooksTotal: 52,
+		}
+	case "idle":
+		// The after-eval state: fully done (pending 0, claimed 0, EmbedBacklog 0,
+		// eval coverage 100%), phase idle, GPU util 0 — yet ~29 GB VRAM is still
+		// occupied with the models resident (see demoGPUProber idle case). Renders
+		// "Idle — safe to walk away" with the GPU card showing models resident.
+		hb := now.Add(-4 * time.Minute) // runner idle but recently seen
+		emb := now.Add(-3 * time.Minute)
+		avg := 488.0
+		tok := int64(7_010_000)
+		libDur := 1_188_000.0
+		libWords := int64(12_400_000)
+		q = &db.QueueStats{
+			Pending: 0, Claimed: 0, Done: 362, Failed: 2,
+			Transcripts: 362, Chunks: 21040, EmbedBacklog: 0, LastEmbedAt: &emb,
+			TotalJobs: 362, DoneLastHour: 0, // nothing left to do
+			// Eval coverage 100%: every done track has been judged → fullyDone.
+			EvalCoverageDone: 362,
+			RunnerActive:     false, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 52, BooksTotal: 52,
+		}
+	default: // active — transcribe running, eval coverage partial (winding-down-visible state)
 		hb := now.Add(-12 * time.Second)
 		emb := now.Add(-30 * time.Second) // embeds landing → backlog is normal catch-up, no stall
 		avg := 487.5
@@ -582,7 +672,11 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			Pending: 42, Claimed: 1, Done: 317, Failed: 2,
 			Transcripts: 317, Chunks: 18452, EmbedBacklog: 3, LastEmbedAt: &emb,
 			TotalJobs: 362, DoneLastHour: 22,
-			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			// EvalCoverageDone < Done: the eval judge has reviewed 280 of 317 done
+			// tracks, so eval coverage is ~88% — the lifecycle strip shows the gap
+			// and the "winding down" state is visible in demo once transcribe drains.
+			EvalCoverageDone: 280,
+			RunnerActive:     true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 41, BooksTotal: 52,
 		}
@@ -1039,6 +1133,9 @@ func StartDemoDashboard(addr string) error {
 		aiRoles = &config.AIRoles{Embeddings: "embed-1"} // no Eval binding
 		demoEvalToken = ""
 	}
+	// The active scenario enables EVAL_IN_PIPELINE so the lifecycle strip shows a
+	// realistic winding-down state (EvalCoverageDone < Done: 280 / 317 judged).
+	evalInPipeline := scenario != "empty"
 	cfg := &config.Config{
 		MCPHTTPAddr:        addr,
 		StaleJobTimeout:    30 * time.Minute,
@@ -1052,11 +1149,12 @@ func StartDemoDashboard(addr string) error {
 		ASRServers:      demoServersFor(scenario),
 		AIEndpoints:     demoAIEndpoints,
 		AIRoles:         aiRoles,
+		EvalInPipeline:  evalInPipeline,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	// Swap the real HTTP probers for the static demo ones so the readiness states
 	// render without any network call.
-	srv.prober = demoGPUProber{}
+	srv.prober = demoGPUProber{scenario: scenario}
 	srv.endpointProber = demoEndpointProber{}
 	// Swap the live chat client for a static fake judge so clicking "run eval"
 	// exercises the trigger + async indicator with no network call (the demo

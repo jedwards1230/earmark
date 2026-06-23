@@ -63,6 +63,11 @@ type MCPServer struct {
 	// with an explanation rather than POSTing into a guaranteed failure.
 	eval evalState
 
+	// evalInPipeline reflects the EVAL_IN_PIPELINE config value: when true the
+	// embed worker runs the judge inline before embedding, so eval coverage is a
+	// live signal the lifecycle view can surface honestly.
+	evalInPipeline bool
+
 	// metrics is the Prometheus registry mounted at /metrics (CONTRACT §2.16).
 	// nil in the demo (no DB-backed scrape source).
 	metrics *metrics.Registry
@@ -268,6 +273,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		controlToken:     cfg.ControlAPIToken,
 		asrServers:       cfg.ASRServers,
 		cfg:              cfg,
+		evalInPipeline:   cfg.EvalInPipeline,
 		// 2s timeout keeps a slow/unreachable gpu-arbiter from stalling the page;
 		// 5s TTL coalesces the /servers + /api/v1/status probes within one refresh.
 		prober: newHTTPGPUProber(2*time.Second, 5*time.Second),

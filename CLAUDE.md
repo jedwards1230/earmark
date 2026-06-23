@@ -98,10 +98,14 @@ MCP_HTTP_ADDR=:9876 ./earmark mcp --demo      # http://localhost:9876/
 
 Set `DEMO_SCENARIO` to render a specific state so every UI path is testable:
 `active` (default), `empty` (fresh install), `stale` (crashed runner — old
-heartbeat), `failed` (failures incl. a long multi-line error), or `multibackend`
-(three ASR families — Parakeet/Whisper/Canary — across three servers). To see the
-connection-lost banner, open the page then stop the server — htmx flags the data
-stale instead of freezing silently.
+heartbeat), `failed` (failures incl. a long multi-line error), `multibackend`
+(three ASR families — Parakeet/Whisper/Canary — across three servers),
+`winddown` (transcribe drained but the eval judge still owns the GPU — the
+"Winding down — GPU still working (eval)" state line + `active on GPU` marker),
+or `idle` (fully done, GPU util 0 but ~29 GB VRAM still occupied — the
+"Idle — safe to walk away · models resident" answer to "why is VRAM held while
+idle"). To see the connection-lost banner, open the page then stop the server —
+htmx flags the data stale instead of freezing silently.
 
 ```bash
 # Smoke-test the rendered HTML without a browser (server must be running):
