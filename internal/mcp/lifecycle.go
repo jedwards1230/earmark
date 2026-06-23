@@ -56,6 +56,24 @@ type pipelineLifecycle struct {
 	//   pending == 0 AND claimed == 0 AND embedBacklog == 0
 	//   AND (evalCoverage == 1 OR !evalInPipeline)
 	FullyDone bool `json:"fullyDone"`
+
+	// Per-track stage bucket counts for the segmented pipeline bar (CONTRACT
+	// §2.12). These are populated from QueueStats.PipelineBuckets at lifecycle
+	// computation time and exposed in /api/v1/status so agents get the same
+	// breakdown the dashboard bar renders.
+	//
+	// notStarted   = pending + transcribing (split below for finer granularity).
+	// transcribing = in-flight (claimed).
+	// transcribedOnly = done, no eval completion, no embedded chunks.
+	// evaldOnly       = done, eval finished, no embedded chunks.
+	// embeddedReady   = done, has embedded chunks (the terminal/goal state).
+	// failed           = status='failed' (off the bar fill; side-exit).
+	NotStarted      int `json:"notStarted"`
+	Transcribing    int `json:"transcribing"`
+	TranscribedOnly int `json:"transcribedOnly"`
+	EvaldOnly       int `json:"evaldOnly"`
+	EmbeddedReady   int `json:"embeddedReady"`
+	BucketFailed    int `json:"failed"`
 }
 
 // evalInPipelineSignal is the ambient flag for whether EVAL_IN_PIPELINE is
@@ -119,6 +137,15 @@ func computePipelineLifecycle(
 
 	// Activity label.
 	lc.Activity = deriveActivity(stats, phase, lc.EmbedBacklog, evalEnabled, lc.EvalCoverage, lc.FullyDone, lc.GPUCommitted)
+
+	// Segment bucket counts for the API and the bar template.
+	b := stats.PipelineBuckets
+	lc.NotStarted = b.Pending + b.Claimed
+	lc.Transcribing = b.Claimed
+	lc.TranscribedOnly = b.TranscribedOnly
+	lc.EvaldOnly = b.EvaldOnly
+	lc.EmbeddedReady = b.EmbeddedReady
+	lc.BucketFailed = b.Failed
 
 	return lc
 }

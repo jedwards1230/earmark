@@ -639,6 +639,14 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			RunnerActive:     true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 50, BooksTotal: 52,
+			// Winddown bar: all transcribed, most embedded, some eval'd-only, a few not-yet-embedded.
+			PipelineBuckets: db.PipelineBuckets{
+				Pending: 0, Claimed: 0,
+				TranscribedOnly: 12, // embed backlog still draining
+				EvaldOnly:       15, // eval'd but not embedded yet
+				EmbeddedReady:   290,
+				Failed:          2,
+			},
 		}
 	case "idle":
 		// The after-eval state: fully done (pending 0, claimed 0, EmbedBacklog 0,
@@ -660,6 +668,11 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			RunnerActive:     false, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 52, BooksTotal: 52,
+			// Idle: everything embedded.
+			PipelineBuckets: db.PipelineBuckets{
+				EmbeddedReady: 362,
+				Failed:        2,
+			},
 		}
 	default: // active — transcribe running, eval coverage partial (winding-down-visible state)
 		hb := now.Add(-12 * time.Second)
@@ -679,6 +692,22 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			RunnerActive:     true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 41, BooksTotal: 52,
+			// Active scenario: representative distribution across all five stages so
+			// every bar segment, the min-width floor, and the legend all render.
+			// - 42 pending (not started, waiting for a runner)
+			// - 1 claimed (transcribing right now)
+			// - 20 done but not yet embedded (transcribed-only, no eval, in backlog)
+			// - 4 done+eval'd but not yet embedded (evald-only, rare today)
+			// - 293 done+embedded (the bulk of the green "ready" band)
+			// - 2 failed (off the bar, drives the failed callout)
+			PipelineBuckets: db.PipelineBuckets{
+				Pending:         42,
+				Claimed:         1,
+				TranscribedOnly: 20,
+				EvaldOnly:       4,
+				EmbeddedReady:   250,
+				Failed:          2,
+			},
 		}
 	}
 	q.Paused = d.isPaused()

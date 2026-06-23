@@ -404,15 +404,48 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
   {{end}}
 </div>
 
+{{- /* ─── Segmented pipeline progress bar ────────────────────────────────────
+     Replaces the old single-color transcription-% bar with a 5-segment stacked
+     bar, one colour per stage: not-started · transcribing · transcribed ·
+     eval'd · ready/searchable. Failed tracks are excluded from the denominator
+     and shown only in the failed-jobs callout below.
+     A11y: role="img" + full-sentence aria-label; segments aria-hidden; the
+     container is aria-live="off" so the 3s poll does not interrupt screen readers.
+*/ -}}
+{{- $bar := .PipelineBar -}}
 {{if .ShowProgress}}
-<div class="overview-progress">
-  <div class="op-bar"><div class="op-fill" style="width:{{.DonePct}}%"></div></div>
+<div class="pp-wrap" aria-live="off">
+  {{- /* Bar row */ -}}
+  {{- $lc := .Lifecycle -}}
+  {{- $ariaLabel := printf "%s tracks: %d not started, %d transcribing, %d transcribed, %d eval'd, %d ready / searchable" (commafy $bar.Total) ($lc.NotStarted) ($lc.Transcribing) ($lc.TranscribedOnly) ($lc.EvaldOnly) ($lc.EmbeddedReady) -}}
+  <div class="pp-bar" role="img" aria-label="{{$ariaLabel}}">
+    {{range $bar.Segments}}
+    <span class="pp-seg{{if eq .ID 1}} pp-seg-pulse{{end}}"
+          style="width:{{.Pct}}%;background:{{.Color}}"
+          aria-hidden="true"></span>
+    {{end}}
+  </div>
+  {{- /* Meta row: EvalLabel overlay + books stat + throughput + ETA */ -}}
   <div class="op-meta">
     <span class="op-main">{{.ProgressText}}</span>
     {{if .Stats.BooksTotal}}<span title="a book is a directory of tracks; track counts above are per audio file">{{commafy .Stats.BooksFullyDone}} / {{commafy .Stats.BooksTotal}} books</span>{{end}}
+    {{if $bar.EvalLabel}}<span class="pp-eval-label" title="eval coverage over embedded-ready tracks">{{$bar.EvalLabel}}</span>{{end}}
     <span>{{.ThroughputText}}</span>
     <span>{{.ETAText}}</span>
   </div>
+  {{- /* Legend */ -}}
+  {{if $bar.Segments}}
+  <div class="pp-legend" aria-label="pipeline stage legend">
+    {{range $bar.Segments}}
+    <a class="pp-legend-row" href="/library?status={{.Status}}" title="filter library to {{.Label}} tracks">
+      <span class="pp-swatch" style="background:{{.Color}}" aria-hidden="true"></span>
+      <span class="pp-legend-label">{{.Label}}</span>
+      <span class="pp-legend-count">{{commafy .Count}}</span>
+      <span class="pp-legend-pct">{{.Pct}}%</span>
+    </a>
+    {{end}}
+  </div>
+  {{end}}
 </div>
 {{end}}
 
@@ -1202,6 +1235,11 @@ type statusData struct {
 	// Zero-value (Reachable=false) when no probe is configured or the probe failed.
 	// It carries the VRAM metrics and resident unit list for the GPU card group.
 	PrimaryArbiter arbiterStatus
+
+	// PipelineBar is the segmented, multi-color stacked progress bar data.
+	// Computed at render time from Stats.PipelineBuckets via computePipelineBar.
+	// Zero-value (empty Segments slice) when there are no tracks yet.
+	PipelineBar pipelineBarData
 }
 
 type bookRow struct {
@@ -1977,6 +2015,7 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 		}
 		data.Lifecycle = computePipelineLifecycle(stats, phase, primaryArbiter, gpuProbed, s.evalInPipeline)
 		data.PrimaryArbiter = primaryArbiter
+		data.PipelineBar = computePipelineBar(stats.PipelineBuckets, stats.EvalCoverageDone)
 		// Override the default SubText (and, when needed, the RUNNING-but-transcribing
 		// label) with the lifecycle-aware message so the Pipeline page is honest about
 		// which stage owns the GPU. The base state machine only knows the ASR runner's

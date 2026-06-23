@@ -1565,6 +1565,44 @@ type QueueStats struct {
 	TotalWords           *int64
 	BooksFullyDone       int
 	BooksTotal           int
+
+	// PipelineBuckets is the per-track furthest pipeline stage breakdown used by
+	// the segmented progress bar. It is populated by a single FILTER-aggregate
+	// query over transcription_jobs at the end of GetServiceStatus; individual
+	// Pending/Claimed/Done/Failed counts above are already read by then so no
+	// duplicate round-trip occurs.
+	//
+	// Denominator for the bar = NotStarted + Transcribing + TranscribedOnly +
+	// EvaldOnly + EmbeddedReady (i.e. all non-failed tracks). Failed is excluded
+	// from the bar fill (it is a side-exit, not a pipeline stage).
+	PipelineBuckets PipelineBuckets
+}
+
+// PipelineBuckets holds per-track furthest-stage counts for the segmented
+// pipeline bar. Each track falls into exactly one bucket:
+//
+//   - NotStarted     — status IN ('pending','claimed') with no chunks/eval yet.
+//     Pending and Transcribing are the pending+claimed split surfaced separately
+//     so the bar can show "transcribing" (Claimed) distinctly from "waiting".
+//   - TranscribedOnly — status='done', no eval completion, no chunks.
+//   - EvaldOnly       — status='done', eval finished, no chunks (rare today).
+//   - EmbeddedReady   — status='done', has chunks (the goal state).
+//   - Failed          — status='failed' (kept for the API; off the bar fill).
+//
+// Pending and Claimed are NOT separate bucket fields — they duplicate the
+// top-level QueueStats.Pending/Claimed (which the DB already read) and are
+// derived from them at render time: NotStarted = Pending + Claimed.
+type PipelineBuckets struct {
+	// NotStarted = Pending + Claimed (split below for the "transcribing" segment).
+	// These duplicate QueueStats.Pending / .Claimed so bar logic can work from
+	// one struct; they are filled by the same query that fills the other buckets.
+	Pending int // status='pending'
+	Claimed int // status='claimed' (in-flight transcription)
+	// done tracks by embedding+eval state
+	TranscribedOnly int // done, no eval, no chunks
+	EvaldOnly       int // done, eval finished, no chunks
+	EmbeddedReady   int // done, has chunks (terminal)
+	Failed          int // status='failed' (off the bar; kept for API parity)
 }
 
 // GetServiceStatus returns a single aggregate snapshot used by the status
@@ -1745,6 +1783,59 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		     FROM transcription_jobs)
 	`).Scan(&q.TotalDurationSeconds, &q.TotalWords, &q.BooksFullyDone, &q.BooksTotal); err != nil {
 		return nil, fmt.Errorf("library totals: %w", err)
+	}
+
+	// Pipeline stage buckets for the segmented bar. One FILTER-aggregate pass
+	// over transcription_jobs; correlated EXISTS subqueries check eval and embed
+	// completion without a JOIN (eval: run_metrics.eval_finished_at IS NOT NULL;
+	// embed: any transcript_chunks row for the job via transcripts.job_id).
+	// has_chunks is the terminal "embedded" signal; has_eval is advisory.
+	// Pending and Claimed duplicate q.Pending/q.Claimed but are re-read here so
+	// PipelineBuckets is self-contained for callers that use it independently.
+	if err := db.pool.QueryRow(ctx, `
+		SELECT
+		  COUNT(*) FILTER (WHERE status = 'pending')  AS pending,
+		  COUNT(*) FILTER (WHERE status = 'claimed')  AS claimed,
+		  COUNT(*) FILTER (WHERE status = 'failed')   AS failed,
+		  COUNT(*) FILTER (WHERE status = 'done'
+		    AND NOT EXISTS (
+		      SELECT 1 FROM run_metrics rm
+		      WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
+		    )
+		    AND NOT EXISTS (
+		      SELECT 1 FROM transcripts tr
+		      JOIN transcript_chunks tc ON tc.transcript_id = tr.id
+		      WHERE tr.job_id = j.id LIMIT 1
+		    )
+		  ) AS transcribed_only,
+		  COUNT(*) FILTER (WHERE status = 'done'
+		    AND EXISTS (
+		      SELECT 1 FROM run_metrics rm
+		      WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
+		    )
+		    AND NOT EXISTS (
+		      SELECT 1 FROM transcripts tr
+		      JOIN transcript_chunks tc ON tc.transcript_id = tr.id
+		      WHERE tr.job_id = j.id LIMIT 1
+		    )
+		  ) AS evald_only,
+		  COUNT(*) FILTER (WHERE status = 'done'
+		    AND EXISTS (
+		      SELECT 1 FROM transcripts tr
+		      JOIN transcript_chunks tc ON tc.transcript_id = tr.id
+		      WHERE tr.job_id = j.id LIMIT 1
+		    )
+		  ) AS embedded_ready
+		FROM transcription_jobs j
+	`).Scan(
+		&q.PipelineBuckets.Pending,
+		&q.PipelineBuckets.Claimed,
+		&q.PipelineBuckets.Failed,
+		&q.PipelineBuckets.TranscribedOnly,
+		&q.PipelineBuckets.EvaldOnly,
+		&q.PipelineBuckets.EmbeddedReady,
+	); err != nil {
+		return nil, fmt.Errorf("pipeline bucket counts: %w", err)
 	}
 
 	return q, nil

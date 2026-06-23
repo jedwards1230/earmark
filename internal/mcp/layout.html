@@ -35,6 +35,15 @@
     --accent-text: #ffffff;
     --focus: #60a5fa;       /* focus-visible ring */
 
+    /* ── pipeline progress bar (pp-*) stage colour aliases ──────────────
+       Aliased from the palette above so all 5 stage colours are in one place.
+       Override only these tokens for a custom theme. */
+    --pp-not-started: var(--muted);
+    --pp-transcribing: var(--blue);
+    --pp-transcribed: var(--amber);
+    --pp-evald: var(--purple);
+    --pp-ready: var(--green);
+
     /* ── recurring tints (themed in one place so the light block stays small) ── */
     --row-hover: #1e2230;   /* table row hover */
     --tint-blue: #15233a;   /* active chips / accent-tinted panels */
@@ -88,6 +97,13 @@
 
       --accent: #2563eb;   /* white label = 5.2:1 */
       --focus:  #1d4ed8;
+
+      /* pipeline progress bar stage colours (light palette) */
+      --pp-not-started: var(--muted);
+      --pp-transcribing: var(--blue);
+      --pp-transcribed: var(--amber);
+      --pp-evald: var(--purple);
+      --pp-ready: var(--green);
 
       --row-hover: #eef2fb;
       --tint-blue: #e7eefc;       /* active chips / filtered rows */
@@ -362,12 +378,63 @@
   .error-row > pre { color: var(--red); white-space: pre-wrap; word-break: break-word; margin-top: 4px; font-family: var(--font-mono); font-size: var(--fs-sm); }
   .actions { text-align: right; white-space: nowrap; }
 
-  /* overview backfill progress bar */
-  .overview-progress { margin-bottom: 20px; }
-  .op-bar { height: 8px; background: var(--track-bg); border-radius: 4px; overflow: hidden; }
-  .op-fill { height: 100%; background: var(--green); }
+  /* ── segmented pipeline progress bar (pp-*) ────────────────────────── */
+  .pp-wrap { margin-bottom: 20px; }
+  /* Bar: flex row; each segment is a coloured span with its % width. */
+  .pp-bar {
+    display: flex;
+    height: 10px;
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--track-bg); /* shows behind gaps when browser sub-pixels */
+  }
+  .pp-seg {
+    height: 100%;
+    flex-shrink: 0;
+    /* smooth width transitions between polls, unless the user prefers less motion */
+    transition: width .4s ease;
+  }
+  /* subtle breathing pulse on the in-flight "transcribing" segment (ID 1) */
+  @keyframes pp-pulse {
+    0%,100% { opacity: 1; }
+    50%      { opacity: .55; }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .pp-seg-pulse { animation: pp-pulse 2s ease-in-out infinite; }
+  }
+
+  /* Meta row reused from old .op-meta */
   .op-meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; color: var(--text-2); font-size: var(--fs-sm); }
   .op-main { color: var(--text); font-weight: 600; }
+  .pp-eval-label { color: var(--pp-evald); }
+
+  /* Legend: auto-fit grid of stage rows; each row is a link to the filtered library view. */
+  .pp-legend {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 4px 16px;
+    margin-top: 8px;
+  }
+  .pp-legend-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+    padding: 2px 4px;
+    border-radius: 4px;
+    text-decoration: none;
+  }
+  .pp-legend-row:hover { background: var(--row-hover); color: var(--text); }
+  .pp-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+  .pp-legend-label { flex: 1; }
+  .pp-legend-count { color: var(--text); font-variant-numeric: tabular-nums; }
+  .pp-legend-pct   { color: var(--muted); min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
 
   /* ── callouts ──────────────────────────────────────────────────── */
   .stall-callout { background: var(--tint-amber); color: var(--amber); border: 1px solid var(--amber); border-radius: 6px; padding: 8px 14px; margin-bottom: 20px; font-size: var(--fs-sm); line-height: 1.5; }
