@@ -90,8 +90,8 @@ func TestComputePipelineBar_MinWidthFloor(t *testing.T) {
 	// Each non-zero segment must be >= 1% (the borrow can never go below 1 due to
 	// the guard) and, specifically, the tiny segments should have been boosted.
 	for _, s := range bar.Segments {
-		if s.Pct < 1 {
-			t.Errorf("segment %q has Pct=%d < 1", s.Label, s.Pct)
+		if s.Pct < 2 {
+			t.Errorf("segment %q has Pct=%d < 2 (min-width floor)", s.Label, s.Pct)
 		}
 	}
 	// Widths must still sum to exactly 100.
@@ -120,6 +120,36 @@ func TestComputePipelineBar_LargestRemainderSumsTo100(t *testing.T) {
 	}
 	if sum != 100 {
 		t.Errorf("widths sum to %d, want 100 (largest-remainder)", sum)
+	}
+}
+
+func TestComputePipelineBar_MinWidthCascade(t *testing.T) {
+	// The worst case for the floor: all four minority stages have a single track
+	// (each truncates to 0% and needs the 2% floor) against one dominant ready
+	// bucket. Raise-then-reclaim must keep the row at exactly 100% with every
+	// visible segment >= the floor — the cascade a borrow-if-affordable guard
+	// would have silently dropped (leaving a segment at 0%).
+	b := db.PipelineBuckets{
+		Pending:         1,
+		Claimed:         1,
+		TranscribedOnly: 1,
+		EvaldOnly:       1,
+		EmbeddedReady:   9996,
+	}
+	bar := computePipelineBar(b, 0)
+
+	if len(bar.Segments) != 5 {
+		t.Fatalf("len(Segments) = %d, want 5", len(bar.Segments))
+	}
+	sum := 0
+	for _, s := range bar.Segments {
+		if s.Pct < 2 {
+			t.Errorf("segment %q has Pct=%d < 2 (floor not applied)", s.Label, s.Pct)
+		}
+		sum += s.Pct
+	}
+	if sum != 100 {
+		t.Errorf("widths sum to %d, want exactly 100 under the cascade", sum)
 	}
 }
 

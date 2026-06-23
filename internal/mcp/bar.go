@@ -102,29 +102,34 @@ func computePipelineBar(b db.PipelineBuckets, evalCoverageDone int) pipelineBarD
 		}
 	}
 
-	// Min-width floor: a non-zero segment that truncated to 0% or 1% gets raised
-	// to 2%; borrow the delta from the segment with the largest Pct.
+	// Min-width floor: raise every non-zero segment that truncated below 2% up to
+	// 2% so it stays visible, then reclaim the width we added by trimming the
+	// largest reducible segment(s) one point at a time (never below the floor).
+	// Raise-then-reclaim (rather than per-segment borrow-if-affordable) keeps the
+	// row summing to exactly 100% even when many tiny segments compete for floor
+	// from one dominant segment — the cascade that a borrow-guard silently drops.
 	const minPct = 2
 	for i := range raw {
 		if raw[i].Count > 0 && raw[i].Pct < minPct {
-			borrow := minPct - raw[i].Pct
-			// Find the segment with the largest width to borrow from.
-			maxIdx := -1
-			for j := range raw {
-				if j == i || raw[j].Pct <= minPct {
-					continue
-				}
-				if maxIdx < 0 || raw[j].Pct > raw[maxIdx].Pct {
-					maxIdx = j
-				}
-			}
-			if maxIdx >= 0 && raw[maxIdx].Pct-borrow >= minPct {
-				raw[maxIdx].Pct -= borrow
-				raw[i].Pct = minPct
-			}
-			// If there is no segment large enough to borrow from, leave the
-			// percent as-is (the bar row will still display something narrow).
+			raw[i].Pct = minPct
 		}
+	}
+	// Reclaim the surplus (raising tiny segments pushed the sum above 100).
+	sumPct = 0
+	for _, s := range raw {
+		sumPct += s.Pct
+	}
+	for surplus := sumPct - 100; surplus > 0; surplus-- {
+		maxIdx := -1
+		for j := range raw {
+			if raw[j].Count > 0 && raw[j].Pct > minPct && (maxIdx < 0 || raw[j].Pct > raw[maxIdx].Pct) {
+				maxIdx = j
+			}
+		}
+		if maxIdx < 0 {
+			break // pathological: every segment already at the floor — nothing to trim
+		}
+		raw[maxIdx].Pct--
 	}
 
 	// Collect non-zero segments for the template.

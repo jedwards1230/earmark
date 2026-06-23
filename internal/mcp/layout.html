@@ -402,6 +402,7 @@
   @media (prefers-reduced-motion: no-preference) {
     .pp-seg-pulse { animation: pp-pulse 2s ease-in-out infinite; }
   }
+  @media (prefers-reduced-motion: reduce) { .pp-seg { transition: none; } }
 
   /* Meta row reused from old .op-meta */
   .op-meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; color: var(--text-2); font-size: var(--fs-sm); }
