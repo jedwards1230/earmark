@@ -1053,13 +1053,23 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
   "embedBacklog":    3,     // completed transcripts not yet embedded
   "gpuCommitted":    true,  // pipeline currently owns the GPU (transcribing or evaluating)
   "gpuProbed":       true,  // gpu-arbiter probe is configured and reachable
-  "fullyDone":       false  // all stages complete (pending==0 && claimed==0 && embedBacklog==0 && eval covered)
+  "fullyDone":       false, // all stages complete (pending==0 && claimed==0 && embedBacklog==0 && eval covered)
+
+  // Per-track stage bucket counts for the segmented pipeline bar.
+  // Denominator (bar total): notStarted + transcribing + transcribedOnly + evaldOnly + embeddedReady.
+  // failed is off the bar fill — kept here for agent convenience.
+  "notStarted":      42,    // pending (not yet claimed by any runner)
+  "transcribing":    1,     // claimed (in-flight, the "transcribing" pulse segment)
+  "transcribedOnly": 20,    // done, no eval completion, no embedded chunks
+  "evaldOnly":       4,     // done, eval finished, no embedded chunks
+  "embeddedReady":   250,   // done, has embedded chunks — the terminal / goal state
+  "failed":          2      // status='failed' (off the bar; separate failed-callout)
 }
 ```
 
 `activity` precedence: `paused` → `transcribing` → `evaluating` → `embedding` → `winding-down` → `idle`.
 `evalCoverage == -1` means eval is not in-pipeline (not applicable). `winding-down` is the key state the original dashboard missed: transcribe queue drained but GPU still busy (eval / embed catch-up).
-No new DB queries — all fields are derived from signals already fetched by `/api/v1/status`.
+No new DB queries — the bucket counts are populated from a single FILTER-aggregate query over `transcription_jobs`.
 
 **Auth**: mutating endpoints require `Authorization: Bearer <CONTROL_API_TOKEN>`
 (constant-time compared). When `CONTROL_API_TOKEN` is unset they **fail closed**

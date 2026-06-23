@@ -458,9 +458,9 @@ func TestStartMCPServiceConfiguration(t *testing.T) {
 
 // ─── Dashboard tests ──────────────────────────────────────────────────────────
 
-// TestDashboardPage verifies that GET / returns 200 with the HTML shell.
-// TestDashboardPage verifies the home page (GET /) is now the Library shell, and
-// that it still serves the vendored htmx (no external CDN).
+// TestDashboardPage verifies the home page (GET /) is now the Pipeline ops shell
+// (Library moved to /library), and that it still serves the vendored htmx (no
+// external CDN).
 func TestDashboardPage(t *testing.T) {
 	h := buildTestMux(&SimpleMockDB{})
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -478,8 +478,8 @@ func TestDashboardPage(t *testing.T) {
 	for _, marker := range []string{
 		"earmark",
 		`src="/static/htmx.min.js"`, // vendored, not a CDN
-		`id="library-region"`,       // home is now the Library
-		`hx-get="/library/data`,
+		`id="data-region"`,          // home is now the Pipeline ops page
+		`hx-get="/status/data`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("GET /: body missing expected marker %q", marker)

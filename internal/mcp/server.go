@@ -370,7 +370,9 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	// its data fragment via htmx. GET is enforced with a wrapper rather than a
 	// "GET /" method pattern, which would conflict with the method-less "/mcp"
 	// route and make ServeMux panic. Only reachable under HTTP transport.
-	mux.HandleFunc("/", getOnly(s.handleLibraryPage))
+	// "/" is the home/default page → the Pipeline ops page. handlePipelinePage is
+	// the catch-all (it 404s unmatched paths). Library moved to "/library".
+	mux.HandleFunc("/", getOnly(s.handlePipelinePage))
 	mux.HandleFunc("/pipeline", getOnly(s.handlePipelinePage))
 	mux.HandleFunc("/status/data", getOnly(s.handleStatusData))
 	mux.HandleFunc("/library", getOnly(s.handleLibraryPage))
