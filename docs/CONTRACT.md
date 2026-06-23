@@ -310,8 +310,15 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
    exhausted (`run_limit==0`) or no `pending` jobs remain.
 3. **Phase B — analyze.** Set `phase='analyze'`. The runner parks its model
    (freeing the GPU) and the embed worker drains the just-transcribed
-   transcripts (chunk → embed, with inline eval when `EVAL_IN_PIPELINE=true`).
-   Wait until the embed backlog (completed transcripts with no chunks) is 0.
+   transcripts via the two-pass gated flow (see `EVAL_GATES_EMBED` below):
+   - **Ungated** (`EVAL_GATES_EMBED=false`, default): embed worker runs the
+     combined chunk→eval→embed path as before; Phase B completes when the embed
+     backlog (`EmbedBacklog`) is 0.
+   - **Gated** (`EVAL_GATES_EMBED=true`): the worker runs an eval pass first
+     (select done, not-eval'd, not-embedded → judge → write `eval_finished_at`),
+     then an embed pass (select done, eval'd, not-embedded → embed). Phase B
+     completes when **both** the eval backlog (`EvalBacklog`: done,
+     not-eval'd, not-embedded count) AND the embed backlog are 0.
 
 **Robustness contract:** the coordinator **always restores `phase='idle'` and
 sets `run_limit=0`** on exit — normal completion, error, AND `SIGINT`/`SIGTERM` —
@@ -484,6 +491,42 @@ cleanly to one job (`job_id`). The **standalone** `earmark eval` / `/actions/eva
 paths evaluate a whole book (many jobs) or a library-wide sample, so they do
 **not** write the per-job `run_metrics` eval slice (the mapping to a single job
 is ambiguous); they emit a `pipeline_events` `stage='eval'` row instead (§1.7).
+
+**`eval_finished_at` as the embed gate (`EVAL_GATES_EMBED=true`).** When
+`EVAL_GATES_EMBED` is enabled, `eval_finished_at IS NOT NULL` is **the latch
+that allows a transcript to be embedded**: the embed pass selects only transcripts
+whose `run_metrics.eval_finished_at IS NOT NULL` (eval'd) AND have no chunks (not
+yet embedded). Under this gate the invariant `embedded ⟹ eval'd` holds: a
+transcript is never searchable until it has been judged. Column ownership is
+preserved — the eval pass writes `eval_finished_at` (its column), the embed pass
+writes the embed slice, the runner writes the transcribe slice; no clobber.
+
+**Deterministic chunk UUIDs (gated mode).** When `EVAL_GATES_EMBED=true`, chunk
+UUIDs are derived as **UUIDv5 over the namespace `earmark-chunk-v1` (a fixed
+UUID) and the string `<transcript_id>/<chunk_index>`**. This is the correctness
+invariant: the eval pass chunks the transcript to judge it, and the embed pass
+re-chunks the same transcript to embed it. Because both passes use the same
+deterministic function over the same inputs (segments + `CHUNK_SIZE`), they
+produce identical chunk sets and identical UUIDs — findings written in the eval
+pass (referencing those UUIDs) correctly point to the chunk rows the embed pass
+inserts. Without determinism, the two passes would generate different random UUIDs
+and findings would be orphaned (referencing chunk IDs that were never inserted).
+UUIDv5 is idempotent under retry: re-running either pass regenerates the same
+IDs. The `transcript_chunks` table's `UNIQUE(transcript_id, chunk_index)`
+constraint catches any divergence at insert time (it would be an impossible
+double-insert of the same chunk, not a silent mismatch).
+
+**Backfill (`earmark eval --backfill-unevaluated`).** When transitioning an
+existing deployment from ungated to gated (`EVAL_GATES_EMBED=true`), the
+~embedded-but-never-judged corpus needs a one-time backfill. The command selects
+done jobs whose `eval_finished_at IS NULL` **regardless of embed state** (so it
+covers the ~790 already-embedded tracks), judges them, and writes
+`eval_finished_at`. It is read-only over transcripts: it only INSERTs findings and
+UPSERTs the eval `run_metrics` slice — it does NOT re-embed or touch
+`transcript_chunks`. After the backfill, `embedded ⟹ eval'd` holds for the
+existing corpus, matching the invariant the gate enforces going forward. The
+command respects `--sample` / batch bounds to control cost. See `earmark eval
+--backfill-unevaluated --write` (§2.15 and `earmark eval --help`).
 
 The new runner-owned columns join the runner's existing single UPSERT slice — no
 clobber risk, since they are columns no other writer touches. Populating them is
@@ -818,7 +861,8 @@ All env var names are fixed. No synonyms, no alternatives.
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
-| `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval). Default off → eval stays on-demand and the worker is unchanged. Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. |
+| `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval). Default off → eval stays on-demand and the worker is unchanged. Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
+| `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-eval'd, not-embedded transcripts and judges them (writing `eval_finished_at`); an **embed pass** then selects done, eval'd, not-embedded transcripts and embeds them. The `eval_finished_at` latch (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ eval'd`. **Fail-closed**: if `EVAL_GATES_EMBED=true` but no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`), the service fails at startup — never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Set `EVAL_IN_PIPELINE=true` alongside to activate the eval pass; when `EVAL_GATES_EMBED=true` and `EVAL_IN_PIPELINE=false`, the eval pass does nothing (the embed pass never finds any eval'd transcripts) and is treated as a misconfiguration (warn-at-startup, not fatal). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
 | `GPU_ARBITER_URL` | no | gpu-arbiter `/status` URL (e.g. `http://gpu-host:48750/status`) read by the `earmark batch` coordinator (§1.4) to yield the GPU to games. **Read-only** — the coordinator only `GET`s it, never `POST`s. Unset or unreachable → the coordinator logs it and proceeds (degrades gracefully). The `batch --gpu-arbiter-url` flag overrides it. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
@@ -1396,6 +1440,34 @@ batch the coordinator drives). The unit of evaluation is the **chunk**. The CLI
 is dry-run by default (prints what it
 would record) and persists only with `--write` (alias `--yes`); the in-pipeline
 path always persists.
+
+**Gated mode (`EVAL_GATES_EMBED=true`).** When the gate is enabled, eval is
+mandatory per-track (not optional/sampled) for any transcript to become
+searchable. Cost is still bounded: the batch coordinator drives Phase B in batches
+of `--batch-size` tracks per round, so the eval judge processes exactly as many
+transcripts as the current batch contains. The gate does NOT change how many
+tracks are evaluated per judge call — it changes WHEN (before embed, not after)
+and WHAT happens if the judge is unavailable (startup fatal, not skip).
+
+**Fail-closed matrix.**
+
+| `EVAL_GATES_EMBED` | `EVAL_IN_PIPELINE` | Eval judge configured | Behavior |
+|---|---|---|---|
+| `false` (default) | `false` (default) | — | Today's behavior: eval on-demand only |
+| `false` | `true` | yes | Best-effort inline eval before embed (judge nil → logged-skip) |
+| `false` | `true` | no | Judge nil (warn at startup), embed proceeds normally |
+| `true` | `true` | yes | Gated two-pass: eval pass → embed pass |
+| `true` | `true` | no | **Fatal startup error** — gate on without judge is a misconfiguration |
+| `true` | `false` | — | **Warn at startup** (gate without in-pipeline eval means embed pass finds nothing); treat as misconfiguration |
+
+**`earmark eval --backfill-unevaluated`** is the one-time migration command for
+existing deployments enabling the gate. It selects done jobs with
+`eval_finished_at IS NULL` regardless of embed state, judges them, and writes
+`eval_finished_at`. It is safe over live embedded data: it only INSERTs findings
+and UPSERTs the eval slice — it does NOT touch `transcript_chunks` or
+`transcripts`. Run with `--write` to persist; omit for a dry-run preview. Cost is
+bounded per `--sample N` / `--limit N` flags. After the command completes,
+`embedded ⟹ eval'd` holds for the existing corpus.
 
 **Noise filters (applied per chunk, before persistence).** Two precision filters
 trim the judge's over-flagging, in this order:

@@ -109,6 +109,10 @@ func runBatch(_ *cobra.Command, _ []string) {
 		// Record runner_availability transitions to pipeline_events (CONTRACT §1.7)
 		// so the availability windows feed the calendar ETA model. Best-effort.
 		Sink: database,
+		// EvalGatesEmbed: when true the batch coordinator waits for BOTH the eval
+		// backlog and the embed backlog to reach 0 before advancing to the next
+		// batch (Phase B completion, CONTRACT §1.4, §2.4).
+		EvalGatesEmbed: cfg.EvalGatesEmbed,
 	}
 	arbiter := batch.NewHTTPArbiter(arbiterURL, opts.arbiterTimeout)
 

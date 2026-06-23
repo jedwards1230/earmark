@@ -6,6 +6,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
 )
@@ -173,5 +174,169 @@ func TestRunOutput_ReportsSkippedChunks(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "3 chunk(s) skipped") {
 		t.Errorf("output should report skipped chunks on transient errors, got:\n%s", out.String())
+	}
+}
+
+// ─── Backfill tests (CONTRACT §2.15, §1.5) ───────────────────────────────────
+
+// fakeBackfillDB implements backfillDB for unit tests without a live DB.
+type fakeBackfillDB struct {
+	transcripts   []*db.Transcript
+	findings      []db.Finding
+	evalMetrics   []db.EvalMetrics
+	findingsErr   error
+	metricsErr    error
+	transcriptErr error
+}
+
+func (f *fakeBackfillDB) GetUnevaluatedJobTranscripts(_ context.Context) ([]*db.Transcript, error) {
+	if f.transcriptErr != nil {
+		return nil, f.transcriptErr
+	}
+	return f.transcripts, nil
+}
+
+func (f *fakeBackfillDB) InsertFindings(_ context.Context, findings []db.Finding) error {
+	if f.findingsErr != nil {
+		return f.findingsErr
+	}
+	f.findings = append(f.findings, findings...)
+	return nil
+}
+
+func (f *fakeBackfillDB) UpsertEvalMetrics(_ context.Context, m db.EvalMetrics) error {
+	if f.metricsErr != nil {
+		return f.metricsErr
+	}
+	f.evalMetrics = append(f.evalMetrics, m)
+	return nil
+}
+
+// fakeJudge implements the chat.Client interface used by evalpkg.NewJudge.
+type fakeBackfillChat struct{ resp string }
+
+func (c fakeBackfillChat) Complete(_ context.Context, _, _ string) (string, error) {
+	return c.resp, nil
+}
+func (c fakeBackfillChat) Model() string { return "fake-backfill-judge" }
+
+// TestRunBackfill_DryRunDoesNotWrite verifies that in dry-run mode (write=false)
+// the backfill function prints what it would do but writes no findings and no
+// eval_finished_at rows.
+func TestRunBackfill_DryRunDoesNotWrite(t *testing.T) {
+	fdb := &fakeBackfillDB{
+		transcripts: []*db.Transcript{
+			{
+				ID:       "t1",
+				JobID:    "j1",
+				FilePath: "/books/Dune/Chapter1.m4b",
+				RawText:  "The spice must flow. Paul Atreides walked the sands of Arrakis.",
+			},
+		},
+	}
+	judge := evalpkg.NewJudge(fakeBackfillChat{
+		resp: `{"findings":[{"original_text":"Atreides","issue_type":"misheard_proper_noun","confidence":0.9}]}`,
+	})
+	cfg := &config.Config{ChunkSize: 32}
+
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, false); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+
+	if len(fdb.findings) != 0 {
+		t.Errorf("dry-run must not persist findings, got %d", len(fdb.findings))
+	}
+	if len(fdb.evalMetrics) != 0 {
+		t.Errorf("dry-run must not persist eval_finished_at, got %d", len(fdb.evalMetrics))
+	}
+	if s := out.String(); !strings.Contains(s, "(dry-run)") {
+		t.Errorf("expected dry-run notice, got:\n%s", s)
+	}
+}
+
+// TestRunBackfill_WritePersistesFindingsAndEvalFinishedAt verifies that in write
+// mode the backfill persists findings and writes eval_finished_at for each
+// transcript (the embed-gate latch).
+func TestRunBackfill_WritePersistesFindingsAndEvalFinishedAt(t *testing.T) {
+	fdb := &fakeBackfillDB{
+		transcripts: []*db.Transcript{
+			{
+				ID:       "t-write",
+				JobID:    "j-write",
+				FilePath: "/books/Dune/Ch2.m4b",
+				RawText:  "Fear is the mind killer. I must not fear.",
+			},
+		},
+	}
+	judge := evalpkg.NewJudge(fakeBackfillChat{
+		resp: `{"findings":[{"original_text":"fear","issue_type":"misheard_word","suggested_correction":"spice","confidence":0.85}]}`,
+	})
+	cfg := &config.Config{ChunkSize: 32}
+
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, true); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+
+	if len(fdb.findings) == 0 {
+		t.Error("write mode must persist findings")
+	}
+	if len(fdb.evalMetrics) != 1 {
+		t.Errorf("expected exactly 1 eval_metrics row (eval_finished_at), got %d", len(fdb.evalMetrics))
+	}
+	em := fdb.evalMetrics[0]
+	if em.JobID != "j-write" {
+		t.Errorf("eval_metrics.JobID = %q, want %q", em.JobID, "j-write")
+	}
+	if em.FinishedAt.IsZero() {
+		t.Error("eval_metrics.FinishedAt must be set (it is the embed-gate latch)")
+	}
+	if em.Model != "fake-backfill-judge" {
+		t.Errorf("eval_metrics.Model = %q, want %q", em.Model, "fake-backfill-judge")
+	}
+}
+
+// TestRunBackfill_EmptyQueueReportsNoWork verifies that when there are no
+// unevaluated transcripts the backfill prints a "nothing to do" message and
+// returns nil.
+func TestRunBackfill_EmptyQueueReportsNoWork(t *testing.T) {
+	fdb := &fakeBackfillDB{}
+	judge := evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[]}`})
+	cfg := &config.Config{ChunkSize: 32}
+
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, false); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+	if s := out.String(); !strings.Contains(s, "nothing to backfill") {
+		t.Errorf("expected 'nothing to backfill' message, got:\n%s", s)
+	}
+}
+
+// TestRunBackfill_MultipleTranscriptsEachGetEvalMetrics verifies that each
+// transcript in the backfill batch receives its own eval_finished_at row, not
+// a single aggregated one.
+func TestRunBackfill_MultipleTranscriptsEachGetEvalMetrics(t *testing.T) {
+	fdb := &fakeBackfillDB{
+		transcripts: []*db.Transcript{
+			{ID: "t1", JobID: "j1", FilePath: "/books/A/ch1.m4b", RawText: "First book text here."},
+			{ID: "t2", JobID: "j2", FilePath: "/books/B/ch1.m4b", RawText: "Second book text here."},
+		},
+	}
+	judge := evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[]}`})
+	cfg := &config.Config{ChunkSize: 32}
+
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, true); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+
+	if len(fdb.evalMetrics) != 2 {
+		t.Errorf("expected 2 eval_metrics rows (one per transcript), got %d", len(fdb.evalMetrics))
+	}
+	jobIDs := map[string]bool{fdb.evalMetrics[0].JobID: true, fdb.evalMetrics[1].JobID: true}
+	if !jobIDs["j1"] || !jobIDs["j2"] {
+		t.Errorf("eval_metrics should cover both job IDs, got %v", jobIDs)
 	}
 }

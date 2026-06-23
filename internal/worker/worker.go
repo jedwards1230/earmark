@@ -21,7 +21,15 @@ import (
 
 // DBInterface is the subset of db.DB used by the worker.
 type DBInterface interface {
+	// GetCompletedTranscripts returns done transcripts not yet embedded
+	// (ungated path: EVAL_GATES_EMBED=false).
 	GetCompletedTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	// GetUnevaluatedTranscripts returns done, not-eval'd, not-embedded
+	// transcripts — the eval-pass selection for EVAL_GATES_EMBED=true.
+	GetUnevaluatedTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	// GetEvaluatedUnembeddedTranscripts returns done, eval'd, not-embedded
+	// transcripts — the embed-pass selection for EVAL_GATES_EMBED=true.
+	GetEvaluatedUnembeddedTranscripts(ctx context.Context) ([]*db.Transcript, error)
 	InsertChunks(ctx context.Context, chunks []db.Chunk) error
 	// EmbedDocuments embeds transcript chunks for STORAGE — the document side of
 	// the pipeline (search_document: prefix for nomic-embed-text). Never the
@@ -57,6 +65,10 @@ type Worker struct {
 	// judge is non-nil only when EvalInPipeline is set AND a chat endpoint
 	// resolved; when nil the worker skips the in-pipeline eval step entirely.
 	judge *eval.Judge
+	// evalGatesEmbed mirrors cfg.EvalGatesEmbed: when true the worker runs the
+	// strict two-pass gated flow (eval pass → embed pass) rather than the
+	// combined single-pass flow. CONTRACT §2.4.
+	evalGatesEmbed bool
 	// metrics records Prometheus stage durations + counters (CONTRACT §2.16).
 	// nil-safe: a nil Registry makes the Record* calls no-ops.
 	metrics *metrics.Registry
@@ -72,18 +84,20 @@ func (w *Worker) SetMetrics(m *metrics.Registry) { w.metrics = m }
 //
 // When cfg.EvalInPipeline is set, the worker resolves the eval chat endpoint and
 // builds a judge so each transcript is evaluated before embedding. A resolution
-// failure is non-fatal: it logs a warning and leaves the judge nil (the worker
-// embeds as usual, just without inline eval) — the pipeline must not stall
-// because the judge endpoint is misconfigured.
+// failure is non-fatal unless cfg.EvalGatesEmbed is also true: the gate requires
+// a judge (fail-closed contract validated in config.LoadConfig), so by the time
+// NewWorker runs, a missing judge with EvalGatesEmbed=true is already an error;
+// here we only need the non-fatal path for EvalInPipeline without the gate.
 func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &Worker{
-		queue:  q,
-		done:   make(chan struct{}),
-		ctx:    ctx,
-		cancel: cancel,
-		db:     database,
-		log:    log.NewLogger("worker"),
+		queue:          q,
+		done:           make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		db:             database,
+		log:            log.NewLogger("worker"),
+		evalGatesEmbed: cfg.EvalGatesEmbed,
 	}
 	if cfg.EvalInPipeline {
 		chat, err := eval.ResolveChatClient(eval.ConfigSource(cfg))
@@ -92,7 +106,8 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 				"error", err)
 		} else {
 			w.judge = eval.NewJudge(chat)
-			w.log.Info("in-pipeline eval enabled", "judge_model", chat.Model())
+			w.log.Info("in-pipeline eval enabled", "judge_model", chat.Model(),
+				"eval_gates_embed", cfg.EvalGatesEmbed)
 		}
 	}
 	return w
@@ -145,27 +160,75 @@ func (w *Worker) Start(cfg *config.Config) {
 			continue
 		}
 
-		transcripts, err := w.db.GetCompletedTranscripts(w.ctx)
-		if err != nil {
-			w.log.Error("poll for completed transcripts failed", "error", err)
-			w.sleep(pollInterval)
-			continue
-		}
+		if w.evalGatesEmbed {
+			// Gated two-pass flow (EVAL_GATES_EMBED=true, CONTRACT §2.4):
+			//   Eval pass:  done, not-eval'd, not-embedded → judge → eval_finished_at
+			//   Embed pass: done, eval'd, not-embedded     → embed → transcript_chunks
+			// The two passes run sequentially in the same poll cycle; the
+			// eval_finished_at latch is the hand-off. Both are crash-resumable DB
+			// selections — restarting the worker re-enters the correct pass.
 
-		if len(transcripts) == 0 {
-			w.sleep(pollInterval)
-			continue
-		}
-
-		for _, t := range transcripts {
-			if w.ctx.Err() != nil {
-				return
+			// Eval pass.
+			unevaluated, err := w.db.GetUnevaluatedTranscripts(w.ctx)
+			if err != nil {
+				w.log.Error("poll for unevaluated transcripts failed", "error", err)
+				w.sleep(pollInterval)
+				continue
 			}
-			if err := w.processTranscript(cfg, t); err != nil {
-				w.log.Error("failed to process transcript",
-					"transcript_id", t.ID,
-					"file", t.FilePath,
-					"error", err)
+			for _, t := range unevaluated {
+				if w.ctx.Err() != nil {
+					return
+				}
+				if err := w.evalTranscript(cfg, t); err != nil {
+					w.log.Error("failed to eval transcript",
+						"transcript_id", t.ID, "file", t.FilePath, "error", err)
+				}
+			}
+
+			// Embed pass (picks up transcripts the eval pass just finished, plus
+			// any that were already eval'd from a previous cycle).
+			evaluated, err := w.db.GetEvaluatedUnembeddedTranscripts(w.ctx)
+			if err != nil {
+				w.log.Error("poll for evaluated unembedded transcripts failed", "error", err)
+				w.sleep(pollInterval)
+				continue
+			}
+			for _, t := range evaluated {
+				if w.ctx.Err() != nil {
+					return
+				}
+				if err := w.embedTranscript(cfg, t); err != nil {
+					w.log.Error("failed to embed transcript",
+						"transcript_id", t.ID, "file", t.FilePath, "error", err)
+				}
+			}
+			if len(unevaluated) == 0 && len(evaluated) == 0 {
+				w.sleep(pollInterval)
+			}
+		} else {
+			// Ungated single-pass flow (default): combined chunk→eval→embed.
+			transcripts, err := w.db.GetCompletedTranscripts(w.ctx)
+			if err != nil {
+				w.log.Error("poll for completed transcripts failed", "error", err)
+				w.sleep(pollInterval)
+				continue
+			}
+
+			if len(transcripts) == 0 {
+				w.sleep(pollInterval)
+				continue
+			}
+
+			for _, t := range transcripts {
+				if w.ctx.Err() != nil {
+					return
+				}
+				if err := w.processTranscript(cfg, t); err != nil {
+					w.log.Error("failed to process transcript",
+						"transcript_id", t.ID,
+						"file", t.FilePath,
+						"error", err)
+				}
 			}
 		}
 	}
@@ -233,10 +296,19 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	}
 
 	// Pre-assign chunk UUIDs so the in-pipeline eval below can attribute findings
-	// to chunks before they are inserted. InsertChunks persists these ids; the
-	// column default still applies for any caller that leaves ID empty.
-	for i := range chunks {
-		chunks[i].ID = uuid.NewString()
+	// to chunks before they are inserted. When EvalGatesEmbed is on, use
+	// deterministic UUIDs (UUIDv5 over transcript_id+chunk_index) so the eval
+	// pass and the embed pass produce the same IDs without coordination —
+	// findings written in a prior eval pass reference the same chunk rows the
+	// embed pass will insert. CONTRACT §1.5.
+	if w.evalGatesEmbed {
+		for i := range chunks {
+			chunks[i].ID = db.ChunkUUID(t.ID, chunks[i].ChunkIndex)
+		}
+	} else {
+		for i := range chunks {
+			chunks[i].ID = uuid.NewString()
+		}
 	}
 
 	// In-pipeline eval (repositioned per the batched-pipeline design): judge the
@@ -309,6 +381,187 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	// token counts. Best-effort — a metrics write must not fail the embed.
 	w.recordEmbedMetrics(t, texts, usage, start, finished, len(chunks),
 		embedModel(cfg))
+	return nil
+}
+
+// evalTranscript is the eval-pass handler for EVAL_GATES_EMBED=true. It:
+//  1. Chunks the transcript with deterministic UUIDs (so the embed pass later
+//     produces the same IDs).
+//  2. Runs the judge over the chunks.
+//  3. Persists findings.
+//  4. Writes eval_finished_at (the embed-gate latch, CONTRACT §1.5).
+//
+// It does NOT embed — that is the embed pass's job. If the judge is nil
+// (EVAL_IN_PIPELINE not set alongside EVAL_GATES_EMBED), we still write
+// eval_finished_at with zero findings so the embed pass can proceed; the
+// startup warning in config.LoadConfig already flagged the misconfiguration.
+func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
+	if t.RawText == "" {
+		return fmt.Errorf("transcript %s has empty raw text, skipping", t.ID)
+	}
+	w.log.Info("eval pass: judging transcript", "file", t.FilePath, "transcript_id", t.ID)
+
+	chunkSize := cfg.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 512
+	}
+
+	var chunks []db.Chunk
+	if len(t.Segments) == 0 {
+		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
+			"transcript_id", t.ID)
+		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
+		if len(texts) == 0 {
+			return fmt.Errorf("no chunks produced for transcript %s", t.ID)
+		}
+		chunks = make([]db.Chunk, len(texts))
+		for i, text := range texts {
+			chunks[i] = db.Chunk{
+				TranscriptID: t.ID,
+				FilePath:     t.FilePath,
+				ChunkIndex:   i,
+				StartSec:     0,
+				EndSec:       0,
+				Text:         text,
+			}
+		}
+	} else {
+		chunks = buildChunksFromSegments(t, chunkSize)
+		if len(chunks) == 0 {
+			return fmt.Errorf("no chunks produced from segments for transcript %s", t.ID)
+		}
+	}
+
+	// Deterministic UUIDs: same as the embed pass will produce for the same
+	// (transcript_id, chunk_index) — findings reference these IDs before insert.
+	for i := range chunks {
+		chunks[i].ID = db.ChunkUUID(t.ID, chunks[i].ChunkIndex)
+	}
+
+	evalStart := time.Now()
+	var inlineFindings []db.Finding
+	if w.judge != nil {
+		inlineFindings = w.judgeChunks(t, chunks)
+	} else {
+		w.log.Warn("eval pass: no judge configured (EVAL_IN_PIPELINE not set); "+
+			"writing eval_finished_at with zero findings so embed pass can proceed",
+			"transcript_id", t.ID)
+	}
+	evalFinished := time.Now()
+
+	// Persist findings before the eval_finished_at latch so the DB is never in
+	// a state where the latch is set but the findings are absent.
+	if len(inlineFindings) > 0 {
+		if err := w.db.InsertFindings(w.ctx, inlineFindings); err != nil {
+			w.log.Warn("eval pass: persist findings failed (writing eval_finished_at anyway — findings lost)",
+				"transcript_id", t.ID, "findings", len(inlineFindings), "error", err)
+		}
+	}
+
+	// Write eval_finished_at — the latch that allows the embed pass to pick this
+	// transcript up. We write it even when findings is empty (a clean transcript)
+	// or when the judge was nil (misconfiguration fallback) so the pipeline never
+	// stalls on a latch that is never set.
+	stats := eval.RunStats{ChunksEvaluated: len(chunks), FindingsFound: len(inlineFindings)}
+	w.recordEvalMetrics(t, stats, evalStart, evalFinished)
+	w.log.Info("eval pass: finished", "file", t.FilePath, "chunks", len(chunks),
+		"findings", len(inlineFindings), "duration", evalFinished.Sub(evalStart).Round(time.Millisecond))
+	return nil
+}
+
+// embedTranscript is the embed-pass handler for EVAL_GATES_EMBED=true. It
+// chunks the transcript with the same deterministic UUIDs as the eval pass used,
+// embeds the chunks, and inserts them. It does NOT run the judge (eval was
+// already done in the eval pass). CONTRACT §1.5.
+func (w *Worker) embedTranscript(cfg *config.Config, t *db.Transcript) error {
+	if t.RawText == "" {
+		return fmt.Errorf("transcript %s has empty raw text, skipping", t.ID)
+	}
+	w.log.Info("embed pass: embedding transcript", "file", t.FilePath, "transcript_id", t.ID)
+	start := time.Now()
+	w.appendEvent(db.PipelineEvent{
+		JobID:      t.JobID,
+		FilePath:   t.FilePath,
+		Stage:      db.StageEmbed,
+		Event:      db.EventStart,
+		RunnerHost: db.HostGoWorker,
+	})
+
+	chunkSize := cfg.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 512
+	}
+
+	var chunks []db.Chunk
+	if len(t.Segments) == 0 {
+		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
+			"transcript_id", t.ID)
+		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
+		if len(texts) == 0 {
+			return fmt.Errorf("no chunks produced for transcript %s", t.ID)
+		}
+		chunks = make([]db.Chunk, len(texts))
+		for i, text := range texts {
+			chunks[i] = db.Chunk{
+				TranscriptID: t.ID,
+				FilePath:     t.FilePath,
+				ChunkIndex:   i,
+				StartSec:     0,
+				EndSec:       0,
+				Text:         text,
+			}
+		}
+	} else {
+		chunks = buildChunksFromSegments(t, chunkSize)
+		if len(chunks) == 0 {
+			return fmt.Errorf("no chunks produced from segments for transcript %s", t.ID)
+		}
+	}
+
+	// Deterministic UUIDs — must match what the eval pass assigned to these
+	// chunks so findings reference the correct chunk rows after insert.
+	for i := range chunks {
+		chunks[i].ID = db.ChunkUUID(t.ID, chunks[i].ChunkIndex)
+	}
+
+	texts := make([]string, len(chunks))
+	for i, c := range chunks {
+		texts[i] = c.Text
+	}
+
+	embeddings, usage, err := w.db.EmbedDocumentsWithUsage(texts)
+	if err != nil {
+		return fmt.Errorf("get embeddings: %w", err)
+	}
+	if len(embeddings) != len(texts) {
+		return fmt.Errorf("embedding count mismatch: got %d for %d chunks", len(embeddings), len(texts))
+	}
+
+	for i := range chunks {
+		chunks[i].Embedding = embeddings[i]
+	}
+
+	if err := w.db.InsertChunks(w.ctx, chunks); err != nil {
+		return fmt.Errorf("insert chunks: %w", err)
+	}
+	finished := time.Now()
+	w.appendEvent(db.PipelineEvent{
+		JobID:      t.JobID,
+		FilePath:   t.FilePath,
+		Stage:      db.StageEmbed,
+		Event:      db.EventFinish,
+		RunnerHost: db.HostGoWorker,
+		Model:      embedModel(cfg),
+		DurationMS: db.Int64Ptr(finished.Sub(start).Milliseconds()),
+		ItemCount:  db.IntPtr(len(chunks)),
+	})
+	w.metrics.RecordStageFinish(db.StageEmbed, finished.Sub(start))
+
+	w.log.Info("embed pass: transcript embedded",
+		"file", t.FilePath, "transcript_id", t.ID, "chunks", len(chunks),
+		"duration", finished.Sub(start).Round(time.Millisecond))
+
+	w.recordEmbedMetrics(t, texts, usage, start, finished, len(chunks), embedModel(cfg))
 	return nil
 }
 

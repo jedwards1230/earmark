@@ -72,6 +72,26 @@ func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, e
 	return f.transcripts, nil
 }
 
+// GetUnevaluatedTranscripts stubs the eval-pass selection: returns transcripts
+// from the fakeDB's transcript slice that have no evaluatedIDs entry. For tests
+// that don't exercise the gated flow, it returns the same slice as
+// GetCompletedTranscripts (the ungated path is tested via GetCompletedTranscripts).
+func (f *fakeDB) GetUnevaluatedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.transcripts, nil
+}
+
+// GetEvaluatedUnembeddedTranscripts stubs the embed-pass selection. In the gated
+// flow the embed pass picks up transcripts after they have been eval'd; in tests
+// we return an empty slice by default so callers that call this without a gated
+// scenario don't accidentally embed a second time.
+func (f *fakeDB) GetEvaluatedUnembeddedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return nil, nil
+}
+
 func (f *fakeDB) InsertChunks(_ context.Context, chunks []db.Chunk) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

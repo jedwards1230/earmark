@@ -117,6 +117,11 @@ type Options struct {
 	// Sink records runner_availability events on arbiter-state transitions
 	// (CONTRACT §1.7). nil → a no-op sink (events disabled). Best-effort.
 	Sink EventSink
+	// EvalGatesEmbed mirrors cfg.EvalGatesEmbed: when true Phase B completion
+	// requires BOTH the eval backlog AND the embed backlog to reach 0. When
+	// false (default) Phase B completes when only the embed backlog reaches 0,
+	// preserving today's behavior. CONTRACT §1.4, §2.4.
+	EvalGatesEmbed bool
 }
 
 const (
@@ -208,7 +213,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 		if err := store.SetPipelinePhase(ctx, db.PhaseAnalyze, actor); err != nil {
 			return fmt.Errorf("set analyze phase (resume): %w", err)
 		}
-		if err := waitForAnalyzeDrained(ctx, p, store, o.PollInterval); err != nil {
+		if err := waitForAnalyzeDrained(ctx, p, store, o.PollInterval, o.EvalGatesEmbed); err != nil {
 			return err
 		}
 	}
@@ -340,32 +345,53 @@ func transcribeDone(st *db.QueueStats) bool {
 
 // runAnalyzePhase sets phase=analyze (the runner parks its model, freeing the
 // GPU; the embed worker drains the just-transcribed transcripts) and waits for
-// the embed backlog to reach 0.
+// the backlogs to reach 0. Under EVAL_GATES_EMBED both the eval backlog and the
+// embed backlog must reach 0 (CONTRACT §1.4); otherwise only the embed backlog.
 func runAnalyzePhase(ctx context.Context, p func(string, ...any), store PhaseStore, o Options) error {
 	if err := store.SetPipelinePhase(ctx, db.PhaseAnalyze, actor); err != nil {
 		return fmt.Errorf("set analyze phase: %w", err)
 	}
-	p("Phase B (analyze): waiting for the embed backlog to drain...\n")
-	return waitForAnalyzeDrained(ctx, p, store, o.PollInterval)
+	if o.EvalGatesEmbed {
+		p("Phase B (analyze): waiting for the eval backlog and embed backlog to drain (EVAL_GATES_EMBED)...\n")
+	} else {
+		p("Phase B (analyze): waiting for the embed backlog to drain...\n")
+	}
+	return waitForAnalyzeDrained(ctx, p, store, o.PollInterval, o.EvalGatesEmbed)
 }
 
-// waitForAnalyzeDrained polls until EmbedBacklog (completed transcripts with no
-// chunks) reaches 0. Used both by Phase B and by resume reconciliation. The
-// caller is responsible for having set phase=analyze before calling this.
-func waitForAnalyzeDrained(ctx context.Context, p func(string, ...any), store PhaseStore, poll time.Duration) error {
+// waitForAnalyzeDrained polls until the relevant backlogs reach 0. When
+// evalGatesEmbed is true, BOTH EvalBacklog and EmbedBacklog must be 0 (the eval
+// pass must finish before the embed pass can pick anything up). When false, only
+// EmbedBacklog must be 0 (today's behavior). Used both by Phase B and by resume
+// reconciliation. The caller is responsible for having set phase=analyze.
+func waitForAnalyzeDrained(ctx context.Context, p func(string, ...any), store PhaseStore, poll time.Duration, evalGatesEmbed bool) error {
 	for {
 		st, err := store.GetServiceStatus(ctx)
 		if err != nil {
 			return fmt.Errorf("poll analyze status: %w", err)
 		}
-		if st.EmbedBacklog == 0 {
-			p("Phase B complete (embed backlog drained).\n")
+		if analyzeDrained(st, evalGatesEmbed) {
+			if evalGatesEmbed {
+				p("Phase B complete (eval backlog and embed backlog drained).\n")
+			} else {
+				p("Phase B complete (embed backlog drained).\n")
+			}
 			return nil
 		}
 		if err := sleep(ctx, poll); err != nil {
 			return err
 		}
 	}
+}
+
+// analyzeDrained reports whether the Phase B completion condition is satisfied.
+// Under the gate: both eval and embed backlogs must be 0.
+// Without the gate: only the embed backlog must be 0 (today's behavior).
+func analyzeDrained(st *db.QueueStats, evalGatesEmbed bool) bool {
+	if evalGatesEmbed {
+		return st.EvalBacklog == 0 && st.EmbedBacklog == 0
+	}
+	return st.EmbedBacklog == 0
 }
 
 // restoreIdle returns the pipeline to a SAFE idle resting state: phase=idle and
