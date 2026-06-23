@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/predict"
 )
 
@@ -68,6 +69,11 @@ type apiStatus struct {
 	// Endpoints is the AI endpoint registry (CONTRACT §2.14) with health probes.
 	// Always non-empty (at least the embeddings endpoint after config load).
 	Endpoints []apiEndpoint `json:"endpoints"`
+	// Pipeline is the derived 3-stage lifecycle view (CONTRACT §2.12). It
+	// summarises transcribe / eval / embed progress and the GPU commitment so an
+	// agent can read one self-describing object rather than piecing it together
+	// from Pending/Claimed/EmbedBacklog/Paused.
+	Pipeline *pipelineLifecycle `json:"pipeline"`
 }
 
 // apiEndpoint is the JSON shape of one AI endpoint in GET /api/v1/status.
@@ -221,6 +227,35 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 			HasWork:         e.HasWork,
 			Label:           e.Label(),
 		}
+	}
+
+	// Pipeline lifecycle (CONTRACT §2.12). Computed from already-read stats plus
+	// the coordinator phase + the primary server's gpu-arbiter probe. Best-effort:
+	// a phase read error degrades to "idle" without failing the response; the probe
+	// may be nil (no servers configured) — lifecycle handles that gracefully.
+	{
+		phase := db.PhaseIdle
+		if p, perr := s.db.GetPipelinePhase(r.Context()); perr != nil {
+			s.logger.Warn("api status: GetPipelinePhase error; lifecycle phase degraded", "error", perr)
+		} else {
+			phase = p
+		}
+		// Pick the primary server's arbiter probe (if any). "primary" role wins;
+		// fall back to the first configured server if none is explicitly primary.
+		probes := s.probeServers(r.Context())
+		primaryArbiter := arbiterStatus{}
+		gpuProbed := false
+		for _, c := range s.asrServers {
+			if st, ok := probes[c.Name]; ok {
+				gpuProbed = true
+				primaryArbiter = st
+				if c.Role == "primary" {
+					break // prefer the primary role
+				}
+			}
+		}
+		lc := computePipelineLifecycle(stats, phase, primaryArbiter, gpuProbed, s.evalInPipeline)
+		out.Pipeline = &lc
 	}
 
 	// Servers view is supplementary: a query error here logs but does not fail the

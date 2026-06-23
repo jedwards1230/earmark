@@ -219,12 +219,20 @@ func (demoGPUProber) Probe(_ context.Context, url string) arbiterStatus {
 	switch {
 	case strings.Contains(url, "busy"):
 		return arbiterStatus{Reachable: true, State: "gaming", Claims: []string{"steam:413150"},
-			ASRRunning: bp(false), VRAMUsedMB: ip(7338), VRAMTotalMB: ip(32607)}
+			ASRRunning: bp(false), VRAMUsedMB: ip(7338), VRAMTotalMB: ip(32607),
+			ResidentUnits: []residentUnit{
+				{Unit: "asr-runner.service", Running: false},
+				{Unit: "ollama.service", Running: false},
+			}}
 	case strings.Contains(url, "offline"):
 		return arbiterStatus{Reachable: false}
-	default: // ready
+	default: // ready — GPU is busy with eval judge (parakeet + ollama/gemma3 resident, high VRAM)
 		return arbiterStatus{Reachable: true, State: "available",
-			ASRRunning: bp(true), VRAMUsedMB: ip(512), VRAMTotalMB: ip(32607)}
+			ASRRunning: bp(true), VRAMUsedMB: ip(29696), VRAMTotalMB: ip(32607),
+			ResidentUnits: []residentUnit{
+				{Unit: "asr-runner.service", Running: true},
+				{Unit: "ollama.service", Running: true},
+			}}
 	}
 }
 
@@ -571,7 +579,7 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 12, BooksTotal: 15,
 		}
-	default: // active
+	default: // active — transcribe running, eval coverage partial (winding-down-visible state)
 		hb := now.Add(-12 * time.Second)
 		emb := now.Add(-30 * time.Second) // embeds landing → backlog is normal catch-up, no stall
 		avg := 487.5
@@ -582,7 +590,11 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			Pending: 42, Claimed: 1, Done: 317, Failed: 2,
 			Transcripts: 317, Chunks: 18452, EmbedBacklog: 3, LastEmbedAt: &emb,
 			TotalJobs: 362, DoneLastHour: 22,
-			RunnerActive: true, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			// EvalCoverageDone < Done: the eval judge has reviewed 280 of 317 done
+			// tracks, so eval coverage is ~88% — the lifecycle strip shows the gap
+			// and the "winding down" state is visible in demo once transcribe drains.
+			EvalCoverageDone: 280,
+			RunnerActive:     true, RunnerID: "demo-runner", LastHeartbeat: &hb,
 			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
 			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 41, BooksTotal: 52,
 		}
@@ -1039,6 +1051,9 @@ func StartDemoDashboard(addr string) error {
 		aiRoles = &config.AIRoles{Embeddings: "embed-1"} // no Eval binding
 		demoEvalToken = ""
 	}
+	// The active scenario enables EVAL_IN_PIPELINE so the lifecycle strip shows a
+	// realistic winding-down state (EvalCoverageDone < Done: 280 / 317 judged).
+	evalInPipeline := scenario != "empty"
 	cfg := &config.Config{
 		MCPHTTPAddr:        addr,
 		StaleJobTimeout:    30 * time.Minute,
@@ -1052,6 +1067,7 @@ func StartDemoDashboard(addr string) error {
 		ASRServers:      demoServersFor(scenario),
 		AIEndpoints:     demoAIEndpoints,
 		AIRoles:         aiRoles,
+		EvalInPipeline:  evalInPipeline,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	// Swap the real HTTP probers for the static demo ones so the readiness states

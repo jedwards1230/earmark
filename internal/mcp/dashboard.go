@@ -212,6 +212,9 @@ var tmplFuncs = template.FuncMap{
 	// query string with url.QueryEscape'd values, returned as template.URL for
 	// interpolation into an hx-get attribute.
 	"worklistURL": worklistURL,
+	// vramLabel renders a "used / total GB" VRAM string from nullable MB values
+	// reported by gpu-arbiter, or an em dash when either value is absent.
+	"vramLabel": vramLabel,
 }
 
 // mustPage parses the shared layout plus a page-specific {{define "content"}}.
@@ -409,6 +412,94 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
     {{if .Stats.BooksTotal}}<span title="a book is a directory of tracks; track counts above are per audio file">{{commafy .Stats.BooksFullyDone}} / {{commafy .Stats.BooksTotal}} books</span>{{end}}
     <span>{{.ThroughputText}}</span>
     <span>{{.ETAText}}</span>
+  </div>
+</div>
+{{end}}
+
+{{- /* ─── 3-stage lifecycle strip ─────────────────────────────────────────────
+     Shows the honest Transcribe → Eval → Embed pipeline so an operator can see
+     exactly which stage owns work / the GPU right now. The strip is always
+     shown when there is any progress (ShowProgress) or the pipeline is still
+     winding down. A11y: each stage cell uses glyph + word, not color alone.
+*/ -}}
+{{if or .ShowProgress (.Lifecycle.WindingDown)}}
+<div class="lc-strip" aria-label="3-stage pipeline lifecycle">
+  {{- $lc := .Lifecycle -}}
+  {{- $done := $lc.TranscribeDone -}}
+  {{- $total := $lc.TranscribeTotal -}}
+  {{- $transcribePct := pct $done $total -}}
+
+  <div class="lc-stage{{if eq (print $lc.Activity) "transcribing"}} lc-active{{end}}">
+    <div class="lc-stage-hd">
+      <span class="lc-glyph" aria-hidden="true">&#9658;</span>
+      <span class="lc-name">Transcribe</span>
+      {{if eq (print $lc.Activity) "transcribing"}}<span class="lc-gpu-marker" title="runner is actively using the GPU">&#9679; active on GPU</span>{{end}}
+    </div>
+    <div class="lc-count">{{commafy $done}} / {{commafy $total}}</div>
+    <div class="lc-bar-wrap"><div class="lc-bar"><div class="lc-bar-fill" style="width:{{$transcribePct}}%"></div></div></div>
+  </div>
+
+  <div class="lc-stage{{if eq (print $lc.Activity) "evaluating"}} lc-active{{end}}{{if not $lc.EvalInPipeline}} lc-na{{end}}">
+    <div class="lc-stage-hd">
+      <span class="lc-glyph" aria-hidden="true">&#9673;</span>
+      <span class="lc-name">Eval</span>
+      {{if eq (print $lc.Activity) "evaluating"}}<span class="lc-gpu-marker" title="eval judge is actively using the GPU">&#9679; active on GPU</span>{{end}}
+    </div>
+    {{if $lc.EvalInPipeline}}
+    <div class="lc-count">{{$lc.EvalCoverageDisplay $done}}</div>
+    <div class="lc-bar-wrap"><div class="lc-bar"><div class="lc-bar-fill" style="width:{{$lc.EvalCoveragePct $done}}%"></div></div></div>
+    {{else}}
+    <div class="lc-count lc-na-text">not in pipeline</div>
+    {{end}}
+  </div>
+
+  <div class="lc-stage{{if eq (print $lc.Activity) "embedding"}} lc-active{{end}}">
+    <div class="lc-stage-hd">
+      <span class="lc-glyph" aria-hidden="true">&#8857;</span>
+      <span class="lc-name">Embed</span>
+    </div>
+    {{if gt $lc.EmbedBacklog 0}}
+    <div class="lc-count">{{commafy $lc.EmbedBacklog}} backlog</div>
+    <div class="lc-bar-wrap"><div class="lc-bar lc-bar-indeterminate"></div></div>
+    {{else}}
+    <div class="lc-count">&#10003; clear</div>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+{{- /* ─── GPU / VRAM card group ───────────────────────────────────────────────
+     Only shown when a gpu-arbiter probe is configured and reachable (GPUProbed).
+     Shows GPU STATE, VRAM, and a MODELS RESIDENT list. A11y: glyph + word.
+*/ -}}
+{{if .Lifecycle.GPUProbed}}
+<div class="card-group gpu-card-group">
+  <div class="group-label">GPU <span class="group-unit">· <a href="/servers">details on Servers page</a></span></div>
+  <div class="grid">
+    <div class="card" title="gpu-arbiter state: available = GPU free for pipeline; gaming = evicted by game">
+      <div class="card-label">GPU State</div>
+      <div class="card-value{{if .Lifecycle.GPUCommitted}} green{{end}}">
+        {{if .Lifecycle.GPUCommitted}}&#9679; committed{{else if .PrimaryArbiter.Reachable}}&#9675; free{{else}}&#8212; offline{{end}}
+      </div>
+    </div>
+    <div class="card" title="VRAM usage reported by gpu-arbiter (used / total)">
+      <div class="card-label">VRAM</div>
+      <div class="card-value">{{vramLabel .PrimaryArbiter.VRAMUsedMB .PrimaryArbiter.VRAMTotalMB}}</div>
+    </div>
+    {{if .PrimaryArbiter.ResidentUnits}}
+    <div class="card gpu-resident-card" title="model services resident on the GPU (&#9658; running, &#9679; loaded)">
+      <div class="card-label">Models Resident</div>
+      <div class="gpu-resident-list">
+        {{range .PrimaryArbiter.ResidentUnits}}
+        <div class="gpu-resident-unit">
+          <span class="gpu-unit-glyph" aria-hidden="true">{{if .Running}}&#9658;{{else}}&#9679;{{end}}</span>
+          <span class="gpu-unit-name">{{.Unit}}</span>
+          <span class="gpu-unit-state">{{if .Running}}active{{else}}resident{{end}}</span>
+        </div>
+        {{end}}
+      </div>
+    </div>
+    {{end}}
   </div>
 </div>
 {{end}}
@@ -1100,6 +1191,17 @@ type statusData struct {
 	RunLimit       *int
 	RunBudgetText  string
 	ControlEnabled bool
+
+	// Lifecycle is the derived 3-stage pipeline view (Transcribe → Eval → Embed).
+	// It is computed in renderStatusFragment by calling computePipelineLifecycle
+	// after the arbiter probe, and threaded into the template so the status strip
+	// and GPU/VRAM cards can render with a single data source.
+	Lifecycle pipelineLifecycle
+
+	// PrimaryArbiter is the gpu-arbiter probe result for the primary ASR server.
+	// Zero-value (Reachable=false) when no probe is configured or the probe failed.
+	// It carries the VRAM metrics and resident unit list for the GPU card group.
+	PrimaryArbiter arbiterStatus
 }
 
 type bookRow struct {
@@ -1470,6 +1572,15 @@ func codecLabel(codec *string, channels *int) string {
 }
 
 func commafy(n int) string { return commafy64(int64(n)) }
+
+// vramLabel renders "N.N / M.M GB" from nullable MB values (gpu-arbiter probe),
+// or an em dash when either pointer is nil.
+func vramLabel(usedMB, totalMB *int) string {
+	if usedMB == nil || totalMB == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f / %.1f GB", float64(*usedMB)/1024, float64(*totalMB)/1024)
+}
 
 func commafy64(n int64) string {
 	s := strconv.FormatInt(n, 10)
@@ -1846,6 +1957,34 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 	data.RunLimit = stats.RunLimit
 	data.RunBudgetText = runBudgetText(stats.RunLimit)
 	data.ControlEnabled = s.controlToken != ""
+
+	// Pipeline lifecycle (3-stage: Transcribe → Eval → Embed). Computed here so
+	// the status fragment can show the honest "winding down" state and the GPU/VRAM
+	// card group. Arbiter probe: prefer the "primary" role server; fall back to the
+	// first configured server with a probe URL.
+	{
+		probes := s.probeServers(ctx)
+		primaryArbiter := arbiterStatus{}
+		gpuProbed := false
+		for _, c := range s.asrServers {
+			if st, ok := probes[c.Name]; ok {
+				gpuProbed = true
+				primaryArbiter = st
+				if c.Role == "primary" {
+					break
+				}
+			}
+		}
+		data.Lifecycle = computePipelineLifecycle(stats, phase, primaryArbiter, gpuProbed, s.evalInPipeline)
+		data.PrimaryArbiter = primaryArbiter
+		// Override the default SubText with the lifecycle-aware message so the
+		// Pipeline page never says "IDLE" while the GPU is still committed.
+		if data.Lifecycle.WindingDown() && data.StateClass == "state-idle" {
+			data.SubText = "Winding down — GPU still working (eval / embed)"
+		} else if data.Lifecycle.FullyDone && !data.Lifecycle.GPUCommitted {
+			data.SubText = "Idle — safe to walk away"
+		}
+	}
 
 	// Build the queue and activity feeds. The queue is built first (primary section);
 	// the activity feed then excludes books already in the queue to avoid duplication.

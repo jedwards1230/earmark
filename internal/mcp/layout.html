@@ -517,6 +517,34 @@
   .cap-badge.cap-off { background: var(--tint-amber); color: var(--amber); cursor: help; }
   .server-note code.cap-badge { font-size: var(--fs-xs); }
 
+  /* ── 3-stage pipeline lifecycle strip ─────────────────────────────── */
+  .lc-strip { display: flex; gap: 12px; margin-bottom: 20px; }
+  .lc-stage { flex: 1; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .lc-stage.lc-active { border-color: var(--green); background: var(--tint-green, rgba(34,197,94,0.06)); }
+  .lc-stage.lc-na { opacity: 0.55; }
+  .lc-stage-hd { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .lc-glyph { color: var(--muted); font-size: var(--fs-sm); }
+  .lc-active .lc-glyph { color: var(--green); }
+  .lc-name { font-size: var(--fs-sm); font-weight: 600; color: var(--text); flex: 1; }
+  .lc-gpu-marker { font-size: var(--fs-xs); color: var(--green); font-weight: 600; white-space: nowrap; }
+  .lc-count { font-size: var(--fs-sm); color: var(--text-2); margin-bottom: 4px; }
+  .lc-na-text { color: var(--muted); }
+  .lc-bar-wrap { margin-top: 2px; }
+  .lc-bar { height: 4px; background: var(--track-bg); border-radius: 2px; overflow: hidden; }
+  .lc-bar-fill { height: 100%; background: var(--green); border-radius: 2px; }
+  .lc-bar-indeterminate { background: repeating-linear-gradient(90deg, var(--green) 0, var(--green) 30%, transparent 30%, transparent 60%); background-size: 48px 100%; animation: lc-shimmer 1.2s linear infinite; }
+  @keyframes lc-shimmer { to { background-position: 48px 0; } }
+  @media (prefers-reduced-motion: reduce) { .lc-bar-indeterminate { animation: none; background: var(--track-bg); } }
+
+  /* ── GPU card group ────────────────────────────────────────────────── */
+  .gpu-card-group { }
+  .gpu-resident-card { grid-column: span 2; }
+  .gpu-resident-list { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+  .gpu-resident-unit { display: flex; align-items: baseline; gap: 6px; font-size: var(--fs-sm); }
+  .gpu-unit-glyph { color: var(--green); font-size: var(--fs-xs); flex-shrink: 0; }
+  .gpu-unit-name { color: var(--text); font-family: var(--font-mono); font-size: var(--fs-xs); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gpu-unit-state { color: var(--muted); font-size: var(--fs-xs); flex-shrink: 0; }
+
   @media (max-width: 560px) {
     main { padding: 14px; }
     .file-name { max-width: 50vw; }
@@ -524,6 +552,9 @@
     /* 44px touch targets on the phone (the dashboard is used over LAN, 2.5.8) */
     .btn { padding: 10px 14px; min-height: 44px; }
     .nav a { padding: 9px 12px; min-height: 44px; }
+    /* lifecycle strip stacks vertically on small screens */
+    .lc-strip { flex-direction: column; }
+    .gpu-resident-card { grid-column: span 1; }
   }
 </style>
 </head>

@@ -33,6 +33,16 @@ type arbiterStatus struct {
 	ASRRunning  *bool    // asr-runner.service running (nil when no such unit reported)
 	VRAMUsedMB  *int
 	VRAMTotalMB *int
+	// ResidentUnits is ALL reported units with their running state, so the
+	// dashboard can list which models are currently resident (parakeet, gemma3 …)
+	// without having to re-interpret the raw JSON.
+	ResidentUnits []residentUnit
+}
+
+// residentUnit is one gpu-arbiter unit (service) with its running state.
+type residentUnit struct {
+	Unit    string // systemd unit name, e.g. "asr-runner.service", "ollama.service"
+	Running bool
 }
 
 // ready reports whether the GPU is available for transcription right now:
@@ -138,7 +148,8 @@ func (p *httpGPUProber) fetch(ctx context.Context, rawURL string) arbiterStatus 
 }
 
 // toStatus converts the raw JSON into the dashboard view, locating the ASR
-// runner unit by an "asr"/"parakeet" substring on the unit name.
+// runner unit by an "asr"/"parakeet" substring on the unit name, and carrying
+// ALL reported units so the dashboard can list resident models.
 func (r arbiterRaw) toStatus() arbiterStatus {
 	st := arbiterStatus{
 		Reachable:   true,
@@ -152,8 +163,8 @@ func (r arbiterRaw) toStatus() arbiterStatus {
 		if strings.Contains(name, "asr") || strings.Contains(name, "parakeet") {
 			running := u.Running
 			st.ASRRunning = &running
-			break
 		}
+		st.ResidentUnits = append(st.ResidentUnits, residentUnit{Unit: u.Unit, Running: u.Running})
 	}
 	return st
 }
