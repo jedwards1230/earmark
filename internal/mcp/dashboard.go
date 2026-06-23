@@ -1872,14 +1872,20 @@ func (s *MCPServer) handleHTMX(w http.ResponseWriter, _ *http.Request) {
 // handlePipelinePage serves the Pipeline ops page shell (GET /pipeline): the
 // status fragment plus the folded-in Failed view.
 func (s *MCPServer) handlePipelinePage(w http.ResponseWriter, r *http.Request) {
+	// Pipeline is the home/default page (GET /), so this is the catch-all route —
+	// 404 any unmatched path that falls through to "/". Real "/" and "/pipeline"
+	// requests pass this guard unchanged.
+	if r.URL.Path != "/" && r.URL.Path != "/pipeline" {
+		http.NotFound(w, r)
+		return
+	}
 	s.renderPage(w, r, pipelinePage, pageShell{Title: "pipeline", Nav: "pipeline"})
 }
 
 func (s *MCPServer) handleLibraryPage(w http.ResponseWriter, r *http.Request) {
-	// The Library is now the home page (GET /), which is a catch-all route — so
-	// 404 any unmatched path that falls through to "/". A real /library request
-	// has Path=="/library" and passes this guard unchanged.
-	if r.URL.Path != "/" && r.URL.Path != "/library" {
+	// Library moved off the home page to "/library" (Pipeline is now home). This
+	// route only serves "/library"; the catch-all 404 lives in handlePipelinePage.
+	if r.URL.Path != "/library" {
 		http.NotFound(w, r)
 		return
 	}
