@@ -162,6 +162,19 @@ the two Deployments.
 - name: EVAL_IN_PIPELINE
   value: "true"
 {{- end }}
+{{- /*
+  Strict-linear eval gate (CONTRACT §2.15): when true, embed waits on eval.
+  The gate needs the in-pipeline judge, so fail render fast if it's on without
+  evalInPipeline (mirrors the app's fail-closed startup — surface the bad combo
+  here so it never reaches a CrashLooping pod).
+*/}}
+{{- if .Values.config.evalGatesEmbed }}
+{{- if not .Values.config.evalInPipeline }}
+{{- fail "config.evalGatesEmbed is true but config.evalInPipeline is false. The eval gate requires the in-pipeline judge (CONTRACT §2.15) — set config.evalInPipeline: true, or disable config.evalGatesEmbed." }}
+{{- end }}
+- name: EVAL_GATES_EMBED
+  value: "true"
+{{- end }}
 - name: METADATA_PROVIDER
   value: {{ .Values.config.metadataProvider | quote }}
 {{- /*
