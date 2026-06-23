@@ -23,8 +23,11 @@ import (
 type DBInterface interface {
 	GetCompletedTranscripts(ctx context.Context) ([]*db.Transcript, error)
 	InsertChunks(ctx context.Context, chunks []db.Chunk) error
-	GetEmbeddings(texts []string) ([][]float32, error)
-	GetEmbeddingsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
+	// EmbedDocuments embeds transcript chunks for STORAGE — the document side of
+	// the pipeline (search_document: prefix for nomic-embed-text). Never the
+	// query side; see db.EmbedQuery.
+	EmbedDocuments(texts []string) ([][]float32, error)
+	EmbedDocumentsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error)
 	RecoverStaleJobs(ctx context.Context, timeout time.Duration) (int, error)
 	UpsertEmbedMetrics(ctx context.Context, m db.EmbedMetrics) error
 	// UpsertEvalMetrics records the eval slice of run_metrics (timing, judge
@@ -254,7 +257,7 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		texts[i] = c.Text
 	}
 
-	embeddings, usage, err := w.db.GetEmbeddingsWithUsage(texts)
+	embeddings, usage, err := w.db.EmbedDocumentsWithUsage(texts)
 	if err != nil {
 		return fmt.Errorf("get embeddings: %w", err)
 	}
