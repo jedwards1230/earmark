@@ -84,6 +84,7 @@
         "staleJobTimeout":   { "type": "string" },
         "chunkSize":         { "type": "string" },
         "evalInPipeline":    { "type": "boolean" },
+        "evalGatesEmbed":    { "type": "boolean" },
         "metadataProvider":  { "type": "string" },
         "absURL":            { "type": "string" },
         "absLibraryID":      { "type": "string" },

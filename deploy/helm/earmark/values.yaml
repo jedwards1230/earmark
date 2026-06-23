@@ -148,6 +148,15 @@ config:
   # pipeline (CONTRACT §1.4). Default false (eval stays on-demand).
   evalInPipeline: false
 
+  # Strict-linear eval gate (EVAL_GATES_EMBED, CONTRACT §2.15): when true, a
+  # transcript is NOT embedded/searchable until the eval judge has reviewed it
+  # (transcribe → eval → embed, monotonic). REQUIRES evalInPipeline: true — the
+  # gate needs the in-pipeline judge, and the app fail-closes at startup if the
+  # gate is on without it (the chart also guards this at render time). Default
+  # false (eval is best-effort and does NOT gate embed). Enabling adds GPU cost:
+  # every track is judged before becoming searchable.
+  evalGatesEmbed: false
+
   # ── Metadata provider (CONTRACT §2.4) ──────────────────────────────────────
   # METADATA_PROVIDER selects how the ingest monitor derives book metadata:
   #   path           — filesystem path only (default; no external dependency)
