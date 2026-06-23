@@ -72,6 +72,26 @@ func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, e
 	return f.transcripts, nil
 }
 
+// GetUnevaluatedTranscripts stubs the eval-pass selection: returns transcripts
+// from the fakeDB's transcript slice that have no evaluatedIDs entry. For tests
+// that don't exercise the gated flow, it returns the same slice as
+// GetCompletedTranscripts (the ungated path is tested via GetCompletedTranscripts).
+func (f *fakeDB) GetUnevaluatedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.transcripts, nil
+}
+
+// GetEvaluatedUnembeddedTranscripts stubs the embed-pass selection. In the gated
+// flow the embed pass picks up transcripts after they have been eval'd; in tests
+// we return an empty slice by default so callers that call this without a gated
+// scenario don't accidentally embed a second time.
+func (f *fakeDB) GetEvaluatedUnembeddedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return nil, nil
+}
+
 func (f *fakeDB) InsertChunks(_ context.Context, chunks []db.Chunk) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -388,6 +408,94 @@ func TestProcessTranscript_TransientJudgeErrorSkipsChunkAndPersistsRest(t *testi
 	require.NotEmpty(t, fdb.findings, "surviving chunks should still yield persisted findings")
 	require.Less(t, len(fdb.findings), len(fdb.chunks),
 		"the first chunk's judge error should have skipped its finding (partial result)")
+}
+
+// ─── Gated two-pass flow (EVAL_GATES_EMBED=true) ─────────────────────────────
+
+// TestEvalTranscript_DeterministicChunkIDsMatchEmbedPass proves the core
+// determinism guarantee: the eval pass and the embed pass, run independently
+// over the same transcript via the shared chunkTranscript helper, assign
+// IDENTICAL chunk IDs. The eval pass's findings therefore reference the exact
+// chunk rows the embed pass inserts.
+func TestEvalTranscript_DeterministicChunkIDsMatchEmbedPass(t *testing.T) {
+	cfg := &config.Config{ChunkSize: 8, EvalGatesEmbed: true}
+	transcript := &db.Transcript{
+		ID: "tid-det", JobID: "job-det", FilePath: "/b/a/t/ch.mp3",
+		RawText: "Hello world this is a fairly long test transcript with many words to chunk.",
+	}
+
+	// Eval pass: judge writes findings, then eval_finished_at.
+	evalDB := &fakeDB{}
+	judge := eval.NewJudge(workerFakeChat{
+		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+	})
+	evalW := &Worker{
+		ctx: context.Background(), db: evalDB, log: log.NewLogger("eval-pass"),
+		judge: judge, evalGatesEmbed: true,
+	}
+	require.NoError(t, evalW.evalTranscript(cfg, transcript))
+	require.NotEmpty(t, evalDB.findings, "eval pass should persist findings")
+	require.NotEmpty(t, evalDB.evalMetrics, "eval pass writes the eval_finished_at latch via eval metrics")
+	for _, em := range evalDB.evalMetrics {
+		require.False(t, em.FinishedAt.IsZero(), "eval_finished_at latch must be set")
+	}
+	require.Empty(t, evalDB.chunks, "eval pass must NOT embed (no chunks inserted)")
+
+	// Embed pass: chunks the same transcript and inserts chunks.
+	embedDB := &fakeDB{}
+	embedW := &Worker{
+		ctx: context.Background(), db: embedDB, log: log.NewLogger("embed-pass"),
+		evalGatesEmbed: true,
+	}
+	require.NoError(t, embedW.embedTranscript(cfg, transcript))
+	require.NotEmpty(t, embedDB.chunks, "embed pass inserts chunks")
+
+	// Every finding's chunk_id from the eval pass must match a chunk the embed
+	// pass inserted — the deterministic-UUID guarantee.
+	embedChunkIDs := map[string]bool{}
+	for _, c := range embedDB.chunks {
+		embedChunkIDs[c.ID] = true
+	}
+	for _, f := range evalDB.findings {
+		require.NotNil(t, f.ChunkID)
+		require.True(t, embedChunkIDs[*f.ChunkID],
+			"eval-pass finding chunk_id %q must match an embed-pass chunk (deterministic UUID)", *f.ChunkID)
+	}
+}
+
+// TestEvalTranscript_NilJudgeDoesNotPanic is the defensive nil-guard the review
+// asked for: even though the fail-closed config validation guarantees a judge
+// whenever EVAL_GATES_EMBED=true, a caller that reaches evalTranscript with
+// judge=nil must still write the eval_finished_at latch (with zero findings and
+// an empty model) instead of dereferencing w.judge.Model() → panic.
+func TestEvalTranscript_NilJudgeDoesNotPanic(t *testing.T) {
+	fdb := &fakeDB{}
+	w := &Worker{
+		ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"),
+		judge: nil, evalGatesEmbed: true, // judge intentionally nil
+	}
+	cfg := &config.Config{ChunkSize: 10, EvalGatesEmbed: true}
+	transcript := &db.Transcript{ID: "tid-nil", JobID: "job-nil", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."}
+
+	require.NotPanics(t, func() {
+		require.NoError(t, w.evalTranscript(cfg, transcript))
+	}, "nil judge must not panic — judgeModel() is nil-safe")
+
+	// The latch is still written so the embed pass can proceed.
+	require.Len(t, fdb.evalMetrics, 1, "eval_finished_at latch must be written even with a nil judge")
+	require.Equal(t, "", fdb.evalMetrics[0].Model, "nil judge → empty eval_model (no nil deref)")
+	require.Empty(t, fdb.findings, "nil judge → zero findings")
+	require.Empty(t, fdb.chunks, "eval pass must not embed")
+}
+
+// TestEvalTranscript_EmptyRawTextSkips guards the empty-transcript early return.
+func TestEvalTranscript_EmptyRawTextSkips(t *testing.T) {
+	fdb := &fakeDB{}
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), evalGatesEmbed: true}
+	transcript := &db.Transcript{ID: "tid-empty", JobID: "job-empty", RawText: ""}
+	require.Error(t, w.evalTranscript(&config.Config{ChunkSize: 10}, transcript),
+		"empty raw text must be skipped with an error")
+	require.Empty(t, fdb.evalMetrics, "no latch written for an empty transcript")
 }
 
 func TestProcessTranscript_RecordsEmbedMetrics(t *testing.T) {

@@ -402,6 +402,107 @@ func TestTranscribeDone(t *testing.T) {
 	}
 }
 
+// noopPrintf is a no-op printer for the wait-loop helpers under test.
+func noopPrintf(string, ...any) {}
+
+// TestAnalyzeDrained covers the Phase-B completion predicate for both the
+// ungated (EmbedBacklog==0 alone) and gated (EvalBacklog==0 AND EmbedBacklog==0)
+// modes. The gated rows guard the core gate invariant: Phase B must NOT complete
+// while either backlog is non-zero, because the eval pass must finish before the
+// embed pass can pick anything up.
+func TestAnalyzeDrained(t *testing.T) {
+	cases := []struct {
+		name           string
+		st             *db.QueueStats
+		evalGatesEmbed bool
+		want           bool
+	}{
+		// Ungated: only the embed backlog matters; EvalBacklog is ignored (always 0
+		// on ungated deployments anyway).
+		{"ungated embed drained → done", &db.QueueStats{EmbedBacklog: 0, EvalBacklog: 0}, false, true},
+		{"ungated embed left → not done", &db.QueueStats{EmbedBacklog: 2, EvalBacklog: 0}, false, false},
+		{"ungated ignores eval backlog → done", &db.QueueStats{EmbedBacklog: 0, EvalBacklog: 5}, false, true},
+
+		// Gated: BOTH must be 0.
+		{"gated both drained → done", &db.QueueStats{EmbedBacklog: 0, EvalBacklog: 0}, true, true},
+		{"gated only embed drained (eval pending) → not done", &db.QueueStats{EmbedBacklog: 0, EvalBacklog: 3}, true, false},
+		{"gated only eval drained (embed pending) → not done", &db.QueueStats{EmbedBacklog: 4, EvalBacklog: 0}, true, false},
+		{"gated neither drained → not done", &db.QueueStats{EmbedBacklog: 4, EvalBacklog: 3}, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := analyzeDrained(tc.st, tc.evalGatesEmbed); got != tc.want {
+				t.Errorf("analyzeDrained(%+v, gate=%v) = %v, want %v",
+					tc.st, tc.evalGatesEmbed, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWaitForAnalyzeDrained_Gated drives the gated wait loop: it must keep
+// polling while EITHER backlog is non-zero and only return once BOTH reach 0.
+// The scripted snapshots step through "eval still draining" → "eval done but
+// embed draining" → "both drained" so a regression that completes early (on
+// only one backlog) is caught by counting the polls consumed.
+func TestWaitForAnalyzeDrained_Gated(t *testing.T) {
+	store := newFakeStore(db.PhaseAnalyze,
+		&db.QueueStats{EvalBacklog: 2, EmbedBacklog: 0}, // eval still running → keep waiting
+		&db.QueueStats{EvalBacklog: 0, EmbedBacklog: 3}, // eval done, embed draining → keep waiting
+		&db.QueueStats{EvalBacklog: 0, EmbedBacklog: 0}, // both drained → complete
+	)
+	err := waitForAnalyzeDrained(context.Background(), noopPrintf, store, time.Millisecond, true)
+	if err != nil {
+		t.Fatalf("waitForAnalyzeDrained: %v", err)
+	}
+	// It must have consumed all three snapshots (not stopped early on the first two,
+	// each of which has exactly one backlog at 0).
+	if store.statusCalls < 3 {
+		t.Errorf("gated wait completed early after %d polls; must wait for BOTH backlogs to reach 0", store.statusCalls)
+	}
+}
+
+// TestWaitForAnalyzeDrained_Ungated drives the ungated wait loop: it completes
+// as soon as EmbedBacklog reaches 0, ignoring EvalBacklog (which is always 0 on
+// ungated deployments). A non-zero EvalBacklog must NOT hold up an ungated batch.
+func TestWaitForAnalyzeDrained_Ungated(t *testing.T) {
+	store := newFakeStore(db.PhaseAnalyze,
+		&db.QueueStats{EvalBacklog: 9, EmbedBacklog: 1}, // embed draining → keep waiting
+		&db.QueueStats{EvalBacklog: 9, EmbedBacklog: 0}, // embed drained → complete (eval ignored)
+	)
+	err := waitForAnalyzeDrained(context.Background(), noopPrintf, store, time.Millisecond, false)
+	if err != nil {
+		t.Fatalf("waitForAnalyzeDrained: %v", err)
+	}
+	if store.statusCalls != 2 {
+		t.Errorf("ungated wait consumed %d polls, want 2 (complete on EmbedBacklog==0 regardless of EvalBacklog)", store.statusCalls)
+	}
+}
+
+// TestWaitForAnalyzeDrained_GatedDoesNotCompleteOnSingleBacklog is the explicit
+// negative guard the review asked for: under the gate, a state where only ONE of
+// the two backlogs is 0 must NOT complete. We use a cancelable context and a
+// store that never fully drains, then assert the loop is still waiting (returns
+// ctx.Canceled) rather than having declared completion.
+func TestWaitForAnalyzeDrained_GatedDoesNotCompleteOnSingleBacklog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	// Only the eval backlog ever reaches 0; embed stays at 1 forever.
+	store := newFakeStore(db.PhaseAnalyze,
+		&db.QueueStats{EvalBacklog: 0, EmbedBacklog: 1},
+	)
+	// Cancel shortly after the loop starts polling so the test doesn't hang if the
+	// (buggy) implementation never completes — we then assert it returned the
+	// cancellation, proving it did NOT complete on the single-zero backlog.
+	go func() {
+		// Let a few polls happen first.
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	err := waitForAnalyzeDrained(ctx, noopPrintf, store, time.Millisecond, true)
+	if err == nil {
+		t.Fatal("gated wait completed while EmbedBacklog=1 (only EvalBacklog drained) — must keep waiting")
+	}
+}
+
 // recordingSink captures AppendEvent calls for assertions.
 type recordingSink struct {
 	mu     sync.Mutex
@@ -425,9 +526,9 @@ func (s *recordingSink) snapshot() []db.PipelineEvent {
 
 func TestArbiterReason(t *testing.T) {
 	cases := []struct {
-		gaming, ok        bool
-		wantReason        string
-		wantAvail         bool
+		gaming, ok bool
+		wantReason string
+		wantAvail  bool
 	}{
 		{gaming: false, ok: false, wantReason: "unreachable", wantAvail: false},
 		{gaming: true, ok: true, wantReason: "gaming", wantAvail: false},

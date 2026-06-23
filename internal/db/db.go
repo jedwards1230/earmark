@@ -33,6 +33,24 @@ import (
 	"github.com/jedwards1230/earmark/internal/openai"
 )
 
+// ─── Deterministic chunk UUID ────────────────────────────────────────────────
+
+// chunkUUIDNamespace is the fixed UUID namespace for deriving chunk IDs.
+// It is UUIDv5(DNS, "earmark-chunk-v1") — a stable, well-known value that
+// makes chunk IDs reproducible given the same (transcript_id, chunk_index)
+// inputs. CONTRACT §1.5: required when EVAL_GATES_EMBED=true so the eval pass
+// and the embed pass agree on which UUID a given chunk will have.
+var chunkUUIDNamespace = uuid.NewSHA1(uuid.NameSpaceDNS, []byte("earmark-chunk-v1"))
+
+// ChunkUUID derives a deterministic UUIDv5 for a chunk identified by its
+// transcript ID and ordinal index within that transcript. Both passes (eval and
+// embed) must call this function with the same inputs to produce the same ID.
+// The format is "<transcript_id>/<chunk_index>".
+func ChunkUUID(transcriptID string, chunkIndex int) string {
+	key := fmt.Sprintf("%s/%d", transcriptID, chunkIndex)
+	return uuid.NewSHA1(chunkUUIDNamespace, []byte(key)).String()
+}
+
 // ─── Domain types ────────────────────────────────────────────────────────────
 
 // Job represents a row from transcription_jobs.
@@ -668,6 +686,9 @@ func (db *DB) IsPathQueued(ctx context.Context, filePath string) (bool, error) {
 
 // GetCompletedTranscripts returns transcripts that have been completed by the
 // runner but not yet embedded (i.e. no rows in transcript_chunks for that transcript_id).
+// This is the ungated embed-eligible selection (EVAL_GATES_EMBED=false, default).
+// When the gate is enabled the worker uses GetUnevaluatedTranscripts (eval pass)
+// and GetEvaluatedUnembeddedTranscripts (embed pass) instead.
 func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT t.id, t.job_id, t.file_path, t.checksum,
@@ -682,8 +703,94 @@ func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error
 	if err != nil {
 		return nil, fmt.Errorf("query completed transcripts: %w", err)
 	}
-	defer rows.Close()
+	return scanTranscriptRows(rows)
+}
 
+// GetUnevaluatedTranscripts returns done transcripts that have not been eval'd
+// (run_metrics.eval_finished_at IS NULL or no run_metrics row) AND have no
+// chunks yet (not yet embedded). This is the eval-pass selection for the
+// EVAL_GATES_EMBED two-pass gated flow (CONTRACT §2.4, §1.5).
+//
+// The eval pass judges these transcripts and writes eval_finished_at so the
+// embed pass can pick them up. We restrict to not-embedded so we don't
+// re-judge transcripts that are already embedded (they are handled by
+// earmark eval --backfill-unevaluated).
+func (db *DB) GetUnevaluatedTranscripts(ctx context.Context) ([]*Transcript, error) {
+	return db.getUnevaluatedTranscripts(ctx, db.pool)
+}
+
+// unevaluatedTranscriptsSQL is the eval-pass selection: done jobs, NOT embedded
+// (no transcript_chunks), NOT eval'd (no run_metrics row with eval_finished_at).
+// Exported as a package var so the execution-level test can match it exactly.
+const unevaluatedTranscriptsSQL = `
+		SELECT t.id, t.job_id, t.file_path, t.checksum,
+		       t.language, t.duration_seconds, t.speaker_count,
+		       t.segments, t.raw_text, t.model_name, t.created_at
+		FROM transcripts t
+		JOIN transcription_jobs j ON j.id = t.job_id
+		WHERE j.status = 'done'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM run_metrics rm
+		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
+		  )
+		ORDER BY t.created_at ASC
+	`
+
+func (db *DB) getUnevaluatedTranscripts(ctx context.Context, q rowQuerier) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, unevaluatedTranscriptsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("query unevaluated transcripts: %w", err)
+	}
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
+}
+
+// GetEvaluatedUnembeddedTranscripts returns done transcripts that have been
+// eval'd (run_metrics.eval_finished_at IS NOT NULL) AND have no chunks yet
+// (not yet embedded). This is the embed-pass selection for the EVAL_GATES_EMBED
+// two-pass gated flow (CONTRACT §2.4, §1.5).
+//
+// A transcript appearing here is guaranteed to have been judged; the caller
+// embeds it and it becomes searchable. eval_finished_at IS NOT NULL is the
+// hand-off latch that separates the eval pass from the embed pass.
+func (db *DB) GetEvaluatedUnembeddedTranscripts(ctx context.Context) ([]*Transcript, error) {
+	return db.getEvaluatedUnembeddedTranscripts(ctx, db.pool)
+}
+
+// evaluatedUnembeddedTranscriptsSQL is the embed-pass selection: done jobs that
+// ARE eval'd (run_metrics.eval_finished_at IS NOT NULL) and NOT embedded (no
+// transcript_chunks). Exported as a package const so the execution-level test
+// can match it exactly.
+const evaluatedUnembeddedTranscriptsSQL = `
+		SELECT t.id, t.job_id, t.file_path, t.checksum,
+		       t.language, t.duration_seconds, t.speaker_count,
+		       t.segments, t.raw_text, t.model_name, t.created_at
+		FROM transcripts t
+		JOIN transcription_jobs j ON j.id = t.job_id
+		JOIN run_metrics rm ON rm.job_id = j.id
+		WHERE j.status = 'done'
+		  AND rm.eval_finished_at IS NOT NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
+		  )
+		ORDER BY t.created_at ASC
+	`
+
+func (db *DB) getEvaluatedUnembeddedTranscripts(ctx context.Context, q rowQuerier) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, evaluatedUnembeddedTranscriptsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("query evaluated unembedded transcripts: %w", err)
+	}
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
+}
+
+// scanTranscriptRows scans a pgx.Rows result into []*Transcript. Shared by
+// GetCompletedTranscripts, GetUnevaluatedTranscripts, and
+// GetEvaluatedUnembeddedTranscripts to keep scanning logic DRY.
+func scanTranscriptRows(rows pgx.Rows) ([]*Transcript, error) {
+	defer rows.Close()
 	var results []*Transcript
 	for rows.Next() {
 		var t Transcript
@@ -701,7 +808,7 @@ func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error
 		results = append(results, &t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows error (completed transcripts): %w", err)
+		return nil, fmt.Errorf("rows error (transcripts): %w", err)
 	}
 	return results, nil
 }
@@ -1506,6 +1613,13 @@ type QueueStats struct {
 	// down or model missing), which is otherwise invisible because the job rows
 	// stay 'done' and never flip to 'failed'.
 	EmbedBacklog int
+
+	// EvalBacklog counts done transcripts that have not been eval'd
+	// (run_metrics.eval_finished_at IS NULL) AND have no chunks yet. This is the
+	// eval-pass backlog when EVAL_GATES_EMBED=true — Phase B is complete only
+	// when BOTH EvalBacklog==0 AND EmbedBacklog==0. Always 0 when the gate is
+	// disabled (ungated deployments ignore it). CONTRACT §1.4, §1.5.
+	EvalBacklog int
 	// LastEmbedAt is the newest transcript_chunks.created_at — i.e. when the
 	// worker last finished embedding a transcript. Paired with EmbedBacklog it
 	// distinguishes a genuine stall (backlog high AND no embed in a while) from
@@ -1668,6 +1782,26 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		)
 	`).Scan(&q.EmbedBacklog); err != nil {
 		return nil, fmt.Errorf("embed backlog count: %w", err)
+	}
+
+	// Eval backlog: done transcripts not yet eval'd AND not yet embedded.
+	// This is the eval-pass backlog when EVAL_GATES_EMBED=true (CONTRACT §1.4).
+	// Under the gate, Phase B is complete when BOTH EvalBacklog==0 AND
+	// EmbedBacklog==0. Always 0 when no gate is in use (ungated deployments
+	// ignore it; the value is still computed for the dashboard and control API).
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM transcripts t
+		JOIN transcription_jobs j ON j.id = t.job_id
+		WHERE j.status = 'done'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM run_metrics rm
+		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
+		  )
+	`).Scan(&q.EvalBacklog); err != nil {
+		return nil, fmt.Errorf("eval backlog count: %w", err)
 	}
 
 	// Backfill progress + throughput.
@@ -2706,6 +2840,38 @@ var evalChunkSelectSQL = `
 	FROM transcript_chunks c
 	JOIN transcripts t ON t.id = c.transcript_id
 `
+
+// GetUnevaluatedJobTranscripts returns done transcripts whose run_metrics row
+// has eval_finished_at IS NULL (or has no run_metrics row at all), regardless of
+// whether the transcript has already been embedded. This is the backfill
+// selection for `earmark eval --backfill-unevaluated` (CONTRACT §2.15, §1.5):
+// it judges any done transcript that slipped through before EVAL_GATES_EMBED was
+// enabled, writing eval_finished_at so they are retroactively covered.
+//
+// Unlike GetUnevaluatedTranscripts (which restricts to not-yet-embedded), this
+// method returns ALL done+not-eval'd transcripts, including already-embedded
+// ones, because the backfill command runs against live data and must not miss
+// anything. The caller (cmd/eval --backfill-unevaluated) persists findings and
+// eval_finished_at via the existing eval + UpsertEvalMetrics path.
+func (db *DB) GetUnevaluatedJobTranscripts(ctx context.Context) ([]*Transcript, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT t.id, t.job_id, t.file_path, t.checksum,
+		       t.language, t.duration_seconds, t.speaker_count,
+		       t.segments, t.raw_text, t.model_name, t.created_at
+		FROM transcripts t
+		JOIN transcription_jobs j ON j.id = t.job_id
+		WHERE j.status = 'done'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM run_metrics rm
+		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
+		  )
+		ORDER BY t.created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query unevaluated job transcripts: %w", err)
+	}
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
+}
 
 // GetEvalChunksForBook returns the chunks whose file_path contains substr
 // (case-insensitive), in path/chunk order, capped at limit (≤0 → a sane

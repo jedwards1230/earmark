@@ -19,6 +19,8 @@ func clearContractEnvVars(t *testing.T) {
 		"MCP_HTTP_ADDR", "STALE_JOB_TIMEOUT",
 		"CHUNK_SIZE", "DEBUG", "DEBUG_DB_RESET",
 		"ASR_SERVERS", "AI_ENDPOINTS", "AI_ROLES",
+		"EVAL_GATES_EMBED", "EVAL_IN_PIPELINE",
+		"EVAL_CHAT_BASE_URL", "EVAL_CHAT_MODEL",
 	}
 	for _, k := range vars {
 		t.Setenv(k, "") // t.Setenv restores on cleanup
@@ -418,4 +420,95 @@ func TestLoadConfig_AIEndpointsWinsOverLegacy(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "new-model", emb.Model)
 	assert.Equal(t, "http://new:11434/v1", emb.BaseURL)
+}
+
+// ─── EVAL_GATES_EMBED fail-closed startup (CONTRACT §2.4) ───────────────────
+
+// TestLoadConfig_EvalGatesEmbed_FailClosedWithNoEndpoint verifies that
+// EVAL_GATES_EMBED=true without any eval endpoint is a fatal startup error.
+// This is the fail-closed contract: a gate without a judge would silently stall
+// the corpus (no transcript can ever be embedded), so it must be detected at
+// startup rather than at runtime. CONTRACT §2.4.
+func TestLoadConfig_EvalGatesEmbed_FailClosedWithNoEndpoint(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("EVAL_GATES_EMBED", "true")
+	t.Setenv("EVAL_IN_PIPELINE", "true") // isolate the no-endpoint failure
+	// No AI_ROLES["eval"], no EVAL_CHAT_BASE_URL, no EVAL_CHAT_MODEL.
+
+	_, err := LoadConfig()
+	require.Error(t, err, "EVAL_GATES_EMBED=true without eval endpoint must fail at startup")
+	assert.Contains(t, err.Error(), "EVAL_GATES_EMBED=true requires an eval chat endpoint")
+}
+
+// TestLoadConfig_EvalGatesEmbed_FailClosedWithoutInPipeline verifies that
+// EVAL_GATES_EMBED=true WITHOUT EVAL_IN_PIPELINE=true is a fatal startup error
+// even when an eval endpoint resolves. The gate makes eval a strict prerequisite
+// for embedding, but the eval judge is only built when EVAL_IN_PIPELINE=true;
+// without it the gated worker would run with a nil judge (stalling the corpus
+// or risking a nil-judge deref). CONTRACT §2.4 fail-closed matrix.
+func TestLoadConfig_EvalGatesEmbed_FailClosedWithoutInPipeline(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("EVAL_GATES_EMBED", "true")
+	// EVAL_IN_PIPELINE intentionally unset (defaults false).
+	t.Setenv("EVAL_CHAT_BASE_URL", "http://vllm:8000/v1")
+	t.Setenv("EVAL_CHAT_MODEL", "mistral-7b-instruct")
+
+	_, err := LoadConfig()
+	require.Error(t, err, "EVAL_GATES_EMBED=true without EVAL_IN_PIPELINE=true must fail at startup")
+	assert.Contains(t, err.Error(), "EVAL_GATES_EMBED=true requires EVAL_IN_PIPELINE=true")
+}
+
+// TestLoadConfig_EvalGatesEmbed_PassesWithEvalChatEnvVars verifies that
+// EVAL_GATES_EMBED=true + EVAL_CHAT_BASE_URL + EVAL_CHAT_MODEL does NOT fail at
+// startup. The standalone EVAL_CHAT_* env vars are the escape hatch for
+// deployments that don't use the AI_ENDPOINTS registry.
+func TestLoadConfig_EvalGatesEmbed_PassesWithEvalChatEnvVars(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("EVAL_GATES_EMBED", "true")
+	t.Setenv("EVAL_IN_PIPELINE", "true")
+	t.Setenv("EVAL_CHAT_BASE_URL", "http://vllm:8000/v1")
+	t.Setenv("EVAL_CHAT_MODEL", "mistral-7b-instruct")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err, "EVAL_GATES_EMBED=true + EVAL_IN_PIPELINE=true + EVAL_CHAT_* must not fail startup")
+	assert.True(t, cfg.EvalGatesEmbed, "EvalGatesEmbed must be set")
+}
+
+// TestLoadConfig_EvalGatesEmbed_PassesWithAIRolesEval verifies that
+// EVAL_GATES_EMBED=true + AI_ENDPOINTS/AI_ROLES["eval"] does NOT fail at startup.
+// The embeddings role is left unset in AI_ROLES so it falls back to the legacy
+// EMBEDDINGS_BASE_URL/EMBEDDINGS_MODEL synthesis path (no "embeddings" endpoint
+// required for this test — we're only validating the eval role resolves).
+func TestLoadConfig_EvalGatesEmbed_PassesWithAIRolesEval(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("EVAL_GATES_EMBED", "true")
+	t.Setenv("EVAL_IN_PIPELINE", "true")
+	// Two endpoints: one for eval (chat), one for embeddings.
+	t.Setenv("AI_ENDPOINTS", `[`+
+		`{"id":"ev","type":"chat","backend":"openai-compat","baseURL":"http://vllm:8000/v1","model":"mistral"},`+
+		`{"id":"emb","type":"embeddings","backend":"openai-compat","baseURL":"http://ollama:11434/v1","model":"nomic-embed-text"}`+
+		`]`)
+	t.Setenv("AI_ROLES", `{"embeddings":"emb","eval":"ev"}`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err, "EVAL_GATES_EMBED=true with AI_ROLES[eval] must not fail startup")
+	assert.True(t, cfg.EvalGatesEmbed, "EvalGatesEmbed must be set")
+	_, ok := cfg.EvalEndpoint()
+	assert.True(t, ok, "EvalEndpoint() must resolve from AI_ROLES")
+}
+
+// TestLoadConfig_EvalGatesEmbed_FalseByDefault verifies EVAL_GATES_EMBED
+// defaults to false (opt-in, no behavior change for unconfigured deployments).
+func TestLoadConfig_EvalGatesEmbed_FalseByDefault(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	// EVAL_GATES_EMBED not set.
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	assert.False(t, cfg.EvalGatesEmbed, "EVAL_GATES_EMBED must default to false")
 }

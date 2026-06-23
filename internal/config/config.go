@@ -322,6 +322,15 @@ type Config struct {
 	// batch coordinator turns this on per batch. Source: EVAL_IN_PIPELINE.
 	EvalInPipeline bool
 
+	// EvalGatesEmbed — when true, eval is a strict prerequisite for embedding:
+	// a transcript is NOT embedded (not searchable) until it has been judged.
+	// Implements the two-pass gated flow: eval pass (done, not-eval'd,
+	// not-embedded → judge → eval_finished_at) then embed pass (done, eval'd,
+	// not-embedded → embed). Default false → today's behavior unchanged.
+	// Fail-closed: fatal startup error when true but no eval judge resolves.
+	// Source: EVAL_GATES_EMBED (CONTRACT §2.4).
+	EvalGatesEmbed bool
+
 	// LIBRARY_COLLECTIONS — optional JSON describing how each library root is
 	// shaped, so author/title labels are derived from configuration rather than
 	// hardcoded path assumptions. Empty → a generic fallback is used.
@@ -443,6 +452,13 @@ func LoadConfig() (*Config, error) {
 		cfg.EvalInPipeline, _ = strconv.ParseBool(v)
 	}
 
+	// EVAL_GATES_EMBED: make eval a strict prerequisite for embedding.
+	// Default false. Fail-closed: fatal when true but no eval judge resolves
+	// (validated after the AI registry is loaded, below). CONTRACT §2.4.
+	if v := os.Getenv("EVAL_GATES_EMBED"); v != "" {
+		cfg.EvalGatesEmbed, _ = strconv.ParseBool(v)
+	}
+
 	// ASR_SERVERS is best-effort, like LIBRARY_COLLECTIONS: a parse error logs a
 	// warning and degrades to "no configured servers" (the page then lists only
 	// observed runners) rather than blocking startup on a cosmetic list.
@@ -462,6 +478,33 @@ func LoadConfig() (*Config, error) {
 	// critical path and a silent degrade would cause invisible embed failures.
 	if err := cfg.loadAIRegistry(); err != nil {
 		return nil, err
+	}
+
+	// Fail-closed: EVAL_GATES_EMBED=true requires BOTH an eval chat endpoint AND
+	// EVAL_IN_PIPELINE=true. The gate makes eval a strict prerequisite for embed,
+	// and the eval pass only runs (the judge is only built) when EVAL_IN_PIPELINE
+	// is set. Reaching the worker with gate=true + judge=nil would either stall
+	// the corpus (no transcript ever embeds) or, worse, latch eval_finished_at
+	// with zero findings and call w.judge.Model() on a nil judge → panic. We
+	// fail at startup instead. Mirror the §2.14 malformed-registry fatal posture.
+	// CONTRACT §2.4.
+	if cfg.EvalGatesEmbed {
+		// 1. An eval chat endpoint must resolve (registry role or EVAL_CHAT_* env).
+		_, haveEndpoint := cfg.EvalEndpoint()
+		if !haveEndpoint {
+			haveEndpoint = os.Getenv("EVAL_CHAT_BASE_URL") != "" && os.Getenv("EVAL_CHAT_MODEL") != ""
+		}
+		if !haveEndpoint {
+			return nil, fmt.Errorf("EVAL_GATES_EMBED=true requires an eval chat endpoint: " +
+				"set AI_ROLES[\"eval\"] in AI_ENDPOINTS or set EVAL_CHAT_BASE_URL + EVAL_CHAT_MODEL")
+		}
+		// 2. The eval pass must be enabled, otherwise the judge is never built and
+		//    the gated worker would run with a nil judge.
+		if !cfg.EvalInPipeline {
+			return nil, fmt.Errorf("EVAL_GATES_EMBED=true requires EVAL_IN_PIPELINE=true: " +
+				"the gate makes eval a strict prerequisite for embedding, and the eval " +
+				"judge is only built when EVAL_IN_PIPELINE=true")
+		}
 	}
 
 	cfg.Debug = parseBoolEnv("DEBUG")
@@ -614,6 +657,8 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("ABS Library ID", "value", c.ABSLibraryID)
 	logger.Debug("ASR Servers", "count", len(c.ASRServers))
 	logger.Debug("AI Endpoints", "count", len(c.AIEndpoints))
+	logger.Debug("Eval In Pipeline", "value", c.EvalInPipeline)
+	logger.Debug("Eval Gates Embed", "value", c.EvalGatesEmbed)
 	if emb, ok := c.EmbeddingsEndpoint(); ok {
 		logger.Debug("Embeddings endpoint (resolved)", "id", emb.ID, "model", emb.Model, "baseURL", emb.BaseURL)
 	}
