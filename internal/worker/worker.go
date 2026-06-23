@@ -259,56 +259,14 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		RunnerHost: db.HostGoWorker,
 	})
 
-	chunkSize := cfg.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 512
-	}
-
-	var chunks []db.Chunk
-
-	if len(t.Segments) == 0 {
-		// Fallback: raw-text chunking with zero timestamps.
-		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
-			"transcript_id", t.ID)
-		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
-		if len(texts) == 0 {
-			return fmt.Errorf("no chunks produced for transcript %s", t.ID)
-		}
-		chunks = make([]db.Chunk, len(texts))
-		for i, text := range texts {
-			chunks[i] = db.Chunk{
-				TranscriptID: t.ID,
-				FilePath:     t.FilePath,
-				ChunkIndex:   i,
-				StartSec:     0,
-				EndSec:       0,
-				Text:         text,
-				// Speaker remains nil
-			}
-		}
-	} else {
-		// Preferred path: accumulate whole segments until the token budget is
-		// exhausted, then emit a chunk with accurate timestamps and speaker.
-		chunks = buildChunksFromSegments(t, chunkSize)
-		if len(chunks) == 0 {
-			return fmt.Errorf("no chunks produced from segments for transcript %s", t.ID)
-		}
-	}
-
-	// Pre-assign chunk UUIDs so the in-pipeline eval below can attribute findings
-	// to chunks before they are inserted. When EvalGatesEmbed is on, use
-	// deterministic UUIDs (UUIDv5 over transcript_id+chunk_index) so the eval
-	// pass and the embed pass produce the same IDs without coordination —
-	// findings written in a prior eval pass reference the same chunk rows the
-	// embed pass will insert. CONTRACT §1.5.
-	if w.evalGatesEmbed {
-		for i := range chunks {
-			chunks[i].ID = db.ChunkUUID(t.ID, chunks[i].ChunkIndex)
-		}
-	} else {
-		for i := range chunks {
-			chunks[i].ID = uuid.NewString()
-		}
+	// Single-sourced chunking. When EvalGatesEmbed is on, use deterministic
+	// UUIDs (UUIDv5 over transcript_id+chunk_index) so the eval pass and the
+	// embed pass produce the same IDs without coordination — findings written in
+	// a prior eval pass reference the same chunk rows the embed pass will insert.
+	// CONTRACT §1.5.
+	chunks, err := w.chunkTranscript(t, cfg.ChunkSize, w.evalGatesEmbed)
+	if err != nil {
+		return err
 	}
 
 	// In-pipeline eval (repositioned per the batched-pipeline design): judge the
@@ -391,51 +349,22 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 //  3. Persists findings.
 //  4. Writes eval_finished_at (the embed-gate latch, CONTRACT §1.5).
 //
-// It does NOT embed — that is the embed pass's job. If the judge is nil
-// (EVAL_IN_PIPELINE not set alongside EVAL_GATES_EMBED), we still write
-// eval_finished_at with zero findings so the embed pass can proceed; the
-// startup warning in config.LoadConfig already flagged the misconfiguration.
+// It does NOT embed — that is the embed pass's job. The gate's fail-closed
+// startup validation (config.LoadConfig) guarantees a judge is built whenever
+// EVAL_GATES_EMBED=true, so w.judge is non-nil here; the nil-guard below is
+// belt-and-suspenders so a future caller that reaches this with judge=nil still
+// writes the latch (with zero findings) instead of panicking.
 func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 	if t.RawText == "" {
 		return fmt.Errorf("transcript %s has empty raw text, skipping", t.ID)
 	}
 	w.log.Info("eval pass: judging transcript", "file", t.FilePath, "transcript_id", t.ID)
 
-	chunkSize := cfg.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 512
-	}
-
-	var chunks []db.Chunk
-	if len(t.Segments) == 0 {
-		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
-			"transcript_id", t.ID)
-		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
-		if len(texts) == 0 {
-			return fmt.Errorf("no chunks produced for transcript %s", t.ID)
-		}
-		chunks = make([]db.Chunk, len(texts))
-		for i, text := range texts {
-			chunks[i] = db.Chunk{
-				TranscriptID: t.ID,
-				FilePath:     t.FilePath,
-				ChunkIndex:   i,
-				StartSec:     0,
-				EndSec:       0,
-				Text:         text,
-			}
-		}
-	} else {
-		chunks = buildChunksFromSegments(t, chunkSize)
-		if len(chunks) == 0 {
-			return fmt.Errorf("no chunks produced from segments for transcript %s", t.ID)
-		}
-	}
-
 	// Deterministic UUIDs: same as the embed pass will produce for the same
 	// (transcript_id, chunk_index) — findings reference these IDs before insert.
-	for i := range chunks {
-		chunks[i].ID = db.ChunkUUID(t.ID, chunks[i].ChunkIndex)
+	chunks, err := w.chunkTranscript(t, cfg.ChunkSize, true)
+	if err != nil {
+		return err
 	}
 
 	evalStart := time.Now()
@@ -461,9 +390,9 @@ func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 	// Write eval_finished_at — the latch that allows the embed pass to pick this
 	// transcript up. We write it even when findings is empty (a clean transcript)
 	// or when the judge was nil (misconfiguration fallback) so the pipeline never
-	// stalls on a latch that is never set.
+	// stalls on a latch that is never set. judgeModel() is nil-safe.
 	stats := eval.RunStats{ChunksEvaluated: len(chunks), FindingsFound: len(inlineFindings)}
-	w.recordEvalMetrics(t, stats, evalStart, evalFinished)
+	w.recordEvalMetrics(t, stats, evalStart, evalFinished, w.judgeModel())
 	w.log.Info("eval pass: finished", "file", t.FilePath, "chunks", len(chunks),
 		"findings", len(inlineFindings), "duration", evalFinished.Sub(evalStart).Round(time.Millisecond))
 	return nil
@@ -487,41 +416,11 @@ func (w *Worker) embedTranscript(cfg *config.Config, t *db.Transcript) error {
 		RunnerHost: db.HostGoWorker,
 	})
 
-	chunkSize := cfg.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 512
-	}
-
-	var chunks []db.Chunk
-	if len(t.Segments) == 0 {
-		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
-			"transcript_id", t.ID)
-		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
-		if len(texts) == 0 {
-			return fmt.Errorf("no chunks produced for transcript %s", t.ID)
-		}
-		chunks = make([]db.Chunk, len(texts))
-		for i, text := range texts {
-			chunks[i] = db.Chunk{
-				TranscriptID: t.ID,
-				FilePath:     t.FilePath,
-				ChunkIndex:   i,
-				StartSec:     0,
-				EndSec:       0,
-				Text:         text,
-			}
-		}
-	} else {
-		chunks = buildChunksFromSegments(t, chunkSize)
-		if len(chunks) == 0 {
-			return fmt.Errorf("no chunks produced from segments for transcript %s", t.ID)
-		}
-	}
-
 	// Deterministic UUIDs — must match what the eval pass assigned to these
 	// chunks so findings reference the correct chunk rows after insert.
-	for i := range chunks {
-		chunks[i].ID = db.ChunkUUID(t.ID, chunks[i].ChunkIndex)
+	chunks, err := w.chunkTranscript(t, cfg.ChunkSize, true)
+	if err != nil {
+		return err
 	}
 
 	texts := make([]string, len(chunks))
@@ -622,7 +521,7 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 	// chunk set maps cleanly to this one job (t.JobID), so the run_metrics eval
 	// slice attribution is unambiguous. Best-effort — a metrics write must not
 	// fail the embed step (eval is advisory).
-	w.recordEvalMetrics(t, stats, evalStart, evalFinished)
+	w.recordEvalMetrics(t, stats, evalStart, evalFinished, w.judgeModel())
 	w.appendEvent(db.PipelineEvent{
 		JobID:      t.JobID,
 		FilePath:   t.FilePath,
@@ -650,15 +549,27 @@ func (w *Worker) appendEvent(e db.PipelineEvent) {
 	}
 }
 
+// judgeModel returns the eval judge's model id, or "" when no judge is
+// configured. Nil-safe: callers can record eval metrics in the (validated-out,
+// but defensively handled) judge=nil case without dereferencing a nil judge.
+func (w *Worker) judgeModel() string {
+	if w.judge == nil {
+		return ""
+	}
+	return w.judge.Model()
+}
+
 // recordEvalMetrics UPSERTs the eval worker's slice of run_metrics for a
 // transcript's job (CONTRACT §1.5). eval_finished_at is the per-job eval-
-// completion marker. Best-effort: a DB error is logged and swallowed.
-func (w *Worker) recordEvalMetrics(t *db.Transcript, stats eval.RunStats, started, finished time.Time) {
+// completion marker. The model is passed in (computed nil-safely by the caller
+// via judgeModel) so this never dereferences a nil judge. Best-effort: a DB
+// error is logged and swallowed.
+func (w *Worker) recordEvalMetrics(t *db.Transcript, stats eval.RunStats, started, finished time.Time, model string) {
 	m := db.EvalMetrics{
 		JobID:      t.JobID,
 		StartedAt:  started,
 		FinishedAt: finished,
-		Model:      w.judge.Model(),
+		Model:      model,
 		Chunks:     stats.ChunksEvaluated,
 		Skipped:    stats.ChunksSkipped,
 		Findings:   stats.FindingsFound,
@@ -826,6 +737,69 @@ func buildChunksFromSegments(t *db.Transcript, chunkSize int) []db.Chunk {
 	flushChunk()
 
 	return chunks
+}
+
+// chunkTranscript is the single-source chunking contract shared by the ungated
+// single-pass (processTranscript) and the gated two-pass (evalTranscript /
+// embedTranscript) flows. Keeping all three on this one helper guarantees the
+// eval pass and the embed pass produce byte-identical chunk text and indices
+// (and, when deterministicIDs is true, identical chunk IDs) so findings written
+// in the eval pass reference the exact chunk rows the embed pass inserts.
+//
+// Chunking strategy:
+//   - With segments (NeMo Parakeet output): accumulate whole segments until the
+//     token budget is reached, preserving start/end timestamps and dominant
+//     speaker (buildChunksFromSegments).
+//   - Without segments (legacy/missing diarization): raw-text token chunking with
+//     zero timestamps and no speaker.
+//
+// IDs: when deterministicIDs is true, each chunk gets a UUIDv5 over
+// (transcript_id, chunk_index) — stable across passes and worker restarts. When
+// false, each chunk gets a fresh random UUID (ungated path, single insert).
+//
+// Returns an error when no chunks are produced (empty raw text or empty segment
+// text) so the caller can skip the transcript rather than embed nothing.
+func (w *Worker) chunkTranscript(t *db.Transcript, chunkSize int, deterministicIDs bool) ([]db.Chunk, error) {
+	if chunkSize <= 0 {
+		chunkSize = 512
+	}
+
+	var chunks []db.Chunk
+	if len(t.Segments) == 0 {
+		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
+			"transcript_id", t.ID)
+		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
+		if len(texts) == 0 {
+			return nil, fmt.Errorf("no chunks produced for transcript %s", t.ID)
+		}
+		chunks = make([]db.Chunk, len(texts))
+		for i, text := range texts {
+			chunks[i] = db.Chunk{
+				TranscriptID: t.ID,
+				FilePath:     t.FilePath,
+				ChunkIndex:   i,
+				StartSec:     0,
+				EndSec:       0,
+				Text:         text,
+				// Speaker remains nil
+			}
+		}
+	} else {
+		chunks = buildChunksFromSegments(t, chunkSize)
+		if len(chunks) == 0 {
+			return nil, fmt.Errorf("no chunks produced from segments for transcript %s", t.ID)
+		}
+	}
+
+	for i := range chunks {
+		if deterministicIDs {
+			chunks[i].ID = db.ChunkUUID(t.ID, chunks[i].ChunkIndex)
+		} else {
+			chunks[i].ID = uuid.NewString()
+		}
+	}
+
+	return chunks, nil
 }
 
 // Stop signals the worker to shut down and waits for it to finish.

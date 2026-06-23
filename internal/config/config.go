@@ -480,23 +480,30 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	// Fail-closed: EVAL_GATES_EMBED=true without an eval endpoint is a
-	// misconfiguration — it would silently stall the corpus (no transcript can
-	// ever be embedded). Mirror the §2.14 malformed-registry fatal posture.
+	// Fail-closed: EVAL_GATES_EMBED=true requires BOTH an eval chat endpoint AND
+	// EVAL_IN_PIPELINE=true. The gate makes eval a strict prerequisite for embed,
+	// and the eval pass only runs (the judge is only built) when EVAL_IN_PIPELINE
+	// is set. Reaching the worker with gate=true + judge=nil would either stall
+	// the corpus (no transcript ever embeds) or, worse, latch eval_finished_at
+	// with zero findings and call w.judge.Model() on a nil judge → panic. We
+	// fail at startup instead. Mirror the §2.14 malformed-registry fatal posture.
 	// CONTRACT §2.4.
 	if cfg.EvalGatesEmbed {
-		if _, ok := cfg.EvalEndpoint(); !ok {
-			// Check standalone EVAL_CHAT_* env vars as a fallback signal before
-			// failing — if they're set the judge will resolve at worker construction.
-			if os.Getenv("EVAL_CHAT_BASE_URL") == "" || os.Getenv("EVAL_CHAT_MODEL") == "" {
-				return nil, fmt.Errorf("EVAL_GATES_EMBED=true requires an eval chat endpoint: " +
-					"set AI_ROLES[\"eval\"] in AI_ENDPOINTS or set EVAL_CHAT_BASE_URL + EVAL_CHAT_MODEL")
-			}
+		// 1. An eval chat endpoint must resolve (registry role or EVAL_CHAT_* env).
+		_, haveEndpoint := cfg.EvalEndpoint()
+		if !haveEndpoint {
+			haveEndpoint = os.Getenv("EVAL_CHAT_BASE_URL") != "" && os.Getenv("EVAL_CHAT_MODEL") != ""
 		}
+		if !haveEndpoint {
+			return nil, fmt.Errorf("EVAL_GATES_EMBED=true requires an eval chat endpoint: " +
+				"set AI_ROLES[\"eval\"] in AI_ENDPOINTS or set EVAL_CHAT_BASE_URL + EVAL_CHAT_MODEL")
+		}
+		// 2. The eval pass must be enabled, otherwise the judge is never built and
+		//    the gated worker would run with a nil judge.
 		if !cfg.EvalInPipeline {
-			logger.Warn("EVAL_GATES_EMBED=true but EVAL_IN_PIPELINE=false — " +
-				"the eval pass is disabled so the embed pass will find nothing to embed; " +
-				"set EVAL_IN_PIPELINE=true alongside EVAL_GATES_EMBED=true")
+			return nil, fmt.Errorf("EVAL_GATES_EMBED=true requires EVAL_IN_PIPELINE=true: " +
+				"the gate makes eval a strict prerequisite for embedding, and the eval " +
+				"judge is only built when EVAL_IN_PIPELINE=true")
 		}
 	}
 

@@ -716,7 +716,13 @@ func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error
 // re-judge transcripts that are already embedded (they are handled by
 // earmark eval --backfill-unevaluated).
 func (db *DB) GetUnevaluatedTranscripts(ctx context.Context) ([]*Transcript, error) {
-	rows, err := db.pool.Query(ctx, `
+	return db.getUnevaluatedTranscripts(ctx, db.pool)
+}
+
+// unevaluatedTranscriptsSQL is the eval-pass selection: done jobs, NOT embedded
+// (no transcript_chunks), NOT eval'd (no run_metrics row with eval_finished_at).
+// Exported as a package var so the execution-level test can match it exactly.
+const unevaluatedTranscriptsSQL = `
 		SELECT t.id, t.job_id, t.file_path, t.checksum,
 		       t.language, t.duration_seconds, t.speaker_count,
 		       t.segments, t.raw_text, t.model_name, t.created_at
@@ -731,12 +737,14 @@ func (db *DB) GetUnevaluatedTranscripts(ctx context.Context) ([]*Transcript, err
 		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
 		  )
 		ORDER BY t.created_at ASC
-	`)
+	`
+
+func (db *DB) getUnevaluatedTranscripts(ctx context.Context, q rowQuerier) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, unevaluatedTranscriptsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("query unevaluated transcripts: %w", err)
 	}
-	defer rows.Close()
-	return scanTranscriptRows(rows)
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
 }
 
 // GetEvaluatedUnembeddedTranscripts returns done transcripts that have been
@@ -748,7 +756,14 @@ func (db *DB) GetUnevaluatedTranscripts(ctx context.Context) ([]*Transcript, err
 // embeds it and it becomes searchable. eval_finished_at IS NOT NULL is the
 // hand-off latch that separates the eval pass from the embed pass.
 func (db *DB) GetEvaluatedUnembeddedTranscripts(ctx context.Context) ([]*Transcript, error) {
-	rows, err := db.pool.Query(ctx, `
+	return db.getEvaluatedUnembeddedTranscripts(ctx, db.pool)
+}
+
+// evaluatedUnembeddedTranscriptsSQL is the embed-pass selection: done jobs that
+// ARE eval'd (run_metrics.eval_finished_at IS NOT NULL) and NOT embedded (no
+// transcript_chunks). Exported as a package const so the execution-level test
+// can match it exactly.
+const evaluatedUnembeddedTranscriptsSQL = `
 		SELECT t.id, t.job_id, t.file_path, t.checksum,
 		       t.language, t.duration_seconds, t.speaker_count,
 		       t.segments, t.raw_text, t.model_name, t.created_at
@@ -761,12 +776,14 @@ func (db *DB) GetEvaluatedUnembeddedTranscripts(ctx context.Context) ([]*Transcr
 		    SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
 		  )
 		ORDER BY t.created_at ASC
-	`)
+	`
+
+func (db *DB) getEvaluatedUnembeddedTranscripts(ctx context.Context, q rowQuerier) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, evaluatedUnembeddedTranscriptsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("query evaluated unembedded transcripts: %w", err)
 	}
-	defer rows.Close()
-	return scanTranscriptRows(rows)
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
 }
 
 // scanTranscriptRows scans a pgx.Rows result into []*Transcript. Shared by
@@ -2853,8 +2870,7 @@ func (db *DB) GetUnevaluatedJobTranscripts(ctx context.Context) ([]*Transcript, 
 	if err != nil {
 		return nil, fmt.Errorf("query unevaluated job transcripts: %w", err)
 	}
-	defer rows.Close()
-	return scanTranscriptRows(rows)
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
 }
 
 // GetEvalChunksForBook returns the chunks whose file_path contains substr
