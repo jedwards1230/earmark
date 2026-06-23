@@ -1977,12 +1977,27 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 		}
 		data.Lifecycle = computePipelineLifecycle(stats, phase, primaryArbiter, gpuProbed, s.evalInPipeline)
 		data.PrimaryArbiter = primaryArbiter
-		// Override the default SubText with the lifecycle-aware message so the
-		// Pipeline page never says "IDLE" while the GPU is still committed.
-		if data.Lifecycle.WindingDown() && data.StateClass == "state-idle" {
+		// Override the default SubText (and, when needed, the RUNNING-but-transcribing
+		// label) with the lifecycle-aware message so the Pipeline page is honest about
+		// which stage owns the GPU. The base state machine only knows the ASR runner's
+		// claim heartbeat, so once transcribe drains it either says "IDLE" (heartbeat
+		// gone) or "RUNNING … is transcribing" (heartbeat fresh) — both wrong while the
+		// eval judge owns the GPU. The lifecycle knows better.
+		switch {
+		case data.Lifecycle.Activity == activityEvaluating && stats.Pending == 0 && stats.Claimed == 0:
+			// Transcribe drained; the eval judge is the one on the GPU. Relabel so the
+			// state line stops claiming the runner "is transcribing".
+			data.StateLabel, data.StateClass, data.DotClass = "WINDING DOWN", "state-running", "green"
+			data.SubText = "Winding down — GPU still working (eval)"
+		case data.Lifecycle.WindingDown() && data.StateClass == "state-idle":
 			data.SubText = "Winding down — GPU still working (eval / embed)"
-		} else if data.Lifecycle.FullyDone && !data.Lifecycle.GPUCommitted {
+		case data.Lifecycle.FullyDone && !data.Lifecycle.GPUCommitted:
 			data.SubText = "Idle — safe to walk away"
+			if data.Lifecycle.GPUProbed && data.PrimaryArbiter.VRAMUsedMB != nil && *data.PrimaryArbiter.VRAMUsedMB > 1024 {
+				// Idle but the models are still resident in VRAM — the "why is 29 GB
+				// occupied while idle" answer surfaces right on the state line.
+				data.SubText = "Idle — safe to walk away · models resident"
+			}
 		}
 	}
 

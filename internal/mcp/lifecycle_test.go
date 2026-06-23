@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 )
 
@@ -328,6 +331,72 @@ func TestComputePipelineLifecycle_NilStats(t *testing.T) {
 	}
 	if !lc.FullyDone {
 		t.Errorf("nil stats: FullyDone should be true (nothing to do)")
+	}
+}
+
+// TestDemoLifecycleScenariosRender drives the full /status/data fragment through
+// the demo DB + demo GPU prober for the two pipeline-lifecycle scenarios, so the
+// "winding down — GPU still working" and "idle · models resident" states stay
+// renderable (CLAUDE.md requires every UI path be visually checkable via demo).
+func TestDemoLifecycleScenariosRender(t *testing.T) {
+	tests := []struct {
+		scenario     string
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			scenario: "winddown",
+			wantContains: []string{
+				"WINDING DOWN", // relabeled state line
+				"Winding down — GPU still working (eval)", // honest subtext
+				"active on GPU",   // marker under the Eval stage
+				"Models Resident", // GPU resident card
+			},
+			// Must NOT claim the runner is transcribing — transcribe has drained.
+			wantAbsent: []string{"is transcribing"},
+		},
+		{
+			scenario: "idle",
+			wantContains: []string{
+				"IDLE",
+				"safe to walk away",
+				"models resident", // the "why is 29 GB occupied while idle" answer
+				"Models Resident",
+			},
+			wantAbsent: []string{"Winding down"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.scenario, func(t *testing.T) {
+			cfg := &config.Config{
+				ASRServers:     demoServersFor(tc.scenario),
+				AIEndpoints:    demoAIEndpoints,
+				AIRoles:        demoAIRoles,
+				EvalInPipeline: true,
+			}
+			srv := NewMCPServer(demoDB{scenario: tc.scenario, paused: new(bool)}, cfg)
+			srv.prober = demoGPUProber{scenario: tc.scenario}
+			srv.endpointProber = demoEndpointProber{}
+			h := srv.buildMux()
+
+			req := httptest.NewRequest(http.MethodGet, "/status/data", nil)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			out := w.Body.String()
+			for _, want := range tc.wantContains {
+				if !containsStr(out, want) {
+					t.Errorf("fragment missing %q", want)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if containsStr(out, absent) {
+					t.Errorf("fragment unexpectedly contains %q", absent)
+				}
+			}
+		})
 	}
 }
 
