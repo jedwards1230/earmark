@@ -1,6 +1,10 @@
 package mcp
 
-import "github.com/jedwards1230/earmark/internal/db"
+import (
+	"html/template"
+
+	"github.com/jedwards1230/earmark/internal/db"
+)
 
 // barSegID identifies one segment of the pipeline bar in pipeline order.
 // The order determines left-to-right visual position in the stacked bar.
@@ -17,11 +21,11 @@ const (
 // barSeg is one rendered segment of the pipeline bar.
 type barSeg struct {
 	ID     barSegID
-	Label  string // human label for the legend
-	Color  string // CSS custom property, e.g. "var(--pp-not-started)"
-	Count  int    // raw track count
-	Pct    int    // integer percent width (0–100); 0 means omit the segment
-	Status string // ?status= filter value for the legend link
+	Label  string       // human label for the legend
+	Color  template.CSS // CSS custom property, e.g. "var(--pp-not-started)"; typed template.CSS so html/template trusts the var() in a style attr (a plain string is sanitized to ZgotmplZ)
+	Count  int          // raw track count
+	Pct    int          // integer percent width (0–100); 0 means omit the segment
+	Status string       // ?status= filter value for the legend link
 }
 
 // pipelineBarData is the fully-computed bar model passed to the template.
@@ -67,11 +71,11 @@ func computePipelineBar(b db.PipelineBuckets, evalCoverageDone int) pipelineBarD
 
 	// Raw segment definitions (pipeline order).
 	raw := []barSeg{
-		{ID: segNotStarted, Label: "not started", Color: "var(--pp-not-started)", Count: b.Pending, Status: "pending"},
-		{ID: segTranscribing, Label: "transcribing", Color: "var(--pp-transcribing)", Count: b.Claimed, Status: "claimed"},
-		{ID: segTranscribedOnly, Label: "transcribed (awaiting embed)", Color: "var(--pp-transcribed)", Count: b.TranscribedOnly, Status: "done"},
-		{ID: segEvaldOnly, Label: "eval'd (awaiting embed)", Color: "var(--pp-evald)", Count: b.EvaldOnly, Status: "done"},
-		{ID: segEmbeddedReady, Label: "ready / searchable", Color: "var(--pp-ready)", Count: b.EmbeddedReady, Status: "done"},
+		{ID: segNotStarted, Label: "not started", Color: template.CSS("var(--pp-not-started)"), Count: b.Pending, Status: "pending"},
+		{ID: segTranscribing, Label: "transcribing", Color: template.CSS("var(--pp-transcribing)"), Count: b.Claimed, Status: "claimed"},
+		{ID: segTranscribedOnly, Label: "transcribed (awaiting embed)", Color: template.CSS("var(--pp-transcribed)"), Count: b.TranscribedOnly, Status: "done"},
+		{ID: segEvaldOnly, Label: "eval'd (awaiting embed)", Color: template.CSS("var(--pp-evald)"), Count: b.EvaldOnly, Status: "done"},
+		{ID: segEmbeddedReady, Label: "ready / searchable", Color: template.CSS("var(--pp-ready)"), Count: b.EmbeddedReady, Status: "done"},
 	}
 
 	// Compute raw integer percents (truncating division = largest-remainder base).
