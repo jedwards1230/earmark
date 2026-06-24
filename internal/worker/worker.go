@@ -46,8 +46,14 @@ type DBInterface interface {
 	AppendEvent(ctx context.Context, e db.PipelineEvent) error
 	// GetPipelinePhase reports the batched-pipeline phase (CONTRACT §1.4). The
 	// embed worker idles during the "transcribe" phase (ASR owns the GPU) and
-	// processes normally for "idle"/"analyze"/NULL.
+	// processes normally for "idle"/"analyze"/NULL. The worker ALSO idles when
+	// GetPaused reports true — paused is a global stop that gates the embed
+	// worker too, independent of phase (CONTRACT §1.4).
 	GetPipelinePhase(ctx context.Context) (string, error)
+	// GetPaused reports the global pause flag (CONTRACT §1.4). When true the embed
+	// worker idles each cycle (global stop) — this is what makes the dashboard
+	// PAUSED banner truthful. Independent of phase; checked before the phase gate.
+	GetPaused(ctx context.Context) (bool, error)
 	// InsertFindings persists eval findings — used only by the in-pipeline eval
 	// path (EvalInPipeline). *db.DB already satisfies this (it is the eval
 	// FindingWriter).
@@ -142,6 +148,22 @@ func (w *Worker) Start(cfg *config.Config) {
 				}
 			}
 			lastStale = time.Now()
+		}
+
+		// Pause gate (CONTRACT §1.4): paused is a global stop. When set (the
+		// dashboard Pause button), the embed worker idles too — not just the ASR
+		// runner — so the PAUSED banner is truthful (embeddings stop). Checked
+		// before the phase gate and independent of it. A read error defaults to
+		// NOT paused (process) + logs, so a DB hiccup never wedges the worker.
+		paused, err := w.db.GetPaused(w.ctx)
+		if err != nil {
+			w.log.Error("read pause flag failed; defaulting to not paused (processing)", "error", err)
+			paused = false
+		}
+		if paused {
+			w.log.Debug("pipeline paused; embed worker idling this cycle")
+			w.sleep(pollInterval)
+			continue
 		}
 
 		// Phase gate (CONTRACT §1.4): during the ASR-only "transcribe" phase the

@@ -59,6 +59,10 @@ type fakeDB struct {
 	// "idle" so existing tests are unaffected. phaseErr forces a read error.
 	phase    string
 	phaseErr error
+	// paused is returned by GetPaused. The zero value (false) keeps existing
+	// tests unaffected. pausedErr forces a read error.
+	paused    bool
+	pausedErr error
 	// getCompletedCalls counts GetCompletedTranscripts invocations so the phase
 	// gate can be observed: in the "transcribe" phase the worker idles BEFORE
 	// polling, so the count stays 0.
@@ -174,6 +178,15 @@ func (f *fakeDB) GetPipelinePhase(_ context.Context) (string, error) {
 		return db.PhaseIdle, nil
 	}
 	return f.phase, nil
+}
+
+func (f *fakeDB) GetPaused(_ context.Context) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pausedErr != nil {
+		return false, f.pausedErr
+	}
+	return f.paused, nil
 }
 
 func (f *fakeDB) InsertFindings(_ context.Context, findings []db.Finding) error {
@@ -745,5 +758,67 @@ func TestStart_PhaseReadErrorDefaultsToProcessing(t *testing.T) {
 		return fdb.chunkCount() > 0
 	}, 2*time.Second, 10*time.Millisecond,
 		"a phase-read error must default to processing, not idle/wedge")
+	w.Stop()
+}
+
+// ─── Pause gate (CONTRACT §1.4 — global stop) ────────────────────────────────
+
+func TestStart_PausedSkipsProcessing(t *testing.T) {
+	// paused==true is a global stop: the embed worker idles regardless of phase
+	// or backlog. It must NOT poll for completed transcripts and must NOT insert
+	// any chunks, even though one is available and the phase is processable. This
+	// is what makes the dashboard PAUSED banner truthful (embeddings stop).
+	for _, phase := range []string{"", db.PhaseIdle, db.PhaseAnalyze} {
+		t.Run("phase="+phase, func(t *testing.T) {
+			fdb := &fakeDB{
+				paused: true,
+				phase:  phase,
+				transcripts: []*db.Transcript{
+					{ID: "tid-paused", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."},
+				},
+			}
+			w := startWorkerWith(fdb)
+			time.Sleep(150 * time.Millisecond) // let the first cycle run + hit the gate
+			w.Stop()
+
+			require.Zero(t, fdb.completedCalls(), "paused must idle before polling transcripts")
+			require.Zero(t, fdb.chunkCount(), "paused must not process/insert chunks")
+		})
+	}
+}
+
+func TestStart_NotPausedProcesses(t *testing.T) {
+	// paused==false with an idle/analyze phase: the worker processes as before —
+	// no regression from adding the pause gate.
+	fdb := &fakeDB{
+		paused: false,
+		phase:  db.PhaseAnalyze,
+		transcripts: []*db.Transcript{
+			{ID: "tid-go", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."},
+		},
+	}
+	w := startWorkerWith(fdb)
+	require.Eventually(t, func() bool {
+		return fdb.chunkCount() > 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"not paused must process transcripts (chunks inserted)")
+	w.Stop()
+	require.Positive(t, fdb.completedCalls(), "not paused must poll for transcripts")
+}
+
+func TestStart_PauseReadErrorDefaultsToProcessing(t *testing.T) {
+	// A pause-read DB error must default to NOT paused (process) — never wedge the
+	// worker. The transcript is still polled and embedded.
+	fdb := &fakeDB{
+		pausedErr: fmt.Errorf("runner_control unavailable"),
+		transcripts: []*db.Transcript{
+			{ID: "tid-perr", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world test transcript."},
+		},
+	}
+	w := startWorkerWith(fdb)
+	require.Eventually(t, func() bool {
+		return fdb.chunkCount() > 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"a pause-read error must default to processing, not paused/wedge")
 	w.Stop()
 }

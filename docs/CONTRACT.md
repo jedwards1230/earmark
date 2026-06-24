@@ -277,18 +277,29 @@ INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NO
   non-default values let a single GPU host a large ASR model **or** a large eval
   judge, never both at once. The column is gated by a CHECK to the closed set
   `{idle, transcribe, analyze}`; `NULL`/`idle` are equivalent and `idle` is
-  stored as `NULL`. `paused`/`run_limit` and `phase` are **independent axes**: a
-  paused pipeline in `transcribe` phase claims nothing AND idles the worker.
+  stored as `NULL`. `paused`/`run_limit` and `phase` are **independent axes**:
+  `paused` is a **global stop** (it gates the ASR runner AND the Go embed worker,
+  regardless of phase), while `phase` is the batched selector used during normal
+  (non-paused) operation. So a paused pipeline in `transcribe` phase claims
+  nothing AND idles the worker — and a paused pipeline in any phase idles the
+  worker. The `earmark batch` coordinator orchestrates via `run_limit` + `phase`
+  and **never** sets `paused`, so batched transcribe/analyze are unaffected by
+  the pause gate.
 
-**Phase semantics (worker gate):** the Go embed worker reads `phase` at the top
-of each poll cycle. When `phase = 'transcribe'` it SKIPS that cycle (idles for
-the poll interval, processes nothing) so the ASR runner has the GPU to itself.
-For `'idle'`/`'analyze'`/`NULL` it processes completed transcripts as usual. A
-phase-read error defaults to `'idle'` (process) and is logged — a DB hiccup must
-never wedge the worker. A missing row is treated as `'idle'`. With `phase` left
-`NULL` the pipeline behaves exactly as before (both stages run concurrently);
-the **`earmark batch` coordinator** (below) is what flips `phase` to orchestrate
-transcribe- and analyze-batches.
+**Phase semantics (worker gate):** the Go embed worker checks the global
+`paused` flag, then `phase`, at the top of each poll cycle. When `paused` is set
+(the dashboard Pause button — a global stop) it SKIPS that cycle no matter the
+phase, so the dashboard PAUSED banner is truthful (embeddings actually stop).
+Otherwise, when `phase = 'transcribe'` it SKIPS that cycle (idles for the poll
+interval, processes nothing) so the ASR runner has the GPU to itself; for
+`'idle'`/`'analyze'`/`NULL` it processes completed transcripts as usual. A
+pause-read error defaults to NOT paused (process) and a phase-read error
+defaults to `'idle'` (process); both are logged — a DB hiccup must never wedge
+the worker. A missing row is treated as not-paused / `'idle'`. With `paused`
+false and `phase` left `NULL` the pipeline behaves exactly as before (both
+stages run concurrently); the **`earmark batch` coordinator** (below) is what
+flips `phase` to orchestrate transcribe- and analyze-batches, and it never sets
+`paused`.
 
 **The `earmark batch` coordinator.** A standalone, hardware-agnostic command
 that runs the pipeline in batches so the ASR model and the eval-judge LLM
