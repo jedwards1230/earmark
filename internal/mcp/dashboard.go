@@ -492,8 +492,12 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
       <span class="lc-name">Embed</span>
     </div>
     {{if gt $lc.EmbedBacklog 0}}
-    <div class="lc-count">{{commafy $lc.EmbedBacklog}} backlog</div>
+    <div class="lc-count">{{commafy $lc.EmbedBacklog}} backlog{{if .Stats.Paused}} &middot; paused{{end}}</div>
+    {{if .Stats.Paused}}
+    <div class="lc-bar-wrap"><div class="lc-bar"><div class="lc-bar-fill" style="width:{{$lc.EmbedReadyPct}}%"></div></div></div>
+    {{else}}
     <div class="lc-bar-wrap"><div class="lc-bar lc-bar-indeterminate"></div></div>
+    {{end}}
     {{else}}
     <div class="lc-count">&#10003; clear</div>
     {{end}}
