@@ -211,6 +211,24 @@ func (lc pipelineLifecycle) EvalCoverageDisplay(done int) string {
 	return commafy(evalDone) + " / " + commafy(done)
 }
 
+// EmbedReadyPct returns the integer percentage (0–100) of tracks that have
+// reached the terminal embedded-ready state. This is the raw EmbeddedReady /
+// total share — the same quantity the green segEmbeddedReady segment represents
+// on the wider pipeline bar (computePipelineBar's total in bar.go) — without
+// that bar's min-width redistribution. Used for the Embed card's static fill
+// when the pipeline is paused. Returns 0 when there are no tracks. Exported for
+// template use.
+func (lc pipelineLifecycle) EmbedReadyPct() int {
+	// Mirror computePipelineBar's denominator (bar.go): the non-failed track
+	// total. NotStarted already includes claimed/transcribing, so it is not
+	// added again here.
+	total := lc.NotStarted + lc.TranscribedOnly + lc.EvaldOnly + lc.EmbeddedReady
+	if total <= 0 {
+		return 0
+	}
+	return lc.EmbeddedReady * 100 / total
+}
+
 // EvalCoveragePct returns the integer percentage (0–100) for a progress bar.
 // Returns 0 when eval is not in-pipeline or done==0.  Exported for template use.
 func (lc pipelineLifecycle) EvalCoveragePct(done int) int {

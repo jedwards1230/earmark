@@ -293,6 +293,46 @@ func TestEvalCoveragePct(t *testing.T) {
 	}
 }
 
+func TestEmbedReadyPct(t *testing.T) {
+	tests := []struct {
+		name    string
+		lc      pipelineLifecycle
+		wantPct int
+	}{
+		{
+			name:    "no tracks → 0 (divide-by-zero guard)",
+			lc:      pipelineLifecycle{},
+			wantPct: 0,
+		},
+		{
+			name: "raw embedded-ready share matches green segment",
+			// total = NotStarted + TranscribedOnly + EvaldOnly + EmbeddedReady
+			//       = 20 + 10 + 10 + 60 = 100 → 60%.
+			lc:      pipelineLifecycle{NotStarted: 20, TranscribedOnly: 10, EvaldOnly: 10, EmbeddedReady: 60},
+			wantPct: 60,
+		},
+		{
+			name: "Transcribing is not double-counted (already in NotStarted)",
+			// NotStarted already includes the 5 claimed/transcribing tracks, so the
+			// denominator stays 100 → 60% (not diluted to ~57%).
+			lc:      pipelineLifecycle{NotStarted: 20, Transcribing: 5, TranscribedOnly: 10, EvaldOnly: 10, EmbeddedReady: 60},
+			wantPct: 60,
+		},
+		{
+			name:    "truncating division",
+			lc:      pipelineLifecycle{NotStarted: 2, EmbeddedReady: 1},
+			wantPct: 33,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.lc.EmbedReadyPct(); got != tc.wantPct {
+				t.Errorf("EmbedReadyPct() = %d, want %d", got, tc.wantPct)
+			}
+		})
+	}
+}
+
 func TestToStatusAllUnits(t *testing.T) {
 	// toStatus must collect ALL units — not stop after the first ASR unit —
 	// so the dashboard can list every resident model.

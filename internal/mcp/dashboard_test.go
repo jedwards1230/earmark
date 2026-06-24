@@ -1170,3 +1170,72 @@ func TestStatusFragmentQueueAndActivityLayout(t *testing.T) {
 		t.Error("empty queue must show the 'all caught up' message")
 	}
 }
+
+// TestEmbedCardBarPausedVsActive guards the Embed lifecycle card's bar: when the
+// pipeline is PAUSED with an embed backlog the card shows a STATIC determinate
+// fill at the embedded-ready share (matching the green segEmbeddedReady segment
+// on the strip above) — not the misleading looping shimmer. When NOT paused with
+// a backlog it keeps the indeterminate animation. With the backlog clear it shows
+// neither bar, just "✓ clear".
+func TestEmbedCardBarPausedVsActive(t *testing.T) {
+	now := time.Now()
+	stale := 30 * time.Minute
+
+	// total = Pending+Claimed + TranscribedOnly + EvaldOnly + EmbeddedReady
+	//       = 20 + 10 + 10 + 60 = 100 → embedded-ready share 60%.
+	buckets := db.PipelineBuckets{
+		Pending: 20, TranscribedOnly: 10, EvaldOnly: 10, EmbeddedReady: 60,
+	}
+
+	render := func(t *testing.T, stats *db.QueueStats) string {
+		t.Helper()
+		stats.PipelineBuckets = buckets
+		data := newStatusData(stats, nil, now, stale, "", nil)
+		// Lifecycle is normally populated in renderStatusFragment; do it here so the
+		// lc-strip Embed card renders against the same derivation.
+		data.Lifecycle = computePipelineLifecycle(stats, "", arbiterStatus{}, false, false)
+		var buf bytes.Buffer
+		if err := statusFragmentTmpl.Execute(&buf, data); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		return buf.String()
+	}
+
+	t.Run("paused with backlog → static fill, no shimmer", func(t *testing.T) {
+		out := render(t, &db.QueueStats{
+			Paused: true, TotalJobs: 100, Done: 80, EmbedBacklog: 5,
+		})
+		if strings.Contains(out, "lc-bar-indeterminate") {
+			t.Error("paused embed card must NOT animate the indeterminate bar")
+		}
+		if !strings.Contains(out, "lc-bar-fill") {
+			t.Error("paused embed card must render a static determinate fill")
+		}
+		if !strings.Contains(out, "width:60%") {
+			t.Errorf("paused embed fill should be the embedded-ready share (60%%):\n%s", out)
+		}
+	})
+
+	t.Run("active with backlog → indeterminate shimmer", func(t *testing.T) {
+		out := render(t, &db.QueueStats{
+			TotalJobs: 100, Done: 80, EmbedBacklog: 5,
+		})
+		if !strings.Contains(out, "lc-bar-indeterminate") {
+			t.Error("active embed card with a backlog must keep the looping shimmer")
+		}
+	})
+
+	t.Run("backlog clear → no bar, ✓ clear", func(t *testing.T) {
+		out := render(t, &db.QueueStats{
+			Paused: true, TotalJobs: 100, Done: 100, EmbedBacklog: 0,
+		})
+		if strings.Contains(out, "lc-bar-indeterminate") {
+			t.Error("cleared embed card must not show the indeterminate bar")
+		}
+		// The cleared branch renders the "✓ clear" count and no lc-bar-fill inside
+		// the Embed card; assert the clear marker is present.
+		if !strings.Contains(out, "clear") {
+			t.Errorf("cleared embed card must show the ✓ clear marker:\n%s", out)
+		}
+	})
+}
