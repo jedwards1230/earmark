@@ -71,6 +71,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
 import socket
@@ -674,9 +675,12 @@ def _should_self_update(
 ) -> bool:
     """
     Pure gate: attempt a self-update only when an operator has REQUESTED a
-    specific, different version. Returns False once running==desired (converged)
-    or after a 'failed'/'updating' attempt (no retry-loop until the button is
-    pressed again, which resets state to 'requested').
+    specific, different version. Returns True only when BOTH hold:
+      - `desired` is non-empty AND differs from `current`, AND
+      - `state` is exactly "requested".
+    Any other state ("updating"/"failed"/"success"/None) returns False, so there
+    is no retry loop after a failed/in-flight attempt — the operator must press
+    the button again (which resets state to "requested") to retry.
     """
     if not desired or desired == current:
         return False
@@ -733,6 +737,12 @@ def _set_update_state(
 def _fetch_runner_source(version: str) -> bytes:
     """Fetch runner/runner.py at the given tag from GitHub raw (outbound-only,
     public repo, no token — same provenance as the ansible get_url)."""
+    # `version` originates from the dashboard/API; a git tag or sha is the only
+    # legitimate value. Whitelist it before it reaches the URL — defence-in-depth
+    # against path traversal / URL injection even though desired_runner_version is
+    # operator-controlled behind the CONTROL_API_TOKEN gate.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+        raise RuntimeError(f"refusing to fetch invalid version string: {version!r}")
     url = (
         f"https://raw.githubusercontent.com/{RUNNER_SOURCE_REPO}/"
         f"{version}/runner/runner.py"
@@ -762,7 +772,9 @@ def _self_check_file(path: Path) -> tuple[bool, str]:
     except Exception as exc:  # subprocess failed to even launch
         return False, f"self-check could not run: {exc}"
     if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout or "non-zero exit").strip()[:500]
+        return False, (proc.stderr or proc.stdout or "non-zero exit").strip()[
+            :MAX_ERROR_LEN
+        ]
     return True, ""
 
 
@@ -813,7 +825,20 @@ def _reexec() -> None:
     swapped) runner file. systemd keeps the unit; the new process reads the new
     VERSION file and reports the new version on its next heartbeat."""
     log.info("re-execing into %s", RUNNER_INSTALL_PATH)
-    os.execv(sys.executable, [sys.executable, str(RUNNER_INSTALL_PATH)])
+    try:
+        os.execv(sys.executable, [sys.executable, str(RUNNER_INSTALL_PATH)])
+    except Exception as exc:
+        # os.execv only returns on failure. The new runner.py is already on disk,
+        # so continuing would run stale in-memory code that would misreport itself
+        # as the updated version on the next heartbeat (a false "success"). Exit
+        # instead and let systemd (Restart=on-failure) restart cleanly onto the
+        # swapped file.
+        log.critical(
+            "re-exec failed after staged self-update; exiting to avoid stale "
+            "state: %s",
+            exc,
+        )
+        sys.exit(1)
 
 
 def _maybe_self_update(conn: psycopg2.extensions.connection) -> bool:
@@ -852,15 +877,22 @@ def _maybe_self_update(conn: psycopg2.extensions.connection) -> bool:
         _perform_self_update(desired)  # type: ignore[arg-type]
     except Exception as exc:
         log.exception("self-update to %s failed", desired)
-        _set_update_state(conn, "failed", str(exc)[:500])
+        _set_update_state(conn, "failed", str(exc)[:MAX_ERROR_LEN])
         return False
 
     log.info("self-update staged (%s -> %s); re-execing", RUNNER_VERSION, desired)
+    # Clear any pending transaction before orphaning the connection across the
+    # re-exec — the process image is about to be replaced, so leave no half-open
+    # transaction behind.
+    try:
+        conn.rollback()
+    except Exception:
+        pass
     try:
         conn.close()
     except Exception:
         pass
-    _reexec()  # replaces the process image; never returns
+    _reexec()  # replaces the process image; never returns (exits on failure)
     return True  # unreachable
 
 

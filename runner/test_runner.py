@@ -253,6 +253,14 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertFalse(runner._should_self_update("v1", "v2", "failed"))     # no retry
         self.assertFalse(runner._should_self_update("v1", None, "requested"))  # nothing set
 
+    def test_fetch_rejects_invalid_version(self) -> None:
+        # `version` is interpolated into the GitHub raw URL, so a non-tag string
+        # must be refused by the whitelist BEFORE any network call — each of these
+        # raises without fetching.
+        for bad in ("../../etc/passwd", "v1/../x", "v1 2", "v1;rm -rf", "", "a\nb"):
+            with self.assertRaises(RuntimeError):
+                runner._fetch_runner_source(bad)
+
     # ── fetch → self-check → atomic swap ─────────────────────────────────────
     def test_perform_self_update_swaps_and_writes_version(self) -> None:
         with tempfile.TemporaryDirectory() as d:
