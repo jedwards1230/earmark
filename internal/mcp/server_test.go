@@ -54,6 +54,12 @@ type SimpleMockDB struct {
 	lastBookFilter db.BookFilter    // last filter passed to GetBookSummaries (asserts the all-in-Go fetch uses a high cap)
 
 	findingsList []db.FindingRow // when non-nil, ListFindings returns this set
+
+	desiredVersionSetTo string // last version passed to SetDesiredRunnerVersion
+	desiredVersionSet   bool   // SetDesiredRunnerVersion was called
+	runnerUpdateCleared bool   // ClearRunnerUpdate was called
+	runnerVersion       string // RunnerVersion reported by GetServiceStatus
+	desiredRunnerVer    string // DesiredRunnerVersion reported by GetServiceStatus
 }
 
 func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error {
@@ -67,6 +73,17 @@ func (m *SimpleMockDB) SetPaused(_ context.Context, paused bool, _ string) error
 
 func (m *SimpleMockDB) GetControl(_ context.Context) (bool, *int, error) {
 	return m.paused, m.runLimit, nil
+}
+
+func (m *SimpleMockDB) SetDesiredRunnerVersion(_ context.Context, version, _ string) error {
+	m.desiredVersionSetTo = version
+	m.desiredVersionSet = true
+	return nil
+}
+
+func (m *SimpleMockDB) ClearRunnerUpdate(_ context.Context, _ string) error {
+	m.runnerUpdateCleared = true
+	return nil
 }
 
 func (m *SimpleMockDB) GetPipelinePhase(_ context.Context) (string, error) {
@@ -308,6 +325,18 @@ func (m *SimpleMockDB) GetServiceStatus(_ context.Context) (*db.QueueStats, erro
 		RunnerActive:   true,
 		RunnerID:       runnerID,
 		LastHeartbeat:  &now,
+		RunnerVersion: func() *string {
+			if m.runnerVersion == "" {
+				return nil
+			}
+			return &m.runnerVersion
+		}(),
+		DesiredRunnerVersion: func() *string {
+			if m.desiredRunnerVer == "" {
+				return nil
+			}
+			return &m.desiredRunnerVer
+		}(),
 	}, nil
 }
 

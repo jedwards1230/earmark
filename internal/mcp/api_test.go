@@ -62,6 +62,92 @@ func TestAPIStatusNeedsNoToken(t *testing.T) {
 	}
 }
 
+func TestAPIRunnerUpdateSetsDesired(t *testing.T) {
+	mock := &SimpleMockDB{runnerVersion: "v0.32.1"}
+	h := muxWithToken(mock, testToken)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runner/update",
+		strings.NewReader(`{"version":"v0.34.0"}`))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	if !mock.desiredVersionSet || mock.desiredVersionSetTo != "v0.34.0" {
+		t.Errorf("SetDesiredRunnerVersion not called with v0.34.0: set=%v val=%q",
+			mock.desiredVersionSet, mock.desiredVersionSetTo)
+	}
+}
+
+func TestAPIRunnerUpdateEmptyClears(t *testing.T) {
+	mock := &SimpleMockDB{}
+	h := muxWithToken(mock, testToken)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runner/update",
+		strings.NewReader(`{"version":""}`))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+	if !mock.runnerUpdateCleared {
+		t.Errorf("empty version should ClearRunnerUpdate")
+	}
+	if mock.desiredVersionSet {
+		t.Errorf("empty version must not set a desired version")
+	}
+}
+
+func TestAPIRunnerUpdateFailsClosedWithoutToken(t *testing.T) {
+	// No control token configured → the mutation route fails closed (503).
+	h := buildTestMux(&SimpleMockDB{})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runner/update",
+		strings.NewReader(`{"version":"v9.9.9"}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (token unset → fail closed)", w.Code)
+	}
+}
+
+func TestAPIStatusRunnerUpdateSkew(t *testing.T) {
+	mock := &SimpleMockDB{runnerVersion: "v0.32.1", desiredRunnerVer: "v0.33.0"}
+	h := buildTestMux(mock)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	var got apiStatus
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.RunnerUpdate == nil {
+		t.Fatalf("RunnerUpdate unexpectedly nil")
+	}
+	if got.RunnerUpdate.RunningVersion != "v0.32.1" || got.RunnerUpdate.DesiredVersion != "v0.33.0" {
+		t.Errorf("versions = %+v", got.RunnerUpdate)
+	}
+	if !got.RunnerUpdate.UpdateAvailable {
+		t.Errorf("UpdateAvailable = false, want true (desired != running)")
+	}
+}
+
+func TestRunnerUpdateFromStats(t *testing.T) {
+	sp := func(s string) *string { return &s }
+	if runnerUpdateFromStats(nil, nil, nil, nil, nil) != nil {
+		t.Errorf("all-empty should yield nil (card hidden)")
+	}
+	ru := runnerUpdateFromStats(sp("v1"), sp("v1"), sp("idle"), nil, nil)
+	if ru == nil || ru.UpdateAvailable {
+		t.Errorf("running==desired must not be UpdateAvailable: %+v", ru)
+	}
+	ru = runnerUpdateFromStats(sp("v1"), sp("v2"), sp("requested"), nil, nil)
+	if ru == nil || !ru.UpdateAvailable {
+		t.Errorf("running!=desired must be UpdateAvailable: %+v", ru)
+	}
+}
+
 func TestAPIPauseGet(t *testing.T) {
 	limit := 2
 	mock := &SimpleMockDB{paused: true, runLimit: &limit}

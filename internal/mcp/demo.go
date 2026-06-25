@@ -562,6 +562,11 @@ func (d demoDB) GetControl(context.Context) (bool, *int, error) {
 
 func (d demoDB) SetRunLimit(context.Context, *int, string) error { return nil }
 
+// Runner self-update is a no-op in the demo (value receiver); the fixture renders
+// a representative skew state via GetServiceStatus instead.
+func (d demoDB) SetDesiredRunnerVersion(context.Context, string, string) error { return nil }
+func (d demoDB) ClearRunnerUpdate(context.Context, string) error               { return nil }
+
 // GetPipelinePhase reports a per-scenario coordinator phase so the read-only
 // phase badge renders a representative state with no database: the live "active"
 // scenario is mid-transcribe, the crashed-runner "stale" scenario is in the
@@ -712,6 +717,17 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 	}
 	q.Paused = d.isPaused()
 	q.RunLimit = d.runLimit
+	// Runner version-skew fixture so the /servers update card renders without a
+	// DB: the active/failed scenarios show an available update, others show the
+	// runner current (no card content beyond the running version).
+	rv := "v0.32.1"
+	q.RunnerVersion = &rv
+	if d.scenario == "" || d.scenario == "active" || d.scenario == "failed" {
+		dv := "v0.33.0"
+		st := "requested"
+		q.DesiredRunnerVersion = &dv
+		q.RunnerUpdateState = &st
+	}
 	return q, nil
 }
 

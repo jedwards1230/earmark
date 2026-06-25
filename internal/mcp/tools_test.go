@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/jedwards1230/earmark/internal/db"
-	"github.com/jedwards1230/earmark/internal/predict"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/predict"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -95,6 +95,10 @@ func (m *MockDBInterface) RequeueFailed(ctx context.Context) ([]string, error) {
 // Pause/library methods are part of DBInterface but unused by the MCP tool
 // handlers under test, so they are plain stubs (no testify expectations).
 func (m *MockDBInterface) SetPaused(context.Context, bool, string) error { return nil }
+func (m *MockDBInterface) SetDesiredRunnerVersion(context.Context, string, string) error {
+	return nil
+}
+func (m *MockDBInterface) ClearRunnerUpdate(context.Context, string) error { return nil }
 func (m *MockDBInterface) GetControl(context.Context) (bool, *int, error) {
 	return false, nil, nil
 }

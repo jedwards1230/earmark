@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -88,22 +89,49 @@ class FakeConn:
 class RunnerHeartbeatTests(unittest.TestCase):
     """_runner_heartbeat stamps runner_control every cycle, best-effort."""
 
-    def test_updates_runner_control_and_commits(self) -> None:
+    def test_updates_heartbeat_and_version_and_commits(self) -> None:
         conn = FakeConn(control_row=None, job_row=None)
         runner._runner_heartbeat(conn)
+        # The combined UPDATE stamps both liveness and the running version.
         self.assertTrue(
             any(
-                "UPDATE runner_control" in s and "runner_heartbeat_at" in s
+                "UPDATE runner_control" in s
+                and "runner_heartbeat_at" in s
+                and "runner_version" in s
                 for s, _ in conn.executed
             )
         )
         self.assertEqual(conn.commits, 1)
         self.assertEqual(conn.rollbacks, 0)
 
+    def test_falls_back_to_liveness_only_when_version_column_missing(self) -> None:
+        # First execute (combined, has runner_version) raises; the second
+        # (liveness-only) succeeds — so liveness still records.
+        class _VersionMissingCursor(FakeCursor):
+            def execute(self, sql: str, params: object = None) -> None:
+                if "runner_version" in sql:
+                    raise RuntimeError("column runner_version does not exist")
+                super().execute(sql, params)
+
+        class _Conn(FakeConn):
+            def cursor(self) -> FakeCursor:
+                return _VersionMissingCursor(self)
+
+        conn = _Conn(control_row=None, job_row=None)
+        runner._runner_heartbeat(conn)  # must not raise
+        self.assertEqual(conn.commits, 1)  # the liveness-only fallback committed
+        self.assertEqual(conn.rollbacks, 1)  # the combined attempt rolled back
+        self.assertTrue(
+            any(
+                "runner_heartbeat_at" in s and "runner_version" not in s
+                for s, _ in conn.executed
+            )
+        )
+
     def test_swallows_errors_and_rolls_back(self) -> None:
         class _BoomCursor(FakeCursor):
             def execute(self, sql: str, params: object = None) -> None:
-                raise RuntimeError("column runner_heartbeat_at does not exist")
+                raise RuntimeError("runner_control is gone")
 
         class _BoomConn(FakeConn):
             def cursor(self) -> FakeCursor:
@@ -112,7 +140,209 @@ class RunnerHeartbeatTests(unittest.TestCase):
         conn = _BoomConn(control_row=None, job_row=None)
         runner._runner_heartbeat(conn)  # must not raise
         self.assertEqual(conn.commits, 0)
-        self.assertEqual(conn.rollbacks, 1)
+        self.assertEqual(conn.rollbacks, 2)  # combined + liveness-only both fail
+
+
+# A self-contained candidate that PASSES `python <file> --self-check` without
+# importing psycopg2/nemo (so the swap's self-check works in CI).
+_GOOD_SOURCE = b"import sys\nif '--self-check' in sys.argv[1:]:\n    print('ok')\n    sys.exit(0)\n"
+# A syntactically broken candidate that FAILS --self-check (must NOT be swapped in).
+_BAD_SOURCE = b"def (:\n    pass\n"
+
+
+class _UpdCursor:
+    def __init__(self, conn: "_UpdConn") -> None:
+        self.conn = conn
+
+    def __enter__(self) -> "_UpdCursor":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self.conn.executed.append((sql, params))
+        self.conn.last_sql = sql
+
+    def fetchone(self) -> object:
+        if "desired_runner_version" in self.conn.last_sql:
+            return self.conn.update_row
+        if "phase" in self.conn.last_sql:
+            return (self.conn.phase,)
+        return None
+
+
+class _UpdConn:
+    """Fake conn that answers the self-update SELECTs (desired/state, phase)."""
+
+    def __init__(self, update_row: object, phase: str = "idle") -> None:
+        self.update_row = update_row
+        self.phase = phase
+        self.executed: list[tuple[str, object]] = []
+        self.last_sql = ""
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+    def cursor(self) -> _UpdCursor:
+        return _UpdCursor(self)
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ReexecCalled(Exception):
+    pass
+
+
+class SelfUpdateTests(unittest.TestCase):
+    """Version reporting + DB-driven self-update gate, fetch/swap, rollback."""
+
+    def setUp(self) -> None:
+        self._saved = {
+            k: getattr(runner, k)
+            for k in (
+                "RUNNER_INSTALL_PATH",
+                "RUNNER_VERSION_FILE",
+                "RUNNER_VERSION",
+                "RUNNER_SELF_UPDATE_ENABLED",
+                "_fetch_runner_source",
+                "_perform_self_update",
+                "_reexec",
+            )
+        }
+        runner.RUNNER_SELF_UPDATE_ENABLED = True
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            setattr(runner, k, v)
+
+    # ── version model ────────────────────────────────────────────────────────
+    def test_version_file_wins_over_env(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            vf = Path(d) / "VERSION"
+            vf.write_text("v9.9.9\n")
+            runner.RUNNER_VERSION_FILE = vf
+            os.environ["RUNNER_VERSION"] = "v0.0.1"
+            try:
+                self.assertEqual(runner._read_runner_version(), "v9.9.9")
+            finally:
+                del os.environ["RUNNER_VERSION"]
+
+    def test_version_falls_back_to_env_then_unknown(self) -> None:
+        runner.RUNNER_VERSION_FILE = Path("/nonexistent/earmark-VERSION")
+        os.environ.pop("RUNNER_VERSION", None)
+        self.assertEqual(runner._read_runner_version(), "unknown")
+        os.environ["RUNNER_VERSION"] = "v1.2.3"
+        try:
+            self.assertEqual(runner._read_runner_version(), "v1.2.3")
+        finally:
+            del os.environ["RUNNER_VERSION"]
+
+    # ── pure gate ────────────────────────────────────────────────────────────
+    def test_should_self_update_truth_table(self) -> None:
+        self.assertTrue(runner._should_self_update("v1", "v2", "requested"))
+        self.assertFalse(runner._should_self_update("v1", "v1", "requested"))  # converged
+        self.assertFalse(runner._should_self_update("v1", "v2", "updating"))   # in-flight
+        self.assertFalse(runner._should_self_update("v1", "v2", "failed"))     # no retry
+        self.assertFalse(runner._should_self_update("v1", None, "requested"))  # nothing set
+
+    def test_fetch_rejects_invalid_version(self) -> None:
+        # `version` is interpolated into the GitHub raw URL, so a non-tag string
+        # must be refused by the whitelist BEFORE any network call — each of these
+        # raises without fetching.
+        for bad in ("../../etc/passwd", "v1/../x", "v1 2", "v1;rm -rf", "", "a\nb"):
+            with self.assertRaises(RuntimeError):
+                runner._fetch_runner_source(bad)
+
+    # ── fetch → self-check → atomic swap ─────────────────────────────────────
+    def test_perform_self_update_swaps_and_writes_version(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "runner.py"
+            target.write_bytes(b"# OLD RUNNER\n")
+            runner.RUNNER_INSTALL_PATH = target
+            runner.RUNNER_VERSION_FILE = Path(d) / "VERSION"
+            runner._fetch_runner_source = lambda v: _GOOD_SOURCE
+            runner._perform_self_update("v2.0.0")
+            self.assertEqual(target.read_bytes(), _GOOD_SOURCE)            # swapped
+            self.assertEqual(runner.RUNNER_VERSION_FILE.read_text().strip(), "v2.0.0")
+            self.assertEqual((target.with_name("runner.py.backup")).read_bytes(),
+                             b"# OLD RUNNER\n")                            # backup kept
+            self.assertFalse((target.with_name("runner.py.new")).exists())  # temp cleaned
+
+    def test_perform_self_update_rolls_back_on_bad_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "runner.py"
+            target.write_bytes(b"# OLD RUNNER\n")
+            runner.RUNNER_INSTALL_PATH = target
+            runner.RUNNER_VERSION_FILE = Path(d) / "VERSION"
+            runner._fetch_runner_source = lambda v: _BAD_SOURCE
+            with self.assertRaises(RuntimeError):
+                runner._perform_self_update("v2.0.0")
+            self.assertEqual(target.read_bytes(), b"# OLD RUNNER\n")       # untouched
+            self.assertFalse((target.with_name("runner.py.new")).exists())  # temp cleaned
+            self.assertFalse(runner.RUNNER_VERSION_FILE.exists())          # no version write
+
+    # ── _maybe_self_update orchestration ─────────────────────────────────────
+    def test_maybe_update_finalizes_success_when_already_desired(self) -> None:
+        conn = _UpdConn(update_row=(runner.RUNNER_VERSION, "updating"))
+        self.assertFalse(runner._maybe_self_update(conn))
+        self.assertTrue(
+            any("runner_update_state" in s and p and p[0] == "success"
+                for s, p in conn.executed)
+        )
+
+    def test_maybe_update_noop_when_disabled(self) -> None:
+        runner.RUNNER_SELF_UPDATE_ENABLED = False
+        conn = _UpdConn(update_row=("v9.9.9", "requested"))
+        self.assertFalse(runner._maybe_self_update(conn))
+        self.assertEqual(conn.executed, [])
+
+    def test_maybe_update_triggers_and_reexecs(self) -> None:
+        runner.RUNNER_VERSION = "v1.0.0"
+        calls: list[str] = []
+        runner._perform_self_update = lambda v: calls.append(v)
+
+        def _boom() -> None:
+            raise _ReexecCalled()
+
+        runner._reexec = _boom
+        conn = _UpdConn(update_row=("v2.0.0", "requested"), phase="idle")
+        with self.assertRaises(_ReexecCalled):
+            runner._maybe_self_update(conn)
+        self.assertEqual(calls, ["v2.0.0"])
+        self.assertTrue(
+            any("runner_update_state" in s and p and p[0] == "updating"
+                for s, p in conn.executed)
+        )
+
+    def test_maybe_update_defers_in_analyze_phase(self) -> None:
+        runner.RUNNER_VERSION = "v1.0.0"
+        calls: list[str] = []
+        runner._perform_self_update = lambda v: calls.append(v)
+        conn = _UpdConn(update_row=("v2.0.0", "requested"), phase="analyze")
+        self.assertFalse(runner._maybe_self_update(conn))
+        self.assertEqual(calls, [])  # deferred: eval owns the GPU
+
+    def test_maybe_update_marks_failed_on_error(self) -> None:
+        runner.RUNNER_VERSION = "v1.0.0"
+
+        def _raise(v: str) -> None:
+            raise RuntimeError("fetch exploded")
+
+        runner._perform_self_update = _raise
+        conn = _UpdConn(update_row=("v2.0.0", "requested"), phase="idle")
+        self.assertFalse(runner._maybe_self_update(conn))
+        self.assertTrue(
+            any("runner_update_state" in s and p and p[0] == "failed"
+                for s, p in conn.executed)
+        )
 
 
 class GateTests(unittest.TestCase):

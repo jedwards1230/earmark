@@ -66,15 +66,21 @@ HF_TOKEN is NOT required — Parakeet-TDT and NeMo Sortformer are public models.
 from __future__ import annotations
 
 import abc
+import hashlib
 import json
 import logging
 import math
 import os
+import re
+import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -179,6 +185,48 @@ ASR_BIASING_ALPHA: float = float(os.environ.get("ASR_BIASING_ALPHA", "2.5"))
 RUNNER_IDENTITY: str = os.environ.get(
     "RUNNER_IDENTITY", f"earmark-runner-pid-{os.getpid()}"
 )
+
+# -- Self-update (CONTRACT §1.4 runner_control, §2.12) -------------------------
+# The runner reports the earmark git tag it is RUNNING so the Go service can
+# detect skew vs an operator-set desired_runner_version and offer an update
+# button. The running version is read from a VERSION file FIRST (written by a
+# self-update — it is the authoritative "what am I actually running") and falls
+# back to the RUNNER_VERSION env the ansible role renders from
+# asr_runner_source_ref. "unknown" until either is present.
+RUNNER_INSTALL_PATH: Path = Path(
+    os.environ.get("RUNNER_SELF_PATH", os.path.abspath(__file__))
+)
+RUNNER_VERSION_FILE: Path = Path(
+    os.environ.get("RUNNER_VERSION_FILE", str(RUNNER_INSTALL_PATH.parent / "VERSION"))
+)
+RUNNER_SOURCE_REPO: str = os.environ.get("RUNNER_SOURCE_REPO", "jedwards1230/earmark")
+# Self-update is opt-in-on-by-default; set false to pin a host to ansible-only.
+RUNNER_SELF_UPDATE_ENABLED: bool = (
+    os.environ.get("RUNNER_SELF_UPDATE_ENABLED", "true").lower()
+    in ("1", "true", "yes")
+)
+RUNNER_SELF_UPDATE_TIMEOUT: int = int(
+    os.environ.get("RUNNER_SELF_UPDATE_TIMEOUT_SECONDS", "120")
+)
+
+
+def _read_runner_version() -> str:
+    """
+    Resolve the version this runner is actually running. A VERSION file (written
+    by a successful self-update) wins over the RUNNER_VERSION env (rendered by
+    the ansible role from asr_runner_source_ref) — after a self-update the env
+    still names the OLD tag until the role re-runs, so the file is the truth.
+    """
+    try:
+        v = RUNNER_VERSION_FILE.read_text(encoding="utf-8").strip()
+        if v:
+            return v
+    except OSError:
+        pass
+    return os.environ.get("RUNNER_VERSION", "unknown").strip() or "unknown"
+
+
+RUNNER_VERSION: str = _read_runner_version()
 POLL_INTERVAL: int = int(os.environ.get("RUNNER_POLL_INTERVAL_SECONDS", "30"))
 HEARTBEAT_INTERVAL: int = int(os.environ.get("RUNNER_HEARTBEAT_SECONDS", "60"))
 BUSY_FLAG_PATH: Path = Path(
@@ -569,11 +617,35 @@ def _runner_heartbeat(conn: psycopg2.extensions.connection) -> None:
     and therefore goes quiet the moment the queue drains — the exact case that
     made an idle runner look identical to a dead one.
 
-    Best-effort: any failure (e.g. the runner_heartbeat_at column not yet
-    deployed) is logged at DEBUG and swallowed so it can never disturb the
-    claim/transcribe path. Uses its own commit/rollback so the connection is left
-    clean for the subsequent gate + claim.
+    It also stamps runner_version (the tag this runner runs) so the Go service
+    can detect version skew (CONTRACT §1.4). The combined UPDATE is tried first;
+    if runner_version is not yet in the schema it falls back to a liveness-only
+    UPDATE so the heartbeat still records.
+
+    Best-effort: any failure (e.g. the columns not yet deployed) is logged at
+    DEBUG and swallowed so it can never disturb the claim/transcribe path. Uses
+    its own commit/rollback so the connection is left clean for the subsequent
+    gate + claim.
     """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runner_control "
+                "SET runner_heartbeat_at = now(), runner_version = %s",
+                (RUNNER_VERSION,),
+            )
+        conn.commit()
+        return
+    except Exception as exc:
+        log.debug(
+            "heartbeat+version stamp failed (%s); falling back to liveness-only",
+            exc,
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    # Fallback: record liveness even if runner_version is not in the schema yet.
     try:
         with conn.cursor() as cur:
             cur.execute("UPDATE runner_control SET runner_heartbeat_at = now()")
@@ -584,6 +656,257 @@ def _runner_heartbeat(conn: psycopg2.extensions.connection) -> None:
             conn.rollback()
         except Exception:
             pass
+
+
+# ─── Self-update (DB-driven pull; CONTRACT §1.4 + §2.12) ──────────────────────
+#
+# The dashboard writes runner_control.desired_runner_version + update state
+# 'requested'. Each poll cycle, BETWEEN jobs, the runner compares it to its own
+# RUNNER_VERSION and — when behind and not in the eval (analyze) phase — fetches
+# runner.py at the desired tag from raw.githubusercontent.com (mirroring the
+# ansible get_url), self-checks the fetched file in a subprocess, atomically
+# swaps it in (keeping a .backup), writes the VERSION file, and re-execs. The Go
+# side marks the update 'success' only once it sees a heartbeat carrying the new
+# version; the runner itself stamps that success on its first post-re-exec cycle.
+
+
+def _should_self_update(
+    current: str, desired: str | None, state: str | None
+) -> bool:
+    """
+    Pure gate: attempt a self-update only when an operator has REQUESTED a
+    specific, different version. Returns True only when BOTH hold:
+      - `desired` is non-empty AND differs from `current`, AND
+      - `state` is exactly "requested".
+    Any other state ("updating"/"failed"/"success"/None) returns False, so there
+    is no retry loop after a failed/in-flight attempt — the operator must press
+    the button again (which resets state to "requested") to retry.
+    """
+    if not desired or desired == current:
+        return False
+    return state == "requested"
+
+
+def _read_update_request(
+    conn: psycopg2.extensions.connection,
+) -> tuple[str | None, str | None]:
+    """Read (desired_runner_version, runner_update_state); ((None, None) if the
+    columns are absent — defensive, like the phase read)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT desired_runner_version, runner_update_state "
+                "FROM runner_control WHERE id = 1"
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except Exception as exc:
+        log.debug("update-request read failed (%s) — assuming none", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None, None
+    if not row:
+        return None, None
+    if isinstance(row, dict):
+        return row["desired_runner_version"], row["runner_update_state"]
+    return row[0], row[1]
+
+
+def _set_update_state(
+    conn: psycopg2.extensions.connection, state: str, error: str | None
+) -> None:
+    """Record the self-update state machine transition (best-effort)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runner_control SET runner_update_state = %s, "
+                "runner_update_error = %s, runner_update_at = now()",
+                (state, error),
+            )
+        conn.commit()
+    except Exception as exc:
+        log.debug("update-state write failed (non-fatal): %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def _fetch_runner_source(version: str) -> bytes:
+    """Fetch runner/runner.py at the given tag from GitHub raw (outbound-only,
+    public repo, no token — same provenance as the ansible get_url)."""
+    # `version` originates from the dashboard/API; a git tag or sha is the only
+    # legitimate value. Whitelist it before it reaches the URL — defence-in-depth
+    # against path traversal / URL injection even though desired_runner_version is
+    # operator-controlled behind the CONTROL_API_TOKEN gate.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+        raise RuntimeError(f"refusing to fetch invalid version string: {version!r}")
+    url = (
+        f"https://raw.githubusercontent.com/{RUNNER_SOURCE_REPO}/"
+        f"{version}/runner/runner.py"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "earmark-asr-runner"})
+    with urllib.request.urlopen(req, timeout=RUNNER_SELF_UPDATE_TIMEOUT) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"fetch {url} returned HTTP {resp.status}")
+        data = resp.read()
+    if not data:
+        raise RuntimeError(f"fetched empty runner.py from {url}")
+    return data
+
+
+def _self_check_file(path: Path) -> tuple[bool, str]:
+    """Run `python <path> --self-check` in a subprocess: it parses+imports the
+    candidate without loading the model. Gates the swap so a syntactically or
+    importably broken version can never replace the running one."""
+    # Harden the subprocess against module-search-path injection (CWE-426): run
+    # the candidate in isolated mode (-I → ignore PYTHONPATH/PYTHONHOME, don't put
+    # cwd/script-dir on sys.path) AND strip the Python path-injection vars from a
+    # COPY of the env. We copy-and-strip rather than whitelist because runner.py
+    # reads DATABASE_URL at import time, so a bare allow-list would make every
+    # --self-check fail spuriously. The venv's own packages still import (they are
+    # located via the venv interpreter, not PYTHONPATH).
+    check_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
+    }
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", str(path), "--self-check"],
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_SELF_UPDATE_TIMEOUT,
+            check=False,
+            env=check_env,
+        )
+    except Exception as exc:  # subprocess failed to even launch
+        return False, f"self-check could not run: {exc}"
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "non-zero exit").strip()[
+            :MAX_ERROR_LEN
+        ]
+    return True, ""
+
+
+def _perform_self_update(desired: str) -> None:
+    """Fetch → temp-write → self-check → atomic swap (keep .backup) → write
+    VERSION. Raises on any failure WITHOUT having replaced the running file
+    (the swap is the last, atomic step; a half-fetch leaves the original intact).
+    """
+    data = _fetch_runner_source(desired)
+    # Log the integrity digest so it can be matched against the ansible role's
+    # asr_runner_source_checksum for the same tag (provenance audit trail).
+    log.info(
+        "fetched runner %s (%d bytes) sha256=%s",
+        desired,
+        len(data),
+        hashlib.sha256(data).hexdigest(),
+    )
+    target = RUNNER_INSTALL_PATH
+    tmp = target.with_name(target.name + ".new")
+    backup = target.with_name(target.name + ".backup")
+    tmp.write_bytes(data)
+    try:
+        ok, detail = _self_check_file(tmp)
+        if not ok:
+            raise RuntimeError(f"candidate {desired} failed --self-check: {detail}")
+        # Keep a rollback copy of the currently-running file, then swap atomically.
+        try:
+            shutil.copy2(target, backup)
+        except FileNotFoundError:
+            pass
+        os.replace(tmp, target)  # atomic on the same filesystem
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    # Record what we now run, so the re-exec'd process reports the new version
+    # even before the ansible role catches up.
+    try:
+        RUNNER_VERSION_FILE.write_text(desired + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("self-update swapped but VERSION file write failed: %s", exc)
+
+
+def _reexec() -> None:
+    """Replace this process image with a fresh interpreter running the (now
+    swapped) runner file. systemd keeps the unit; the new process reads the new
+    VERSION file and reports the new version on its next heartbeat."""
+    log.info("re-execing into %s", RUNNER_INSTALL_PATH)
+    try:
+        os.execv(sys.executable, [sys.executable, str(RUNNER_INSTALL_PATH)])
+    except Exception as exc:
+        # os.execv only returns on failure. The new runner.py is already on disk,
+        # so continuing would run stale in-memory code that would misreport itself
+        # as the updated version on the next heartbeat (a false "success"). Exit
+        # instead and let systemd (Restart=on-failure) restart cleanly onto the
+        # swapped file.
+        log.critical(
+            "re-exec failed after staged self-update; exiting to avoid stale "
+            "state: %s",
+            exc,
+        )
+        sys.exit(1)
+
+
+def _maybe_self_update(conn: psycopg2.extensions.connection) -> bool:
+    """
+    Called at the between-jobs gate (no claimed job by construction). Returns
+    True only on the unreachable post-re-exec path; False otherwise.
+
+    Also finalizes the state machine: when this process already IS the desired
+    version (i.e. we are the freshly re-exec'd new runner), it stamps the
+    in-flight update 'success'.
+    """
+    if not RUNNER_SELF_UPDATE_ENABLED:
+        return False
+    desired, state = _read_update_request(conn)
+
+    # We are already the desired version → close out any in-flight update.
+    if desired and desired == RUNNER_VERSION:
+        if state in ("requested", "updating"):
+            log.info("self-update to %s complete", desired)
+            _set_update_state(conn, "success", None)
+        return False
+
+    if not _should_self_update(RUNNER_VERSION, desired, state):
+        return False
+
+    # Don't reload the model (which the re-exec'd process does at startup) while
+    # the eval judge owns the GPU. Other GPU-yield (gaming) is handled by the
+    # normal park gate on the next startup; updating while paused is fine (idle).
+    if _read_phase(conn) == "analyze":
+        log.info("self-update to %s deferred: analyze phase owns the GPU", desired)
+        return False
+
+    log.info("self-update requested: %s -> %s", RUNNER_VERSION, desired)
+    _set_update_state(conn, "updating", None)
+    try:
+        _perform_self_update(desired)  # type: ignore[arg-type]
+    except Exception as exc:
+        log.exception("self-update to %s failed", desired)
+        _set_update_state(conn, "failed", str(exc)[:MAX_ERROR_LEN])
+        return False
+
+    log.info("self-update staged (%s -> %s); re-execing", RUNNER_VERSION, desired)
+    # Clear any pending transaction before orphaning the connection across the
+    # re-exec — the process image is about to be replaced, so leave no half-open
+    # transaction behind.
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+    _reexec()  # replaces the process image; never returns (exits on failure)
+    return True  # unreachable
 
 
 def _fetch_bias_terms(
@@ -2210,6 +2533,12 @@ def main() -> None:
             # earmark_runner_alive_seconds). Best-effort; never blocks the claim.
             _runner_heartbeat(conn)
 
+            # Self-update gate (CONTRACT §1.4 + §2.12): between jobs (no claim
+            # yet this cycle), if an operator set a different desired version,
+            # fetch+verify+swap and re-exec. _maybe_self_update never returns
+            # when it re-execs; otherwise it falls through to the normal gate.
+            _maybe_self_update(conn)
+
             # Gate the GPU first (CONTRACT §1.4): when paused or phase='analyze'
             # the model parks off the GPU so the eval judge can use the card; when
             # active again it is restored. _gate_gpu applies the park/unpark only
@@ -2311,4 +2640,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # `--self-check`: reaching this line means the module parsed and imported
+    # cleanly (all top-level code ran). The self-update path runs this on a
+    # freshly-fetched candidate BEFORE swapping it in, so a broken version can
+    # never replace the running one. No model load, no DB connection.
+    if "--self-check" in sys.argv[1:]:
+        print(f"self-check ok: runner {RUNNER_VERSION}")
+        sys.exit(0)
     main()
