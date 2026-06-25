@@ -321,7 +321,10 @@ INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NO
   (`runner_update_error` carries why; the running version is unchanged — the swap
   is atomic and self-check-gated, so a broken candidate never replaces a good
   one). No retry until the button is pressed again (which resets to `requested`).
-  `runner_update_at` timestamps the last transition.
+  `runner_update_at` timestamps the last transition. **Precondition:** the
+  runner's install dir must be writable by the runner's user (the swap renames
+  `runner.py.new` into it); a non-writable dir fails fast with an actionable
+  `failed` error before any fetch, rather than a cryptic mid-swap `EACCES`.
 - **`phase`** — the **batched two-phase pipeline** selector. `NULL` or `'idle'`
   is normal operation (both the ASR runner and the Go embed worker run freely —
   the default, fully backward-compatible); `'transcribe'` is the ASR-only phase
