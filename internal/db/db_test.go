@@ -1533,10 +1533,12 @@ func TestGetUnevaluatedTranscripts_EvalPassSelection(t *testing.T) {
 	rows := pgxmock.NewRows(transcriptScanColumns)
 	addTranscriptRow(rows, "t-uneval-1", "job-1")
 	addTranscriptRow(rows, "t-uneval-2", "job-2")
-	mock.ExpectQuery(unevaluatedTranscriptsSQL).WillReturnRows(rows)
+	// The LIMIT is parameterized ($1): the worker passes the batch size as the
+	// single arg, so the expectation must match it exactly.
+	mock.ExpectQuery(unevaluatedTranscriptsSQL).WithArgs(32).WillReturnRows(rows)
 
 	db := newTestDB()
-	got, err := db.getUnevaluatedTranscripts(context.Background(), mock)
+	got, err := db.getUnevaluatedTranscripts(context.Background(), mock, 32)
 	if err != nil {
 		t.Fatalf("getUnevaluatedTranscripts: %v", err)
 	}
@@ -1562,6 +1564,8 @@ func TestGetUnevaluatedTranscripts_WhereClauseInvariants(t *testing.T) {
 		"FROM transcript_chunks c WHERE c.transcript_id = t.id", // NOT embedded
 		"rm.eval_finished_at IS NOT NULL",                       // NOT eval'd (negated by NOT EXISTS)
 		"NOT EXISTS",
+		"ORDER BY t.created_at ASC", // oldest-first, deterministic drain order
+		"LIMIT $1",                  // bounded + parameterized (OOM guard)
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("eval-pass SQL missing predicate %q:\n%s", want, sql)
@@ -1588,10 +1592,12 @@ func TestGetEvaluatedUnembeddedTranscripts_EmbedPassSelection(t *testing.T) {
 	// The category the embed pass selects: done + eval'd + not-embedded.
 	rows := pgxmock.NewRows(transcriptScanColumns)
 	addTranscriptRow(rows, "t-eval-unembed-1", "job-3")
-	mock.ExpectQuery(evaluatedUnembeddedTranscriptsSQL).WillReturnRows(rows)
+	// The LIMIT is parameterized ($1): the worker passes the batch size as the
+	// single arg, so the expectation must match it exactly.
+	mock.ExpectQuery(evaluatedUnembeddedTranscriptsSQL).WithArgs(32).WillReturnRows(rows)
 
 	db := newTestDB()
-	got, err := db.getEvaluatedUnembeddedTranscripts(context.Background(), mock)
+	got, err := db.getEvaluatedUnembeddedTranscripts(context.Background(), mock, 32)
 	if err != nil {
 		t.Fatalf("getEvaluatedUnembeddedTranscripts: %v", err)
 	}
@@ -1620,9 +1626,44 @@ func TestGetEvaluatedUnembeddedTranscripts_WhereClauseInvariants(t *testing.T) {
 		"rm.eval_finished_at IS NOT NULL",                       // eval'd
 		"FROM transcript_chunks c WHERE c.transcript_id = t.id", // NOT embedded
 		"NOT EXISTS",
+		"ORDER BY t.created_at ASC", // oldest-first, deterministic drain order
+		"LIMIT $1",                  // bounded + parameterized (OOM guard)
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("embed-pass SQL missing predicate %q:\n%s", want, sql)
+		}
+	}
+}
+
+// TestSelectLimitNormalization asserts normalizeSelectLimit clamps a
+// non-positive limit to defaultSelectLimit so a stray 0 (or negative) can never
+// produce an unbounded selection — the OOM guard must hold even on a
+// misconfigured caller.
+func TestSelectLimitNormalization(t *testing.T) {
+	for _, tc := range []struct {
+		in, want int
+	}{
+		{0, defaultSelectLimit},
+		{-1, defaultSelectLimit},
+		{1, 1},
+		{64, 64},
+	} {
+		if got := normalizeSelectLimit(tc.in); got != tc.want {
+			t.Errorf("normalizeSelectLimit(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestGatedSelections_BoundedAndParameterized asserts both gated-flow selections
+// carry a parameterized LIMIT (the OOM guard) rather than an unbounded scan or a
+// string-interpolated limit (which would be unsafe).
+func TestGatedSelections_BoundedAndParameterized(t *testing.T) {
+	for name, sql := range map[string]string{
+		"eval-pass":  unevaluatedTranscriptsSQL,
+		"embed-pass": evaluatedUnembeddedTranscriptsSQL,
+	} {
+		if !strings.Contains(sql, "LIMIT $1") {
+			t.Errorf("%s SQL must carry a parameterized LIMIT $1 (OOM guard):\n%s", name, sql)
 		}
 	}
 }

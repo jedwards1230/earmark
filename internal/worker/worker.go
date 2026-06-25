@@ -25,11 +25,14 @@ type DBInterface interface {
 	// (ungated path: EVAL_GATES_EMBED=false).
 	GetCompletedTranscripts(ctx context.Context) ([]*db.Transcript, error)
 	// GetUnevaluatedTranscripts returns done, not-eval'd, not-embedded
-	// transcripts — the eval-pass selection for EVAL_GATES_EMBED=true.
-	GetUnevaluatedTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	// transcripts — the eval-pass selection for EVAL_GATES_EMBED=true. limit
+	// bounds the rows loaded per call so a large backlog can't OOM the pod; the
+	// worker drains across cycles (CONTRACT §2.4, EMBED_BATCH_SIZE).
+	GetUnevaluatedTranscripts(ctx context.Context, limit int) ([]*db.Transcript, error)
 	// GetEvaluatedUnembeddedTranscripts returns done, eval'd, not-embedded
-	// transcripts — the embed-pass selection for EVAL_GATES_EMBED=true.
-	GetEvaluatedUnembeddedTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	// transcripts — the embed-pass selection for EVAL_GATES_EMBED=true. limit
+	// bounds the rows loaded per call (see GetUnevaluatedTranscripts).
+	GetEvaluatedUnembeddedTranscripts(ctx context.Context, limit int) ([]*db.Transcript, error)
 	InsertChunks(ctx context.Context, chunks []db.Chunk) error
 	// EmbedDocuments embeds transcript chunks for STORAGE — the document side of
 	// the pipeline (search_document: prefix for nomic-embed-text). Never the
@@ -189,9 +192,16 @@ func (w *Worker) Start(cfg *config.Config) {
 			// The two passes run sequentially in the same poll cycle; the
 			// eval_finished_at latch is the hand-off. Both are crash-resumable DB
 			// selections — restarting the worker re-enters the correct pass.
+			//
+			// Both selections are bounded by EMBED_BATCH_SIZE so a large backlog
+			// (e.g. a full re-embed after re-segmentation) never loads every
+			// transcript's segments JSONB into one slice and OOM-kills the pod.
+			// Each pass processes at most batchSize transcripts; a transcript that
+			// gets eval'd or embedded drops out of the next cycle's selection.
+			batchSize := embedBatchSize(cfg)
 
 			// Eval pass.
-			unevaluated, err := w.db.GetUnevaluatedTranscripts(w.ctx)
+			unevaluated, err := w.db.GetUnevaluatedTranscripts(w.ctx, batchSize)
 			if err != nil {
 				w.log.Error("poll for unevaluated transcripts failed", "error", err)
 				w.sleep(pollInterval)
@@ -209,7 +219,7 @@ func (w *Worker) Start(cfg *config.Config) {
 
 			// Embed pass (picks up transcripts the eval pass just finished, plus
 			// any that were already eval'd from a previous cycle).
-			evaluated, err := w.db.GetEvaluatedUnembeddedTranscripts(w.ctx)
+			evaluated, err := w.db.GetEvaluatedUnembeddedTranscripts(w.ctx, batchSize)
 			if err != nil {
 				w.log.Error("poll for evaluated unembedded transcripts failed", "error", err)
 				w.sleep(pollInterval)
@@ -224,7 +234,15 @@ func (w *Worker) Start(cfg *config.Config) {
 						"transcript_id", t.ID, "file", t.FilePath, "error", err)
 				}
 			}
-			if len(unevaluated) == 0 && len(evaluated) == 0 {
+
+			// Drain-fast: when either pass returned a FULL batch, more work is
+			// waiting — loop immediately (no pollInterval sleep) so a large backlog
+			// drains across back-to-back cycles instead of one batch per poll
+			// interval. Only sleep when both passes returned a short (or empty)
+			// batch, which means the backlog is drained; this avoids a busy-loop on
+			// an empty queue while keeping a 4000-item backlog from idling for hours.
+			fullBatch := len(unevaluated) >= batchSize || len(evaluated) >= batchSize
+			if !fullBatch {
 				w.sleep(pollInterval)
 			}
 		} else {
@@ -664,6 +682,18 @@ func localTokenCount(texts []string) (total, failed int) {
 		total += n
 	}
 	return total, failed
+}
+
+// embedBatchSize returns the gated-flow per-cycle selection limit, falling back
+// to the CONTRACT default (32) when cfg carries a non-positive value (e.g. a
+// hand-constructed Config in a test). This is the OOM guard's load-bearing
+// bound — it must never be zero/negative, which would round-trip to an
+// unbounded selection.
+func embedBatchSize(cfg *config.Config) int {
+	if cfg.EmbedBatchSize > 0 {
+		return cfg.EmbedBatchSize
+	}
+	return 32
 }
 
 // embedModel returns the configured embeddings model, falling back to the
