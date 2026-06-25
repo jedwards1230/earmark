@@ -761,13 +761,26 @@ def _self_check_file(path: Path) -> tuple[bool, str]:
     """Run `python <path> --self-check` in a subprocess: it parses+imports the
     candidate without loading the model. Gates the swap so a syntactically or
     importably broken version can never replace the running one."""
+    # Harden the subprocess against module-search-path injection (CWE-426): run
+    # the candidate in isolated mode (-I → ignore PYTHONPATH/PYTHONHOME, don't put
+    # cwd/script-dir on sys.path) AND strip the Python path-injection vars from a
+    # COPY of the env. We copy-and-strip rather than whitelist because runner.py
+    # reads DATABASE_URL at import time, so a bare allow-list would make every
+    # --self-check fail spuriously. The venv's own packages still import (they are
+    # located via the venv interpreter, not PYTHONPATH).
+    check_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
+    }
     try:
         proc = subprocess.run(
-            [sys.executable, str(path), "--self-check"],
+            [sys.executable, "-I", str(path), "--self-check"],
             capture_output=True,
             text=True,
             timeout=RUNNER_SELF_UPDATE_TIMEOUT,
             check=False,
+            env=check_env,
         )
     except Exception as exc:  # subprocess failed to even launch
         return False, f"self-check could not run: {exc}"
