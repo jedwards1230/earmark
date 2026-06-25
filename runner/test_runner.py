@@ -289,6 +289,25 @@ class SelfUpdateTests(unittest.TestCase):
             self.assertFalse((target.with_name("runner.py.new")).exists())  # temp cleaned
             self.assertFalse(runner.RUNNER_VERSION_FILE.exists())          # no version write
 
+    def test_perform_self_update_fails_fast_when_dir_not_writable(self) -> None:
+        # A non-writable install dir must raise an actionable error BEFORE any
+        # network fetch — guards the root-owned-dir EACCES footgun (earmark#92).
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as d:
+            runner.RUNNER_INSTALL_PATH = Path(d) / "runner.py"
+            runner.RUNNER_VERSION_FILE = Path(d) / "VERSION"
+
+            def _boom(_v: str) -> bytes:  # must never be reached
+                raise AssertionError("fetched despite non-writable install dir")
+
+            runner._fetch_runner_source = _boom
+            with mock.patch.object(runner.os, "access", return_value=False):
+                with self.assertRaises(RuntimeError) as ctx:
+                    runner._perform_self_update("v2.0.0")
+            self.assertIn("not writable", str(ctx.exception))
+            self.assertFalse(runner.RUNNER_VERSION_FILE.exists())  # nothing written
+
     # ── _maybe_self_update orchestration ─────────────────────────────────────
     def test_maybe_update_finalizes_success_when_already_desired(self) -> None:
         conn = _UpdConn(update_row=(runner.RUNNER_VERSION, "updating"))

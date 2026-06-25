@@ -796,6 +796,19 @@ def _perform_self_update(desired: str) -> None:
     VERSION. Raises on any failure WITHOUT having replaced the running file
     (the swap is the last, atomic step; a half-fetch leaves the original intact).
     """
+    target = RUNNER_INSTALL_PATH
+    # Fail fast (before the network fetch) if the install dir is not writable by
+    # this process: the swap writes <name>.new and renames it into this dir, so a
+    # root-owned install dir would otherwise fail mid-operation with a cryptic
+    # EACCES on runner.py.new. The asr-runner role must own the dir + runner.py as
+    # the runner user (earmark#92).
+    install_dir = target.parent
+    if not os.access(install_dir, os.W_OK):
+        raise RuntimeError(
+            f"install dir {install_dir} is not writable by the runner user "
+            f"(uid={os.getuid()}): self-update needs the install dir + runner.py "
+            f"owned by the runner user (see the asr-runner role / earmark#92)"
+        )
     data = _fetch_runner_source(desired)
     # Log the integrity digest so it can be matched against the ansible role's
     # asr_runner_source_checksum for the same tag (provenance audit trail).
@@ -805,7 +818,6 @@ def _perform_self_update(desired: str) -> None:
         len(data),
         hashlib.sha256(data).hexdigest(),
     )
-    target = RUNNER_INSTALL_PATH
     tmp = target.with_name(target.name + ".new")
     backup = target.with_name(target.name + ".backup")
     tmp.write_bytes(data)
