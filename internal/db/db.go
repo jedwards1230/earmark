@@ -753,12 +753,18 @@ func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error
 // embed pass can pick them up. We restrict to not-embedded so we don't
 // re-judge transcripts that are already embedded (they are handled by
 // earmark eval --backfill-unevaluated).
-func (db *DB) GetUnevaluatedTranscripts(ctx context.Context) ([]*Transcript, error) {
-	return db.getUnevaluatedTranscripts(ctx, db.pool)
+//
+// limit bounds the rows loaded per call (each row carries the transcript's
+// segments JSONB), so a large backlog never OOM-kills the pod — the worker
+// drains it across cycles (CONTRACT §2.4, EMBED_BATCH_SIZE). A non-positive
+// limit is normalized to defaultSelectLimit.
+func (db *DB) GetUnevaluatedTranscripts(ctx context.Context, limit int) ([]*Transcript, error) {
+	return db.getUnevaluatedTranscripts(ctx, db.pool, limit)
 }
 
 // unevaluatedTranscriptsSQL is the eval-pass selection: done jobs, NOT embedded
 // (no transcript_chunks), NOT eval'd (no run_metrics row with eval_finished_at).
+// The LIMIT is parameterized ($1) so the worker bounds each cycle's memory.
 // Exported as a package var so the execution-level test can match it exactly.
 const unevaluatedTranscriptsSQL = `
 		SELECT t.id, t.job_id, t.file_path, t.checksum,
@@ -775,10 +781,11 @@ const unevaluatedTranscriptsSQL = `
 		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
 		  )
 		ORDER BY t.created_at ASC
+		LIMIT $1
 	`
 
-func (db *DB) getUnevaluatedTranscripts(ctx context.Context, q rowQuerier) ([]*Transcript, error) {
-	rows, err := q.Query(ctx, unevaluatedTranscriptsSQL)
+func (db *DB) getUnevaluatedTranscripts(ctx context.Context, q rowQuerier, limit int) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, unevaluatedTranscriptsSQL, normalizeSelectLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("query unevaluated transcripts: %w", err)
 	}
@@ -793,14 +800,20 @@ func (db *DB) getUnevaluatedTranscripts(ctx context.Context, q rowQuerier) ([]*T
 // A transcript appearing here is guaranteed to have been judged; the caller
 // embeds it and it becomes searchable. eval_finished_at IS NOT NULL is the
 // hand-off latch that separates the eval pass from the embed pass.
-func (db *DB) GetEvaluatedUnembeddedTranscripts(ctx context.Context) ([]*Transcript, error) {
-	return db.getEvaluatedUnembeddedTranscripts(ctx, db.pool)
+//
+// limit bounds the rows loaded per call (each row carries the transcript's
+// segments JSONB), so a large backlog never OOM-kills the pod — the worker
+// drains it across cycles (CONTRACT §2.4, EMBED_BATCH_SIZE). A non-positive
+// limit is normalized to defaultSelectLimit.
+func (db *DB) GetEvaluatedUnembeddedTranscripts(ctx context.Context, limit int) ([]*Transcript, error) {
+	return db.getEvaluatedUnembeddedTranscripts(ctx, db.pool, limit)
 }
 
 // evaluatedUnembeddedTranscriptsSQL is the embed-pass selection: done jobs that
 // ARE eval'd (run_metrics.eval_finished_at IS NOT NULL) and NOT embedded (no
-// transcript_chunks). Exported as a package const so the execution-level test
-// can match it exactly.
+// transcript_chunks). The LIMIT is parameterized ($1) so the worker bounds each
+// cycle's memory. Exported as a package const so the execution-level test can
+// match it exactly.
 const evaluatedUnembeddedTranscriptsSQL = `
 		SELECT t.id, t.job_id, t.file_path, t.checksum,
 		       t.language, t.duration_seconds, t.speaker_count,
@@ -814,14 +827,29 @@ const evaluatedUnembeddedTranscriptsSQL = `
 		    SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
 		  )
 		ORDER BY t.created_at ASC
+		LIMIT $1
 	`
 
-func (db *DB) getEvaluatedUnembeddedTranscripts(ctx context.Context, q rowQuerier) ([]*Transcript, error) {
-	rows, err := q.Query(ctx, evaluatedUnembeddedTranscriptsSQL)
+func (db *DB) getEvaluatedUnembeddedTranscripts(ctx context.Context, q rowQuerier, limit int) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, evaluatedUnembeddedTranscriptsSQL, normalizeSelectLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("query evaluated unembedded transcripts: %w", err)
 	}
 	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
+}
+
+// defaultSelectLimit bounds a gated-flow selection when the caller passes a
+// non-positive limit (a misconfiguration). It mirrors config's EMBED_BATCH_SIZE
+// default so a stray 0 still bounds memory rather than reverting to unbounded.
+const defaultSelectLimit = 32
+
+// normalizeSelectLimit clamps a non-positive limit to defaultSelectLimit so a
+// caller can never accidentally issue an unbounded (or negative) LIMIT.
+func normalizeSelectLimit(limit int) int {
+	if limit <= 0 {
+		return defaultSelectLimit
+	}
+	return limit
 }
 
 // scanTranscriptRows scans a pgx.Rows result into []*Transcript. Shared by

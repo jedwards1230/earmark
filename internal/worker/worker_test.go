@@ -67,6 +67,21 @@ type fakeDB struct {
 	// gate can be observed: in the "transcribe" phase the worker idles BEFORE
 	// polling, so the count stays 0.
 	getCompletedCalls int
+
+	// Gated-flow (EVAL_GATES_EMBED) selection plumbing. When evalQueues is
+	// non-nil, GetUnevaluatedTranscripts pops and returns its head per call (so a
+	// test can script per-cycle batches and observe the drain-immediately loop);
+	// otherwise it falls back to returning f.transcripts (legacy behavior).
+	evalQueues  [][]*db.Transcript
+	embedQueues [][]*db.Transcript
+	// lastEvalLimit / lastEmbedLimit capture the limit the worker passed, so a
+	// test can assert the batch size is threaded through.
+	lastEvalLimit  int
+	lastEmbedLimit int
+	// evalCalls / embedCalls count the gated-flow selection invocations so a test
+	// can assert the worker looped back immediately on a full batch.
+	evalCalls  int
+	embedCalls int
 }
 
 func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, error) {
@@ -76,24 +91,55 @@ func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, e
 	return f.transcripts, nil
 }
 
-// GetUnevaluatedTranscripts stubs the eval-pass selection: returns transcripts
-// from the fakeDB's transcript slice that have no evaluatedIDs entry. For tests
-// that don't exercise the gated flow, it returns the same slice as
-// GetCompletedTranscripts (the ungated path is tested via GetCompletedTranscripts).
-func (f *fakeDB) GetUnevaluatedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+// GetUnevaluatedTranscripts stubs the eval-pass selection. When evalQueues is
+// scripted it pops the next per-cycle batch (capped at limit); otherwise it
+// returns the fakeDB's transcript slice (capped at limit), matching the legacy
+// behavior the non-gated tests relied on. It records the limit and call count so
+// the drain-immediately tests can assert on them.
+func (f *fakeDB) GetUnevaluatedTranscripts(_ context.Context, limit int) ([]*db.Transcript, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.transcripts, nil
+	f.lastEvalLimit = limit
+	f.evalCalls++
+	if f.evalQueues != nil {
+		if len(f.evalQueues) == 0 {
+			return nil, nil
+		}
+		batch := f.evalQueues[0]
+		f.evalQueues = f.evalQueues[1:]
+		return capBatch(batch, limit), nil
+	}
+	return capBatch(f.transcripts, limit), nil
 }
 
-// GetEvaluatedUnembeddedTranscripts stubs the embed-pass selection. In the gated
-// flow the embed pass picks up transcripts after they have been eval'd; in tests
-// we return an empty slice by default so callers that call this without a gated
-// scenario don't accidentally embed a second time.
-func (f *fakeDB) GetEvaluatedUnembeddedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+// GetEvaluatedUnembeddedTranscripts stubs the embed-pass selection. When
+// embedQueues is scripted it pops the next per-cycle batch (capped at limit);
+// otherwise it returns an empty slice by default so callers that don't exercise
+// the gated flow don't accidentally embed a second time.
+func (f *fakeDB) GetEvaluatedUnembeddedTranscripts(_ context.Context, limit int) ([]*db.Transcript, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastEmbedLimit = limit
+	f.embedCalls++
+	if f.embedQueues != nil {
+		if len(f.embedQueues) == 0 {
+			return nil, nil
+		}
+		batch := f.embedQueues[0]
+		f.embedQueues = f.embedQueues[1:]
+		return capBatch(batch, limit), nil
+	}
 	return nil, nil
+}
+
+// capBatch returns at most limit transcripts from b, mirroring the LIMIT $1 the
+// real db selections apply. limit <= 0 means "no cap" (only happens if the
+// worker's batch-size guard is bypassed).
+func capBatch(b []*db.Transcript, limit int) []*db.Transcript {
+	if limit > 0 && len(b) > limit {
+		return b[:limit]
+	}
+	return b
 }
 
 func (f *fakeDB) InsertChunks(_ context.Context, chunks []db.Chunk) error {
@@ -821,4 +867,104 @@ func TestStart_PauseReadErrorDefaultsToProcessing(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond,
 		"a pause-read error must default to processing, not paused/wedge")
 	w.Stop()
+}
+
+// ─── Gated-flow batching / drain-fast (CONTRACT §2.4, EMBED_BATCH_SIZE) ───────
+
+// evalCallCount / embedCallCount / lastEmbedLimitVal are locked snapshot helpers
+// for the gated-flow Start-loop test (worker runs on a separate goroutine).
+func (f *fakeDB) evalCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.evalCalls
+}
+
+func (f *fakeDB) embedCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.embedCalls
+}
+
+func (f *fakeDB) lastEmbedLimitVal() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastEmbedLimit
+}
+
+// startGatedWorkerWith spins up a gated-flow worker (EVAL_GATES_EMBED=true) with
+// the given per-cycle batch size, scripting the embed-pass selections via
+// embedQueues so the test controls the per-cycle backlog.
+func startGatedWorkerWith(fdb *fakeDB, batchSize int) *Worker {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{
+		done:           make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		db:             fdb,
+		log:            log.NewLogger("worker-test"),
+		evalGatesEmbed: true,
+	}
+	go w.Start(&config.Config{ChunkSize: 10, EmbedBatchSize: batchSize})
+	return w
+}
+
+// TestStart_GatedDrainsFullBatchesImmediately proves the drain-fast behavior:
+// when the embed pass returns a FULL batch (== EMBED_BATCH_SIZE), the worker
+// must loop immediately (no 30s pollInterval sleep) so a large backlog drains in
+// back-to-back cycles. We script two full batches then a short (empty) one. If
+// the worker slept the full pollInterval between cycles, the second selection
+// would not happen within the test window — so observing two embed selections
+// quickly proves the immediate loop. We also assert the batch-size limit was
+// threaded down to the selection.
+func TestStart_GatedDrainsFullBatchesImmediately(t *testing.T) {
+	const batchSize = 2
+	mk := func(id string) *db.Transcript {
+		return &db.Transcript{ID: id, FilePath: "/b/a/t/" + id + ".mp3", RawText: "Hello world test transcript."}
+	}
+	fdb := &fakeDB{
+		// Eval pass is always empty (already-eval'd backlog); the embed pass owns
+		// the backlog. Two full batches (== batchSize) then a short one (drained).
+		evalQueues: [][]*db.Transcript{{}, {}, {}},
+		embedQueues: [][]*db.Transcript{
+			{mk("e1"), mk("e2")}, // full → loop immediately
+			{mk("e3"), mk("e4")}, // full → loop immediately
+			{mk("e5")},           // short → backlog drained, resume pollInterval
+		},
+	}
+	w := startGatedWorkerWith(fdb, batchSize)
+
+	// All three embed-pass batches (5 transcripts) must be processed well within
+	// the test window. If the worker slept the 30s pollInterval after the first
+	// full batch, we'd see only 2 chunks here — the assertion proves it did not.
+	require.Eventually(t, func() bool {
+		return fdb.chunkCount() >= 5
+	}, 2*time.Second, 10*time.Millisecond,
+		"full-batch cycles must loop immediately and drain the backlog without a pollInterval sleep")
+	w.Stop()
+
+	require.GreaterOrEqual(t, fdb.embedCallCount(), 3,
+		"worker must re-poll the embed pass for each scripted batch (drain-fast)")
+	require.GreaterOrEqual(t, fdb.evalCallCount(), 3,
+		"worker must re-poll the eval pass each cycle too")
+	require.Equal(t, batchSize, fdb.lastEmbedLimitVal(),
+		"the configured EMBED_BATCH_SIZE must be threaded down to the embed selection")
+}
+
+// TestStart_GatedEmptyBacklogDoesNotBusyLoop proves the inverse: with no backlog
+// the worker must NOT busy-loop — it sleeps the pollInterval after a short/empty
+// cycle, so the selection call count stays low across a short observation window.
+func TestStart_GatedEmptyBacklogDoesNotBusyLoop(t *testing.T) {
+	fdb := &fakeDB{
+		// Empty queues every cycle → short batches → must sleep pollInterval.
+		evalQueues:  [][]*db.Transcript{},
+		embedQueues: [][]*db.Transcript{},
+	}
+	w := startGatedWorkerWith(fdb, 2)
+	// First cycle runs immediately, then the worker sleeps pollInterval (30s).
+	// Within 200ms we must see exactly one cycle, not a hot spin of thousands.
+	time.Sleep(200 * time.Millisecond)
+	w.Stop()
+
+	require.LessOrEqual(t, fdb.embedCallCount(), 2,
+		"empty backlog must sleep pollInterval, not busy-loop the embed selection")
 }

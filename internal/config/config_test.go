@@ -17,7 +17,7 @@ func clearContractEnvVars(t *testing.T) {
 		"DATABASE_URL", "BOOKS_DIR",
 		"EMBEDDINGS_BASE_URL", "EMBEDDINGS_MODEL",
 		"MCP_HTTP_ADDR", "STALE_JOB_TIMEOUT",
-		"CHUNK_SIZE", "DEBUG", "DEBUG_DB_RESET",
+		"CHUNK_SIZE", "EMBED_BATCH_SIZE", "DEBUG", "DEBUG_DB_RESET",
 		"ASR_SERVERS", "AI_ENDPOINTS", "AI_ROLES",
 		"EVAL_GATES_EMBED", "EVAL_IN_PIPELINE",
 		"EVAL_CHAT_BASE_URL", "EVAL_CHAT_MODEL",
@@ -41,8 +41,41 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	assert.Equal(t, ":8081", cfg.MCPHTTPAddr)
 	assert.Equal(t, 30*time.Minute, cfg.StaleJobTimeout)
 	assert.Equal(t, 512, cfg.ChunkSize)
+	assert.Equal(t, 32, cfg.EmbedBatchSize)
 	assert.False(t, cfg.Debug)
 	assert.False(t, cfg.DebugDBReset)
+}
+
+func TestLoadConfig_EmbedBatchSize(t *testing.T) {
+	t.Run("override", func(t *testing.T) {
+		clearContractEnvVars(t)
+		t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+		t.Setenv("EMBED_BATCH_SIZE", "64")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		assert.Equal(t, 64, cfg.EmbedBatchSize)
+	})
+
+	t.Run("non-numeric is fatal", func(t *testing.T) {
+		clearContractEnvVars(t)
+		t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+		t.Setenv("EMBED_BATCH_SIZE", "lots")
+
+		_, err := LoadConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "EMBED_BATCH_SIZE")
+	})
+
+	t.Run("non-positive is fatal", func(t *testing.T) {
+		clearContractEnvVars(t)
+		t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+		t.Setenv("EMBED_BATCH_SIZE", "0")
+
+		_, err := LoadConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "EMBED_BATCH_SIZE")
+	})
 }
 
 func TestLoadConfig_MissingDatabaseURL(t *testing.T) {
@@ -62,6 +95,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("MCP_HTTP_ADDR", ":9000")
 	t.Setenv("STALE_JOB_TIMEOUT", "1h")
 	t.Setenv("CHUNK_SIZE", "256")
+	t.Setenv("EMBED_BATCH_SIZE", "16")
 	t.Setenv("DEBUG", "true")
 	t.Setenv("DEBUG_DB_RESET", "1")
 
@@ -74,6 +108,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	assert.Equal(t, ":9000", cfg.MCPHTTPAddr)
 	assert.Equal(t, time.Hour, cfg.StaleJobTimeout)
 	assert.Equal(t, 256, cfg.ChunkSize)
+	assert.Equal(t, 16, cfg.EmbedBatchSize)
 	assert.True(t, cfg.Debug)
 	assert.True(t, cfg.DebugDBReset)
 }

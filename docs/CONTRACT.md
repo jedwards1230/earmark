@@ -379,7 +379,11 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
      (select done, not-eval'd, not-embedded → judge → write `eval_finished_at`),
      then an embed pass (select done, eval'd, not-embedded → embed). Phase B
      completes when **both** the eval backlog (`EvalBacklog`: done,
-     not-eval'd, not-embedded count) AND the embed backlog are 0.
+     not-eval'd, not-embedded count) AND the embed backlog are 0. Both passes'
+     selections are **bounded by `EMBED_BATCH_SIZE` (§2.4, default 32) with
+     `ORDER BY t.created_at ASC LIMIT $1`** so the worker never loads an
+     unbounded transcript backlog (and its `segments` JSONB) into memory at once;
+     it drains across cycles, oldest-first, looping immediately on a full batch.
 
 **Robustness contract:** the coordinator **always restores `phase='idle'` and
 sets `run_limit=0`** on exit — normal completion, error, AND `SIGINT`/`SIGTERM` —
@@ -926,6 +930,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `LOG_FORMAT` | no | `pretty` (default — human-readable, ANSI-colored `PrettyHandler`). Set `json` for a `slog` JSON handler writing one JSON object per line to stdout (parseable in Loki). Both carry the `module` attribute and honor `LOG_DEBUG`/`LOG_VERBOSE`. Used by both Go pods. |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
+| `EMBED_BATCH_SIZE` | no | `32`. Max transcripts the embed worker selects **per poll cycle** for BOTH gated-flow (`EVAL_GATES_EMBED`) passes — the eval pass and the embed pass each `… ORDER BY t.created_at ASC LIMIT $1`. Bounds the worker's per-cycle memory: an unbounded selection loads every matching transcript's `segments` JSONB into one slice, which OOM-kills the pod on a large backlog (e.g. a full re-embed after re-segmentation). The worker drains a backlog across cycles — a transcript that gets eval'd/embedded drops out of the next cycle's selection — and **loops immediately (no `pollInterval` sleep) whenever a pass returns a full batch**, so a multi-thousand-item backlog drains in back-to-back cycles rather than one batch per poll interval. Must be a **positive integer** — a non-positive or non-numeric value is fatal at startup (the OOM guard must never silently round-trip to unbounded). The ungated single-pass selection (`GetCompletedTranscripts`) is unaffected. |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |

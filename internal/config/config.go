@@ -315,6 +315,15 @@ type Config struct {
 	// Overlap is 64 tokens (implementation constant in the chunker).
 	ChunkSize int
 
+	// EmbedBatchSize — max transcripts the embed worker selects per poll cycle
+	// for BOTH gated-flow passes (eval pass and embed pass). Bounds the worker's
+	// per-cycle memory: an unbounded selection loads every matching transcript's
+	// segments JSONB into one slice, which OOM-kills the pod on a large backlog
+	// (e.g. a full re-embed after re-segmentation). The worker drains a backlog
+	// across cycles, looping immediately when a cycle returns a full batch.
+	// Default: 32. Source: EMBED_BATCH_SIZE (CONTRACT §2.4).
+	EmbedBatchSize int
+
 	// EvalInPipeline — when true, the embed worker runs the eval judge on each
 	// transcript's chunks BEFORE embedding (the repositioned, in-pipeline eval
 	// of the batched-pipeline design). Default false: eval stays on-demand
@@ -444,6 +453,22 @@ func LoadConfig() (*Config, error) {
 		}
 	} else {
 		cfg.ChunkSize = 512
+	}
+
+	// EMBED_BATCH_SIZE: bound the per-cycle gated-flow selections so the worker
+	// never loads an unbounded transcript backlog (and its segments JSONB) into
+	// memory at once. Must be a positive integer; a non-positive or unparseable
+	// value is fatal so a typo never silently disables the OOM guard.
+	if bs := os.Getenv("EMBED_BATCH_SIZE"); bs != "" {
+		cfg.EmbedBatchSize, err = strconv.Atoi(bs)
+		if err != nil {
+			return nil, fmt.Errorf("EMBED_BATCH_SIZE %q: %w", bs, err)
+		}
+		if cfg.EmbedBatchSize <= 0 {
+			return nil, fmt.Errorf("EMBED_BATCH_SIZE %q: must be a positive integer", bs)
+		}
+	} else {
+		cfg.EmbedBatchSize = 32
 	}
 
 	// EVAL_IN_PIPELINE: run the eval judge inline (before embed) in the worker.
@@ -651,6 +676,7 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("Control API Token", "value", MaskSecret(c.ControlAPIToken))
 	logger.Debug("Stale Job Timeout", "value", c.StaleJobTimeout)
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
+	logger.Debug("Embed Batch Size", "value", c.EmbedBatchSize)
 	logger.Debug("Metadata Provider", "value", c.MetadataProvider)
 	logger.Debug("ABS URL", "value", c.ABSURL)
 	logger.Debug("ABS Token", "value", MaskSecret(c.ABSToken))
