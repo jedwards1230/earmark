@@ -419,6 +419,9 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	offset := clampOffset(request.GetInt("offset", 0))
 	limit := clampLimit(request.GetInt("limit", 50), 50)
+	// Opt-in per-word timestamps. Default false → the structured payload omits the
+	// `words` field entirely (byte-identical to the pre-word-timestamp response).
+	includeWords := request.GetBool("includeWordTimestamps", false)
 
 	// Two ways in: an explicit track/job id, or a `book` to resolve.
 	trackID := strings.TrimSpace(request.GetString("trackID", ""))
@@ -458,7 +461,7 @@ func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.Call
 		return mcp.NewToolResultError(fmt.Sprintf("Track %q is not transcribed yet (status: %s).", detail.FilePath, detail.Status)), nil
 	}
 
-	return formatTranscriptPage(detail, offset, limit), nil
+	return formatTranscriptPage(detail, offset, limit, includeWords), nil
 }
 
 // handleGetContext retrieves surrounding chunks for better context

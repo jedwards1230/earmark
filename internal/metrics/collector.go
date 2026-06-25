@@ -21,6 +21,7 @@ type statsCollector struct {
 	embedBacklog      *prometheus.Desc // earmark_embed_backlog
 	evalCoverage      *prometheus.Desc // earmark_eval_coverage_ratio
 	lastHeartbeatSecs *prometheus.Desc // earmark_runner_last_heartbeat_seconds
+	aliveSecs         *prometheus.Desc // earmark_runner_alive_seconds
 	runnerAvailable   *prometheus.Desc // earmark_runner_available
 	etaWork           *prometheus.Desc // earmark_eta_work_seconds
 	etaCalendar       *prometheus.Desc // earmark_eta_calendar_seconds
@@ -46,6 +47,10 @@ func newStatsCollector(src StatsSource, timeout time.Duration) *statsCollector {
 			"earmark_runner_last_heartbeat_seconds",
 			"Seconds since the runner's last CLAIM-ACTIVITY (it only stamps a heartbeat while a job is claimed — there is no idle heartbeat). NOT emitted when there is no claim/completion history. Cannot distinguish 'idle, queue empty' from 'down': pair with earmark_jobs{status=pending|claimed}>0 before alerting.",
 			nil, nil),
+		aliveSecs: prometheus.NewDesc(
+			"earmark_runner_alive_seconds",
+			"Seconds since the runner's last LIVENESS heartbeat (runner_control.runner_heartbeat_at), stamped EVERY poll cycle whether working, idle, or paused. Unlike earmark_runner_last_heartbeat_seconds this stays fresh on an empty queue, so it distinguishes 'idle, queue drained' (small value) from 'runner down' (large/growing value). NOT emitted until the runner has stamped at least once.",
+			nil, nil),
 		runnerAvailable: prometheus.NewDesc(
 			"earmark_runner_available",
 			"1 when the runner host is available for transcription (gpu-arbiter not gaming), 0 when gaming/evicting. Only emitted when a runner_availability signal has been observed.",
@@ -67,6 +72,7 @@ func (c *statsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.embedBacklog
 	ch <- c.evalCoverage
 	ch <- c.lastHeartbeatSecs
+	ch <- c.aliveSecs
 	ch <- c.runnerAvailable
 	ch <- c.etaWork
 	ch <- c.etaCalendar
@@ -113,6 +119,18 @@ func (c *statsCollector) Collect(ch chan<- prometheus.Metric) {
 			age = 0
 		}
 		g(c.lastHeartbeatSecs, age)
+	}
+
+	// Runner liveness age — stamped every poll cycle (working/idle/paused), so a
+	// small value with an empty queue is "idle, done" and a large/growing value is
+	// "runner down" (CONTRACT §1.7). Only emitted once the runner has stamped a
+	// heartbeat (nil on a fresh install before the first poll).
+	if st.RunnerHeartbeatAt != nil {
+		age := time.Since(*st.RunnerHeartbeatAt).Seconds()
+		if age < 0 {
+			age = 0
+		}
+		g(c.aliveSecs, age)
 	}
 
 	// Runner availability: only emit when an availability signal exists.

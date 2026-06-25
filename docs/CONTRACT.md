@@ -139,6 +139,20 @@ Rules:
 - `score` in word objects is `null` when the alignment model does not produce a
   confidence value.
 - All timestamps are float64 seconds, not milliseconds.
+- **Segment granularity is sentence-sized, derived from word timestamps.** NeMo
+  Parakeet-TDT returns exactly one "segment" per `transcribe()` call (one per
+  ~600 s transcription window — a 60 s clip still yields a single segment), so
+  its segment-level boundaries are NOT used. The runner instead derives segments
+  from the per-word timestamps: a new segment starts on an inter-word silence
+  gap > `ASR_SEGMENT_GAP_SECONDS` (default 0.6 s ≈ a sentence boundary), a
+  speaker change, or a hard cap of `ASR_SEGMENT_MAX_SECONDS` (30 s) /
+  `ASR_SEGMENT_MAX_WORDS` (80) so no segment exceeds a few tens of seconds even
+  in gap-less speech. Each segment always retains its `words[]`, so per-second
+  precision is available regardless of segment size. Transcripts produced before
+  this scheme (one ~600 s segment per window) can be upgraded in place by
+  `runner/resegment.py` — it re-derives segments from the already-stored words
+  with no re-transcription — followed by `earmark requeue --reembed "" --yes` to
+  rebuild chunks.
 
 ### 1.3 Claim Semantics
 
@@ -257,6 +271,7 @@ CREATE TABLE IF NOT EXISTS runner_control (
     paused     BOOLEAN     NOT NULL DEFAULT false,
     run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
     phase      TEXT            CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze')),
+    runner_heartbeat_at TIMESTAMPTZ,  -- liveness stamp; runner writes it every poll cycle
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by TEXT
 );
@@ -268,6 +283,13 @@ INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NO
 - **`run_limit`** — `NULL` means unlimited (normal operation); a non-negative
   integer is a **bounded run** with that many claims remaining (e.g. `1` for a
   single-job smoke test).
+- **`runner_heartbeat_at`** — liveness stamp the runner writes to `now()` on
+  **every** poll cycle, whether it is working, idle (empty queue), or
+  paused/parked. Unlike `transcription_jobs.updated_at` (which only moves while a
+  job is *claimed*), it stays fresh on a drained queue, so it distinguishes
+  "alive but idle" from "down" (§1.7). The Go collector exposes it as
+  `earmark_runner_alive_seconds` (§2.16). `NULL` until the first stamp; writes
+  are best-effort and never block the claim path.
 - **`phase`** — the **batched two-phase pipeline** selector. `NULL` or `'idle'`
   is normal operation (both the ASR runner and the Go embed worker run freely —
   the default, fully backward-compatible); `'transcribe'` is the ASR-only phase
@@ -688,16 +710,18 @@ Rules:
 | `heartbeat` | derived from the runner's existing claimed-job heartbeat | **derived** — see the heartbeat caveat below |
 | `claim`, `transcribe`, `done` | Python runner | **DEFERRED** — requires runner.py changes + on-hardware validation (NeMo/CUDA). The runner owns the claim/transcribe/mark-done UPDATEs; emitting these from runner.py is a follow-up PR. `done` cannot be observed Go-side (the completion time is captured by the `completed_at` trigger, §1.1, but no Go code sees the transition). |
 
-> **Heartbeat is claim-activity, not idle liveness.** The runner only stamps
-> `transcription_jobs.updated_at` while a job is **claimed** (every
-> `RUNNER_HEARTBEAT_SECONDS`, default 60). There is **no idle heartbeat** — when
-> the queue is drained or the runner is paused, nothing is stamped. So a
-> heartbeat-derived liveness signal (and the `earmark_runner_last_heartbeat_seconds`
-> gauge, §2.16) reflects "time since last claim-activity," and **cannot**
-> distinguish "runner idle, queue empty" from "runner down." A **true idle
-> heartbeat is exactly the deferred runner.py work** — it is why that follow-up
-> matters. Consumers MUST pair this signal with a queue-non-empty + not-paused
-> condition before treating staleness as "down."
+> **Two heartbeats — claim-activity vs idle liveness.** The per-job heartbeat
+> stamps `transcription_jobs.updated_at` only while a job is **claimed** (every
+> `RUNNER_HEARTBEAT_SECONDS`, default 60); it goes quiet on a drained or paused
+> queue, so `earmark_runner_last_heartbeat_seconds` (§2.16) reflects "time since
+> last claim-activity" and **cannot** distinguish "idle, queue empty" from
+> "down." The runner therefore ALSO stamps `runner_control.runner_heartbeat_at`
+> on **every** poll cycle (working, idle, or paused), surfaced as
+> `earmark_runner_alive_seconds` (§2.16) — this IS true idle liveness: a small
+> value with an empty queue is idle-done, a large/growing value is the runner
+> down. Alerts keyed on the old claim-activity gauge MUST still pair it with a
+> queue-non-empty + not-paused condition; alerts on liveness should use
+> `earmark_runner_alive_seconds`.
 
 ---
 
@@ -743,17 +767,19 @@ strictly dominates it; its tree view is folded in via `list_books format=tree`).
 
 **Chunks vs segments** — two granularities of the same text, surfaced by
 different tools: a **chunk** is the embedding/search unit (~hundreds per book; a
-chunk is *tens of consecutive ASR segments* grouped together), while a
-**segment** is a single ASR timestamp unit (thousands per book). The search
-tools + `get_chunk_context` operate on **chunks**; `get_transcript` paginates
-raw **segments**.
+chunk is *tens of consecutive segments* grouped to a token budget), while a
+**segment** is a sentence-sized unit derived from the per-word timestamps
+(silence-gap split with a duration cap, §1.2.1 — typically a few seconds, many
+per chunk) that always carries its own `words[]`. The search tools +
+`get_chunk_context` operate on **chunks**; `get_transcript` paginates
+**segments** (and, with `includeWordTimestamps=true`, their per-word times).
 
 | Tool | Purpose | Key params |
 |------|---------|-----------|
 | `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. Ordered **transcribed-first** (fully-done books, then partial, then fully-pending). Leads with a one-line whole-library summary (`Library: T books — P fully transcribed, Q with pending tracks.` — TRUE totals across the library, not just the page). `format=flat` (default) **omits each book's `dir:` line** to keep the payload small; `format=tree` groups rows under their authors **and** keeps the `dir:` line. | `author?` (substring filter), `format?` (`flat` default \| `tree`), `limit?` (default 50), `offset?` |
 | `semantic_search_audiobooks` | Vector-similarity (meaning) search; hits show a real cosine `similarity: NN%`. Whole library by default; `book` scopes it. `snippet?` caps each hit's quoted text (leading **preview** — no sub-chunk match position). | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `text_search_audiobooks` | Trigram literal/keyword search; hits are labelled **"ranked by trigram match"** (NOT a similarity %, which would mislead on a literal hit). Whole library by default; `book` scopes it. `snippet?` returns an excerpt **centred on the literal match**. | `query` (required), `book?`, `limit?` (10), `snippet?` (max chars; floored to 80) |
-| `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments) |
+| `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. Per-word timestamps are **hidden by default**; `includeWordTimestamps=true` adds each segment's `words[]` (word/start/end, plus score/speaker when present) for "exactly when was X said" queries. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments), `includeWordTimestamps?` (false) |
 | `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (**default 1** → ~3 chunks; clamped to 0–50 to bound the response size) |
 
 **Structured output**: every tool advertises an `outputSchema` and returns
@@ -766,7 +792,11 @@ human-readable text, which is kept as the spec-required back-compat fallback
 `get_transcript` → `{ kind: "transcript", filePath, language, modelName,
 durationSeconds, segments[], offset, limit, totalSegments, nextOffset? }` for a
 page, or `{ kind: "trackChooser", book, tracks[] }` when a book has multiple
-tracks. Bad user input (missing/unmatched `book`, bad `chunkID`, etc.) returns a
+tracks. Each segment is `{ start, end, text }`; with `includeWordTimestamps=true`
+it also carries `words[]` — each `{ word, start, end, score?, speaker? }`
+(`score`/`speaker` present only when the ASR backend supplied them). The `words`
+field is **omitted entirely** by default, so the default response is unchanged.
+Bad user input (missing/unmatched `book`, bad `chunkID`, etc.) returns a
 tool-execution error (`isError`), never a protocol error.
 
 **Snippet windows** (`snippet` on both search tools): omitted → the full ~400-word
@@ -1556,6 +1586,7 @@ histogram are incremented at the Go-emitted pipeline event sites.
 | `earmark_embed_backlog` | gauge | — | Completed transcripts with no chunks yet (the embed worker's needs-embedding set). |
 | `earmark_eval_coverage_ratio` | gauge | — | Done jobs judged (`run_metrics.eval_finished_at` non-NULL) ÷ done jobs; `0` when no done jobs. |
 | `earmark_runner_last_heartbeat_seconds` | gauge | — | Seconds since the runner's last **claim-activity**. The runner only stamps a heartbeat while a job is claimed (no idle heartbeat, §1.7), so this is NOT idle liveness and CANNOT distinguish "idle, queue empty" from "down". **Omitted entirely when there is no claim/completion history** (so an alert can't misread a multi-day age). Pair with `earmark_jobs{status="pending"}+earmark_jobs{status="claimed"}>0` before alerting. |
+| `earmark_runner_alive_seconds` | gauge | — | Seconds since the runner's last **liveness** heartbeat (`runner_control.runner_heartbeat_at`), stamped **every** poll cycle — working, idle, or paused. Unlike `earmark_runner_last_heartbeat_seconds` this stays fresh on a drained queue, so it distinguishes "idle, queue empty" (small value) from "runner down" (large/growing value). **Omitted until the runner has stamped at least once.** |
 | `earmark_runner_available` | gauge | — | `1` when the GPU host is free for transcription (gpu-arbiter not gaming), `0` when gaming/evicting. Omitted until a `runner_availability` event has been observed. |
 | `earmark_stage_duration_seconds` | histogram | `stage` | Per-stage processing duration, observed at Go-emitted finish events (`embed`, `eval`). |
 | `earmark_jobs_completed_total` | counter | — | Go-observable embed-stage completions (best-effort — the **runner** owns the job `done` transition, so this counts the worker's embed finishes, not the runner's mark-done). |
