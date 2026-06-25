@@ -2346,5 +2346,68 @@ class RunMetricsDescriptorBindingTests(unittest.TestCase):
         self.assertIn(None, params)
 
 
+class ResegmentOrderingTests(unittest.TestCase):
+    """_normalize_words / _words_to_segments monotonicity (overlapping windows)."""
+
+    @staticmethod
+    def _w(word: str, start: float, end: float, speaker: str | None = None):
+        return {"word": word, "start": start, "end": end, "score": None, "speaker": speaker}
+
+    def _all_monotonic(self, segments):
+        for s in segments:
+            self.assertLessEqual(
+                s["start"], s["end"], f"segment not monotonic: {s['text']!r}"
+            )
+
+    def test_segments_are_monotonic_and_sorted(self):
+        # Out-of-order input (a late word sorts before an earlier-listed one).
+        words = [
+            self._w("the", 10.0, 10.3),
+            self._w("door", 10.4, 10.8),
+            self._w("here", 1.0, 1.4),  # belongs first
+            self._w("now", 1.5, 1.8),
+        ]
+        segs = runner._words_to_segments(words, [None] * len(words))
+        self._all_monotonic(segs)
+        flat = [w["word"] for s in segs for w in s["words"]]
+        self.assertEqual(flat, ["here", "now", "the", "door"])
+
+    def test_drops_overlapping_window_duplicate(self):
+        # "then" repeats at an overlapping seam timestamp → one copy survives.
+        words = [
+            self._w("surprised", 600.0, 600.5),
+            self._w("then", 600.6, 600.9),
+            self._w("then", 600.6, 600.9),  # overlapping-window duplicate
+            self._w("here", 601.0, 601.4),
+        ]
+        segs = runner._words_to_segments(words, [None] * len(words))
+        self._all_monotonic(segs)
+        flat = [w["word"] for s in segs for w in s["words"]]
+        self.assertEqual(flat.count("then"), 1)
+
+    def test_keeps_legitimate_repeated_word(self):
+        # Non-overlapping repeat ("very very") must be preserved.
+        words = [
+            self._w("very", 5.0, 5.3),
+            self._w("very", 5.4, 5.7),  # starts after prev ends → kept
+            self._w("good", 5.8, 6.1),
+        ]
+        segs = runner._words_to_segments(words, [None] * len(words))
+        flat = [w["word"] for s in segs for w in s["words"]]
+        self.assertEqual(flat.count("very"), 2)
+
+    def test_regression_non_monotonic_seam(self):
+        # The exact failure shape seen in prod: a duplicated phrase whose words
+        # carry earlier timestamps appended after a later-starting word.
+        words = [
+            self._w("here", 606.7, 607.0),
+            self._w("dry", 607.1, 607.4),
+            self._w("then", 600.3, 600.6),  # stale duplicate, big silence gap back
+            self._w("surprised", 600.7, 601.8),
+        ]
+        segs = runner._words_to_segments(words, [None] * len(words))
+        self._all_monotonic(segs)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

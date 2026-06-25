@@ -1754,6 +1754,44 @@ def _build_segments(
     return segments, speaker_count
 
 
+def _normalize_words(
+    words: list[dict[str, Any]],
+    word_speakers: list[str | None],
+) -> tuple[list[dict[str, Any]], list[str | None]]:
+    """
+    Sort words by time and drop overlapping-window duplicate boundary words.
+
+    Long-audio ASR (NeMo Parakeet-TDT) transcribes in overlapping windows, so a
+    word near a window seam can appear twice with near-identical timestamps, and
+    the per-window words[] arrays — concatenated in storage order by
+    resegment_existing — are not globally time-ordered. Feeding that raw stream
+    into segmentation produces non-monotonic segments (end < start) and
+    duplicated seam text.
+
+    We sort by (start, end), keeping word_speakers aligned, then drop a word when
+    it repeats the previous token at an overlapping timestamp (same word text,
+    starting before the previous word ended). A legitimately repeated word
+    ("very very") starts after the previous one ends, so it is kept.
+    """
+    if not words:
+        return [], []
+    order = sorted(
+        range(len(words)),
+        key=lambda i: (words[i]["start"], words[i]["end"]),
+    )
+    out_words: list[dict[str, Any]] = []
+    out_speakers: list[str | None] = []
+    for i in order:
+        w = words[i]
+        if out_words:
+            prev = out_words[-1]
+            if w["word"] == prev["word"] and w["start"] < prev["end"]:
+                continue  # overlapping-window duplicate
+        out_words.append(w)
+        out_speakers.append(word_speakers[i] if i < len(word_speakers) else None)
+    return out_words, out_speakers
+
+
 def _words_to_segments(
     words: list[dict[str, Any]],
     word_speakers: list[str | None],
@@ -1772,6 +1810,14 @@ def _words_to_segments(
     Per-second precision is preserved regardless: every segment keeps its
     words[] array (CONTRACT §1.2.1).
     """
+    if not words:
+        return []
+
+    # Long-audio ASR transcribes in overlapping windows, so the raw words[] is
+    # not globally time-ordered and boundary words can repeat. Normalize first,
+    # or a segment can end up non-monotonic (its last word predates its first →
+    # end < start) with duplicated seam text.
+    words, word_speakers = _normalize_words(words, word_speakers)
     if not words:
         return []
 
@@ -1815,8 +1861,10 @@ def _flush_segment(
     seg_speaker = max(set(seg_speakers), key=seg_speakers.count) if seg_speakers else None
     return {
         "id": idx,
-        "start": words[0]["start"],
-        "end": words[-1]["end"],
+        # min/max (not words[0]/words[-1]) so the segment is monotonic even if a
+        # caller ever passes unsorted words: end can never precede start.
+        "start": min(w["start"] for w in words),
+        "end": max(w["end"] for w in words),
         "text": text,
         "speaker": seg_speaker,
         "words": words,

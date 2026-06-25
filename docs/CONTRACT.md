@@ -152,7 +152,11 @@ Rules:
   this scheme (one ~600 s segment per window) can be upgraded in place by
   `runner/resegment.py` — it re-derives segments from the already-stored words
   with no re-transcription — followed by `earmark requeue --reembed "" --yes` to
-  rebuild chunks.
+  rebuild chunks. Before segmenting, the runner normalizes the word stream
+  (sorts by start time, drops overlapping-window duplicate boundary words), so a
+  segment is always monotonic (`end >= start`) even though long-audio ASR
+  emits overlapping inference windows whose stored `words[]` are not globally
+  ordered.
 
 ### 1.3 Claim Semantics
 
