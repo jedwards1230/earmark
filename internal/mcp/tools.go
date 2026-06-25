@@ -43,6 +43,13 @@ type DBInterface interface {
 	RequeueFailed(ctx context.Context) ([]string, error)
 	// SetPaused writes the global runner pause flag (dashboard pause/resume).
 	SetPaused(ctx context.Context, paused bool, by string) error
+	// SetDesiredRunnerVersion records the operator's runner-update intent: the
+	// target earmark tag + state='requested' (CONTRACT §2.12). The runner reads
+	// it and self-updates when it differs from the version it runs.
+	SetDesiredRunnerVersion(ctx context.Context, version, by string) error
+	// ClearRunnerUpdate cancels/acknowledges an update request (clears the desired
+	// version, resets the state machine to 'idle').
+	ClearRunnerUpdate(ctx context.Context, by string) error
 	// GetControl returns the full runner_control state — pause flag plus the
 	// bounded-run counter (nil = unlimited) — for the control API.
 	GetControl(ctx context.Context) (paused bool, runLimit *int, err error)

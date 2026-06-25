@@ -518,6 +518,27 @@ var serversPage = mustPage(`{{define "content"}}
 var serversFragmentTmpl = template.Must(template.New("servers").Funcs(tmplFuncs).Parse(`
 <div class="updated">updated {{.RenderedAt}}</div>
 
+{{with .RunnerUpdate}}
+<div class="section">
+  <div class="section-title">ASR runner version</div>
+  <div class="panel server-card">
+    <div class="server-head">
+      <span class="server-name">running <code>{{if .Running}}{{.Running}}{{else}}unknown{{end}}</code></span>
+      {{if .Available}}<span class="badge unconfigured" title="a different version is requested">update {{if eq .State "updating"}}in progress{{else if eq .State "failed"}}failed{{else}}available{{end}}</span>{{end}}
+    </div>
+    {{if .Desired}}<div class="server-sub">desired <code>{{.Desired}}</code>{{if .State}} · {{.State}}{{end}}</div>{{end}}
+    {{if .Error}}<div class="server-sub err">{{.Error}}</div>{{end}}
+    {{if $.ControlEnabled}}
+    <form class="rb-form" hx-post="/actions/runner-update" hx-target="#servers-region" hx-swap="innerHTML">
+      <input type="text" name="version" placeholder="vX.Y.Z" value="{{.Desired}}" />
+      <button class="btn btn-primary" type="submit">Update runner</button>
+      {{if .Desired}}<button class="btn" type="button" hx-post="/actions/runner-update?version=" hx-target="#servers-region" hx-swap="innerHTML" title="cancel/acknowledge">Clear</button>{{end}}
+    </form>
+    {{else}}<div class="server-sub">set <code>CONTROL_API_TOKEN</code> to enable the update button.</div>{{end}}
+  </div>
+</div>
+{{end}}
+
 {{if and (not .Servers) (not .Endpoints)}}
 <p class="lib-empty">No servers configured or observed yet. Set <code>ASR_SERVERS</code> to declare your transcription servers, or wait for a runner to claim its first job.</p>
 {{else}}
@@ -640,6 +661,21 @@ type serversData struct {
 	// Endpoints is the AI endpoint registry (CONTRACT §2.14) merged with health
 	// probes — the AI Endpoints section of the Models/Services page.
 	Endpoints []endpointView
+	// RunnerUpdate is the version-skew + self-update affordance (CONTRACT §2.12),
+	// nil when the runner has never reported a version. ControlEnabled gates the
+	// update button on whether a control token is configured (fail-closed).
+	RunnerUpdate   *serversRunnerUpdate
+	ControlEnabled bool
+}
+
+// serversRunnerUpdate is the dashboard view of runner_control's version-skew +
+// update state for the Models/Services page.
+type serversRunnerUpdate struct {
+	Running   string
+	Desired   string
+	State     string
+	Error     string
+	Available bool
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -658,17 +694,75 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 	views := buildServerViews(s.asrServers, obs, s.probeServers(r.Context()), time.Now(), s.runnerStaleAfter)
 	groups := groupByFamily(views)
 	data := serversData{
-		RenderedAt:   time.Now().UTC().Format("15:04:05 UTC"),
-		Servers:      views,
-		FamilyGroups: groups,
-		MultiFamily:  multiFamily(groups),
-		Endpoints:    buildEndpointViews(s.cfg, s.probeEndpoints(r.Context())),
+		RenderedAt:     time.Now().UTC().Format("15:04:05 UTC"),
+		Servers:        views,
+		FamilyGroups:   groups,
+		MultiFamily:    multiFamily(groups),
+		Endpoints:      buildEndpointViews(s.cfg, s.probeEndpoints(r.Context())),
+		ControlEnabled: s.controlToken != "",
+		RunnerUpdate:   s.buildRunnerUpdate(r.Context()),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := serversFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("servers fragment render error", "error", err)
 	}
+}
+
+// buildRunnerUpdate reads runner_control's version-skew state for the dashboard.
+// Returns nil (card hidden) when the runner has never reported a version and no
+// update is pending, so the affordance only appears once it is meaningful.
+func (s *MCPServer) buildRunnerUpdate(ctx context.Context) *serversRunnerUpdate {
+	stats, err := s.db.GetServiceStatus(ctx)
+	if err != nil {
+		s.logger.Warn("servers: runner-update state read failed", "error", err)
+		return nil
+	}
+	running := derefStr(stats.RunnerVersion)
+	desired := derefStr(stats.DesiredRunnerVersion)
+	state := derefStr(stats.RunnerUpdateState)
+	if running == "" && desired == "" && state == "" {
+		return nil
+	}
+	return &serversRunnerUpdate{
+		Running:   running,
+		Desired:   desired,
+		State:     state,
+		Error:     derefStr(stats.RunnerUpdateError),
+		Available: desired != "" && desired != running,
+	}
+}
+
+// handleRunnerUpdate serves POST /actions/runner-update?version=<tag> (htmx): it
+// records the operator's update intent (or clears it when version is empty) and
+// re-renders the servers fragment. The runner — not this handler — performs the
+// swap (CONTRACT §2.12). Fails closed when no control token is configured.
+func (s *MCPServer) handleRunnerUpdate(w http.ResponseWriter, r *http.Request) {
+	if !isHTMX(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if s.controlToken == "" {
+		writeActionError(w, "control token not configured — update disabled")
+		return
+	}
+	version := strings.TrimSpace(r.URL.Query().Get("version"))
+	if version == "" {
+		if err := s.db.ClearRunnerUpdate(r.Context(), "dashboard"); err != nil {
+			s.logger.Error("runner-update clear error", "error", err)
+			writeActionError(w, "clear update failed — see server logs")
+			return
+		}
+		s.logger.Info("runner update request cleared via dashboard")
+	} else {
+		if err := s.db.SetDesiredRunnerVersion(r.Context(), version, "dashboard"); err != nil {
+			s.logger.Error("runner-update error", "error", err)
+			writeActionError(w, "runner update request failed — see server logs")
+			return
+		}
+		s.logger.Info("runner update requested via dashboard", "version", version)
+	}
+	s.handleServersData(w, r)
 }
 
 // probeServers polls gpu-arbiter for every configured server that declares a

@@ -535,6 +535,33 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("runner_heartbeat_at migration: %w", err)
 	}
 
+	// Runner self-update migration (CONTRACT §1.4 + §2.12): version-skew detection
+	// + the update state machine. runner_version is the tag the runner reports it
+	// is RUNNING (stamped on the heartbeat); desired_runner_version is the tag the
+	// dashboard button asks it to run; the runner owns the
+	// requested→updating→success/failed transitions. All NULL until first use.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE runner_control
+			ADD COLUMN IF NOT EXISTS runner_version         TEXT,
+			ADD COLUMN IF NOT EXISTS desired_runner_version TEXT,
+			ADD COLUMN IF NOT EXISTS runner_update_state    TEXT,
+			ADD COLUMN IF NOT EXISTS runner_update_error    TEXT,
+			ADD COLUMN IF NOT EXISTS runner_update_at       TIMESTAMPTZ;
+		DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = 'runner_control_update_state_valid'
+			) THEN
+				ALTER TABLE runner_control
+					ADD CONSTRAINT runner_control_update_state_valid
+					CHECK (runner_update_state IS NULL OR runner_update_state IN
+						('idle','requested','updating','success','failed'));
+			END IF;
+		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+		END $$;
+	`); err != nil {
+		return fmt.Errorf("runner self-update migration: %w", err)
+	}
+
 	// Path-level dedup migration: the original dedup was checksum-only, so a file
 	// hashed mid-copy (over NFS) and again when complete produced two jobs for one
 	// file_path. Collapse any such duplicates (keep the most-advanced, else oldest
@@ -1669,6 +1696,17 @@ type QueueStats struct {
 	// until the runner has stamped at least once (column default NULL).
 	RunnerHeartbeatAt *time.Time
 
+	// Runner self-update (CONTRACT §1.4 + §2.12). RunnerVersion is the tag the
+	// runner reports it is RUNNING (stamped on the heartbeat); DesiredRunnerVersion
+	// is the tag the dashboard asked it to run; RunnerUpdateState is the state
+	// machine token (idle|requested|updating|success|failed) and RunnerUpdateError
+	// carries the failure detail. All nil/"" until the feature is exercised.
+	RunnerVersion        *string
+	DesiredRunnerVersion *string
+	RunnerUpdateState    *string
+	RunnerUpdateError    *string
+	RunnerUpdateAt       *time.Time
+
 	// EvalCoverageDone is the number of done jobs whose run_metrics row has a
 	// non-NULL eval_finished_at (i.e. has been judged). Paired with Done it gives
 	// the eval coverage ratio (CONTRACT §1.5). 0 when nothing is judged yet.
@@ -1840,8 +1878,14 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 	// counter. Tolerate a missing row by defaulting to not-paused/unlimited; the
 	// init seed normally guarantees it exists.
 	if err := db.pool.QueryRow(ctx,
-		`SELECT paused, run_limit, runner_heartbeat_at FROM runner_control WHERE id = 1`,
-	).Scan(&q.Paused, &q.RunLimit, &q.RunnerHeartbeatAt); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		`SELECT paused, run_limit, runner_heartbeat_at,
+		        runner_version, desired_runner_version,
+		        runner_update_state, runner_update_error, runner_update_at
+		 FROM runner_control WHERE id = 1`,
+	).Scan(&q.Paused, &q.RunLimit, &q.RunnerHeartbeatAt,
+		&q.RunnerVersion, &q.DesiredRunnerVersion,
+		&q.RunnerUpdateState, &q.RunnerUpdateError, &q.RunnerUpdateAt,
+	); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("control row query: %w", err)
 	}
 
@@ -2275,6 +2319,50 @@ func (db *DB) SetPaused(ctx context.Context, paused bool, by string) error {
 	`, paused, by)
 	if err != nil {
 		return fmt.Errorf("set paused: %w", err)
+	}
+	return nil
+}
+
+// SetDesiredRunnerVersion records the operator's update intent (CONTRACT §2.12):
+// the dashboard/control-API writes the target tag and flips the state machine to
+// 'requested'. The runner reads desired_runner_version each cycle and, when it
+// differs from the version it is running, self-updates (CONTRACT §1.4). by
+// records who requested it. Upserts the singleton so it works even if the seed
+// insert was skipped.
+func (db *DB) SetDesiredRunnerVersion(ctx context.Context, version, by string) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO runner_control (id, desired_runner_version, runner_update_state, runner_update_error, runner_update_at, updated_at, updated_by)
+		VALUES (1, $1, 'requested', NULL, now(), now(), $2)
+		ON CONFLICT (id) DO UPDATE
+			SET desired_runner_version = EXCLUDED.desired_runner_version,
+			    runner_update_state = 'requested',
+			    runner_update_error = NULL,
+			    runner_update_at = now(),
+			    updated_at = now(),
+			    updated_by = EXCLUDED.updated_by
+	`, version, by)
+	if err != nil {
+		return fmt.Errorf("set desired runner version: %w", err)
+	}
+	return nil
+}
+
+// ClearRunnerUpdate cancels/acknowledges an update request: clears the desired
+// version and resets the state machine to 'idle'. Used by the dashboard's
+// clear/abort affordance after a success or to dismiss a failure.
+func (db *DB) ClearRunnerUpdate(ctx context.Context, by string) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE runner_control
+		SET desired_runner_version = NULL,
+		    runner_update_state = 'idle',
+		    runner_update_error = NULL,
+		    runner_update_at = now(),
+		    updated_at = now(),
+		    updated_by = $1
+		WHERE id = 1
+	`, by)
+	if err != nil {
+		return fmt.Errorf("clear runner update: %w", err)
 	}
 	return nil
 }

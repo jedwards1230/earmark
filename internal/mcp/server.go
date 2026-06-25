@@ -424,6 +424,10 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	// CONTROL_API_TOKEN like the eval actions). Deletes only advisory
 	// transcript_findings rows, then re-renders the /findings fragment.
 	mux.HandleFunc("POST /actions/findings-clear", s.handleFindingsClear)
+	// Runner self-update (CONTRACT §2.12): request the runner switch to a target
+	// earmark tag (or clear the request). htmx-guarded + fail-closed on an unset
+	// CONTROL_API_TOKEN; the runner performs the swap.
+	mux.HandleFunc("POST /actions/runner-update", s.handleRunnerUpdate)
 
 	// JSON control API (script/agent-facing) — distinct from the htmx dashboard
 	// actions above. Reads are unauthenticated; mutations require the bearer token
@@ -434,6 +438,7 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("PUT /api/v1/pipeline/pause", s.requireToken(s.handleAPIPausePut))
 	mux.HandleFunc("POST /api/v1/pipeline/run", s.requireToken(s.handleAPIRun))
 	mux.HandleFunc("DELETE /api/v1/pipeline/run", s.requireToken(s.handleAPIRunClear))
+	mux.HandleFunc("POST /api/v1/runner/update", s.requireToken(s.handleAPIRunnerUpdate))
 
 	// Liveness — no external deps. Both /health (back-compat) and /healthz (the
 	// uniform name the ingest pod also exposes) are served so Helm probes can use

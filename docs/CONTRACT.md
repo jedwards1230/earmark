@@ -272,6 +272,12 @@ CREATE TABLE IF NOT EXISTS runner_control (
     run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
     phase      TEXT            CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze')),
     runner_heartbeat_at TIMESTAMPTZ,  -- liveness stamp; runner writes it every poll cycle
+    runner_version         TEXT,         -- tag the runner reports it is RUNNING (stamped on heartbeat)
+    desired_runner_version TEXT,         -- tag the dashboard asks it to run (self-update target)
+    runner_update_state    TEXT          CHECK (runner_update_state IS NULL OR runner_update_state IN
+                                            ('idle','requested','updating','success','failed')),
+    runner_update_error    TEXT,         -- failure detail for the last update attempt
+    runner_update_at       TIMESTAMPTZ,  -- when the update state last changed
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by TEXT
 );
@@ -290,6 +296,28 @@ INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NO
   "alive but idle" from "down" (§1.7). The Go collector exposes it as
   `earmark_runner_alive_seconds` (§2.16). `NULL` until the first stamp; writes
   are best-effort and never block the claim path.
+- **`runner_version` / `desired_runner_version`** — the runner self-update
+  channel (§2.12). `runner_version` is the earmark git tag the runner reports it
+  is **running** (stamped alongside the heartbeat; resolved from a
+  `/opt/asr-runner/VERSION` file written by a self-update, else the
+  `RUNNER_VERSION` env the ansible role renders from `asr_runner_source_ref`).
+  `desired_runner_version` is the tag the dashboard button asks it to run. Skew =
+  `desired_runner_version` set and ≠ `runner_version`. The runner reads the
+  desired version every poll cycle and, **between jobs** (no claimed job) and not
+  in `analyze` phase, fetches `runner/runner.py` at that tag from
+  `raw.githubusercontent.com` (mirroring the ansible `get_url`), runs it with
+  `--self-check` (parse/import, no model load), atomically swaps it in (keeping a
+  `.backup`), writes the `VERSION` file, and re-execs. Updating while `paused` is
+  allowed (idle is the safe time); the model reload on the re-exec'd startup goes
+  through the normal park gate, so it yields to a game/eval.
+- **`runner_update_state`** — the update state machine, written by the runner
+  (the dashboard only sets `desired_runner_version` + `'requested'`):
+  `requested` (operator asked) → `updating` (runner fetched/swapping) →
+  `success` (the re-exec'd new version stamped its version) | `failed`
+  (`runner_update_error` carries why; the running version is unchanged — the swap
+  is atomic and self-check-gated, so a broken candidate never replaces a good
+  one). No retry until the button is pressed again (which resets to `requested`).
+  `runner_update_at` timestamps the last transition.
 - **`phase`** — the **batched two-phase pipeline** selector. `NULL` or `'idle'`
   is normal operation (both the ASR runner and the Go embed worker run freely —
   the default, fully backward-compatible); `'transcribe'` is the ASR-only phase
@@ -1148,6 +1176,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
 | `DELETE` | `/api/v1/pipeline/run` | bearer | — | `200` clears the bounded run (`run_limit→NULL`) |
+| `POST` | `/api/v1/runner/update` | bearer | `{"version":"<tag>"}` (empty/omitted clears) | `202 {runningVersion,desiredVersion,state,updateAvailable,…}` — request the runner self-update to `<tag>` (sets `desired_runner_version` + `'requested'`); the runner performs the swap (§1.4) |
 
 **`pipeline` object** — a derived 3-stage lifecycle view (Transcribe → Eval → Embed) computed at read-time from already-fetched signals:
 
@@ -1209,6 +1238,7 @@ unchanged.):
 | `POST` | `/actions/book-requeue?dir=…` | htmx | re-transcribe one book |
 | `POST` | `/actions/pause` / `/actions/resume` | htmx + token | toggle the runner pause flag (Pipeline page) |
 | `POST` | `/actions/run` (form/query `n≥1`) | htmx + token | arm a bounded run of N claims then auto-pause — sets `run_limit=N` then unpauses (limit before unpause, mirroring `POST /api/v1/pipeline/run`) |
+| `POST` | `/actions/runner-update` (form/query `version`) | htmx + token | request the runner self-update to `version` (or clear when empty); writes `desired_runner_version` + `'requested'` and re-renders the `/servers` fragment (the version-skew card) |
 | `POST` | `/actions/run-clear` | htmx + token | clear the bounded run (`run_limit→NULL`) without touching the pause flag |
 | `POST` | `/actions/eval?dir=…` | htmx + token | run the LLM judge over one book (async, §2.15) |
 | `POST` | `/actions/eval-sample?n=N` | htmx + token | run the LLM judge over an N-chunk sample (async, §2.15) |

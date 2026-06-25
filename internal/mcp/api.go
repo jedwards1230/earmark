@@ -57,6 +57,9 @@ type apiStatus struct {
 	RunnerActive  bool    `json:"runnerActive"`
 	RunnerID      string  `json:"runnerId,omitempty"`
 	LastHeartbeat *string `json:"lastHeartbeat,omitempty"`
+	// RunnerUpdate is the version-skew + self-update state (CONTRACT §2.12). null
+	// until the runner reports a version or an update is requested.
+	RunnerUpdate *apiRunnerUpdate `json:"runnerUpdate,omitempty"`
 	// Per-run aggregates (run_metrics); null until the runner/worker populate them.
 	AvgProcessingSeconds *float64 `json:"avgProcessingSeconds"`
 	TotalEmbedTokens     *int64   `json:"totalEmbedTokens"`
@@ -145,6 +148,52 @@ type pauseState struct {
 	RunLimit *int `json:"runLimit"`
 }
 
+// apiRunnerUpdate is the JSON shape of the runner version-skew + self-update
+// state (CONTRACT §2.12). RunningVersion is what the runner reports it runs;
+// DesiredVersion is what the operator asked for; State is the update state
+// machine token; UpdateAvailable is true when a different version is desired.
+type apiRunnerUpdate struct {
+	RunningVersion  string  `json:"runningVersion,omitempty"`
+	DesiredVersion  string  `json:"desiredVersion,omitempty"`
+	State           string  `json:"state,omitempty"`
+	Error           string  `json:"error,omitempty"`
+	UpdateAvailable bool    `json:"updateAvailable"`
+	UpdatedAt       *string `json:"updatedAt,omitempty"`
+}
+
+// runnerUpdateFromStats builds the runner-update view from the control-row
+// state, or nil when nothing is known (no reported version, no request) so the
+// field is omitted for runners that predate the feature. UpdateAvailable is true
+// whenever a desired version is set and differs from the running one (the button
+// authors intent directly; we do not call GitHub from the status path).
+func runnerUpdateFromStats(running, desired, state, errMsg *string, at *time.Time) *apiRunnerUpdate {
+	rv := derefStr(running)
+	dv := derefStr(desired)
+	st := derefStr(state)
+	if rv == "" && dv == "" && st == "" {
+		return nil
+	}
+	ru := &apiRunnerUpdate{
+		RunningVersion:  rv,
+		DesiredVersion:  dv,
+		State:           st,
+		Error:           derefStr(errMsg),
+		UpdateAvailable: dv != "" && dv != rv,
+	}
+	if at != nil {
+		s := at.UTC().Format("2006-01-02T15:04:05Z07:00")
+		ru.UpdatedAt = &s
+	}
+	return ru
+}
+
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
 // ─── Auth middleware ─────────────────────────────────────────────────────────
 
 // requireToken guards mutating control endpoints with a bearer token. It fails
@@ -211,6 +260,10 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		hb := stats.LastHeartbeat.UTC().Format("2006-01-02T15:04:05Z07:00")
 		out.LastHeartbeat = &hb
 	}
+	out.RunnerUpdate = runnerUpdateFromStats(
+		stats.RunnerVersion, stats.DesiredRunnerVersion,
+		stats.RunnerUpdateState, stats.RunnerUpdateError, stats.RunnerUpdateAt,
+	)
 
 	// Empirical ETA (CONTRACT §4). Best-effort: a predict-inputs read error logs
 	// and leaves eta null rather than failing the status response.
@@ -408,6 +461,53 @@ func (s *MCPServer) handleAPIRunClear(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("bounded run cleared via control API")
 	s.writeControlState(r.Context(), w, http.StatusOK)
+}
+
+// handleAPIRunnerUpdate serves POST /api/v1/runner/update with body
+// {"version":"<tag>"} — sets desired_runner_version + state='requested' so the
+// runner self-updates (CONTRACT §2.12). An empty/omitted version clears the
+// request (resets to idle). Bearer-token guarded (fails closed) like the other
+// mutating endpoints; the runner — not this handler — performs the swap.
+func (s *MCPServer) handleAPIRunnerUpdate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Version *string `json:"version"`
+	}
+	if err := decodeJSONBody(r, &body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx := r.Context()
+	version := ""
+	if body.Version != nil {
+		version = strings.TrimSpace(*body.Version)
+	}
+	if version == "" {
+		if err := s.db.ClearRunnerUpdate(ctx, "api"); err != nil {
+			s.logger.Error("api runner-update clear error", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, "clear failed")
+			return
+		}
+		s.logger.Info("runner update request cleared via control API")
+	} else {
+		if err := s.db.SetDesiredRunnerVersion(ctx, version, "api"); err != nil {
+			s.logger.Error("api runner-update error", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, "runner update request failed")
+			return
+		}
+		s.logger.Info("runner update requested via control API", "version", version)
+	}
+	// Echo back the authoritative post-write runner-update state.
+	stats, err := s.db.GetServiceStatus(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	ru := runnerUpdateFromStats(stats.RunnerVersion, stats.DesiredRunnerVersion,
+		stats.RunnerUpdateState, stats.RunnerUpdateError, stats.RunnerUpdateAt)
+	if ru == nil {
+		ru = &apiRunnerUpdate{}
+	}
+	writeJSON(w, http.StatusAccepted, ru)
 }
 
 // writeControlState re-reads runner_control and writes it as the response body,
