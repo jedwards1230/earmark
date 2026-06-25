@@ -177,7 +177,12 @@ func formatTrackChooser(book string, tracks []db.RecentJob) *mcp.CallToolResult 
 // formatTranscriptPage renders a page of a track's transcript as timestamped
 // segments. raw_text can be hundreds of thousands of characters, so segments are
 // paginated by offset/limit with a footer pointing at the next page.
-func formatTranscriptPage(d *db.TrackDetail, offset, limit int) *mcp.CallToolResult {
+//
+// includeWords gates the per-word timestamp array on each structured segment.
+// When false (the default), the structured payload is byte-identical to the
+// pre-word-timestamp shape (the `words` field is omitted via omitempty). The
+// human-readable text rendering is unaffected by the flag.
+func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords bool) *mcp.CallToolResult {
 	// Defensive: the caller checks for nil, but guard here too so the helper is
 	// safe to reuse. A nil detail has no transcript to render.
 	if d == nil {
@@ -221,7 +226,11 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int) *mcp.CallToolRes
 	}
 	segs := make([]TranscriptSegment, 0, end-offset)
 	for _, seg := range d.Segments[offset:end] {
-		segs = append(segs, TranscriptSegment{Start: seg.Start, End: seg.End, Text: strings.TrimSpace(seg.Text)})
+		ts := TranscriptSegment{Start: seg.Start, End: seg.End, Text: strings.TrimSpace(seg.Text)}
+		if includeWords {
+			ts.Words = transcriptWords(seg.Words)
+		}
+		segs = append(segs, ts)
 		fmt.Fprintf(&b, "[%s → %s] %s\n", mmss(seg.Start), mmss(seg.End), strings.TrimSpace(seg.Text))
 	}
 	base.Segments = segs
@@ -235,6 +244,27 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int) *mcp.CallToolRes
 		fmt.Fprintf(&b, "Showing segments %d–%d of %d (end of transcript).", offset+1, end, totalSegs)
 	}
 	return mcp.NewToolResultStructured(base, b.String())
+}
+
+// transcriptWords maps the DB's per-segment word tokens to the structured output
+// type. It returns nil for an empty input so the segment's `words` field is
+// omitted entirely (rather than rendered as an empty array) when a segment
+// carries no word-level data.
+func transcriptWords(words []db.Word) []TranscriptWord {
+	if len(words) == 0 {
+		return nil
+	}
+	out := make([]TranscriptWord, 0, len(words))
+	for _, w := range words {
+		out = append(out, TranscriptWord{
+			Word:    w.Word,
+			Start:   w.Start,
+			End:     w.End,
+			Score:   w.Score,
+			Speaker: w.Speaker,
+		})
+	}
+	return out
 }
 
 // searchKind labels how a result set was ranked, so the formatter can render an

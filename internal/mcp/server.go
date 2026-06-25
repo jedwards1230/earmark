@@ -225,7 +225,9 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"consecutive segments grouped for embedding). Provide `book` (a title) or `trackID` (a job id "+
 			"from list_books / a track chooser). Transcripts are large, so segments are paginated via "+
 			"offset/limit; the response footer tells you the next offset. If a book has multiple tracks, this "+
-			"returns the track list so you can pick one by trackID."),
+			"returns the track list so you can pick one by trackID. Per-word timestamps are HIDDEN by default; "+
+			"set includeWordTimestamps=true to get each segment's word-level start/end times (for queries like "+
+			"\"exactly when was X said\")."),
 		mcp.WithToolAnnotation(readOnlyAnnotations),
 		mcp.WithOutputSchema[TranscriptOutput](),
 		mcp.WithString("book",
@@ -241,6 +243,12 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		mcp.WithNumber("limit",
 			mcp.Description("Number of segments to return per page (default: 50)"),
 			mcp.DefaultNumber(50),
+		),
+		mcp.WithBoolean("includeWordTimestamps",
+			mcp.Description("Include per-word timestamps (word/start/end, plus score/speaker when available) on each "+
+				"returned segment. Default false — omitted to keep the response small; enable it only when you need "+
+				"word-level timing (e.g. \"exactly when was X said\")."),
+			mcp.DefaultBool(false),
 		),
 	), handlers.handleGetTranscript)
 

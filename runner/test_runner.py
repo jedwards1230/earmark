@@ -85,6 +85,36 @@ class FakeConn:
         return any("run_limit = run_limit - 1" in s for s, _ in self.executed)
 
 
+class RunnerHeartbeatTests(unittest.TestCase):
+    """_runner_heartbeat stamps runner_control every cycle, best-effort."""
+
+    def test_updates_runner_control_and_commits(self) -> None:
+        conn = FakeConn(control_row=None, job_row=None)
+        runner._runner_heartbeat(conn)
+        self.assertTrue(
+            any(
+                "UPDATE runner_control" in s and "runner_heartbeat_at" in s
+                for s, _ in conn.executed
+            )
+        )
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 0)
+
+    def test_swallows_errors_and_rolls_back(self) -> None:
+        class _BoomCursor(FakeCursor):
+            def execute(self, sql: str, params: object = None) -> None:
+                raise RuntimeError("column runner_heartbeat_at does not exist")
+
+        class _BoomConn(FakeConn):
+            def cursor(self) -> FakeCursor:
+                return _BoomCursor(self)
+
+        conn = _BoomConn(control_row=None, job_row=None)
+        runner._runner_heartbeat(conn)  # must not raise
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 1)
+
+
 class GateTests(unittest.TestCase):
     def setUp(self) -> None:
         # Ensure the host-local busy flag is absent for all gate tests.
@@ -705,49 +735,144 @@ class StitchedHypothesisTests(unittest.TestCase):
 
 
 class WordsToSegmentsTests(unittest.TestCase):
-    """_words_to_segments groups words into pseudo-segments on a 1.5 s gap."""
+    """
+    _words_to_segments groups words into sentence-sized segments on silence gaps
+    (SEGMENT_GAP_SECONDS) with a hard duration/word cap (SEGMENT_MAX_SECONDS /
+    SEGMENT_MAX_WORDS) so granularity is bounded even in gap-less speech.
+    """
 
     def test_empty_words(self) -> None:
         self.assertEqual(runner._words_to_segments([], []), [])
 
     def test_single_segment_small_gaps(self) -> None:
+        # All gaps (~0.1 s) are below SEGMENT_GAP_SECONDS → one segment.
         words = [
-            {"word": "The", "start": 0.0, "end": 0.2, "speaker": None},
+            {"word": "the", "start": 0.0, "end": 0.2, "speaker": None},
             {"word": "quick", "start": 0.3, "end": 0.7, "speaker": None},
             {"word": "fox", "start": 0.8, "end": 1.1, "speaker": None},
         ]
         self.assertEqual(len(runner._words_to_segments(words, [None, None, None])), 1)
 
     def test_splits_on_silence_gap(self) -> None:
-        # >1.5 s gap between "silence." (ends 0.8) and "Then" (starts 2.5) → split.
+        # 1.7 s gap (> SEGMENT_GAP_SECONDS) between "silence" and "then" → split.
         words = [
-            {"word": "The", "start": 0.0, "end": 0.2, "speaker": None},
-            {"word": "silence.", "start": 0.2, "end": 0.8, "speaker": None},
-            {"word": "Then", "start": 2.5, "end": 2.7, "speaker": None},
+            {"word": "the", "start": 0.0, "end": 0.2, "speaker": None},
+            {"word": "silence", "start": 0.2, "end": 0.8, "speaker": None},
+            {"word": "then", "start": 2.5, "end": 2.7, "speaker": None},
         ]
         self.assertEqual(len(runner._words_to_segments(words, [None, None, None])), 2)
+
+    def test_gap_threshold_boundary(self) -> None:
+        # A gap just under SEGMENT_GAP_SECONDS does not split; just over does.
+        g = runner.SEGMENT_GAP_SECONDS
+        below = [
+            {"word": "a", "start": 0.0, "end": 1.0, "speaker": None},
+            {"word": "b", "start": 1.0 + g - 0.05, "end": 2.0, "speaker": None},
+        ]
+        above = [
+            {"word": "a", "start": 0.0, "end": 1.0, "speaker": None},
+            {"word": "b", "start": 1.0 + g + 0.05, "end": 2.0, "speaker": None},
+        ]
+        self.assertEqual(len(runner._words_to_segments(below, [None, None])), 1)
+        self.assertEqual(len(runner._words_to_segments(above, [None, None])), 2)
 
     def test_splits_on_speaker_change(self) -> None:
         # Same timing (no silence gap) but the speaker changes → split.
         words = [
-            {"word": "Hi", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
+            {"word": "hi", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
             {"word": "there", "start": 0.3, "end": 0.6, "speaker": "SPEAKER_01"},
         ]
         self.assertEqual(
             len(runner._words_to_segments(words, ["SPEAKER_00", "SPEAKER_01"])), 2
         )
 
-    def test_build_segments_falls_back_to_words(self) -> None:
-        # Word timestamps present but NO segment boundaries → _build_segments
-        # falls back to _words_to_segments and splits at the silence gap.
+    def test_duration_cap_splits_gapless_speech(self) -> None:
+        # Contiguous words (zero gap) spanning > SEGMENT_MAX_SECONDS still split,
+        # and no resulting segment exceeds the cap.
+        n = int(runner.SEGMENT_MAX_SECONDS) + 5
         words = [
-            {"word": "One", "start": 0.0, "end": 0.2},
-            {"word": "two.", "start": 0.3, "end": 0.7},
-            {"word": "Three", "start": 3.0, "end": 3.3},  # >1.5 s gap
+            {"word": str(i), "start": float(i), "end": float(i + 1), "speaker": None}
+            for i in range(n)
         ]
-        hyp = runner._StitchedHypothesis("One two. Three", words, [])
+        segs = runner._words_to_segments(words, [None] * n)
+        self.assertGreater(len(segs), 1)
+        for s in segs:
+            self.assertLessEqual(
+                s["end"] - s["start"], runner.SEGMENT_MAX_SECONDS + 1.0
+            )
+
+    def test_word_cap_splits_dense_speech(self) -> None:
+        # Many tiny contiguous words (short total duration) split on the word cap.
+        n = runner.SEGMENT_MAX_WORDS + 5
+        words = [
+            {"word": "x", "start": i * 0.01, "end": (i + 1) * 0.01, "speaker": None}
+            for i in range(n)
+        ]
+        segs = runner._words_to_segments(words, [None] * n)
+        self.assertGreater(len(segs), 1)
+        for s in segs:
+            self.assertLessEqual(len(s["words"]), runner.SEGMENT_MAX_WORDS)
+
+    def test_segment_shape_ids_and_words_preserved(self) -> None:
+        words = [
+            {"word": "one", "start": 0.0, "end": 0.2, "speaker": None},
+            {"word": "two", "start": 0.3, "end": 0.7, "speaker": None},
+            {"word": "three", "start": 5.0, "end": 5.4, "speaker": None},  # gap → split
+        ]
+        segs = runner._words_to_segments(words, [None, None, None])
+        self.assertEqual([s["id"] for s in segs], list(range(len(segs))))
+        self.assertEqual(segs[0]["text"], "one two")
+        self.assertEqual(segs[0]["start"], 0.0)
+        self.assertEqual(segs[0]["end"], 0.7)
+        self.assertEqual(len(segs[0]["words"]), 2)
+        self.assertEqual(segs[-1]["text"], "three")
+
+    def test_build_segments_ignores_nemo_coarse_segment(self) -> None:
+        # Even when NeMo supplies a (coarse) whole-window segment entry,
+        # _build_segments ignores it and re-segments from words: a gap larger
+        # than SEGMENT_GAP_SECONDS splits the run into two.
+        words = [
+            {"word": "one", "start": 0.0, "end": 0.2},
+            {"word": "two", "start": 0.3, "end": 0.7},
+            {"word": "three", "start": 3.0, "end": 3.3},  # gap → split
+        ]
+        coarse = [{"segment": "one two three", "start": 0.0, "end": 3.3}]
+        hyp = runner._StitchedHypothesis("one two three", words, coarse)
         segments, _ = runner._build_segments(hyp, None, Path("/x.wav"))
         self.assertEqual(len(segments), 2)
+
+
+class ResegmentExistingTests(unittest.TestCase):
+    """resegment_existing rebuilds fine segments from a transcript's stored words."""
+
+    def _coarse(self) -> list[dict[str, object]]:
+        # One ~coarse segment carrying words that span two sentence-gaps.
+        words = [
+            {"word": "one", "start": 0.0, "end": 0.2, "score": None, "speaker": None},
+            {"word": "two", "start": 0.3, "end": 0.7, "score": None, "speaker": None},
+            {"word": "three", "start": 3.0, "end": 3.3, "score": None, "speaker": None},
+            {"word": "four", "start": 6.0, "end": 6.4, "score": None, "speaker": None},
+        ]
+        return [{"id": 0, "start": 0.0, "end": 6.4, "text": "one two three four",
+                 "speaker": None, "words": words}]
+
+    def test_splits_coarse_segment_into_fine(self) -> None:
+        out = runner.resegment_existing(self._coarse())
+        # Two >0.6 s gaps → three fine segments.
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["text"], "one two")
+
+    def test_idempotent(self) -> None:
+        once = runner.resegment_existing(self._coarse())
+        twice = runner.resegment_existing(once)
+        self.assertEqual(once, twice)
+
+    def test_empty_words_yields_empty(self) -> None:
+        # No words → empty result (caller must guard before overwriting).
+        self.assertEqual(
+            runner.resegment_existing([{"id": 0, "start": 0, "end": 0, "words": []}]),
+            [],
+        )
 
 
 class AudioProbeTests(unittest.TestCase):

@@ -524,6 +524,17 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("phase migration: %w", err)
 	}
 
+	// runner_heartbeat_at migration (CONTRACT §1.7): a liveness timestamp the
+	// runner stamps EVERY poll cycle — working, idle, or paused — so "alive but
+	// idle" is distinguishable from "down" (the per-job updated_at heartbeat goes
+	// quiet the moment the queue drains). Default NULL until the first stamp; the
+	// earmark_runner_alive_seconds metric is simply absent until then.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS runner_heartbeat_at TIMESTAMPTZ;
+	`); err != nil {
+		return fmt.Errorf("runner_heartbeat_at migration: %w", err)
+	}
+
 	// Path-level dedup migration: the original dedup was checksum-only, so a file
 	// hashed mid-copy (over NFS) and again when complete produced two jobs for one
 	// file_path. Collapse any such duplicates (keep the most-advanced, else oldest
@@ -1650,6 +1661,13 @@ type QueueStats struct {
 	// recently" signal. nil only on a fresh install with no claims and no
 	// completions.
 	LatestActivity *time.Time
+	// RunnerHeartbeatAt mirrors runner_control.runner_heartbeat_at — the liveness
+	// stamp the runner writes on EVERY poll cycle (working, idle, or paused),
+	// unlike LastHeartbeat/LatestActivity which only move while a job is claimed.
+	// This is what distinguishes "alive but idle" from "down": a fresh value with
+	// an empty queue is idle-done; a stale value is the runner actually gone. nil
+	// until the runner has stamped at least once (column default NULL).
+	RunnerHeartbeatAt *time.Time
 
 	// EvalCoverageDone is the number of done jobs whose run_metrics row has a
 	// non-NULL eval_finished_at (i.e. has been judged). Paired with Done it gives
@@ -1822,8 +1840,8 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 	// counter. Tolerate a missing row by defaulting to not-paused/unlimited; the
 	// init seed normally guarantees it exists.
 	if err := db.pool.QueryRow(ctx,
-		`SELECT paused, run_limit FROM runner_control WHERE id = 1`,
-	).Scan(&q.Paused, &q.RunLimit); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		`SELECT paused, run_limit, runner_heartbeat_at FROM runner_control WHERE id = 1`,
+	).Scan(&q.Paused, &q.RunLimit, &q.RunnerHeartbeatAt); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("control row query: %w", err)
 	}
 

@@ -45,6 +45,7 @@ func TestRegistry_RegistersAndScrapes(t *testing.T) {
 			EmbedBacklog:         3,
 			EvalCoverageDone:     40,
 			LatestActivity:       &now,
+			RunnerHeartbeatAt:    &now,
 			RunnerAvailable:      true,
 			RunnerAvailableKnown: true,
 		},
@@ -67,6 +68,7 @@ func TestRegistry_RegistersAndScrapes(t *testing.T) {
 		`earmark_eval_coverage_ratio 0.4`,
 		`earmark_runner_available 1`,
 		`earmark_runner_last_heartbeat_seconds`,
+		`earmark_runner_alive_seconds`,
 		`earmark_eta_work_seconds`,
 		`earmark_eta_calendar_seconds`,
 		`earmark_jobs_failed_total 0`,
@@ -92,6 +94,9 @@ func TestHeartbeatGaugeOmittedWhenNoActivity(t *testing.T) {
 
 	if strings.Contains(body, "earmark_runner_last_heartbeat_seconds ") {
 		t.Errorf("heartbeat gauge must be omitted when there is no activity:\n%s", body)
+	}
+	if strings.Contains(body, "earmark_runner_alive_seconds ") {
+		t.Errorf("alive gauge must be omitted until the runner stamps a heartbeat:\n%s", body)
 	}
 	if strings.Contains(body, "earmark_runner_available ") {
 		t.Errorf("runner_available must be omitted until a signal exists:\n%s", body)

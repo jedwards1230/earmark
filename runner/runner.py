@@ -228,6 +228,37 @@ CHUNK_OVERLAP_SECONDS: float = float(
     os.environ.get("ASR_CHUNK_OVERLAP_SECONDS", "15")
 )
 
+# Fine-grained segmentation geometry (CONTRACT §1.2.1).
+#
+# NeMo Parakeet-TDT returns exactly ONE segment per transcribe() call regardless
+# of clip length (verified on desktop-1: a 60 s multi-sentence clip yields
+# N_SEGMENTS=1), so hyp.timestamp['segment'] carries no usable granularity — one
+# window == one ~600 s block. We therefore ALWAYS derive segments from the
+# per-word timestamps (hyp.timestamp['word'], which are accurate to ~0.1 s) by
+# splitting on inter-word silence gaps, with a hard duration/word cap so no
+# segment exceeds a few tens of seconds — well under any 5-minute floor — even in
+# gap-less narration. Per-second precision is always preserved in each segment's
+# words[] array.
+#
+#   SEGMENT_GAP_SECONDS  — a gap larger than this starts a new segment. 0.6 s
+#                          tracks sentence boundaries in audiobook narration
+#                          (measured: ~one >0.6 s gap per ~15 words, i.e. roughly
+#                          one per sentence) while staying above comma/phrase
+#                          pauses (p90 gap ~0.24 s).
+#   SEGMENT_MAX_SECONDS  — force a split once the current segment reaches this
+#                          duration, bounding granularity in continuous speech.
+#   SEGMENT_MAX_WORDS    — force a split once the current segment reaches this
+#                          many words (belt-and-suspenders for fast speech).
+SEGMENT_GAP_SECONDS: float = float(
+    os.environ.get("ASR_SEGMENT_GAP_SECONDS", "0.6")
+)
+SEGMENT_MAX_SECONDS: float = float(
+    os.environ.get("ASR_SEGMENT_MAX_SECONDS", "30")
+)
+SEGMENT_MAX_WORDS: int = int(
+    os.environ.get("ASR_SEGMENT_MAX_WORDS", "80")
+)
+
 # Language reported in the transcript.  Parakeet-TDT is English-only; "en"
 # is the only valid value in production.
 TRANSCRIPT_LANGUAGE: str = "en"
@@ -520,6 +551,35 @@ def _heartbeat(conn: psycopg2.extensions.connection, job_id: str) -> None:
         conn.commit()
     except Exception as exc:
         log.warning("Heartbeat failed for job %s: %s", job_id, exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def _runner_heartbeat(conn: psycopg2.extensions.connection) -> None:
+    """
+    Stamp a liveness heartbeat on the singleton runner_control row EVERY poll
+    cycle — whether the runner is working, idle (empty queue), or parked/paused.
+
+    This is the signal that distinguishes "alive but idle" from "down": the Go
+    collector exposes it as earmark_runner_alive_seconds (seconds since this
+    stamp). It is DISTINCT from _heartbeat(), which only stamps
+    transcription_jobs.updated_at while a job is claimed (stale-claim recovery)
+    and therefore goes quiet the moment the queue drains — the exact case that
+    made an idle runner look identical to a dead one.
+
+    Best-effort: any failure (e.g. the runner_heartbeat_at column not yet
+    deployed) is logged at DEBUG and swallowed so it can never disturb the
+    claim/transcribe path. Uses its own commit/rollback so the connection is left
+    clean for the subsequent gate + claim.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE runner_control SET runner_heartbeat_at = now()")
+        conn.commit()
+    except Exception as exc:
+        log.debug("Runner liveness heartbeat failed (non-fatal): %s", exc)
         try:
             conn.rollback()
         except Exception:
@@ -1303,15 +1363,18 @@ def _build_segments(
     """
     Convert a NeMo Hypothesis into the CONTRACT.md §1.2.1 segment list.
 
-    Word timestamps come from hyp.timestamp['word'] (NeMo 2.7 TDT models).
-    Segment boundaries come from hyp.timestamp['segment'] when available,
-    otherwise we group words into pseudo-segments using a silence gap heuristic.
+    Word timestamps come from hyp.timestamp['word'] (NeMo 2.7 TDT models),
+    accurate to ~0.1 s. Segments are ALWAYS rebuilt from those words via
+    _words_to_segments — NeMo Parakeet-TDT returns exactly one coarse segment per
+    transcribe() call (one per ~600 s window), so its segment-level timestamps
+    carry no usable granularity and are not used for boundaries.
 
-    MUST VERIFY ON DESKTOP-1:
-      - hyp.timestamp key names ('word', 'segment') for Parakeet-TDT v3.
-      - Each word entry dict shape: expected {'word': str, 'start': float, 'end': float}.
-        NeMo may use 'start_offset'/'end_offset' in frames — check and convert.
-      - Each segment entry dict shape: expected {'start': float, 'end': float, 'text': str}.
+    Verified on desktop-1 (parakeet-tdt-1.1b, NeMo 2.7):
+      - hyp.timestamp keys are ['timestep', 'char', 'word', 'segment'].
+      - A 60 s multi-sentence clip yields exactly one 'segment' entry (hence the
+        re-segment-from-words approach).
+      - Each word entry is {'word': str, 'start': float, 'end': float} in
+        seconds (not frame offsets).
 
     score is always null: TDT alignment does not produce confidence values.
     CONTRACT.md §1.2.1 explicitly allows null for score.
@@ -1353,46 +1416,17 @@ def _build_segments(
     # ---------------------------------------------------------------------------
     # Build segment list (CONTRACT format)
     # ---------------------------------------------------------------------------
-    if seg_ts:
-        # NeMo provided segment-level boundaries — use them directly.
-        segments: list[dict[str, Any]] = []
-        for idx, seg in enumerate(seg_ts):
-            seg_start = float(seg.get("start", 0.0))
-            seg_end = float(seg.get("end", 0.0))
-            # NeMo 2.7 TDT stores segment text under the 'segment' key, not
-            # 'text' (verified on RTX 5090).
-            seg_text = (seg.get("text") or seg.get("segment") or "").strip()
-
-            # Collect words that fall within this segment's time range.
-            seg_words = [
-                w for w in words_out
-                if w["start"] >= seg_start - 0.01 and w["end"] <= seg_end + 0.01
-            ]
-
-            # Fall back to reconstructing text from the segment's words if NeMo
-            # did not supply segment-level text.
-            if not seg_text:
-                seg_text = " ".join(w["word"] for w in seg_words).strip()
-
-            # Determine dominant speaker for this segment.
-            seg_speakers = [w["speaker"] for w in seg_words if w["speaker"]]
-            seg_speaker = max(set(seg_speakers), key=seg_speakers.count) if seg_speakers else None
-
-            segments.append(
-                {
-                    "id": idx,
-                    "start": seg_start,
-                    "end": seg_end,
-                    "text": seg_text,
-                    "speaker": seg_speaker,
-                    "words": seg_words,
-                }
-            )
-    else:
-        # Fallback: group words into pseudo-segments using a 1.5 s silence gap.
-        # This handles the case where NeMo TDT provides word timestamps but no
-        # segment boundaries (possible with some model versions).
-        segments = _words_to_segments(words_out, word_speakers)
+    # Always derive segments from the per-word timestamps. NeMo Parakeet-TDT
+    # emits exactly ONE coarse "segment" per transcribe() call — one per ~600 s
+    # window (verified on desktop-1: even a 60 s clip yields a single segment) —
+    # so hyp.timestamp['segment'] carries no usable granularity. We re-segment
+    # from words instead (CONTRACT §1.2.1). seg_ts is logged for diagnostics.
+    log.debug(
+        "re-segmenting from %d words (NeMo returned %d coarse segment(s))",
+        len(word_ts),
+        len(seg_ts),
+    )
+    segments: list[dict[str, Any]] = _words_to_segments(words_out, word_speakers)
 
     return segments, speaker_count
 
@@ -1402,15 +1436,21 @@ def _words_to_segments(
     word_speakers: list[str | None],
 ) -> list[dict[str, Any]]:
     """
-    Group word-level timestamps into segments using a silence gap heuristic.
+    Group word-level timestamps into sentence-sized segments.
 
-    A new segment starts when the gap between consecutive words exceeds 1.5 s
-    or when the speaker changes (when diarization is active).
+    A new segment starts when any of these hold for the next word:
+      - the silence gap from the previous word exceeds SEGMENT_GAP_SECONDS
+        (≈ a sentence boundary in audiobook narration), or
+      - the speaker changes (when diarization is active), or
+      - the current segment has reached SEGMENT_MAX_SECONDS or
+        SEGMENT_MAX_WORDS — a hard cap that bounds granularity in continuous,
+        gap-less speech so no segment exceeds a few tens of seconds.
+
+    Per-second precision is preserved regardless: every segment keeps its
+    words[] array (CONTRACT §1.2.1).
     """
     if not words:
         return []
-
-    SILENCE_GAP = 1.5  # seconds
 
     segments: list[dict[str, Any]] = []
     current_words: list[dict[str, Any]] = [words[0]]
@@ -1424,8 +1464,14 @@ def _words_to_segments(
             and word_speakers[i - 1] is not None
             and word_speakers[i] != word_speakers[i - 1]
         )
+        # Duration of the segment-so-far (start of first word → end of prev).
+        seg_duration = prev["end"] - current_words[0]["start"]
+        over_cap = (
+            seg_duration >= SEGMENT_MAX_SECONDS
+            or len(current_words) >= SEGMENT_MAX_WORDS
+        )
 
-        if gap > SILENCE_GAP or speaker_change:
+        if gap > SEGMENT_GAP_SECONDS or speaker_change or over_cap:
             segments.append(_flush_segment(len(segments), current_words))
             current_words = [curr]
         else:
@@ -1452,6 +1498,40 @@ def _flush_segment(
         "speaker": seg_speaker,
         "words": words,
     }
+
+
+def resegment_existing(
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Re-derive fine-grained segments from the per-word timestamps already stored
+    in an existing transcript's ``segments`` JSONB — WITHOUT re-running ASR.
+
+    Transcripts produced before fine-grained segmentation store one ~600 s
+    "segment" per window, but each already carries a full words[] array with
+    accurate per-word timestamps. This flattens every segment's words[] (in
+    order) and re-runs _words_to_segments, yielding the same sentence-sized
+    segments a fresh transcription would now produce.
+
+    Idempotent: applying it to already-fine segments reproduces them, so the
+    backfill (runner/resegment.py) is safe to re-run. Returns ``[]`` only when
+    the input carries no words (callers must guard against overwriting a
+    non-empty transcript with an empty result).
+    """
+    words: list[dict[str, Any]] = []
+    for seg in segments:
+        for w in seg.get("words") or []:
+            words.append(
+                {
+                    "word": w.get("word", ""),
+                    "start": float(w.get("start", 0.0)),
+                    "end": float(w.get("end", 0.0)),
+                    "score": w.get("score"),
+                    "speaker": w.get("speaker"),
+                }
+            )
+    word_speakers: list[str | None] = [w["speaker"] for w in words]
+    return _words_to_segments(words, word_speakers)
 
 
 def _assign_speakers(
@@ -2124,6 +2204,11 @@ def main() -> None:
         conn: psycopg2.extensions.connection | None = None
         try:
             conn = _connect()
+
+            # Liveness heartbeat every cycle — working, idle, or parked/paused —
+            # so "alive but idle" is distinguishable from "down" (Go exposes it as
+            # earmark_runner_alive_seconds). Best-effort; never blocks the claim.
+            _runner_heartbeat(conn)
 
             # Gate the GPU first (CONTRACT §1.4): when paused or phase='analyze'
             # the model parks off the GPU so the eval judge can use the card; when

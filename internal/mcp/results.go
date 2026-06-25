@@ -70,11 +70,26 @@ type TrackRef struct {
 	Status   string `json:"status"`
 }
 
-// TranscriptSegment is one timestamped segment in a get_transcript page.
+// TranscriptWord is one timestamped word token inside a segment, emitted only
+// when get_transcript is called with includeWordTimestamps=true. The field
+// names/types mirror db.Word so the mapping in formatTranscriptPage is trivial;
+// Score/Speaker are optional (nil when the ASR backend doesn't supply them).
+type TranscriptWord struct {
+	Word    string   `json:"word"`
+	Start   float64  `json:"start"`
+	End     float64  `json:"end"`
+	Score   *float64 `json:"score,omitempty"`
+	Speaker *string  `json:"speaker,omitempty"`
+}
+
+// TranscriptSegment is one timestamped segment in a get_transcript page. Words
+// is populated only when the caller requests includeWordTimestamps; omitempty
+// keeps the default response byte-identical to the pre-word-timestamp shape.
 type TranscriptSegment struct {
-	Start float64 `json:"start"`
-	End   float64 `json:"end"`
-	Text  string  `json:"text"`
+	Start float64          `json:"start"`
+	End   float64          `json:"end"`
+	Text  string           `json:"text"`
+	Words []TranscriptWord `json:"words,omitempty"`
 }
 
 // TranscriptOutput is the structured payload for get_transcript. It is one of two
