@@ -40,8 +40,6 @@ names, or the MCP upstream key without updating it first.
 ## Commands
 
 ```bash
-# Build/test/lint: see CONTRIBUTING.md
-
 # Run (requires DATABASE_URL)
 ./earmark monitor   # file watcher + worker
 ./earmark mcp       # MCP server (stdio by default)
