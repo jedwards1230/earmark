@@ -34,7 +34,7 @@ govulncheck ./...
 ## Before you open a PR
 
 - Make sure all CI checks pass locally first — run the formatter, linter, and tests.
-- For UI or template changes, verify the dashboard visually in demo mode before opening a PR (see the Visual Verification section of `CLAUDE.md`).
+- For UI or template changes, verify the status dashboard visually in demo mode before opening a PR — it needs no database: `MCP_HTTP_ADDR=:9876 ./earmark mcp --demo` then open `http://localhost:9876/`.
 
 ## Branching & commits
 
