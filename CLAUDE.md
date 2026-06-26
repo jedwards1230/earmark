@@ -40,15 +40,6 @@ names, or the MCP upstream key without updating it first.
 ## Commands
 
 ```bash
-# Build
-go build ./...
-
-# Test
-go test ./...
-
-# Lint
-golangci-lint run ./...
-
 # Run (requires DATABASE_URL)
 ./earmark monitor   # file watcher + worker
 ./earmark mcp       # MCP server (stdio by default)

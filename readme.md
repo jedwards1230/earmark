@@ -78,6 +78,10 @@ go run . mcp --demo     # http://localhost:8081/
 
 Renders the htmx status dashboard with synthetic data. Set `DEMO_SCENARIO` to `active` (default), `empty`, `stale`, `failed`, or `multibackend` (three ASR families across three servers).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/lint instructions, branching conventions, and PR guidelines.
+
 ## Reference
 
 - [`docs/CONTRACT.md`](docs/CONTRACT.md) — authoritative schema, env vars, deployment interface

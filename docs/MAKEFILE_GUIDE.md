@@ -29,7 +29,7 @@ make help         # full target list
 |--------|--------------|
 | `make dashboard` | `go run . mcp --demo` — serves the htmx status dashboard with synthetic data at `http://localhost:8081/`; no Postgres required |
 
-Use `DEMO_SCENARIO=empty|active|stale|failed` to switch dashboard fixture states.
+Set `DEMO_SCENARIO` to switch dashboard fixture states: `active` (default), `empty`, `stale`, `failed`, `multibackend`, `winddown`, `idle`.
 
 ### Quality
 
