@@ -51,7 +51,7 @@ Keep documentation current as part of the change, not as a follow-up — update 
 
 - Open the PR against `main`.
 - Every PR runs CI and an automated code review. Resolve **all** review threads before the PR is merged.
-- A PR is merged once CI is green and the review is approved.
+- A PR can be merged once CI is green and all review threads are resolved.
 
 ## Releases
 
