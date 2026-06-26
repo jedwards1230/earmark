@@ -31,6 +31,10 @@ gosec ./...
 govulncheck ./...
 ```
 
+## Documentation
+
+Keep documentation current as part of the change, not as a follow-up — update the README and any affected docs in the same PR. `docs/CONTRACT.md` is authoritative: changes to environment variable names, database column names, or the MCP upstream key must update it first.
+
 ## Before you open a PR
 
 - Make sure all CI checks pass locally first — run the formatter, linter, and tests.
