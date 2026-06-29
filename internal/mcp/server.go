@@ -106,7 +106,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// omitted (no published icon asset).
 	mcpServer := server.NewMCPServer("earmark", "1.0.0",
 		server.WithToolCapabilities(true),
-		server.WithResourceCapabilities(false, false), // Not implementing resources yet
+		server.WithResourceCapabilities(false, false), // No MCP resources yet. TRAP: if you add resources, ALSO change this to (false, true). ContextForge's federation gates on a truthy `resources` capability and silently skips resources from servers that advertise bare `resources: {}` (which (false,false) emits). See my-wiki's equivalent fix.
 		server.WithPromptCapabilities(false),          // Not implementing prompts yet
 		server.WithLogging(),
 		server.WithTitle("Audiobook Processor"),
