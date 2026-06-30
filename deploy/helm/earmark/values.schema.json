@@ -201,6 +201,14 @@
       "type": "array",
       "items": { "type": "object" }
     },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "podLabels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
     "cnpg": {
       "type": "object",
       "required": ["imageName", "instances", "storage", "backup"],
