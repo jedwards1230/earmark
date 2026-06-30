@@ -24,8 +24,14 @@ spec:
       labels:
         {{- include "earmark.labels" . | nindent 8 }}
         app.kubernetes.io/component: mcp-server
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       annotations:
         {{- include "earmark.configChecksum" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       securityContext:
         {{- include "earmark.podSecurityContext" . | nindent 8 }}

@@ -10,6 +10,12 @@ image:
 mcp:
   replicaCount: 1
 
+# ── Pod metadata (shared by both the mcp and ingest deployments) ────────────────
+# -- Pod annotations (e.g. Velero backup-volumes hooks)
+podAnnotations: {}
+# -- Additional pod labels
+podLabels: {}
+
 service:
   type: ClusterIP
   port: 8081
