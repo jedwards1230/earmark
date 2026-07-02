@@ -1,0 +1,53 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore"]
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore"]
+    commit-message:
+      prefix: "deps(gomod)"
+    groups:
+      gomod:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: "/runner"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore"]
+    commit-message:
+      prefix: "deps(pip)"
+    groups:
+      pip:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore"]
+    commit-message:
+      prefix: "deps(docker)"
+    groups:
+      docker:
+        patterns: ["*"]
