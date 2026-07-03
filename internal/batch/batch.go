@@ -48,6 +48,25 @@ type Arbiter interface {
 	Gaming(ctx context.Context) (gaming bool, ok bool)
 }
 
+// Waiter is an OPTIONAL capability an Arbiter may additionally implement
+// (execArbiter does; httpArbiter does not). When present, yieldToGames uses it
+// instead of its own sleep-and-repoll step: Wait blocks for roughly one
+// "attempt" at the GPU becoming available (its own internal bound — e.g. the
+// gpu-arbiter CLI's `wait --timeout`), then returns. The caller's very next
+// Gaming() check independently re-derives the real state (busy vs available vs
+// unreachable), so Wait itself does NOT need to distinguish "still gaming" from
+// "arbiter unreachable" — both simply resolve on the next Gaming() call. This
+// is what lets `earmark batch` delegate to `gpu-arbiter wait` (hardening plan
+// #18) while keeping the exact same observable poll-and-yield behavior as the
+// hand-rolled Go loop.
+//
+// Wait returns a non-nil error ONLY when ctx is done, so a cancelled batch run
+// unwinds exactly like the sleep-based poll loop does (propagated up through
+// yieldToGames → Run's deferred restore-idle).
+type Waiter interface {
+	Wait(ctx context.Context) error
+}
+
 // EventSink records pipeline_events for the coordinator (CONTRACT §1.7). It is a
 // seam so the coordinator stays unit-testable: tests inject a recording/no-op
 // sink. *db.DB satisfies AppendEvent; the coordinator wraps it. Best-effort —
@@ -266,7 +285,17 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 // unreachable/unset arbiter (ok=false) returns immediately — the coordinator
 // proceeds, degrading gracefully. arbiterWarned (owned by Run) ensures the
 // "arbiter unavailable" notice is logged at most once per run, not per batch.
+//
+// When arb also implements Waiter (the exec-delegated gpu-arbiter CLI path —
+// see arbiter_exec.go), the "wait for the next poll to be worth checking" step
+// is delegated to it instead of a Go-side sleep: Wait blocks roughly one poll
+// interval's worth of time, then the loop goes right back to the top and lets
+// the ordinary Gaming() check re-derive the state (busy / available /
+// unreachable) exactly as it would have after a plain sleep. Every other
+// behavior — messaging, the availability-event emission, the degrade-once
+// notice — is unchanged.
 func yieldToGames(ctx context.Context, p func(string, ...any), arb Arbiter, poll time.Duration, arbiterWarned *bool, avail *availabilityEmitter) error {
+	waiter, delegated := arb.(Waiter)
 	announced := false
 	for {
 		busy, ok := arb.Gaming(ctx)
@@ -292,6 +321,12 @@ func yieldToGames(ctx context.Context, p func(string, ...any), arb Arbiter, poll
 		if !announced {
 			p("gpu-arbiter reports the GPU busy with a game — waiting (polling every %s)...\n", poll)
 			announced = true
+		}
+		if delegated {
+			if err := waiter.Wait(ctx); err != nil {
+				return err
+			}
+			continue
 		}
 		if err := sleep(ctx, poll); err != nil {
 			return err
