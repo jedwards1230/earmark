@@ -372,6 +372,26 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
    `GET /status`** — the coordinator never `POST`s to it. An unset or unreachable
    arbiter is logged and the coordinator proceeds (degrades gracefully — arbiter
    absence never wedges it).
+
+   **gpu-arbiter CLI delegation (optional, gpu-arbiter hardening plan #18).**
+   When `GPU_ARBITER_URL` is set AND a [gpu-arbiter](https://github.com/jedwards1230/gpu-arbiter)
+   binary (≥ v0.10.0, which ships `wait`/`status -q`) resolves — checked in
+   order: `--arbiter-wait-cmd`, `$ARBITER_WAIT_CMD`, then `gpu-arbiter` on
+   `PATH` — the coordinator shells out to the CLI (`gpu-arbiter status -q
+   --url <base>` for the busy check, `gpu-arbiter wait --for available
+   --timeout <arbiter-poll-seconds> --url <base>` for the actual wait) instead
+   of its own hand-rolled HTTP GET + JSON decode. This is a **strict
+   optimization, never a requirement**: `earmark batch` does not depend on the
+   gpu-arbiter binary being installed, and the container image that ships the
+   `earmark` binary does not bundle it. If no binary resolves (e.g. running
+   inside the earmark container, or on any host without gpu-arbiter
+   installed), the coordinator falls back to the built-in HTTP poll loop
+   described above, unchanged. Both paths are read-only GETs against
+   gpu-arbiter's `/status` endpoint and preserve the same observable contract
+   — degrade-gracefully on an unreachable/unconfigured arbiter, never wedge,
+   honor `ctx` cancellation (SIGINT/SIGTERM kills the delegated subprocess via
+   `exec.CommandContext`). The chosen path (delegated CLI vs HTTP poll loop) is
+   logged once at coordinator startup.
 2. **Phase A — transcribe.** Set `phase='transcribe'` and `run_limit=N`
    (`--batch-size`, default 10). The runner claims up to N jobs then stops; the
    embed worker idles. Wait until nothing is `claimed` AND the run budget is
@@ -945,6 +965,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval). Default off → eval stays on-demand and the worker is unchanged. Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
 | `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-eval'd, not-embedded transcripts and judges them (writing `eval_finished_at`); an **embed pass** then selects done, eval'd, not-embedded transcripts and embeds them. The `eval_finished_at` latch (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ eval'd`. **Fail-closed** (two conditions, both fatal at startup): (1) if no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`); and (2) if `EVAL_IN_PIPELINE` is not also `true`. The gate makes eval a strict prerequisite for embedding, and the eval judge is only built when `EVAL_IN_PIPELINE=true`; so `EVAL_GATES_EMBED=true` **requires** `EVAL_IN_PIPELINE=true` (and a resolvable judge) — otherwise the worker would run gated with a nil judge, stalling the corpus (or risking a nil-judge deref). Both failures fail at startup, never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
 | `GPU_ARBITER_URL` | no | gpu-arbiter `/status` URL (e.g. `http://gpu-host:48750/status`) read by the `earmark batch` coordinator (§1.4) to yield the GPU to games. **Read-only** — the coordinator only `GET`s it, never `POST`s. Unset or unreachable → the coordinator logs it and proceeds (degrades gracefully). The `batch --gpu-arbiter-url` flag overrides it. |
+| `ARBITER_WAIT_CMD` | no | Explicit path to a gpu-arbiter binary the `earmark batch` coordinator should delegate waits to (§1.4). Lower precedence than the `batch --arbiter-wait-cmd` flag, higher than `gpu-arbiter` auto-detected on `PATH`. Unset → the coordinator auto-detects on `PATH`, falling back to its built-in HTTP poll loop if nothing resolves. Purely an optimization — never required. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
 | `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.example.com`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |

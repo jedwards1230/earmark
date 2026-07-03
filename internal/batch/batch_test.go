@@ -606,3 +606,77 @@ func TestRun_EmitsAvailabilityEvent(t *testing.T) {
 		t.Errorf("first event stage = %q, want runner_availability", evs[0].Stage)
 	}
 }
+
+// fakeWaiterArbiter wraps fakeArbiter and additionally implements Waiter, so
+// tests can assert yieldToGames delegates to Wait() (instead of sleep+repoll)
+// when the injected Arbiter supports it — the seam exec-delegated batches use
+// in production (arbiter_exec.go), exercised here without any real subprocess.
+type fakeWaiterArbiter struct {
+	fakeArbiter
+	waitCalls int
+	waitErr   error // returned by every Wait() call; nil means "succeeded"
+}
+
+func (a *fakeWaiterArbiter) Wait(context.Context) error {
+	a.mu.Lock()
+	a.waitCalls++
+	a.mu.Unlock()
+	return a.waitErr
+}
+
+// TestRun_DelegatesWaitToWaiterCapableArbiter verifies that when the injected
+// Arbiter also implements Waiter, yieldToGames calls Wait() instead of
+// sleeping between Gaming() checks, while every other observable behavior
+// (phase transitions, eventual completion) is unchanged.
+func TestRun_DelegatesWaitToWaiterCapableArbiter(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 2},
+		&db.QueueStats{Pending: 0, Claimed: 0, RunLimit: ptr(0)},
+		&db.QueueStats{Pending: 0, Claimed: 0, EmbedBacklog: 0},
+	)
+	arb := &fakeWaiterArbiter{fakeArbiter: fakeArbiter{results: []arbiterResult{
+		{gaming: true, ok: true},
+		{gaming: true, ok: true},
+		{gaming: false, ok: true},
+	}}}
+
+	// A very large PollInterval/ArbiterPoll would time the test out if the
+	// coordinator fell back to sleeping instead of delegating to Wait().
+	o := fastOpts()
+	o.ArbiterPoll = time.Hour
+
+	done := make(chan error, 1)
+	go func() { done <- Run(context.Background(), io.Discard, store, arb, o) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not complete promptly — yieldToGames likely fell back to sleeping instead of delegating to Wait()")
+	}
+	if arb.waitCalls < 2 {
+		t.Errorf("expected Wait() to be called while gaming (>=2 calls), got %d", arb.waitCalls)
+	}
+}
+
+// TestRun_WaiterErrorPropagatesAsCancellation: a Waiter that reports an error
+// (mirroring a ctx-cancelled delegated wait) must unwind Run exactly like a
+// cancelled sleep() does — restoring idle on the way out.
+func TestRun_WaiterErrorPropagatesAsCancellation(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle, &db.QueueStats{Pending: 2})
+	arb := &fakeWaiterArbiter{
+		fakeArbiter: fakeArbiter{results: []arbiterResult{{gaming: true, ok: true}}},
+		waitErr:     context.Canceled,
+	}
+
+	err := Run(context.Background(), io.Discard, store, arb, fastOpts())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	got := store.transitions()
+	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
+		t.Errorf("idle must be restored when the delegated wait errors; transitions=%v", got)
+	}
+}
