@@ -41,6 +41,11 @@ type fakeExecRunner struct {
 	// returning a scripted result — used to simulate a long-running child that
 	// only exits when its context is cancelled (exec.CommandContext killing it).
 	blockUntilCancel bool
+	// delay, if set, makes run() take this long (or until ctx is done,
+	// whichever comes first) before returning its scripted result — used to
+	// simulate a slow-failing child (e.g. a network call that errors partway
+	// through the wait window).
+	delay time.Duration
 }
 
 type fakeExecResult struct {
@@ -59,6 +64,13 @@ func (f *fakeExecRunner) run(ctx context.Context, bin string, args []string) (in
 	if f.blockUntilCancel {
 		<-ctx.Done()
 		return -1, "", ctx.Err()
+	}
+	if f.delay > 0 {
+		select {
+		case <-ctx.Done():
+			return -1, "", ctx.Err()
+		case <-time.After(f.delay):
+		}
 	}
 	if len(f.results) == 0 {
 		return 0, "", nil
@@ -210,6 +222,58 @@ func TestExecArbiter_Wait_FastFailureFallsBackToFloorSleep(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 		t.Errorf("Wait() returned after %s, expected it to floor-sleep out roughly waitTimeout (50ms)", elapsed)
+	}
+}
+
+// TestExecArbiter_Wait_SlowFailureAlsoFloorSleeps closes the gap the PR review
+// flagged: a SLOW failure — one that consumes more than half of waitTimeout
+// but returns before waitTimeout has fully elapsed (e.g. a child killed by a
+// mid-window network error) — must ALSO sleep out the remainder. The invariant
+// is that every non-success Wait() consumes >= waitTimeout, regardless of how
+// long the child itself took, so no failure latency can produce a tight
+// subprocess-spawn loop.
+func TestExecArbiter_Wait_SlowFailureAlsoFloorSleeps(t *testing.T) {
+	const waitTimeout = 60 * time.Millisecond
+	runner := &fakeExecRunner{
+		// 40ms > waitTimeout/2 (30ms): under the old waitTimeout/2 guard this
+		// returned immediately after the child; now it must sleep the rest.
+		delay:   40 * time.Millisecond,
+		results: []fakeExecResult{{exitCode: 1, stderr: "ERROR: querying /status: connection reset"}},
+	}
+	a := &execArbiter{bin: "gpu-arbiter", baseURL: "http://gpu-host:48750", waitTimeout: waitTimeout, probeTimeout: time.Second, runner: runner}
+
+	start := time.Now()
+	if err := a.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < waitTimeout-10*time.Millisecond {
+		t.Errorf("Wait() returned after %s, expected a slow failure to still consume >= waitTimeout (%s)", elapsed, waitTimeout)
+	}
+}
+
+// TestExecArbiter_Wait_ChildBoundedByWaitTimeout verifies the child's context
+// deadline is waitTimeout itself (not waitTimeout+probeTimeout): a wedged
+// child that only exits on context kill must be reaped at ~waitTimeout, and a
+// Wait() against it must not run anywhere near waitTimeout+probeTimeout.
+func TestExecArbiter_Wait_ChildBoundedByWaitTimeout(t *testing.T) {
+	runner := &fakeExecRunner{blockUntilCancel: true} // wedged child: exits only on ctx kill
+	a := &execArbiter{
+		bin: "gpu-arbiter", baseURL: "http://gpu-host:48750",
+		waitTimeout:  50 * time.Millisecond,
+		probeTimeout: time.Hour, // must NOT extend the child's deadline
+		runner:       runner,
+	}
+
+	start := time.Now()
+	if err := a.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("Wait() returned after %s, want ~waitTimeout (50ms)", elapsed)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Wait() took %s — the wedged child was not bounded by waitTimeout", elapsed)
 	}
 }
 

@@ -3,6 +3,7 @@ package batch
 import (
 	"context"
 	"errors"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -33,8 +34,8 @@ import (
 //     distinguish "timed out, still gaming" from "daemon unreachable" (both
 //     are 1) — but Wait doesn't need to: the caller's very next Gaming() call
 //     re-derives the real state via the unambiguous `status -q` exit codes
-//     above, so Wait simply reports whether it had to fall back to a floor
-//     delay (see run) and otherwise ignores its own exit code entirely.
+//     above, so beyond detecting success (exit 0) Wait ignores its own exit
+//     code entirely and just guarantees a >= waitTimeout floor on failure.
 type execArbiter struct {
 	// bin is the resolved gpu-arbiter executable (an absolute path or a bare
 	// name resolved against PATH by the caller).
@@ -48,9 +49,10 @@ type execArbiter struct {
 	// coordinator's --arbiter-poll cadence so a delegated wait attempt takes
 	// about as long as a single Go-side poll would have.
 	waitTimeout time.Duration
-	// probeTimeout bounds each exec'd subprocess via a context deadline — a
-	// safety net in case the child hangs despite its own internal timeout
-	// (e.g. a wedged network call). Mirrors httpArbiter's request timeout.
+	// probeTimeout bounds the quick Gaming() status probe via a context
+	// deadline — a safety net in case the child hangs (e.g. a wedged network
+	// call). Mirrors httpArbiter's request timeout. It does NOT apply to the
+	// deliberately-long Wait() child, which is bounded by waitTimeout itself.
 	probeTimeout time.Duration
 	runner       execRunner
 }
@@ -73,6 +75,11 @@ func (realExecRunner) run(ctx context.Context, bin string, args []string) (int, 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
+	// Discard stdout rather than inherit the parent's: the two subcommands we
+	// run are quiet by design (`status -q` prints nothing; `wait` reports only
+	// on stderr) and the exit code carries the whole answer — but a future CLI
+	// version growing chatty must not pollute the coordinator's stdout logs.
+	cmd.Stdout = io.Discard
 	err := cmd.Run()
 	if err == nil {
 		return 0, stderr.String(), nil
@@ -89,9 +96,13 @@ func (realExecRunner) run(ctx context.Context, bin string, args []string) (int, 
 // NewExecArbiter builds an Arbiter (and Waiter) that delegates to the
 // gpu-arbiter CLI at bin. statusURL is GPU_ARBITER_URL in its documented form
 // (a full .../status URL, CONTRACT §2.4) — arbiterBaseURL strips the suffix
-// gpu-arbiter's own --url flag expects. waitTimeout should match the
-// coordinator's --arbiter-poll cadence; probeTimeout bounds each subprocess
-// call (falls back to a sane default if <= 0, mirroring NewHTTPArbiter).
+// gpu-arbiter's own --url flag expects. If statusURL is empty, the result is a
+// no-op arbiter: Gaming returns (false, false) with no subprocess execution,
+// mirroring NewHTTPArbiter's empty-URL behavior, so an unconfigured arbiter
+// never blocks the coordinator. waitTimeout should match the coordinator's
+// --arbiter-poll cadence and bounds the Wait() child (both its CLI --timeout
+// and its context deadline); probeTimeout bounds only the Gaming() status
+// probe (both fall back to sane defaults if <= 0, mirroring NewHTTPArbiter).
 func NewExecArbiter(bin, statusURL string, waitTimeout, probeTimeout time.Duration) Arbiter {
 	if probeTimeout <= 0 {
 		probeTimeout = 3 * time.Second
@@ -157,19 +168,26 @@ func (a *execArbiter) Gaming(ctx context.Context) (gaming bool, ok bool) {
 // detecting a genuine ctx cancellation — see the type doc comment for why the
 // caller's next Gaming() call is what actually classifies the outcome.
 //
+// The child is bounded by a context deadline of exactly waitTimeout, matching
+// the CLI's own --timeout: the CLI is expected to exit on its own at
+// ~waitTimeout, and the context kill is only the backstop for a wedged child.
+// probeTimeout plays no role here — it bounds the quick Gaming() status probe,
+// never the deliberately-long wait.
+//
 // A legitimate success (the GPU became available) always returns immediately.
-// Any OTHER outcome (unreachable, a genuine internal timeout, an exec failure,
-// a CLI/version mismatch, ...) that returns suspiciously fast — well under
-// waitTimeout — instead sleeps out the remainder of waitTimeout before
-// returning, so a persistent non-network failure (e.g. an argument/version
-// mismatch that always exits immediately) can never turn into a tight
-// subprocess-spawn loop against yieldToGames' Gaming()+Wait() cycle.
+// EVERY other outcome (unreachable, a genuine internal timeout, an exec
+// failure, a CLI/version mismatch, ...) that returns before waitTimeout has
+// elapsed sleeps out the remainder before returning — the invariant is that a
+// non-success Wait() always consumes >= waitTimeout, so a persistent failure
+// of ANY latency (an instant exec error and a multi-second network failure
+// alike) can never turn into a tight subprocess-spawn loop against
+// yieldToGames' Gaming()+Wait() cycle.
 func (a *execArbiter) Wait(ctx context.Context) error {
 	timeoutSecs := int64(a.waitTimeout.Seconds())
 	if timeoutSecs < 1 {
 		timeoutSecs = 1
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, a.waitTimeout+a.probeTimeout)
+	waitCtx, cancel := context.WithTimeout(ctx, a.waitTimeout)
 	defer cancel()
 
 	start := time.Now()
@@ -185,7 +203,7 @@ func (a *execArbiter) Wait(ctx context.Context) error {
 		// Became available — a legitimately fast success needs no guarding.
 		return nil
 	}
-	if elapsed := time.Since(start); elapsed < a.waitTimeout/2 {
+	if elapsed := time.Since(start); elapsed < a.waitTimeout {
 		return sleep(ctx, a.waitTimeout-elapsed)
 	}
 	return nil
