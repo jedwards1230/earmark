@@ -35,7 +35,8 @@
   },
   "enabledPlugins": {
     "go-quality@jedwards1230-plugins": true,
-    "gopls-lsp@claude-plugins-official": true
+    "gopls-lsp@claude-plugins-official": true,
+    "screenshotter@jedwards1230-plugins": true
   },
   "hooks": {
     "SessionStart": [
