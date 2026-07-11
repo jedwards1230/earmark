@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"testing"
 
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/jedwards1230/earmark/internal/db"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -100,7 +101,7 @@ func TestGetTranscriptIncludeWords(t *testing.T) {
 	assert.Nil(t, w1.Speaker, "speaker is nil when the backend omits it")
 
 	// The human-readable text fallback is unchanged by the flag (still per-segment).
-	text := res.Content[0].(mcp.TextContent).Text
+	text := res.Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, text, "hello world")
 
 	mockDB.AssertExpectations(t)

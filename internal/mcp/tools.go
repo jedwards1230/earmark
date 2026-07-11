@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mark3labs/mcp-go/mcp"
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/library"
@@ -214,19 +214,24 @@ func clampContextWindow(window int) int {
 
 // handleSemanticSearch performs semantic search on audiobook transcriptions,
 // over the whole library by default or scoped to one book when `book` is given.
-func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract required query parameter
-	query, err := request.RequireString("query")
+func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := parseArgs(req)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Missing or invalid query parameter: %v", err)), nil
+		return errorResult(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+
+	// Extract required query parameter
+	query, err := args.requireString("query")
+	if err != nil {
+		return errorResult(fmt.Sprintf("Missing or invalid query parameter: %v", err)), nil
 	}
 
 	// Extract optional parameters with defaults
-	threshold := clampThreshold(request.GetFloat("threshold", 0.3))
-	limit := clampLimit(request.GetInt("limit", 10), 10)
-	book := strings.TrimSpace(request.GetString("book", ""))
+	threshold := clampThreshold(args.getFloat("threshold", 0.3))
+	limit := clampLimit(args.getInt("limit", 10), 10)
+	book := strings.TrimSpace(args.getString("book", ""))
 	// snippet (max chars per hit). 0/omitted → full chunk; <0 ignored.
-	snippet := snippetChars(request.GetInt("snippet", 0))
+	snippet := snippetChars(args.getInt("snippet", 0))
 
 	// Scoped: resolve `book` → a canonical dir, then run an exact (non-HNSW)
 	// distance scan within that book so a selective filter keeps full recall.
@@ -239,7 +244,7 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 		results, err := h.db.SearchInBook(ctx, query, dir, limit, threshold)
 		if err != nil {
 			h.logger.Error("Scoped semantic search failed", "error", err)
-			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+			return errorResult(fmt.Sprintf("Search failed: %v", err)), nil
 		}
 		return formatSearchResultsOpts(results, searchSemantic, query, snippet), nil
 	}
@@ -250,7 +255,7 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 	results, err := h.db.Search(ctx, query, limit, threshold)
 	if err != nil {
 		h.logger.Error("Semantic search failed", "error", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+		return errorResult(fmt.Sprintf("Search failed: %v", err)), nil
 	}
 
 	// Format results using the shared formatting function
@@ -259,18 +264,23 @@ func (h *ToolHandlers) handleSemanticSearch(ctx context.Context, request mcp.Cal
 
 // handleTextSearch performs full-text search on audiobook transcriptions, over
 // the whole library by default or scoped to one book when `book` is given.
-func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract required query parameter
-	query, err := request.RequireString("query")
+func (h *ToolHandlers) handleTextSearch(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := parseArgs(req)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Missing or invalid query parameter: %v", err)), nil
+		return errorResult(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+
+	// Extract required query parameter
+	query, err := args.requireString("query")
+	if err != nil {
+		return errorResult(fmt.Sprintf("Missing or invalid query parameter: %v", err)), nil
 	}
 
 	// Extract optional parameters
-	limit := clampLimit(request.GetInt("limit", 10), 10)
-	book := strings.TrimSpace(request.GetString("book", ""))
+	limit := clampLimit(args.getInt("limit", 10), 10)
+	book := strings.TrimSpace(args.getString("book", ""))
 	// snippet (max chars per hit). 0/omitted → full chunk; <0 ignored.
-	snippet := snippetChars(request.GetInt("snippet", 0))
+	snippet := snippetChars(args.getInt("snippet", 0))
 
 	// Scoped: resolve `book` → a canonical dir and reuse the per-book text search.
 	if book != "" {
@@ -282,7 +292,7 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 		results, err := h.db.TextSearchInBook(ctx, dir, query, limit)
 		if err != nil {
 			h.logger.Error("Scoped text search failed", "error", err)
-			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+			return errorResult(fmt.Sprintf("Search failed: %v", err)), nil
 		}
 		return formatSearchResultsOpts(results, searchText, query, snippet), nil
 	}
@@ -293,7 +303,7 @@ func (h *ToolHandlers) handleTextSearch(ctx context.Context, request mcp.CallToo
 	results, err := h.db.TextSearch(ctx, query, limit)
 	if err != nil {
 		h.logger.Error("Text search failed", "error", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+		return errorResult(fmt.Sprintf("Search failed: %v", err)), nil
 	}
 
 	// Format results using the shared formatting function
@@ -331,7 +341,7 @@ func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string,
 	summaries, _, err := h.db.GetBookSummaries(ctx, db.BookFilter{Query: book, Limit: 200})
 	if err != nil {
 		h.logger.Error("book resolution failed", "book", book, "error", err)
-		return "", mcp.NewToolResultError(fmt.Sprintf("Failed to resolve book %q: %v", book, err))
+		return "", errorResult(fmt.Sprintf("Failed to resolve book %q: %v", book, err))
 	}
 
 	// A bracketed catalogue id in the query switches to exact-ASIN matching.
@@ -368,7 +378,7 @@ func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string,
 	case 1:
 		return matches[0].dir, nil
 	case 0:
-		return "", mcp.NewToolResultError(fmt.Sprintf(
+		return "", errorResult(fmt.Sprintf(
 			"No book matched %q. Use list_books to see the available titles, or omit `book` to search the whole library.", book))
 	default:
 		var b strings.Builder
@@ -380,19 +390,24 @@ func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string,
 			}
 			fmt.Fprintf(&b, "  • %s  (%s)\n", label, m.dir)
 		}
-		return "", mcp.NewToolResultError(b.String())
+		return "", errorResult(b.String())
 	}
 }
 
 // handleListBooks returns the library inventory: each book with author, title,
 // track progress, duration, word count, and chunk count.
-func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	limit := clampLimit(request.GetInt("limit", 50), 50)
-	offset := clampOffset(request.GetInt("offset", 0))
-	author := strings.TrimSpace(request.GetString("author", ""))
+func (h *ToolHandlers) handleListBooks(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := parseArgs(req)
+	if err != nil {
+		return errorResult(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+
+	limit := clampLimit(args.getInt("limit", 50), 50)
+	offset := clampOffset(args.getInt("offset", 0))
+	author := strings.TrimSpace(args.getString("author", ""))
 	// format: "flat" (default, one entry per book) or "tree" (group books by
 	// author). Both query the same rows; tree only regroups them in the formatter.
-	format := strings.ToLower(strings.TrimSpace(request.GetString("format", "flat")))
+	format := strings.ToLower(strings.TrimSpace(args.getString("format", "flat")))
 
 	h.logger.Info("Listing books", "limit", limit, "offset", offset, "author", author, "format", format)
 
@@ -401,7 +416,7 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 	})
 	if err != nil {
 		h.logger.Error("list books failed", "error", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to list books: %v", err)), nil
+		return errorResult(fmt.Sprintf("Failed to list books: %v", err)), nil
 	}
 
 	// Whole-library (filter-scoped) counts for the one-line summary header. This is
@@ -423,19 +438,24 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, request mcp.CallTool
 // read the full text. It resolves `book` → a track (disambiguating when a book
 // has multiple tracks), then returns timestamped segments with offset/limit
 // pagination.
-func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	offset := clampOffset(request.GetInt("offset", 0))
-	limit := clampLimit(request.GetInt("limit", 50), 50)
+func (h *ToolHandlers) handleGetTranscript(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := parseArgs(req)
+	if err != nil {
+		return errorResult(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+
+	offset := clampOffset(args.getInt("offset", 0))
+	limit := clampLimit(args.getInt("limit", 50), 50)
 	// Opt-in per-word timestamps. Default false → the structured payload omits the
 	// `words` field entirely (byte-identical to the pre-word-timestamp response).
-	includeWords := request.GetBool("includeWordTimestamps", false)
+	includeWords := args.getBool("includeWordTimestamps", false)
 
 	// Two ways in: an explicit track/job id, or a `book` to resolve.
-	trackID := strings.TrimSpace(request.GetString("trackID", ""))
+	trackID := strings.TrimSpace(args.getString("trackID", ""))
 	if trackID == "" {
-		book := strings.TrimSpace(request.GetString("book", ""))
+		book := strings.TrimSpace(args.getString("book", ""))
 		if book == "" {
-			return mcp.NewToolResultError("Provide either `book` (a title/dir) or `trackID` (a job id). Use list_books to find titles."), nil
+			return errorResult("Provide either `book` (a title/dir) or `trackID` (a job id). Use list_books to find titles."), nil
 		}
 		dir, errResult := h.resolveBookDir(ctx, book)
 		if errResult != nil {
@@ -444,10 +464,10 @@ func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.Call
 		tracks, err := h.db.GetBookTracks(ctx, dir)
 		if err != nil {
 			h.logger.Error("get book tracks failed", "dir", dir, "error", err)
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to load tracks for %q: %v", book, err)), nil
+			return errorResult(fmt.Sprintf("Failed to load tracks for %q: %v", book, err)), nil
 		}
 		if len(tracks) == 0 {
-			return mcp.NewToolResultError(fmt.Sprintf("No tracks found for %q.", book)), nil
+			return errorResult(fmt.Sprintf("No tracks found for %q.", book)), nil
 		}
 		if len(tracks) > 1 {
 			// Multiple tracks → list them so the caller can pick one via trackID.
@@ -459,30 +479,35 @@ func (h *ToolHandlers) handleGetTranscript(ctx context.Context, request mcp.Call
 	detail, err := h.db.GetTrackDetail(ctx, trackID)
 	if err != nil {
 		h.logger.Error("get track detail failed", "trackID", trackID, "error", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to load transcript for track %q: %v", trackID, err)), nil
+		return errorResult(fmt.Sprintf("Failed to load transcript for track %q: %v", trackID, err)), nil
 	}
 	if detail == nil {
-		return mcp.NewToolResultError(fmt.Sprintf("No track found with id %q.", trackID)), nil
+		return errorResult(fmt.Sprintf("No track found with id %q.", trackID)), nil
 	}
 	if !detail.HasTranscript {
-		return mcp.NewToolResultError(fmt.Sprintf("Track %q is not transcribed yet (status: %s).", detail.FilePath, detail.Status)), nil
+		return errorResult(fmt.Sprintf("Track %q is not transcribed yet (status: %s).", detail.FilePath, detail.Status)), nil
 	}
 
 	return formatTranscriptPage(detail, offset, limit, includeWords), nil
 }
 
 // handleGetContext retrieves surrounding chunks for better context
-func (h *ToolHandlers) handleGetContext(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract required chunk ID parameter
-	chunkID, err := request.RequireString("chunkID")
+func (h *ToolHandlers) handleGetContext(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := parseArgs(req)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Missing or invalid chunkID parameter: %v", err)), nil
+		return errorResult(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+
+	// Extract required chunk ID parameter
+	chunkID, err := args.requireString("chunkID")
+	if err != nil {
+		return errorResult(fmt.Sprintf("Missing or invalid chunkID parameter: %v", err)), nil
 	}
 
 	// Extract optional context window size (default 1 chunk before and after, so
 	// the default response is ~3 chunks), bounded so a huge value can't pull an
 	// entire transcript's chunks.
-	contextWindow := clampContextWindow(request.GetInt("contextWindow", 1))
+	contextWindow := clampContextWindow(args.getInt("contextWindow", 1))
 
 	h.logger.Info("Getting chunk context", "chunkID", chunkID, "contextWindow", contextWindow)
 
@@ -490,7 +515,7 @@ func (h *ToolHandlers) handleGetContext(ctx context.Context, request mcp.CallToo
 	results, err := h.db.GetChunkContext(ctx, chunkID, contextWindow)
 	if err != nil {
 		h.logger.Error("Failed to get chunk context", "error", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to get context: %v", err)), nil
+		return errorResult(fmt.Sprintf("Failed to get context: %v", err)), nil
 	}
 
 	// Format results using the shared formatting function

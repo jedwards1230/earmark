@@ -5,10 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -57,7 +58,7 @@ ID: 11111111-1111-1111-1111-111111111111 | File: /media/audiobooks/tolkien/the-h
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := formatSearchResults(tt.results)
-			assert.Equal(t, tt.expected, result.Content[0].(mcp.TextContent).Text)
+			assert.Equal(t, tt.expected, result.Content[0].(*mcp.TextContent).Text)
 		})
 	}
 }
@@ -72,10 +73,10 @@ func TestFormatSemanticVsTextRelevance(t *testing.T) {
 		Similarity: 0.012, ChunkID: "c1",
 	}}
 
-	semantic := formatSearchResultsOpts(res, searchSemantic, "spice", 0).Content[0].(mcp.TextContent).Text
+	semantic := formatSearchResultsOpts(res, searchSemantic, "spice", 0).Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, semantic, "similarity: 1%")
 
-	text := formatSearchResultsOpts(res, searchText, "spice", 0).Content[0].(mcp.TextContent).Text
+	text := formatSearchResultsOpts(res, searchText, "spice", 0).Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, text, "ranked by trigram match")
 	assert.NotContains(t, text, "similarity:")
 	assert.NotContains(t, text, "%)") // no percentage on a literal-match hit
@@ -95,20 +96,20 @@ func TestSnippetTruncation(t *testing.T) {
 	}}
 
 	// Text search, snippet=80, query NEEDLE → centred excerpt that includes NEEDLE.
-	text := formatSearchResultsOpts(res, searchText, "NEEDLE", 80).Content[0].(mcp.TextContent).Text
+	text := formatSearchResultsOpts(res, searchText, "NEEDLE", 80).Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, text, "NEEDLE")
 	assert.Contains(t, text, "(truncated, use get_chunk_context for full text)")
 	assert.NotContains(t, text, "alpha beta gamma") // leading text dropped by centring
 
 	// Semantic search, snippet=80 → leading preview (starts at alpha, excludes the
 	// far-out NEEDLE since there is no sub-chunk match position to centre on).
-	sem := formatSearchResultsOpts(res, searchSemantic, "NEEDLE", 80).Content[0].(mcp.TextContent).Text
+	sem := formatSearchResultsOpts(res, searchSemantic, "NEEDLE", 80).Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, sem, "alpha beta")
 	assert.NotContains(t, sem, "NEEDLE")
 	assert.Contains(t, sem, "(truncated, use get_chunk_context for full text)")
 
 	// snippet larger than the content → no truncation, no marker.
-	full := formatSearchResultsOpts(res, searchSemantic, "", 100000).Content[0].(mcp.TextContent).Text
+	full := formatSearchResultsOpts(res, searchSemantic, "", 100000).Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, full, long)
 	assert.NotContains(t, full, "(truncated")
 }
@@ -164,7 +165,7 @@ func TestFormatBookTree(t *testing.T) {
 			Total:      24, Done: 22, Pending: 2},
 	}
 	totals := db.LibraryTotals{TotalBooks: 3, FullyTranscribed: 2, WithPending: 1}
-	out := formatBookTree(context.Background(), books, 3, 0, totals, meta).Content[0].(mcp.TextContent).Text
+	out := formatBookTree(context.Background(), books, 3, 0, totals, meta).Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, out, "Library: 3 books — 2 fully transcribed, 1 with pending tracks.")
 	assert.Contains(t, out, "Library: 3 book(s) across 2 author(s)")
 	assert.Contains(t, out, "Andy Weir\n")
@@ -187,16 +188,16 @@ func TestFormatChapterZeroSuppressed(t *testing.T) {
 		ID: "c1", Content: "passage", Author: "A", Title: "B",
 		ChunkIndex: 4, TotalChunks: 10, Similarity: 0.5, ChunkID: "c1",
 	}}
-	sem := formatSearchResultsOpts(noChap, searchSemantic, "q", 0).Content[0].(mcp.TextContent).Text
+	sem := formatSearchResultsOpts(noChap, searchSemantic, "q", 0).Content[0].(*mcp.TextContent).Text
 	assert.NotContains(t, sem, "Chapter 0:")
 	assert.NotContains(t, sem, "Chapter")
 	assert.Contains(t, sem, "(chunk 5/10, similarity: 50%)")
 
-	txt := formatSearchResultsOpts(noChap, searchText, "q", 0).Content[0].(mcp.TextContent).Text
+	txt := formatSearchResultsOpts(noChap, searchText, "q", 0).Content[0].(*mcp.TextContent).Text
 	assert.NotContains(t, txt, "Chapter")
 	assert.Contains(t, txt, "(chunk 5/10, ranked by trigram match)")
 
-	ctx := formatSearchResults(noChap).Content[0].(mcp.TextContent).Text
+	ctx := formatSearchResults(noChap).Content[0].(*mcp.TextContent).Text
 	assert.NotContains(t, ctx, "Chapter")
 	assert.Contains(t, ctx, "(chunk 5/10)")
 
@@ -205,7 +206,7 @@ func TestFormatChapterZeroSuppressed(t *testing.T) {
 		ID: "c2", Content: "x", Author: "A", Title: "B",
 		ChunkIndex: 0, TotalChunks: 3, ChapterIndex: 0, ChapterTitle: "Prologue", ChunkID: "c2",
 	}}
-	out := formatSearchResults(titled).Content[0].(mcp.TextContent).Text
+	out := formatSearchResults(titled).Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, out, "Chapter 0: Prologue (chunk 1/3)")
 }
 

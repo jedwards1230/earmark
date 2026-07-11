@@ -8,8 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/eval"
@@ -20,7 +19,7 @@ import (
 
 // MCPServer wraps the MCP server functionality for the earmark service
 type MCPServer struct {
-	server   *server.MCPServer
+	server   *mcp.Server
 	handlers *ToolHandlers
 	logger   log.Logger
 	db       DBInterface // kept for /readyz probe
@@ -90,6 +89,19 @@ type evalState struct {
 // construction). Injectable so handler tests don't need a live LLM.
 type evalRunFunc func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error)
 
+// readOnlyAnnotations is shared by every search/browse/read tool: they only
+// query the database; they never mutate state or produce side-effects.
+// OpenWorldHint is deliberately left unset (nil), matching the original
+// mcp-go tool.ToolAnnotation, which never set it either.
+func readOnlyAnnotations() *mcp.ToolAnnotations {
+	f := false
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    true,
+		DestructiveHint: &f,
+		IdempotentHint:  true,
+	}
+}
+
 // NewMCPServer creates a new MCP server instance
 func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	logger := log.NewLogger("mcp-server")
@@ -99,19 +111,28 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		staleAfter = 30 * time.Minute
 	}
 
-	// Create MCP server with all capabilities enabled. Identity metadata (title,
-	// description) helps a host present the server in a picker. websiteUrl is
-	// omitted — the only HTTP surface is the LAN-only status dashboard, not a
-	// public site, so there's no canonical URL to advertise. Icons are likewise
-	// omitted (no published icon asset).
-	mcpServer := server.NewMCPServer("earmark", "1.0.0",
-		server.WithToolCapabilities(true),
-		server.WithResourceCapabilities(false, false), // No MCP resources yet. TRAP: if you add resources, ALSO change this to (false, true). ContextForge's federation gates on a truthy `resources` capability and silently skips resources from servers that advertise bare `resources: {}` (which (false,false) emits). See my-wiki's equivalent fix.
-		server.WithPromptCapabilities(false),          // Not implementing prompts yet
-		server.WithLogging(),
-		server.WithTitle("Audiobook Processor"),
-		server.WithDescription("Semantic and keyword search over audiobook transcripts, plus full-transcript reading and library browsing."),
-	)
+	// Create the MCP server. Capabilities is left NIL deliberately: the SDK
+	// auto-derives {"tools":{"listChanged":true}} from the 5 tools registered
+	// below and, since no resources/prompts are registered, omits those keys
+	// entirely (never a falsy `resources: {}`) — this is exactly what
+	// ContextForge's federation gate (`if capabilities.get("resources")`,
+	// which treats `{}` as falsy) needs. Hand-setting Capabilities here would
+	// only be able to reintroduce that trap, so don't. A nil Capabilities also
+	// keeps the SDK's default `{"logging":{}}` capability, the equivalent of
+	// mcp-go's WithLogging(). Identity metadata (Title) helps a host present
+	// the server in a picker; Instructions carries the long-form description
+	// mcp-go exposed via the (non-spec) Implementation.Description field,
+	// which the official Implementation struct has no equivalent of.
+	// websiteUrl/icons are omitted — the only HTTP surface is the LAN-only
+	// status dashboard, not a public site, so there's no canonical URL to
+	// advertise.
+	mcpServer := mcp.NewServer(&mcp.Implementation{
+		Name:    "earmark",
+		Version: "1.0.0",
+		Title:   "Audiobook Processor",
+	}, &mcp.ServerOptions{
+		Instructions: "Semantic and keyword search over audiobook transcripts, plus full-transcript reading and library browsing.",
+	})
 
 	// Build the metadata provider from config. NewPathProvider handles parse
 	// errors internally (falls back to generic resolver) — labels are cosmetic,
@@ -122,153 +143,76 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// search tools and the list_books labels match the dashboard's labels.
 	handlers := NewToolHandlers(database, meta)
 
-	// All search/browse/read tools are read-only and non-destructive — they only
-	// query the database; they never mutate state or produce side-effects.
-	readOnlyAnnotations := mcp.ToolAnnotation{
-		ReadOnlyHint:    mcp.ToBoolPtr(true),
-		DestructiveHint: mcp.ToBoolPtr(false),
-		IdempotentHint:  mcp.ToBoolPtr(true),
-	}
+	annotations := readOnlyAnnotations()
 
 	// Add semantic search tool
-	mcpServer.AddTool(mcp.NewTool("semantic_search_audiobooks",
-		mcp.WithDescription("Search audiobook transcriptions by meaning (vector similarity). "+
-			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. "+
-			"Each hit is a chunk (the embedding/search unit — a chunk is tens of consecutive ASR "+
-			"segments grouped together, so one book has far fewer chunks than segments). "+
-			"Use this to find passages about a concept; use list_books to discover titles, "+
-			"get_chunk_context to expand around a hit, and get_transcript to read full text."),
-		mcp.WithToolAnnotation(readOnlyAnnotations),
-		mcp.WithOutputSchema[SearchResultsOutput](),
-		mcp.WithString("query",
-			mcp.Description("The search query to find relevant content"),
-			mcp.Required(),
-		),
-		mcp.WithString("book",
-			mcp.Description("Optional: restrict the search to one book (a title or directory substring, e.g. \"Project Hail Mary\"). Omit to search the entire library. Run list_books to see available titles."),
-		),
-		mcp.WithNumber("threshold",
-			mcp.Description("Similarity threshold (0.0-1.0, default: 0.3)"),
-			mcp.DefaultNumber(0.3),
-		),
-		mcp.WithNumber("limit",
-			mcp.Description("Maximum number of results to return (default: 10)"),
-			mcp.DefaultNumber(10),
-		),
-		mcp.WithNumber("snippet",
-			mcp.Description("Optional: cap each hit's quoted text to roughly this many characters to keep iterative searches cheap. "+
-				"Omit to return the full ~400-word chunk (default). A semantic hit has no sub-chunk match position, so the "+
-				"snippet is a leading PREVIEW of the chunk, not a centered excerpt — use get_chunk_context for the full "+
-				"surrounding text."),
-		),
-	), handlers.handleSemanticSearch)
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "semantic_search_audiobooks",
+		Description: "Search audiobook transcriptions by meaning (vector similarity). " +
+			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. " +
+			"Each hit is a chunk (the embedding/search unit — a chunk is tens of consecutive ASR " +
+			"segments grouped together, so one book has far fewer chunks than segments). " +
+			"Use this to find passages about a concept; use list_books to discover titles, " +
+			"get_chunk_context to expand around a hit, and get_transcript to read full text.",
+		Annotations:  annotations,
+		InputSchema:  semanticSearchSchema(),
+		OutputSchema: outputSchemaFor[SearchResultsOutput](),
+	}, handlers.handleSemanticSearch)
 
 	// Add text search tool
-	mcpServer.AddTool(mcp.NewTool("text_search_audiobooks",
-		mcp.WithDescription("Search audiobook transcriptions by literal/keyword text (trigram match). "+
-			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. "+
-			"Each hit is a chunk (the search unit — a chunk is tens of consecutive ASR segments grouped "+
-			"together). Ranked by trigram match, not vector distance — results carry a \"trigram match\" "+
-			"label, NOT a semantic-similarity score. "+
-			"Use this for exact phrases or names; use semantic_search_audiobooks for conceptual queries."),
-		mcp.WithToolAnnotation(readOnlyAnnotations),
-		mcp.WithOutputSchema[SearchResultsOutput](),
-		mcp.WithString("query",
-			mcp.Description("The search query to find exact text matches"),
-			mcp.Required(),
-		),
-		mcp.WithString("book",
-			mcp.Description("Optional: restrict the search to one book (a title or directory substring, e.g. \"Dune\"). Omit to search the entire library. Run list_books to see available titles."),
-		),
-		mcp.WithNumber("limit",
-			mcp.Description("Maximum number of results to return (default: 10)"),
-			mcp.DefaultNumber(10),
-		),
-		mcp.WithNumber("snippet",
-			mcp.Description("Optional: cap each hit's quoted text to roughly this many characters to keep iterative searches cheap. "+
-				"Omit to return the full ~400-word chunk (default). When set, the excerpt is CENTERED on the literal query "+
-				"match within the chunk. Use get_chunk_context for the full surrounding text."),
-		),
-	), handlers.handleTextSearch)
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "text_search_audiobooks",
+		Description: "Search audiobook transcriptions by literal/keyword text (trigram match). " +
+			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. " +
+			"Each hit is a chunk (the search unit — a chunk is tens of consecutive ASR segments grouped " +
+			"together). Ranked by trigram match, not vector distance — results carry a \"trigram match\" " +
+			"label, NOT a semantic-similarity score. " +
+			"Use this for exact phrases or names; use semantic_search_audiobooks for conceptual queries.",
+		Annotations:  annotations,
+		InputSchema:  textSearchSchema(),
+		OutputSchema: outputSchemaFor[SearchResultsOutput](),
+	}, handlers.handleTextSearch)
 
 	// Add list_books tool — the library inventory.
-	mcpServer.AddTool(mcp.NewTool("list_books",
-		mcp.WithDescription("List the audiobook library inventory: each book with author, title, "+
-			"track progress (done/total), total duration, word count, and embedded-chunk count. "+
-			"This is the inventory tool — use it to discover which titles exist before scoping a "+
-			"search or fetching a transcript. Pass format=tree to group the same books under their "+
-			"authors instead of a flat list."),
-		mcp.WithToolAnnotation(readOnlyAnnotations),
-		mcp.WithOutputSchema[ListBooksOutput](),
-		mcp.WithString("author",
-			mcp.Description("Optional: filter to books whose path/author matches this substring (case-insensitive)."),
-		),
-		mcp.WithString("format",
-			mcp.Description("Output shape: \"flat\" (default) — one entry per book; or \"tree\" — group books by author. "+
-				"Both list the same books with the same metadata; tree only changes the grouping."),
-		),
-		mcp.WithNumber("limit",
-			mcp.Description("Maximum number of books to return (default: 50)"),
-			mcp.DefaultNumber(50),
-		),
-		mcp.WithNumber("offset",
-			mcp.Description("Pagination offset into the book list (default: 0)"),
-			mcp.DefaultNumber(0),
-		),
-	), handlers.handleListBooks)
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "list_books",
+		Description: "List the audiobook library inventory: each book with author, title, " +
+			"track progress (done/total), total duration, word count, and embedded-chunk count. " +
+			"This is the inventory tool — use it to discover which titles exist before scoping a " +
+			"search or fetching a transcript. Pass format=tree to group the same books under their " +
+			"authors instead of a flat list.",
+		Annotations:  annotations,
+		InputSchema:  listBooksSchema(),
+		OutputSchema: outputSchemaFor[ListBooksOutput](),
+	}, handlers.handleListBooks)
 
 	// Add get_transcript tool — read the full transcript text (paginated).
-	mcpServer.AddTool(mcp.NewTool("get_transcript",
-		mcp.WithDescription("Read the full transcript of a book/track as timestamped segments, so you can "+
-			"READ the text rather than only search fragments. This paginates SEGMENTS (raw ASR "+
-			"timestamp units — there are far more segments than search chunks; a chunk is tens of "+
-			"consecutive segments grouped for embedding). Provide `book` (a title) or `trackID` (a job id "+
-			"from list_books / a track chooser). Transcripts are large, so segments are paginated via "+
-			"offset/limit; the response footer tells you the next offset. If a book has multiple tracks, this "+
-			"returns the track list so you can pick one by trackID. Per-word timestamps are HIDDEN by default; "+
-			"set includeWordTimestamps=true to get each segment's word-level start/end times (for queries like "+
-			"\"exactly when was X said\")."),
-		mcp.WithToolAnnotation(readOnlyAnnotations),
-		mcp.WithOutputSchema[TranscriptOutput](),
-		mcp.WithString("book",
-			mcp.Description("A book title or directory substring to read (e.g. \"Project Hail Mary\"). Either this or trackID is required."),
-		),
-		mcp.WithString("trackID",
-			mcp.Description("A specific track/job id (UUID) to read. Takes precedence over `book`. Use when a book has multiple tracks."),
-		),
-		mcp.WithNumber("offset",
-			mcp.Description("Segment offset to start the page at (default: 0)"),
-			mcp.DefaultNumber(0),
-		),
-		mcp.WithNumber("limit",
-			mcp.Description("Number of segments to return per page (default: 50)"),
-			mcp.DefaultNumber(50),
-		),
-		mcp.WithBoolean("includeWordTimestamps",
-			mcp.Description("Include per-word timestamps (word/start/end, plus score/speaker when available) on each "+
-				"returned segment. Default false — omitted to keep the response small; enable it only when you need "+
-				"word-level timing (e.g. \"exactly when was X said\")."),
-			mcp.DefaultBool(false),
-		),
-	), handlers.handleGetTranscript)
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "get_transcript",
+		Description: "Read the full transcript of a book/track as timestamped segments, so you can " +
+			"READ the text rather than only search fragments. This paginates SEGMENTS (raw ASR " +
+			"timestamp units — there are far more segments than search chunks; a chunk is tens of " +
+			"consecutive segments grouped for embedding). Provide `book` (a title) or `trackID` (a job id " +
+			"from list_books / a track chooser). Transcripts are large, so segments are paginated via " +
+			"offset/limit; the response footer tells you the next offset. If a book has multiple tracks, this " +
+			"returns the track list so you can pick one by trackID. Per-word timestamps are HIDDEN by default; " +
+			"set includeWordTimestamps=true to get each segment's word-level start/end times (for queries like " +
+			"\"exactly when was X said\").",
+		Annotations:  annotations,
+		InputSchema:  getTranscriptSchema(),
+		OutputSchema: outputSchemaFor[TranscriptOutput](),
+	}, handlers.handleGetTranscript)
 
 	// Add chunk context tool
-	mcpServer.AddTool(mcp.NewTool("get_chunk_context",
-		mcp.WithDescription("Get the chunks surrounding a search hit, so you can read the full text around a match. "+
-			"Operates on CHUNKS (the search/embedding unit — a chunk is tens of consecutive ASR segments grouped "+
-			"together; use get_transcript to page raw segments instead). Pass the chunk's UUID from a search result."),
-		mcp.WithToolAnnotation(readOnlyAnnotations),
-		mcp.WithOutputSchema[SearchResultsOutput](),
-		mcp.WithString("chunkID",
-			mcp.Description("The chunk UUID returned in the `ID` field of semantic_search_audiobooks / "+
-				"text_search_audiobooks results."),
-			mcp.Required(),
-		),
-		mcp.WithNumber("contextWindow",
-			mcp.Description("Number of chunks before and after to include (default: 1, i.e. ~3 chunks; clamped to 0–50)"),
-			mcp.DefaultNumber(1),
-		),
-	), handlers.handleGetContext)
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "get_chunk_context",
+		Description: "Get the chunks surrounding a search hit, so you can read the full text around a match. " +
+			"Operates on CHUNKS (the search/embedding unit — a chunk is tens of consecutive ASR segments grouped " +
+			"together; use get_transcript to page raw segments instead). Pass the chunk's UUID from a search result.",
+		Annotations:  annotations,
+		InputSchema:  getChunkContextSchema(),
+		OutputSchema: outputSchemaFor[SearchResultsOutput](),
+	}, handlers.handleGetContext)
 
 	s := &MCPServer{
 		server:           mcpServer,
@@ -321,7 +265,7 @@ func (s *MCPServer) initEval(cfg *config.Config) {
 func (s *MCPServer) StartStdio() error {
 	s.logger.Info("Starting MCP server with stdio transport")
 
-	return server.ServeStdio(s.server)
+	return s.server.Run(context.Background(), &mcp.StdioTransport{})
 }
 
 // getOnly wraps a handler so non-GET requests get 405 Method Not Allowed.
@@ -369,7 +313,9 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //
 // Extracted so that tests can wire the same mux without binding a port.
 func (s *MCPServer) buildMux() *http.ServeMux {
-	mcpHandler := server.NewStreamableHTTPServer(s.server)
+	// getServer returns the single prebuilt server for every session — the tool
+	// set is process-wide, not per-request.
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.server }, nil)
 
 	mux := http.NewServeMux()
 
@@ -471,7 +417,7 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	})
 
 	// MCP protocol handler at /mcp (ServeHTTP handles all methods; path-based
-	// routing is done internally by mcp-go when used as an http.Handler).
+	// routing is done internally by the SDK when used as an http.Handler).
 	mux.Handle("/mcp", mcpHandler)
 
 	return mux
