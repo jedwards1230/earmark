@@ -4,9 +4,10 @@ import (
 	"context"
 	"testing"
 
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/jedwards1230/earmark/internal/db"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -36,7 +37,7 @@ func TestListBooksStructuredContent(t *testing.T) {
 
 	// Back-compat text fallback is still present as the first content block.
 	require.NotEmpty(t, res.Content)
-	_, ok := res.Content[0].(mcp.TextContent)
+	_, ok := res.Content[0].(*mcp.TextContent)
 	assert.True(t, ok, "Content[0] should be the text fallback")
 
 	// Structured payload is present and correctly typed.

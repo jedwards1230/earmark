@@ -6,10 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
-
-	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // fmtHMS renders a second count as "Hh MMm SSs" (em dash when unknown), matching
@@ -71,7 +71,7 @@ func librarySummaryLine(t db.LibraryTotals) string {
 // view keeps it); a leading summary line reports whole-library totals.
 func formatBookList(ctx context.Context, books []db.BookSummary, total, offset int, totals db.LibraryTotals, meta metaprovider.MetadataProvider) *mcp.CallToolResult {
 	if len(books) == 0 {
-		return mcp.NewToolResultStructured(
+		return structuredResult(
 			ListBooksOutput{Format: "flat", Books: []BookEntry{}, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset},
 			"No books found.",
 		)
@@ -124,7 +124,7 @@ func formatBookList(ctx context.Context, books []db.BookSummary, total, offset i
 		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, n)
 	}
 
-	return mcp.NewToolResultStructured(
+	return structuredResult(
 		ListBooksOutput{Format: "flat", Books: entries, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset, NextOffset: nextOffset},
 		strings.TrimRight(b.String(), "\n"),
 	)
@@ -168,7 +168,7 @@ func formatTrackChooser(book string, tracks []db.RecentJob) *mcp.CallToolResult 
 		refs = append(refs, TrackRef{TrackID: t.ID, FilePath: t.FilePath, Status: t.Status})
 		fmt.Fprintf(&b, "  • %s  [%s]  trackID=%s\n", filepath.Base(t.FilePath), t.Status, t.ID)
 	}
-	return mcp.NewToolResultStructured(
+	return structuredResult(
 		TranscriptOutput{Kind: "trackChooser", Book: book, Tracks: refs},
 		strings.TrimRight(b.String(), "\n"),
 	)
@@ -186,7 +186,7 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords boo
 	// Defensive: the caller checks for nil, but guard here too so the helper is
 	// safe to reuse. A nil detail has no transcript to render.
 	if d == nil {
-		return mcp.NewToolResultError("no transcript available")
+		return errorResult("no transcript available")
 	}
 	totalSegs := len(d.Segments)
 	if offset < 0 {
@@ -217,7 +217,7 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords boo
 
 	if offset >= totalSegs {
 		fmt.Fprintf(&b, "(offset %d is past the end — %d segments total)", offset, totalSegs)
-		return mcp.NewToolResultStructured(base, b.String())
+		return structuredResult(base, b.String())
 	}
 
 	end := offset + limit
@@ -243,7 +243,7 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords boo
 	} else {
 		fmt.Fprintf(&b, "Showing segments %d–%d of %d (end of transcript).", offset+1, end, totalSegs)
 	}
-	return mcp.NewToolResultStructured(base, b.String())
+	return structuredResult(base, b.String())
 }
 
 // transcriptWords maps the DB's per-segment word tokens to the structured output
@@ -320,7 +320,7 @@ func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchK
 	if len(results) == 0 {
 		// Even the empty case emits structured content so a consumer can rely on
 		// the shape unconditionally (results: []).
-		return mcp.NewToolResultStructured(
+		return structuredResult(
 			SearchResultsOutput{Kind: kind.label(), Query: query, Count: 0, Results: []db.SearchResultWithMetadata{}},
 			"No results found.",
 		)
@@ -388,7 +388,7 @@ func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchK
 	// Structured payload mirrors the text: the raw typed rows plus the ranking
 	// kind. The text rendering above remains the spec-required back-compat
 	// fallback (Content[0]).
-	return mcp.NewToolResultStructured(
+	return structuredResult(
 		SearchResultsOutput{Kind: kind.label(), Query: query, Count: len(results), Results: results},
 		output.String(),
 	)
@@ -468,7 +468,7 @@ type authorGroup struct {
 // produced — no new queries — so author → books, books in their original order.
 func formatBookTree(ctx context.Context, books []db.BookSummary, total, offset int, totals db.LibraryTotals, meta metaprovider.MetadataProvider) *mcp.CallToolResult {
 	if len(books) == 0 {
-		return mcp.NewToolResultStructured(
+		return structuredResult(
 			ListBooksOutput{Format: "tree", Books: []BookEntry{}, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset},
 			"No books found.",
 		)
@@ -541,7 +541,7 @@ func formatBookTree(ctx context.Context, books []db.BookSummary, total, offset i
 		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, n)
 	}
 
-	return mcp.NewToolResultStructured(
+	return structuredResult(
 		ListBooksOutput{Format: "tree", Books: entries, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset, NextOffset: nextOffset},
 		strings.TrimRight(b.String(), "\n"),
 	)

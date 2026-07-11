@@ -2,15 +2,17 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
+
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/predict"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -187,7 +189,7 @@ func (m *MockDBInterface) GetFindingsCountByBook(ctx context.Context) (map[strin
 func TestHandleSemanticSearch(t *testing.T) {
 	tests := []struct {
 		name          string
-		request       mcp.CallToolRequest
+		request       *mcp.CallToolRequest
 		mockResults   []db.SearchResultWithMetadata
 		mockError     error
 		expectedError bool
@@ -195,16 +197,11 @@ func TestHandleSemanticSearch(t *testing.T) {
 	}{
 		{
 			name: "successful search with results",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "semantic_search_audiobooks",
-					Arguments: map[string]interface{}{
-						"query":     "dragon",
-						"threshold": 0.8,
-						"limit":     5.0,
-					},
-				},
-			},
+			request: req("semantic_search_audiobooks", map[string]interface{}{
+				"query":     "dragon",
+				"threshold": 0.8,
+				"limit":     5.0,
+			}),
 			mockResults: []db.SearchResultWithMetadata{
 				{
 					ID:            "chunk-1",
@@ -226,14 +223,9 @@ func TestHandleSemanticSearch(t *testing.T) {
 		},
 		{
 			name: "search with default parameters",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "semantic_search_audiobooks",
-					Arguments: map[string]interface{}{
-						"query": "magic",
-					},
-				},
-			},
+			request: req("semantic_search_audiobooks", map[string]interface{}{
+				"query": "magic",
+			}),
 			mockResults:   []db.SearchResultWithMetadata{},
 			mockError:     nil,
 			expectedError: false,
@@ -241,27 +233,17 @@ func TestHandleSemanticSearch(t *testing.T) {
 		},
 		{
 			name: "database error",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "semantic_search_audiobooks",
-					Arguments: map[string]interface{}{
-						"query": "test",
-					},
-				},
-			},
+			request: req("semantic_search_audiobooks", map[string]interface{}{
+				"query": "test",
+			}),
 			mockResults:   []db.SearchResultWithMetadata{},
 			mockError:     errors.New("database connection failed"),
 			expectedError: true,
 			expectedText:  "Search failed: database connection failed",
 		},
 		{
-			name: "missing query parameter",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name:      "semantic_search_audiobooks",
-					Arguments: map[string]interface{}{},
-				},
-			},
+			name:          "missing query parameter",
+			request:       req("semantic_search_audiobooks", map[string]interface{}{}),
 			mockResults:   nil,
 			mockError:     nil,
 			expectedError: true,
@@ -273,7 +255,7 @@ func TestHandleSemanticSearch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mockDB := &MockDBInterface{}
 
-			args := tt.request.Params.Arguments.(map[string]interface{})
+			args := argsMap(t, tt.request)
 			if query, ok := args["query"].(string); ok && query != "" {
 				expectedThreshold := 0.3 // default
 				if threshold, exists := args["threshold"]; exists {
@@ -303,12 +285,12 @@ func TestHandleSemanticSearch(t *testing.T) {
 					assert.Contains(t, err.Error(), tt.expectedText)
 				} else {
 					assert.True(t, result.IsError)
-					assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
+					assert.Contains(t, result.Content[0].(*mcp.TextContent).Text, tt.expectedText)
 				}
 			} else {
 				assert.NoError(t, err)
 				assert.False(t, result.IsError)
-				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
+				assert.Contains(t, result.Content[0].(*mcp.TextContent).Text, tt.expectedText)
 			}
 
 			mockDB.AssertExpectations(t)
@@ -319,7 +301,7 @@ func TestHandleSemanticSearch(t *testing.T) {
 func TestHandleTextSearch(t *testing.T) {
 	tests := []struct {
 		name          string
-		request       mcp.CallToolRequest
+		request       *mcp.CallToolRequest
 		mockResults   []db.SearchResultWithMetadata
 		mockError     error
 		expectedError bool
@@ -327,15 +309,10 @@ func TestHandleTextSearch(t *testing.T) {
 	}{
 		{
 			name: "successful text search",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "text_search_audiobooks",
-					Arguments: map[string]interface{}{
-						"query": "exact phrase",
-						"limit": 15.0,
-					},
-				},
-			},
+			request: req("text_search_audiobooks", map[string]interface{}{
+				"query": "exact phrase",
+				"limit": 15.0,
+			}),
 			mockResults: []db.SearchResultWithMetadata{
 				{
 					ID:            "chunk-2",
@@ -357,14 +334,9 @@ func TestHandleTextSearch(t *testing.T) {
 		},
 		{
 			name: "text search with default limit",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "text_search_audiobooks",
-					Arguments: map[string]interface{}{
-						"query": "test query",
-					},
-				},
-			},
+			request: req("text_search_audiobooks", map[string]interface{}{
+				"query": "test query",
+			}),
 			mockResults:   []db.SearchResultWithMetadata{},
 			mockError:     nil,
 			expectedError: false,
@@ -376,7 +348,7 @@ func TestHandleTextSearch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mockDB := &MockDBInterface{}
 
-			args := tt.request.Params.Arguments.(map[string]interface{})
+			args := argsMap(t, tt.request)
 			query := args["query"].(string)
 
 			expectedLimit := 10 // default
@@ -404,7 +376,7 @@ func TestHandleTextSearch(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 				assert.False(t, result.IsError)
-				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
+				assert.Contains(t, result.Content[0].(*mcp.TextContent).Text, tt.expectedText)
 			}
 
 			mockDB.AssertExpectations(t)
@@ -415,7 +387,7 @@ func TestHandleTextSearch(t *testing.T) {
 func TestHandleGetContext(t *testing.T) {
 	tests := []struct {
 		name          string
-		request       mcp.CallToolRequest
+		request       *mcp.CallToolRequest
 		mockResults   []db.SearchResultWithMetadata
 		mockError     error
 		expectedError bool
@@ -423,15 +395,10 @@ func TestHandleGetContext(t *testing.T) {
 	}{
 		{
 			name: "successful context retrieval",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "get_chunk_context",
-					Arguments: map[string]interface{}{
-						"chunkID":       "chunk-5",
-						"contextWindow": 2,
-					},
-				},
-			},
+			request: req("get_chunk_context", map[string]interface{}{
+				"chunkID":       "chunk-5",
+				"contextWindow": 2,
+			}),
 			mockResults: []db.SearchResultWithMetadata{
 				{
 					ID:         fmt.Sprintf("chunk-%d", 10),
@@ -464,14 +431,9 @@ func TestHandleGetContext(t *testing.T) {
 		},
 		{
 			name: "missing chunk ID parameter",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "get_chunk_context",
-					Arguments: map[string]interface{}{
-						"contextWindow": 2,
-					},
-				},
-			},
+			request: req("get_chunk_context", map[string]interface{}{
+				"contextWindow": 2,
+			}),
 			mockResults:   nil,
 			mockError:     nil,
 			expectedError: true,
@@ -479,15 +441,10 @@ func TestHandleGetContext(t *testing.T) {
 		},
 		{
 			name: "database error",
-			request: mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name: "get_chunk_context",
-					Arguments: map[string]interface{}{
-						"chunkID":       "chunk-5",
-						"contextWindow": 2,
-					},
-				},
-			},
+			request: req("get_chunk_context", map[string]interface{}{
+				"chunkID":       "chunk-5",
+				"contextWindow": 2,
+			}),
 			mockResults:   nil,
 			mockError:     errors.New("database connection failed"),
 			expectedError: true,
@@ -500,8 +457,17 @@ func TestHandleGetContext(t *testing.T) {
 			mockDB := new(MockDBInterface)
 
 			if tt.mockResults != nil || tt.mockError != nil {
-				chunkID := tt.request.GetString("chunkID", "")
-				contextWindow := tt.request.GetInt("contextWindow", 2)
+				a := argsMap(t, tt.request)
+				chunkID, _ := a["chunkID"].(string)
+				contextWindow := 2
+				if cw, ok := a["contextWindow"]; ok {
+					switch v := cw.(type) {
+					case float64:
+						contextWindow = int(v)
+					case int:
+						contextWindow = v
+					}
+				}
 				mockDB.On("GetChunkContext", mock.Anything, chunkID, contextWindow).Return(tt.mockResults, tt.mockError)
 			}
 
@@ -510,11 +476,11 @@ func TestHandleGetContext(t *testing.T) {
 
 			if tt.expectedError {
 				assert.NotNil(t, result)
-				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
+				assert.Contains(t, result.Content[0].(*mcp.TextContent).Text, tt.expectedText)
 			} else {
 				assert.Nil(t, err)
 				assert.NotNil(t, result)
-				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, tt.expectedText)
+				assert.Contains(t, result.Content[0].(*mcp.TextContent).Text, tt.expectedText)
 			}
 
 			mockDB.AssertExpectations(t)
@@ -545,9 +511,29 @@ func TestHandleGetContextClampsWindow(t *testing.T) {
 	mockDB.AssertExpectations(t)
 }
 
-// req builds a CallToolRequest with the given name and arguments.
-func req(name string, args map[string]interface{}) mcp.CallToolRequest {
-	return mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: args}}
+// req builds a CallToolRequest with the given name and arguments, JSON-encoding
+// args into the raw Arguments payload the official SDK hands tool handlers
+// (mirroring how a real client call arrives on the wire).
+func req(name string, args map[string]interface{}) *mcp.CallToolRequest {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		panic(fmt.Sprintf("req(%q): marshal args: %v", name, err))
+	}
+	return &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: name, Arguments: raw}}
+}
+
+// argsMap decodes a CallToolRequest's raw JSON arguments back into a map, for
+// tests that need to inspect the call's arguments after building the request
+// via req().
+func argsMap(t *testing.T, r *mcp.CallToolRequest) map[string]interface{} {
+	t.Helper()
+	m := map[string]interface{}{}
+	if len(r.Params.Arguments) > 0 {
+		if err := json.Unmarshal(r.Params.Arguments, &m); err != nil {
+			t.Fatalf("unmarshal args: %v", err)
+		}
+	}
+	return m
 }
 
 // providerForTest returns a MetadataProvider that labels the demo collections,
@@ -583,7 +569,7 @@ func TestHandleListBooks(t *testing.T) {
 	res, err := h.handleListBooks(context.Background(), req("list_books", map[string]interface{}{}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
-	text := res.Content[0].(mcp.TextContent).Text
+	text := res.Content[0].(*mcp.TextContent).Text
 	// Leading whole-library summary line (TRUE totals).
 	assert.Contains(t, text, "Library: 2 books — 1 fully transcribed, 1 with pending tracks.")
 	assert.Contains(t, text, "Library: 2 book(s)")
@@ -618,7 +604,7 @@ func TestHandleSemanticSearchScoped(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
-	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "Found 1 result(s)")
 	mockDB.AssertExpectations(t)
 }
 
@@ -638,7 +624,7 @@ func TestHandleTextSearchScoped(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
-	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "Found 1 result(s)")
 	mockDB.AssertExpectations(t)
 }
 
@@ -660,7 +646,7 @@ func TestResolveBookDirAmbiguous(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.True(t, res.IsError)
-	text := res.Content[0].(mcp.TextContent).Text
+	text := res.Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, text, "matched 2 books")
 	assert.Contains(t, text, "Project Hail Mary")
 	assert.Contains(t, text, "The Martian")
@@ -692,7 +678,7 @@ func TestResolveBookDirASINCollision(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError, "book=1984 should resolve to the 1984 title, not collide on Noise's ASIN")
-	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "Found 1 result(s)")
 	mockDB.AssertExpectations(t)
 }
 
@@ -717,7 +703,7 @@ func TestResolveBookDirASINExact(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
-	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "Found 1 result(s)")
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "Found 1 result(s)")
 	mockDB.AssertExpectations(t)
 }
 
@@ -734,7 +720,7 @@ func TestResolveBookDirNoMatch(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.True(t, res.IsError)
-	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "No book matched")
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "No book matched")
 	mockDB.AssertExpectations(t)
 }
 
@@ -765,7 +751,7 @@ func TestHandleGetTranscriptSingleTrack(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
-	text := res.Content[0].(mcp.TextContent).Text
+	text := res.Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, text, "Transcript: "+dir+"/PHM.m4b")
 	assert.Contains(t, text, "[00:00 → 00:08] line 0")
 	assert.Contains(t, text, "[00:10 → 00:18] line 1")
@@ -794,7 +780,7 @@ func TestHandleGetTranscriptMultiTrack(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
-	text := res.Content[0].(mcp.TextContent).Text
+	text := res.Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, text, "has 2 tracks")
 	assert.Contains(t, text, "trackID=j1")
 	assert.Contains(t, text, "trackID=j2")
@@ -818,7 +804,7 @@ func TestHandleGetTranscriptByTrackID(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.False(t, res.IsError)
-	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "[00:00 → 00:05] hello")
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "[00:00 → 00:05] hello")
 	mockDB.AssertExpectations(t)
 }
 
@@ -1002,6 +988,6 @@ func TestHandleGetTranscriptNotTranscribed(t *testing.T) {
 	}))
 	assert.NoError(t, err)
 	assert.True(t, res.IsError)
-	assert.Contains(t, res.Content[0].(mcp.TextContent).Text, "not transcribed yet")
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "not transcribed yet")
 	mockDB.AssertExpectations(t)
 }
