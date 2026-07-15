@@ -77,8 +77,9 @@ spec:
       parameters:
         barmanObjectName: garage-backup-store
         serverName: earmark-pg
-        retentionPolicy: {{ required "cnpg.backup.retention is required" .Values.cnpg.backup.retention | quote }}
         backupTarget: "prefer-standby"
+        # NOTE: retentionPolicy is NOT a plugin parameter — the sidecar ignores
+        # it there. It lives on the ObjectStore spec below.
 
   monitoring:
     enablePodMonitor: true
@@ -95,6 +96,11 @@ metadata:
     {{- include "earmark.labels" . | nindent 4 }}
     app.kubernetes.io/component: database
 spec:
+  # Retention MUST be set here (spec.retentionPolicy): the barman-cloud plugin
+  # sidecar enforces retention from the ObjectStore CR only — a retentionPolicy
+  # in the Cluster's plugins[].parameters is silently ignored (nothing is ever
+  # pruned).
+  retentionPolicy: {{ required "cnpg.backup.retention is required" .Values.cnpg.backup.retention | quote }}
   configuration:
     destinationPath: {{ printf "s3://%s/" (required "cnpg.backup.bucket is required" .Values.cnpg.backup.bucket) | quote }}
     endpointURL: {{ required "cnpg.backup.garageEndpoint is required" .Values.cnpg.backup.garageEndpoint | quote }}
