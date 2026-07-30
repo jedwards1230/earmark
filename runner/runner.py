@@ -279,7 +279,7 @@ CHUNK_OVERLAP_SECONDS: float = float(
 # Fine-grained segmentation geometry (CONTRACT §1.2.1).
 #
 # NeMo Parakeet-TDT returns exactly ONE segment per transcribe() call regardless
-# of clip length (verified on desktop-1: a 60 s multi-sentence clip yields
+# of clip length (verified on the GPU host: a 60 s multi-sentence clip yields
 # N_SEGMENTS=1), so hyp.timestamp['segment'] carries no usable granularity — one
 # window == one ~600 s block. We therefore ALWAYS derive segments from the
 # per-word timestamps (hyp.timestamp['word'], which are accurate to ~0.1 s) by
@@ -1391,7 +1391,7 @@ def _transcribe_file(
     transcribe_finished_at = datetime.now(timezone.utc)
 
     # NeMo transcribe() returns a list of Hypothesis objects (one per file).
-    # MUST VERIFY ON DESKTOP-1: the Hypothesis attribute names below.
+    # MUST VERIFY ON THE GPU HOST: the Hypothesis attribute names below.
     # In NeMo 2.7, Hypothesis.text is the transcript string.
     # Hypothesis.timestamp is a dict with keys 'word' and 'segment', each
     # a list of dicts.  The exact key names may vary — check nemo source:
@@ -1704,7 +1704,7 @@ def _build_segments(
     transcribe() call (one per ~600 s window), so its segment-level timestamps
     carry no usable granularity and are not used for boundaries.
 
-    Verified on desktop-1 (parakeet-tdt-1.1b, NeMo 2.7):
+    Verified on the GPU host (parakeet-tdt-1.1b, NeMo 2.7):
       - hyp.timestamp keys are ['timestep', 'char', 'word', 'segment'].
       - A 60 s multi-sentence clip yields exactly one 'segment' entry (hence the
         re-segment-from-words approach).
@@ -1738,7 +1738,7 @@ def _build_segments(
     for i, w in enumerate(word_ts):
         words_out.append(
             {
-                # MUST VERIFY ON DESKTOP-1: NeMo may use 'word' or 'char' key.
+                # MUST VERIFY ON THE GPU HOST: NeMo may use 'word' or 'char' key.
                 "word": w.get("word", ""),
                 "start": float(w.get("start", 0.0)),
                 "end": float(w.get("end", 0.0)),
@@ -1753,7 +1753,7 @@ def _build_segments(
     # ---------------------------------------------------------------------------
     # Always derive segments from the per-word timestamps. NeMo Parakeet-TDT
     # emits exactly ONE coarse "segment" per transcribe() call — one per ~600 s
-    # window (verified on desktop-1: even a 60 s clip yields a single segment) —
+    # window (verified on the GPU host: even a 60 s clip yields a single segment) —
     # so hyp.timestamp['segment'] carries no usable granularity. We re-segment
     # from words instead (CONTRACT §1.2.1). seg_ts is logged for diagnostics.
     log.debug(
@@ -1928,7 +1928,7 @@ def _assign_speakers(
 
     Returns (word_speakers list, speaker_count).
 
-    MUST VERIFY ON DESKTOP-1 — this entire function is a best-effort port of
+    MUST VERIFY ON THE GPU HOST — this entire function is a best-effort port of
     the NeMo 2.7.x Sortformer diarization API.  In particular:
       - diarize_model.diarize() may not exist; the correct entrypoint may be
         diarize_model.transcribe() with specific kwargs, or a ClusteringDiarizer
@@ -1939,7 +1939,7 @@ def _assign_speakers(
     """
     log.info("Running NeMo Sortformer diarization on %s", audio_path)
 
-    # MUST VERIFY ON DESKTOP-1: correct NeMo 2.7 Sortformer API.
+    # MUST VERIFY ON THE GPU HOST: correct NeMo 2.7 Sortformer API.
     diar_output = diarize_model.diarize([str(audio_path)])
 
     # Parse diarization output into a list of (start, end, speaker) turns.
@@ -1966,7 +1966,7 @@ def _parse_diarize_output(diar_output: Any) -> list[tuple[float, float, str]]:
     """
     Parse NeMo Sortformer diarization output into (start, end, speaker) tuples.
 
-    MUST VERIFY ON DESKTOP-1: the actual output format of
+    MUST VERIFY ON THE GPU HOST: the actual output format of
     SortformerEncLabelModel.diarize() in NeMo 2.7.x.  This function makes a
     reasonable guess based on NeMo 2.6 RTTM-style output but may need changes.
 
@@ -2360,7 +2360,7 @@ class NeMoParakeetProvider(ASRProvider):
         Parakeet-TDT 0.6B v3 is a public model — no HF token required.
         NeMo Sortformer (diarization) is also public — no token required.
 
-        MUST VERIFY ON DESKTOP-1: NeMo downloads models to ~/.cache/huggingface
+        MUST VERIFY ON THE GPU HOST: NeMo downloads models to ~/.cache/huggingface
         or a NeMo-specific cache directory on first run.  Ensure the runner user
         has write access to that directory.
         """
@@ -2385,7 +2385,7 @@ class NeMoParakeetProvider(ASRProvider):
         asr_model = asr_model.cuda()
 
         # Apply compute type.
-        # MUST VERIFY ON DESKTOP-1: bfloat16 is the recommended dtype for
+        # MUST VERIFY ON THE GPU HOST: bfloat16 is the recommended dtype for
         # Blackwell (RTX 5090 / Ampere+).  NeMo 2.7.x supports model.to(dtype)
         # but some model internals may not support bf16 — verify no warnings.
         if ASR_COMPUTE_TYPE == "bfloat16":
@@ -2399,7 +2399,7 @@ class NeMoParakeetProvider(ASRProvider):
         diarize_model: Any | None = None
         if ASR_DIARIZE:
             # NeMo Sortformer speaker diarization — public model, no token needed.
-            # MUST VERIFY ON DESKTOP-1: the exact model id and the NeMo 2.7.x
+            # MUST VERIFY ON THE GPU HOST: the exact model id and the NeMo 2.7.x
             # API for loading a SortformerEncLabelModel.  The from_pretrained call
             # and the diarize() API shape are correct per NeMo 2.7 docs but require
             # runtime confirmation (we cannot test NeMo on this Mac).

@@ -1845,8 +1845,8 @@ func isTruthy(s string) bool {
 // whole library (not just one SQL page), then paginate in Go. A library beyond
 // this bound is logged as a warning and the excess rows are NOT silently
 // dropped from correctness — they're simply not fetched in one pass; the warning
-// tells an operator the cap needs raising. 5000 books is far above any real
-// homelab library.
+// tells an operator the cap needs raising. 5000 books is far above any
+// realistic library.
 const libraryFetchCap = 5000
 
 // isHTMX guards mutating endpoints against drive-by/CSRF posts (htmx sets the

@@ -18,7 +18,7 @@ import (
 // coordinator otherwise falls back to httpArbiter unchanged (arbiter.go). This
 // keeps `earmark batch` free of a hard dependency on the gpu-arbiter binary —
 // it is a strict optimization when the binary happens to be present (e.g. on
-// the same desktop-1 host gpu-arbiter itself runs on), never a requirement.
+// the same host gpu-arbiter itself runs on), never a requirement.
 //
 // Both subcommands this type shells out to are, like the coordinator's own
 // contract (CONTRACT §1.4), strictly read-only GETs against gpu-arbiter's

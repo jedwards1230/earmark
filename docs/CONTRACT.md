@@ -656,7 +656,7 @@ One row per **book directory** (`book_dir = filepath.Dir(file_path)` of any
 track under the book). It is **additive** — nothing in §1.1–§1.5 or §3 depends
 on it, and a missing row never blocks the pipeline. Writer: **Go monitor**, at
 enqueue time via `MetadataProvider.Lookup`. Reader: the Python ASR runner reads
-`bias_terms` to drive NeMo word-boosting (PR 5 homelab-ansible runner PR).
+`bias_terms` to drive NeMo word-boosting.
 
 ```sql
 CREATE TABLE IF NOT EXISTS book_metadata (
@@ -1144,11 +1144,8 @@ spec:
 Chart lives at `deploy/helm/earmark/` in the `earmark` repo.
 Published as `oci://ghcr.io/jedwards1230/charts/earmark`.
 
-The helmfile release for homelab-k8s lives at:
-`repos/homelab-k8s/apps/earmark/helmfile.yaml`
-
-ArgoCD Application CRD lives at:
-`repos/homelab-k8s/base/core/argocd/applications/earmark/earmark-helmfile.yaml`
+The helmfile release and the ArgoCD Application CRD live in the private
+deployment repo, alongside the other cluster manifests.
 
 Sync policy: **auto-sync** (`prune: true`, `selfHeal: true`) — this is a
 non-critical new service, not in the manual-sync exceptions list.
@@ -1635,9 +1632,9 @@ Both Go pods expose a Prometheus `/metrics` endpoint (the mcp pod mounts it on
 its existing `:8081` mux; the ingest pod on its `INGEST_HTTP_ADDR` listener,
 §2.4). The surface is **gauges/counters only — NO per-job series** (high-
 cardinality per-job history belongs in Postgres/Grafana, not Prometheus). These
-metric **names are load-bearing** — the homelab-k8s companion PR (alert rules,
-dashboards, scrape config) depends on them verbatim; do not rename without
-updating that PR.
+metric **names are load-bearing** — the deployment's alert rules, dashboards,
+and scrape config depend on them verbatim; do not rename without updating
+those consumers.
 
 The current-state gauges are produced by a scrape-time collector that reads the
 DB on each scrape (always fresh, no refresh goroutine). The counters and the
@@ -1704,5 +1701,5 @@ Any change to:
 - The `AI_ENDPOINTS` / `AI_ROLES` JSON shapes or role names in section 2.14
 
 ...requires updating this file **before** writing implementation code. All
-three repos (earmark Go, homelab-ansible runner, homelab-k8s manifests)
+three components (this Go service, the ASR runner, the deployment manifests)
 must be updated atomically when a contract value changes.
