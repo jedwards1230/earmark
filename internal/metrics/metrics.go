@@ -2,9 +2,9 @@
 // §2.16). It is deliberately gauges/counters only — NO per-job series (high-
 // cardinality per-job history belongs in Postgres/Grafana, not Prometheus).
 //
-// The metric NAMES here are load-bearing: the homelab-k8s companion PR (alert
-// rules, dashboards) depends on them verbatim. Do not rename without updating
-// CONTRACT §2.16 and that PR.
+// The metric NAMES here are load-bearing: downstream deployment alert rules
+// and dashboards depend on them verbatim. Do not rename without updating
+// CONTRACT §2.16 and those consumers.
 //
 // Design:
 //   - Gauges that reflect current state (queue depth, backlog, coverage, ETA,

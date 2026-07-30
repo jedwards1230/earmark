@@ -52,7 +52,7 @@ const minTermLen = 3
 
 // DeriveBiasTerms derives a deduplicated list of proper-noun bias terms from
 // a book's metadata. The resulting terms are suitable for use as a NeMo
-// word-boosting list (see homelab-ansible runner PR).
+// word-boosting list, consumed by the external ASR runner.
 //
 // Source fields and strategy:
 //   - Author, Narrator, Series: each full field value is added as a phrase;
