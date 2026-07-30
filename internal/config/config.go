@@ -374,7 +374,9 @@ type Config struct {
 	ABSToken string
 
 	// ABS_LIBRARY_ID — UUID of the ABS books library to search.
-	// Default: "c749dc72-87a0-4889-8714-227eddb25900" (the homelab books library).
+	// No default: the value is deployment-specific, so it is supplied by the
+	// deployment (Helm `config.absLibraryID`). When unset, the ABS provider is
+	// skipped with a warning and metadata falls back to the path provider.
 	ABSLibraryID string
 
 	// ASRServers — optional JSON array describing the transcription servers
@@ -436,7 +438,7 @@ func LoadConfig() (*Config, error) {
 	cfg.MetadataProvider = getEnvOrDefault("METADATA_PROVIDER", "path")
 	cfg.ABSURL = os.Getenv("ABS_URL")
 	cfg.ABSToken = os.Getenv("ABS_TOKEN")
-	cfg.ABSLibraryID = getEnvOrDefault("ABS_LIBRARY_ID", "c749dc72-87a0-4889-8714-227eddb25900")
+	cfg.ABSLibraryID = os.Getenv("ABS_LIBRARY_ID")
 
 	var err error
 
