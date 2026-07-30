@@ -252,10 +252,10 @@ BOOKS_DB_ROOT: Path = Path(os.environ.get("BOOKS_DB_ROOT", "/books"))
 # The often-quoted "handles ~3 h single pass" does NOT hold on a 32 GB card.
 #
 # Default threshold = 900 s (15 min): single-pass below it peaks ~16 GB, which
-# leaves comfortable headroom for other GPU users on this shared box (Sunshine,
-# tv-shell). Files above it take the split-and-stitch chunked path, which
-# peaks well under 9 GB regardless of total length. Overridable via env for
-# tuning, but do not raise it past ~1080 s (18 min) without re-measuring VRAM.
+# leaves comfortable headroom for other GPU workloads sharing the host. Files
+# above it take the split-and-stitch chunked path, which peaks well under 9 GB
+# regardless of total length. Overridable via env for tuning, but do not raise
+# it past ~1080 s (18 min) without re-measuring VRAM.
 CHUNK_THRESHOLD_SECONDS: float = float(
     os.environ.get("ASR_CHUNK_THRESHOLD_SECONDS", "900")
 )
