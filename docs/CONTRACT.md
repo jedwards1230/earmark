@@ -970,7 +970,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `METADATA_PROVIDER` | no | `path` (default). Accepts `path`, `abs`, or `chain:<p1>,<p2>` (e.g. `chain:abs,path`). `path` derives title/author from the filesystem path only; `abs` queries Audiobookshelf; `chain` tries providers left-to-right and returns the first non-empty result. |
 | `ABS_URL` | no | Base URL of the Audiobookshelf server (e.g. `https://audiobooks.example.com`). Required when `METADATA_PROVIDER=abs` or `abs` appears in a chain spec; ignored otherwise. |
 | `ABS_TOKEN` | no | Audiobookshelf API token. Required when `ABS_URL` is set. |
-| `ABS_LIBRARY_ID` | no | Audiobookshelf library ID to search for book metadata. Required when `ABS_URL` is set. Defaults to the first configured library if omitted (implementation may change). |
+| `ABS_LIBRARY_ID` | no | Audiobookshelf library ID to search for book metadata. Required when `ABS_URL` is set — there is no default, since the value is deployment-specific. When unset, the ABS provider is skipped with a warning and metadata falls back to the path provider. |
 
 `LIBRARY_COLLECTIONS` is a JSON array of `{"root","layout"}` objects. `root` is a
 path prefix (absolute, or relative to `BOOKS_DIR`); `layout` is a slash-delimited
