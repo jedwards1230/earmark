@@ -655,8 +655,9 @@ Rules:
 One row per **book directory** (`book_dir = filepath.Dir(file_path)` of any
 track under the book). It is **additive** — nothing in §1.1–§1.5 or §3 depends
 on it, and a missing row never blocks the pipeline. Writer: **Go monitor**, at
-enqueue time via `MetadataProvider.Lookup`. Reader: the Python ASR runner reads
-`bias_terms` to drive NeMo word-boosting.
+enqueue time via `MetadataProvider.Lookup`. Readers: the Python ASR runner reads
+`bias_terms` to drive NeMo word-boosting; the **Go MCP read path** reads
+`chapters` and `series` (see below).
 
 ```sql
 CREATE TABLE IF NOT EXISTS book_metadata (
@@ -679,6 +680,28 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 |--------|------|-------------------|
 | **Go monitor** | at every enqueue (via `db.UpsertBookMetadata`) | `title`, `author`, `bias_terms`, `source` |
 | **Go monitor — ABS path** | when METADATA_PROVIDER includes ABS | `narrator`, `series`, `asin`, `chapters` |
+
+#### Column readers
+
+| Reader | When | Columns it reads |
+|--------|------|------------------|
+| **Python ASR runner** | before each transcription | `bias_terms` (NeMo word-boosting) |
+| **Go MCP layer** | per search-result book (`db.loadBookContext`, cached per `book_dir`) | `chapters`, `series` |
+| **Go MCP layer** | `list_books` (LEFT JOIN on `book_dir`) | `series` |
+
+`chapters` and `series` are read in a **single** `SELECT chapters, series FROM
+book_metadata WHERE book_dir = $1` per distinct book directory in a result set,
+cached for the rest of that set — never per row.
+
+**`series` format:** a comma-joined list of `Name #Sequence` entries, because a
+book can belong to several series — e.g. `"Dune #2, The Dune Sequence #13"`. The
+`#Sequence` part is optional (a membership with no declared position), and the
+sequence is **not** necessarily an integer: novellas are commonly `#1.5`, and
+non-numeric positions are legal. `metaprovider.ParseSeries` splits this into
+`[]SeriesRef{{Name, Sequence}}` with **Sequence typed as a string** so no real
+value is truncated or rejected. A series name containing a comma is
+indistinguishable from the separator — an accepted limitation, since ABS joins
+memberships with `", "`.
 
 `bias_terms` is derived by `metaprovider.DeriveBiasTerms(meta)` inside
 `db.UpsertBookMetadata` at every call — both at enqueue time (monitor) and
@@ -848,7 +871,7 @@ per chunk) that always carries its own `words[]`. The search tools +
 
 | Tool | Purpose | Key params |
 |------|---------|-----------|
-| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. Ordered **transcribed-first** (fully-done books, then partial, then fully-pending). Leads with a one-line whole-library summary (`Library: T books — P fully transcribed, Q with pending tracks.` — TRUE totals across the library, not just the page). `format=flat` (default) **omits each book's `dir:` line** to keep the payload small; `format=tree` groups rows under their authors **and** keeps the `dir:` line. | `author?` (substring filter), `format?` (`flat` default \| `tree`), `limit?` (default 50), `offset?` |
+| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. Ordered **transcribed-first** (fully-done books, then partial, then fully-pending). Leads with a one-line whole-library summary (`Library: T books — P fully transcribed, Q with pending tracks.` — TRUE totals across the library, not just the page). `format=flat` (default) **omits each book's `dir:` line** to keep the payload small; `format=tree` groups rows under their authors **and** keeps the `dir:` line; `format=series` groups rows under their **series name**, ordered by sequence within each group, with a trailing **"No series"** group so no book disappears (a book in several series is listed under each — by design). | `author?` (substring filter), `series?` (case-insensitive substring on `book_metadata.series`, §1.6 — so `Dune` matches both `Dune #2` and `The Dune Sequence #13`; books with no series row are excluded), `format?` (`flat` default \| `tree` \| `series`), `limit?` (default 50), `offset?` |
 | `semantic_search_audiobooks` | Vector-similarity (meaning) search; hits show a real cosine `similarity: NN%`. Whole library by default; `book` scopes it. `snippet?` caps each hit's quoted text (leading **preview** — no sub-chunk match position). | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `text_search_audiobooks` | Trigram literal/keyword search; hits are labelled **"ranked by trigram match"** (NOT a similarity %, which would mislead on a literal hit). Whole library by default; `book` scopes it. `snippet?` returns an excerpt **centred on the literal match**. | `query` (required), `book?`, `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. Per-word timestamps are **hidden by default**; `includeWordTimestamps=true` adds each segment's `words[]` (word/start/end, plus score/speaker when present) for "exactly when was X said" queries. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments), `includeWordTimestamps?` (false) |
@@ -871,6 +894,22 @@ it also carries `words[]` — each `{ word, start, end, score?, speaker? }`
 field is **omitted entirely** by default, so the default response is unchanged.
 Bad user input (missing/unmatched `book`, bad `chunkID`, etc.) returns a
 tool-execution error (`isError`), never a protocol error.
+
+**Series in structured output** (**additive response-shape change** — no existing
+field changed type or meaning, and nothing was removed): both the `list_books`
+`books[]` entries and the search / `get_chunk_context` `results[]` rows carry a
+new optional `series` array parsed from `book_metadata.series` (§1.6). Each entry
+is `{ name, sequence? }`; `sequence` is a **string**, not a number, because
+novellas are commonly `#1.5` and non-numeric positions exist — a numeric type
+would truncate or reject real values. A book can be in several series, so the
+array can hold more than one entry (`"Dune #2, The Dune Sequence #13"` →
+`[{"name":"Dune","sequence":"2"},{"name":"The Dune Sequence","sequence":"13"}]`).
+The field is **omitted entirely** (`omitempty`) for a book with no series
+metadata — the common case for path-sourced books — so a consumer that ignores it
+sees a byte-identical payload. `list_books format=series` regroups only the text
+rendering; the structured `books[]` stays the same flat page in all three formats.
+The whole-library summary line is scoped by `author` only, **not** by `series` —
+it answers "how big is the library", while `total` reports the filtered count.
 
 **Snippet windows** (`snippet` on both search tools): omitted → the full ~400-word
 chunk (backward-compatible). When set, the hit's quoted text is truncated to

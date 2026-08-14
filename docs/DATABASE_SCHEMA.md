@@ -216,8 +216,9 @@ INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NO
 ### 6. `book_metadata` — Per-book Enrichment (CONTRACT §1.6)
 
 One row per book directory. Written best-effort by the Go monitor at enqueue.
-Read by the Python runner to drive NeMo word-boosting (`bias_terms`). A missing
-row never blocks the pipeline.
+Read by the Python runner to drive NeMo word-boosting (`bias_terms`), and by the
+Go **MCP layer** for `chapters` + `series` (see below). A missing row never
+blocks the pipeline.
 
 ```sql
 CREATE TABLE IF NOT EXISTS book_metadata (
@@ -242,6 +243,17 @@ all tracks concatenated in play order (that is what Audiobookshelf's
 `media.chapters` reports). Mapping a `transcript_chunks` row into this list
 requires adding the chunk's track offset first; see the time-bases note under
 `transcripts` (§2).
+
+`series` is a comma-joined list of `Name #Sequence` entries — a book can belong
+to several series, e.g. `"Dune #2, The Dune Sequence #13"`. The `#Sequence` part
+is optional, and the sequence is **not** necessarily an integer (novellas are
+commonly `#1.5`; non-numeric positions are legal). The **Go MCP layer reads this
+column** — `metaprovider.ParseSeries` turns it into `[{name, sequence}]` with a
+**string**-typed sequence, surfaced on `list_books` entries and on every search /
+`get_chunk_context` result row (CONTRACT §2.2.1). It is read together with
+`chapters` in one `SELECT chapters, series FROM book_metadata WHERE book_dir = $1`
+per book directory (cached per result set), and via a `LEFT JOIN` on `book_dir`
+for the `list_books` inventory and its `series` filter.
 
 ### 7. `transcript_findings` — Read-only Eval Layer (CONTRACT §2.15)
 

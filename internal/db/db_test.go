@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -138,11 +139,17 @@ const (
 	testLibationTrk2  = testLibationDir + "/02 - Chapter 2.m4b"
 	testCustomDir     = "/books/audio-custom/Jonathan Haidt"
 	testCustomTrack   = testCustomDir + "/The Coddling of the American Mind.m4b"
-	testChaptersCols  = "chapters"
 	testTrackCheck1   = "sha256-track-1"
 	testTrackCheck2   = "sha256-track-2"
 	testCustomChecksm = "sha256-custom"
+	// testSeriesRaw is the real shape of book_metadata.series: a comma-joined
+	// list of "Name #Sequence" (a book can be in several series).
+	testSeriesRaw = "Dune #2, The Dune Sequence #13"
 )
+
+// testBookMetaCols are the columns the per-book enrichment read SELECTs from
+// book_metadata, in scan order.
+var testBookMetaCols = []string{"chapters", "series"}
 
 // testBookChapters is a BOOK-ABSOLUTE chapter timeline (the shape a provider
 // like Audiobookshelf returns): times run across all tracks concatenated. Track
@@ -164,13 +171,19 @@ func chaptersJSONFixture(t *testing.T, chapters []metaprovider.Chapter) []byte {
 }
 
 // expectBookContext queues the two per-book_dir reads scanResults issues:
-// book_metadata.chapters, then the book's transcripts rows (path, duration,
-// checksum) in play order. Pass a nil chaptersJSON for a book with no metadata
-// row content.
+// book_metadata (chapters + series) in ONE row, then the book's transcripts rows
+// (path, duration, checksum) in play order. Pass a nil chaptersJSON for a book
+// with no chapter data; series is NULL (no series metadata).
 func expectBookContext(mock pgxmock.PgxPoolIface, bookDir string, chaptersJSON []byte, tracks [][]any) {
-	mock.ExpectQuery("SELECT chapters FROM book_metadata").
+	expectBookContextSeries(mock, bookDir, chaptersJSON, nil, tracks)
+}
+
+// expectBookContextSeries is expectBookContext with an explicit series column
+// value (nil = SQL NULL), for the tests that assert series enrichment.
+func expectBookContextSeries(mock pgxmock.PgxPoolIface, bookDir string, chaptersJSON []byte, series *string, tracks [][]any) {
+	mock.ExpectQuery("SELECT chapters, series FROM book_metadata").
 		WithArgs(bookDir).
-		WillReturnRows(pgxmock.NewRows([]string{testChaptersCols}).AddRow(chaptersJSON))
+		WillReturnRows(pgxmock.NewRows(testBookMetaCols).AddRow(chaptersJSON, series))
 
 	trackRows := pgxmock.NewRows([]string{"file_path", "duration_seconds", "checksum"})
 	for _, tr := range tracks {
@@ -247,8 +260,9 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 			7,
 		)
 
+	seriesRaw := testSeriesRaw
 	mock.ExpectQuery("SELECT").WithArgs("elephant", 10).WillReturnRows(rows)
-	expectBookContext(mock, testLibationDir, chaptersJSONFixture(t, testBookChapters), [][]any{
+	expectBookContextSeries(mock, testLibationDir, chaptersJSONFixture(t, testBookChapters), &seriesRaw, [][]any{
 		{testLibationTrk1, fp(1000), testTrackCheck1},
 		{testLibationTrk2, fp(1000), testTrackCheck2},
 	})
@@ -311,7 +325,15 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 	if r.Chapter != "01 - Chapter 1.m4b" {
 		t.Errorf("Chapter = %q, want 01 - Chapter 1.m4b", r.Chapter)
 	}
-	// Per-book enrichment: chapter list size, track checksum, chunk word count.
+	// Per-book enrichment: series (parsed from the multi-series raw column),
+	// chapter list size, track checksum, chunk word count.
+	wantSeries := []metaprovider.SeriesRef{
+		{Name: "Dune", Sequence: "2"},
+		{Name: "The Dune Sequence", Sequence: "13"},
+	}
+	if !reflect.DeepEqual(r.Series, wantSeries) {
+		t.Errorf("Series = %+v, want %+v", r.Series, wantSeries)
+	}
 	if r.TotalChapters != len(testBookChapters) {
 		t.Errorf("TotalChapters = %d, want %d", r.TotalChapters, len(testBookChapters))
 	}
@@ -363,6 +385,10 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 	if r3.TotalChapters != 0 || r3.ChapterTitle != "" || r3.ChapterIndex != 0 {
 		t.Errorf("row3 chapter fields = (%d, %d, %q), want all zero",
 			r3.TotalChapters, r3.ChapterIndex, r3.ChapterTitle)
+	}
+	// A NULL series column leaves the parsed slice nil (omitted from JSON).
+	if r3.Series != nil {
+		t.Errorf("row3 Series = %+v, want nil (NULL series column)", r3.Series)
 	}
 	if r3.FileChecksum != testCustomChecksm {
 		t.Errorf("row3 FileChecksum = %q, want %q", r3.FileChecksum, testCustomChecksm)
@@ -482,7 +508,7 @@ func TestScanResultsBookContextFailureIsNonFatal(t *testing.T) {
 		AddRow("chunk-1", "the elephant and the rider", testLibationTrk1, 3, 12.5, 18.0, nil, 0.9, 42)
 
 	mock.ExpectQuery("SELECT").WithArgs("elephant", 10).WillReturnRows(rows)
-	mock.ExpectQuery("SELECT chapters FROM book_metadata").
+	mock.ExpectQuery("SELECT chapters, series FROM book_metadata").
 		WithArgs(testLibationDir).
 		WillReturnError(errBookContextTest)
 	mock.ExpectQuery("duration_seconds, checksum").
@@ -867,11 +893,11 @@ func TestGetFindingsCountByBook(t *testing.T) {
 	}
 }
 
-// bookSummaryColumns are the 12 columns SELECTed by GetBookSummaries, in scan
+// bookSummaryColumns are the 13 columns SELECTed by GetBookSummaries, in scan
 // order. The dynamic HAVING clause doesn't change the SELECT list.
 var bookSummaryColumns = []string{
 	"book_dir", "sample_path", "total", "pending", "claimed", "done", "failed",
-	"last_updated", "duration_seconds", "word_count", "embed_chunk_count", "total_books",
+	"last_updated", "duration_seconds", "word_count", "embed_chunk_count", "series", "total_books",
 }
 
 // TestGetBookSummariesAggregates drives getBookSummaries at execution level with
@@ -891,17 +917,18 @@ func TestGetBookSummariesAggregates(t *testing.T) {
 	dur := 58320.0
 	words := 124800
 	chunks := 412
+	seriesRaw := testSeriesRaw
 
 	rows := pgxmock.NewRows(bookSummaryColumns).
 		// Book with done tracks → aggregates populated.
 		AddRow("/books/audio-libation/Andy Weir/PHM", "/books/audio-libation/Andy Weir/PHM/01.m4b",
-			1, 0, 0, 1, 0, now, &dur, &words, &chunks, 2).
+			1, 0, 0, 1, 0, now, &dur, &words, &chunks, &seriesRaw, 2).
 		// Pending-only book → no done track → aggregates NULL.
 		AddRow("/books/audio-libro/X", "/books/audio-libro/X/01.mp3",
-			3, 3, 0, 0, 0, now, nil, nil, nil, 2)
+			3, 3, 0, 0, 0, now, nil, nil, nil, nil, 2)
 
 	// Default 20-page limit, offset 0, empty query.
-	mock.ExpectQuery("WITH books AS").WithArgs("", 20, 0).WillReturnRows(rows)
+	mock.ExpectQuery("WITH books AS").WithArgs("", 20, 0, "").WillReturnRows(rows)
 
 	got, total, err := db.getBookSummaries(context.Background(), mock, BookFilter{})
 	if err != nil {
@@ -928,10 +955,43 @@ func TestGetBookSummariesAggregates(t *testing.T) {
 		t.Errorf("EmbedChunkCount = %v, want %d", b.EmbedChunkCount, chunks)
 	}
 
+	// The raw series column is carried through unparsed (the MCP layer parses it).
+	if b.Series == nil || *b.Series != testSeriesRaw {
+		t.Errorf("Series = %v, want %q", b.Series, testSeriesRaw)
+	}
+
 	b2 := got[1]
 	if b2.DurationSeconds != nil || b2.WordCount != nil || b2.EmbedChunkCount != nil {
 		t.Errorf("row2 aggregates = (%v,%v,%v), want all nil",
 			b2.DurationSeconds, b2.WordCount, b2.EmbedChunkCount)
+	}
+	if b2.Series != nil {
+		t.Errorf("row2 Series = %v, want nil (no book_metadata row)", b2.Series)
+	}
+}
+
+// TestGetBookSummariesSeriesFilter asserts the series filter reaches the SQL as
+// a bound $4 parameter matched case-insensitively against book_metadata.series
+// via the LEFT JOIN outside the CTE (so both the filter and the selected column
+// resolve against the already-grouped book_dir).
+func TestGetBookSummariesSeriesFilter(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(bookSummaryColumns)
+	mock.ExpectQuery(`LEFT JOIN book_metadata bm ON bm\.book_dir = b\.book_dir`).
+		WithArgs("", 20, 0, "Dune").WillReturnRows(rows)
+
+	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Series: "Dune"}); err != nil {
+		t.Fatalf("getBookSummaries(series): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
@@ -949,7 +1009,7 @@ func TestGetBookSummariesStatusFilter(t *testing.T) {
 	rows := pgxmock.NewRows(bookSummaryColumns)
 	// The HAVING clause for status=done must reference j.status.
 	mock.ExpectQuery(`HAVING COUNT\(\*\) FILTER \(WHERE j\.status = 'done'\)`).
-		WithArgs("", 20, 0).WillReturnRows(rows)
+		WithArgs("", 20, 0, "").WillReturnRows(rows)
 
 	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Status: "done"}); err != nil {
 		t.Fatalf("getBookSummaries(done): %v", err)
@@ -978,8 +1038,8 @@ func TestGetBookSummariesSortFilter(t *testing.T) {
 
 	rows := pgxmock.NewRows(bookSummaryColumns)
 	// Sort=activity must order by last_updated DESC (the activity feed order).
-	mock.ExpectQuery(`ORDER BY last_updated DESC, book_dir`).
-		WithArgs("", 20, 0).WillReturnRows(rows)
+	mock.ExpectQuery(`ORDER BY last_updated DESC, b\.book_dir`).
+		WithArgs("", 20, 0, "").WillReturnRows(rows)
 
 	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Sort: "activity"}); err != nil {
 		t.Fatalf("getBookSummaries(activity): %v", err)
@@ -1009,7 +1069,7 @@ func TestGetBookSummariesQueuedStatus(t *testing.T) {
 	rows := pgxmock.NewRows(bookSummaryColumns)
 	// The HAVING clause for status=queued must include both pending and claimed.
 	mock.ExpectQuery(`HAVING COUNT\(\*\) FILTER \(WHERE j\.status IN \('pending','claimed'\)\) > 0`).
-		WithArgs("", 20, 0).WillReturnRows(rows)
+		WithArgs("", 20, 0, "").WillReturnRows(rows)
 
 	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Status: "queued"}); err != nil {
 		t.Fatalf("getBookSummaries(queued): %v", err)
@@ -1033,8 +1093,8 @@ func TestGetBookSummariesQueueSort(t *testing.T) {
 
 	rows := pgxmock.NewRows(bookSummaryColumns)
 	// Sort=queue must order by active-first: claimed>0 books lead.
-	mock.ExpectQuery(`ORDER BY \(claimed > 0\) DESC, claimed DESC, pending DESC, last_updated ASC, book_dir`).
-		WithArgs("", 20, 0).WillReturnRows(rows)
+	mock.ExpectQuery(`ORDER BY \(claimed > 0\) DESC, claimed DESC, pending DESC, last_updated ASC, b\.book_dir`).
+		WithArgs("", 20, 0, "").WillReturnRows(rows)
 
 	if _, _, err := db.getBookSummaries(context.Background(), mock, BookFilter{Sort: "queue"}); err != nil {
 		t.Fatalf("getBookSummaries(queue): %v", err)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -131,12 +133,14 @@ func formatBookList(ctx context.Context, books []db.BookSummary, total, offset i
 }
 
 // bookEntry builds the structured BookEntry for one book row, using the
-// provider-resolved author/title (already defaulted by the caller).
+// provider-resolved author/title (already defaulted by the caller) and the
+// parsed form of the raw book_metadata.series column.
 func bookEntry(bk db.BookSummary, author, title string) BookEntry {
 	return BookEntry{
 		Dir:             bk.Dir,
 		Author:          author,
 		Title:           title,
+		Series:          bookSeries(bk),
 		Total:           bk.Total,
 		Pending:         bk.Pending,
 		Claimed:         bk.Claimed,
@@ -475,6 +479,16 @@ func makeSnippet(content, query string, max int, kind searchKind) (string, bool)
 	return prefix + excerpt + suffix, true
 }
 
+// bookSeries parses a book summary's raw book_metadata.series column into its
+// structured memberships. A nil column (no metadata row, or an ABS record with
+// no series) yields nil, so the `series` key is omitted from the JSON entirely.
+func bookSeries(bk db.BookSummary) []metaprovider.SeriesRef {
+	if bk.Series == nil {
+		return nil
+	}
+	return metaprovider.ParseSeries(*bk.Series)
+}
+
 // authorGroup is one author and their books, used to render the list_books tree.
 type authorGroup struct {
 	author string
@@ -563,4 +577,163 @@ func formatBookTree(ctx context.Context, books []db.BookSummary, total, offset i
 		ListBooksOutput{Format: "tree", Books: entries, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset, NextOffset: nextOffset},
 		strings.TrimRight(b.String(), "\n"),
 	)
+}
+
+// noSeriesGroup labels the trailing bucket in the series view. Books with no
+// book_metadata.series (every path-sourced book, and any ABS book that isn't
+// part of a series) land here rather than being dropped from the listing.
+const noSeriesGroup = "No series"
+
+// seriesMember is one book inside a series group, carrying the sequence it holds
+// in THAT series (a book in several series has a different one in each).
+type seriesMember struct {
+	book     db.BookSummary
+	title    string
+	sequence string
+}
+
+// seriesGroup is one series name and its books, used to render list_books
+// format=series.
+type seriesGroup struct {
+	name    string
+	members []seriesMember
+}
+
+// formatBookSeries renders the same inventory as formatBookList but grouped by
+// SERIES name (list_books format=series). Like format=tree it only regroups the
+// rows list_books already produced — no new queries.
+//
+// Groups appear in first-seen order, with the "No series" bucket appended last
+// so no book silently disappears from the listing. Within a group, books are
+// ordered by their sequence in that series (see compareSequence). A book that
+// belongs to several series appears under EACH of them — that is correct, not a
+// duplication bug, and the rendered header says so.
+//
+// The structured payload is the same flat book list as the other formats (each
+// entry carrying its full `series` array); only the text rendering regroups.
+func formatBookSeries(ctx context.Context, books []db.BookSummary, total, offset int, totals db.LibraryTotals, meta metaprovider.MetadataProvider) *mcp.CallToolResult {
+	if len(books) == 0 {
+		return structuredResult(
+			ListBooksOutput{Format: "series", Books: []BookEntry{}, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset},
+			"No books found.",
+		)
+	}
+
+	entries := make([]BookEntry, 0, len(books))
+
+	var (
+		groups   []seriesGroup
+		index    = map[string]int{}
+		unsorted []seriesMember // the "No series" bucket, kept for the tail
+	)
+	addMember := func(name string, m seriesMember) {
+		if i, ok := index[name]; ok {
+			groups[i].members = append(groups[i].members, m)
+			return
+		}
+		index[name] = len(groups)
+		groups = append(groups, seriesGroup{name: name, members: []seriesMember{m}})
+	}
+
+	for _, bk := range books {
+		bookMeta, _ := meta.Lookup(ctx, bk.SamplePath, bk.SamplePath)
+		author := bookMeta.Author
+		if author == "" {
+			author = "Unknown"
+		}
+		title := bookMeta.Title
+		if title == "" {
+			title = filepath.Base(bk.Dir)
+		}
+		entry := bookEntry(bk, author, title)
+		entries = append(entries, entry)
+
+		if len(entry.Series) == 0 {
+			unsorted = append(unsorted, seriesMember{book: bk, title: title})
+			continue
+		}
+		for _, ref := range entry.Series {
+			addMember(ref.Name, seriesMember{book: bk, title: title, sequence: ref.Sequence})
+		}
+	}
+	for i := range groups {
+		members := groups[i].members
+		sort.SliceStable(members, func(a, b int) bool {
+			return compareSequence(members[a].sequence, members[b].sequence)
+		})
+	}
+	if len(unsorted) > 0 {
+		groups = append(groups, seriesGroup{name: noSeriesGroup, members: unsorted})
+	}
+
+	var b strings.Builder
+	if summary := librarySummaryLine(totals); summary != "" {
+		b.WriteString(summary)
+		b.WriteString("\n\n")
+	}
+	fmt.Fprintf(&b, "Library: %d book(s) across %d series group(s)", total, len(groups))
+	if offset > 0 || len(books) < total {
+		fmt.Fprintf(&b, " (showing %d–%d)", offset+1, offset+len(books))
+	}
+	b.WriteString("\n(a book in several series is listed under each of them)\n\n")
+
+	for _, g := range groups {
+		fmt.Fprintf(&b, "%s\n", g.name)
+		for _, m := range g.members {
+			label := m.title
+			if m.sequence != "" {
+				label = "#" + m.sequence + " " + m.title
+			}
+			fmt.Fprintf(&b, "  • %s — tracks: %d/%d done", label, m.book.Done, m.book.Total)
+			if m.book.Pending > 0 {
+				fmt.Fprintf(&b, ", %d pending", m.book.Pending)
+			}
+			if m.book.Failed > 0 {
+				fmt.Fprintf(&b, ", %d failed", m.book.Failed)
+			}
+			fmt.Fprintf(&b, " | duration: %s | words: %s | chunks: %s\n",
+				fmtHMS(m.book.DurationSeconds), intOrDash(m.book.WordCount), intOrDash(m.book.EmbedChunkCount))
+			fmt.Fprintf(&b, "    dir: %s\n", m.book.Dir)
+		}
+		b.WriteString("\n")
+	}
+
+	var nextOffset *int
+	if offset+len(books) < total {
+		n := offset + len(books)
+		nextOffset = &n
+		fmt.Fprintf(&b, "Showing %d of %d books. Next page: offset=%d.\n", offset+len(books), total, n)
+	}
+
+	return structuredResult(
+		ListBooksOutput{Format: "series", Books: entries, Totals: libraryTotalsOutput(totals), Total: total, Offset: offset, NextOffset: nextOffset},
+		strings.TrimRight(b.String(), "\n"),
+	)
+}
+
+// compareSequence reports whether series sequence a sorts before b.
+//
+// Sequences are strings on purpose (metaprovider.SeriesRef) because real values
+// include novella decimals like "1.5" and non-numeric forms like "1-3". So:
+// when BOTH parse as floats we compare numerically (2 before 10, 1 before 1.5);
+// otherwise we fall back to a plain string comparison, which is stable and
+// never panics on an exotic value. An empty sequence (a series membership with
+// no declared position) sorts LAST within its group — it can't be placed among
+// numbered entries honestly.
+func compareSequence(a, b string) bool {
+	if a == b {
+		return false
+	}
+	if a == "" {
+		return false
+	}
+	if b == "" {
+		return true
+	}
+	af, aerr := strconv.ParseFloat(a, 64)
+	bf, berr := strconv.ParseFloat(b, 64)
+	if aerr == nil && berr == nil {
+		return af < bf
+	}
+	return a < b
 }

@@ -141,6 +141,10 @@ type HierarchicalEntry struct {
 // while ChapterIndex/ChapterTitle come from the book-absolute provider chapter
 // list — scanResults bridges the two time bases via
 // metaprovider.ChapterForTrackSec (CONTRACT §2.2.1).
+//
+// Series is the parsed book_metadata.series value (a book can be in several
+// series). It is omitted from JSON entirely for books with no series row — the
+// majority of path-sourced books.
 type SearchResultWithMetadata struct {
 	ID         string  `json:"id"`
 	Content    string  `json:"content"`
@@ -163,6 +167,9 @@ type SearchResultWithMetadata struct {
 	FileChecksum  string `json:"fileChecksum"`
 	ISBN          string `json:"isbn,omitempty"`
 	ASIN          string `json:"asin,omitempty"`
+
+	// Series memberships parsed from book_metadata.series (CONTRACT §1.6).
+	Series []metaprovider.SeriesRef `json:"series,omitempty"`
 }
 
 // ─── DB ──────────────────────────────────────────────────────────────────────
@@ -1487,8 +1494,8 @@ func likePrefix(s string) string {
 
 // scanResults scans a result set from findSimilar, TextSearch, or
 // GetChunkContext, populating Author/Title from the MetadataProvider plus the
-// per-book fields (ChapterIndex/ChapterTitle, TotalChapters, FileChecksum) and
-// the per-chunk WordCount.
+// per-book fields (ChapterIndex/ChapterTitle, TotalChapters, Series,
+// FileChecksum) and the per-chunk WordCount.
 //
 // Chapter mapping: chunk start_sec is TRACK-relative (one ASR transcript per
 // audio file) while book_metadata.chapters is BOOK-absolute across the
@@ -1547,6 +1554,7 @@ func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]S
 			bookCache[bookDir] = bc // cache even on (partial) error
 		}
 		r.TotalChapters = len(bc.chapters)
+		r.Series = bc.series
 
 		// Chapter mapping: translate the track-relative start_sec into
 		// book-absolute time using the chunk's track offset within the book.
@@ -1566,25 +1574,40 @@ func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]S
 	return results, nil
 }
 
-// getBookChaptersQ reads the chapters JSONB column from book_metadata using the
-// supplied rowScanner — this lets scanResults be exercised against a mock pool
-// in tests without hitting db.pool (which may be nil in test doubles).
-func (db *DB) getBookChaptersQ(ctx context.Context, q rowScanner, bookDir string) ([]metaprovider.Chapter, error) {
-	var chaptersJSON []byte
+// getBookMetaQ reads the per-book enrichment columns search results need —
+// `chapters` (JSONB) and `series` (TEXT) — from book_metadata in ONE round trip,
+// using the supplied rowScanner so scanResults can be exercised against a mock
+// pool in tests without hitting db.pool (which may be nil in test doubles).
+//
+// Both columns are nullable and a missing row is not an error: a book with no
+// book_metadata row simply carries no chapter label and no series.
+func (db *DB) getBookMetaQ(ctx context.Context, q rowScanner, bookDir string) ([]metaprovider.Chapter, []metaprovider.SeriesRef, error) {
+	var (
+		chaptersJSON []byte
+		series       *string
+	)
 	err := q.QueryRow(ctx, `
-		SELECT chapters FROM book_metadata WHERE book_dir = $1
-	`, bookDir).Scan(&chaptersJSON)
-	if errors.Is(err, pgx.ErrNoRows) || chaptersJSON == nil {
-		return nil, nil
+		SELECT chapters, series FROM book_metadata WHERE book_dir = $1
+	`, bookDir).Scan(&chaptersJSON, &series)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get book chapters: %w", err)
+		return nil, nil, fmt.Errorf("get book metadata: %w", err)
+	}
+
+	var refs []metaprovider.SeriesRef
+	if series != nil {
+		refs = metaprovider.ParseSeries(*series)
+	}
+	if chaptersJSON == nil {
+		return nil, refs, nil
 	}
 	var chapters []metaprovider.Chapter
 	if err := json.Unmarshal(chaptersJSON, &chapters); err != nil {
-		return nil, fmt.Errorf("unmarshal chapters: %w", err)
+		return nil, refs, fmt.Errorf("unmarshal chapters: %w", err)
 	}
-	return chapters, nil
+	return chapters, refs, nil
 }
 
 // ─── Per-book context for search results ─────────────────────────────────────
@@ -1599,10 +1622,12 @@ type bookTrack struct {
 }
 
 // bookContext is everything scanResults needs about one book_dir: the provider
-// chapter list (book-absolute times) plus the book's tracks in play order.
-// durations mirrors tracks so the offset math needs no per-row allocation.
+// chapter list (book-absolute times), the book's parsed series memberships, plus
+// the book's tracks in play order. durations mirrors tracks so the offset math
+// needs no per-row allocation.
 type bookContext struct {
 	chapters  []metaprovider.Chapter
+	series    []metaprovider.SeriesRef
 	tracks    []bookTrack
 	durations []float64
 }
@@ -1630,22 +1655,24 @@ var bookTracksDurationSQL = `
 		ORDER BY file_path
 	`
 
-// loadBookContext reads the chapter list and the track list for one book_dir
-// through the supplied rowScanner (so scanResults stays testable against a mock
-// pool). Both reads are best-effort and independent: a failure of one still
-// returns whatever the other produced, with the errors joined so the caller can
-// log them and continue with partial enrichment.
+// loadBookContext reads the book_metadata enrichment (chapters + series) and the
+// track list for one book_dir through the supplied rowScanner (so scanResults
+// stays testable against a mock pool). Both reads are best-effort and
+// independent: a failure of one still returns whatever the other produced, with
+// the errors joined so the caller can log them and continue with partial
+// enrichment. Exactly two reads per book_dir, cached by the caller.
 func (db *DB) loadBookContext(ctx context.Context, q rowScanner, bookDir string) (bookContext, error) {
 	var (
 		bc   bookContext
 		errs []error
 	)
 
-	chapters, err := db.getBookChaptersQ(ctx, q, bookDir)
+	chapters, series, err := db.getBookMetaQ(ctx, q, bookDir)
 	if err != nil {
 		errs = append(errs, err)
 	}
 	bc.chapters = chapters
+	bc.series = series
 
 	tracks, err := db.getBookTrackRows(ctx, q, bookDir)
 	if err != nil {
@@ -2650,6 +2677,12 @@ type BookSummary struct {
 	Failed      int
 	LastUpdated time.Time
 
+	// Series is the RAW book_metadata.series column (LEFT JOINed on book_dir),
+	// nil for a book with no metadata row or no series. It is deliberately left
+	// unparsed here — this layer mirrors the column, and the MCP layer parses it
+	// with metaprovider.ParseSeries when building its own DTO.
+	Series *string
+
 	// Per-book aggregates over the book's done tracks (transcripts + run_metrics
 	// LEFT JOINs). All nullable — a book with no transcribed track, or whose
 	// transcripts predate run_metrics, sums to NULL → nil here (rendered as an em
@@ -2667,8 +2700,13 @@ type BookFilter struct {
 	// "queued" matches books with at least one pending OR claimed track (remaining work).
 	Status string
 	Query  string // case-insensitive substring match on file_path (author/title/track)
-	Limit  int    // page size (defaulted if ≤ 0)
-	Offset int    // page offset
+	// Series is a case-insensitive substring match on book_metadata.series, so
+	// "Dune" matches both "Dune #2" and "The Dune Sequence #13" — the useful
+	// behaviour for a conversational caller. Empty = no series filter (books
+	// without a metadata row are then included).
+	Series string
+	Limit  int // page size (defaulted if ≤ 0)
+	Offset int // page offset
 	// Sort controls the ORDER BY: "" or "default" uses the standard transcribed-first
 	// order (done-ratio desc, done count desc, last_updated desc, book_dir).
 	// "activity" orders by most-recently-updated first (last_updated DESC, book_dir)
@@ -2709,7 +2747,8 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 	}
 
 	// COUNT(*) OVER() yields the total matching-book count alongside the page so
-	// pagination needs only one round-trip. $1=query, $2=limit, $3=offset.
+	// pagination needs only one round-trip. $1=query, $2=limit, $3=offset,
+	// $4=series.
 	// The per-book LEFT JOINs to transcripts/run_metrics let us SUM the stored
 	// duration / word / embed-chunk totals across each book's tracks. A track with
 	// no transcript (pending) or no run_metrics row contributes NULL to its SUM;
@@ -2724,23 +2763,32 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 	// most-recently-updated first (the pipeline activity feed); the default
 	// keeps the library's transcribed-first order. An unknown value fails loudly
 	// rather than silently defaulting.
+	//
+	// book_dir is qualified as b.book_dir throughout the outer query: the
+	// book_metadata LEFT JOIN brings its own book_dir column into scope, so an
+	// unqualified reference would be ambiguous.
 	var orderBy string
 	switch f.Sort {
 	case "", "default":
 		orderBy = `ORDER BY (done::float8 / NULLIF(total, 0)) DESC NULLS LAST,
 		         done DESC,
 		         last_updated DESC,
-		         book_dir`
+		         b.book_dir`
 	case "activity":
-		orderBy = `ORDER BY last_updated DESC, book_dir`
+		orderBy = `ORDER BY last_updated DESC, b.book_dir`
 	case "queue":
 		// Active books (claimed > 0) first, then most-claimed, then most-pending,
 		// then longest-waiting (oldest last_updated first), then stable book_dir.
 		// This puts actively-transcribing books at the top of the queue view.
-		orderBy = `ORDER BY (claimed > 0) DESC, claimed DESC, pending DESC, last_updated ASC, book_dir`
+		orderBy = `ORDER BY (claimed > 0) DESC, claimed DESC, pending DESC, last_updated ASC, b.book_dir`
 	default:
 		return nil, 0, fmt.Errorf("invalid sort filter: %q", f.Sort)
 	}
+	// The book_metadata LEFT JOIN sits OUTSIDE the CTE — the CTE groups jobs, and
+	// joining per-book enrichment there would multiply the grouped rows. Outside
+	// it, the join is 1:1 on the already-grouped book_dir, so both the selected
+	// `series` column and the $4 series filter are exact. COUNT(*) OVER() is
+	// evaluated after the WHERE, so the reported total is the FILTERED book count.
 	query := fmt.Sprintf(`
 		WITH books AS (
 			SELECT
@@ -2762,15 +2810,18 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 			GROUP BY book_dir
 			%s
 		)
-		SELECT book_dir, sample_path, total, pending, claimed, done, failed, last_updated,
-		       duration_seconds, word_count, embed_chunk_count,
+		SELECT b.book_dir, b.sample_path, b.total, b.pending, b.claimed, b.done, b.failed,
+		       b.last_updated, b.duration_seconds, b.word_count, b.embed_chunk_count,
+		       bm.series,
 		       COUNT(*) OVER() AS total_books
-		FROM books
+		FROM books b
+		LEFT JOIN book_metadata bm ON bm.book_dir = b.book_dir
+		WHERE ($4 = '' OR bm.series ILIKE '%%' || $4 || '%%')
 		%s
 		LIMIT $2 OFFSET $3
 	`, statusHaving, orderBy)
 
-	rows, err := qr.Query(ctx, query, f.Query, f.Limit, f.Offset)
+	rows, err := qr.Query(ctx, query, f.Query, f.Limit, f.Offset, f.Series)
 	if err != nil {
 		return nil, 0, fmt.Errorf("book summaries query: %w", err)
 	}
@@ -2784,7 +2835,7 @@ func (db *DB) getBookSummaries(ctx context.Context, qr rowQuerier, f BookFilter)
 		var b BookSummary
 		if err := rows.Scan(&b.Dir, &b.SamplePath, &b.Total, &b.Pending, &b.Claimed, &b.Done,
 			&b.Failed, &b.LastUpdated, &b.DurationSeconds, &b.WordCount, &b.EmbedChunkCount,
-			&total); err != nil {
+			&b.Series, &total); err != nil {
 			return nil, 0, fmt.Errorf("scan book summary: %w", err)
 		}
 		out = append(out, b)

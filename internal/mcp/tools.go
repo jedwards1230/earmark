@@ -395,7 +395,9 @@ func (h *ToolHandlers) resolveBookDir(ctx context.Context, book string) (string,
 }
 
 // handleListBooks returns the library inventory: each book with author, title,
-// track progress, duration, word count, and chunk count.
+// series memberships, track progress, duration, word count, and chunk count.
+// `author` and `series` narrow the rows; `format` (flat|tree|series) only
+// changes how the same rows are grouped in the text rendering.
 func (h *ToolHandlers) handleListBooks(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args, err := parseArgs(req)
 	if err != nil {
@@ -405,33 +407,44 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, req *mcp.CallToolReq
 	limit := clampLimit(args.getInt("limit", 50), 50)
 	offset := clampOffset(args.getInt("offset", 0))
 	author := strings.TrimSpace(args.getString("author", ""))
-	// format: "flat" (default, one entry per book) or "tree" (group books by
-	// author). Both query the same rows; tree only regroups them in the formatter.
+	// series: case-insensitive substring match on book_metadata.series, so
+	// "Dune" matches both "Dune #2" and "The Dune Sequence #13".
+	series := strings.TrimSpace(args.getString("series", ""))
+	// format: "flat" (default, one entry per book), "tree" (group books by
+	// author), or "series" (group books by series name). All three query the same
+	// rows; tree/series only regroup them in the formatter.
 	format := strings.ToLower(strings.TrimSpace(args.getString("format", "flat")))
 
-	h.logger.Info("Listing books", "limit", limit, "offset", offset, "author", author, "format", format)
+	h.logger.Info("Listing books",
+		"limit", limit, "offset", offset, "author", author, "series", series, "format", format)
 
 	summaries, total, err := h.db.GetBookSummaries(ctx, db.BookFilter{
-		Query: author, Limit: limit, Offset: offset,
+		Query: author, Series: series, Limit: limit, Offset: offset,
 	})
 	if err != nil {
 		h.logger.Error("list books failed", "error", err)
 		return errorResult(fmt.Sprintf("Failed to list books: %v", err)), nil
 	}
 
-	// Whole-library (filter-scoped) counts for the one-line summary header. This is
-	// a TRUE total across the library, not just the current page. A failure here is
-	// non-fatal — the inventory still renders, just without the summary line.
+	// Whole-library (author-filter-scoped) counts for the one-line summary header.
+	// This is a TRUE total across the library, not just the current page; it is
+	// deliberately NOT narrowed by `series` — the header answers "how big is the
+	// library" while `total` above reports the filtered match count. A failure here
+	// is non-fatal — the inventory still renders, just without the summary line.
 	totals, err := h.db.GetLibraryTotals(ctx, author)
 	if err != nil {
 		h.logger.Warn("library totals failed; omitting summary line", "error", err)
 		totals = db.LibraryTotals{}
 	}
 
-	if format == "tree" {
+	switch format {
+	case "tree":
 		return formatBookTree(ctx, summaries, total, offset, totals, h.meta), nil
+	case "series":
+		return formatBookSeries(ctx, summaries, total, offset, totals, h.meta), nil
+	default:
+		return formatBookList(ctx, summaries, total, offset, totals, h.meta), nil
 	}
-	return formatBookList(ctx, summaries, total, offset, totals, h.meta), nil
 }
 
 // handleGetTranscript returns a page of a track's transcript so the model can

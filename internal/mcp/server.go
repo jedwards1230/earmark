@@ -152,6 +152,8 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"Searches the WHOLE library by default; pass `book` to scope the search to a single title. " +
 			"Each hit is a chunk (the embedding/search unit — a chunk is tens of consecutive ASR " +
 			"segments grouped together, so one book has far fewer chunks than segments). " +
+			"Each structured hit carries the book's series[] as {name, sequence} entries (omitted when the " +
+			"book has no series metadata). " +
 			"Use this to find passages about a concept; use list_books to discover titles, " +
 			"get_chunk_context to expand around a hit, and get_transcript to read full text.",
 		Annotations:  annotations,
@@ -167,6 +169,8 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 			"Each hit is a chunk (the search unit — a chunk is tens of consecutive ASR segments grouped " +
 			"together). Ranked by trigram match, not vector distance — results carry a \"trigram match\" " +
 			"label, NOT a semantic-similarity score. " +
+			"Each structured hit carries the book's series[] as {name, sequence} entries (omitted when the " +
+			"book has no series metadata). " +
 			"Use this for exact phrases or names; use semantic_search_audiobooks for conceptual queries.",
 		Annotations:  annotations,
 		InputSchema:  textSearchSchema(),
@@ -176,11 +180,14 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// Add list_books tool — the library inventory.
 	mcpServer.AddTool(&mcp.Tool{
 		Name: "list_books",
-		Description: "List the audiobook library inventory: each book with author, title, " +
-			"track progress (done/total), total duration, word count, and embedded-chunk count. " +
+		Description: "List the audiobook library inventory: each book with author, title, series " +
+			"membership, track progress (done/total), total duration, word count, and embedded-chunk count. " +
 			"This is the inventory tool — use it to discover which titles exist before scoping a " +
 			"search or fetching a transcript. Pass format=tree to group the same books under their " +
-			"authors instead of a flat list.",
+			"authors, or format=series to group them by series (ordered by sequence within each series). " +
+			"Pass series=\"Dune\" to filter to one series (case-insensitive substring). Each structured book " +
+			"carries series[] as {name, sequence} entries — sequence is a STRING because novellas use " +
+			"positions like \"1.5\" — and is omitted for books with no series metadata.",
 		Annotations:  annotations,
 		InputSchema:  listBooksSchema(),
 		OutputSchema: outputSchemaFor[ListBooksOutput](),
@@ -208,7 +215,8 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		Name: "get_chunk_context",
 		Description: "Get the chunks surrounding a search hit, so you can read the full text around a match. " +
 			"Operates on CHUNKS (the search/embedding unit — a chunk is tens of consecutive ASR segments grouped " +
-			"together; use get_transcript to page raw segments instead). Pass the chunk's UUID from a search result.",
+			"together; use get_transcript to page raw segments instead). Pass the chunk's UUID from a search result. " +
+			"Rows carry the same per-book metadata as a search hit, including series[] as {name, sequence} entries.",
 		Annotations:  annotations,
 		InputSchema:  getChunkContextSchema(),
 		OutputSchema: outputSchemaFor[SearchResultsOutput](),

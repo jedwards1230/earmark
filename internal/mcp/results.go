@@ -1,6 +1,9 @@
 package mcp
 
-import "github.com/jedwards1230/earmark/internal/db"
+import (
+	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/metaprovider"
+)
 
 // This file defines the structured-output payloads for the MCP tools. Each tool
 // returns BOTH a human-readable text rendering (the long-standing format, kept as
@@ -28,18 +31,24 @@ type SearchResultsOutput struct {
 // rendered inventory line: provider-derived author/title plus the per-book
 // track/duration/word/chunk aggregates. JSON tags are added here (db.BookSummary
 // itself carries none) so the structured payload has stable, camelCase keys.
+//
+// Series is the parsed form of the raw db.BookSummary.Series column: zero or
+// more `{name, sequence}` memberships (a book can be in several series). It is
+// omitted entirely for books with no series, which is the common case for
+// path-sourced books.
 type BookEntry struct {
-	Dir             string   `json:"dir"`
-	Author          string   `json:"author"`
-	Title           string   `json:"title"`
-	Total           int      `json:"total"`
-	Pending         int      `json:"pending"`
-	Claimed         int      `json:"claimed"`
-	Done            int      `json:"done"`
-	Failed          int      `json:"failed"`
-	DurationSeconds *float64 `json:"durationSeconds,omitempty"`
-	WordCount       *int     `json:"wordCount,omitempty"`
-	EmbedChunkCount *int     `json:"embedChunkCount,omitempty"`
+	Dir             string                   `json:"dir"`
+	Author          string                   `json:"author"`
+	Title           string                   `json:"title"`
+	Series          []metaprovider.SeriesRef `json:"series,omitempty"`
+	Total           int                      `json:"total"`
+	Pending         int                      `json:"pending"`
+	Claimed         int                      `json:"claimed"`
+	Done            int                      `json:"done"`
+	Failed          int                      `json:"failed"`
+	DurationSeconds *float64                 `json:"durationSeconds,omitempty"`
+	WordCount       *int                     `json:"wordCount,omitempty"`
+	EmbedChunkCount *int                     `json:"embedChunkCount,omitempty"`
 }
 
 // LibraryTotalsOutput mirrors db.LibraryTotals with explicit JSON tags for the
