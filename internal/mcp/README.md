@@ -74,7 +74,7 @@ default; `book` scopes to one title via ASIN-aware resolution.
 | `book` | — | title/author substring or bracketed ASIN |
 | `threshold` | 0.3 | cosine similarity floor (0–1) |
 | `limit` | 10 | |
-| `snippet` | 0 (full chunk) | max chars; values below 80 raised to 80, above 4000 capped |
+| `snippet` | 0 (full chunk) | max chars of the text output **and** `structuredContent.results[].content`; values below 80 raised to 80, above 4000 capped |
 
 ### `text_search_audiobooks`
 
@@ -86,7 +86,7 @@ similarity %). `snippet` centres the excerpt on the literal match.
 | `query` | required | |
 | `book` | — | same resolution as semantic search |
 | `limit` | 10 | |
-| `snippet` | 0 (full chunk) | centres window on the match |
+| `snippet` | 0 (full chunk) | centres window on the match, in the text output **and** `structuredContent.results[].content` |
 
 ### `get_transcript`
 

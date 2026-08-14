@@ -39,7 +39,7 @@ Vector-similarity (meaning) search. Hits show a real cosine `similarity: NN%`.
 | `book` | string | — | Scope to one title (ASIN-aware resolution; see below) |
 | `threshold` | float | 0.3 | Cosine similarity floor (0.0–1.0) |
 | `limit` | integer | 10 | Max hits |
-| `snippet` | integer | — | Max chars of quoted text; floored to 80, capped at 4000. Omit for full chunk text |
+| `snippet` | integer | — | Max chars of quoted text **and** of `structuredContent.results[].content`; floored to 80, capped at 4000. Omit for full chunk text |
 
 Unscoped: HNSW index. Scoped (`book` set): exact distance scan within the book's chunks (recall-perfect, no filtered-ANN loss).
 
@@ -52,7 +52,7 @@ Trigram literal/keyword search. Hits are labelled **"ranked by trigram match"** 
 | `query` | string | **required** | Keyword or phrase |
 | `book` | string | — | Scope to one title |
 | `limit` | integer | 10 | Max hits |
-| `snippet` | integer | — | Returns an excerpt centred on the literal match |
+| `snippet` | integer | — | Returns an excerpt centred on the literal match, in the text output **and** in `structuredContent.results[].content` |
 
 ### Tool: `get_transcript`
 

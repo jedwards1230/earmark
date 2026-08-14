@@ -859,7 +859,8 @@ per chunk) that always carries its own `words[]`. The search tools +
 human-readable text, which is kept as the spec-required back-compat fallback
 (`content[0]`). The structured payloads are: the two search tools +
 `get_chunk_context` → `{ kind, query?, count, results[] }` (`kind` is
-`semantic` \| `trigram` \| `context`; `results` are the raw chunk rows);
+`semantic` \| `trigram` \| `context`; `results` are the chunk rows, with each
+row's `content` honouring the `snippet` window when one is set);
 `list_books` → `{ format, books[], totals, total, offset, nextOffset? }`;
 `get_transcript` → `{ kind: "transcript", filePath, language, modelName,
 durationSeconds, segments[], offset, limit, totalSegments, nextOffset? }` for a
@@ -874,8 +875,13 @@ tool-execution error (`isError`), never a protocol error.
 **Snippet windows** (`snippet` on both search tools): omitted → the full ~400-word
 chunk (backward-compatible). When set, the hit's quoted text is truncated to
 ~`snippet` chars with a `…(truncated, use get_chunk_context for full text)`
-marker. Text search centres the window on the literal query match; semantic
-search returns a **leading preview** (there is no sub-chunk match position) and
+marker. The cap applies to **`structuredContent.results[].content` as well as
+the human-readable text rendering** — a structured consumer never receives the
+full chunk when a window is set (the structured row carries the bare excerpt,
+whose leading/trailing `…` already signal truncation; the prose marker is
+text-rendering only, since `chunkID` already names the follow-up call). Text
+search centres the window on the literal query match; semantic search returns a
+**leading preview** (there is no sub-chunk match position) and
 `get_chunk_context` returns the full surrounding text. A positive value below 80
 is raised to 80 so the excerpt stays readable, and a value above 4000 is capped
 to 4000 (well past a full chunk, so the cap only guards against absurd inputs).

@@ -91,6 +91,78 @@ func TestSemanticSearchStructuredContent(t *testing.T) {
 	mockDB.AssertExpectations(t)
 }
 
+// snippetSource is a chunk comfortably longer than the 80-char snippet window,
+// with NEEDLE far enough in that a leading preview excludes it.
+const snippetSource = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi " +
+	"omicron pi rho sigma tau upsilon phi chi psi omega aaa bbb ccc ddd eee fff " +
+	"ggg hhh iii jjj NEEDLE kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www"
+
+// TestTextSearchSnippetStructuredContent is the regression guard for issue #124:
+// `snippet` used to window only the human-readable text fallback while
+// structuredContent — what the federated MCP gateway actually surfaces — carried
+// the full untruncated chunk. Text search centres the window on the literal match.
+func TestTextSearchSnippetStructuredContent(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	rows := []db.SearchResultWithMetadata{
+		{ID: "t1", ChunkID: "t1", Content: snippetSource, Title: "Dune", Author: "Frank Herbert",
+			TotalChunks: 10, ChunkIndex: 2, WordCount: 45},
+	}
+	mockDB.On("TextSearch", mock.Anything, "NEEDLE", 10).Return(rows, nil).Once()
+
+	h := NewToolHandlers(mockDB, providerForTest())
+	res, err := h.handleTextSearch(context.Background(), req("text_search_audiobooks", map[string]interface{}{
+		"query": "NEEDLE",
+		// float64: req marshals args through JSON, so an int would arrive as a float anyway.
+		"snippet": float64(80),
+	}))
+	require.NoError(t, err)
+	assert.False(t, res.IsError)
+
+	out, ok := res.StructuredContent.(SearchResultsOutput)
+	require.True(t, ok, "structuredContent should be a SearchResultsOutput, got %T", res.StructuredContent)
+	require.Len(t, out.Results, 1)
+	got := out.Results[0].Content
+	assert.Less(t, len(got), len(snippetSource), "structured content must honour the snippet window")
+	assert.Contains(t, got, "NEEDLE", "text search centres the window on the literal match")
+	assert.NotContains(t, got, "alpha beta gamma", "centred window drops the leading filler")
+	assert.NotContains(t, got, "(truncated, use get_chunk_context for full text)")
+	// wordCount is deliberately the FULL chunk's count, not the excerpt's.
+	assert.Equal(t, 45, out.Results[0].WordCount)
+
+	mockDB.AssertExpectations(t)
+}
+
+// TestSemanticSearchSnippetStructuredContent is the semantic half of the #124
+// guard: no sub-chunk match position exists, so the structured row carries a
+// leading preview windowed to `snippet`.
+func TestSemanticSearchSnippetStructuredContent(t *testing.T) {
+	mockDB := &MockDBInterface{}
+	rows := []db.SearchResultWithMetadata{
+		{ID: "s1", ChunkID: "s1", Content: snippetSource, Title: "Dune", Author: "Frank Herbert",
+			Similarity: 0.77, TotalChunks: 10, ChunkIndex: 2},
+	}
+	mockDB.On("Search", mock.Anything, "NEEDLE", 10, 0.3).Return(rows, nil).Once()
+
+	h := NewToolHandlers(mockDB, providerForTest())
+	res, err := h.handleSemanticSearch(context.Background(), req("semantic_search_audiobooks", map[string]interface{}{
+		"query":   "NEEDLE",
+		"snippet": float64(80),
+	}))
+	require.NoError(t, err)
+	assert.False(t, res.IsError)
+
+	out, ok := res.StructuredContent.(SearchResultsOutput)
+	require.True(t, ok, "structuredContent should be a SearchResultsOutput, got %T", res.StructuredContent)
+	require.Len(t, out.Results, 1)
+	got := out.Results[0].Content
+	assert.Less(t, len(got), len(snippetSource), "structured content must honour the snippet window")
+	assert.Contains(t, got, "alpha beta", "semantic search returns a leading preview")
+	assert.NotContains(t, got, "NEEDLE", "the leading preview stops well before the match")
+	assert.NotContains(t, got, "(truncated, use get_chunk_context for full text)")
+
+	mockDB.AssertExpectations(t)
+}
+
 // TestSearchEmptyStructuredContent asserts the empty-result path still carries a
 // well-shaped structured payload (results: []), so a consumer can rely on the
 // shape unconditionally.

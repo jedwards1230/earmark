@@ -312,10 +312,13 @@ func formatSearchResults(results []db.SearchResultWithMetadata) *mcp.CallToolRes
 //     pg_trgm values are tiny for a literal hit and would mislead if labelled
 //     "similarity"); context omits the line entirely.
 //   - query/snippet drive the optional excerpt window: when snippet > 0 the chunk
-//     text is truncated to ~snippet chars. Text search centres the window on the
-//     literal query match; semantic search returns a leading preview (no
+//     text is truncated to ~snippet chars in BOTH the text rendering and the
+//     structured payload's results[].content. Text search centres the window on
+//     the literal query match; semantic search returns a leading preview (no
 //     sub-chunk match position exists). Truncated text gets a marker pointing at
-//     get_chunk_context for the full surrounding text.
+//     get_chunk_context for the full surrounding text; the structured rows carry
+//     the bare excerpt (its … markers already signal truncation, and chunkID
+//     already names the follow-up call).
 func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchKind, query string, snippet int) *mcp.CallToolResult {
 	if len(results) == 0 {
 		// Even the empty case emits structured content so a consumer can rely on
@@ -329,13 +332,25 @@ func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchK
 	var output strings.Builder
 	fmt.Fprintf(&output, "Found %d result(s):\n\n", len(results))
 
-	for _, result := range results {
+	// Rows for the structured payload. With the snippet window off this is the
+	// original slice (no copy, byte-identical to the input); with it on, a shallow
+	// copy whose Content carries the same excerpt the text rendering shows —
+	// SearchResultWithMetadata is flat (its only pointer, Speaker, is never
+	// rewritten here), so a shallow copy is safe.
+	out := results
+	if snippet > 0 {
+		out = make([]db.SearchResultWithMetadata, len(results))
+		copy(out, results)
+	}
+
+	for i, result := range results {
 		// Format: **Title** by Author
 		fmt.Fprintf(&output, "**%s** by %s\n", result.Title, result.Author)
 
-		// Chapter mapping isn't populated yet (a future ABS-integration PR will
-		// fill it in), so suppress the misleading "Chapter 0:" prefix whenever
-		// there's no real chapter data — index 0 AND empty title.
+		// Chapter mapping IS populated when the book has a provider chapter list
+		// (book_metadata.chapters); it stays empty for books without one, or when
+		// the chunk's track offset can't be established. Suppress the misleading
+		// "Chapter 0:" prefix in exactly those cases — index 0 AND empty title.
 		chapterPrefix := ""
 		if result.ChapterIndex != 0 || strings.TrimSpace(result.ChapterTitle) != "" {
 			chapterPrefix = fmt.Sprintf("Chapter %d: %s ", result.ChapterIndex, result.ChapterTitle)
@@ -371,11 +386,14 @@ func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchK
 		// Format: > Content (optionally windowed to a snippet).
 		content := result.Content
 		if snippet > 0 {
-			if excerpt, truncated := makeSnippet(content, query, snippet, kind); truncated {
-				content = excerpt + " …(truncated, use get_chunk_context for full text)"
-			} else {
-				content = excerpt
+			excerpt, truncated := makeSnippet(content, query, snippet, kind)
+			content = excerpt
+			if truncated {
+				content += " …(truncated, use get_chunk_context for full text)"
 			}
+			// The structured row gets the bare excerpt: the prose marker is an
+			// English sentence, wrong in a machine payload.
+			out[i].Content = excerpt
 		}
 		fmt.Fprintf(&output, "> %s\n", content)
 
@@ -385,11 +403,11 @@ func formatSearchResultsOpts(results []db.SearchResultWithMetadata, kind searchK
 		}
 	}
 
-	// Structured payload mirrors the text: the raw typed rows plus the ranking
-	// kind. The text rendering above remains the spec-required back-compat
-	// fallback (Content[0]).
+	// Structured payload mirrors the text: the typed rows (content honouring the
+	// snippet window when set) plus the ranking kind. The text rendering above
+	// remains the spec-required back-compat fallback (Content[0]).
 	return structuredResult(
-		SearchResultsOutput{Kind: kind.label(), Query: query, Count: len(results), Results: results},
+		SearchResultsOutput{Kind: kind.label(), Query: query, Count: len(results), Results: out},
 		output.String(),
 	)
 }
