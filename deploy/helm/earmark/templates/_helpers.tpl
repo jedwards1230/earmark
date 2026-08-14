@@ -96,6 +96,13 @@ the two Deployments.
   value: {{ .Values.config.embeddingsModel | quote }}
 - name: STALE_JOB_TIMEOUT
   value: {{ .Values.config.staleJobTimeout | quote }}
+{{- /*
+  SCAN_INTERVAL (CONTRACT §2.4): cadence of the monitor's recurring BOOKS_DIR
+  walk. fsnotify does not fire for writes made by another NFS client, so this is
+  the backstop that actually discovers new books. "0" disables it.
+*/}}
+- name: SCAN_INTERVAL
+  value: {{ .Values.config.scanInterval | quote }}
 - name: CHUNK_SIZE
   value: {{ .Values.config.chunkSize | quote }}
 {{- /*

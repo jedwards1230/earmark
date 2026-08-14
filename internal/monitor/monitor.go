@@ -1,10 +1,17 @@
 // Package monitor watches the books directory for new audio files and
 // enqueues them into the transcription_jobs table (dedup by SHA-256 checksum).
 //
-// The monitor no longer calls a local transcriber. It is a pure producer:
+// The monitor no longer calls a local transcriber. It is a pure producer, and
+// discovers files three ways:
 //   - Initial scan: walk BOOKS_DIR, compute checksum for each audio file,
 //     insert a pending job if none exists.
-//   - Live watch (fsnotify): handle CREATE events for new audio files.
+//   - Live watch (fsnotify): handle CREATE events for new audio files. This is
+//     the low-latency path, but inotify only reports writes made through *this*
+//     host's kernel.
+//   - Periodic scan (SCAN_INTERVAL, default 1h): re-walk BOOKS_DIR. This is the
+//     correctness backstop for a library on NFS — a book written directly on the
+//     file server, or by any other NFS client, never raises an inotify event
+//     here, so the watch alone would miss it forever.
 package monitor
 
 import (
@@ -73,6 +80,11 @@ type FileMonitor struct {
 	stabilityInterval time.Duration
 	stabilityCount    int
 	stabilityTimeout  time.Duration
+
+	// scanInterval is how often BooksDir is re-walked after the startup scan
+	// (config.ScanInterval / SCAN_INTERVAL). Overridable in tests. A
+	// non-positive value disables periodic scanning entirely.
+	scanInterval time.Duration
 }
 
 // NewFileMonitor creates a FileMonitor. Call Start to begin watching.
@@ -91,6 +103,7 @@ func NewFileMonitor(cfg *config.Config, db DBInterface, meta metaprovider.Metada
 		stabilityInterval: defaultStabilityInterval,
 		stabilityCount:    defaultStabilityCount,
 		stabilityTimeout:  defaultStabilityTimeout,
+		scanInterval:      cfg.ScanInterval,
 	}
 }
 
@@ -108,9 +121,7 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 		fm.log.Info("pruned AppleDouble (._*) junk jobs", "count", n)
 	}
 
-	if err := fm.scan(); err != nil {
-		fm.log.Error("initial scan failed", "error", err)
-	}
+	fm.runScan("initial")
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -131,6 +142,12 @@ func (fm *FileMonitor) Start(ready chan<- struct{}) {
 	// (heartbeat/runner_availability) so they don't grow unbounded (CONTRACT §1.7).
 	// Best-effort + ctx-aware; runs once at startup and every 24h thereafter.
 	go fm.runRetentionPrune()
+
+	// Periodic re-walk of BooksDir (SCAN_INTERVAL). fsnotify above is only the
+	// low-latency path for writes this kernel sees; it never fires for a file
+	// written by a different NFS client, so without this a book added after
+	// startup is never discovered.
+	go fm.runPeriodicScan()
 
 	for {
 		select {
@@ -190,10 +207,75 @@ func (fm *FileMonitor) runRetentionPrune() {
 	}
 }
 
+// runPeriodicScan re-walks BooksDir every scanInterval until the monitor's
+// context is cancelled. Best-effort: a scan failure is logged and the loop
+// continues.
+//
+// Why this exists: fsnotify/inotify only reports writes that pass through this
+// host's kernel. The library lives on NFS and is written by other clients (the
+// downloader writes straight to the file server), so those files never raise a
+// watch event here — before this loop, anything added after startup stayed
+// invisible until the pod restarted. fsnotify remains the low-latency path for
+// local writes; this walk is the correctness backstop.
+//
+// Unlike runRetentionPrune, this does NOT do a pass immediately on start: Start
+// has already run the initial scan, and repeating it here would walk the whole
+// library twice at boot. It waits for the first tick.
+//
+// A non-positive interval disables periodic scanning (documented escape hatch,
+// and it keeps time.NewTicker from panicking on 0).
+func (fm *FileMonitor) runPeriodicScan() {
+	if fm.scanInterval <= 0 {
+		fm.log.Info("periodic scan disabled (SCAN_INTERVAL <= 0); relying on the startup scan and fsnotify only",
+			"scan_interval", fm.scanInterval)
+		return
+	}
+
+	fm.log.Info("periodic scan enabled", "scan_interval", fm.scanInterval)
+	ticker := time.NewTicker(fm.scanInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-fm.ctx.Done():
+			return
+		case <-ticker.C:
+			fm.runScan("periodic")
+		}
+	}
+}
+
 // Stop signals the monitor to shut down and waits for it to finish.
 func (fm *FileMonitor) Stop() {
 	fm.cancel()
 	<-fm.done
+}
+
+// scanResult summarizes one walk of BooksDir, so a scan that legitimately found
+// nothing is distinguishable in the logs from a scan that never ran.
+type scanResult struct {
+	// walked is the number of audio files visited (already-queued ones included).
+	walked int
+	// enqueued is the number of files that produced a NEW transcription_jobs row.
+	enqueued int
+	// skipped is the number of paths a walk error made unreadable this pass.
+	skipped int
+}
+
+// runScan performs one walk and logs its outcome. kind labels what triggered it
+// ("initial" / "periodic") so the two are distinguishable in logs.
+func (fm *FileMonitor) runScan(kind string) scanResult {
+	start := time.Now()
+	res, err := fm.scan()
+	if err != nil {
+		fm.log.Error(kind+" scan failed", "error", err,
+			"total_audio_files", res.walked, "enqueued", res.enqueued, "skipped", res.skipped,
+			"duration", time.Since(start))
+		return res
+	}
+	fm.log.Info(kind+" scan complete",
+		"total_audio_files", res.walked, "enqueued", res.enqueued, "skipped", res.skipped,
+		"duration", time.Since(start))
+	return res
 }
 
 // scan walks BooksDir and enqueues any unqueued audio files. Already-known
@@ -201,20 +283,51 @@ func (fm *FileMonitor) Stop() {
 // is a metadata-only walk instead of a multi-TB re-hash. (The library is
 // append-only — files are added, not edited in place — so a known path never
 // needs re-checking.)
-func (fm *FileMonitor) scan() error {
-	return filepath.Walk(fm.cfg.BooksDir, func(path string, info os.FileInfo, err error) error {
+//
+// Per-entry errors are logged, counted in scanResult.skipped, and the walk
+// continues: this runs on a timer over an NFS mount, and a transient EIO on one
+// subdirectory must not abort — and thereby silently disable — every subsequent
+// scan. Only a hard failure on BooksDir itself is returned as an error.
+//
+// Caveat (mid-copy race): unlike handleCreate, the scan path does NOT call
+// waitForStableSize — doing so would add stabilityCount polls per file to a walk
+// over the whole library. A file still being copied by another NFS client can
+// therefore be hashed mid-copy. The consequence is bounded: dedup is by
+// file_path as well as checksum (see TestMonitorDuplicatePathDifferentChecksum),
+// so this yields one job with a stale checksum rather than a duplicate job, and
+// the ASR runner reads the file by path when it eventually claims it.
+func (fm *FileMonitor) scan() (scanResult, error) {
+	var res scanResult
+	err := filepath.Walk(fm.cfg.BooksDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			// A failure on the root itself means the library is unreadable —
+			// that is a real error, not a skippable entry.
+			if path == fm.cfg.BooksDir {
+				return err
+			}
+			res.skipped++
+			fm.log.Warn("scan: skipping unreadable path (continuing)", "path", path, "error", err)
+			if info != nil && info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if info.IsDir() || !isAudioFile(info.Name()) {
 			return nil
 		}
+		res.walked++
 		if fm.pathAlreadyQueued(path) {
 			return nil
 		}
-		fm.enqueueFile(path)
+		if fm.enqueueFile(path) {
+			res.enqueued++
+		}
 		return nil
 	})
+	if err != nil {
+		return res, fmt.Errorf("walk %s: %w", fm.cfg.BooksDir, err)
+	}
+	return res, nil
 }
 
 // pathAlreadyQueued reports whether a job already exists for path. On a DB error
@@ -243,7 +356,7 @@ func (fm *FileMonitor) handleCreate(filePath string) {
 	if err := fm.waitForStableSize(filePath); err != nil {
 		fm.log.Warn("file did not stabilize; enqueuing anyway", "file", filePath, "error", err)
 	}
-	fm.enqueueFile(filePath)
+	_ = fm.enqueueFile(filePath)
 }
 
 // waitForStableSize blocks until path's size is unchanged across stabilityCount
@@ -276,15 +389,17 @@ func (fm *FileMonitor) waitForStableSize(path string) error {
 	}
 }
 
-// enqueueFile computes the checksum and inserts a job row if absent.
-func (fm *FileMonitor) enqueueFile(filePath string) {
+// enqueueFile computes the checksum and inserts a job row if absent. It reports
+// whether a NEW job row was created, so a scan can tally genuinely-new files
+// instead of guessing from the number of files it visited.
+func (fm *FileMonitor) enqueueFile(filePath string) (created bool) {
 	ctx, cancel := context.WithTimeout(fm.ctx, 30*time.Second)
 	defer cancel()
 
 	jobID, created, err := transcribe.EnqueueJob(ctx, filePath, fm.db)
 	if err != nil {
 		fm.log.Error("failed to enqueue job", "file", filePath, "error", err)
-		return
+		return false
 	}
 	if created {
 		fm.log.Info("enqueued transcription job", "file", filePath, "job_id", jobID)
@@ -317,6 +432,8 @@ func (fm *FileMonitor) enqueueFile(filePath string) {
 	// pattern exactly. The sampleName is the filename component, which the
 	// PathProvider uses to strip track-number prefixes and derive a title.
 	fm.upsertBookMetadata(ctx, filePath)
+
+	return created
 }
 
 // upsertBookMetadata derives book metadata from filePath via the configured

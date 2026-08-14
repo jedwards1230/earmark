@@ -16,7 +16,7 @@ func clearContractEnvVars(t *testing.T) {
 	vars := []string{
 		"DATABASE_URL", "BOOKS_DIR",
 		"EMBEDDINGS_BASE_URL", "EMBEDDINGS_MODEL",
-		"MCP_HTTP_ADDR", "STALE_JOB_TIMEOUT",
+		"MCP_HTTP_ADDR", "STALE_JOB_TIMEOUT", "SCAN_INTERVAL",
 		"CHUNK_SIZE", "EMBED_BATCH_SIZE", "DEBUG", "DEBUG_DB_RESET",
 		"ASR_SERVERS", "AI_ENDPOINTS", "AI_ROLES",
 		"EVAL_GATES_EMBED", "EVAL_IN_PIPELINE",
@@ -40,6 +40,7 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	assert.Equal(t, "nomic-embed-text", cfg.EmbeddingsModel)
 	assert.Equal(t, ":8081", cfg.MCPHTTPAddr)
 	assert.Equal(t, 30*time.Minute, cfg.StaleJobTimeout)
+	assert.Equal(t, time.Hour, cfg.ScanInterval)
 	assert.Equal(t, 512, cfg.ChunkSize)
 	assert.Equal(t, 32, cfg.EmbedBatchSize)
 	assert.False(t, cfg.Debug)
@@ -94,6 +95,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("EMBEDDINGS_MODEL", "mxbai-embed-large")
 	t.Setenv("MCP_HTTP_ADDR", ":9000")
 	t.Setenv("STALE_JOB_TIMEOUT", "1h")
+	t.Setenv("SCAN_INTERVAL", "15m")
 	t.Setenv("CHUNK_SIZE", "256")
 	t.Setenv("EMBED_BATCH_SIZE", "16")
 	t.Setenv("DEBUG", "true")
@@ -107,6 +109,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	assert.Equal(t, "mxbai-embed-large", cfg.EmbeddingsModel)
 	assert.Equal(t, ":9000", cfg.MCPHTTPAddr)
 	assert.Equal(t, time.Hour, cfg.StaleJobTimeout)
+	assert.Equal(t, 15*time.Minute, cfg.ScanInterval)
 	assert.Equal(t, 256, cfg.ChunkSize)
 	assert.Equal(t, 16, cfg.EmbedBatchSize)
 	assert.True(t, cfg.Debug)
@@ -121,6 +124,29 @@ func TestLoadConfig_InvalidStaleJobTimeout(t *testing.T) {
 	_, err := LoadConfig()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "STALE_JOB_TIMEOUT")
+}
+
+func TestLoadConfig_InvalidScanInterval(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("SCAN_INTERVAL", "not-a-duration")
+
+	_, err := LoadConfig()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "SCAN_INTERVAL")
+}
+
+// TestLoadConfig_ScanIntervalDisabled documents the escape hatch: `0` is a valid
+// value meaning "no periodic scanning" (the monitor then relies on the startup
+// walk plus fsnotify only).
+func TestLoadConfig_ScanIntervalDisabled(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("SCAN_INTERVAL", "0s")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), cfg.ScanInterval)
 }
 
 func TestLoadConfig_InvalidChunkSize(t *testing.T) {

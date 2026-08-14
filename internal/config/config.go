@@ -311,6 +311,14 @@ type Config struct {
 	// service resets it to pending. Default: 30m (CONTRACT §1.3).
 	StaleJobTimeout time.Duration
 
+	// SCAN_INTERVAL — how often the monitor re-walks BOOKS_DIR looking for new
+	// audio files, in addition to the startup scan. fsnotify only sees writes
+	// made through this host's kernel, so a book written directly on the NFS
+	// server (or by any other NFS client) never raises a watch event and would
+	// otherwise stay undiscovered until the pod restarts. Default: 1h.
+	// `0` or negative disables periodic scanning (CONTRACT §2.4).
+	ScanInterval time.Duration
+
 	// ChunkSize — target token count per transcript chunk. Default: 512.
 	// Overlap is 64 tokens (implementation constant in the chunker).
 	ChunkSize int
@@ -446,6 +454,15 @@ func LoadConfig() (*Config, error) {
 	cfg.StaleJobTimeout, err = time.ParseDuration(staleStr)
 	if err != nil {
 		return nil, fmt.Errorf("STALE_JOB_TIMEOUT %q: %w", staleStr, err)
+	}
+
+	// SCAN_INTERVAL: cadence of the monitor's recurring BOOKS_DIR walk, the
+	// backstop for NFS writes fsnotify cannot see. `0` (or negative) is a valid
+	// value meaning "disable periodic scanning".
+	scanStr := getEnvOrDefault("SCAN_INTERVAL", "1h")
+	cfg.ScanInterval, err = time.ParseDuration(scanStr)
+	if err != nil {
+		return nil, fmt.Errorf("SCAN_INTERVAL %q: %w", scanStr, err)
 	}
 
 	if cs := os.Getenv("CHUNK_SIZE"); cs != "" {
@@ -677,6 +694,7 @@ func (c *Config) PrintEnvVars() {
 	logger.Debug("Library Collections", "value", c.LibraryCollections)
 	logger.Debug("Control API Token", "value", MaskSecret(c.ControlAPIToken))
 	logger.Debug("Stale Job Timeout", "value", c.StaleJobTimeout)
+	logger.Debug("Scan Interval", "value", c.ScanInterval)
 	logger.Debug("Chunk Size", "value", c.ChunkSize)
 	logger.Debug("Embed Batch Size", "value", c.EmbedBatchSize)
 	logger.Debug("Metadata Provider", "value", c.MetadataProvider)

@@ -35,7 +35,24 @@ Walks `BOOKS_DIR` to discover audio files. For each file not already in `transcr
 - UPSERTs a `pending` row into `transcription_jobs`
 - UPSERTs a `run_metrics` row with `audio_bytes` (from `os.Stat`)
 
-After the initial walk, the monitor enters a poll/watch loop for new files.
+After the initial walk, the monitor discovers new files two ways, both running
+until shutdown:
+
+- **fsnotify watch** — an inotify watch on `BOOKS_DIR` and every subdirectory.
+  New directories are added to the watch as they appear. This is the
+  low-latency path, but inotify only reports writes made through *this* host's
+  kernel.
+- **Periodic scan** (`SCAN_INTERVAL`, default `1h`) — a ticker goroutine that
+  re-runs the same walk. This is the correctness backstop: the library is on
+  NFS and is written by other clients (e.g. a downloader writing directly to the
+  file server), and those writes raise **no** inotify event here — so without
+  the recurring walk, a book added after the pod started would never be
+  enqueued. Already-queued paths are skipped without re-hashing, so the walk is
+  metadata-only and cheap; per-entry errors (a transient NFS `EIO` on one
+  subdirectory) are logged and skipped rather than aborting the pass. Each scan
+  logs `… scan complete` with the walked/enqueued/skipped counts, so a scan that
+  found nothing is distinguishable from a scan that never ran. Set
+  `SCAN_INTERVAL=0` to disable it.
 
 ### 4. Stale-job recovery goroutine
 

@@ -166,7 +166,7 @@ func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
 		switch key {
 		case "error":
 			attrs = append(attrs, fmt.Sprintf("%s%s%s: %v", colorRed, key, colorReset, value))
-		case "count", "total_books", "total_audio_files", "processed_books", "processed_chapters", "total_files", "chapter_index", "num_gc":
+		case "count", "total_books", "total_audio_files", "processed_books", "processed_chapters", "total_files", "chapter_index", "num_gc", "enqueued", "skipped":
 			attrs = append(attrs, fmt.Sprintf("%s%s%s=%v", colorBlue, key, colorReset, value))
 		case "title", "author", "chapter_name", "file", "path", "status":
 			attrs = append(attrs, fmt.Sprintf("%s%s%s=%q", colorWhite, key, colorReset, value))

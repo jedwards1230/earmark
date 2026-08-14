@@ -756,6 +756,13 @@ Rules:
   startup, then every 24h). Only the high-frequency heartbeat/availability rows
   are pruned; per-job stage events are low-volume and kept indefinitely.
 
+The retention prune is one of two recurring monitor tickers. The other is the
+**periodic library scan** (`SCAN_INTERVAL`, default `1h`, §2.4), which re-walks
+`BOOKS_DIR` to discover files fsnotify cannot see — writes made by another NFS
+client never raise an inotify event in the monitor pod. Unlike the retention
+prune, the scan ticker does **not** run once immediately: `Start` has already
+performed the startup walk, so it waits for the first tick.
+
 #### Stages: Go-emitted vs deferred (runner-side)
 
 | Stage / event | Source | Status |
@@ -956,6 +963,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `INGEST_HTTP_ADDR` | no | `:8082`. The `earmark monitor` (ingest) process serves a minimal HTTP listener here for `/healthz` (liveness) and `/metrics` (Prometheus, §2.16). The mcp pod uses `MCP_HTTP_ADDR` for its surface; this is the ingest pod's only HTTP port. Chosen to avoid colliding with `:8081`. |
 | `LOG_FORMAT` | no | `pretty` (default — human-readable, ANSI-colored `PrettyHandler`). Set `json` for a `slog` JSON handler writing one JSON object per line to stdout (parseable in Loki). Both carry the `module` attribute and honor `LOG_DEBUG`/`LOG_VERBOSE`. Used by both Go pods. |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
+| `SCAN_INTERVAL` | no | `1h` (Go duration string). How often the monitor **re-walks `BOOKS_DIR`** looking for new audio files, in addition to the walk it does at startup. Required for correctness on NFS: fsnotify/inotify only reports writes that pass through the monitor pod's own kernel, so a book written directly on the file server — or by any other NFS client — raises **no** watch event and would otherwise stay undiscovered until the pod restarted. The recurring walk is the backstop; fsnotify remains the low-latency path for local writes. The walk is metadata-only for known paths (already-queued `file_path`s are skipped without re-hashing, §1.1), so it is cheap over a multi-TB library. Per-entry errors (e.g. a transient NFS `EIO` on one subdirectory) are logged, counted, and skipped — one bad directory must never abort, and thereby silently disable, every subsequent scan. **`0` (or a negative value) disables periodic scanning**, leaving only the startup walk and fsnotify. |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `EMBED_BATCH_SIZE` | no | `32`. Max transcripts the embed worker selects **per poll cycle** for BOTH gated-flow (`EVAL_GATES_EMBED`) passes — the eval pass and the embed pass each `… ORDER BY t.created_at ASC LIMIT $1`. Bounds the worker's per-cycle memory: an unbounded selection loads every matching transcript's `segments` JSONB into one slice, which OOM-kills the pod on a large backlog (e.g. a full re-embed after re-segmentation). The worker drains a backlog across cycles — a transcript that gets eval'd/embedded drops out of the next cycle's selection — and **loops immediately (no `pollInterval` sleep) whenever a pass returns a full batch**, so a multi-thousand-item backlog drains in back-to-back cycles rather than one batch per poll interval. Must be a **positive integer** — a non-positive or non-numeric value is fatal at startup (the OOM guard must never silently round-trip to unbounded). The ungated single-pass selection (`GetCompletedTranscripts`) is unaffected. |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
