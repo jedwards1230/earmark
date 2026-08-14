@@ -136,6 +136,11 @@ type HierarchicalEntry struct {
 
 // SearchResultWithMetadata extends SearchResult with extra fields for the MCP
 // layer so the existing MCP tool formatters keep working.
+//
+// StartSec/EndSec are TRACK-RELATIVE (offsets into the chunk's own audio file),
+// while ChapterIndex/ChapterTitle come from the book-absolute provider chapter
+// list — scanResults bridges the two time bases via
+// metaprovider.ChapterForTrackSec (CONTRACT §2.2.1).
 type SearchResultWithMetadata struct {
 	ID         string  `json:"id"`
 	Content    string  `json:"content"`
@@ -155,8 +160,6 @@ type SearchResultWithMetadata struct {
 	TotalChapters int    `json:"totalChapters"`
 	ChunkID       string `json:"chunkID"`
 	WordCount     int    `json:"wordCount"`
-	ChunkStart    int    `json:"chunkStart"`
-	ChunkEnd      int    `json:"chunkEnd"`
 	FileChecksum  string `json:"fileChecksum"`
 	ISBN          string `json:"isbn,omitempty"`
 	ASIN          string `json:"asin,omitempty"`
@@ -392,8 +395,10 @@ func (db *DB) initialize(ctx context.Context) error {
 		-- directory (book_dir = filepath.Dir of any track under the book). This is
 		-- the DB seam for the provider-architecture: the Go monitor writes the
 		-- initial row at enqueue time using the MetadataProvider; later PRs populate
-		-- the nullable columns (chapters in PR 4, bias_terms in PR 5). No pipeline
-		-- code reads this table yet — it is additive and a missing row is a no-op.
+		-- the nullable columns (chapters in PR 4, bias_terms in PR 5). It is
+		-- additive and a missing row is a no-op (search results simply carry no
+		-- chapter label). chapters times are BOOK-absolute across all of the
+		-- book's tracks — see scanResults for the track-offset translation.
 		CREATE TABLE IF NOT EXISTS book_metadata (
 			book_dir    TEXT        NOT NULL PRIMARY KEY,
 			title       TEXT,
@@ -1481,20 +1486,28 @@ func likePrefix(s string) string {
 }
 
 // scanResults scans a result set from findSimilar, TextSearch, or
-// GetChunkContext, populating Author/Title from the MetadataProvider and
-// ChapterIndex/ChapterTitle by mapping the chunk's start_sec into the book's
-// chapter list stored in book_metadata.chapters.
+// GetChunkContext, populating Author/Title from the MetadataProvider plus the
+// per-book fields (ChapterIndex/ChapterTitle, TotalChapters, FileChecksum) and
+// the per-chunk WordCount.
 //
-// Chapter mapping: for each result we read book_metadata.chapters (one DB call
-// per distinct book_dir; a simple inline call is acceptable here because each
-// search result set is ≤50 rows and book_metadata is tiny). The chapter whose
-// [StartSec, EndSec) contains the chunk's start_sec is selected. When no chapter
-// data exists the ChapterIndex/ChapterTitle stay zero, and the MCP formatter
-// already suppresses the label in that case (CONTRACT §2.2.1).
+// Chapter mapping: chunk start_sec is TRACK-relative (one ASR transcript per
+// audio file) while book_metadata.chapters is BOOK-absolute across the
+// concatenated tracks, so the chunk's track offset within the book must be added
+// before the lookup — see metaprovider.ChapterForTrackSec. Both the chapter list
+// and the book's track rows are loaded once per distinct book_dir
+// (loadBookContext) and cached for the result set; two small reads per book are
+// acceptable here because a search result set is ≤50 rows and touches 1–3 books,
+// and it keeps the hot chunk SELECTs join-free (a JOIN on the vector path risks
+// defeating the HNSW index).
+//
+// When the chapter list is empty, or the book offset cannot be established (an
+// unknown/NULL preceding track duration), ChapterIndex/ChapterTitle stay zero and
+// the MCP formatter suppresses the label (CONTRACT §2.2.1) — a missing label
+// beats a plausible wrong one.
 func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]SearchResultWithMetadata, error) {
-	// Cache book chapters per book_dir to avoid redundant DB reads within one
-	// result set (a typical 10-result search touches 1–3 books).
-	chaptersCache := make(map[string][]metaprovider.Chapter)
+	// Cache per-book context (chapters + track rows) per book_dir to avoid
+	// redundant DB reads within one result set.
+	bookCache := make(map[string]bookContext)
 
 	var results []SearchResultWithMetadata
 	for rows.Next() {
@@ -1518,21 +1531,31 @@ func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]S
 		r.Author, r.Title = bookMeta.Author, bookMeta.Title
 		r.Chapter = filepath.Base(r.FilePath)
 
-		// Chapter mapping: map the chunk's start_sec into the book's chapter list.
+		// Word count of the full chunk text (the MCP citation line renders it
+		// only when > 0).
+		r.WordCount = len(strings.Fields(r.Content))
+
 		bookDir := filepath.Dir(r.FilePath)
-		chapters, seen := chaptersCache[bookDir]
+		bc, seen := bookCache[bookDir]
 		if !seen {
 			var err error
-			chapters, err = db.getBookChaptersQ(ctx, q, bookDir)
+			bc, err = db.loadBookContext(ctx, q, bookDir)
 			if err != nil {
-				db.log.Debug("chapter lookup failed (continuing without chapter label)",
+				db.log.Debug("book context lookup failed (continuing without chapter label)",
 					"book_dir", bookDir, "error", err)
 			}
-			chaptersCache[bookDir] = chapters // cache even on error (nil chapters)
+			bookCache[bookDir] = bc // cache even on (partial) error
 		}
-		if idx, title, ok := metaprovider.ChapterForSec(chapters, r.StartSec); ok {
-			r.ChapterIndex = idx
-			r.ChapterTitle = title
+		r.TotalChapters = len(bc.chapters)
+
+		// Chapter mapping: translate the track-relative start_sec into
+		// book-absolute time using the chunk's track offset within the book.
+		if ti := bc.trackIndex(r.FilePath); ti >= 0 {
+			r.FileChecksum = bc.tracks[ti].checksum
+			if idx, title, ok := metaprovider.ChapterForTrackSec(bc.chapters, bc.durations, ti, r.StartSec); ok {
+				r.ChapterIndex = idx
+				r.ChapterTitle = title
+			}
 		}
 
 		results = append(results, r)
@@ -1562,6 +1585,110 @@ func (db *DB) getBookChaptersQ(ctx context.Context, q rowScanner, bookDir string
 		return nil, fmt.Errorf("unmarshal chapters: %w", err)
 	}
 	return chapters, nil
+}
+
+// ─── Per-book context for search results ─────────────────────────────────────
+
+// bookTrack is one transcripts row of a book, trimmed to what search-result
+// enrichment needs: the track's path (to locate the chunk's own track), its
+// duration (to compute book offsets), and its checksum.
+type bookTrack struct {
+	filePath string
+	duration float64 // 0 when the column is NULL / unknown
+	checksum string
+}
+
+// bookContext is everything scanResults needs about one book_dir: the provider
+// chapter list (book-absolute times) plus the book's tracks in play order.
+// durations mirrors tracks so the offset math needs no per-row allocation.
+type bookContext struct {
+	chapters  []metaprovider.Chapter
+	tracks    []bookTrack
+	durations []float64
+}
+
+// trackIndex returns the position of filePath within the book's tracks, or -1
+// when the track is unknown (no transcripts row, or the lookup failed).
+func (bc bookContext) trackIndex(filePath string) int {
+	for i, t := range bc.tracks {
+		if t.filePath == filePath {
+			return i
+		}
+	}
+	return -1
+}
+
+// bookTracksDurationSQL lists a book's transcribed tracks in play order. The
+// book_dir derivation (strip the trailing "/<file>") matches bookTracksSQL and
+// the book_dir key written by the monitor. Ordering by file_path mirrors the
+// zero-padded track naming used by the library layouts, which is the same order
+// the provider's book-absolute chapter timeline assumes.
+var bookTracksDurationSQL = `
+		SELECT file_path, duration_seconds, checksum
+		FROM transcripts
+		WHERE regexp_replace(file_path, '/[^/]+$', '') = $1
+		ORDER BY file_path
+	`
+
+// loadBookContext reads the chapter list and the track list for one book_dir
+// through the supplied rowScanner (so scanResults stays testable against a mock
+// pool). Both reads are best-effort and independent: a failure of one still
+// returns whatever the other produced, with the errors joined so the caller can
+// log them and continue with partial enrichment.
+func (db *DB) loadBookContext(ctx context.Context, q rowScanner, bookDir string) (bookContext, error) {
+	var (
+		bc   bookContext
+		errs []error
+	)
+
+	chapters, err := db.getBookChaptersQ(ctx, q, bookDir)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	bc.chapters = chapters
+
+	tracks, err := db.getBookTrackRows(ctx, q, bookDir)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	bc.tracks = tracks
+	bc.durations = make([]float64, len(tracks))
+	for i, t := range tracks {
+		bc.durations[i] = t.duration
+	}
+
+	return bc, errors.Join(errs...)
+}
+
+// getBookTrackRows reads the transcripts rows for one book_dir in play order.
+// duration_seconds is scanned as *float64 because the column can be NULL on rows
+// written by older runners; a NULL becomes 0, which bookOffsetSec treats as an
+// unknown offset (no chapter label) rather than a guess.
+func (db *DB) getBookTrackRows(ctx context.Context, q rowQuerier, bookDir string) ([]bookTrack, error) {
+	rows, err := q.Query(ctx, bookTracksDurationSQL, bookDir)
+	if err != nil {
+		return nil, fmt.Errorf("book track durations query: %w", err)
+	}
+	defer rows.Close()
+
+	var tracks []bookTrack
+	for rows.Next() {
+		var (
+			t   bookTrack
+			dur *float64
+		)
+		if err := rows.Scan(&t.filePath, &dur, &t.checksum); err != nil {
+			return nil, fmt.Errorf("scan book track duration: %w", err)
+		}
+		if dur != nil {
+			t.duration = *dur
+		}
+		tracks = append(tracks, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error (book track durations): %w", err)
+	}
+	return tracks, nil
 }
 
 // GetHierarchicalData returns a list of files with their chunk counts for the

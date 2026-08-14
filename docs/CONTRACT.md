@@ -701,6 +701,12 @@ Rules:
   `bias_terms` is always overwritten (not COALESCE-guarded) so an improved
   metadata source is reflected on the next write.
 - `chapters` is nullable and left `NULL` when no ABS provider is configured.
+- **`chapters` times are BOOK-ABSOLUTE.** Each entry is
+  `{Index, Title, StartSec, EndSec}` with `StartSec`/`EndSec` measured from the
+  start of the **whole book** (all tracks concatenated in play order) — that is
+  what Audiobookshelf's `media.chapters` reports. This is a *different time base*
+  from `transcript_chunks.start_sec`, which is track-relative (§3); readers must
+  add the track's book offset before mapping a chunk into this list (§2.2.1).
 - The Go service creates the table in its schema-init transaction.
 
 ### 1.7 Append-only pipeline audit log — `pipeline_events` table
@@ -887,11 +893,36 @@ is resolved to a single canonical `file_path` directory prefix via
 
 Zero or multiple matches return a helpful error listing the candidates.
 
-**Result formatting (search + context):** chapter mapping is not yet populated
-(a future ABS-integration PR fills it in), so the formatter **suppresses the
-chapter label entirely** when there is no real chapter data (chapter index 0 AND
-empty title) — no misleading `Chapter 0:` prefix is emitted. A populated chapter
-(non-zero index or a non-empty title) still renders as `Chapter N: <title>`.
+**Result formatting (search + context):** chapter mapping **is** populated when
+the book has a provider chapter list (`book_metadata.chapters`, §1.6 — in
+practice an ABS-enriched book). The formatter still **suppresses the chapter
+label entirely** when there is no real chapter data (chapter index 0 AND empty
+title) — no misleading `Chapter 0:` prefix is emitted. A populated chapter
+(non-zero index or a non-empty title) renders as `Chapter N: <title>`.
+
+**Chapter time bases (search + context):** a chunk's `startSec`/`endSec` are
+**track-relative** — offsets into the chunk's own audio file, because there is
+one ASR transcript per track — while a provider chapter list is **book-absolute**
+across all of a book's tracks concatenated in play order. Mapping a chunk to a
+chapter therefore adds the chunk's **track offset within the book** (the summed
+durations of the preceding tracks, from `transcripts.duration_seconds` ordered by
+`file_path`) before the lookup. Single-track books have a zero offset and are
+unaffected. When the offset cannot be established — a preceding track has no
+transcript row yet, or a NULL/zero `duration_seconds` — the chapter fields are
+left **unset** and the label is suppressed: a missing chapter label is honest,
+a plausible-but-wrong chapter title is not.
+
+**Per-result metadata fields** in the structured payload of both search tools and
+`get_chunk_context`: `wordCount` is the whitespace-delimited word count of the
+**full** chunk text (not of a `snippet`-truncated excerpt); `totalChapters` is the
+size of the book's provider chapter list (`0` means "no chapter data for this
+book"); `fileChecksum` is the SHA-256 of the chunk's track from `transcripts`.
+The former `chunkStart`/`chunkEnd` fields (character offsets into `raw_text`)
+**have been removed** — no such column exists and no writer ever populated them,
+so they always serialized as `0`; use the populated `startSec`/`endSec` time
+offsets instead. This is a response-shape change to the structured payload; the
+human-readable text output is unchanged apart from the now-rendered
+`| Words: N` citation segment and the now-populated chapter label.
 
 **Scoped semantic search query strategy (`book` set):** scoped semantic search
 does **NOT** add a `WHERE file_path LIKE` predicate to the HNSW query — pgvector

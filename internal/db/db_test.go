@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/pashagolub/pgxmock/v4"
 	"github.com/pgvector/pgvector-go"
 
+	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 )
 
@@ -22,12 +25,20 @@ var scanResultColumns = []string{
 	"start_sec", "end_sec", "speaker", "similarity", "total_chunks",
 }
 
-// newTestDB builds a DB with only the layout-aware metadata provider populated
-// (no pool). scanResults never touches the pool, so this is sufficient for
-// execution-level scan tests and for exercising the Author/Title derivation.
+// newTestDB builds a DB with the layout-aware metadata provider and a real
+// logger populated (no pool). scanResults never touches the pool, so this is
+// sufficient for execution-level scan tests and for exercising the Author/Title
+// derivation.
+//
+// The logger is NOT optional: log.Logger embeds a *slog.Logger, so a zero-value
+// DB.log panics the moment scanResults takes its debug branch (which it does
+// whenever a per-book lookup query is unexpected by the mock).
 func newTestDB() *DB {
 	const collectionsJSON = `[{"root":"audio-libation","layout":"author/title"},{"root":"audio-custom","layout":"author"}]`
-	return &DB{meta: metaprovider.NewPathProvider(collectionsJSON, "/books")}
+	return &DB{
+		meta: metaprovider.NewPathProvider(collectionsJSON, "/books"),
+		log:  log.NewLogger("db"),
+	}
 }
 
 func TestComputeFileChecksum(t *testing.T) {
@@ -119,14 +130,78 @@ func TestScanResultsMetadata(t *testing.T) {
 	}
 }
 
+// ─── Per-book enrichment fixtures (chapters + tracks) ────────────────────────
+
+const (
+	testLibationDir   = "/books/audio-libation/Jonathan Haidt/The Righteous Mind"
+	testLibationTrk1  = testLibationDir + "/01 - Chapter 1.m4b"
+	testLibationTrk2  = testLibationDir + "/02 - Chapter 2.m4b"
+	testCustomDir     = "/books/audio-custom/Jonathan Haidt"
+	testCustomTrack   = testCustomDir + "/The Coddling of the American Mind.m4b"
+	testChaptersCols  = "chapters"
+	testTrackCheck1   = "sha256-track-1"
+	testTrackCheck2   = "sha256-track-2"
+	testCustomChecksm = "sha256-custom"
+)
+
+// testBookChapters is a BOOK-ABSOLUTE chapter timeline (the shape a provider
+// like Audiobookshelf returns): times run across all tracks concatenated. Track
+// 1 is 1000 s long, so anything at ~1000 s belongs to track 2 — see
+// chaptersJSONFixture / trackRows below.
+var testBookChapters = []metaprovider.Chapter{
+	{Index: 0, Title: "Front Matter", StartSec: 0, EndSec: 60},
+	{Index: 1, Title: "Chapter 1", StartSec: 60, EndSec: 900},
+	{Index: 2, Title: "Chapter 2", StartSec: 900, EndSec: 2000},
+}
+
+func chaptersJSONFixture(t *testing.T, chapters []metaprovider.Chapter) []byte {
+	t.Helper()
+	b, err := json.Marshal(chapters)
+	if err != nil {
+		t.Fatalf("marshal chapters fixture: %v", err)
+	}
+	return b
+}
+
+// expectBookContext queues the two per-book_dir reads scanResults issues:
+// book_metadata.chapters, then the book's transcripts rows (path, duration,
+// checksum) in play order. Pass a nil chaptersJSON for a book with no metadata
+// row content.
+func expectBookContext(mock pgxmock.PgxPoolIface, bookDir string, chaptersJSON []byte, tracks [][]any) {
+	mock.ExpectQuery("SELECT chapters FROM book_metadata").
+		WithArgs(bookDir).
+		WillReturnRows(pgxmock.NewRows([]string{testChaptersCols}).AddRow(chaptersJSON))
+
+	trackRows := pgxmock.NewRows([]string{"file_path", "duration_seconds", "checksum"})
+	for _, tr := range tracks {
+		trackRows = trackRows.AddRow(tr...)
+	}
+	mock.ExpectQuery("duration_seconds, checksum").
+		WithArgs(bookDir).
+		WillReturnRows(trackRows)
+}
+
+func fp(v float64) *float64 { return &v }
+
+// errBookContextTest is the canned failure used to prove the per-book
+// enrichment reads are best-effort.
+var errBookContextTest = errors.New("book context unavailable")
+
 // TestScanResultsPopulatesFields drives db.scanResults() at execution level with
-// pgxmock-produced rows and asserts that all 9 scanned columns AND the 4 derived
-// fields (Author, Title, Chapter, ChunkID) land in the right struct fields.
+// pgxmock-produced rows and asserts that all 9 scanned columns AND every derived
+// field (Author, Title, Chapter, ChunkID, WordCount, TotalChapters,
+// FileChecksum, ChapterIndex/ChapterTitle) land in the right struct fields.
 //
 // This is the test the resolver-only TestScanResultsMetadata could not provide:
 // it actually exercises the rows.Scan() argument order, the *string speaker
 // dereference (including a nil case), the r.ChunkID = r.ID assignment, and the
 // layout-aware Author/Title resolution for both 3-level and 2-level layouts.
+//
+// It is ALSO the regression test for issue #125: rows 1 and 2 are two different
+// TRACKS of the same book with near-identical track-relative start_sec values.
+// Chunk start_sec is track-relative while the chapter list is book-absolute, so
+// the later track must resolve to a LATER chapter. Before the fix both rows
+// mapped through start_sec directly and came back as "Front Matter".
 func TestScanResultsPopulatesFields(t *testing.T) {
 	db := newTestDB()
 
@@ -138,22 +213,33 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 
 	speaker := "SPEAKER_01"
 	rows := pgxmock.NewRows(scanResultColumns).
-		// 3-level libation layout, non-nil speaker.
+		// 3-level libation layout, track 1, non-nil speaker.
 		AddRow(
 			"chunk-1",
 			"the elephant and the rider",
-			"/books/audio-libation/Jonathan Haidt/The Righteous Mind/01 - Chapter 1.m4b",
+			testLibationTrk1,
 			3,
 			12.5, 18.0,
 			&speaker,
 			0.91,
 			42,
 		).
-		// 2-level custom single-file layout, nil speaker.
+		// Same book, track 2 — same small track-relative start_sec as row 1.
 		AddRow(
 			"chunk-2",
+			"moral intuitions come first strategic reasoning second",
+			testLibationTrk2,
+			1,
+			12.5, 20.0,
+			&speaker,
+			0.80,
+			42,
+		).
+		// 2-level custom single-file layout, nil speaker.
+		AddRow(
+			"chunk-3",
 			"a different passage entirely",
-			"/books/audio-custom/Jonathan Haidt/The Coddling of the American Mind.m4b",
+			testCustomTrack,
 			0,
 			0.0, 5.0,
 			nil,
@@ -162,6 +248,13 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 		)
 
 	mock.ExpectQuery("SELECT").WithArgs("elephant", 10).WillReturnRows(rows)
+	expectBookContext(mock, testLibationDir, chaptersJSONFixture(t, testBookChapters), [][]any{
+		{testLibationTrk1, fp(1000), testTrackCheck1},
+		{testLibationTrk2, fp(1000), testTrackCheck2},
+	})
+	expectBookContext(mock, testCustomDir, nil, [][]any{
+		{testCustomTrack, fp(3600), testCustomChecksm},
+	})
 
 	// Run through the public query path so Query() is actually invoked.
 	got, err := db.textSearch(context.Background(), mock, "elephant", 10)
@@ -172,8 +265,8 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 		t.Fatalf("unmet expectations: %v", err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("got %d results, want 2", len(got))
+	if len(got) != 3 {
+		t.Fatalf("got %d results, want 3", len(got))
 	}
 
 	// ── Row 1: all 9 scanned fields + 4 derived fields ────────────────────────
@@ -187,7 +280,7 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 	if r.Content != "the elephant and the rider" {
 		t.Errorf("Content = %q", r.Content)
 	}
-	if r.FilePath != "/books/audio-libation/Jonathan Haidt/The Righteous Mind/01 - Chapter 1.m4b" {
+	if r.FilePath != testLibationTrk1 {
 		t.Errorf("FilePath = %q", r.FilePath)
 	}
 	if r.ChunkIndex != 3 {
@@ -218,20 +311,240 @@ func TestScanResultsPopulatesFields(t *testing.T) {
 	if r.Chapter != "01 - Chapter 1.m4b" {
 		t.Errorf("Chapter = %q, want 01 - Chapter 1.m4b", r.Chapter)
 	}
+	// Per-book enrichment: chapter list size, track checksum, chunk word count.
+	if r.TotalChapters != len(testBookChapters) {
+		t.Errorf("TotalChapters = %d, want %d", r.TotalChapters, len(testBookChapters))
+	}
+	if r.FileChecksum != testTrackCheck1 {
+		t.Errorf("FileChecksum = %q, want %q", r.FileChecksum, testTrackCheck1)
+	}
+	if r.WordCount != 5 {
+		t.Errorf("WordCount = %d, want 5 (%q)", r.WordCount, r.Content)
+	}
+	// Track 1 @ 12.5 s → book-absolute 12.5 s → "Front Matter".
+	if r.ChapterIndex != 0 || r.ChapterTitle != "Front Matter" {
+		t.Errorf("row1 chapter = (%d, %q), want (0, %q)", r.ChapterIndex, r.ChapterTitle, "Front Matter")
+	}
 
-	// ── Row 2: nil speaker + 2-level layout ──────────────────────────────────
+	// ── Row 2: the issue #125 regression ─────────────────────────────────────
+	// Track 2 @ 12.5 s is 1012.5 s into the BOOK (track 1 is 1000 s), which is
+	// "Chapter 2". Mapping the raw track-relative start_sec would return
+	// "Front Matter" — identical to row 1 — which was the bug.
 	r2 := got[1]
-	if r2.Speaker != nil {
-		t.Errorf("Speaker = %v, want nil for row 2", r2.Speaker)
+	if r2.ChapterTitle != "Chapter 2" || r2.ChapterIndex != 2 {
+		t.Errorf("row2 chapter = (%d, %q), want (2, %q) — track-relative start_sec must be offset by preceding track durations",
+			r2.ChapterIndex, r2.ChapterTitle, "Chapter 2")
 	}
-	if r2.Author != "Jonathan Haidt" {
-		t.Errorf("row2 Author = %q, want Jonathan Haidt", r2.Author)
+	if r2.ChapterTitle == r.ChapterTitle {
+		t.Errorf("row1 and row2 are different tracks but both resolved to %q", r2.ChapterTitle)
 	}
-	if r2.Title != "The Coddling of the American Mind" {
-		t.Errorf("row2 Title = %q, want The Coddling of the American Mind", r2.Title)
+	if r2.FileChecksum != testTrackCheck2 {
+		t.Errorf("row2 FileChecksum = %q, want %q", r2.FileChecksum, testTrackCheck2)
 	}
-	if r2.ChunkID != "chunk-2" {
-		t.Errorf("row2 ChunkID = %q, want chunk-2", r2.ChunkID)
+	if r2.WordCount != 7 {
+		t.Errorf("row2 WordCount = %d, want 7 (%q)", r2.WordCount, r2.Content)
+	}
+
+	// ── Row 3: nil speaker + 2-level layout, no chapter data ─────────────────
+	r3 := got[2]
+	if r3.Speaker != nil {
+		t.Errorf("Speaker = %v, want nil for row 3", r3.Speaker)
+	}
+	if r3.Author != "Jonathan Haidt" {
+		t.Errorf("row3 Author = %q, want Jonathan Haidt", r3.Author)
+	}
+	if r3.Title != "The Coddling of the American Mind" {
+		t.Errorf("row3 Title = %q, want The Coddling of the American Mind", r3.Title)
+	}
+	if r3.ChunkID != "chunk-3" {
+		t.Errorf("row3 ChunkID = %q, want chunk-3", r3.ChunkID)
+	}
+	// No chapters row → no label, and TotalChapters is a genuine 0 sentinel.
+	if r3.TotalChapters != 0 || r3.ChapterTitle != "" || r3.ChapterIndex != 0 {
+		t.Errorf("row3 chapter fields = (%d, %d, %q), want all zero",
+			r3.TotalChapters, r3.ChapterIndex, r3.ChapterTitle)
+	}
+	if r3.FileChecksum != testCustomChecksm {
+		t.Errorf("row3 FileChecksum = %q, want %q", r3.FileChecksum, testCustomChecksm)
+	}
+	if r3.WordCount != 4 {
+		t.Errorf("row3 WordCount = %d, want 4 (%q)", r3.WordCount, r3.Content)
+	}
+}
+
+// TestScanResultsSingleTrackBookChapterMapping is the no-regression guard for
+// single-file books: with one track the book offset is 0, so a chunk's
+// track-relative start_sec is already book-absolute and must map exactly as it
+// did before the offset fix.
+func TestScanResultsSingleTrackBookChapterMapping(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	const singleTrack = testCustomDir + "/The Coddling of the American Mind.m4b"
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("chunk-1", "safetyism on campus", singleTrack, 0, 30.0, 40.0, nil, 0.9, 12).
+		AddRow("chunk-2", "the untruth of fragility", singleTrack, 9, 1500.0, 1520.0, nil, 0.8, 12)
+
+	mock.ExpectQuery("SELECT").WithArgs("campus", 10).WillReturnRows(rows)
+	expectBookContext(mock, testCustomDir, chaptersJSONFixture(t, testBookChapters), [][]any{
+		{singleTrack, fp(2000), testCustomChecksm},
+	})
+
+	got, err := db.textSearch(context.Background(), mock, "campus", 10)
+	if err != nil {
+		t.Fatalf("textSearch: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d results, want 2", len(got))
+	}
+	if got[0].ChapterIndex != 0 || got[0].ChapterTitle != "Front Matter" {
+		t.Errorf("chunk @30s chapter = (%d, %q), want (0, \"Front Matter\")",
+			got[0].ChapterIndex, got[0].ChapterTitle)
+	}
+	if got[1].ChapterIndex != 2 || got[1].ChapterTitle != "Chapter 2" {
+		t.Errorf("chunk @1500s chapter = (%d, %q), want (2, \"Chapter 2\")",
+			got[1].ChapterIndex, got[1].ChapterTitle)
+	}
+}
+
+// TestScanResultsUnknownTrackDurationLeavesChapterUnset covers the honesty rule:
+// when a preceding track's duration is NULL (or 0) the book offset is unknowable,
+// so the chapter fields stay unset rather than reporting a plausible-but-wrong
+// chapter. The other enrichment fields (checksum, totals, word count) are still
+// populated.
+func TestScanResultsUnknownTrackDurationLeavesChapterUnset(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("chunk-2", "moral intuitions come first", testLibationTrk2, 1, 12.5, 20.0, nil, 0.8, 42)
+
+	mock.ExpectQuery("SELECT").WithArgs("intuitions", 10).WillReturnRows(rows)
+	expectBookContext(mock, testLibationDir, chaptersJSONFixture(t, testBookChapters), [][]any{
+		// Track 1's duration is NULL — the offset of track 2 is unknowable.
+		{testLibationTrk1, nil, testTrackCheck1},
+		{testLibationTrk2, fp(1000), testTrackCheck2},
+	})
+
+	got, err := db.textSearch(context.Background(), mock, "intuitions", 10)
+	if err != nil {
+		t.Fatalf("textSearch: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+	r := got[0]
+	if r.ChapterTitle != "" || r.ChapterIndex != 0 {
+		t.Errorf("chapter = (%d, %q), want unset — an unknown offset must not produce a label",
+			r.ChapterIndex, r.ChapterTitle)
+	}
+	if r.TotalChapters != len(testBookChapters) {
+		t.Errorf("TotalChapters = %d, want %d (chapter data exists, only the offset is unknown)",
+			r.TotalChapters, len(testBookChapters))
+	}
+	if r.FileChecksum != testTrackCheck2 {
+		t.Errorf("FileChecksum = %q, want %q", r.FileChecksum, testTrackCheck2)
+	}
+	if r.WordCount != 4 {
+		t.Errorf("WordCount = %d, want 4", r.WordCount)
+	}
+}
+
+// TestScanResultsBookContextFailureIsNonFatal asserts the enrichment reads are
+// best-effort: when the per-book queries error the search still returns its rows
+// with the scanned columns and the provider-derived labels intact.
+func TestScanResultsBookContextFailureIsNonFatal(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("chunk-1", "the elephant and the rider", testLibationTrk1, 3, 12.5, 18.0, nil, 0.9, 42)
+
+	mock.ExpectQuery("SELECT").WithArgs("elephant", 10).WillReturnRows(rows)
+	mock.ExpectQuery("SELECT chapters FROM book_metadata").
+		WithArgs(testLibationDir).
+		WillReturnError(errBookContextTest)
+	mock.ExpectQuery("duration_seconds, checksum").
+		WithArgs(testLibationDir).
+		WillReturnError(errBookContextTest)
+
+	got, err := db.textSearch(context.Background(), mock, "elephant", 10)
+	if err != nil {
+		t.Fatalf("textSearch must not fail when book enrichment fails: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+	r := got[0]
+	if r.Title != "The Righteous Mind" || r.Author != "Jonathan Haidt" {
+		t.Errorf("provider labels lost: author=%q title=%q", r.Author, r.Title)
+	}
+	if r.WordCount != 5 {
+		t.Errorf("WordCount = %d, want 5", r.WordCount)
+	}
+	if r.ChapterTitle != "" || r.TotalChapters != 0 || r.FileChecksum != "" {
+		t.Errorf("expected empty enrichment on error, got chapter=%q totalChapters=%d checksum=%q",
+			r.ChapterTitle, r.TotalChapters, r.FileChecksum)
+	}
+}
+
+// TestLoadBookContextCachedPerBookDir asserts scanResults loads a book's
+// chapters+tracks ONCE per distinct book_dir: three chunks from the same book
+// must issue exactly one pair of enrichment queries (pgxmock fails on a fourth,
+// unexpected query).
+func TestLoadBookContextCachedPerBookDir(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("chunk-1", "one", testLibationTrk1, 0, 1.0, 2.0, nil, 0.9, 42).
+		AddRow("chunk-2", "two", testLibationTrk1, 1, 3.0, 4.0, nil, 0.8, 42).
+		AddRow("chunk-3", "three", testLibationTrk2, 0, 1.0, 2.0, nil, 0.7, 42)
+
+	mock.ExpectQuery("SELECT").WithArgs("one", 10).WillReturnRows(rows)
+	expectBookContext(mock, testLibationDir, chaptersJSONFixture(t, testBookChapters), [][]any{
+		{testLibationTrk1, fp(1000), testTrackCheck1},
+		{testLibationTrk2, fp(1000), testTrackCheck2},
+	})
+
+	got, err := db.textSearch(context.Background(), mock, "one", 10)
+	if err != nil {
+		t.Fatalf("textSearch: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d results, want 3", len(got))
 	}
 }
 
