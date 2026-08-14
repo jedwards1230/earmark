@@ -69,6 +69,11 @@ config:
   # if you change this.
   ingestHttpAddr: ":8082"
   staleJobTimeout: "30m"
+  # scanInterval is how often the monitor re-walks booksDir for new audio files,
+  # in addition to the startup walk. fsnotify never fires for files written by
+  # another NFS client (e.g. straight onto the file server), so this recurring
+  # walk is what actually discovers new books. "0" disables it. CONTRACT §2.4.
+  scanInterval: "1h"
   chunkSize: "512"
   # logFormat: "json" emits structured slog JSON (parseable in Loki) on both pods;
   # "pretty" keeps the human-readable handler. CONTRACT §2.4. Default json in K8s.

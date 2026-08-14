@@ -61,7 +61,7 @@ CREATE TABLE transcripts (
     file_path        TEXT        NOT NULL,
     checksum         TEXT        NOT NULL,
     language         TEXT        NOT NULL,   -- ISO 639-1, e.g. "en"
-    duration_seconds FLOAT8      NOT NULL,
+    duration_seconds FLOAT8      NOT NULL,   -- length of THIS track (see time bases below)
     speaker_count    INTEGER,               -- NULL when diarization disabled
     segments         JSONB       NOT NULL,  -- []Segment (see CONTRACT §1.2.1)
     raw_text         TEXT        NOT NULL,  -- full transcript, concatenated
@@ -74,6 +74,23 @@ CREATE TABLE transcripts (
 CREATE INDEX transcripts_file_path_idx     ON transcripts (file_path);
 CREATE INDEX transcripts_raw_text_trgm_idx ON transcripts USING gin (raw_text gin_trgm_ops);
 ```
+
+#### ⚠️ Time bases: one transcript per TRACK, not per book
+
+There is exactly **one row per audio file** (`transcripts_job_id_unique`, and one
+job per file). A multi-track book therefore has several `transcripts` rows, and
+every time value in them — `segments[].start/end`, `duration_seconds`, and the
+derived `transcript_chunks.start_sec/end_sec` — is **relative to the start of
+that track**, restarting at ~0 for each new file.
+
+Provider chapter lists (`book_metadata.chapters`, CONTRACT §1.6) use the opposite
+base: they are **book-absolute** across all tracks concatenated in play order.
+Anything mapping a chunk to a chapter must first add the track's book offset —
+the summed `duration_seconds` of the preceding tracks of the same `book_dir`,
+ordered by `file_path` (see `metaprovider.ChapterForTrackSec`). Mixing the two
+bases silently maps every track to the book's opening chapters. A NULL/zero
+preceding `duration_seconds` makes the offset unknowable, and callers must then
+report no chapter rather than a guess.
 
 #### Segment JSON Shape (`segments` column)
 
@@ -108,8 +125,8 @@ CREATE TABLE transcript_chunks (
     transcript_id UUID        NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
     file_path     TEXT        NOT NULL,
     chunk_index   INTEGER     NOT NULL,
-    start_sec     FLOAT8      NOT NULL,   -- earliest segment start in this chunk
-    end_sec       FLOAT8      NOT NULL,   -- latest segment end in this chunk
+    start_sec     FLOAT8      NOT NULL,   -- earliest segment start in this chunk; TRACK-relative
+    end_sec       FLOAT8      NOT NULL,   -- latest segment end in this chunk; TRACK-relative
     text          TEXT        NOT NULL,
     speaker       TEXT,                   -- dominant speaker, or NULL
     embedding     VECTOR(768) NOT NULL,   -- nomic-embed-text; MUST match EMBEDDINGS_MODEL
@@ -124,6 +141,12 @@ CREATE INDEX transcript_chunks_file_path_idx ON transcript_chunks (file_path);
 CREATE INDEX transcript_chunks_text_trgm_idx
     ON transcript_chunks USING gin (text gin_trgm_ops);
 ```
+
+**Timestamps are TRACK-relative**: `start_sec`/`end_sec` are copied from the
+parent transcript's segment boundaries, so they are offsets into the chunk's own
+audio file — chunk 0 of track 7 starts at ~0, not at track 7's position in the
+book. They are **not** comparable with `book_metadata.chapters` times, which are
+book-absolute; see the time-bases note under `transcripts` above.
 
 **Vector dimension**: 768 (nomic-embed-text). Any model change requires a full
 re-embed and a column type migration.
@@ -193,8 +216,9 @@ INSERT INTO runner_control (id, paused) VALUES (1, false) ON CONFLICT (id) DO NO
 ### 6. `book_metadata` — Per-book Enrichment (CONTRACT §1.6)
 
 One row per book directory. Written best-effort by the Go monitor at enqueue.
-Read by the Python runner to drive NeMo word-boosting (`bias_terms`). A missing
-row never blocks the pipeline.
+Read by the Python runner to drive NeMo word-boosting (`bias_terms`), and by the
+Go **MCP layer** for `chapters` + `series` (see below). A missing row never
+blocks the pipeline.
 
 ```sql
 CREATE TABLE IF NOT EXISTS book_metadata (
@@ -212,6 +236,24 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 ```
 
 `bias_terms` is re-derived from metadata on every write (never COALESCE-guarded).
+
+`chapters` is a JSONB array of `{"Index","Title","StartSec","EndSec"}` objects
+whose times are **book-absolute** — measured from the start of the whole book,
+all tracks concatenated in play order (that is what Audiobookshelf's
+`media.chapters` reports). Mapping a `transcript_chunks` row into this list
+requires adding the chunk's track offset first; see the time-bases note under
+`transcripts` (§2).
+
+`series` is a comma-joined list of `Name #Sequence` entries — a book can belong
+to several series, e.g. `"Dune #2, The Dune Sequence #13"`. The `#Sequence` part
+is optional, and the sequence is **not** necessarily an integer (novellas are
+commonly `#1.5`; non-numeric positions are legal). The **Go MCP layer reads this
+column** — `metaprovider.ParseSeries` turns it into `[{name, sequence}]` with a
+**string**-typed sequence, surfaced on `list_books` entries and on every search /
+`get_chunk_context` result row (CONTRACT §2.2.1). It is read together with
+`chapters` in one `SELECT chapters, series FROM book_metadata WHERE book_dir = $1`
+per book directory (cached per result set), and via a `LEFT JOIN` on `book_dir`
+for the `list_books` inventory and its `series` filter.
 
 ### 7. `transcript_findings` — Read-only Eval Layer (CONTRACT §2.15)
 

@@ -11,6 +11,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestFormatSearchResults covers the get_chunk_context path: positional
@@ -84,7 +85,9 @@ func TestFormatSemanticVsTextRelevance(t *testing.T) {
 
 // TestSnippetTruncation covers both truncation paths: text search centres the
 // window on the literal match; semantic search returns a leading preview. Both
-// append the get_chunk_context marker only when actually shortened.
+// append the get_chunk_context marker only when actually shortened. The
+// structured payload must honour the same window (issue #124: it used to carry
+// the full untruncated chunk), minus the human-prose marker.
 func TestSnippetTruncation(t *testing.T) {
 	// A leading run of filler well over the 80-char window, then NEEDLE far out so
 	// a leading preview clearly excludes it while a centred window includes it.
@@ -92,26 +95,69 @@ func TestSnippetTruncation(t *testing.T) {
 		"omicron pi rho sigma tau upsilon phi chi psi omega aaa bbb ccc ddd eee fff " +
 		"ggg hhh iii jjj NEEDLE kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www"
 	res := []db.SearchResultWithMetadata{{
-		ID: "c1", Content: long, Author: "A", Title: "B", ChunkIndex: 0, TotalChunks: 1, ChunkID: "c1",
+		ID: "c1", Content: long, Author: "A", Title: "B", ChunkIndex: 0, TotalChunks: 1,
+		ChunkID: "c1", WordCount: len(strings.Fields(long)),
 	}}
 
 	// Text search, snippet=80, query NEEDLE → centred excerpt that includes NEEDLE.
-	text := formatSearchResultsOpts(res, searchText, "NEEDLE", 80).Content[0].(*mcp.TextContent).Text
+	textRes := formatSearchResultsOpts(res, searchText, "NEEDLE", 80)
+	text := textRes.Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, text, "NEEDLE")
 	assert.Contains(t, text, "(truncated, use get_chunk_context for full text)")
 	assert.NotContains(t, text, "alpha beta gamma") // leading text dropped by centring
 
+	textOut := structuredRows(t, textRes)
+	require.Len(t, textOut, 1)
+	assert.Less(t, len(textOut[0].Content), len(long), "structured content must honour the snippet window")
+	assert.Contains(t, textOut[0].Content, "NEEDLE")
+	assert.NotContains(t, textOut[0].Content, "(truncated, use get_chunk_context for full text)",
+		"the prose marker is for humans, not the machine payload")
+	// The window is a value change only — full-chunk metadata is untouched.
+	assert.Equal(t, len(strings.Fields(long)), textOut[0].WordCount)
+
 	// Semantic search, snippet=80 → leading preview (starts at alpha, excludes the
 	// far-out NEEDLE since there is no sub-chunk match position to centre on).
-	sem := formatSearchResultsOpts(res, searchSemantic, "NEEDLE", 80).Content[0].(*mcp.TextContent).Text
+	semRes := formatSearchResultsOpts(res, searchSemantic, "NEEDLE", 80)
+	sem := semRes.Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, sem, "alpha beta")
 	assert.NotContains(t, sem, "NEEDLE")
 	assert.Contains(t, sem, "(truncated, use get_chunk_context for full text)")
 
+	semOut := structuredRows(t, semRes)
+	require.Len(t, semOut, 1)
+	assert.Less(t, len(semOut[0].Content), len(long))
+	assert.Contains(t, semOut[0].Content, "alpha beta")
+	assert.NotContains(t, semOut[0].Content, "NEEDLE")
+
+	// The source slice must not be mutated in place — callers keep the full rows.
+	assert.Equal(t, long, res[0].Content, "input rows must not be rewritten")
+
 	// snippet larger than the content → no truncation, no marker.
-	full := formatSearchResultsOpts(res, searchSemantic, "", 100000).Content[0].(*mcp.TextContent).Text
+	fullRes := formatSearchResultsOpts(res, searchSemantic, "", 100000)
+	full := fullRes.Content[0].(*mcp.TextContent).Text
 	assert.Contains(t, full, long)
 	assert.NotContains(t, full, "(truncated")
+	assert.Equal(t, long, structuredRows(t, fullRes)[0].Content)
+
+	// snippet=0 (the default) → structured content is identical to the source row.
+	offRes := formatSearchResultsOpts(res, searchText, "NEEDLE", 0)
+	assert.Contains(t, offRes.Content[0].(*mcp.TextContent).Text, long)
+	assert.Equal(t, long, structuredRows(t, offRes)[0].Content)
+
+	// get_chunk_context is never truncated — it exists to return the full text.
+	ctxRes := formatSearchResults(res)
+	assert.Contains(t, ctxRes.Content[0].(*mcp.TextContent).Text, long)
+	assert.Equal(t, long, structuredRows(t, ctxRes)[0].Content)
+}
+
+// structuredRows extracts the typed search rows from a tool result's
+// structuredContent, failing the test if the payload is missing or mistyped.
+func structuredRows(t *testing.T, res *mcp.CallToolResult) []db.SearchResultWithMetadata {
+	t.Helper()
+	require.NotNil(t, res.StructuredContent, "search results must emit structuredContent")
+	out, ok := res.StructuredContent.(SearchResultsOutput)
+	require.True(t, ok, "structuredContent should be a SearchResultsOutput, got %T", res.StructuredContent)
+	return out.Results
 }
 
 // TestMakeSnippetKindGate tests makeSnippet directly to assert the centering gate

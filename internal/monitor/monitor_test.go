@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +56,10 @@ func TestIsAudioFile(t *testing.T) {
 // fakeDB implements DBInterface for unit tests — no real DB needed. It models
 // the production dedup invariant: a job is unique by both checksum and
 // file_path. Maps are lazily initialized so `&fakeDB{}` works.
+// Guarded by mu: runPeriodicScan drives the DB from its own goroutine, so the
+// ticker tests read these counters concurrently with the scan writing them.
 type fakeDB struct {
+	mu           sync.Mutex
 	inserted     map[string]string // checksum -> jobID
 	insertedPath map[string]string // file_path -> jobID
 	insertCalls  int               // times a NEW job was actually created
@@ -72,7 +76,17 @@ type fakeDB struct {
 	pruneCalls int                // times PruneEvents was called
 }
 
+// insertCount returns insertCalls under the lock, for use from a test goroutine
+// while a scan may be running.
+func (f *fakeDB) insertCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.insertCalls
+}
+
 func (f *fakeDB) InsertJobIfAbsent(_ context.Context, filePath, checksum string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.inserted == nil {
 		f.inserted = map[string]string{}
 	}
@@ -93,16 +107,22 @@ func (f *fakeDB) InsertJobIfAbsent(_ context.Context, filePath, checksum string)
 }
 
 func (f *fakeDB) IsPathQueued(_ context.Context, filePath string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	_, ok := f.insertedPath[filePath]
 	return ok, nil
 }
 
 func (f *fakeDB) PruneAppleDoubleJobs(context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.pruned++
 	return 0, nil
 }
 
 func (f *fakeDB) UpsertAudioBytes(_ context.Context, jobID string, bytes int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.audioBytes == nil {
 		f.audioBytes = map[string]int64{}
 	}
@@ -111,16 +131,22 @@ func (f *fakeDB) UpsertAudioBytes(_ context.Context, jobID string, bytes int64) 
 }
 
 func (f *fakeDB) AppendEvent(_ context.Context, e db.PipelineEvent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.events = append(f.events, e)
 	return nil
 }
 
 func (f *fakeDB) PruneEvents(context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.pruneCalls++
 	return 0, nil
 }
 
 func (f *fakeDB) UpsertBookMetadata(_ context.Context, bookDir string, meta metaprovider.BookMeta) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.bookMetaCalls++
 	if f.bookMetaErr != nil {
 		return f.bookMetaErr
@@ -265,11 +291,23 @@ func TestMonitorScan(t *testing.T) {
 
 	db := &fakeDB{inserted: make(map[string]string)}
 	fm := newTestMonitor(dir, db)
-	if err := fm.scan(); err != nil {
+	res, err := fm.scan()
+	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	if len(db.inserted) != 2 {
 		t.Errorf("expected 2 jobs after scan (AppleDouble skipped), got %d", len(db.inserted))
+	}
+	// The result counts must match what actually happened, so an empty scan is
+	// distinguishable from a scan that never ran.
+	if res.walked != 2 {
+		t.Errorf("scan walked = %d, want 2 audio files", res.walked)
+	}
+	if res.enqueued != 2 {
+		t.Errorf("scan enqueued = %d, want 2", res.enqueued)
+	}
+	if res.skipped != 0 {
+		t.Errorf("scan skipped = %d, want 0", res.skipped)
 	}
 
 	// audio_bytes must be recorded for each enqueued file (per-run observability).
@@ -305,19 +343,119 @@ func TestMonitorScanSkipsKnownPaths(t *testing.T) {
 	db := &fakeDB{}
 	fm := newTestMonitor(dir, db)
 
-	if err := fm.scan(); err != nil {
+	first, err := fm.scan()
+	if err != nil {
 		t.Fatalf("first scan: %v", err)
 	}
 	if db.insertCalls != 2 {
 		t.Fatalf("first scan: want 2 inserts, got %d", db.insertCalls)
 	}
+	if first.enqueued != 2 {
+		t.Errorf("first scan: enqueued = %d, want 2", first.enqueued)
+	}
 
 	// Second scan: every path is already queued → no re-hash, no new inserts.
-	if err := fm.scan(); err != nil {
+	// This is the invariant periodic scanning relies on — an hourly re-walk must
+	// be a metadata-only pass, not a re-hash of the whole library.
+	second, err := fm.scan()
+	if err != nil {
 		t.Fatalf("second scan: %v", err)
 	}
 	if db.insertCalls != 2 {
 		t.Errorf("second scan: want still 2 inserts (known paths skipped), got %d", db.insertCalls)
+	}
+	if second.enqueued != 0 {
+		t.Errorf("second scan: enqueued = %d, want 0 (all paths known)", second.enqueued)
+	}
+	if second.walked != 2 {
+		t.Errorf("second scan: walked = %d, want 2 (files still visited)", second.walked)
+	}
+}
+
+// TestMonitorScanUnreadableRootIsAnError verifies that a hard failure on
+// BOOKS_DIR itself still surfaces as an error, even though per-entry errors are
+// log-and-continue.
+func TestMonitorScanUnreadableRootIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	fm := newTestMonitor(filepath.Join(dir, "does-not-exist"), &fakeDB{})
+
+	if _, err := fm.scan(); err == nil {
+		t.Error("expected an error when BOOKS_DIR is unreadable")
+	}
+}
+
+// TestMonitorPeriodicScanEnqueuesNewFiles is the regression test for #126: a
+// file that appears after startup must be discovered by the periodic walk alone.
+// No fsnotify watcher is running here, so the ticker is the only thing that can
+// find it.
+func TestMonitorPeriodicScanEnqueuesNewFiles(t *testing.T) {
+	dir := t.TempDir()
+	fdb := &fakeDB{}
+	fm := newTestMonitor(dir, fdb)
+	fm.scanInterval = 10 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fm.runPeriodicScan()
+	}()
+	t.Cleanup(func() {
+		fm.cancel()
+		<-done
+	})
+
+	// Simulate a book landing on the NFS mount from another client, after the
+	// monitor has already started.
+	if err := os.WriteFile(filepath.Join(dir, "ch01.mp3"), []byte("late arrival"), 0600); err != nil {
+		t.Fatalf("write late file: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for fdb.insertCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("periodic scan did not enqueue the file added after start")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	if got := fdb.insertCount(); got != 1 {
+		t.Errorf("want exactly 1 insert from repeated scans, got %d", got)
+	}
+}
+
+// TestMonitorPeriodicScanDisabled verifies the documented escape hatch: a
+// non-positive interval disables the ticker (and must not panic — time.NewTicker
+// panics on a non-positive duration).
+func TestMonitorPeriodicScanDisabled(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ch01.mp3"), []byte("audio"), 0600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	for _, interval := range []time.Duration{0, -time.Second} {
+		t.Run(interval.String(), func(t *testing.T) {
+			fdb := &fakeDB{}
+			fm := newTestMonitor(dir, fdb)
+			fm.scanInterval = interval
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				fm.runPeriodicScan()
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				fm.cancel()
+				t.Fatal("runPeriodicScan should return immediately when the interval is non-positive")
+			}
+
+			if got := fdb.insertCount(); got != 0 {
+				t.Errorf("disabled periodic scan must not scan; got %d inserts", got)
+			}
+		})
 	}
 }
 

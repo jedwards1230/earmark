@@ -51,17 +51,20 @@ removed — `list_books format=tree` covers that use case.
 
 ### `list_books`
 
-Library inventory: per-book author, title, track progress (done/total), duration,
-word count, and embedded-chunk count. Ordered transcribed-first. Leads with a
-one-line library summary (`Library: T books — P fully transcribed, Q with pending
-tracks.`).
+Library inventory: per-book author, title, series membership, track progress
+(done/total), duration, word count, and embedded-chunk count. Ordered
+transcribed-first. Leads with a one-line library summary (`Library: T books — P
+fully transcribed, Q with pending tracks.`).
 
 | Param | Default | Notes |
 |-------|---------|-------|
 | `author` | — | substring filter |
-| `format` | `flat` | `flat` (omits `dir:`) or `tree` (groups by author, keeps `dir:`) |
+| `series` | — | case-insensitive substring on `book_metadata.series` (`Dune` matches `Dune #2` **and** `The Dune Sequence #13`); excludes books with no series row |
+| `format` | `flat` | `flat` (omits `dir:`), `tree` (groups by author, keeps `dir:`), or `series` (groups by series name, ordered by sequence, trailing **No series** group) |
 | `limit` | 50 | |
 | `offset` | 0 | |
+
+Each structured book carries `series[]` — see [Series on results](#series-on-results).
 
 ### `semantic_search_audiobooks`
 
@@ -74,7 +77,7 @@ default; `book` scopes to one title via ASIN-aware resolution.
 | `book` | — | title/author substring or bracketed ASIN |
 | `threshold` | 0.3 | cosine similarity floor (0–1) |
 | `limit` | 10 | |
-| `snippet` | 0 (full chunk) | max chars; values below 80 raised to 80, above 4000 capped |
+| `snippet` | 0 (full chunk) | max chars of the text output **and** `structuredContent.results[].content`; values below 80 raised to 80, above 4000 capped |
 
 ### `text_search_audiobooks`
 
@@ -86,7 +89,7 @@ similarity %). `snippet` centres the excerpt on the literal match.
 | `query` | required | |
 | `book` | — | same resolution as semantic search |
 | `limit` | 10 | |
-| `snippet` | 0 (full chunk) | centres window on the match |
+| `snippet` | 0 (full chunk) | centres window on the match, in the text output **and** `structuredContent.results[].content` |
 
 ### `get_transcript`
 
@@ -110,6 +113,29 @@ search result's `ID` field.
 |-------|---------|-------|
 | `chunkID` | required | UUID from a search hit |
 | `contextWindow` | 1 | chunks before/after (clamped 0–50); default → ~3 chunks |
+
+## Series on results
+
+`book_metadata.series` (CONTRACT §1.6) stores a comma-joined list of
+`Name #Sequence` entries — a book can be in several series, e.g.
+`"Dune #2, The Dune Sequence #13"`. Every `list_books` book and every search /
+`get_chunk_context` result row exposes it parsed by `metaprovider.ParseSeries`:
+
+```json
+"series": [
+  { "name": "Dune", "sequence": "2" },
+  { "name": "The Dune Sequence", "sequence": "13" }
+]
+```
+
+`sequence` is a **string**, not a number: novellas are commonly `#1.5` and
+non-numeric positions exist, so a numeric type would truncate or reject real
+values. `sequence` is absent for a membership with no declared position, and the
+whole `series` key is **omitted** for a book with no series metadata — an
+**additive** response-shape change (no existing field changed). The per-book read
+is folded into the existing `loadBookContext` query (`SELECT chapters, series …`),
+cached per `book_dir`, so it adds no round-trips; `list_books` gets it from a
+`LEFT JOIN book_metadata` outside the aggregate CTE.
 
 ## Transport
 

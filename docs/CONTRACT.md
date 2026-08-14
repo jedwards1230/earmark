@@ -655,8 +655,9 @@ Rules:
 One row per **book directory** (`book_dir = filepath.Dir(file_path)` of any
 track under the book). It is **additive** — nothing in §1.1–§1.5 or §3 depends
 on it, and a missing row never blocks the pipeline. Writer: **Go monitor**, at
-enqueue time via `MetadataProvider.Lookup`. Reader: the Python ASR runner reads
-`bias_terms` to drive NeMo word-boosting.
+enqueue time via `MetadataProvider.Lookup`. Readers: the Python ASR runner reads
+`bias_terms` to drive NeMo word-boosting; the **Go MCP read path** reads
+`chapters` and `series` (see below).
 
 ```sql
 CREATE TABLE IF NOT EXISTS book_metadata (
@@ -680,6 +681,28 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 | **Go monitor** | at every enqueue (via `db.UpsertBookMetadata`) | `title`, `author`, `bias_terms`, `source` |
 | **Go monitor — ABS path** | when METADATA_PROVIDER includes ABS | `narrator`, `series`, `asin`, `chapters` |
 
+#### Column readers
+
+| Reader | When | Columns it reads |
+|--------|------|------------------|
+| **Python ASR runner** | before each transcription | `bias_terms` (NeMo word-boosting) |
+| **Go MCP layer** | per search-result book (`db.loadBookContext`, cached per `book_dir`) | `chapters`, `series` |
+| **Go MCP layer** | `list_books` (LEFT JOIN on `book_dir`) | `series` |
+
+`chapters` and `series` are read in a **single** `SELECT chapters, series FROM
+book_metadata WHERE book_dir = $1` per distinct book directory in a result set,
+cached for the rest of that set — never per row.
+
+**`series` format:** a comma-joined list of `Name #Sequence` entries, because a
+book can belong to several series — e.g. `"Dune #2, The Dune Sequence #13"`. The
+`#Sequence` part is optional (a membership with no declared position), and the
+sequence is **not** necessarily an integer: novellas are commonly `#1.5`, and
+non-numeric positions are legal. `metaprovider.ParseSeries` splits this into
+`[]SeriesRef{{Name, Sequence}}` with **Sequence typed as a string** so no real
+value is truncated or rejected. A series name containing a comma is
+indistinguishable from the separator — an accepted limitation, since ABS joins
+memberships with `", "`.
+
 `bias_terms` is derived by `metaprovider.DeriveBiasTerms(meta)` inside
 `db.UpsertBookMetadata` at every call — both at enqueue time (monitor) and
 during a metadata backfill (`earmark backfill-metadata --yes`). It is
@@ -701,6 +724,12 @@ Rules:
   `bias_terms` is always overwritten (not COALESCE-guarded) so an improved
   metadata source is reflected on the next write.
 - `chapters` is nullable and left `NULL` when no ABS provider is configured.
+- **`chapters` times are BOOK-ABSOLUTE.** Each entry is
+  `{Index, Title, StartSec, EndSec}` with `StartSec`/`EndSec` measured from the
+  start of the **whole book** (all tracks concatenated in play order) — that is
+  what Audiobookshelf's `media.chapters` reports. This is a *different time base*
+  from `transcript_chunks.start_sec`, which is track-relative (§3); readers must
+  add the track's book offset before mapping a chunk into this list (§2.2.1).
 - The Go service creates the table in its schema-init transaction.
 
 ### 1.7 Append-only pipeline audit log — `pipeline_events` table
@@ -755,6 +784,13 @@ Rules:
   stage IN ('heartbeat','runner_availability')` (run from the monitor: once at
   startup, then every 24h). Only the high-frequency heartbeat/availability rows
   are pruned; per-job stage events are low-volume and kept indefinitely.
+
+The retention prune is one of two recurring monitor tickers. The other is the
+**periodic library scan** (`SCAN_INTERVAL`, default `1h`, §2.4), which re-walks
+`BOOKS_DIR` to discover files fsnotify cannot see — writes made by another NFS
+client never raise an inotify event in the monitor pod. Unlike the retention
+prune, the scan ticker does **not** run once immediately: `Start` has already
+performed the startup walk, so it waits for the first tick.
 
 #### Stages: Go-emitted vs deferred (runner-side)
 
@@ -835,7 +871,7 @@ per chunk) that always carries its own `words[]`. The search tools +
 
 | Tool | Purpose | Key params |
 |------|---------|-----------|
-| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. Ordered **transcribed-first** (fully-done books, then partial, then fully-pending). Leads with a one-line whole-library summary (`Library: T books — P fully transcribed, Q with pending tracks.` — TRUE totals across the library, not just the page). `format=flat` (default) **omits each book's `dir:` line** to keep the payload small; `format=tree` groups rows under their authors **and** keeps the `dir:` line. | `author?` (substring filter), `format?` (`flat` default \| `tree`), `limit?` (default 50), `offset?` |
+| `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. Ordered **transcribed-first** (fully-done books, then partial, then fully-pending). Leads with a one-line whole-library summary (`Library: T books — P fully transcribed, Q with pending tracks.` — TRUE totals across the library, not just the page). `format=flat` (default) **omits each book's `dir:` line** to keep the payload small; `format=tree` groups rows under their authors **and** keeps the `dir:` line; `format=series` groups rows under their **series name**, ordered by sequence within each group, with a trailing **"No series"** group so no book disappears (a book in several series is listed under each — by design). | `author?` (substring filter), `series?` (case-insensitive substring on `book_metadata.series`, §1.6 — so `Dune` matches both `Dune #2` and `The Dune Sequence #13`; books with no series row are excluded), `format?` (`flat` default \| `tree` \| `series`), `limit?` (default 50), `offset?` |
 | `semantic_search_audiobooks` | Vector-similarity (meaning) search; hits show a real cosine `similarity: NN%`. Whole library by default; `book` scopes it. `snippet?` caps each hit's quoted text (leading **preview** — no sub-chunk match position). | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `text_search_audiobooks` | Trigram literal/keyword search; hits are labelled **"ranked by trigram match"** (NOT a similarity %, which would mislead on a literal hit). Whole library by default; `book` scopes it. `snippet?` returns an excerpt **centred on the literal match**. | `query` (required), `book?`, `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. Per-word timestamps are **hidden by default**; `includeWordTimestamps=true` adds each segment's `words[]` (word/start/end, plus score/speaker when present) for "exactly when was X said" queries. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments), `includeWordTimestamps?` (false) |
@@ -846,7 +882,8 @@ per chunk) that always carries its own `words[]`. The search tools +
 human-readable text, which is kept as the spec-required back-compat fallback
 (`content[0]`). The structured payloads are: the two search tools +
 `get_chunk_context` → `{ kind, query?, count, results[] }` (`kind` is
-`semantic` \| `trigram` \| `context`; `results` are the raw chunk rows);
+`semantic` \| `trigram` \| `context`; `results` are the chunk rows, with each
+row's `content` honouring the `snippet` window when one is set);
 `list_books` → `{ format, books[], totals, total, offset, nextOffset? }`;
 `get_transcript` → `{ kind: "transcript", filePath, language, modelName,
 durationSeconds, segments[], offset, limit, totalSegments, nextOffset? }` for a
@@ -858,11 +895,32 @@ field is **omitted entirely** by default, so the default response is unchanged.
 Bad user input (missing/unmatched `book`, bad `chunkID`, etc.) returns a
 tool-execution error (`isError`), never a protocol error.
 
+**Series in structured output** (**additive response-shape change** — no existing
+field changed type or meaning, and nothing was removed): both the `list_books`
+`books[]` entries and the search / `get_chunk_context` `results[]` rows carry a
+new optional `series` array parsed from `book_metadata.series` (§1.6). Each entry
+is `{ name, sequence? }`; `sequence` is a **string**, not a number, because
+novellas are commonly `#1.5` and non-numeric positions exist — a numeric type
+would truncate or reject real values. A book can be in several series, so the
+array can hold more than one entry (`"Dune #2, The Dune Sequence #13"` →
+`[{"name":"Dune","sequence":"2"},{"name":"The Dune Sequence","sequence":"13"}]`).
+The field is **omitted entirely** (`omitempty`) for a book with no series
+metadata — the common case for path-sourced books — so a consumer that ignores it
+sees a byte-identical payload. `list_books format=series` regroups only the text
+rendering; the structured `books[]` stays the same flat page in all three formats.
+The whole-library summary line is scoped by `author` only, **not** by `series` —
+it answers "how big is the library", while `total` reports the filtered count.
+
 **Snippet windows** (`snippet` on both search tools): omitted → the full ~400-word
 chunk (backward-compatible). When set, the hit's quoted text is truncated to
 ~`snippet` chars with a `…(truncated, use get_chunk_context for full text)`
-marker. Text search centres the window on the literal query match; semantic
-search returns a **leading preview** (there is no sub-chunk match position) and
+marker. The cap applies to **`structuredContent.results[].content` as well as
+the human-readable text rendering** — a structured consumer never receives the
+full chunk when a window is set (the structured row carries the bare excerpt,
+whose leading/trailing `…` already signal truncation; the prose marker is
+text-rendering only, since `chunkID` already names the follow-up call). Text
+search centres the window on the literal query match; semantic search returns a
+**leading preview** (there is no sub-chunk match position) and
 `get_chunk_context` returns the full surrounding text. A positive value below 80
 is raised to 80 so the excerpt stays readable, and a value above 4000 is capped
 to 4000 (well past a full chunk, so the cap only guards against absurd inputs).
@@ -880,11 +938,36 @@ is resolved to a single canonical `file_path` directory prefix via
 
 Zero or multiple matches return a helpful error listing the candidates.
 
-**Result formatting (search + context):** chapter mapping is not yet populated
-(a future ABS-integration PR fills it in), so the formatter **suppresses the
-chapter label entirely** when there is no real chapter data (chapter index 0 AND
-empty title) — no misleading `Chapter 0:` prefix is emitted. A populated chapter
-(non-zero index or a non-empty title) still renders as `Chapter N: <title>`.
+**Result formatting (search + context):** chapter mapping **is** populated when
+the book has a provider chapter list (`book_metadata.chapters`, §1.6 — in
+practice an ABS-enriched book). The formatter still **suppresses the chapter
+label entirely** when there is no real chapter data (chapter index 0 AND empty
+title) — no misleading `Chapter 0:` prefix is emitted. A populated chapter
+(non-zero index or a non-empty title) renders as `Chapter N: <title>`.
+
+**Chapter time bases (search + context):** a chunk's `startSec`/`endSec` are
+**track-relative** — offsets into the chunk's own audio file, because there is
+one ASR transcript per track — while a provider chapter list is **book-absolute**
+across all of a book's tracks concatenated in play order. Mapping a chunk to a
+chapter therefore adds the chunk's **track offset within the book** (the summed
+durations of the preceding tracks, from `transcripts.duration_seconds` ordered by
+`file_path`) before the lookup. Single-track books have a zero offset and are
+unaffected. When the offset cannot be established — a preceding track has no
+transcript row yet, or a NULL/zero `duration_seconds` — the chapter fields are
+left **unset** and the label is suppressed: a missing chapter label is honest,
+a plausible-but-wrong chapter title is not.
+
+**Per-result metadata fields** in the structured payload of both search tools and
+`get_chunk_context`: `wordCount` is the whitespace-delimited word count of the
+**full** chunk text (not of a `snippet`-truncated excerpt); `totalChapters` is the
+size of the book's provider chapter list (`0` means "no chapter data for this
+book"); `fileChecksum` is the SHA-256 of the chunk's track from `transcripts`.
+The former `chunkStart`/`chunkEnd` fields (character offsets into `raw_text`)
+**have been removed** — no such column exists and no writer ever populated them,
+so they always serialized as `0`; use the populated `startSec`/`endSec` time
+offsets instead. This is a response-shape change to the structured payload; the
+human-readable text output is unchanged apart from the now-rendered
+`| Words: N` citation segment and the now-populated chapter label.
 
 **Scoped semantic search query strategy (`book` set):** scoped semantic search
 does **NOT** add a `WHERE file_path LIKE` predicate to the HNSW query — pgvector
@@ -956,6 +1039,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `INGEST_HTTP_ADDR` | no | `:8082`. The `earmark monitor` (ingest) process serves a minimal HTTP listener here for `/healthz` (liveness) and `/metrics` (Prometheus, §2.16). The mcp pod uses `MCP_HTTP_ADDR` for its surface; this is the ingest pod's only HTTP port. Chosen to avoid colliding with `:8081`. |
 | `LOG_FORMAT` | no | `pretty` (default — human-readable, ANSI-colored `PrettyHandler`). Set `json` for a `slog` JSON handler writing one JSON object per line to stdout (parseable in Loki). Both carry the `module` attribute and honor `LOG_DEBUG`/`LOG_VERBOSE`. Used by both Go pods. |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
+| `SCAN_INTERVAL` | no | `1h` (Go duration string). How often the monitor **re-walks `BOOKS_DIR`** looking for new audio files, in addition to the walk it does at startup. Required for correctness on NFS: fsnotify/inotify only reports writes that pass through the monitor pod's own kernel, so a book written directly on the file server — or by any other NFS client — raises **no** watch event and would otherwise stay undiscovered until the pod restarted. The recurring walk is the backstop; fsnotify remains the low-latency path for local writes. The walk is metadata-only for known paths (already-queued `file_path`s are skipped without re-hashing, §1.1), so it is cheap over a multi-TB library. Per-entry errors (e.g. a transient NFS `EIO` on one subdirectory) are logged, counted, and skipped — one bad directory must never abort, and thereby silently disable, every subsequent scan. **`0` (or a negative value) disables periodic scanning**, leaving only the startup walk and fsnotify. |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `EMBED_BATCH_SIZE` | no | `32`. Max transcripts the embed worker selects **per poll cycle** for BOTH gated-flow (`EVAL_GATES_EMBED`) passes — the eval pass and the embed pass each `… ORDER BY t.created_at ASC LIMIT $1`. Bounds the worker's per-cycle memory: an unbounded selection loads every matching transcript's `segments` JSONB into one slice, which OOM-kills the pod on a large backlog (e.g. a full re-embed after re-segmentation). The worker drains a backlog across cycles — a transcript that gets eval'd/embedded drops out of the next cycle's selection — and **loops immediately (no `pollInterval` sleep) whenever a pass returns a full batch**, so a multi-thousand-item backlog drains in back-to-back cycles rather than one batch per poll interval. Must be a **positive integer** — a non-positive or non-numeric value is fatal at startup (the OOM guard must never silently round-trip to unbounded). The ungated single-pass selection (`GetCompletedTranscripts`) is unaffected. |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |

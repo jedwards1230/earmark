@@ -87,13 +87,17 @@ func textSearchSchema() *jsonschema.Schema {
 	})
 }
 
-// listBooksSchema: no required fields; author, format, limit (default 50),
-// offset (default 0).
+// listBooksSchema: no required fields; author, series, format, limit (default
+// 50), offset (default 0).
 func listBooksSchema() *jsonschema.Schema {
 	return objectSchema(nil, map[string]*jsonschema.Schema{
 		"author": stringProp("Optional: filter to books whose path/author matches this substring (case-insensitive)."),
-		"format": stringProp("Output shape: \"flat\" (default) — one entry per book; or \"tree\" — group books by author. " +
-			"Both list the same books with the same metadata; tree only changes the grouping."),
+		"series": stringProp("Optional: filter to books in a series whose name matches this substring (case-insensitive). " +
+			"e.g. \"Dune\" matches both \"Dune #2\" and \"The Dune Sequence #13\". Books with no series metadata are excluded."),
+		"format": stringProp("Output shape: \"flat\" (default) — one entry per book; \"tree\" — group books by author; " +
+			"or \"series\" — group books by series name, ordered by sequence within each series (books with no " +
+			"series fall into a trailing \"No series\" group, and a book in several series is listed under each). " +
+			"All three list the same books with the same metadata; format only changes the grouping."),
 		"limit":  numberProp("Maximum number of books to return (default: 50)", 50),
 		"offset": numberProp("Pagination offset into the book list (default: 0)", 0),
 	})

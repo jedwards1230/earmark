@@ -82,6 +82,7 @@
         "ingestHttpAddr":    { "type": "string" },
         "logFormat":         { "type": "string", "enum": ["pretty", "json"] },
         "staleJobTimeout":   { "type": "string" },
+        "scanInterval":      { "type": "string" },
         "chunkSize":         { "type": "string" },
         "evalInPipeline":    { "type": "boolean" },
         "evalGatesEmbed":    { "type": "boolean" },

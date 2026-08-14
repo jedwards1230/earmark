@@ -41,6 +41,8 @@ NFS audiobooks (read-only)
 
 Walks `BOOKS_DIR` on NFS. For each audio file not yet in the DB, computes a SHA-256 and inserts a `pending` row into `transcription_jobs`. Also upserts `book_metadata` (title/author from path or Audiobookshelf API). Deduplication is by checksum — the same file imported twice produces one job.
 
+The walk runs at startup **and on a recurring ticker** (`SCAN_INTERVAL`, default `1h`; `0` disables). The recurring walk is not an optimization — it is the only reliable discovery path for a library on NFS: the fsnotify watch the monitor also keeps only fires for writes made through this pod's own kernel, so a book written directly on the file server, or by any other NFS client, raises no event. Already-queued `file_path`s are skipped without re-hashing, so a re-walk is metadata-only.
+
 ### Python ASR runner (external, GPU host)
 
 One or more Python runners on GPU hosts (configured via `ASR_SERVERS`; current default: NeMo Parakeet-TDT-0.6b-v3 on a CUDA host). Each runner polls `transcription_jobs` for `pending` rows via an atomic `FOR UPDATE SKIP LOCKED` claim, transcribes audio from NFS, and writes a structured `transcripts` row (segments as JSONB with word-level timestamps). Sends a heartbeat every 60s while running; the Go service resets stale claims after 30m. The runner honors a `runner_control` DB row (pause / bounded run) and a local busy-flag file (`/tmp/earmark-busy`) for GPU-contention gating. ASR backend family, runtime, and applied capabilities are recorded in `run_metrics` (CONTRACT §2.13, §1.5).

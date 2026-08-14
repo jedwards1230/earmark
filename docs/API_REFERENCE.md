@@ -20,18 +20,34 @@ Two granularities of the same text:
 
 ### Tool: `list_books`
 
-Library inventory. Per book: author, title, track progress (done/total), total duration, word count, embedded-chunk count. Ordered transcribed-first (fully done → partial → fully pending). Leads with a one-line whole-library summary.
+Library inventory. Per book: author, title, series membership, track progress (done/total), total duration, word count, embedded-chunk count. Ordered transcribed-first (fully done → partial → fully pending). Leads with a one-line whole-library summary.
 
 | Parameter | Type | Default | Notes |
 |-----------|------|---------|-------|
 | `author` | string | — | Substring filter |
-| `format` | `flat`\|`tree` | `flat` | `flat` omits each book's `dir:` line; `tree` groups by author and keeps `dir:` |
+| `series` | string | — | Case-insensitive substring on `book_metadata.series` — `Dune` matches both `Dune #2` and `The Dune Sequence #13`. Books with no series metadata are excluded |
+| `format` | `flat`\|`tree`\|`series` | `flat` | `flat` omits each book's `dir:` line; `tree` groups by author and keeps `dir:`; `series` groups by series name, ordered by sequence, with a trailing **No series** group |
 | `limit` | integer | 50 | — |
 | `offset` | integer | 0 | — |
 
+Each structured book carries `series[]` — `{ name, sequence? }` entries — omitted entirely when the book has no series metadata. `format` changes only the text grouping; `books[]` is the same flat page in all three. The whole-library summary line is scoped by `author` only, not by `series`.
+
+### Series on results
+
+`book_metadata.series` (CONTRACT §1.6) stores a comma-joined list of `Name #Sequence` entries because a book can belong to several series (`"Dune #2, The Dune Sequence #13"`). Every `list_books` entry and every search / `get_chunk_context` result row exposes it parsed:
+
+```json
+"series": [
+  { "name": "Dune", "sequence": "2" },
+  { "name": "The Dune Sequence", "sequence": "13" }
+]
+```
+
+`sequence` is a **string**, not a number — novellas are commonly `#1.5` and non-numeric positions exist, so a numeric type would truncate or reject real values. `sequence` is absent when the membership declares no position, and the whole `series` key is **omitted** for books with no series metadata. This is an **additive** response-shape change: no existing field changed.
+
 ### Tool: `semantic_search_audiobooks`
 
-Vector-similarity (meaning) search. Hits show a real cosine `similarity: NN%`.
+Vector-similarity (meaning) search. Hits show a real cosine `similarity: NN%`. Each structured hit carries the book's `series[]` (see [Series on results](#series-on-results)).
 
 | Parameter | Type | Default | Notes |
 |-----------|------|---------|-------|
@@ -39,20 +55,20 @@ Vector-similarity (meaning) search. Hits show a real cosine `similarity: NN%`.
 | `book` | string | — | Scope to one title (ASIN-aware resolution; see below) |
 | `threshold` | float | 0.3 | Cosine similarity floor (0.0–1.0) |
 | `limit` | integer | 10 | Max hits |
-| `snippet` | integer | — | Max chars of quoted text; floored to 80, capped at 4000. Omit for full chunk text |
+| `snippet` | integer | — | Max chars of quoted text **and** of `structuredContent.results[].content`; floored to 80, capped at 4000. Omit for full chunk text |
 
 Unscoped: HNSW index. Scoped (`book` set): exact distance scan within the book's chunks (recall-perfect, no filtered-ANN loss).
 
 ### Tool: `text_search_audiobooks`
 
-Trigram literal/keyword search. Hits are labelled **"ranked by trigram match"** — no similarity percentage (a similarity % would mislead on a literal match).
+Trigram literal/keyword search. Hits are labelled **"ranked by trigram match"** — no similarity percentage (a similarity % would mislead on a literal match). Each structured hit carries the book's `series[]` (see [Series on results](#series-on-results)).
 
 | Parameter | Type | Default | Notes |
 |-----------|------|---------|-------|
 | `query` | string | **required** | Keyword or phrase |
 | `book` | string | — | Scope to one title |
 | `limit` | integer | 10 | Max hits |
-| `snippet` | integer | — | Returns an excerpt centred on the literal match |
+| `snippet` | integer | — | Returns an excerpt centred on the literal match, in the text output **and** in `structuredContent.results[].content` |
 
 ### Tool: `get_transcript`
 
@@ -67,7 +83,7 @@ Full transcript for a track as paginated **segments** (raw ASR output; `raw_text
 
 ### Tool: `get_chunk_context`
 
-Surrounding chunks around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field.
+Surrounding chunks around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. Rows carry the same per-book metadata as a search hit, including `series[]` (see [Series on results](#series-on-results)).
 
 | Parameter | Type | Default | Notes |
 |-----------|------|---------|-------|
