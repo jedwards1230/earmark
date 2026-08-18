@@ -49,7 +49,10 @@ You are a transcription QA reviewer. You are given a span of an audiobook
 transcript produced by an automatic speech recognizer (ASR). Your job is to flag
 spans where the ASR almost certainly MISHEARD the spoken audio.
 
-You are ADVISORY ONLY: never rewrite the transcript.
+You PROPOSE edits; you never apply them. Each finding becomes a patch shown to a
+human reviewer, who accepts or rejects it before anything is written. Because an
+accepted patch DOES rewrite the stored transcript, a wrong correction is no
+longer harmless — hold a higher bar than you would for a note in the margin.
 
 Default to flagging NOTHING. The large majority of spans contain no ASR error.
 Only flag a span when you are reasonably confident the words shown are not what
@@ -63,10 +66,17 @@ Respond with STRICT JSON only (no prose, no markdown fences) in this shape:
       "original_text": "<verbatim span copied from the input>",
       "issue_type": "<one of the types below>",
       "suggested_correction": "<the corrected words — REQUIRED, never empty>",
-      "confidence": <number 0.0-1.0>
+      "confidence": <number 0.0-1.0>,
+      "anchor_offset": <0-based character index where original_text starts>,
+      "anchor_occurrence": <0-based index among identical copies of original_text>
     }
   ]
 }
+
+anchor_offset and anchor_occurrence locate the exact span to patch. If
+original_text appears more than once in the span, anchor_occurrence says which
+copy you mean (0 = the first). Get these right — they decide which words get
+rewritten. If you are not certain which copy you mean, do not flag it.
 
 issue_type — pick the single best fit:
 - misheard_proper_noun: a NAME, place, brand, or title the ASR garbled
@@ -118,6 +128,20 @@ certainly right; 0.6-0.8 when it looks wrong but the correction is a guess; belo
 empty findings array is the correct, expected answer for a clean span.
 `)
 
+// anchorValue normalizes an optional anchor field to the convention
+// internal/patch expects: a non-negative index, or -1 for "unknown".
+//
+// A missing field and a negative one collapse to the same answer on purpose.
+// Both mean the model did not give us a position we can trust, and inventing
+// 0 would be worse than admitting ignorance — offset 0 is a real, plausible
+// position, so a fabricated 0 would silently patch the start of the span.
+func anchorValue(p *int) int {
+	if p == nil || *p < 0 {
+		return -1
+	}
+	return *p
+}
+
 // buildPrompt returns the (system, user) prompt pair for one chunk. The user
 // message carries the book/track path (light context) and the verbatim text.
 func buildPrompt(c db.EvalChunk) (system, user string) {
@@ -135,6 +159,12 @@ type rawFinding struct {
 	IssueType           string  `json:"issue_type"`
 	SuggestedCorrection string  `json:"suggested_correction"`
 	Confidence          float64 `json:"confidence"`
+	// Anchor fields. Pointers so "absent" is distinguishable from "0" — a model
+	// that omits them (or an older response replayed from a log) must fall back
+	// to unique-match recovery in internal/patch rather than silently claiming
+	// the span is at offset 0, occurrence 0.
+	AnchorOffset     *int `json:"anchor_offset"`
+	AnchorOccurrence *int `json:"anchor_occurrence"`
 }
 
 // judgeResponse is the top-level JSON object the judge returns.
@@ -148,6 +178,11 @@ type parsedFinding struct {
 	IssueType           string
 	SuggestedCorrection string
 	Confidence          float64
+	// Resolved anchor. Negative means "the model did not tell us", which
+	// internal/patch treats as a cue to fall back to unique-match recovery
+	// instead of trusting a fabricated position.
+	AnchorOffset     int
+	AnchorOccurrence int
 }
 
 // maxJudgeResponseBytes caps the judge response we will attempt to parse. A
@@ -214,6 +249,8 @@ func parseFindings(raw string) ([]parsedFinding, error) {
 			IssueType:           issue,
 			SuggestedCorrection: correction,
 			Confidence:          clampConfidence(f.Confidence),
+			AnchorOffset:        anchorValue(f.AnchorOffset),
+			AnchorOccurrence:    anchorValue(f.AnchorOccurrence),
 		})
 	}
 	return out, nil

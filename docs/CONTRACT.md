@@ -1544,18 +1544,31 @@ only — earmark does **not** route work between endpoints.
 
 > §2.14 defines the AI endpoint registry (#48/#50). This section (#49)
 > documents the read-only eval layer, which binds to it.
+>
+> **Amended (2026-08-18, reviewable patches).** `suggested_correction` is no
+> longer a dead end: a finding is now a **proposed patch** that a human can
+> accept and apply (§2.17). The eval layer's read-only guarantee below is
+> UNCHANGED and still binding — the judge writes nothing but findings. What
+> changed is that a *separate, human-gated* component may act on one. Read
+> §2.17 before touching either.
 
 The eval layer is a **read-only LLM-as-judge** (`internal/eval`, `earmark eval`)
 that READS transcript chunks and records **suspected** transcription errors as
-**advisory metadata** — it NEVER edits transcripts. The asymmetry is the whole
-point: a wrong flag is harmless (triage by confidence), a wrong *correction*
-would corrupt the corpus, so `suggested_correction` is recorded but **never
-applied**.
+**proposed patches** — it NEVER edits transcripts itself. The asymmetry is the
+whole point: a wrong flag is harmless (triage by confidence, or reject it in
+review), a wrong *autonomous correction* would corrupt the corpus, so
+`suggested_correction` is recorded and **never applied by the judge**.
 
-**Read-only / advisory contract (binding):** the eval layer issues no
+**Read-only contract (binding, unchanged):** the eval layer issues no
 `UPDATE`/`DELETE`/`ALTER`/`DROP`/`TRUNCATE` against `transcripts`, `segments`, or
 `transcript_chunks`. Its only write is `INSERT INTO transcript_findings`. The
 findings table carries no foreign key that cascade-mutates the transcript tables.
+
+This is enforced structurally, not by convention: the apply path lives in
+`internal/patch`, a different package, so `internal/eval` contains no transcript
+write at all and its SQL guard test continues to assert exactly that. If you
+find yourself adding an `UPDATE` to `internal/eval`, you are in the wrong
+package.
 
 #### Env vars
 
@@ -1742,6 +1755,112 @@ Standard `go_*` and `process_*` collectors are also registered for baseline
 observability. Both pods also serve `/healthz` (liveness, always-200).
 
 ---
+
+### 2.17 Reviewable Patches (human-gated apply)
+
+> Added 2026-08-18. This section is the counterpart to §2.15: it defines how a
+> finding stops being a note and becomes an edit. §2.15's read-only guarantee is
+> unchanged — everything here happens in `internal/patch`, never in
+> `internal/eval`.
+
+A finding is a **proposed patch**. The judge proposes; a human disposes. No
+transcript text changes without an explicit, recorded human decision on a
+specific finding.
+
+#### Lifecycle
+
+`transcript_findings.patch_state` holds the state. Legal transitions are
+centralised in `patch.CanTransition` so the DB layer and the UI cannot disagree:
+
+```
+proposed ──accept──> accepted ──apply──> applied ──revert──> reverted
+    │                    │                   │                   │
+    └──reject──> rejected┘                   │                   └──> proposed
+                    │                        │
+                    └──> proposed            └──> stale
+```
+
+- **proposed** — the judge's output. Existing rows migrate here by default.
+- **accepted** — a human approved it; not yet written.
+- **applied** — the chunk text has been rewritten.
+- **rejected** — a human declined it. May return to `proposed` for reconsideration.
+- **reverted** — an applied patch was undone.
+- **stale** — the underlying chunk changed, so the finding describes text that no
+  longer exists. **Terminal**: re-run the judge rather than resurrecting it.
+
+`proposed → applied` is deliberately **illegal**. Reaching `applied` requires
+passing through `accepted`, which is the human gate; skipping it would be an
+autonomous correction, which is exactly what §2.15 forbids.
+
+#### Anchoring
+
+`original_text` alone cannot locate an edit — a span like `the fox` may occur
+several times in one chunk, and patching the wrong occurrence is corpus
+corruption that reads as a successful edit. Three additive columns fix that:
+
+| Column | Meaning |
+|---|---|
+| `anchor_offset` | 0-based **rune** index of the span in the chunk text. NULL = model did not say. |
+| `anchor_occurrence` | 0-based index among identical spans. NULL = model did not say. |
+| `chunk_text_sha256` | Fingerprint of the chunk **as the judge saw it**. |
+
+Offsets are rune-indexed, not byte-indexed, so an offset can never split a
+multi-byte character and the numbers mean the same thing to the review UI as to
+the apply path.
+
+`patch.Locate` resolves them most-precise-first: offset hit → occurrence hit →
+unique-match recovery (for legacy rows with no anchor) → **refuse**. The refusal
+is load-bearing: an ambiguous anchor yields `ErrAnchorAmbiguous` and the patch is
+never applied on a guess.
+
+Before writing, the apply path re-hashes the chunk and compares to
+`chunk_text_sha256`. A mismatch means the chunk changed after the judge reviewed
+it, so the patch is marked `stale` rather than applied to text no model ever saw.
+Applying twice is impossible for the same reason: the first apply changes the
+hash, so the second is refused.
+
+#### Applying and re-embedding
+
+An applied patch rewrites `transcript_chunks.text` and sets
+`transcript_chunks.embedding_stale = true`. The embed worker re-embeds flagged
+chunks and clears the flag.
+
+Invalidation is **exactly one chunk**, and this is a property of the schema
+rather than a lucky accident: chunks store their text denormalized and carry no
+absolute character offsets into the transcript, so editing one chunk never shifts
+another's anchors. A patch therefore costs one re-embed, not a corpus re-embed.
+
+`embedding_stale` exists because `transcript_chunks.embedding` is
+`VECTOR(768) NOT NULL` — staleness cannot be signalled by nulling the vector.
+
+**Interaction with `EVAL_GATES_EMBED` (§2.15):** the gate latches on
+`run_metrics.eval_finished_at`, which is per-job and unaffected by applying a
+patch. A re-embed triggered by `embedding_stale` is therefore independent of the
+eval gate and does not require re-judging the job.
+
+#### Reversibility
+
+Apply records `applied_before_text` and `applied_after_text` verbatim, plus
+`applied_at`. Revert is a whole-text swap verified against the recorded "after" —
+it deliberately does **not** re-resolve the anchor, because re-deriving a span
+would reintroduce the ambiguity the recorded text exists to eliminate.
+
+`decided_at` / `decided_by` record who accepted or rejected, and `stale_reason`
+records why a patch was retired.
+
+#### What is deliberately NOT edited
+
+`transcripts.segments` is the **immutable ASR record** — what the recognizer
+actually produced. It is provenance, and corrections never touch it. The findings
+table is the audit trail of divergence between the ASR output and the reviewed
+text.
+
+> **Open item (not yet implemented):** `transcripts.raw_text` duplicates the
+> transcript body alongside the chunks. This revision patches
+> `transcript_chunks.text` (the embedded, searched surface) only, so `raw_text`
+> can drift from the chunks once patches are applied. Reconciling the two — or
+> deriving one from the other — is tracked as follow-up work and must land before
+> patch-apply is enabled in production.
 
 ## 3. SCHEMA — pgvector chunks table
 

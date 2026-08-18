@@ -574,6 +574,67 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("runner self-update migration: %w", err)
 	}
 
+	// Reviewable-patch migration (CONTRACT §2.15 + §2.17). Turns each finding
+	// from a dead-end advisory row into a proposed patch a human can accept,
+	// reject, and apply.
+	//
+	// The anchor trio is the point of this migration. original_text alone is
+	// ambiguous — a span like "the fox" can occur more than once in a chunk, so
+	// a naive replace could edit the wrong occurrence. anchor_offset (rune index
+	// into the chunk text) plus anchor_occurrence pins the exact span, and
+	// chunk_text_sha256 records what the chunk looked like when the judge saw
+	// it. If the chunk has changed since, the patch is marked stale instead of
+	// applied to text the judge never actually reviewed.
+	//
+	// applied_before_text/applied_after_text make the apply reversible without
+	// re-deriving anything, so revert never has to trust the anchor a second
+	// time. All columns are NULL/defaulted so existing rows migrate silently as
+	// 'proposed'.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE transcript_findings
+			ADD COLUMN IF NOT EXISTS patch_state         TEXT NOT NULL DEFAULT 'proposed',
+			ADD COLUMN IF NOT EXISTS anchor_offset       INTEGER,
+			ADD COLUMN IF NOT EXISTS anchor_occurrence   INTEGER,
+			ADD COLUMN IF NOT EXISTS chunk_text_sha256   TEXT,
+			ADD COLUMN IF NOT EXISTS decided_at          TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS decided_by          TEXT,
+			ADD COLUMN IF NOT EXISTS applied_at          TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS applied_before_text TEXT,
+			ADD COLUMN IF NOT EXISTS applied_after_text  TEXT,
+			ADD COLUMN IF NOT EXISTS stale_reason        TEXT;
+		DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = 'transcript_findings_patch_state_valid'
+			) THEN
+				ALTER TABLE transcript_findings
+					ADD CONSTRAINT transcript_findings_patch_state_valid
+					CHECK (patch_state IN
+						('proposed','accepted','rejected','applied','stale','reverted'));
+			END IF;
+		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+		END $$;
+		CREATE INDEX IF NOT EXISTS transcript_findings_patch_state_idx
+			ON transcript_findings (patch_state);
+	`); err != nil {
+		return fmt.Errorf("reviewable-patch migration: %w", err)
+	}
+
+	// Embedding invalidation (CONTRACT §2.17). transcript_chunks.embedding is
+	// VECTOR(768) NOT NULL, so a stale embedding cannot be signalled by nulling
+	// it. This flag is the marker instead: applying a patch rewrites the chunk
+	// text, which invalidates that ONE chunk's embedding and no other (chunks
+	// store their text denormalized and carry no absolute offsets into the
+	// transcript, so an edit never shifts a neighbour). The embed worker
+	// re-embeds flagged chunks and clears the flag.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE transcript_chunks
+			ADD COLUMN IF NOT EXISTS embedding_stale BOOLEAN NOT NULL DEFAULT false;
+		CREATE INDEX IF NOT EXISTS transcript_chunks_embedding_stale_idx
+			ON transcript_chunks (embedding_stale) WHERE embedding_stale;
+	`); err != nil {
+		return fmt.Errorf("embedding-stale migration: %w", err)
+	}
+
 	// Path-level dedup migration: the original dedup was checksum-only, so a file
 	// hashed mid-copy (over NFS) and again when complete produced two jobs for one
 	// file_path. Collapse any such duplicates (keep the most-advanced, else oldest
@@ -3239,8 +3300,13 @@ func scanEvalChunks(rows pgx.Rows) ([]EvalChunk, error) {
 	return out, nil
 }
 
-// Finding is one advisory suspected-error row to INSERT into transcript_findings.
-// suggested_correction is informational only and is never applied (§2.15).
+// Finding is one suspected-error row to INSERT into transcript_findings.
+//
+// A finding is a PROPOSED patch (§2.16): the judge that writes it is still
+// read-only and never applies suggested_correction itself. A human accepts the
+// patch through internal/patch, and only that accepted decision rewrites the
+// chunk. The anchor trio below is what makes the proposal precisely applicable
+// later — see internal/patch.Locate.
 type Finding struct {
 	TranscriptID        string
 	FilePath            string
@@ -3254,6 +3320,13 @@ type Finding struct {
 	Confidence          float64
 	Model               string
 	TranscriptionRunID  *string
+	// AnchorOffset / AnchorOccurrence pin which span of the chunk this refers
+	// to. NULL when the model did not report a usable position.
+	AnchorOffset     *int
+	AnchorOccurrence *int
+	// ChunkTextSHA256 fingerprints the chunk as the judge saw it, so the apply
+	// path can refuse to edit a revision the model never reviewed.
+	ChunkTextSHA256 *string
 }
 
 // insertFindingSQL is the INSERT for one finding. Package var so a test can
@@ -3263,8 +3336,9 @@ var insertFindingSQL = `
 	INSERT INTO transcript_findings
 	       (transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
 	        original_text, issue_type, suggested_correction, confidence, model,
-	        transcription_run_id)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	        transcription_run_id, anchor_offset, anchor_occurrence,
+	        chunk_text_sha256)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 `
 
 // InsertFindings stores judge findings in one transaction. Insert-only: it never
@@ -3284,7 +3358,7 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 		if _, err := tx.Exec(ctx, insertFindingSQL,
 			f.TranscriptID, f.FilePath, f.ChunkID, f.ChunkIndex, f.StartSec, f.EndSec,
 			f.OriginalText, f.IssueType, f.SuggestedCorrection, f.Confidence, f.Model,
-			f.TranscriptionRunID,
+			f.TranscriptionRunID, f.AnchorOffset, f.AnchorOccurrence, f.ChunkTextSHA256,
 		); err != nil {
 			return fmt.Errorf("insert finding %d: %w", i, err)
 		}
