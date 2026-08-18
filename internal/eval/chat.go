@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,14 @@ type openAIChatClient struct {
 	model   string
 	apiKey  string
 	http    *http.Client
+
+	// responseFormat, when non-nil, pins replies to a JSON schema server-side.
+	// reasoningEffort / chatTemplateKwargs suppress extended thinking on models
+	// that support either spelling. All three are set at construction because
+	// this client serves exactly one caller (the judge) with one output shape.
+	responseFormat     *responseFormat
+	reasoningEffort    string
+	chatTemplateKwargs map[string]any
 }
 
 // chatConfig is resolved from the AI endpoint registry (AI_ROLES["eval"]) or,
@@ -135,6 +144,15 @@ func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {
 		// error as soon as ctx is cancelled or its deadline passes, regardless of
 		// this timeout.
 		http: &http.Client{Timeout: 120 * time.Second},
+
+		// Pin the reply shape server-side, and ask any thinking-capable model to
+		// stop thinking. Both reasoning spellings are sent: endpoints that do not
+		// recognise a field ignore it, and the two model families disagree on
+		// which one to honour. If a reasoning model ignores both, Complete fails
+		// with ErrThinkingOnlyResponse rather than reporting a clean transcript.
+		responseFormat:     findingsResponseFormat,
+		reasoningEffort:    "none",
+		chatTemplateKwargs: map[string]any{"enable_thinking": false},
 	}
 }
 
@@ -145,11 +163,48 @@ type chatRequest struct {
 	Model       string        `json:"model"`
 	Messages    []chatMessage `json:"messages"`
 	Temperature float64       `json:"temperature"`
+	// ResponseFormat pins the reply to a JSON schema server-side. Verified
+	// against Ollama's OpenAI-compatible endpoint (v0.32.x): it honours
+	// {"type":"json_schema"} and returns schema-conforming output, which is
+	// what makes the patch contract reliable enough to drive a review UI
+	// instead of hoping the prompt is obeyed. Omitted when nil so endpoints
+	// that do not support it are unaffected.
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	// ReasoningEffort is the OpenAI-style knob for suppressing extended
+	// thinking. Sent only when configured — see the reasoning-model note on
+	// chatResponse for why this matters.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// ChatTemplateKwargs is Ollama's passthrough into the model's chat
+	// template; {"enable_thinking": false} is how several Qwen-family models
+	// disable thinking. Belt-and-braces alongside ReasoningEffort because the
+	// two families spell the same intent differently.
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
+}
+
+// responseFormat is the OpenAI structured-output envelope.
+type responseFormat struct {
+	Type       string      `json:"type"`
+	JSONSchema *jsonSchema `json:"json_schema,omitempty"`
+}
+
+type jsonSchema struct {
+	Name   string `json:"name"`
+	Strict bool   `json:"strict"`
+	Schema any    `json:"schema"`
 }
 
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Reasoning captures the field a thinking model puts its chain-of-thought
+	// in. We never use its contents — it exists so the judge can tell
+	// "the model thought but said nothing" apart from "the model found no
+	// errors". Without it a reasoning model returns empty Content and the
+	// judge records zero findings, which is indistinguishable from a clean
+	// transcript. That failure is silent and corpus-wide, and it is exactly
+	// how gemma4:12b was rejected for this role.
+	Reasoning        string `json:"reasoning,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type chatResponse struct {
@@ -157,6 +212,11 @@ type chatResponse struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
 }
+
+// ErrThinkingOnlyResponse means the model returned reasoning but no answer.
+// Surfaced rather than swallowed: an empty judge reply must never be quietly
+// read as "no findings".
+var ErrThinkingOnlyResponse = errors.New("model returned reasoning but empty content (thinking not suppressed)")
 
 // Complete posts a system+user prompt to /chat/completions and returns the first
 // choice's message content. Temperature is 0 for a deterministic, reproducible
@@ -169,6 +229,9 @@ func (c *openAIChatClient) Complete(ctx context.Context, system, user string) (s
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
+		ResponseFormat:     c.responseFormat,
+		ReasoningEffort:    c.reasoningEffort,
+		ChatTemplateKwargs: c.chatTemplateKwargs,
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal chat request: %w", err)
@@ -204,5 +267,14 @@ func (c *openAIChatClient) Complete(ctx context.Context, system, user string) (s
 	if len(parsed.Choices) == 0 {
 		return "", fmt.Errorf("chat endpoint returned no choices")
 	}
-	return parsed.Choices[0].Message.Content, nil
+
+	msg := parsed.Choices[0].Message
+	// Fail loudly on the thinking-only reply. Returning "" here would parse to
+	// zero findings and be recorded as a clean chunk — a silent false negative
+	// across every chunk the judge touches.
+	if strings.TrimSpace(msg.Content) == "" &&
+		(strings.TrimSpace(msg.Reasoning) != "" || strings.TrimSpace(msg.ReasoningContent) != "") {
+		return "", ErrThinkingOnlyResponse
+	}
+	return msg.Content, nil
 }

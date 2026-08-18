@@ -2,11 +2,17 @@
 // §2.15, GitHub issue #49).
 //
 // The judge READS transcript chunks and records suspected transcription errors
-// as advisory metadata in transcript_findings. It NEVER edits transcripts: this
+// as PROPOSED PATCHES in transcript_findings. It NEVER edits transcripts: this
 // package issues no UPDATE/DELETE/ALTER against transcripts/segments/
 // transcript_chunks. The asymmetry is the whole point — a wrong flag is
-// harmless, a wrong correction would corrupt the corpus, so corrections
-// (suggested_correction) are recorded but never applied.
+// harmless, a wrong autonomous correction would corrupt the corpus, so
+// corrections (suggested_correction) are recorded but never applied *here*.
+//
+// Applying a correction is a human decision and lives in internal/patch
+// (CONTRACT §2.17). The split is deliberate: keeping the write path in another
+// package is what makes the read-only guarantee mechanically checkable rather
+// than a promise in a comment. If you are about to add an UPDATE to this
+// package, you want internal/patch instead.
 //
 // Cost is operator-bounded: the judge runs on-demand per book or over a random
 // sample of N chunks (never every segment of every book), behind a dry-run gate.
@@ -21,6 +27,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/patch"
 )
 
 // defaultMaxFindingsPerChunk bounds how many findings the judge keeps for a
@@ -187,6 +194,12 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 			Confidence:          p.Confidence,
 			Model:               model,
 			TranscriptionRunID:  optionalStr(runID),
+			AnchorOffset:        optionalInt(p.AnchorOffset),
+			AnchorOccurrence:    optionalInt(p.AnchorOccurrence),
+			// Fingerprint the chunk exactly as the judge saw it. This is what
+			// lets the apply path later prove it is editing the same revision
+			// the model reviewed, instead of text that changed in between.
+			ChunkTextSHA256: optionalStr(patch.ChunkHash(c.Text)),
 		})
 	}
 	return Result{Chunk: c, Findings: findings}, nil
@@ -237,4 +250,14 @@ func optionalStr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// optionalInt maps the "-1 means unknown" anchor convention onto a nullable
+// column. A negative value becomes NULL so the database records "the model did
+// not say" rather than a position nothing should trust.
+func optionalInt(i int) *int {
+	if i < 0 {
+		return nil
+	}
+	return &i
 }
