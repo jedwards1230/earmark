@@ -109,92 +109,11 @@ func TestLocateIsRuneIndexedNotByteIndexed(t *testing.T) {
 	}
 }
 
-func TestApply(t *testing.T) {
-	chunk := "the quick brown fox jumped"
-	hash := ChunkHash(chunk)
-
-	t.Run("applies at the anchored span", func(t *testing.T) {
-		got, span, err := Apply(chunk, hash, Anchor{OriginalText: "fox", Offset: 16, Occurrence: 0}, "folks")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if want := "the quick brown folks jumped"; got != want {
-			t.Errorf("want %q, got %q", want, got)
-		}
-		if span.Start != 16 || span.End != 19 {
-			t.Errorf("unexpected span %+v", span)
-		}
-	})
-
-	t.Run("edits only the anchored occurrence", func(t *testing.T) {
-		repeated := "the fox ran and the fox sat"
-		got, _, err := Apply(repeated, ChunkHash(repeated),
-			Anchor{OriginalText: "fox", Offset: 20, Occurrence: 1}, "folks")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if want := "the fox ran and the folks sat"; got != want {
-			t.Errorf("want %q, got %q", want, got)
-		}
-		if strings.Count(got, "fox") != 1 {
-			t.Errorf("the other occurrence should be untouched: %q", got)
-		}
-	})
-
-	t.Run("refuses when the chunk changed underneath", func(t *testing.T) {
-		_, _, err := Apply("something else entirely", hash,
-			Anchor{OriginalText: "fox", Offset: 16, Occurrence: 0}, "folks")
-		if !errors.Is(err, ErrChunkChanged) {
-			t.Fatalf("want ErrChunkChanged, got %v", err)
-		}
-	})
-
-	t.Run("refuses an empty correction", func(t *testing.T) {
-		_, _, err := Apply(chunk, hash, Anchor{OriginalText: "fox", Offset: 16, Occurrence: 0}, "   ")
-		if !errors.Is(err, ErrEmptyCorrection) {
-			t.Fatalf("want ErrEmptyCorrection, got %v", err)
-		}
-	})
-
-	t.Run("empty hash skips verification for legacy findings", func(t *testing.T) {
-		if _, _, err := Apply(chunk, "", Anchor{OriginalText: "fox", Offset: 16, Occurrence: 0}, "folks"); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
-	// Applying twice must not compound. The second attempt is against text whose
-	// hash no longer matches, so it is refused rather than double-edited.
-	t.Run("is not idempotent-by-accident: reapply is refused", func(t *testing.T) {
-		once, _, err := Apply(chunk, hash, Anchor{OriginalText: "fox", Offset: 16, Occurrence: 0}, "folks")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if _, _, err := Apply(once, hash, Anchor{OriginalText: "fox", Offset: 16, Occurrence: 0}, "folks"); !errors.Is(err, ErrChunkChanged) {
-			t.Fatalf("want ErrChunkChanged on reapply, got %v", err)
-		}
-	})
-}
-
-func TestRevert(t *testing.T) {
-	before := "the quick brown fox jumped"
-	after := "the quick brown folks jumped"
-
-	t.Run("restores the recorded before-text", func(t *testing.T) {
-		got, err := Revert(after, after, before)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != before {
-			t.Errorf("want %q, got %q", before, got)
-		}
-	})
-
-	t.Run("refuses when the chunk drifted after apply", func(t *testing.T) {
-		if _, err := Revert("edited again by someone", after, before); !errors.Is(err, ErrChunkChanged) {
-			t.Fatalf("want ErrChunkChanged, got %v", err)
-		}
-	})
-}
+// TestApply and TestRevert lived here. Apply/Revert were deleted with the
+// edit-the-chunk model (see anchor.go); every case they covered was migrated
+// into TestApplyCorrections in overlay_test.go as a single-patch case, so the
+// coverage moved rather than shrank. TestRevert had no successor on purpose:
+// revert is now "flip patch_state and rebuild the projection", not a text swap.
 
 func TestCanTransition(t *testing.T) {
 	legal := []struct{ from, to string }{

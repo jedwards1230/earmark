@@ -102,6 +102,14 @@ type Transcript struct {
 }
 
 // Chunk is a row from transcript_chunks (after embedding).
+//
+// Text vs SourceText (CONTRACT §2.17): a chunk is a DERIVED PROJECTION of the
+// immutable transcript, rebuilt from source on every embed. SourceText is the
+// pristine regenerated text — the projection's input, and the only text the
+// eval judge is ever shown. Text is that same text with the accepted-correction
+// overlay replayed onto it, and is what gets embedded, searched, and displayed.
+// They are equal until a correction applies. Legacy rows have SourceText empty
+// (source_text IS NULL), which reads correctly as "no corrections applied".
 type Chunk struct {
 	ID           string
 	TranscriptID string
@@ -110,6 +118,7 @@ type Chunk struct {
 	StartSec     float64
 	EndSec       float64
 	Text         string
+	SourceText   string
 	Speaker      *string
 	Embedding    []float32
 	CreatedAt    time.Time
@@ -686,6 +695,33 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("embedding-stale migration: %w", err)
 	}
 
+	// Correction-overlay migration (CONTRACT §2.17). transcript_chunks is a
+	// DERIVED PROJECTION: the worker regenerates it from the immutable
+	// transcript source on every embed, so a correction written into `text`
+	// is destroyed by the next re-chunk. Corrections therefore live in
+	// transcript_findings and are REPLAYED onto the regenerated text.
+	//
+	// That split needs both texts on the row:
+	//
+	//	source_text = the pristine regenerated chunk (the projection's input)
+	//	text        = ApplyCorrections(source_text, overlay) — what is embedded,
+	//	              searched, and displayed
+	//
+	// The judge must always be shown source_text. It records rune anchors and
+	// chunk_text_sha256 against the text it saw, and replay always starts from
+	// pristine — feed it the corrected surface and every new finding is born
+	// stale.
+	//
+	// Additive and NULL-safe: legacy rows keep source_text NULL and are read as
+	// COALESCE(source_text, text), which is exactly right because a legacy row
+	// has no corrections applied.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE transcript_chunks
+			ADD COLUMN IF NOT EXISTS source_text TEXT;
+	`); err != nil {
+		return fmt.Errorf("chunk source-text migration: %w", err)
+	}
+
 	// Path-level dedup migration: the original dedup was checksum-only, so a file
 	// hashed mid-copy (over NFS) and again when complete produced two jobs for one
 	// file_path. Collapse any such duplicates (keep the most-advanced, else oldest
@@ -962,6 +998,52 @@ func (db *DB) getEvaluatedUnembeddedTranscripts(ctx context.Context, q rowQuerie
 	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
 }
 
+// GetTranscriptsWithStaleChunks returns transcripts that have at least one
+// chunk flagged embedding_stale — the rebuild selection for the correction
+// overlay (CONTRACT §2.17).
+//
+// This is the trigger that closes the accept → rebuild loop. The other three
+// selections all gate on "has NO chunks yet", so once a transcript is embedded
+// they never look at it again — and findings only exist for already-embedded
+// transcripts. Without this selection an accepted correction would sit in the
+// overlay forever and never reach the searchable text.
+//
+// The caller runs these back through the normal regenerate → replay → embed
+// path. It is deliberately independent of the eval gate: a stale-driven
+// re-embed does not require re-judging the job (§2.17).
+//
+// limit bounds the rows loaded per call (each carries the transcript's segments
+// JSONB) exactly as the other selections do.
+func (db *DB) GetTranscriptsWithStaleChunks(ctx context.Context, limit int) ([]*Transcript, error) {
+	return db.getTranscriptsWithStaleChunks(ctx, db.pool, limit)
+}
+
+// staleChunkTranscriptsSQL is the rebuild selection. EXISTS (not NOT EXISTS) is
+// the whole difference from the other three: this one wants transcripts that
+// ARE embedded but whose projection is out of date. It rides the partial index
+// transcript_chunks_embedding_stale_idx. Package const so the execution-level
+// test can match it exactly.
+const staleChunkTranscriptsSQL = `
+		SELECT t.id, t.job_id, t.file_path, t.checksum,
+		       t.language, t.duration_seconds, t.speaker_count,
+		       t.segments, t.raw_text, t.model_name, t.created_at
+		FROM transcripts t
+		WHERE EXISTS (
+		    SELECT 1 FROM transcript_chunks c
+		    WHERE c.transcript_id = t.id AND c.embedding_stale
+		  )
+		ORDER BY t.created_at ASC
+		LIMIT $1
+	`
+
+func (db *DB) getTranscriptsWithStaleChunks(ctx context.Context, q rowQuerier, limit int) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, staleChunkTranscriptsSQL, normalizeSelectLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("query transcripts with stale chunks: %w", err)
+	}
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
+}
+
 // defaultSelectLimit bounds a gated-flow selection when the caller passes a
 // non-positive limit (a misconfiguration). It mirrors config's EMBED_BATCH_SIZE
 // default so a stray 0 still bounds memory rather than reverting to unbounded.
@@ -976,6 +1058,12 @@ func normalizeSelectLimit(limit int) int {
 	return limit
 }
 
+// scanTranscriptRows and the four SELECTs feeding it read t.segments/t.raw_text
+// as ORIGINAL text (CONTRACT §2.17 reader audit). That is what they want: they
+// feed the chunker, which regenerates the projection from the immutable ASR
+// record before the correction overlay is replayed onto it. NOTHING in Go ever
+// writes segments or raw_text — they are provenance.
+//
 // scanTranscriptRows scans a pgx.Rows result into []*Transcript. Shared by
 // GetCompletedTranscripts, GetUnevaluatedTranscripts, and
 // GetEvaluatedUnembeddedTranscripts to keep scanning logic DRY.
@@ -1115,17 +1203,30 @@ func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 		// worker generates UUIDs so in-pipeline eval findings can reference the
 		// chunk before it is inserted). An empty id falls back to the column
 		// default — COALESCE(NULLIF(...)) keeps both callers working.
+		//
+		// source_text carries the pristine regenerated text alongside the
+		// corrected surface (CONTRACT §2.17). NULLIF keeps it NULL for callers
+		// that don't populate it, matching the legacy-row reading.
+		//
+		// embedding_stale is deliberately NOT touched on conflict. Clearing it
+		// here would be a lost update: a human accept that lands between the
+		// worker's overlay read and this insert sets the flag true, and an
+		// unconditional clear would drop that accept — it would never be
+		// replayed and never re-flagged. ClearEmbeddingStale runs afterwards
+		// instead, guarded by the watermark the overlay read returned.
+		// A brand-new row gets the column's `false` default.
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO transcript_chunks
 			       (id, transcript_id, file_path, chunk_index, start_sec, end_sec,
-			        text, speaker, embedding)
+			        text, source_text, speaker, embedding)
 			VALUES (COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()),
-			        $2, $3, $4, $5, $6, $7, $8, $9)
+			        $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10)
 			ON CONFLICT (transcript_id, chunk_index) DO UPDATE
-			SET text      = EXCLUDED.text,
-			    embedding = EXCLUDED.embedding
+			SET text        = EXCLUDED.text,
+			    source_text = EXCLUDED.source_text,
+			    embedding   = EXCLUDED.embedding
 		`, c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
-			c.Text, c.Speaker, pgvector.NewVector(c.Embedding),
+			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding),
 		); err != nil {
 			return fmt.Errorf("insert chunk %d: %w", c.ChunkIndex, err)
 		}
@@ -3137,6 +3238,15 @@ var trackDetailSQL = `
 // optional transcript (with segments for the timestamped reader), its optional
 // run_metrics, and its embedded chunk list. Returns pgx.ErrNoRows if no job has
 // that id, which the handler maps to a 404.
+//
+// KNOWN GAP (CONTRACT §2.17 reader audit). Its consumers — the web transcript
+// reader and the MCP get_transcript tool — are the one place a reader genuinely
+// wants CORRECTED text, but the segments returned here are transcripts.segments:
+// immutable ASR provenance that carries no corrections and must never be
+// rewritten. So the reader shows uncorrected ASR while search shows corrected
+// text. Closing the gap means projecting corrections onto segments at render
+// time (they have no chunk anchors today), which is deliberately out of scope —
+// mutating segments to fix it would destroy the provenance record.
 func (db *DB) GetTrackDetail(ctx context.Context, jobID string) (*TrackDetail, error) {
 	return db.getTrackDetail(ctx, db.pool, jobID)
 }
@@ -3258,9 +3368,18 @@ type EvalChunk struct {
 // It joins each chunk back to its transcript's originating job so a finding can
 // carry transcription_run_id (per-backend attribution). It is a package var so
 // tests can assert it never contains a write verb against the transcript tables.
+//
+// It selects COALESCE(c.source_text, c.text) — the PRISTINE chunk text, never
+// the corrected surface (CONTRACT §2.17). The judge records rune anchors and
+// chunk_text_sha256 against whatever it is shown, and the correction overlay is
+// always replayed from pristine; show the judge corrected text and every new
+// finding would be born stale (its hash would never match the projection's
+// input). Legacy rows have source_text NULL and fall back to c.text, which is
+// correct because they carry no corrections.
 var evalChunkSelectSQL = `
 	SELECT c.id, c.transcript_id, t.job_id, c.file_path,
-	       c.chunk_index, c.start_sec, c.end_sec, c.text
+	       c.chunk_index, c.start_sec, c.end_sec,
+	       COALESCE(c.source_text, c.text) AS text
 	FROM transcript_chunks c
 	JOIN transcripts t ON t.id = c.transcript_id
 `

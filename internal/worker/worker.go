@@ -5,6 +5,8 @@ package worker
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +17,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metrics"
 	"github.com/jedwards1230/earmark/internal/openai"
+	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/queue"
 	"github.com/jedwards1230/earmark/internal/tokenizer"
 )
@@ -61,6 +64,24 @@ type DBInterface interface {
 	// path (EvalInPipeline). *db.DB already satisfies this (it is the eval
 	// FindingWriter).
 	InsertFindings(ctx context.Context, findings []db.Finding) error
+	// GetCorrectionOverlay loads a transcript's accepted corrections so the
+	// embed path can replay them onto the regenerated chunks (CONTRACT §2.17).
+	// Read-only. It also returns the server-side watermark that read was taken
+	// at, which ClearEmbeddingStale needs to avoid swallowing a concurrent
+	// human decision.
+	GetCorrectionOverlay(ctx context.Context, transcriptID string) ([]db.CorrectionRow, time.Time, error)
+	// MarkFindingsApplied / MarkFindingsStale persist the outcome of a replay:
+	// which corrections landed (with their span-level before/after) and which
+	// could no longer be placed. Both write only transcript_findings.
+	MarkFindingsApplied(ctx context.Context, recs []db.AppliedFinding) error
+	MarkFindingsStale(ctx context.Context, ids []string, reason string) error
+	// ClearEmbeddingStale clears the rebuild flag for chunks this rebuild
+	// brought up to date, guarded by the overlay-read watermark.
+	ClearEmbeddingStale(ctx context.Context, transcriptID string, watermark time.Time) error
+	// GetTranscriptsWithStaleChunks selects transcripts with at least one chunk
+	// flagged embedding_stale — the rebuild pass that closes the
+	// accept → replay → re-embed loop (CONTRACT §2.17).
+	GetTranscriptsWithStaleChunks(ctx context.Context, limit int) ([]*db.Transcript, error)
 }
 
 // Worker polls for completed transcripts and embeds them.
@@ -185,6 +206,14 @@ func (w *Worker) Start(cfg *config.Config) {
 			continue
 		}
 
+		// Rebuild pass (CONTRACT §2.17): transcripts whose projection is out of
+		// date because a human accepted or reverted a correction. It runs in
+		// BOTH flows and before them, because the other selections only ever
+		// look at transcripts with no chunks yet — an already-embedded
+		// transcript would otherwise never be revisited and an accepted
+		// correction would never reach the searchable text.
+		staleRebuilt := w.rebuildStaleTranscripts(cfg)
+
 		if w.evalGatesEmbed {
 			// Gated two-pass flow (EVAL_GATES_EMBED=true, CONTRACT §2.4):
 			//   Eval pass:  done, not-eval'd, not-embedded → judge → eval_finished_at
@@ -241,7 +270,8 @@ func (w *Worker) Start(cfg *config.Config) {
 			// interval. Only sleep when both passes returned a short (or empty)
 			// batch, which means the backlog is drained; this avoids a busy-loop on
 			// an empty queue while keeping a 4000-item backlog from idling for hours.
-			fullBatch := len(unevaluated) >= batchSize || len(evaluated) >= batchSize
+			fullBatch := len(unevaluated) >= batchSize || len(evaluated) >= batchSize ||
+				staleRebuilt >= batchSize
 			if !fullBatch {
 				w.sleep(pollInterval)
 			}
@@ -254,8 +284,12 @@ func (w *Worker) Start(cfg *config.Config) {
 				continue
 			}
 
+			// Only idle when there was nothing to embed AND nothing to rebuild —
+			// a rebuild-only cycle must not be mistaken for an empty queue.
 			if len(transcripts) == 0 {
-				w.sleep(pollInterval)
+				if staleRebuilt == 0 {
+					w.sleep(pollInterval)
+				}
 				continue
 			}
 
@@ -285,6 +319,9 @@ func (w *Worker) Start(cfg *config.Config) {
 //   - If Segments is empty (legacy or missing diarization data), fall back
 //     to raw-text token chunking with zero timestamps and no speaker.
 func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
+	// ORIGINAL-text consumer (§2.17 reader audit): raw_text is immutable
+	// provenance and is only used here as an "is there anything to chunk at all"
+	// guard. Corrections are applied downstream, to the projection.
 	if t.RawText == "" {
 		return fmt.Errorf("transcript %s has empty raw text, skipping", t.ID)
 	}
@@ -304,7 +341,7 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	// embed pass produce the same IDs without coordination — findings written in
 	// a prior eval pass reference the same chunk rows the embed pass will insert.
 	// CONTRACT §1.5.
-	chunks, err := w.chunkTranscript(t, cfg.ChunkSize, w.evalGatesEmbed)
+	pristine, err := w.chunkTranscript(t, cfg.ChunkSize, w.evalGatesEmbed)
 	if err != nil {
 		return err
 	}
@@ -316,9 +353,29 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	// embedding failure would leave findings referencing chunk UUIDs that were
 	// never inserted (orphans), and the retry would re-chunk with fresh UUIDs and
 	// double up. Best-effort: a judge error yields no findings, never blocks embed.
+	//
+	// JUDGE PATH — PRISTINE, NO OVERLAY (CONTRACT §2.17). The judge records rune
+	// anchors and chunk_text_sha256 against exactly the text it is shown, and
+	// replay always starts from the pristine regenerated text. Show it the
+	// corrected surface and every new finding is born stale, because its hash
+	// could never match the projection's input.
 	var inlineFindings []db.Finding
 	if w.judge != nil {
-		inlineFindings = w.judgeChunks(t, chunks)
+		inlineFindings = w.judgeChunks(t, pristine)
+	}
+
+	// EMBED PATH — replay the accepted corrections onto a COPY of the pristine
+	// chunks. ONE chunking pass feeds both consumers: `pristine` is what the
+	// judge saw, `chunks` is the corrected projection that gets embedded,
+	// searched, and displayed.
+	//
+	// `replay` is COMPUTED here but PERSISTED only after InsertChunks succeeds,
+	// for the same reason as inlineFindings above: a premature write would claim
+	// corrections landed in chunks that were never inserted, and `stale` is
+	// terminal.
+	chunks, replay, err := w.correctedChunks(t, pristine)
+	if err != nil {
+		return err
 	}
 
 	// Collect texts for batch embedding.
@@ -354,6 +411,9 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 		ItemCount:  db.IntPtr(len(chunks)),
 	})
 	w.metrics.RecordStageFinish(db.StageEmbed, finished.Sub(start))
+
+	// Persist the replay outcome now that the projection it describes exists.
+	w.persistReplay(t, replay)
 
 	// Persist in-pipeline findings now that their chunks exist. Best-effort: a
 	// findings-write failure leaves chunks searchable but un-flagged (advisory),
@@ -395,11 +455,19 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 // belt-and-suspenders so a future caller that reaches this with judge=nil still
 // writes the latch (with zero findings) instead of panicking.
 func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
+	// ORIGINAL-text consumer (§2.17 reader audit): raw_text is immutable
+	// provenance, read here only as an emptiness guard.
 	if t.RawText == "" {
 		return fmt.Errorf("transcript %s has empty raw text, skipping", t.ID)
 	}
 	w.log.Info("eval pass: judging transcript", "file", t.FilePath, "transcript_id", t.ID)
 
+	// PRISTINE, NO OVERLAY (CONTRACT §2.17). This whole pass is the judge path,
+	// so the correction overlay is deliberately NOT replayed here. The judge
+	// records rune anchors and chunk_text_sha256 against the text it is shown,
+	// and replay always starts from the pristine regenerated text — judging the
+	// corrected surface would make every new finding stale on arrival.
+	//
 	// Deterministic UUIDs: same as the embed pass will produce for the same
 	// (transcript_id, chunk_index) — findings reference these IDs before insert.
 	chunks, err := w.chunkTranscript(t, cfg.ChunkSize, true)
@@ -443,6 +511,8 @@ func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 // embeds the chunks, and inserts them. It does NOT run the judge (eval was
 // already done in the eval pass). CONTRACT §1.5.
 func (w *Worker) embedTranscript(cfg *config.Config, t *db.Transcript) error {
+	// ORIGINAL-text consumer (§2.17 reader audit): guard only. The text actually
+	// embedded below is the CORRECTED projection — raw_text is never rewritten.
 	if t.RawText == "" {
 		return fmt.Errorf("transcript %s has empty raw text, skipping", t.ID)
 	}
@@ -458,7 +528,16 @@ func (w *Worker) embedTranscript(cfg *config.Config, t *db.Transcript) error {
 
 	// Deterministic UUIDs — must match what the eval pass assigned to these
 	// chunks so findings reference the correct chunk rows after insert.
-	chunks, err := w.chunkTranscript(t, cfg.ChunkSize, true)
+	pristine, err := w.chunkTranscript(t, cfg.ChunkSize, true)
+	if err != nil {
+		return err
+	}
+
+	// EMBED PATH — replay the accepted corrections onto the regenerated chunks
+	// (CONTRACT §2.17). This is the only place corrected text is produced; the
+	// eval pass above deliberately embeds nothing and sees only pristine text.
+	// The outcome is persisted only after InsertChunks succeeds (below).
+	chunks, replay, err := w.correctedChunks(t, pristine)
 	if err != nil {
 		return err
 	}
@@ -495,6 +574,9 @@ func (w *Worker) embedTranscript(cfg *config.Config, t *db.Transcript) error {
 		ItemCount:  db.IntPtr(len(chunks)),
 	})
 	w.metrics.RecordStageFinish(db.StageEmbed, finished.Sub(start))
+
+	// Persist the replay outcome now that the projection it describes exists.
+	w.persistReplay(t, replay)
 
 	w.log.Info("embed pass: transcript embedded",
 		"file", t.FilePath, "transcript_id", t.ID, "chunks", len(chunks),
@@ -811,11 +893,21 @@ func buildChunksFromSegments(t *db.Transcript, chunkSize int) []db.Chunk {
 //
 // Returns an error when no chunks are produced (empty raw text or empty segment
 // text) so the caller can skip the transcript rather than embed nothing.
+//
+// PURE and PRISTINE (CONTRACT §2.17): it queries nothing and replays nothing.
+// It IS the regeneration step of "regenerate from source → replay corrections →
+// embed", so it must keep producing exactly what the ASR recorded. Corrections
+// are layered on afterwards by applyOverlay, which rewrites Text only. Reading
+// the overlay in here would put corrected text in front of the judge and make
+// every new finding stale on arrival.
 func (w *Worker) chunkTranscript(t *db.Transcript, chunkSize int, deterministicIDs bool) ([]db.Chunk, error) {
 	if chunkSize <= 0 {
 		chunkSize = 512
 	}
 
+	// ORIGINAL-text consumers (§2.17 reader audit): segments (and the raw_text
+	// fallback) are the immutable ASR record. This is the regeneration step, so
+	// it wants exactly that — and it never writes either of them back.
 	var chunks []db.Chunk
 	if len(t.Segments) == 0 {
 		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
@@ -849,9 +941,238 @@ func (w *Worker) chunkTranscript(t *db.Transcript, chunkSize int, deterministicI
 		} else {
 			chunks[i].ID = uuid.NewString()
 		}
+		// These chunks are PRISTINE: regenerated from the immutable transcript
+		// source with no corrections replayed yet, so source_text == text.
+		// applyOverlay rewrites Text only; SourceText stays the projection's
+		// input and the text the judge is shown (CONTRACT §2.17).
+		chunks[i].SourceText = chunks[i].Text
 	}
 
 	return chunks, nil
+}
+
+// ─── Correction overlay (CONTRACT §2.17) ─────────────────────────────────────
+//
+// Chunking is "regenerate from source → replay accepted corrections → embed".
+// The regeneration step (chunkTranscript) is pristine and pure; this section is
+// the replay step. Keeping them separate is what lets the judge see pristine
+// text while search sees corrected text, from a single chunking pass.
+
+// rebuildStaleTranscripts re-runs the embed path for transcripts whose
+// projection is out of date — the trigger that closes the
+// accept → replay → re-embed loop. Returns how many transcripts it attempted.
+//
+// A human accepting or reverting a correction sets embedding_stale on the one
+// affected chunk (db.SetPatchState). Nothing else in the worker would ever look
+// at that transcript again: the other three selections all require a transcript
+// to have NO chunks, and findings only exist for transcripts that are already
+// embedded. This pass is what makes an accepted correction actually reach the
+// searchable text.
+//
+// It reuses embedTranscript deliberately — same regenerate → replay → embed
+// path, no second chunking implementation to drift. That also means it NEVER
+// feeds the judge: embedTranscript does not run eval, so the
+// judge-sees-pristine invariant is untouched and, per §2.17, a stale-driven
+// re-embed does not require re-judging the job (the eval gate latches on
+// run_metrics.eval_finished_at, which this does not disturb).
+//
+// Bounded by the same EMBED_BATCH_SIZE as the other passes. A selection error
+// is logged and skipped: a rebuild backlog is not urgent enough to wedge the
+// embed of new transcripts.
+func (w *Worker) rebuildStaleTranscripts(cfg *config.Config) int {
+	batchSize := embedBatchSize(cfg)
+	stale, err := w.db.GetTranscriptsWithStaleChunks(w.ctx, batchSize)
+	if err != nil {
+		w.log.Error("poll for transcripts with stale chunks failed", "error", err)
+		return 0
+	}
+	if len(stale) == 0 {
+		return 0
+	}
+
+	w.log.Info("rebuild pass: re-embedding transcripts with corrected chunks",
+		"transcripts", len(stale))
+	for _, t := range stale {
+		if w.ctx.Err() != nil {
+			return len(stale)
+		}
+		if err := w.embedTranscript(cfg, t); err != nil {
+			// Left flagged, so the next cycle retries it.
+			w.log.Error("failed to rebuild transcript with stale chunks",
+				"transcript_id", t.ID, "file", t.FilePath, "error", err)
+		}
+	}
+	return len(stale)
+}
+
+// replayOutcome is what a rebuild owes the database AFTER its projection has
+// been written: which corrections landed, which were retired, and the watermark
+// the overlay was read at.
+//
+// It is a return value rather than a side effect on purpose. Writing it before
+// the chunks are inserted would claim corrections landed in a projection that
+// an embed or insert failure then prevented from ever existing — and `stale` is
+// TERMINAL, so a premature retirement cannot be walked back. This mirrors the
+// rule processTranscript already applies to in-pipeline findings: computed
+// early, persisted only after InsertChunks succeeds.
+type replayOutcome struct {
+	applied []patch.AppliedPatch
+	stale   []patch.StaleRef
+	// readAt is the server-side time the overlay was read. Always set on a
+	// successful load, including the zero-corrections case — a revert leaves a
+	// chunk flagged with nothing left to replay, and that flag still has to be
+	// cleared safely.
+	readAt time.Time
+}
+
+// correctedChunks loads the transcript's accepted corrections and replays them
+// onto the regenerated chunks, returning the copy to embed plus the outcome the
+// caller must persist after a successful insert.
+//
+// FAIL CLOSED on load: if the overlay cannot be read we do NOT fall back to
+// embedding pristine text. That would silently publish uncorrected text as if
+// it were corrected — indistinguishable, in the corpus, from "there were no
+// corrections" — so the transcript is left alone and retried next cycle.
+func (w *Worker) correctedChunks(t *db.Transcript, chunks []db.Chunk) ([]db.Chunk, replayOutcome, error) {
+	rows, readAt, err := w.db.GetCorrectionOverlay(w.ctx, t.ID)
+	if err != nil {
+		w.log.Error("load correction overlay failed; refusing to embed pristine text as corrected",
+			"transcript_id", t.ID, "file", t.FilePath, "error", err)
+		return nil, replayOutcome{}, fmt.Errorf("load correction overlay for transcript %s: %w", t.ID, err)
+	}
+	outcome := replayOutcome{readAt: readAt}
+	if len(rows) == 0 {
+		return chunks, outcome, nil
+	}
+
+	overlay, unplaceable := db.BuildOverlay(rows)
+	out, applied, stale := applyOverlay(chunks, overlay)
+
+	// A finding with no chunk_index has no chunk to replay onto; retire it
+	// rather than leaving it accepted-but-invisible forever.
+	for _, id := range unplaceable {
+		stale = append(stale, patch.StaleRef{ID: id, Reason: patch.StaleReasonChunkChanged})
+	}
+
+	w.log.Info("correction overlay replayed",
+		"transcript_id", t.ID, "file", t.FilePath,
+		"corrections", len(rows), "applied", len(applied), "stale", len(stale))
+
+	outcome.applied, outcome.stale = applied, stale
+	return out, outcome, nil
+}
+
+// persistReplay records a replay's outcome and clears the rebuild flag.
+//
+// MUST be called only after the rebuilt chunks are durably inserted — see
+// replayOutcome.
+//
+// Best-effort by design: the projection is already correct, and every rebuild
+// replays the whole overlay from scratch, so a failed bookkeeping write is
+// re-attempted next cycle. The flag clear is guarded by the overlay watermark,
+// so a decision that raced this rebuild leaves the chunk flagged and gets its
+// own rebuild instead of being swallowed.
+func (w *Worker) persistReplay(t *db.Transcript, o replayOutcome) {
+	if len(o.applied) > 0 {
+		recs := make([]db.AppliedFinding, len(o.applied))
+		for i, a := range o.applied {
+			recs[i] = db.AppliedFinding{ID: a.ID, Before: a.Before, After: a.After}
+		}
+		if err := w.db.MarkFindingsApplied(w.ctx, recs); err != nil {
+			w.log.Warn("recording applied corrections failed (projection is still correct; retried next rebuild)",
+				"transcript_id", t.ID, "applied", len(recs), "error", err)
+		}
+	}
+
+	// Group by reason so each retired finding records WHY it stopped applying.
+	// Reasons are visited in sorted order: map iteration order must not leak
+	// into the DB call sequence or the logs.
+	byReason := make(map[string][]string)
+	for _, s := range o.stale {
+		byReason[s.Reason] = append(byReason[s.Reason], s.ID)
+	}
+	for _, reason := range slices.Sorted(maps.Keys(byReason)) {
+		ids := byReason[reason]
+		if err := w.db.MarkFindingsStale(w.ctx, ids, reason); err != nil {
+			w.log.Warn("marking corrections stale failed",
+				"transcript_id", t.ID, "reason", reason, "findings", len(ids), "error", err)
+		}
+	}
+
+	// Clear the rebuild flag last: it is the only record that a rebuild is
+	// owed, so it must not be dropped before the outcome above is recorded.
+	if o.readAt.IsZero() {
+		return
+	}
+	if err := w.db.ClearEmbeddingStale(w.ctx, t.ID, o.readAt); err != nil {
+		w.log.Warn("clearing embedding_stale failed (chunk stays flagged; rebuilt again next cycle)",
+			"transcript_id", t.ID, "error", err)
+	}
+}
+
+// applyOverlay replays an overlay onto regenerated chunks.
+//
+// Pure: the overlay is an argument, nothing is queried, and the input slice is
+// not modified. It rewrites only Text and leaves SourceText alone — SourceText
+// is the projection's pristine input and the ONLY thing the judge is ever shown,
+// so a replay must never touch it.
+//
+// Replay always starts from the pristine text, never from a previously
+// corrected chunk. That is what makes a rebuild byte-identical no matter how
+// many times it runs.
+func applyOverlay(chunks []db.Chunk, o patch.Overlay) (out []db.Chunk, applied []patch.AppliedPatch, stale []patch.StaleRef) {
+	// Always copy, even with nothing to replay. Returning the caller's slice
+	// would alias the PRISTINE chunks the judge was shown, and the embed path
+	// writes Embedding into every element of what it gets back — which would
+	// then be writing through to the judge's copy.
+	out = make([]db.Chunk, len(chunks))
+	copy(out, chunks)
+	if len(o) == 0 {
+		return out, nil, nil
+	}
+
+	// Corrections whose chunk_index no longer corresponds to any chunk (the
+	// transcript re-chunked into fewer chunks) have nothing to replay onto.
+	seen := make(map[int]bool, len(out))
+	for i := range out {
+		seen[out[i].ChunkIndex] = true
+		patches := o[out[i].ChunkIndex]
+		if len(patches) == 0 {
+			continue
+		}
+		res := patch.Replay(pristineText(out[i]), patches)
+		out[i].Text = res.Text
+		applied = append(applied, res.Applied...)
+		stale = append(stale, res.Stale...)
+	}
+	orphaned := make([]int, 0, len(o))
+	for idx := range o {
+		if !seen[idx] {
+			orphaned = append(orphaned, idx)
+		}
+	}
+	slices.Sort(orphaned) // map iteration order must not leak into the output
+	for _, idx := range orphaned {
+		for _, p := range o[idx] {
+			stale = append(stale, patch.StaleRef{ID: p.ID, Reason: patch.StaleReasonChunkChanged})
+		}
+	}
+	return out, applied, stale
+}
+
+// pristineText returns the chunk's projection input.
+//
+// SourceText is authoritative and chunkTranscript always sets it, so the
+// fallback is unreachable on the worker's own path. It is kept as a defence for
+// any future caller that builds a db.Chunk without it (nothing SELECTs
+// source_text into a db.Chunk today): replaying onto an empty string would
+// quietly blank the chunk, whereas falling back to Text replays onto text that
+// — for a chunk with no SourceText — carries no corrections and so IS pristine.
+func pristineText(c db.Chunk) string {
+	if c.SourceText != "" {
+		return c.SourceText
+	}
+	return c.Text
 }
 
 // Stop signals the worker to shut down and waits for it to finish.

@@ -1781,12 +1781,17 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
 ```
 
 - **proposed** — the judge's output. Existing rows migrate here by default.
-- **accepted** — a human approved it; not yet written.
-- **applied** — the chunk text has been rewritten.
+- **accepted** — a human approved it; in the overlay, not yet reflected in the
+  projection (the chunk is flagged `embedding_stale`).
+- **applied** — the correction is reflected in the current projection. Both
+  `accepted` and `applied` replay on every rebuild — see "Applying" below.
 - **rejected** — a human declined it. May return to `proposed` for reconsideration.
-- **reverted** — an applied patch was undone.
-- **stale** — the underlying chunk changed, so the finding describes text that no
-  longer exists. **Terminal**: re-run the judge rather than resurrecting it.
+- **reverted** — an applied correction was withdrawn; the next rebuild simply
+  stops replaying it.
+- **stale** — the correction can no longer be replayed (the chunk changed, or
+  its anchor no longer resolves), so it describes text that no longer exists.
+  **Terminal**: re-run the judge rather than resurrecting it. Stale findings stay
+  visible; they are never deleted.
 
 `proposed → applied` is deliberately **illegal**. Reaching `applied` requires
 passing through `accepted`, which is the human gate; skipping it would be an
@@ -1813,54 +1818,216 @@ unique-match recovery (for legacy rows with no anchor) → **refuse**. The refus
 is load-bearing: an ambiguous anchor yields `ErrAnchorAmbiguous` and the patch is
 never applied on a guess.
 
-Before writing, the apply path re-hashes the chunk and compares to
-`chunk_text_sha256`. A mismatch means the chunk changed after the judge reviewed
-it, so the patch is marked `stale` rather than applied to text no model ever saw.
-Applying twice is impossible for the same reason: the first apply changes the
-hash, so the second is refused.
+Before replaying, the apply path re-hashes the chunk's **pristine** text and
+compares to `chunk_text_sha256`. A mismatch means the chunk changed after the
+judge reviewed it, so the patch is marked `stale` rather than applied to text no
+model ever saw.
 
-#### Applying and re-embedding
+Double-application is impossible by construction rather than by hash: every
+rebuild starts from the pristine `source_text` and replays the whole overlay, so
+replaying an already-applied correction reproduces the same bytes instead of
+compounding. (Replaying onto already-corrected text — which the projection never
+does — is separately refused by the hash check.)
 
-An applied patch rewrites `transcript_chunks.text` and sets
-`transcript_chunks.embedding_stale = true`. The embed worker re-embeds flagged
-chunks and clears the flag.
+#### Applying: the replayable correction overlay
+
+> **Revised 2026-08-19.** The earlier model — "an applied patch rewrites
+> `transcript_chunks.text`" — was **wrong and is replaced by this section**. It
+> could not work: the embed worker regenerates every chunk from
+> `transcripts.segments` (falling back to `raw_text`) on each embed and upserts
+> over the existing rows by deterministic UUID, so a correction written into
+> `transcript_chunks.text` is destroyed by the next re-embed. Chunks can never
+> be authoritative storage for corrections.
+
+Chunking is therefore defined as:
+
+```
+regenerate from source  →  replay applied corrections  →  embed
+```
+
+##### Three layers, one writer each
+
+| Layer | Tables | Writer | Mutability |
+|---|---|---|---|
+| Source | `transcripts.segments`, `transcripts.raw_text` | ingest (the ASR runner), once | **immutable** |
+| Decisions | `transcript_findings` | human accept/reject | append-only; only `patch_state` transitions |
+| Projection | `transcript_chunks` + embeddings | the chunker | **disposable, rebuildable** |
+
+A correction lives in the *decisions* layer and is **replayed** onto the
+projection. It is never stored in the projection, because the projection is
+thrown away and rebuilt.
+
+##### `source_text` — why a chunk carries two texts
+
+`transcript_chunks.source_text TEXT` (nullable, additive) holds the **pristine
+regenerated** chunk — the projection's input. `text` holds
+`ApplyCorrections(source_text, overlay)` — the embedded, searched, and displayed
+surface. Legacy rows have `source_text IS NULL` and are read as
+`COALESCE(source_text, text)`, which is correct because a legacy row has no
+corrections applied.
+
+The split exists because of a hard constraint: **the judge must always be shown
+pristine text.** It records `anchor_offset`/`anchor_occurrence` and
+`chunk_text_sha256` against exactly the text it was given, and replay always
+starts from the pristine regenerated text. Judge the corrected surface and every
+new finding is born `stale` — its hash could never match the projection's input.
+So `evalChunkSelectSQL` (which feeds `earmark eval`) selects
+`COALESCE(c.source_text, c.text)`, and the worker's eval passes never replay the
+overlay.
+
+##### Replay order is load-bearing
+
+All patches on one chunk were judged against the same revision, so they share
+one coordinate system. Replay therefore resolves **every** span against the
+pristine input text (never against a partially-patched string), then splices in
+**descending start-offset order**, tiebroken by end offset descending then
+finding id ascending.
+
+Descending is not a preference. Splicing left-to-right invalidates every later
+offset the moment an earlier replacement changes length — a silent corruption
+that yields plausible text and no error. Applying from the end backwards leaves
+every not-yet-applied span's indices untouched.
+
+Two corrections claiming **overlapping** spans have no well-defined composition
+and are refused rather than silently ordered.
+
+##### Byte-identical rebuild
+
+`patch.ApplyCorrections` is pure — no database, no I/O, no clock. Same pristine
+text plus same patch set produces a **byte-identical** result on every rebuild
+and in any input row order. That property is what makes `transcript_chunks` safe
+to throw away: a rebuild cannot make the searchable corpus drift.
+
+##### Stale rule (never delete a finding)
+
+`patch.Replay` is the lenient wrapper the projection uses. A correction that
+fails the hash check, the empty-correction check, anchor resolution, or the
+overlap check is **quarantined**, not dropped: it is returned with a reason and
+written back as `patch_state = 'stale'` plus `stale_reason` ∈
+
+`chunk_changed` · `anchor_not_found` · `anchor_ambiguous` · `overlapping_patch` ·
+`empty_correction`
+
+A stale finding **stays visible** — it is an `UPDATE`, never a `DELETE`. Every
+correction ends up either applied or explicitly retired; none is silently lost.
+`stale` remains terminal (re-run the judge rather than resurrecting it).
+
+##### Invalidation, the rebuild trigger, and the watermark
+
+Accepting or reverting a finding sets `transcript_chunks.embedding_stale = true`
+for that one chunk, in the same transaction as the decision.
+
+**The rebuild trigger.** The embed worker runs a **rebuild pass** each cycle over
+transcripts with at least one flagged chunk, and puts them back through the
+normal regenerate → replay → embed path (`GetTranscriptsWithStaleChunks` →
+`embedTranscript`). This pass is what closes the loop, and it is load-bearing:
+the other three worker selections all require a transcript to have **no** chunks
+yet, and findings only ever exist for transcripts that are already embedded — so
+without it an accepted correction would sit in the overlay forever and never
+reach the searchable text. The pass is bounded by `EMBED_BATCH_SIZE` like every
+other selection, and it does **not** run the judge: per this section a
+stale-driven re-embed does not require re-judging, and the eval gate's
+`run_metrics.eval_finished_at` latch is untouched.
+
+**Ordering.** The replay outcome (`applied` / `stale` / clearing the flag) is
+computed during the rebuild but persisted **only after `InsertChunks` succeeds**.
+A failed embed or insert means the projection was never written, so recording
+corrections as applied — or retiring one to the terminal `stale` state — would
+describe something that never happened. Same rule the in-pipeline findings
+already follow.
+
+**The watermark.** `InsertChunks` deliberately does **not** clear
+`embedding_stale`. An unconditional clear there is a lost update: a human accept
+committing between the rebuild's overlay read and its insert sets the flag, and
+the clear would wipe it — that correction would never be replayed and never be
+re-flagged. Instead `GetCorrectionOverlay` returns the server-side timestamp its
+read was taken at, and the clear is guarded: a chunk is only unflagged when it
+carries no finding `decided_at` later than that watermark **and** no finding
+still sitting in `accepted`. A blocked chunk simply gets rebuilt again next
+cycle, so the failure mode is one redundant re-embed rather than a lost
+correction. (The second condition also makes a failed best-effort
+`MarkFindingsApplied` self-healing.) Because the watermark is what protects a
+concurrent decision, **revert stamps `decided_at` too** — not only accept and
+reject.
 
 Invalidation is **exactly one chunk**, and this is a property of the schema
 rather than a lucky accident: chunks store their text denormalized and carry no
-absolute character offsets into the transcript, so editing one chunk never shifts
-another's anchors. A patch therefore costs one re-embed, not a corpus re-embed.
+absolute character offsets into the transcript, so a correction in one chunk
+never shifts another's anchors. A correction therefore costs one re-embed, not a
+corpus re-embed.
 
 `embedding_stale` exists because `transcript_chunks.embedding` is
 `VECTOR(768) NOT NULL` — staleness cannot be signalled by nulling the vector.
 
 **Interaction with `EVAL_GATES_EMBED` (§2.15):** the gate latches on
 `run_metrics.eval_finished_at`, which is per-job and unaffected by applying a
-patch. A re-embed triggered by `embedding_stale` is therefore independent of the
-eval gate and does not require re-judging the job.
+correction. A re-embed triggered by `embedding_stale` is therefore independent
+of the eval gate and does not require re-judging the job.
+
+**Fail closed.** If the overlay cannot be read, the worker does **not** embed
+pristine text as though it were corrected — in the corpus that is
+indistinguishable from "there were no corrections". It logs and returns an
+error, leaving the transcript for the next cycle.
 
 #### Reversibility
 
-Apply records `applied_before_text` and `applied_after_text` verbatim, plus
-`applied_at`. Revert is a whole-text swap verified against the recorded "after" —
-it deliberately does **not** re-resolve the anchor, because re-deriving a span
-would reintroduce the ambiguity the recorded text exists to eliminate.
+Revert is **"flip `patch_state` and rebuild the projection"**. There is no text
+swap: the next rebuild regenerates from source and replays an overlay that no
+longer contains the reverted correction, so the correction simply stops being
+applied. Reverting sets `embedding_stale` on the affected chunk (which the
+rebuild pass then picks up) and stamps `decided_at`/`decided_by` like any other
+human decision.
 
-`decided_at` / `decided_by` record who accepted or rejected, and `stale_reason`
-records why a patch was retired.
+`applied_at` plus `applied_before_text` / `applied_after_text` remain an **audit
+trail** of what landed, with one **semantic narrowing**: they now hold the
+**span-level** before/after (the located span and its replacement), not the
+whole chunk. Whole-chunk before/after became ill-defined once a chunk can carry
+several corrections — there is no single "before" that attributes a difference
+to one finding.
+
+`decided_at` / `decided_by` record who made a human decision — accept, reject,
+**or revert** — and `stale_reason` records why a correction was retired. The
+machine transitions (`applied`, `stale`, written by the embed worker) never
+stamp them, so the record of who approved a correction is not overwritten by a
+rebuild.
+
+State transitions go through `patch.CanTransition` at the DB boundary: an
+illegal move (notably `proposed → applied`, which would skip the human gate) is
+refused before any SQL runs, and the `UPDATE` is guarded on the expected current
+state so a concurrent decision cannot be clobbered.
 
 #### What is deliberately NOT edited
 
-`transcripts.segments` is the **immutable ASR record** — what the recognizer
-actually produced. It is provenance, and corrections never touch it. The findings
-table is the audit trail of divergence between the ASR output and the reviewed
-text.
+`transcripts.segments` and `transcripts.raw_text` are the **immutable ASR
+record** — what the recognizer actually produced. They are provenance, no Go
+code writes them, and corrections never touch them. The findings table is the
+audit trail of divergence between the ASR output and the reviewed text.
 
-> **Open item (not yet implemented):** `transcripts.raw_text` duplicates the
-> transcript body alongside the chunks. This revision patches
-> `transcript_chunks.text` (the embedded, searched surface) only, so `raw_text`
-> can drift from the chunks once patches are applied. Reconciling the two — or
-> deriving one from the other — is tracked as follow-up work and must land before
-> patch-apply is enabled in production.
+> **Resolved (was: "`raw_text` can drift from the chunks").** Under the overlay
+> model `raw_text` cannot drift, because nothing ever writes it. Corrections are
+> not stored in any text column: they are replayed onto a projection that is
+> regenerated from `segments`/`raw_text` every time. The two can no longer
+> disagree about a correction, because only one of them ever carries one.
+
+##### Reader audit — who wants ORIGINAL text, who wants CORRECTED
+
+| Site | Wants | Status |
+|---|---|---|
+| `worker.processTranscript` / `evalTranscript` / `embedTranscript` empty-guards | ORIGINAL | `raw_text` read only as an emptiness guard |
+| `worker.chunkTranscript` (segments + raw-text fallback) | ORIGINAL | it **is** the regeneration step |
+| `cmd/eval --backfill-unevaluated` | ORIGINAL | the judge must see pristine text |
+| `db` transcript SELECTs (feed the chunker) | ORIGINAL | correct as-is |
+| `evalChunkSelectSQL` (feeds `earmark eval`) | ORIGINAL | selects `COALESCE(c.source_text, c.text)` |
+| search / `transcript_chunks.text` | CORRECTED | the overlay is replayed before embedding |
+| MCP `get_transcript`, web transcript reader (`GetTrackDetail` → segments) | CORRECTED | **KNOWN GAP** |
+
+> **Known gap (accepted, documented, not fixed here).** The MCP `get_transcript`
+> tool and the web transcript reader render `transcripts.segments`. A reader
+> genuinely wants corrected text there — but segments are immutable provenance
+> and carry no corrections, so **search shows corrected text while the reader
+> shows uncorrected ASR.** Closing the gap means projecting corrections onto
+> segments at render time (segments have no chunk anchors today). Mutating
+> segments to "fix" it is forbidden: it would destroy the provenance record.
 
 ## 3. SCHEMA — pgvector chunks table
 
@@ -1898,9 +2065,11 @@ CREATE TABLE transcript_chunks (
     chunk_index  INTEGER     NOT NULL,   -- ordinal position within transcript
     start_sec    FLOAT8      NOT NULL,   -- earliest segment start in this chunk
     end_sec      FLOAT8      NOT NULL,   -- latest segment end in this chunk
-    text         TEXT        NOT NULL,
+    text         TEXT        NOT NULL,   -- CORRECTED surface: source_text + replayed overlay (§2.17)
+    source_text  TEXT,                   -- PRISTINE regenerated text; NULL on legacy rows (§2.17)
     speaker      TEXT,                   -- dominant speaker in chunk, or NULL
     embedding    VECTOR(768) NOT NULL,   -- nomic-embed-text dimension, MUST match EMBEDDINGS_MODEL
+    embedding_stale BOOLEAN  NOT NULL DEFAULT false,  -- set on accept/revert, cleared on rebuild (§2.17)
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT transcript_chunks_transcript_chunk_unique UNIQUE (transcript_id, chunk_index)
@@ -1913,6 +2082,12 @@ CREATE INDEX transcript_chunks_file_path_idx ON transcript_chunks (file_path);
 
 Chunk size target: **512 tokens** (Go tokenizer), overlap: **64 tokens**.
 These are implementation constants in the Go chunker, not a DB concern.
+
+`transcript_chunks` is a **derived projection**, not storage: the embed worker
+regenerates every row from `transcripts.segments`/`raw_text` and upserts over
+the existing rows. Nothing durable may live only here — see §2.17 for why
+corrections are replayed onto it rather than written into it, and what
+`source_text` / `embedding_stale` are for.
 
 ---
 

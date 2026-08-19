@@ -186,6 +186,11 @@ func formatTrackChooser(book string, tracks []db.RecentJob) *mcp.CallToolResult 
 // When false (the default), the structured payload is byte-identical to the
 // pre-word-timestamp shape (the `words` field is omitted via omitempty). The
 // human-readable text rendering is unaffected by the flag.
+//
+// KNOWN GAP (CONTRACT §2.17): this renders transcripts.segments, the immutable
+// ASR record, so get_transcript shows UNCORRECTED text while search shows the
+// corrected projection. A reader would want corrected text, but segments are
+// provenance and are never rewritten — see db.GetTrackDetail.
 func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords bool) *mcp.CallToolResult {
 	// Defensive: the caller checks for nil, but guard here too so the helper is
 	// safe to reuse. A nil detail has no transcript to render.
