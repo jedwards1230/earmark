@@ -234,13 +234,64 @@ func (db *DB) Ping(ctx context.Context) error {
 	return db.pool.Ping(ctx)
 }
 
+// schemaInitLockKey is the advisory-lock key serializing schema initialization.
+//
+// The value is arbitrary; only its stability matters. Every process that runs
+// initialize() must use the SAME key or the serialization does not happen.
+// Chosen from "earmark schema init" so a stray lock is identifiable in
+// pg_locks rather than looking like a random number.
+const schemaInitLockKey int64 = 0x4541524D_5343484D // "EARM","SCHM"
+
+// schemaInitLockSQL acquires that lock. Package var (like insertFindingSQL) so
+// a test can assert its properties without a live database.
+//
+// It MUST stay pg_advisory_xact_lock (transaction-scoped), never
+// pg_advisory_lock (session-scoped). The session-scoped variant survives
+// COMMIT and is only released by an explicit unlock or by the connection
+// closing — and this runs on a POOLED connection, so a leaked lock would be
+// handed to the next borrower and block every later initialize() forever.
+var schemaInitLockSQL = `SELECT pg_advisory_xact_lock($1)`
+
 // initialize creates the CONTRACT schema and indexes in a single transaction.
+//
+// # Why the advisory lock
+//
+// earmark runs two processes against one database (earmark-ingest and
+// earmark-mcp), and both call initialize() on startup. In Kubernetes they are
+// rolled together, so they routinely execute this identical DDL block
+// concurrently — and concurrent DDL deadlocks:
+//
+//	Process A waits for AccessExclusiveLock on relation X
+//	Process B waits for ShareLock on A's transaction
+//
+// Observed in production on 2026-08-14 (earmark-mcp, during CREATE FUNCTION,
+// "while updating tuple in relation pg_proc") and again on 2026-08-19
+// (earmark-ingest, during DROP TRIGGER). The CREATE OR REPLACE FUNCTION +
+// DROP TRIGGER pair mutates pg_proc from both sessions at once, and they take
+// locks in opposing orders.
+//
+// It self-healed each time — the loser crashed, restarted, and succeeded
+// because the winner had finished — so the symptom was only a crash-loop on
+// deploy. But relying on "every statement is idempotent AND a retry always
+// follows" is luck, not design: a deadlock mid-DDL is a failure at an
+// arbitrary point, and only the IF NOT EXISTS guards made that survivable.
+//
+// pg_advisory_xact_lock makes the second process WAIT instead of racing. It is
+// transaction-scoped, so it is released on COMMIT or ROLLBACK — including the
+// deferred Rollback below and an outright process crash. There is no unlock
+// path to forget and no lock to leak.
 func (db *DB) initialize(ctx context.Context) error {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin init tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Must be the FIRST statement in the transaction: anything executed before
+	// it takes locks outside the serialized region and can still deadlock.
+	if _, err := tx.Exec(ctx, schemaInitLockSQL, schemaInitLockKey); err != nil {
+		return fmt.Errorf("acquire schema-init advisory lock: %w", err)
+	}
 
 	if _, err := tx.Exec(ctx, `
 		CREATE EXTENSION IF NOT EXISTS vector;

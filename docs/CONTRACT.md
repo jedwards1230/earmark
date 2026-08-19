@@ -1867,6 +1867,29 @@ text.
 The Go service reads completed transcripts, chunks them, and embeds each chunk.
 Chunks are stored alongside the transcripts in the same database.
 
+> **Schema init is serialized by an advisory lock (binding for new processes).**
+> Every earmark process runs the same idempotent schema-init transaction on
+> startup — today that is `earmark-ingest` and `earmark-mcp`, which Kubernetes
+> rolls together, so they execute the identical DDL block concurrently.
+> Concurrent DDL **deadlocks**: observed in production 2026-08-14 (during
+> `CREATE FUNCTION`, "while updating tuple in relation `pg_proc`") and again
+> 2026-08-19 (during `DROP TRIGGER`). The loser crashed and recovered on
+> restart, so the symptom was a crash-loop on deploy rather than data loss —
+> survivable only because every statement is `IF NOT EXISTS`-guarded.
+>
+> `initialize()` therefore takes `pg_advisory_xact_lock` as the **first**
+> statement in its transaction, before any DDL. The second process waits
+> instead of racing. The lock is transaction-scoped, so COMMIT, ROLLBACK, or a
+> process crash all release it — there is no unlock path to forget.
+>
+> **If you add a third process that touches this database, it must run the same
+> schema-init (and therefore take the same lock) or reintroduce the deadlock.**
+> Two constraints are load-bearing and are covered by tests in
+> `internal/db/schema_lock_test.go`: the key must be the same constant in every
+> process, and the lock must stay `pg_advisory_xact_lock` — the session-scoped
+> `pg_advisory_lock` would survive COMMIT on a *pooled* connection and block
+> every later initialization permanently.
+
 ```sql
 CREATE TABLE transcript_chunks (
     id           UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
