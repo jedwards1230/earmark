@@ -18,13 +18,24 @@ import (
 // liveSpan is the exact transcript span used in the probes.
 const liveSpan = "the signal was sent from the auto sebo observatory in nineteen seventy four"
 
+// livePatch builds the replayable patch for a probe result. The chunk hash is
+// the live span's own, so these exercise the normal (hash-verified) path.
+func livePatch(a Anchor, correction string) Patch {
+	return Patch{
+		ID:         "live",
+		Anchor:     a,
+		Correction: correction,
+		ChunkHash:  ChunkHash(liveSpan),
+	}
+}
+
 // TestLiveModelOffsetIsUntrusted is the regression guard for the observed
 // failure. qwen3.8, asked with response_format json_schema and thinking
 // suppressed, reported anchor_offset=27 for "auto sebo" — which actually starts
 // at 29. Offset 27 selects "e auto se": two characters early, straddling the
 // word boundary.
 //
-// If Locate trusted the reported offset, the applied result would have been
+// If Locate trusted the reported offset, the replayed result would have been
 // "...from thareciboobservatory in..." — a corruption that produces no error
 // and reads as a successful edit. This test fails if anyone ever "optimises"
 // Locate into trusting the model's number.
@@ -53,6 +64,8 @@ func TestLiveModelOffsetIsUntrusted(t *testing.T) {
 		t.Fatalf("expected the bad offset to select %q, got %q", "e auto se", got)
 	}
 
+	// The resolution ladder itself, called directly — this is the actual
+	// regression guard and must stay a direct Locate call.
 	span, err := Locate(liveSpan, Anchor{
 		OriginalText: original,
 		Offset:       reportedOffset,
@@ -65,22 +78,44 @@ func TestLiveModelOffsetIsUntrusted(t *testing.T) {
 		t.Errorf("Locate trusted the model's offset: want start %d, got %d", trueOffset, span.Start)
 	}
 
-	got, _, err := Apply(liveSpan, ChunkHash(liveSpan), Anchor{
+	// And end-to-end through the production replay path.
+	got, err := ApplyCorrections(liveSpan, []Patch{livePatch(Anchor{
 		OriginalText: original,
 		Offset:       reportedOffset,
 		Occurrence:   0,
-	}, correction)
+	}, correction)})
 	if err != nil {
-		t.Fatalf("Apply: %v", err)
+		t.Fatalf("ApplyCorrections: %v", err)
 	}
 
 	const want = "the signal was sent from the arecibo observatory in nineteen seventy four"
 	if got != want {
-		t.Errorf("Apply produced corrupted text.\n want: %q\n  got: %q", want, got)
+		t.Errorf("ApplyCorrections produced corrupted text.\n want: %q\n  got: %q", want, got)
 	}
 	// The specific corruption the bad offset would have caused.
 	if strings.Contains(got, "thareciboobservatory") {
-		t.Error("Apply used the model's raw offset and welded words together")
+		t.Error("replay used the model's raw offset and welded words together")
+	}
+
+	// The lenient path must reach the same text and quarantine nothing — a
+	// recoverable bad offset is not a reason to retire a finding.
+	res := Replay(liveSpan, []Patch{livePatch(Anchor{
+		OriginalText: original,
+		Offset:       reportedOffset,
+		Occurrence:   0,
+	}, correction)})
+	if res.Text != want {
+		t.Errorf("Replay diverged from ApplyCorrections.\n want: %q\n  got: %q", want, res.Text)
+	}
+	if len(res.Stale) != 0 {
+		t.Errorf("a recoverable model offset must not make the patch stale: %+v", res.Stale)
+	}
+	if len(res.Applied) != 1 || res.Applied[0].Span.Start != trueOffset {
+		t.Errorf("Replay recorded the wrong span: %+v", res.Applied)
+	}
+	if len(res.Applied) == 1 && res.Applied[0].Before != original {
+		t.Errorf("recorded before-text should be the located span %q, got %q",
+			original, res.Applied[0].Before)
 	}
 }
 
@@ -89,10 +124,10 @@ func TestLiveModelOffsetIsUntrusted(t *testing.T) {
 // offset 29, which is correct. Suppressing thinking made the finding cheaper
 // (87 vs 953 completion tokens) but the offset worse.
 //
-// Both paths must land on the same applied text. If they ever diverge, the
-// resolution ladder has become sensitive to how the model was prompted, which
-// would make patch behaviour depend on inference settings — exactly the kind of
-// coupling the anchor design exists to prevent.
+// All three paths must land on the same replayed text. If they ever diverge,
+// the resolution ladder has become sensitive to how the model was prompted,
+// which would make patch behaviour depend on inference settings — exactly the
+// kind of coupling the anchor design exists to prevent.
 func TestLiveModelOffsetCorrectPathStillWorks(t *testing.T) {
 	const (
 		original   = "auto sebo"
@@ -109,16 +144,28 @@ func TestLiveModelOffsetCorrectPathStillWorks(t *testing.T) {
 		{"model omitted the offset entirely", -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _, err := Apply(liveSpan, ChunkHash(liveSpan), Anchor{
+			p := livePatch(Anchor{
 				OriginalText: original,
 				Offset:       tc.offset,
 				Occurrence:   0,
 			}, correction)
+
+			got, err := ApplyCorrections(liveSpan, []Patch{p})
 			if err != nil {
-				t.Fatalf("Apply: %v", err)
+				t.Fatalf("ApplyCorrections: %v", err)
 			}
 			if got != want {
 				t.Errorf("want %q, got %q", want, got)
+			}
+
+			// The projection layer uses Replay, so it must agree exactly.
+			res := Replay(liveSpan, []Patch{p})
+			if res.Text != want {
+				t.Errorf("Replay disagreed with ApplyCorrections: want %q, got %q", want, res.Text)
+			}
+			if len(res.Applied) != 1 || len(res.Stale) != 0 {
+				t.Errorf("expected exactly one applied patch and no stale refs, got %+v / %+v",
+					res.Applied, res.Stale)
 			}
 		})
 	}

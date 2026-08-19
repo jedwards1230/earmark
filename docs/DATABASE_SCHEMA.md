@@ -151,7 +151,9 @@ next re-embed. Human corrections therefore live in `transcript_findings` and are
 **replayed** onto the regenerated text: `source_text` is the pristine
 regeneration (the judge is always shown this), `text` is that text with the
 accepted-correction overlay applied (what is embedded and searched), and
-`embedding_stale` marks a chunk whose overlay changed. See CONTRACT §2.17.
+`embedding_stale` marks a chunk whose overlay changed — the embed worker's
+rebuild pass selects on it and clears it (guarded by the overlay-read watermark)
+once the rebuilt chunk is inserted. See CONTRACT §2.17.
 
 **Timestamps are TRACK-relative**: `start_sec`/`end_sec` are copied from the
 parent transcript's segment boundaries, so they are offsets into the chunk's own

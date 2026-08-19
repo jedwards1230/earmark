@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pashagolub/pgxmock/v4"
 
@@ -23,6 +24,8 @@ var correctionSQL = map[string]string{
 	"setPatchStateSQL":            setPatchStateSQL,
 	"setPatchStateDecidedSQL":     setPatchStateDecidedSQL,
 	"markChunkStaleForFindingSQL": markChunkStaleForFindingSQL,
+	"clearEmbeddingStaleSQL":      clearEmbeddingStaleSQL,
+	"staleChunkTranscriptsSQL":    staleChunkTranscriptsSQL,
 }
 
 // TestCorrectionSQL_NeverTouchesTranscriptProvenance is the hard invariant of
@@ -35,7 +38,7 @@ func TestCorrectionSQL_NeverTouchesTranscriptProvenance(t *testing.T) {
 		upper := strings.ToUpper(sql)
 		for _, banned := range []string{
 			"UPDATE TRANSCRIPTS", "DELETE FROM TRANSCRIPTS", "INSERT INTO TRANSCRIPTS",
-			"ALTER TABLE TRANSCRIPTS", "SEGMENTS", "RAW_TEXT",
+			"ALTER TABLE TRANSCRIPTS",
 		} {
 			if strings.Contains(upper, banned) {
 				t.Errorf("%s must not touch transcript provenance (%q):\n%s", name, banned, sql)
@@ -45,6 +48,14 @@ func TestCorrectionSQL_NeverTouchesTranscriptProvenance(t *testing.T) {
 			if strings.Contains(upper, verb) {
 				t.Errorf("%s contains destructive verb %q — a stale finding is retired, "+
 					"never deleted:\n%s", name, verb, sql)
+			}
+		}
+		// segments / raw_text may be READ (the rebuild selection regenerates from
+		// them) but never written. Any statement naming them must be a pure SELECT.
+		if strings.Contains(upper, "SEGMENTS") || strings.Contains(upper, "RAW_TEXT") {
+			if !strings.HasPrefix(strings.TrimSpace(upper), "SELECT") {
+				t.Errorf("%s names segments/raw_text outside a pure SELECT — they are "+
+					"immutable provenance:\n%s", name, sql)
 			}
 		}
 	}
@@ -167,10 +178,10 @@ func TestEvalChunkSelectSQL_FeedsTheJudgePristineText(t *testing.T) {
 	}
 }
 
-// TestInsertChunksWritesSourceTextAndClearsStale pins the projection write:
-// source_text is persisted alongside the corrected text, and rebuilding a chunk
-// clears embedding_stale in the same statement (so a rebuild can't forget it).
-func TestInsertChunksWritesSourceTextAndClearsStale(t *testing.T) {
+// TestInsertChunksWritesSourceTextAndLeavesStaleFlag pins the projection write:
+// source_text is persisted alongside the corrected text, and embedding_stale is
+// NOT touched (the clear is watermark-guarded and happens afterwards).
+func TestInsertChunksWritesSourceTextAndLeavesStaleFlag(t *testing.T) {
 	raw, err := os.ReadFile("db.go")
 	if err != nil {
 		t.Fatalf("read db.go: %v", err)
@@ -180,18 +191,164 @@ func TestInsertChunksWritesSourceTextAndClearsStale(t *testing.T) {
 	if start < 0 {
 		t.Fatal("InsertChunks not found — this test needs updating")
 	}
-	body := src[start : start+3000]
+	// Bound the window at the function's closing brace — a column-0 "}" in
+	// gofmt'd Go. A fixed byte count spills into whatever follows (and cannot
+	// fail cleanly if the file shrinks); cutting at the next "func " is also
+	// wrong, because it swallows that function's doc comment.
+	rest := src[start:]
+	body := rest
+	if end := strings.Index(rest, "\n}\n"); end >= 0 {
+		body = rest[:end+3]
+	}
 
-	for _, want := range []string{
-		"source_text",
-		"embedding_stale",
-		"source_text     = EXCLUDED.source_text",
-		"embedding_stale = false",
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("InsertChunks must contain %q so a rebuilt chunk carries its "+
-				"pristine text and is no longer stale", want)
+	// Assert on the SQL literal only. The surrounding comments legitimately
+	// discuss embedding_stale (explaining why it is NOT written), so matching on
+	// the whole function body would fail on its own documentation.
+	const execMarker = "tx.Exec(ctx, `"
+	open := strings.Index(body, execMarker)
+	if open < 0 {
+		t.Fatal("no SQL literal found in InsertChunks — this test needs updating")
+	}
+	open += len(execMarker) - 1
+	closeIdx := strings.Index(body[open+1:], "`")
+	if closeIdx < 0 {
+		t.Fatal("unterminated SQL literal in InsertChunks — this test needs updating")
+	}
+	sql := body[open+1 : open+1+closeIdx]
+
+	if !strings.Contains(sql, "source_text = EXCLUDED.source_text") {
+		t.Errorf("InsertChunks must persist source_text so a rebuilt chunk carries "+
+			"its pristine text:\n%s", sql)
+	}
+
+	// It must NOT clear embedding_stale. An unconditional clear here is a lost
+	// update: a human accept landing between the overlay read and this insert
+	// sets the flag, and clearing it unconditionally drops that accept — never
+	// replayed, never re-flagged. ClearEmbeddingStale does it afterwards, guarded.
+	if strings.Contains(sql, "embedding_stale") {
+		t.Errorf("InsertChunks must not touch embedding_stale — the clear is "+
+			"watermark-guarded in ClearEmbeddingStale:\n%s", sql)
+	}
+}
+
+// TestClearEmbeddingStaleSQL_IsWatermarkGuarded pins the lost-update guard: the
+// clear must be conditional on both the overlay-read watermark and on there
+// being no correction still waiting to be replayed.
+func TestClearEmbeddingStaleSQL_IsWatermarkGuarded(t *testing.T) {
+	if !strings.Contains(clearEmbeddingStaleSQL, "SET embedding_stale = false") {
+		t.Errorf("clearEmbeddingStaleSQL must clear the flag:\n%s", clearEmbeddingStaleSQL)
+	}
+	if !strings.Contains(clearEmbeddingStaleSQL, "NOT EXISTS") {
+		t.Errorf("clearEmbeddingStaleSQL must be guarded, not unconditional:\n%s", clearEmbeddingStaleSQL)
+	}
+	// A decision recorded after the rebuild's read must block the clear.
+	if !strings.Contains(clearEmbeddingStaleSQL, "f.decided_at > $2") {
+		t.Errorf("clearEmbeddingStaleSQL must compare decided_at against the "+
+			"watermark:\n%s", clearEmbeddingStaleSQL)
+	}
+	// So must a correction still sitting in `accepted` (whatever its timestamp) —
+	// that is what makes a failed MarkFindingsApplied self-healing.
+	if !strings.Contains(clearEmbeddingStaleSQL, "f.patch_state = $3") {
+		t.Errorf("clearEmbeddingStaleSQL must also block on a still-accepted "+
+			"correction:\n%s", clearEmbeddingStaleSQL)
+	}
+	// Scoped to one transcript, and only ever touches flagged rows.
+	if !strings.Contains(clearEmbeddingStaleSQL, "c.transcript_id = $1") {
+		t.Errorf("clearEmbeddingStaleSQL must be scoped to one transcript:\n%s", clearEmbeddingStaleSQL)
+	}
+}
+
+// TestClearEmbeddingStale_BindsWatermarkAndAcceptedState drives the real Exec
+// against a mock pool: the guard's parameters must be the watermark and the
+// `accepted` state constant, not literals that could drift.
+func TestClearEmbeddingStale_BindsWatermarkAndAcceptedState(t *testing.T) {
+	database := newTestDB()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	watermark := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	mock.ExpectExec("UPDATE transcript_chunks").
+		WithArgs("t-1", watermark, patch.StateAccepted).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	if err := database.clearEmbeddingStale(context.Background(), mock, "t-1", watermark); err != nil {
+		t.Fatalf("clearEmbeddingStale: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestStaleChunkTranscriptsSQL_SelectsEmbeddedButOutOfDate is the guard on the
+// rebuild trigger. The other three selections all require a transcript to have
+// NO chunks; this one must do the OPPOSITE — select transcripts that ARE
+// embedded but carry a flagged chunk. Without it the overlay is unreachable in
+// production: findings only exist for already-embedded transcripts.
+func TestStaleChunkTranscriptsSQL_SelectsEmbeddedButOutOfDate(t *testing.T) {
+	upper := strings.ToUpper(staleChunkTranscriptsSQL)
+	if !strings.HasPrefix(strings.TrimSpace(upper), "SELECT") {
+		t.Errorf("staleChunkTranscriptsSQL must be read-only:\n%s", staleChunkTranscriptsSQL)
+	}
+	if strings.Contains(upper, "NOT EXISTS") {
+		t.Errorf("staleChunkTranscriptsSQL must select transcripts that DO have "+
+			"chunks (EXISTS, not NOT EXISTS):\n%s", staleChunkTranscriptsSQL)
+	}
+	if !strings.Contains(staleChunkTranscriptsSQL, "c.embedding_stale") {
+		t.Errorf("staleChunkTranscriptsSQL must filter on embedding_stale:\n%s", staleChunkTranscriptsSQL)
+	}
+	if !strings.Contains(staleChunkTranscriptsSQL, "LIMIT $1") {
+		t.Errorf("staleChunkTranscriptsSQL must be bounded by a parameterized LIMIT:\n%s",
+			staleChunkTranscriptsSQL)
+	}
+	// It must read the same immutable source columns as the other selections so
+	// the rebuild regenerates from pristine text.
+	for _, col := range []string{"t.segments", "t.raw_text"} {
+		if !strings.Contains(staleChunkTranscriptsSQL, col) {
+			t.Errorf("staleChunkTranscriptsSQL must select %s (the rebuild regenerates "+
+				"from source):\n%s", col, staleChunkTranscriptsSQL)
 		}
+	}
+	// The eval gate must not leak into the rebuild path: a stale-driven re-embed
+	// does not require re-judging the job (§2.17).
+	if strings.Contains(staleChunkTranscriptsSQL, "eval_finished_at") {
+		t.Errorf("staleChunkTranscriptsSQL must be independent of the eval gate:\n%s",
+			staleChunkTranscriptsSQL)
+	}
+}
+
+// TestGetTranscriptsWithStaleChunks_ScansRows drives the selection's query +
+// scan path against a mock pool.
+func TestGetTranscriptsWithStaleChunks_ScansRows(t *testing.T) {
+	database := newTestDB()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	speakers := 2
+	rows := pgxmock.NewRows([]string{
+		"id", "job_id", "file_path", "checksum", "language", "duration_seconds",
+		"speaker_count", "segments", "raw_text", "model_name", "created_at",
+	}).AddRow("t-1", "j-1", "/books/a/t/ch1.mp3", "sum", "en", 123.4,
+		&speakers, []byte("[]"), "hello", "parakeet", time.Unix(0, 0).UTC())
+
+	mock.ExpectQuery("FROM transcripts t").
+		WithArgs(7).
+		WillReturnRows(rows)
+
+	got, err := database.getTranscriptsWithStaleChunks(context.Background(), mock, 7)
+	if err != nil {
+		t.Fatalf("getTranscriptsWithStaleChunks: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "t-1" || got[0].RawText != "hello" {
+		t.Fatalf("unexpected scan result: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
@@ -320,13 +477,24 @@ func TestGetCorrectionOverlay_ScansRows(t *testing.T) {
 		AddRow("f1", &idx, "auto sebo", &correction, &off, &occ, &hash).
 		AddRow("f2", (*int)(nil), "fox", (*string)(nil), (*int)(nil), (*int)(nil), (*string)(nil))
 
+	watermark := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT now").
+		WillReturnRows(pgxmock.NewRows([]string{"now"}).AddRow(watermark))
 	mock.ExpectQuery("FROM transcript_findings").
 		WithArgs("t-1", overlayStates).
 		WillReturnRows(rows)
+	mock.ExpectRollback()
 
-	got, err := database.getCorrectionOverlay(context.Background(), mock, "t-1")
+	got, readAt, err := database.getCorrectionOverlay(context.Background(), mock, "t-1")
 	if err != nil {
 		t.Fatalf("getCorrectionOverlay: %v", err)
+	}
+	// The watermark comes from the SERVER, in the same transaction as the read.
+	// The worker and the reviewer's decision may be written by different pods, so
+	// a Go-side clock would not be comparable with decided_at.
+	if !readAt.Equal(watermark) {
+		t.Errorf("watermark: want %v, got %v", watermark, readAt)
 	}
 	if len(got) != 2 {
 		t.Fatalf("want 2 rows, got %d", len(got))

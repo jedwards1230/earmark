@@ -1912,12 +1912,43 @@ A stale finding **stays visible** — it is an `UPDATE`, never a `DELETE`. Every
 correction ends up either applied or explicitly retired; none is silently lost.
 `stale` remains terminal (re-run the judge rather than resurrecting it).
 
-##### Invalidation and re-embedding
+##### Invalidation, the rebuild trigger, and the watermark
 
 Accepting or reverting a finding sets `transcript_chunks.embedding_stale = true`
-for that one chunk, in the same transaction as the decision. Rebuilding a chunk
-(`InsertChunks`) clears the flag in the same statement that writes the new text
-and embedding, so a rebuild cannot forget it.
+for that one chunk, in the same transaction as the decision.
+
+**The rebuild trigger.** The embed worker runs a **rebuild pass** each cycle over
+transcripts with at least one flagged chunk, and puts them back through the
+normal regenerate → replay → embed path (`GetTranscriptsWithStaleChunks` →
+`embedTranscript`). This pass is what closes the loop, and it is load-bearing:
+the other three worker selections all require a transcript to have **no** chunks
+yet, and findings only ever exist for transcripts that are already embedded — so
+without it an accepted correction would sit in the overlay forever and never
+reach the searchable text. The pass is bounded by `EMBED_BATCH_SIZE` like every
+other selection, and it does **not** run the judge: per this section a
+stale-driven re-embed does not require re-judging, and the eval gate's
+`run_metrics.eval_finished_at` latch is untouched.
+
+**Ordering.** The replay outcome (`applied` / `stale` / clearing the flag) is
+computed during the rebuild but persisted **only after `InsertChunks` succeeds**.
+A failed embed or insert means the projection was never written, so recording
+corrections as applied — or retiring one to the terminal `stale` state — would
+describe something that never happened. Same rule the in-pipeline findings
+already follow.
+
+**The watermark.** `InsertChunks` deliberately does **not** clear
+`embedding_stale`. An unconditional clear there is a lost update: a human accept
+committing between the rebuild's overlay read and its insert sets the flag, and
+the clear would wipe it — that correction would never be replayed and never be
+re-flagged. Instead `GetCorrectionOverlay` returns the server-side timestamp its
+read was taken at, and the clear is guarded: a chunk is only unflagged when it
+carries no finding `decided_at` later than that watermark **and** no finding
+still sitting in `accepted`. A blocked chunk simply gets rebuilt again next
+cycle, so the failure mode is one redundant re-embed rather than a lost
+correction. (The second condition also makes a failed best-effort
+`MarkFindingsApplied` self-healing.) Because the watermark is what protects a
+concurrent decision, **revert stamps `decided_at` too** — not only accept and
+reject.
 
 Invalidation is **exactly one chunk**, and this is a property of the schema
 rather than a lucky accident: chunks store their text denormalized and carry no
@@ -1943,7 +1974,9 @@ error, leaving the transcript for the next cycle.
 Revert is **"flip `patch_state` and rebuild the projection"**. There is no text
 swap: the next rebuild regenerates from source and replays an overlay that no
 longer contains the reverted correction, so the correction simply stops being
-applied. Reverting sets `embedding_stale` on the affected chunk.
+applied. Reverting sets `embedding_stale` on the affected chunk (which the
+rebuild pass then picks up) and stamps `decided_at`/`decided_by` like any other
+human decision.
 
 `applied_at` plus `applied_before_text` / `applied_after_text` remain an **audit
 trail** of what landed, with one **semantic narrowing**: they now hold the
@@ -1952,8 +1985,11 @@ whole chunk. Whole-chunk before/after became ill-defined once a chunk can carry
 several corrections — there is no single "before" that attributes a difference
 to one finding.
 
-`decided_at` / `decided_by` record who accepted or rejected, and `stale_reason`
-records why a correction was retired.
+`decided_at` / `decided_by` record who made a human decision — accept, reject,
+**or revert** — and `stale_reason` records why a correction was retired. The
+machine transitions (`applied`, `stale`, written by the embed worker) never
+stamp them, so the record of who approved a correction is not overwritten by a
+rebuild.
 
 State transitions go through `patch.CanTransition` at the DB boundary: an
 illegal move (notably `proposed → applied`, which would skip the human gate) is

@@ -998,6 +998,52 @@ func (db *DB) getEvaluatedUnembeddedTranscripts(ctx context.Context, q rowQuerie
 	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
 }
 
+// GetTranscriptsWithStaleChunks returns transcripts that have at least one
+// chunk flagged embedding_stale — the rebuild selection for the correction
+// overlay (CONTRACT §2.17).
+//
+// This is the trigger that closes the accept → rebuild loop. The other three
+// selections all gate on "has NO chunks yet", so once a transcript is embedded
+// they never look at it again — and findings only exist for already-embedded
+// transcripts. Without this selection an accepted correction would sit in the
+// overlay forever and never reach the searchable text.
+//
+// The caller runs these back through the normal regenerate → replay → embed
+// path. It is deliberately independent of the eval gate: a stale-driven
+// re-embed does not require re-judging the job (§2.17).
+//
+// limit bounds the rows loaded per call (each carries the transcript's segments
+// JSONB) exactly as the other selections do.
+func (db *DB) GetTranscriptsWithStaleChunks(ctx context.Context, limit int) ([]*Transcript, error) {
+	return db.getTranscriptsWithStaleChunks(ctx, db.pool, limit)
+}
+
+// staleChunkTranscriptsSQL is the rebuild selection. EXISTS (not NOT EXISTS) is
+// the whole difference from the other three: this one wants transcripts that
+// ARE embedded but whose projection is out of date. It rides the partial index
+// transcript_chunks_embedding_stale_idx. Package const so the execution-level
+// test can match it exactly.
+const staleChunkTranscriptsSQL = `
+		SELECT t.id, t.job_id, t.file_path, t.checksum,
+		       t.language, t.duration_seconds, t.speaker_count,
+		       t.segments, t.raw_text, t.model_name, t.created_at
+		FROM transcripts t
+		WHERE EXISTS (
+		    SELECT 1 FROM transcript_chunks c
+		    WHERE c.transcript_id = t.id AND c.embedding_stale
+		  )
+		ORDER BY t.created_at ASC
+		LIMIT $1
+	`
+
+func (db *DB) getTranscriptsWithStaleChunks(ctx context.Context, q rowQuerier, limit int) ([]*Transcript, error) {
+	rows, err := q.Query(ctx, staleChunkTranscriptsSQL, normalizeSelectLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("query transcripts with stale chunks: %w", err)
+	}
+	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
+}
+
 // defaultSelectLimit bounds a gated-flow selection when the caller passes a
 // non-positive limit (a misconfiguration). It mirrors config's EMBED_BATCH_SIZE
 // default so a stray 0 still bounds memory rather than reverting to unbounded.
@@ -1157,25 +1203,28 @@ func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 		// worker generates UUIDs so in-pipeline eval findings can reference the
 		// chunk before it is inserted). An empty id falls back to the column
 		// default — COALESCE(NULLIF(...)) keeps both callers working.
+		//
 		// source_text carries the pristine regenerated text alongside the
 		// corrected surface (CONTRACT §2.17). NULLIF keeps it NULL for callers
 		// that don't populate it, matching the legacy-row reading.
 		//
-		// embedding_stale is cleared here rather than by a separate UPDATE:
-		// this row was just rebuilt from source with a freshly computed
-		// embedding, so by construction it is no longer stale. Tying the two
-		// together makes it impossible to rebuild a chunk and forget the flag.
+		// embedding_stale is deliberately NOT touched on conflict. Clearing it
+		// here would be a lost update: a human accept that lands between the
+		// worker's overlay read and this insert sets the flag true, and an
+		// unconditional clear would drop that accept — it would never be
+		// replayed and never re-flagged. ClearEmbeddingStale runs afterwards
+		// instead, guarded by the watermark the overlay read returned.
+		// A brand-new row gets the column's `false` default.
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO transcript_chunks
 			       (id, transcript_id, file_path, chunk_index, start_sec, end_sec,
-			        text, source_text, speaker, embedding, embedding_stale)
+			        text, source_text, speaker, embedding)
 			VALUES (COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()),
-			        $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10, false)
+			        $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10)
 			ON CONFLICT (transcript_id, chunk_index) DO UPDATE
-			SET text            = EXCLUDED.text,
-			    source_text     = EXCLUDED.source_text,
-			    embedding       = EXCLUDED.embedding,
-			    embedding_stale = false
+			SET text        = EXCLUDED.text,
+			    source_text = EXCLUDED.source_text,
+			    embedding   = EXCLUDED.embedding
 		`, c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
 			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding),
 		); err != nil {

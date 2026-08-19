@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -107,19 +108,52 @@ var correctionOverlaySQL = `
 	ORDER BY chunk_index, anchor_offset NULLS LAST, id
 `
 
+// overlayWatermarkSQL captures the server-side read time of an overlay load.
+//
+// It is taken INSIDE the same transaction as the overlay SELECT, so it is that
+// read's snapshot timestamp (now() is transaction_timestamp — constant for the
+// whole transaction). ClearEmbeddingStale later refuses to clear any chunk
+// carrying a decision newer than this, which is what stops a rebuild from
+// swallowing a human accept that landed mid-rebuild.
+//
+// The server's clock is used, never the Go process's: the worker and the
+// reviewer's decision may be written by different pods.
+var overlayWatermarkSQL = `SELECT now()`
+
 // GetCorrectionOverlay returns the accepted/applied corrections for one
-// transcript, in deterministic order. Read-only.
-func (db *DB) GetCorrectionOverlay(ctx context.Context, transcriptID string) ([]CorrectionRow, error) {
+// transcript, in deterministic order, plus the watermark that read was taken
+// at. Read-only.
+//
+// The watermark is returned even when there are ZERO corrections. That case is
+// not "nothing to do": a revert removes the last correction from a chunk and
+// leaves it flagged embedding_stale, so the rebuild still has to run and still
+// has to clear the flag safely.
+func (db *DB) GetCorrectionOverlay(ctx context.Context, transcriptID string) ([]CorrectionRow, time.Time, error) {
 	return db.getCorrectionOverlay(ctx, db.pool, transcriptID)
 }
 
-// getCorrectionOverlay is the querier-parameterized core of GetCorrectionOverlay
-// (mirrors listFindings) so the query + scan path is testable against a mock
-// pool.
-func (db *DB) getCorrectionOverlay(ctx context.Context, q rowQuerier, transcriptID string) ([]CorrectionRow, error) {
-	rows, err := q.Query(ctx, correctionOverlaySQL, transcriptID, overlayStates)
+// getCorrectionOverlay is the pool-parameterized core of GetCorrectionOverlay
+// so the query + scan path is testable against a mock pool.
+//
+// It runs in a transaction purely to make the watermark and the rows come from
+// one snapshot; it writes nothing and is rolled back rather than committed.
+func (db *DB) getCorrectionOverlay(ctx context.Context, b txBeginner, transcriptID string) ([]CorrectionRow, time.Time, error) {
+	var readAt time.Time
+
+	tx, err := b.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("correction overlay query for transcript %s: %w", transcriptID, err)
+		return nil, readAt, fmt.Errorf("begin correction overlay tx: %w", err)
+	}
+	// Read-only: always rolled back, never committed.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := tx.QueryRow(ctx, overlayWatermarkSQL).Scan(&readAt); err != nil {
+		return nil, readAt, fmt.Errorf("read correction overlay watermark: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, correctionOverlaySQL, transcriptID, overlayStates)
+	if err != nil {
+		return nil, readAt, fmt.Errorf("correction overlay query for transcript %s: %w", transcriptID, err)
 	}
 	defer rows.Close()
 
@@ -128,14 +162,63 @@ func (db *DB) getCorrectionOverlay(ctx context.Context, q rowQuerier, transcript
 		var c CorrectionRow
 		if err := rows.Scan(&c.ID, &c.ChunkIndex, &c.OriginalText, &c.SuggestedCorrection,
 			&c.AnchorOffset, &c.AnchorOccurrence, &c.ChunkTextSHA256); err != nil {
-			return nil, fmt.Errorf("scan correction row: %w", err)
+			return nil, readAt, fmt.Errorf("scan correction row: %w", err)
 		}
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows error (correction overlay): %w", err)
+		return nil, readAt, fmt.Errorf("rows error (correction overlay): %w", err)
 	}
-	return out, nil
+	return out, readAt, nil
+}
+
+// clearEmbeddingStaleSQL clears the rebuild flag for a transcript's chunks —
+// but ONLY for chunks whose decisions are all older than the rebuild's overlay
+// read.
+//
+// This is the lost-update guard. The unsafe version is an unconditional clear
+// inside InsertChunks: a human accept committing between the overlay read and
+// the insert sets embedding_stale = true, the clear wipes it, and that accept
+// is never replayed and never re-flagged — silently dropped, forever.
+//
+// Two conditions block the clear, and both are needed:
+//
+//   - decided_at > $2 — a decision recorded after the watermark. Catches an
+//     accept or a revert that raced this rebuild.
+//   - patch_state = $3 ('accepted') — a correction still waiting to be
+//     replayed, whatever its timestamp. This also makes a failed (best-effort)
+//     MarkFindingsApplied self-healing: the finding stays `accepted`, the flag
+//     stays set, and the next rebuild pass retries.
+//
+// A blocked chunk is simply rebuilt again next cycle, so the failure mode is
+// one redundant re-embed rather than a lost correction.
+var clearEmbeddingStaleSQL = `
+	UPDATE transcript_chunks c
+	SET embedding_stale = false
+	WHERE c.transcript_id = $1
+	  AND c.embedding_stale
+	  AND NOT EXISTS (
+	      SELECT 1 FROM transcript_findings f
+	      WHERE f.transcript_id = c.transcript_id
+	        AND f.chunk_index = c.chunk_index
+	        AND (f.decided_at > $2 OR f.patch_state = $3)
+	  )
+`
+
+// ClearEmbeddingStale clears the rebuild flag for the chunks of one transcript
+// that the rebuild is known to have brought up to date. Call it only AFTER the
+// rebuilt chunks have been successfully inserted — the flag is the only record
+// that a rebuild is owed.
+func (db *DB) ClearEmbeddingStale(ctx context.Context, transcriptID string, watermark time.Time) error {
+	return db.clearEmbeddingStale(ctx, db.pool, transcriptID, watermark)
+}
+
+func (db *DB) clearEmbeddingStale(ctx context.Context, e execer, transcriptID string, watermark time.Time) error {
+	if _, err := e.Exec(ctx, clearEmbeddingStaleSQL,
+		transcriptID, watermark, patch.StateAccepted); err != nil {
+		return fmt.Errorf("clear embedding_stale for transcript %s: %w", transcriptID, err)
+	}
+	return nil
 }
 
 // BuildOverlay converts persisted correction rows into the replayable overlay,
@@ -277,9 +360,14 @@ func (db *DB) markFindingsStale(ctx context.Context, e execer, ids []string, rea
 // reviewer decided the finding first, the UPDATE matches zero rows and the
 // caller gets ErrPatchStateConflict instead of clobbering that decision.
 //
-// The decided_* variant is used for the human decisions (accept/reject) — the
-// machine-driven transitions (applied/stale) must not overwrite the record of
-// who approved the patch in the first place.
+// The decided_* variant is used for the HUMAN decisions (accept, reject,
+// revert) — the machine-driven transitions (applied/stale, written by the embed
+// worker) must not overwrite the record of who approved the patch.
+//
+// Revert stamps decided_at too, and that is load-bearing rather than
+// cosmetic: decided_at is what ClearEmbeddingStale's watermark compares
+// against, so a revert that did not stamp it would be invisible to the
+// lost-update guard and could be swallowed by a concurrent rebuild.
 var (
 	setPatchStateSQL = `
 		UPDATE transcript_findings
@@ -318,13 +406,26 @@ var markChunkStaleForFindingSQL = `
 	           AND c.chunk_index = f.chunk_index))
 `
 
+// isHumanDecision reports whether a target state is reached by a person rather
+// than by the embed worker. Only these stamp decided_at/decided_by — and only
+// these are visible to ClearEmbeddingStale's watermark.
+func isHumanDecision(to string) bool {
+	switch to {
+	case patch.StateAccepted, patch.StateRejected, patch.StateReverted:
+		return true
+	default:
+		return false
+	}
+}
+
 // SetPatchState moves one finding through the patch state machine. This is the
 // human gate (CONTRACT §2.17): the judge proposes, a person disposes, and no
 // text changes without an explicit recorded decision on a specific finding.
 //
 // The transition is validated against patch.CanTransition BEFORE any SQL runs,
 // so an illegal move (notably proposed → applied, which would skip the human
-// accept) never reaches the database. decidedBy is recorded for accept/reject.
+// accept) never reaches the database. decidedBy is recorded for every human
+// decision (accept, reject, revert).
 //
 // Accepting or reverting also flags the affected chunk `embedding_stale`: the
 // projection for that chunk no longer reflects the overlay, so it must be
@@ -347,7 +448,7 @@ func (db *DB) setPatchState(ctx context.Context, b txBeginner, id, from, to, dec
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var tag pgconn.CommandTag
-	if to == patch.StateAccepted || to == patch.StateRejected {
+	if isHumanDecision(to) {
 		tag, err = tx.Exec(ctx, setPatchStateDecidedSQL, id, from, to, decidedBy)
 	} else {
 		tag, err = tx.Exec(ctx, setPatchStateSQL, id, from, to)

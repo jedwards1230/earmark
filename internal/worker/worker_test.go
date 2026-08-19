@@ -93,6 +93,24 @@ type fakeDB struct {
 	appliedErr   error
 	staleMarks   []staleMark
 	staleErr     error
+	// overlayReadAt is the watermark GetCorrectionOverlay hands back; clearCalls
+	// captures every ClearEmbeddingStale call so a test can assert the flag is
+	// cleared exactly once, after the insert, with that watermark.
+	overlayReadAt time.Time
+	clearCalls    []clearCall
+	clearErr      error
+	// staleQueues scripts GetTranscriptsWithStaleChunks per cycle (like
+	// evalQueues); staleTranscripts is the simple always-return form.
+	staleQueues      [][]*db.Transcript
+	staleTranscripts []*db.Transcript
+	staleSelectErr   error
+	staleSelectCalls int
+}
+
+// clearCall is one ClearEmbeddingStale invocation, captured for assertions.
+type clearCall struct {
+	transcriptID string
+	watermark    time.Time
 }
 
 // staleMark is one MarkFindingsStale call, captured for assertions.
@@ -101,14 +119,46 @@ type staleMark struct {
 	reason string
 }
 
-func (f *fakeDB) GetCorrectionOverlay(_ context.Context, _ string) ([]db.CorrectionRow, error) {
+func (f *fakeDB) GetCorrectionOverlay(_ context.Context, _ string) ([]db.CorrectionRow, time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.overlayCalls++
 	if f.overlayErr != nil {
-		return nil, f.overlayErr
+		return nil, time.Time{}, f.overlayErr
 	}
-	return f.overlay, nil
+	readAt := f.overlayReadAt
+	if readAt.IsZero() {
+		readAt = time.Unix(1_700_000_000, 0).UTC()
+	}
+	return f.overlay, readAt, nil
+}
+
+func (f *fakeDB) ClearEmbeddingStale(_ context.Context, transcriptID string, watermark time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.clearErr != nil {
+		return f.clearErr
+	}
+	f.clearCalls = append(f.clearCalls, clearCall{transcriptID: transcriptID, watermark: watermark})
+	return nil
+}
+
+func (f *fakeDB) GetTranscriptsWithStaleChunks(_ context.Context, limit int) ([]*db.Transcript, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.staleSelectCalls++
+	if f.staleSelectErr != nil {
+		return nil, f.staleSelectErr
+	}
+	if f.staleQueues != nil {
+		if len(f.staleQueues) == 0 {
+			return nil, nil
+		}
+		batch := f.staleQueues[0]
+		f.staleQueues = f.staleQueues[1:]
+		return capBatch(batch, limit), nil
+	}
+	return capBatch(f.staleTranscripts, limit), nil
 }
 
 func (f *fakeDB) MarkFindingsApplied(_ context.Context, recs []db.AppliedFinding) error {
