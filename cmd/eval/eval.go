@@ -230,6 +230,20 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 			continue
 		}
 
+		// ORIGINAL-text consumer (CONTRACT §2.17 reader audit), and correct as-is:
+		// the backfill judge must see PRISTINE text. raw_text is immutable
+		// provenance that no Go code ever writes, and replay always starts from
+		// pristine — so anchors and chunk_text_sha256 recorded here line up with
+		// what the embed worker will replay onto. Feeding the judge the corrected
+		// projection instead would make every backfilled finding stale on arrival.
+		//
+		// TODO(pre-existing, out of scope): this chunks with the RAW-TEXT chunker
+		// while addressing rows by db.ChunkUUID(t.ID, i). For a transcript that
+		// has segments, the embed worker derives its chunks from those segments,
+		// so the text judged here can disagree with the text stored under the
+		// same chunk UUID. Predates the correction overlay; fixing it means
+		// sharing the worker's segment-aware chunking here.
+		//
 		// Build EvalChunks from raw text with deterministic UUIDs so findings
 		// reference the same chunk IDs that the embed pass used/will use.
 		var evalChunks []db.EvalChunk

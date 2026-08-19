@@ -82,6 +82,53 @@ type fakeDB struct {
 	// can assert the worker looped back immediately on a full batch.
 	evalCalls  int
 	embedCalls int
+
+	// Correction-overlay plumbing (CONTRACT §2.17). overlay is what
+	// GetCorrectionOverlay returns; overlayErr forces the fail-closed path.
+	// appliedRecs / staleMarks capture what the worker persisted after a replay.
+	overlay      []db.CorrectionRow
+	overlayErr   error
+	overlayCalls int
+	appliedRecs  []db.AppliedFinding
+	appliedErr   error
+	staleMarks   []staleMark
+	staleErr     error
+}
+
+// staleMark is one MarkFindingsStale call, captured for assertions.
+type staleMark struct {
+	ids    []string
+	reason string
+}
+
+func (f *fakeDB) GetCorrectionOverlay(_ context.Context, _ string) ([]db.CorrectionRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.overlayCalls++
+	if f.overlayErr != nil {
+		return nil, f.overlayErr
+	}
+	return f.overlay, nil
+}
+
+func (f *fakeDB) MarkFindingsApplied(_ context.Context, recs []db.AppliedFinding) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.appliedErr != nil {
+		return f.appliedErr
+	}
+	f.appliedRecs = append(f.appliedRecs, recs...)
+	return nil
+}
+
+func (f *fakeDB) MarkFindingsStale(_ context.Context, ids []string, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.staleErr != nil {
+		return f.staleErr
+	}
+	f.staleMarks = append(f.staleMarks, staleMark{ids: ids, reason: reason})
+	return nil
 }
 
 func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, error) {

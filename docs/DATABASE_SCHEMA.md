@@ -127,9 +127,11 @@ CREATE TABLE transcript_chunks (
     chunk_index   INTEGER     NOT NULL,
     start_sec     FLOAT8      NOT NULL,   -- earliest segment start in this chunk; TRACK-relative
     end_sec       FLOAT8      NOT NULL,   -- latest segment end in this chunk; TRACK-relative
-    text          TEXT        NOT NULL,
+    text          TEXT        NOT NULL,   -- CORRECTED surface (source_text + replayed overlay)
+    source_text   TEXT,                   -- PRISTINE regenerated text; NULL on legacy rows
     speaker       TEXT,                   -- dominant speaker, or NULL
     embedding     VECTOR(768) NOT NULL,   -- nomic-embed-text; MUST match EMBEDDINGS_MODEL
+    embedding_stale BOOLEAN   NOT NULL DEFAULT false,  -- needs re-embed (correction accepted/reverted)
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT transcript_chunks_transcript_chunk_unique UNIQUE (transcript_id, chunk_index)
@@ -141,6 +143,15 @@ CREATE INDEX transcript_chunks_file_path_idx ON transcript_chunks (file_path);
 CREATE INDEX transcript_chunks_text_trgm_idx
     ON transcript_chunks USING gin (text gin_trgm_ops);
 ```
+
+**This table is a derived projection, not storage.** The worker regenerates
+every row from `transcripts.segments`/`raw_text` on each embed and upserts over
+the existing rows, so anything written directly into `text` is destroyed by the
+next re-embed. Human corrections therefore live in `transcript_findings` and are
+**replayed** onto the regenerated text: `source_text` is the pristine
+regeneration (the judge is always shown this), `text` is that text with the
+accepted-correction overlay applied (what is embedded and searched), and
+`embedding_stale` marks a chunk whose overlay changed. See CONTRACT §2.17.
 
 **Timestamps are TRACK-relative**: `start_sec`/`end_sec` are copied from the
 parent transcript's segment boundaries, so they are offsets into the chunk's own
@@ -287,6 +298,15 @@ CREATE TABLE IF NOT EXISTS transcript_findings (
 `confidence` is the judge's self-score (0–1, the triage/scoring signal).
 `transcription_run_id` is the `transcription_jobs.id` of the run that produced
 the transcript, so findings are attributable per ASR backend/run.
+
+Additive columns from the reviewable-patch migration are omitted above for
+brevity: `patch_state` (the `proposed → accepted → applied → reverted` /
+`rejected` / `stale` machine), the anchor trio (`anchor_offset`,
+`anchor_occurrence`, `chunk_text_sha256`), `decided_at`/`decided_by`,
+`applied_at`/`applied_before_text`/`applied_after_text` (**span**-level, not
+whole-chunk), and `stale_reason`. This table is the authoritative home of a
+human-accepted correction — `transcript_chunks` only ever carries a replayed
+copy. CONTRACT §2.17 is the reference.
 
 ## Relationships
 

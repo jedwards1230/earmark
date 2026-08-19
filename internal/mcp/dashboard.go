@@ -2622,6 +2622,13 @@ func (s *MCPServer) handleTrackPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleTrackData renders the per-track fragment, including the transcript
+// reader.
+//
+// KNOWN GAP (CONTRACT §2.17): the reader renders transcripts.segments — the
+// immutable ASR record — so it shows UNCORRECTED text while search shows the
+// corrected projection. Segments are provenance and are never rewritten; see
+// db.GetTrackDetail for why closing the gap is deferred.
 func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
@@ -2685,6 +2692,9 @@ func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
 
 // handleTrackSegments serves one page of the transcript reader (the htmx "load
 // more" target): segments [offset, offset+segmentPageSize) for the given job.
+//
+// Same KNOWN GAP as handleTrackData: these are transcripts.segments, the
+// uncorrected ASR record (CONTRACT §2.17).
 func (s *MCPServer) handleTrackSegments(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {

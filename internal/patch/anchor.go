@@ -21,7 +21,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // Patch lifecycle states. Stored in transcript_findings.patch_state.
@@ -160,48 +159,16 @@ func occurrences(runes, target []rune) []int {
 	return out
 }
 
-// Apply produces the corrected chunk text.
+// Applying lives in overlay.go, not here.
 //
-// It verifies the chunk still hashes to wantHash before touching anything: a
-// finding describes a specific revision of a chunk, and applying it to a later
-// revision would be editing text the judge never reviewed. An empty wantHash
-// skips the check, which is only correct for findings recorded before the hash
-// column existed.
-//
-// Returns the new text and the resolved span. It never edits in place.
-func Apply(chunkText, wantHash string, a Anchor, correction string) (string, Span, error) {
-	if strings.TrimSpace(correction) == "" {
-		return "", Span{}, ErrEmptyCorrection
-	}
-	if wantHash != "" && ChunkHash(chunkText) != wantHash {
-		return "", Span{}, ErrChunkChanged
-	}
-
-	span, err := Locate(chunkText, a)
-	if err != nil {
-		return "", Span{}, err
-	}
-
-	runes := []rune(chunkText)
-	var b strings.Builder
-	b.WriteString(string(runes[:span.Start]))
-	b.WriteString(correction)
-	b.WriteString(string(runes[span.End:]))
-	return b.String(), span, nil
-}
-
-// Revert restores the pre-patch text.
-//
-// It deliberately does NOT re-resolve the anchor. Apply recorded the exact
-// before/after strings, so revert is a whole-text swap verified against the
-// recorded "after" — re-deriving a span here would reintroduce the very
-// ambiguity the recorded text exists to avoid.
-func Revert(currentText, appliedAfter, appliedBefore string) (string, error) {
-	if currentText != appliedAfter {
-		return "", fmt.Errorf("%w: chunk no longer matches the applied text", ErrChunkChanged)
-	}
-	return appliedBefore, nil
-}
+// There used to be an Apply(chunkText, …) that rewrote one chunk's stored text,
+// and a Revert that swapped the whole text back. Both encoded a model that is
+// now known to be wrong: transcript_chunks is a DERIVED PROJECTION, regenerated
+// from the immutable transcript source on every embed, so a correction written
+// into chunk text is destroyed by the next re-chunk. Corrections are replayed
+// onto regenerated text instead (ApplyCorrections / Replay), and revert is
+// "flip patch_state and rebuild the projection" rather than a text swap.
+// CONTRACT §2.17.
 
 // CanTransition reports whether a patch may move from one state to another.
 // Centralised so the DB layer and the UI cannot disagree about what is legal.
