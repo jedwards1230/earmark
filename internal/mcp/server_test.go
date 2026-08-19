@@ -211,6 +211,30 @@ func (m *SimpleMockDB) ClearFindings(_ context.Context, dir string) (int64, erro
 	return m.clearFindingsN, nil
 }
 
+// ─── Correction review (CONTRACT §2.17) ─────────────────────────────────
+// SimpleMockDB is used by tests unrelated to the correction-review tools
+// (HTTP API, capabilities, endpoints), so these are plain zero-value stubs.
+
+func (m *SimpleMockDB) ListCorrections(_ context.Context, _ db.CorrectionFilter) ([]db.CorrectionDetail, error) {
+	return nil, nil
+}
+
+func (m *SimpleMockDB) GetCorrectionOverlay(_ context.Context, _ string) ([]db.CorrectionRow, time.Time, error) {
+	return nil, time.Time{}, nil
+}
+
+func (m *SimpleMockDB) GetChunkForEdit(_ context.Context, _ string) (*db.ChunkTarget, error) {
+	return nil, nil
+}
+
+func (m *SimpleMockDB) SetPatchState(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+
+func (m *SimpleMockDB) InsertManualCorrection(_ context.Context, _ db.ManualCorrection) (string, error) {
+	return "", nil
+}
+
 func (m *SimpleMockDB) GetFailedJobs(_ context.Context) ([]db.FailedJob, error) {
 	err := "RuntimeError: CUDA out of memory"
 	runner := "asr-runner-test"

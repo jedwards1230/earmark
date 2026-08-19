@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -107,6 +108,31 @@ type DBInterface interface {
 	GetEvalChunksForBook(ctx context.Context, dir string, limit int) ([]db.EvalChunk, error)
 	SampleEvalChunks(ctx context.Context, limit int) ([]db.EvalChunk, error)
 	InsertFindings(ctx context.Context, findings []db.Finding) error
+	// ─── Correction review (CONTRACT §2.17) ─────────────────────────────────
+	// The only WRITE surface exposed through MCP tools, and deliberately narrow:
+	// the decisions layer (transcript_findings) plus the rebuild flag
+	// (transcript_chunks.embedding_stale). Nothing here writes transcript text —
+	// segments/raw_text are immutable provenance, and chunk text is a projection
+	// regenerated on every embed.
+
+	// ListCorrections returns findings with the pristine chunk context a
+	// reviewer needs to judge them (read-only).
+	ListCorrections(ctx context.Context, f db.CorrectionFilter) ([]db.CorrectionDetail, error)
+	// GetCorrectionOverlay returns a transcript's accepted/applied corrections —
+	// the same read the embed worker replays — so a direct edit can be checked
+	// for overlap against corrections already on the chunk (read-only).
+	GetCorrectionOverlay(ctx context.Context, transcriptID string) ([]db.CorrectionRow, time.Time, error)
+	// GetChunkForEdit returns one chunk with the PRISTINE text a direct edit
+	// must anchor against (read-only).
+	GetChunkForEdit(ctx context.Context, chunkID string) (*db.ChunkTarget, error)
+	// SetPatchState is the human gate: it validates the move against
+	// patch.CanTransition before any SQL runs, guards the UPDATE on the expected
+	// current state, and flags the affected chunk for re-embed in the same
+	// transaction when the decision changes what the text should say.
+	SetPatchState(ctx context.Context, id, from, to, decidedBy string) error
+	// InsertManualCorrection records a human-authored correction (verified by
+	// patch.PlanDirectEdit) and flags its chunk for re-embed, in one transaction.
+	InsertManualCorrection(ctx context.Context, m db.ManualCorrection) (string, error)
 }
 
 // ToolHandlers contains the database interface and logger for MCP tools

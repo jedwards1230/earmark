@@ -102,6 +102,36 @@ func readOnlyAnnotations() *mcp.ToolAnnotations {
 	}
 }
 
+// decisionAnnotations describes the correction-decision tool (CONTRACT §2.17).
+//
+// Not read-only, and not destructive either — and the difference matters to a
+// host deciding whether to confirm the call. A decision moves one finding
+// through a validated state machine and flags one chunk for re-embed; it
+// deletes nothing and edits no transcript text. Deciding the same finding twice
+// is NOT idempotent: the second call finds the finding in a different state and
+// is refused, which is the point of the guard.
+func decisionAnnotations() *mcp.ToolAnnotations {
+	f := false
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    false,
+		DestructiveHint: &f,
+		IdempotentHint:  false,
+	}
+}
+
+// editAnnotations describes the direct-edit tool. Same shape as
+// decisionAnnotations and separate on purpose: this one CREATES a correction
+// rather than deciding an existing one, so a repeat call appends a second
+// correction instead of failing a state guard.
+func editAnnotations() *mcp.ToolAnnotations {
+	f := false
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    false,
+		DestructiveHint: &f,
+		IdempotentHint:  false,
+	}
+}
+
 // NewMCPServer creates a new MCP server instance
 func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	logger := log.NewLogger("mcp-server")
@@ -112,7 +142,7 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	}
 
 	// Create the MCP server. Capabilities is left NIL deliberately: the SDK
-	// auto-derives {"tools":{"listChanged":true}} from the 5 tools registered
+	// auto-derives {"tools":{"listChanged":true}} from the 8 tools registered
 	// below and, since no resources/prompts are registered, omits those keys
 	// entirely (never a falsy `resources: {}`) — this is exactly what
 	// ContextForge's federation gate (`if capabilities.get("resources")`,
@@ -221,6 +251,61 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		InputSchema:  getChunkContextSchema(),
 		OutputSchema: outputSchemaFor[SearchResultsOutput](),
 	}, handlers.handleGetContext)
+
+	// ─── Correction review (CONTRACT §2.17) ──────────────────────────────────
+	// The first tools on this server that WRITE. They expose the human gate of
+	// the correction overlay: the judge proposes, a reviewer disposes, and the
+	// decision is replayed onto a regenerated projection. What they can write is
+	// narrow by construction — the decisions layer plus one chunk's re-embed
+	// flag — and every write is reversible: a state flip has an inverse, and no
+	// finding is ever deleted.
+
+	// Add correction worklist tool (read-only).
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "list_transcript_corrections",
+		Description: "Review the transcription corrections proposed for the audiobook library. Each row is a " +
+			"suspected ASR error with the span it covers, the proposed replacement, its issue type and " +
+			"confidence, its current decision state, and the surrounding ORIGINAL transcript text — enough " +
+			"to judge whether the correction is right. It also reports whether the correction still ANCHORS " +
+			"to the text (a finding whose span no longer resolves can never be applied) and which actions " +
+			"are legal on it. Defaults to the undecided (`proposed`) queue; pass state=all to see every row. " +
+			"Scope with `book` or `path`. Use decide_transcript_correction to act on a row.",
+		Annotations:  annotations,
+		InputSchema:  listCorrectionsSchema(),
+		OutputSchema: outputSchemaFor[ListCorrectionsOutput](),
+	}, handlers.handleListCorrections)
+
+	// Add correction decision tool (writes transcript_findings.patch_state).
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "decide_transcript_correction",
+		Description: "Accept, reject, revert, or reconsider one proposed transcript correction. Accepting is " +
+			"what makes a correction real: it is replayed onto the chunk's regenerated text on the next " +
+			"rebuild, so the searchable/displayed text changes and that chunk is re-embedded. Rejecting " +
+			"records the decision and changes no text. Reverting withdraws an already-applied correction — " +
+			"the next rebuild simply stops replaying it. Nothing here edits the original ASR transcript, " +
+			"which is immutable, and no finding is ever deleted, so every decision is reversible. " +
+			"Read the correction first (list_transcript_corrections) — illegal moves are refused.",
+		Annotations:  decisionAnnotations(),
+		InputSchema:  decideCorrectionSchema(),
+		OutputSchema: outputSchemaFor[DecideCorrectionOutput](),
+	}, handlers.handleDecideCorrection)
+
+	// Add direct-edit tool (writes a human-authored correction).
+	mcpServer.AddTool(&mcp.Tool{
+		Name: "create_transcript_correction",
+		Description: "Correct a span of transcript text that no model proposed a fix for — the direct-edit " +
+			"escape hatch. Pass the chunk UUID (from a search result), the exact span to replace copied " +
+			"VERBATIM from the chunk's original text, and the replacement. The edit is verified before it " +
+			"is recorded: the span must resolve to exactly one position in that chunk (pass `occurrence` " +
+			"when it repeats), the chunk must not have changed, and the span must not overlap a correction " +
+			"already accepted there. It is stored as a replayable correction attributed to you, not as a " +
+			"rewrite of the transcript — the original ASR record is immutable and never edited. The chunk " +
+			"is then re-embedded so search reflects the corrected text. Use dry_run=true to check that a " +
+			"span anchors before recording anything.",
+		Annotations:  editAnnotations(),
+		InputSchema:  createCorrectionSchema(),
+		OutputSchema: outputSchemaFor[CreateCorrectionOutput](),
+	}, handlers.handleCreateCorrection)
 
 	s := &MCPServer{
 		server:           mcpServer,

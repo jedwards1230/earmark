@@ -92,7 +92,7 @@ Same `pgxpool.Pool` open; same idempotent schema init (safe to run on both pods)
 
 Listens on `MCP_HTTP_ADDR` (default `:8081`). Serves:
 
-- `/mcp` — streamable-HTTP MCP transport (5 tools: `list_books`, `semantic_search_audiobooks`, `text_search_audiobooks`, `get_transcript`, `get_chunk_context`)
+- `/mcp` — streamable-HTTP MCP transport (8 tools: `list_books`, `semantic_search_audiobooks`, `text_search_audiobooks`, `get_transcript`, `get_chunk_context`, `list_transcript_corrections`, plus the two writing correction-review tools `decide_transcript_correction` and `create_transcript_correction` — CONTRACT §2.17)
 - `/` — htmx status dashboard (auto-refreshes `/status/data` fragment every 3 s)
 - `/api/v1/*` — JSON control API (pause/resume/run-N; mutating endpoints require `Authorization: Bearer $CONTROL_API_TOKEN`)
 - `/actions/*` — htmx-guarded dashboard actions (requeue, retry-failed)

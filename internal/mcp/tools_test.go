@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -184,6 +185,55 @@ func (m *MockDBInterface) GetFindingsCountByBook(ctx context.Context) (map[strin
 	}
 	args := m.Called(ctx)
 	return args.Get(0).(map[string]int), args.Error(1)
+}
+
+// ─── Correction review (CONTRACT §2.17) ─────────────────────────────────
+// These five back the correction-review MCP tools under test in
+// corrections_test.go, so — unlike most of this mock's stubs — they use the
+// m.Called + hasExpect pattern rather than returning fixed zero values.
+
+func (m *MockDBInterface) ListCorrections(ctx context.Context, f db.CorrectionFilter) ([]db.CorrectionDetail, error) {
+	if !m.hasExpect("ListCorrections") {
+		return nil, nil
+	}
+	args := m.Called(ctx, f)
+	rows, _ := args.Get(0).([]db.CorrectionDetail)
+	return rows, args.Error(1)
+}
+
+func (m *MockDBInterface) GetCorrectionOverlay(ctx context.Context, transcriptID string) ([]db.CorrectionRow, time.Time, error) {
+	if !m.hasExpect("GetCorrectionOverlay") {
+		return nil, time.Time{}, nil
+	}
+	args := m.Called(ctx, transcriptID)
+	rows, _ := args.Get(0).([]db.CorrectionRow)
+	when, _ := args.Get(1).(time.Time)
+	return rows, when, args.Error(2)
+}
+
+func (m *MockDBInterface) GetChunkForEdit(ctx context.Context, chunkID string) (*db.ChunkTarget, error) {
+	if !m.hasExpect("GetChunkForEdit") {
+		return nil, nil
+	}
+	args := m.Called(ctx, chunkID)
+	target, _ := args.Get(0).(*db.ChunkTarget)
+	return target, args.Error(1)
+}
+
+func (m *MockDBInterface) SetPatchState(ctx context.Context, id, from, to, decidedBy string) error {
+	if !m.hasExpect("SetPatchState") {
+		return nil
+	}
+	args := m.Called(ctx, id, from, to, decidedBy)
+	return args.Error(0)
+}
+
+func (m *MockDBInterface) InsertManualCorrection(ctx context.Context, mc db.ManualCorrection) (string, error) {
+	if !m.hasExpect("InsertManualCorrection") {
+		return "", nil
+	}
+	args := m.Called(ctx, mc)
+	return args.String(0), args.Error(1)
 }
 
 func TestHandleSemanticSearch(t *testing.T) {

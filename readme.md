@@ -32,7 +32,9 @@ Go "mcp" Deployment (K8s)
 | `earmark update` | Update earmark binary to the latest GitHub release |
 | `earmark backfill-metadata` | Re-derive book metadata for all jobs without re-transcribing |
 
-## MCP Tools (5)
+## MCP Tools (8)
+
+6 read-only, 2 write (the correction-review human gate — CONTRACT §2.17).
 
 | Tool | Purpose |
 |------|---------|
@@ -41,6 +43,9 @@ Go "mcp" Deployment (K8s)
 | `text_search_audiobooks` | Trigram literal/keyword search |
 | `get_transcript` | Read a track's full timestamped transcript (paginated) |
 | `get_chunk_context` | Surrounding chunks around a search-hit chunk UUID |
+| `list_transcript_corrections` | Read-only worklist of proposed/decided transcript corrections |
+| `decide_transcript_correction` | **Writes.** Accept/reject/revert/reconsider a correction |
+| `create_transcript_correction` | **Writes.** Direct-edit escape hatch — record a correction no model proposed |
 
 See [`internal/mcp/README.md`](internal/mcp/README.md) for full parameter docs.
 
