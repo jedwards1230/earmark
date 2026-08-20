@@ -126,6 +126,66 @@ func getChunkContextSchema() *jsonschema.Schema {
 	})
 }
 
+// listCorrectionsSchema: no required fields; every argument narrows the
+// worklist. `state` defaults to "proposed" — the undecided queue is what a
+// reviewer almost always wants, and defaulting to "all" would bury it under
+// already-decided rows.
+func listCorrectionsSchema() *jsonschema.Schema {
+	return objectSchema(nil, map[string]*jsonschema.Schema{
+		"state": stringProp("Patch state(s) to list, comma-separated: proposed, accepted, applied, " +
+			"rejected, reverted, stale — or \"all\" for every state. Default: proposed (the undecided queue)."),
+		"book": stringProp("A book title or directory substring to scope to (e.g. \"Project Hail Mary\"). " +
+			"Resolved the same way the search tools resolve it. Ignored when `path` is given."),
+		"path": stringProp("An exact book directory or track file path to scope to. Matches that path and " +
+			"anything beneath it."),
+		"id":             stringProp("A single finding UUID to inspect. Overrides the other filters in practice — one row comes back."),
+		"min_confidence": numberProp("Drop findings below this judge self-score, 0–1 (default: 0, keep all)", 0),
+		"limit":          numberProp("Maximum corrections to return (default: 20, capped at 200)", 20),
+		"offset":         numberProp("Row offset for paging (default: 0)", 0),
+	})
+}
+
+// decideCorrectionSchema: id + action required. expected_state is the caller's
+// optional compare-and-swap — pass the state you read, and the call fails
+// rather than deciding a finding someone else already moved.
+func decideCorrectionSchema() *jsonschema.Schema {
+	return objectSchema([]string{"id", "action"}, map[string]*jsonschema.Schema{
+		"id": stringProp("The finding UUID (the `id` field from list_transcript_corrections)."),
+		"action": stringProp("accept (approve — the correction replays into the searchable text on the next rebuild), " +
+			"reject (decline it), revert (withdraw an already-applied correction), or " +
+			"reconsider (return a rejected/reverted finding to the proposed queue). " +
+			"Which are legal depends on the current state; each row's `allowedActions` lists them."),
+		"decided_by": stringProp("Who is deciding — an agent or person identifier, recorded in the audit trail. " +
+			"Default: \"agent\". Always stored with an \"mcp:\" prefix so the record shows the decision came through this surface."),
+		"expected_state": stringProp("The state you read before deciding. When given, the call fails if the finding " +
+			"has moved since — use it to avoid overwriting a concurrent decision."),
+	})
+}
+
+// createCorrectionSchema: the direct-edit escape hatch. chunk_id +
+// original_text + correction are required because they are the minimum that can
+// be VERIFIED; everything else is a hint or attribution.
+func createCorrectionSchema() *jsonschema.Schema {
+	return objectSchema([]string{"chunk_id", "original_text", "correction"}, map[string]*jsonschema.Schema{
+		"chunk_id": stringProp("The chunk UUID to correct — the `ID` field of a search result, or `chunkId` " +
+			"from list_transcript_corrections."),
+		"original_text": stringProp("The exact span to replace, copied VERBATIM from the chunk's original " +
+			"(uncorrected) text. It is located in that text before anything is written; if it does not occur there, the edit is refused."),
+		"correction": stringProp("The replacement text. Must be non-empty — an empty correction would delete text silently."),
+		"occurrence": numberPropNoDefault("0-based index of which occurrence to correct, when the span appears " +
+			"more than once in the chunk. Omit unless the tool asks for it (it says how many candidates there are)."),
+		"offset": numberPropNoDefault("Optional rune-offset hint for the span. Treated as a hint only — the " +
+			"stored anchor is always the position actually located, never the reported one."),
+		"issue_type": stringProp("Classification, from the judge's vocabulary: misheard_proper_noun, misheard_word, " +
+			"repeated_text, number_artifact, homophone, dropped_word, other. Unknown values become \"other\". Default: other."),
+		"decided_by": stringProp("Who is making the edit — recorded in the audit trail alongside origin=human. Default: \"agent\"."),
+		"expected_chunk_sha256": stringProp("The chunk fingerprint you read (`chunkSha256`). When given, the edit is " +
+			"refused if the chunk changed since — the safe way to edit text you read earlier."),
+		"dry_run": boolProp("Verify the edit and return the preview WITHOUT recording it (default: false). "+
+			"Use it to check that a span anchors before committing to it.", false),
+	})
+}
+
 // outputSchemaFor reflects T into a *jsonschema.Schema for a tool's
 // OutputSchema, the equivalent of mcp-go's mcp.WithOutputSchema[T](). T is
 // always one of the fixed structured-output types in results.go, so

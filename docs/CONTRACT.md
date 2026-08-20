@@ -855,10 +855,42 @@ The mcp-proxy configmap entry (add to `mcpServers` object):
 
 #### 2.2.1 MCP Tools
 
-All tools are read-only (no side-effects). The two search tools default to the
-**whole library** and take an optional `book` to scope to a single title. There
-are **5 tools** (the legacy `browse_audiobook_library` was removed — `list_books`
-strictly dominates it; its tree view is folded in via `list_books format=tree`).
+The MCP server exposes **8 tools**: **6 are read-only** (no side-effects) and
+**2 write** — `decide_transcript_correction` and `create_transcript_correction`,
+the human gate on the correction overlay (§2.17). `list_transcript_corrections`,
+the third correction tool, is itself read-only — it is a worklist query, not a
+decision. The two search tools default to the **whole library** and take an
+optional `book` to scope to a single title. (The legacy `browse_audiobook_library`
+tool was removed — `list_books` strictly dominates it; its tree view is folded in
+via `list_books format=tree`.)
+
+**What the write tools may write.** Both are narrow by construction: they write
+only `transcript_findings` (the decisions layer — a `patch_state` transition, or
+a new human-authored row) and `transcript_chunks.embedding_stale` (the flag that
+triggers the rebuild pass's re-embed). Neither ever writes
+`transcripts.segments`/`transcripts.raw_text` — the immutable ASR record — and
+neither ever writes chunk *text*: the projection is regenerated and the overlay
+replayed onto it on every embed, so text written anywhere else would just be
+overwritten by the next rebuild (§2.17). Both carry non-read-only tool
+annotations (`ReadOnlyHint: false`, `DestructiveHint: false`,
+`IdempotentHint: false`), so an MCP host can prompt a user for confirmation
+before calling either — deciding the same finding twice is refused by the state
+guard rather than being silently idempotent, and `create_transcript_correction`
+genuinely creates a new row on each call, so neither tool could honestly claim
+otherwise.
+
+**Open question: MCP writes carry no bearer token.** Unlike the §2.12 control
+API, which fails closed (`503`) on a mutating call with no
+`Authorization: Bearer <CONTROL_API_TOKEN>`, the MCP tool-call transport has no
+equivalent per-call credential — any client that can reach `/mcp` can call
+`decide_transcript_correction` or `create_transcript_correction`. As it stands
+this is judged acceptable, not settled, on three grounds: the MCP HTTP transport
+is LAN-only (the same posture as the dashboard and the control API); no write
+here deletes anything or touches transcript provenance; and every decision is
+reversible by construction (a state flip has an inverse, and a finding — human-
+or judge-authored — is never deleted). Per-call authorization for MCP writes (a
+bearer token, an MCP-host-level allowlist, or similar) remains an **open
+question**, not a decision this contract has made.
 
 **Chunks vs segments** — two granularities of the same text, surfaced by
 different tools: a **chunk** is the embedding/search unit (~hundreds per book; a
@@ -876,6 +908,9 @@ per chunk) that always carries its own `words[]`. The search tools +
 | `text_search_audiobooks` | Trigram literal/keyword search; hits are labelled **"ranked by trigram match"** (NOT a similarity %, which would mislead on a literal hit). Whole library by default; `book` scopes it. `snippet?` returns an excerpt **centred on the literal match**. | `query` (required), `book?`, `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. Per-word timestamps are **hidden by default**; `includeWordTimestamps=true` adds each segment's `words[]` (word/start/end, plus score/speaker when present) for "exactly when was X said" queries. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments), `includeWordTimestamps?` (false) |
 | `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (**default 1** → ~3 chunks; clamped to 0–50 to bound the response size) |
+| `list_transcript_corrections` | Read-only review **worklist** (§2.17): each row is a finding with pristine chunk context, an anchor-resolution status, and its legal next actions (`allowedActions`). Defaults to the undecided (`proposed`) queue. | `state?` (comma-separated patch states, or `all`/`any`; default `proposed`), `book?`, `path?`, `id?` (a single finding), `min_confidence?` (0), `limit?` (20, capped 200), `offset?` (0) |
+| `decide_transcript_correction` | **Writes.** Accept / reject / revert / reconsider one finding — drives `db.SetPatchState`, validated against `patch.CanTransition` and compare-and-swapped on the expected current state. Accept/revert flag the chunk `embedding_stale`; reject changes no text. | `id` (required), `action` (required: `accept`\|`reject`\|`revert`\|`reconsider`), `decided_by?` (default `"agent"`, stored `mcp:`-prefixed), `expected_state?` (optional CAS guard) |
+| `create_transcript_correction` | **Writes.** The direct-edit escape hatch: records a correction no model proposed, after passing the same gates an accepted judge patch passes (anchor resolution, chunk-hash verification, overlap refusal). Writes no transcript text; flags the chunk `embedding_stale`. | `chunk_id` (required), `original_text` (required, verbatim span), `correction` (required, non-empty), `occurrence?`, `offset?` (hint only — the stored anchor is always the resolved position), `issue_type?` (default `other`), `decided_by?` (default `"agent"`), `expected_chunk_sha256?`, `dry_run?` (default `false`) |
 
 **Structured output**: every tool advertises an `outputSchema` and returns
 `structuredContent` (machine-readable) **in addition to** the existing
@@ -2028,6 +2063,79 @@ audit trail of divergence between the ASR output and the reviewed text.
 > shows uncorrected ASR.** Closing the gap means projecting corrections onto
 > segments at render time (segments have no chunk anchors today). Mutating
 > segments to "fix" it is forbidden: it would destroy the provenance record.
+
+#### The review surface (MCP tools)
+
+> Added 2026-08-19. The lifecycle above is enforced in `internal/patch` and
+> `internal/db`; this subsection documents the MCP tools (`internal/mcp`) that
+> reach it — the surface an agent or host actually calls. Full parameter tables
+> are in §2.2.1 and `internal/mcp/README.md`.
+
+Three tools, three layers written:
+
+| Tool | Writes |
+|---|---|
+| `list_transcript_corrections` | nothing — a worklist query joining `transcript_findings` to the chunk's pristine text |
+| `decide_transcript_correction` | `transcript_findings.patch_state` (+ `decided_at`/`decided_by`); `transcript_chunks.embedding_stale` on accept/revert |
+| `create_transcript_correction` | a new `transcript_findings` row at `patch_state='accepted'`; `transcript_chunks.embedding_stale` |
+
+**Provenance: the `origin` column.** `transcript_findings.origin TEXT NOT NULL
+DEFAULT 'judge'`, `CHECK (origin IN ('judge','human'))`, added by an additive
+`ADD COLUMN IF NOT EXISTS` migration in `initialize()` (`internal/db/db.go`). A
+hand-authored edit and a judge finding are structurally identical rows — same
+table, same anchor columns, same replay — so without provenance recorded *in the
+row* the two are indistinguishable after the fact, and "judge precision"
+silently starts counting decisions a person already made instead of the judge's
+own guesses.
+
+Consequence for readers: **any metric or dashboard that measures the judge must
+filter `origin = 'judge'`.** The existing `/findings` dashboard and
+`GetFindingsSummary` do **not** filter yet — this is a known, deferred gap, not
+an oversight this section is pretending away. A human-authored correction
+recorded through `create_transcript_correction` currently inflates those
+counts/rollups as if the judge had proposed it.
+
+**The direct-edit path**, as `create_transcript_correction` runs it:
+
+1. Read the chunk's pristine text — `COALESCE(source_text, text)` — never the
+   corrected surface.
+2. Verify with `patch.PlanDirectEdit`: non-empty correction → chunk-hash match
+   → unambiguous anchor via `patch.Locate` → no overlap with the chunk's
+   existing overlay (`GetCorrectionOverlay`/`BuildOverlay`, the same overlay the
+   rebuild reads — there is only one definition of "the overlay").
+3. INSERT the finding at `patch_state='accepted'`, with `decided_at`/`decided_by`
+   stamped in the same statement. The INSERT is an `INSERT … SELECT` over the
+   chunk row — `transcript_id`, `file_path`, `chunk_index`, and the timings come
+   FROM THE CHUNK, so a caller cannot file a correction against one chunk while
+   labelling it another — and the statement **re-checks the chunk fingerprint in
+   SQL** (`encode(sha256(convert_to(COALESCE(c.source_text, c.text),
+   'UTF8')),'hex') = $12`), so a rebuild racing the edit between verification and
+   insert matches zero rows and the edit is refused instead of anchoring to text
+   nobody actually verified.
+4. Flag `transcript_chunks.embedding_stale` in the **same transaction** as the
+   INSERT — a correction recorded without its invalidation would leave the
+   corpus permanently showing text that disagrees with its own findings.
+
+**Why `accepted`, not `proposed`.** A direct edit skips the `proposed` state
+because there is nothing to propose — the edit itself *is* the human decision,
+made by the person calling the tool. It still does not skip `applied`: that
+state is reached only by a successful rebuild replaying the overlay (see
+"Applying" above), so the audit trail keeps "a human approved this" and "this is
+in the searchable corpus" as two distinct, separately-observable facts.
+
+**Reserved sentinels: `model='manual'`, `confidence=1`.** Both columns are
+`NOT NULL` on `transcript_findings` and mean "which judge produced this, and its
+self-reported score" — a direct edit had no judge, so it needs values that are
+honest about that rather than a borrowed model id that would corrupt per-model
+attribution, or a confidence that implies uncertainty a human decision doesn't
+carry.
+
+**Pristine, always.** Both `list_transcript_corrections` and
+`create_transcript_correction` resolve anchors, and return context, against the
+chunk's pristine text (`COALESCE(source_text, text)`) — never the corrected
+surface. An anchor taken from corrected text would record a fingerprint the
+projection's input (the pristine regenerated chunk) can never match, so the
+correction would be born `stale` before a reviewer ever saw it.
 
 ## 3. SCHEMA — pgvector chunks table
 

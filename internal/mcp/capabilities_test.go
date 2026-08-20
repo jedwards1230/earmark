@@ -37,7 +37,7 @@ func connectCapabilitiesInMemory(t *testing.T, srv *mcp.Server) *mcp.ClientSessi
 // capabilities carry the parity contract this migration must preserve
 // (see docs/projects/mcp-official-sdk-migration-plan.md, parity rule 3):
 //
-//   - `tools` MUST be present and truthy — earmark registers 5 tools, and the
+//   - `tools` MUST be present and truthy — earmark registers 8 tools, and the
 //     SDK auto-derives {"listChanged":true} from them since
 //     ServerOptions.Capabilities is left nil in NewMCPServer.
 //   - `resources` MUST be ABSENT — earmark registers no MCP resources today,
@@ -70,7 +70,7 @@ func TestInitializeCapabilities(t *testing.T) {
 
 	toolsRaw, ok := m["tools"]
 	if !ok {
-		t.Fatal("capabilities.tools is absent — want present (5 tools registered)")
+		t.Fatal("capabilities.tools is absent — want present (8 tools registered)")
 	}
 	var toolsObj map[string]any
 	if err := json.Unmarshal(toolsRaw, &toolsObj); err != nil {

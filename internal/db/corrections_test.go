@@ -26,6 +26,12 @@ var correctionSQL = map[string]string{
 	"markChunkStaleForFindingSQL": markChunkStaleForFindingSQL,
 	"clearEmbeddingStaleSQL":      clearEmbeddingStaleSQL,
 	"staleChunkTranscriptsSQL":    staleChunkTranscriptsSQL,
+	// The reviewer surface (review.go) — added here so the same
+	// never-touches-transcript-provenance guard below covers it too.
+	"listCorrectionsSQL":        listCorrectionsSQL,
+	"chunkTargetSQL":            chunkTargetSQL,
+	"insertManualCorrectionSQL": insertManualCorrectionSQL,
+	"markChunkStaleByIDSQL":     markChunkStaleByIDSQL,
 }
 
 // TestCorrectionSQL_NeverTouchesTranscriptProvenance is the hard invariant of

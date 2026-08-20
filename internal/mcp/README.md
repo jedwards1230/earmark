@@ -1,7 +1,8 @@
 # MCP Server
 
-Streamable-HTTP MCP server for earmark. Serves 5 read-only tools on `:8081/mcp`
-plus an htmx dashboard. **Home (`/`) is the Library page**; the **Pipeline ops
+Streamable-HTTP MCP server for earmark. Serves 8 tools on `:8081/mcp` — 6
+read-only plus 2 that write (the correction-review human gate, CONTRACT §2.17)
+— plus an htmx dashboard. **Home (`/`) is the Library page**; the **Pipeline ops
 page** (`/pipeline`) carries the auto-refreshing status fragment — counts,
 pipeline state, a **read-only phase badge**, and token-gated **pause + run-budget**
 controls — with the Failed jobs view folded in (the old standalone `/failed` page
@@ -46,8 +47,9 @@ each book to its `#book-findings` section.
 
 ## Tools
 
-There are exactly **5 tools**. The legacy `browse_audiobook_library` tool has been
-removed — `list_books format=tree` covers that use case.
+There are **8 tools** — **6 read-only** and **2 write** (`decide_transcript_correction`,
+`create_transcript_correction`; CONTRACT §2.17). The legacy `browse_audiobook_library`
+tool has been removed — `list_books format=tree` covers that use case.
 
 ### `list_books`
 
@@ -113,6 +115,61 @@ search result's `ID` field.
 |-------|---------|-------|
 | `chunkID` | required | UUID from a search hit |
 | `contextWindow` | 1 | chunks before/after (clamped 0–50); default → ~3 chunks |
+
+### `list_transcript_corrections`
+
+Read-only. The correction-review worklist (CONTRACT §2.17): each row is a
+finding with the surrounding **pristine** chunk context, an anchor-resolution
+status (does the correction still locate in the chunk's current text?), and
+which actions are legal from its current state (`allowedActions`). Defaults to
+the undecided (`proposed`) queue.
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `state` | `proposed` | comma-separated patch states (`proposed`, `accepted`, `applied`, `rejected`, `reverted`, `stale`), or `all`/`any` for every state |
+| `book` | — | resolved the same way the search tools resolve it; ignored when `path` is given |
+| `path` | — | exact book directory or track file path; matches that path and anything beneath it |
+| `id` | — | a single finding UUID — overrides the other filters in practice |
+| `min_confidence` | 0 | drop findings below this judge self-score (0–1) |
+| `limit` | 20 | capped at 200 |
+| `offset` | 0 | paging |
+
+### `decide_transcript_correction`
+
+**Writes.** Accept, reject, revert, or reconsider one finding. Drives
+`db.SetPatchState`, which validates the move against `patch.CanTransition`
+before any SQL runs and guards the `UPDATE` on the expected current state
+(compare-and-swap). Accept and revert flag the chunk `embedding_stale`
+(re-embedded on the next rebuild pass); reject changes no text.
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `id` | required | the finding UUID (`id` field from `list_transcript_corrections`) |
+| `action` | required | `accept` \| `reject` \| `revert` \| `reconsider` — legal actions depend on the current state (each row's `allowedActions`) |
+| `decided_by` | `"agent"` | audit attribution; always stored with an `mcp:` prefix |
+| `expected_state` | — | optional compare-and-swap: the call fails if the finding has moved since you read it |
+
+### `create_transcript_correction`
+
+**Writes.** The direct-edit escape hatch — records a correction no model
+proposed. Takes the identical verification path an accepted judge finding
+takes (`patch.PlanDirectEdit`: non-empty correction, chunk-hash match,
+unambiguous anchor, no overlap with the chunk's existing overlay) before it is
+recorded as a new `transcript_findings` row at `patch_state='accepted'`,
+`origin='human'`. Writes no transcript text — the chunk is flagged
+`embedding_stale` so the next rebuild replays the correction and re-embeds it.
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `chunk_id` | required | chunk UUID — the `ID` field of a search result, or `chunkId` from `list_transcript_corrections` |
+| `original_text` | required | the exact span to replace, copied VERBATIM from the chunk's original (uncorrected) text |
+| `correction` | required | replacement text; must be non-empty — an empty correction would delete text silently |
+| `occurrence` | — | 0-based index of which occurrence to correct, when the span repeats in the chunk |
+| `offset` | — | rune-offset hint only; the stored anchor is always the position actually located, never the reported one |
+| `issue_type` | `other` | the judge's closed vocabulary (`misheard_proper_noun`, `misheard_word`, `repeated_text`, `number_artifact`, `homophone`, `dropped_word`, `other`); unknown values coerce to `other` |
+| `decided_by` | `"agent"` | audit attribution, recorded alongside `origin=human` |
+| `expected_chunk_sha256` | — | refuse the edit if the chunk changed since you read it (`chunkSha256`) |
+| `dry_run` | `false` | verify the edit and return the preview WITHOUT recording it |
 
 ## Series on results
 

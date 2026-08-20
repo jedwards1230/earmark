@@ -679,6 +679,33 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("reviewable-patch migration: %w", err)
 	}
 
+	// Finding provenance (CONTRACT §2.17). A correction may now be authored by a
+	// reviewer directly, with no model having proposed it. Such a row is
+	// structurally identical to a judge finding — same table, same anchors, same
+	// replay — so without a provenance column the two are indistinguishable
+	// afterwards, and "judge precision" silently starts counting decisions a
+	// person already made.
+	//
+	// Additive and default-safe: every pre-existing row is a judge finding, which
+	// is exactly what the DEFAULT records. The CHECK keeps the column enumerable
+	// the same way patch_state is.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE transcript_findings
+			ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'judge';
+		DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = 'transcript_findings_origin_valid'
+			) THEN
+				ALTER TABLE transcript_findings
+					ADD CONSTRAINT transcript_findings_origin_valid
+					CHECK (origin IN ('judge','human'));
+			END IF;
+		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+		END $$;
+	`); err != nil {
+		return fmt.Errorf("finding-origin migration: %w", err)
+	}
+
 	// Embedding invalidation (CONTRACT §2.17). transcript_chunks.embedding is
 	// VECTOR(768) NOT NULL, so a stale embedding cannot be signalled by nulling
 	// it. This flag is the marker instead: applying a patch rewrites the chunk

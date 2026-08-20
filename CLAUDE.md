@@ -159,7 +159,7 @@ Debug-only (both must be set):
 | `internal/db` | pgxpool-based DB handle; schema init; job queue; search; chunks |
 | `internal/worker` | Polls completed transcripts, chunks via segments, embeds, stores |
 | `internal/monitor` | Walks BOOKS_DIR, inserts pending jobs (dedup by SHA-256) |
-| `internal/mcp` | MCP server (5 tools), status dashboard, control API, `/servers` Models/Services page. See [`internal/mcp/README.md`](internal/mcp/README.md) and [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for full details. |
+| `internal/mcp` | MCP server (8 tools: 6 read-only, 2 correction-review writes), status dashboard, control API, `/servers` Models/Services page. See [`internal/mcp/README.md`](internal/mcp/README.md) and [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for full details. |
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client; resolves its endpoint through the AI registry's `embeddings` role (CONTRACT §2.14) |
 | `internal/asr` | ASR backend capability vocabulary (CONTRACT §2.13): closed capability enum + `ParseCapabilities` (drops unknown keys), recommended `family`/`runtime` ids + `KnownFamily`/`KnownRuntime` label helpers. Pure leaf package (no DB/HTTP deps). |
