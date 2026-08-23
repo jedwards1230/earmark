@@ -408,6 +408,11 @@ func (db *DB) initialize(ctx context.Context) error {
 			paused     BOOLEAN     NOT NULL DEFAULT false,
 			run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
 			phase      TEXT            CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze')),
+			-- The acknowledgement paired with the phase column above: phase is the
+			-- request (coordinator -> runner), this is the result (runner ->
+			-- coordinator). NULL means NOT parked — an un-stamped runner must never
+			-- read as a free GPU. Declared inline AND migrated, mirroring phase.
+			runner_gpu_parked BOOLEAN,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_by TEXT
 		);
@@ -605,6 +610,28 @@ func (db *DB) initialize(ctx context.Context) error {
 		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS runner_heartbeat_at TIMESTAMPTZ;
 	`); err != nil {
 		return fmt.Errorf("runner_heartbeat_at migration: %w", err)
+	}
+
+	// runner_gpu_parked migration (CONTRACT §1.4): the acknowledgement half of the
+	// phase hand-off. `phase` above is the REQUEST (coordinator -> runner); this is
+	// the RESULT (runner -> coordinator) — whether the model is, right now, actually
+	// off the GPU.
+	//
+	// It exists because a request is not a result: the runner parks only BETWEEN
+	// JOBS, so an in-flight transcription keeps the card after phase='analyze' is
+	// set. Without an acknowledgement a GPU coordinator can only trust the request
+	// blindly — and hand the card to something else while a tenant still holds it —
+	// or wait out a timeout and stop the service anyway, discarding the in-flight
+	// job the cooperative hand-off exists to protect.
+	//
+	// Default NULL, and NULL means NOT parked, so a database that has migrated but
+	// whose runner has not stamped yet degrades to the pre-existing behavior rather
+	// than to a false all-clear. Deliberately no CHECK constraint: this is a plain
+	// tri-state (true / false / not-yet-known) and all three values are meaningful.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS runner_gpu_parked BOOLEAN;
+	`); err != nil {
+		return fmt.Errorf("runner_gpu_parked migration: %w", err)
 	}
 
 	// Runner self-update migration (CONTRACT §1.4 + §2.12): version-skew detection
