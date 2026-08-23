@@ -485,6 +485,10 @@ class _PhaseCursor:
         if self.conn.raise_on is not None and self.conn.raise_on in sql:
             raise RuntimeError('column "phase" does not exist')
         self.conn.last_sql = sql
+        # Record the published parked state so tests can assert what a GPU
+        # coordinator would actually observe, not merely that park() was called.
+        if "runner_gpu_parked" in sql:
+            self.conn.parked_stamps.append(params[0] if params else None)
 
     def fetchone(self) -> object:
         if "phase" in self.conn.last_sql:
@@ -507,6 +511,7 @@ class _PhaseConn:
         self.last_sql = ""
         self.commits = 0
         self.rollbacks = 0
+        self.parked_stamps: list[object] = []
 
     def cursor(self) -> _PhaseCursor:
         return _PhaseCursor(self)
@@ -759,6 +764,70 @@ class GateGpuTests(unittest.TestCase):
         skip = runner._gate_gpu(conn, provider)  # must not raise
         self.assertTrue(skip)
         self.assertEqual(provider.unparked, 1)
+
+    # ── published parked state (what a GPU coordinator reads) ──────────────
+
+    def test_parking_publishes_parked_true(self) -> None:
+        # The whole point: a coordinator that asked for phase='analyze' can
+        # confirm the VRAM was actually released instead of guessing.
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            phase_row={"phase": "analyze"},
+        )
+        provider = _RecordingProvider()
+        runner._gate_gpu(conn, provider)
+        self.assertEqual(conn.parked_stamps, [True])
+
+    def test_active_publishes_parked_false(self) -> None:
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            phase_row={"phase": "transcribe"},
+        )
+        provider = _RecordingProvider()
+        runner._gate_gpu(conn, provider)
+        self.assertEqual(conn.parked_stamps, [False])
+
+    def test_failed_park_publishes_parked_false(self) -> None:
+        # The safety-critical case. park() raised, so the model may still be on
+        # the card. Publishing True here would tell a coordinator the VRAM is
+        # free and let it hand the GPU to something else on top of a tenant that
+        # never left — so a failed park must read as NOT parked.
+        conn = _PhaseConn(
+            control_row={"paused": True, "run_limit": None},
+            phase_row={"phase": "idle"},
+        )
+        provider = _RecordingProvider(park_raises=True)
+        runner._gate_gpu(conn, provider)
+        self.assertEqual(
+            conn.parked_stamps,
+            [False],
+            "a park that raised must never be published as parked",
+        )
+
+    def test_failed_unpark_publishes_parked_false(self) -> None:
+        # unpark() raised: we could not reclaim the card. We were not asked to
+        # park, so 'not parked' is both the intent and the conservative answer.
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            phase_row={"phase": "transcribe"},
+        )
+        provider = _RecordingProvider(unpark_raises=True)
+        runner._gate_gpu(conn, provider)
+        self.assertEqual(conn.parked_stamps, [False])
+
+    def test_missing_parked_column_does_not_break_the_gate(self) -> None:
+        # The column is additive and may not be deployed yet. A failed stamp must
+        # never disturb the gate decision or propagate to the claim path.
+        conn = _PhaseConn(
+            control_row={"paused": False, "run_limit": None},
+            phase_row={"phase": "analyze"},
+            raise_on="runner_gpu_parked",
+        )
+        provider = _RecordingProvider()
+        skip = runner._gate_gpu(conn, provider)  # must not raise
+        self.assertTrue(skip)
+        self.assertEqual(provider.parked, 1)
+        self.assertEqual(conn.parked_stamps, [])  # nothing recorded; it raised
 
 
 class ResolveAudioPathTests(unittest.TestCase):

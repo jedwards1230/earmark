@@ -464,9 +464,24 @@ yet have the column (or row) behaves exactly as before. The runner never creates
 or writes `phase`; a future coordinator/Go service owns those writes.
 
 ```sql
--- additive column (not yet created by the runner; a separate migration adds it):
+-- additive columns (not created by the runner; a separate migration adds them):
 ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS phase TEXT;
+ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS runner_gpu_parked BOOLEAN;
 ```
+
+`phase` is the **request** (coordinator → runner). `runner_gpu_parked` is the
+**acknowledgement** (runner → coordinator): whether the model is, right now,
+actually off the GPU. The runner owns this column and no one else writes it —
+the mirror image of `phase`.
+
+It exists because a request is not a result. A coordinator that sets
+`phase='analyze'` has asked a tenant to step off the card, but "asked politely"
+is not "the card is free" — the runner parks only **between jobs**, so an
+in-flight transcription keeps the GPU until it finishes. Without an
+acknowledgement the coordinator can only trust the request blindly (and hand the
+GPU to something else on top of a tenant that never left) or wait out a timeout
+and stop the service anyway — throwing away the in-flight job the cooperative
+hand-off exists to protect.
 
 Phase values **as the runner interprets them**:
 
@@ -498,6 +513,37 @@ on the GPU).
 This is independent of `paused`/`run_limit`: `paused=true` always parks (and
 declines claims); `phase` adds the `'analyze'` axis for GPU hand-off without
 pausing the broader pipeline semantics.
+
+**Acknowledgement — `runner_gpu_parked`.** After applying (or failing to apply)
+the park/unpark, the runner stamps this column with the state it actually
+reached:
+
+| value | meaning to a coordinator |
+|---|---|
+| `true` | the model is off the GPU and its VRAM has been returned to the driver |
+| `false` | the model is on the GPU — including when a park was requested but **raised** |
+| `NULL` / column absent | this runner has not stamped yet, or predates the column — treat as **not parked** |
+
+Two properties a consumer may rely on:
+
+- **`true` is only ever published after a park that succeeded.** A `park()` that
+  raised is stamped `false`, because the model may still be resident; a
+  coordinator that read `true` there would free the card on paper while a tenant
+  still held it. The reverse error (`false` while actually parked) costs only a
+  redundant escalation, so the asymmetry is deliberate.
+- **Absent is not parked.** A missing column, missing row, or un-stamped runner
+  must read as "still on the GPU", so a deployment that has not migrated yet
+  degrades to the pre-existing behaviour rather than to a false all-clear.
+
+Stamping is best-effort and never disturbs the claim path: if the column does not
+exist the write is swallowed, exactly as the `phase` read is.
+
+A coordinator's hand-off is therefore: set `phase='analyze'` → poll
+`runner_gpu_parked` until `true` → use the GPU; and on the way back, set `phase`
+to `'idle'`/`'transcribe'` (or `NULL`). If the poll does not go `true` within the
+coordinator's budget, the tenant is still working and the coordinator must decide
+whether to keep waiting or stop the service outright — the acknowledgement makes
+that a *decision* rather than a guess.
 
 #### Operator requeue (out-of-band, `earmark requeue`)
 

@@ -445,6 +445,45 @@ def _read_phase(conn: psycopg2.extensions.connection) -> str:
     return _PHASE_DEFAULT if value is None else str(value)
 
 
+def _stamp_gpu_parked(conn: psycopg2.extensions.connection, parked: bool) -> None:
+    """
+    Publish whether this runner's model is currently OFF the GPU (CONTRACT §1.4).
+
+    The runner already knows this — `ASRProvider._parked` — but that lived purely
+    in-process, so nothing outside could tell whether a park had actually
+    happened. A GPU coordinator that asks a tenant to step off the card
+    (`phase='analyze'`) then has no way to confirm the VRAM was really released,
+    and "asked politely" is not "the card is free": it must either trust the
+    request blindly or wait out a timeout and stop the service anyway, throwing
+    away the in-flight job the cooperative path exists to protect.
+
+    Written **after** the park/unpark side-effect and reflecting its real
+    outcome, so a park that raised is published as NOT parked. That direction is
+    load-bearing: a coordinator reading `true` concludes the VRAM is free and
+    hands the card to something else, so this must never claim a park that did
+    not happen. The reverse error — reporting `false` while actually parked —
+    only costs a redundant escalation.
+
+    Best-effort and defensive, exactly like [`_read_phase`]: the column is
+    additive and may not exist in a deployed DB yet, and a failure here must
+    never disturb the claim path. Uses its own transaction so the connection is
+    left clean for the caller.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runner_control SET runner_gpu_parked = %s WHERE id = 1",
+                (parked,),
+            )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 — degrade safe on missing column/row/table
+        log.debug("gpu_parked stamp failed (%s) — continuing", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def _should_park(paused: bool, phase: str | None) -> bool:
     """
     Decide whether the ASR model should be parked OFF the GPU (CONTRACT §1.4).
@@ -499,7 +538,14 @@ def _gate_gpu(
             phase,
             exc,
         )
+        # The side-effect did NOT complete, so whatever we intended, the card is
+        # not in the state we asked for. Publish "not parked" — a coordinator
+        # must never conclude the VRAM is free off the back of a failed park.
+        _stamp_gpu_parked(conn, False)
         return True  # skip the claim; do not let a GPU fault masquerade as a DB error
+    # Publish the state we actually reached, so a GPU coordinator can confirm a
+    # cooperative release instead of guessing (see `_stamp_gpu_parked`).
+    _stamp_gpu_parked(conn, should_park)
     if should_park:
         log.debug("GPU parked (paused=%s phase=%s) — skipping claim", paused, phase)
     return should_park
