@@ -136,6 +136,7 @@ reversible. Full parameter documentation is in
 | `/` | htmx status dashboard — pipeline, library, per-book/track, servers, findings |
 | `/api/v1/status` | JSON pipeline status (read-only, unauthenticated) |
 | `/api/v1/pipeline/pause`, `/api/v1/pipeline/run` | Pause/resume and run-N-then-pause. `PUT`/`POST`/`DELETE` require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed with `503` when it is unset |
+| `/api/v1/openapi.yaml` | OpenAPI 3.1 contract for the JSON control API, embedded in the binary (read-only, unauthenticated) |
 | `/healthz`, `/health` | Liveness |
 | `/metrics` | Prometheus metrics |
 

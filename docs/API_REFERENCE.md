@@ -114,6 +114,8 @@ JSON endpoints on the same `:8081` port as the MCP server. Read endpoints are al
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` also clears any run bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` |
 | `DELETE` | `/api/v1/pipeline/run` | bearer | — | `200` clears the bounded run (`run_limit→NULL`) |
+| `POST` | `/api/v1/runner/update` | bearer | `{"version":"<tag>"}` (empty clears) | `202` runner-update state — requests the runner self-update |
+| `GET` | `/api/v1/openapi.yaml` | none | — | `200` the OpenAPI 3.1 contract for this API (`application/yaml`), embedded in the binary |
 
 **Single-job smoke test**:
 

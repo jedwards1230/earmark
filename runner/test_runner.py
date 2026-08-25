@@ -245,6 +245,23 @@ class SelfUpdateTests(unittest.TestCase):
         finally:
             del os.environ["RUNNER_VERSION"]
 
+    # ── wire vocabulary ──────────────────────────────────────────────────────
+    def test_update_state_tokens_are_the_wire_contract(self) -> None:
+        # These five strings are a cross-language contract: the CHECK constraint
+        # on runner_control.runner_update_state, the `state` enum of the
+        # RunnerUpdate schema in docs/openapi.yaml, and what
+        # POST /api/v1/runner/update writes. Renaming a constant must not
+        # silently change the value that goes on the wire, so pin them.
+        self.assertEqual(runner.UPDATE_STATE_IDLE, "idle")
+        self.assertEqual(runner.UPDATE_STATE_REQUESTED, "requested")
+        self.assertEqual(runner.UPDATE_STATE_UPDATING, "updating")
+        self.assertEqual(runner.UPDATE_STATE_SUCCESS, "success")
+        self.assertEqual(runner.UPDATE_STATE_FAILED, "failed")
+        # In-flight = the two non-terminal states the runner finalizes from.
+        self.assertEqual(
+            runner.UPDATE_STATES_IN_FLIGHT, ("requested", "updating")
+        )
+
     # ── pure gate ────────────────────────────────────────────────────────────
     def test_should_self_update_truth_table(self) -> None:
         self.assertTrue(runner._should_self_update("v1", "v2", "requested"))
