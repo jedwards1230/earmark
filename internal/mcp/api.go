@@ -142,6 +142,34 @@ type apiETA struct {
 	Label           string  `json:"label"`
 }
 
+// The request bodies and the error envelope are named types rather than
+// anonymous structs or a bare map so that openapi_schemas.go can derive their
+// documented shape by reflection — an inline struct has no type to reflect on,
+// which is how a request schema silently drifts from what the handler decodes.
+
+// errorEnvelope is the uniform non-2xx body written by writeJSONError.
+type errorEnvelope struct {
+	Error string `json:"error"`
+}
+
+// pauseRequest is the PUT /api/v1/pipeline/pause body. Paused is a pointer so a
+// missing field is distinguishable from an explicit false and can be rejected.
+type pauseRequest struct {
+	Paused *bool `json:"paused"`
+}
+
+// runRequest is the POST /api/v1/pipeline/run body. Limit is a pointer for the
+// same reason: absent and 0 mean different things.
+type runRequest struct {
+	Limit *int `json:"limit"`
+}
+
+// runnerUpdateRequest is the POST /api/v1/runner/update body. An absent or empty
+// Version clears the update request.
+type runnerUpdateRequest struct {
+	Version *string `json:"version"`
+}
+
 // pauseState is the JSON shape of the pipeline pause endpoints.
 type pauseState struct {
 	Paused   bool `json:"paused"`
@@ -381,9 +409,7 @@ func (s *MCPServer) handleAPIPauseGet(w http.ResponseWriter, r *http.Request) {
 // paused=true pauses (leaving any bounded run intact); paused=false resumes and
 // clears the bound (back to unlimited).
 func (s *MCPServer) handleAPIPausePut(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Paused *bool `json:"paused"`
-	}
+	var body pauseRequest
 	if err := decodeJSONBody(r, &body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -423,9 +449,7 @@ func (s *MCPServer) handleAPIPausePut(w http.ResponseWriter, r *http.Request) {
 // processes exactly N jobs and then declines further claims (run_limit=0). This
 // is the one-call single-job smoke test (limit:1).
 func (s *MCPServer) handleAPIRun(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Limit *int `json:"limit"`
-	}
+	var body runRequest
 	if err := decodeJSONBody(r, &body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -469,9 +493,7 @@ func (s *MCPServer) handleAPIRunClear(w http.ResponseWriter, r *http.Request) {
 // request (resets to idle). Bearer-token guarded (fails closed) like the other
 // mutating endpoints; the runner — not this handler — performs the swap.
 func (s *MCPServer) handleAPIRunnerUpdate(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Version *string `json:"version"`
-	}
+	var body runnerUpdateRequest
 	if err := decodeJSONBody(r, &body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -531,7 +553,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+	writeJSON(w, code, errorEnvelope{Error: msg})
 }
 
 // decodeJSONBody decodes a small request body, rejecting unknown fields and any

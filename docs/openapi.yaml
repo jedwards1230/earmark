@@ -286,378 +286,423 @@ components:
           example: { error: "control API token not configured" }
 
   schemas:
-    Error:
-      type: object
-      description: The uniform error envelope for every non-2xx control-API response.
-      required: [error]
-      properties:
-        error:
-          type: string
-          description: Human-readable message. Never echoes request bytes.
-
-    PauseState:
-      type: object
-      description: >
-        The two orthogonal axes of `runner_control`. Returned by every pipeline
-        control endpoint, always re-read after a write so callers see the
-        authoritative state.
-      required: [paused, runLimit]
-      properties:
-        paused:
-          type: boolean
-          description: True when the runner is gated and will not claim work.
-        runLimit:
-          type: [integer, "null"]
-          description: >
-            Remaining claims in a bounded run, decremented runner-side. `null`
-            means unlimited (no bound armed).
-
-    PauseRequest:
-      type: object
-      additionalProperties: false
-      required: [paused]
-      properties:
-        paused:
-          type: boolean
-          description: >
-            True pauses (leaving any bounded run intact); false resumes **and**
-            clears the bounded run.
-
-    RunRequest:
-      type: object
-      additionalProperties: false
-      required: [limit]
-      properties:
-        limit:
-          type: integer
-          minimum: 1
-          description: Number of jobs to claim before auto-pausing.
-
-    RunnerUpdateRequest:
-      type: object
-      additionalProperties: false
-      properties:
-        version:
-          type: string
-          description: >
-            Target earmark git tag (e.g. `v0.34.0`). Whitespace is trimmed; an
-            empty or omitted value clears the pending update request.
-
-    RunnerUpdate:
-      type: object
-      description: >
-        Runner version-skew and self-update state (CONTRACT §2.12). Absent from
-        a status response entirely until the runner reports a version or an
-        update is requested, so runners predating the feature stay invisible.
-      required: [updateAvailable]
-      properties:
-        runningVersion:
-          type: string
-          description: Version the runner reports it is running. Omitted when unknown.
-        desiredVersion:
-          type: string
-          description: Version the operator asked for. Omitted when none is pending.
-        state:
-          type: string
-          enum: [idle, requested, updating, success, failed]
-          description: >
-            Update state-machine token; the runner owns the
-            `requested → updating → success|failed` transitions. Omitted (or
-            empty) when no update has ever been requested for this runner.
-        error:
-          type: string
-          description: Last update error reported by the runner. Omitted when none.
-        updateAvailable:
-          type: boolean
-          description: >
-            True when a desired version is set and differs from the running one.
-            Derived from the recorded intent — this server never calls GitHub.
-        updatedAt:
-          type: string
-          format: date-time
-          description: UTC RFC 3339 timestamp of the last state change. Omitted when unset.
-
     ETA:
-      type: object
-      description: >
-        Empirical pipeline ETA (CONTRACT §4). Exposes both the busy-time
-        estimate and the calendar estimate so a caller can tell "3h of GPU work"
-        apart from "done by Tuesday".
-      required:
-        [remainingChunks, workSeconds, calendarSeconds, calendarKnown,
-         evalIncluded, hasWork, label]
+      description: |
+        Empirical pipeline ETA (CONTRACT §4). Exposes both the busy-time estimate and the calendar estimate so a caller can tell "3h of GPU work" apart from "done by Tuesday".
       properties:
-        remainingChunks:
-          type: integer
-          description: Chunks still to process.
-        workSeconds:
-          type: number
-          description: Estimated busy (work) seconds remaining.
-        calendarSeconds:
-          type: number
-          description: Estimated wall-clock seconds remaining; meaningful only when calendarKnown.
         calendarKnown:
-          type: boolean
           description: True when enough history exists to make the calendar estimate meaningful.
+          type: boolean
+        calendarSeconds:
+          description: Estimated wall-clock seconds remaining; meaningful only when calendarKnown.
+          type: number
         evalIncluded:
-          type: boolean
           description: True when eval time is part of the estimate (false → eval timing not yet measured).
-        hasWork:
           type: boolean
+        hasWork:
           description: True when there is anything left to do.
+          type: boolean
         label:
-          type: string
           description: Human-rendered estimate, as shown on the dashboard.
-
-    Endpoint:
+          type: string
+        remainingChunks:
+          description: Chunks still to process.
+          type: integer
+        workSeconds:
+          description: Estimated busy (work) seconds remaining.
+          type: number
+      required:
+        - remainingChunks
+        - workSeconds
+        - calendarSeconds
+        - calendarKnown
+        - evalIncluded
+        - hasWork
+        - label
       type: object
-      description: >
-        One AI endpoint from the registry (CONTRACT §2.14), merged with its
-        liveness probe.
-      required: [id, type, backend, baseURL, model, state, probed]
+    Endpoint:
+      description: |
+        One AI endpoint from the registry (CONTRACT §2.14), merged with its liveness probe.
       properties:
+        backend:
+          description: Backend implementation (e.g. `ollama`).
+          type: string
+        baseURL:
+          description: |
+            LAN-internal, non-secret base address — included deliberately so an operator can debug connectivity from the status payload.
+          type: string
         id:
           type: string
-        type:
-          type: string
-          description: Endpoint kind (e.g. `embeddings`, `chat`).
-        backend:
-          type: string
-          description: Backend implementation (e.g. `ollama`).
-        baseURL:
-          type: string
-          description: >
-            LAN-internal, non-secret base address — included deliberately so an
-            operator can debug connectivity from the status payload.
         model:
           type: string
         options:
-          type: object
           additionalProperties:
             type: string
           description: Raw registry options. Omitted when none are configured.
-        role:
-          type: string
-          description: Registry role this endpoint is bound to. Omitted when unbound.
-        state:
-          type: string
-          enum: [ready, model_not_loaded, offline, unknown]
-          description: >
-            Probe result. `unknown` means not probed (no prober wired), which is
-            distinct from `offline`.
+          type: object
         probed:
-          type: boolean
           description: True when a probe was actually attempted.
-
-    Server:
-      type: object
-      description: >
-        One transcription server, resolved configured-vs-observed. The backend
-        descriptor and GPU fields are omitted rather than zeroed when unknown,
-        so an undescribed server stays minimal.
-      required: [name, configured, state, jobsDone]
-      properties:
-        name:
-          type: string
-        host:
-          type: string
+          type: boolean
         role:
+          description: Registry role this endpoint is bound to. Omitted when unbound.
           type: string
-          description: e.g. `primary`.
-        configured:
-          type: boolean
-          description: True when the server is declared in `ASR_SERVERS` (vs. observed only).
         state:
+          description: |
+            Probe result. `unknown` means not probed (no prober wired), which is distinct from `offline`.
+          enum:
+            - ready
+            - model_not_loaded
+            - offline
+            - unknown
           type: string
-          enum: [transcribing, ready, busy, stalled, offline, idle, not_seen]
-        model:
+        type:
+          description: Endpoint kind (e.g. `embeddings`, `chat`).
           type: string
-        modelSize:
-          type: string
-        computeMode:
-          type: string
-        jobsDone:
-          type: integer
-        family:
-          type: string
-          description: ASR backend family (CONTRACT §2.13), resolved observed > configured.
-        runtime:
-          type: string
-          description: ASR runtime id (CONTRACT §2.13).
-        capabilities:
-          type: object
-          additionalProperties:
-            type: boolean
-          description: Resolved applied-or-declared capability map.
-        capsSkippedReason:
-          type: object
-          additionalProperties:
-            type: string
-          description: Why each declined (false) capability was skipped.
-        meanWordConfidence:
-          type: number
-          description: Mean ASR word confidence. Omitted when not reported.
-        gpuProbed:
-          type: boolean
-          description: Present only when a `gpuArbiterUrl` is configured for this server.
-        gpuReachable:
-          type: boolean
-        gpuState:
-          type: string
-          description: Raw gpu-arbiter state token (e.g. `available`).
-        vramUsedMb:
-          type: integer
-        vramTotalMb:
-          type: integer
-
-    PipelineLifecycle:
-      type: object
-      description: >
-        Derived 3-stage lifecycle view (Transcribe → Eval → Embed), computed at
-        read time from already-fetched signals — no extra DB queries. It exists
-        so an agent reads one self-describing object instead of piecing the
-        state together from the raw counters.
       required:
-        [activity, phase, transcribeDone, transcribeTotal, evalCoverage,
-         evalInPipeline, embedBacklog, gpuCommitted, gpuProbed, fullyDone,
-         notStarted, transcribing, transcribedOnly, evaldOnly, embeddedReady,
-         failed]
+        - id
+        - type
+        - backend
+        - baseURL
+        - model
+        - state
+        - probed
+      type: object
+    Error:
+      description: The uniform error envelope for every non-2xx control-API response.
+      properties:
+        error:
+          description: Human-readable message. Never echoes request bytes.
+          type: string
+      required:
+        - error
+      type: object
+    PauseRequest:
+      additionalProperties: false
+      properties:
+        paused:
+          description: |
+            True pauses (leaving any bounded run intact); false resumes **and** clears the bounded run.
+          type: boolean
+      required:
+        - paused
+      type: object
+    PauseState:
+      description: |
+        The two orthogonal axes of `runner_control`. Returned by every pipeline control endpoint, always re-read after a write so callers see the authoritative state.
+      properties:
+        paused:
+          description: True when the runner is gated and will not claim work.
+          type: boolean
+        runLimit:
+          description: |
+            Remaining claims in a bounded run, decremented runner-side. `null` means unlimited (no bound armed).
+          type:
+            - integer
+            - "null"
+      required:
+        - paused
+        - runLimit
+      type: object
+    PipelineLifecycle:
+      description: |
+        Derived 3-stage lifecycle view (Transcribe → Eval → Embed), computed at read time from already-fetched signals — no extra DB queries. It exists so an agent reads one self-describing object instead of piecing the state together from the raw counters.
       properties:
         activity:
+          description: |
+            Operator-facing label; precedence is paused → transcribing → evaluating → embedding → winding-down → idle. `winding-down` means the transcribe queue is drained but the GPU is still busy (eval or embed catch-up).
+          enum:
+            - transcribing
+            - evaluating
+            - embedding
+            - winding-down
+            - idle
+            - paused
           type: string
-          enum: [transcribing, evaluating, embedding, winding-down, idle, paused]
-          description: >
-            Operator-facing label; precedence is paused → transcribing →
-            evaluating → embedding → winding-down → idle. `winding-down` means
-            the transcribe queue is drained but the GPU is still busy (eval or
-            embed catch-up).
+        embedBacklog:
+          description: Completed transcripts not yet embedded.
+          type: integer
+        embeddedReady:
+          description: Done with embedded chunks — the terminal, goal state.
+          type: integer
+        evalCoverage:
+          description: |
+            Fraction of done jobs that have been judged (0..1). **`-1` is a sentinel** meaning eval is not in the pipeline (not applicable).
+          type: number
+        evalInPipeline:
+          description: Whether `EVAL_IN_PIPELINE` is enabled.
+          type: boolean
+        evaldOnly:
+          description: Done, eval finished, no embedded chunks.
+          type: integer
+        failed:
+          description: |
+            Jobs with status `failed`. Off the progress-bar fill (a side exit), kept here for agent convenience.
+          type: integer
+        fullyDone:
+          description: |
+            True when every stage is complete: pending, claimed, and embedBacklog are all 0 and eval is covered (or not in the pipeline).
+          type: boolean
+        gpuCommitted:
+          description: True when the pipeline currently owns the GPU (transcribing or evaluating).
+          type: boolean
+        gpuProbed:
+          description: |
+            True when a gpu-arbiter probe is configured and reachable, so a consumer can tell "GPU free" from "GPU state unknown".
+          type: boolean
+        notStarted:
+          description: Pending — not yet claimed by any runner.
+          type: integer
         phase:
-          type: string
-          enum: [idle, transcribe, analyze]
           description: Raw `earmark batch` coordinator phase (CONTRACT §1.4).
+          enum:
+            - idle
+            - transcribe
+            - analyze
+          type: string
         transcribeDone:
           type: integer
         transcribeTotal:
           type: integer
-        evalCoverage:
-          type: number
-          description: >
-            Fraction of done jobs that have been judged (0..1). **`-1` is a
-            sentinel** meaning eval is not in the pipeline (not applicable).
-        evalInPipeline:
-          type: boolean
-          description: Whether `EVAL_IN_PIPELINE` is enabled.
-        embedBacklog:
-          type: integer
-          description: Completed transcripts not yet embedded.
-        gpuCommitted:
-          type: boolean
-          description: True when the pipeline currently owns the GPU (transcribing or evaluating).
-        gpuProbed:
-          type: boolean
-          description: >
-            True when a gpu-arbiter probe is configured and reachable, so a
-            consumer can tell "GPU free" from "GPU state unknown".
-        fullyDone:
-          type: boolean
-          description: >
-            True when every stage is complete: pending, claimed, and embedBacklog
-            are all 0 and eval is covered (or not in the pipeline).
-        notStarted:
-          type: integer
-          description: Pending — not yet claimed by any runner.
-        transcribing:
-          type: integer
-          description: Claimed / in-flight.
         transcribedOnly:
-          type: integer
           description: Done, no eval completion, no embedded chunks.
-        evaldOnly:
           type: integer
-          description: Done, eval finished, no embedded chunks.
-        embeddedReady:
+        transcribing:
+          description: Claimed / in-flight.
           type: integer
-          description: Done with embedded chunks — the terminal, goal state.
-        failed:
-          type: integer
-          description: >
-            Jobs with status `failed`. Off the progress-bar fill (a side exit),
-            kept here for agent convenience.
-
-    Status:
-      type: object
-      description: >
-        Full pipeline snapshot. Fields typed as nullable are always present and
-        may be `null`; fields that are simply absent when unknown are documented
-        as optional.
       required:
-        [pending, claimed, done, failed, transcripts, chunks, embedBacklog,
-         totalJobs, doneLastHour, paused, runLimit, runnerActive,
-         avgProcessingSeconds, totalEmbedTokens, eta, servers, endpoints,
-         pipeline]
+        - activity
+        - phase
+        - transcribeDone
+        - transcribeTotal
+        - evalCoverage
+        - evalInPipeline
+        - embedBacklog
+        - gpuCommitted
+        - gpuProbed
+        - fullyDone
+        - notStarted
+        - transcribing
+        - transcribedOnly
+        - evaldOnly
+        - embeddedReady
+        - failed
+      type: object
+    RunRequest:
+      additionalProperties: false
       properties:
-        pending:
+        limit:
+          description: Number of jobs to claim before auto-pausing.
+          minimum: 1
+          type: integer
+      required:
+        - limit
+      type: object
+    RunnerUpdate:
+      description: |
+        Runner version-skew and self-update state (CONTRACT §2.12). Absent from a status response entirely until the runner reports a version or an update is requested, so runners predating the feature stay invisible.
+      properties:
+        desiredVersion:
+          description: Version the operator asked for. Omitted when none is pending.
+          type: string
+        error:
+          description: Last update error reported by the runner. Omitted when none.
+          type: string
+        runningVersion:
+          description: Version the runner reports it is running. Omitted when unknown.
+          type: string
+        state:
+          description: |
+            Update state-machine token; the runner owns the `requested → updating → success|failed` transitions. Omitted (or empty) when no update has ever been requested for this runner.
+          enum:
+            - idle
+            - requested
+            - updating
+            - success
+            - failed
+          type: string
+        updateAvailable:
+          description: |
+            True when a desired version is set and differs from the running one. Derived from the recorded intent — this server never calls GitHub.
+          type: boolean
+        updatedAt:
+          description: UTC RFC 3339 timestamp of the last state change. Omitted when unset.
+          format: date-time
+          type: string
+      required:
+        - updateAvailable
+      type: object
+    RunnerUpdateRequest:
+      additionalProperties: false
+      properties:
+        version:
+          description: |
+            Target earmark git tag (e.g. `v0.34.0`). Whitespace is trimmed; an empty or omitted value clears the pending update request.
+          type: string
+      type: object
+    Server:
+      description: |
+        One transcription server, resolved configured-vs-observed. The backend descriptor and GPU fields are omitted rather than zeroed when unknown, so an undescribed server stays minimal.
+      properties:
+        capabilities:
+          additionalProperties:
+            type: boolean
+          description: Resolved applied-or-declared capability map.
+          type: object
+        capsSkippedReason:
+          additionalProperties:
+            type: string
+          description: Why each declined (false) capability was skipped.
+          type: object
+        computeMode:
+          type: string
+        configured:
+          description: True when the server is declared in `ASR_SERVERS` (vs. observed only).
+          type: boolean
+        family:
+          description: ASR backend family (CONTRACT §2.13), resolved observed > configured.
+          type: string
+        gpuProbed:
+          description: Present only when a `gpuArbiterUrl` is configured for this server.
+          type: boolean
+        gpuReachable:
+          type: boolean
+        gpuState:
+          description: Raw gpu-arbiter state token (e.g. `available`).
+          type: string
+        host:
+          type: string
+        jobsDone:
+          type: integer
+        meanWordConfidence:
+          description: Mean ASR word confidence. Omitted when not reported.
+          type: number
+        model:
+          type: string
+        modelSize:
+          type: string
+        name:
+          type: string
+        role:
+          description: e.g. `primary`.
+          type: string
+        runtime:
+          description: ASR runtime id (CONTRACT §2.13).
+          type: string
+        state:
+          enum:
+            - transcribing
+            - ready
+            - busy
+            - stalled
+            - offline
+            - idle
+            - not_seen
+          type: string
+        vramTotalMb:
+          type: integer
+        vramUsedMb:
+          type: integer
+      required:
+        - name
+        - configured
+        - state
+        - jobsDone
+      type: object
+    Status:
+      description: |
+        Full pipeline snapshot. Fields typed as nullable are always present and may be `null`; fields that are simply absent when unknown are documented as optional.
+      properties:
+        avgProcessingSeconds:
+          description: Per-run aggregate; `null` until the runner/worker populate `run_metrics`.
+          type:
+            - number
+            - "null"
+        chunks:
           type: integer
         claimed:
           type: integer
         done:
           type: integer
-        failed:
-          type: integer
-        transcripts:
-          type: integer
-        chunks:
-          type: integer
-        embedBacklog:
-          type: integer
-          description: Completed transcripts not yet embedded.
-        totalJobs:
-          type: integer
         doneLastHour:
           type: integer
+        embedBacklog:
+          description: Completed transcripts not yet embedded.
+          type: integer
+        endpoints:
+          description: |
+            AI endpoint registry (CONTRACT §2.14) with health probes. Normally non-empty — at least the embeddings endpoint exists after config load.
+          items:
+            $ref: '#/components/schemas/Endpoint'
+          type:
+            - array
+            - "null"
+        eta:
+          description: |
+            Empirical ETA (CONTRACT §4); `null` when no estimate could be computed (no history, or a predict-inputs read error).
+          oneOf:
+            - $ref: '#/components/schemas/ETA'
+            - type: "null"
+        failed:
+          type: integer
+        lastHeartbeat:
+          description: UTC RFC 3339 heartbeat timestamp. Omitted when never seen.
+          format: date-time
+          type: string
         paused:
           type: boolean
-        runLimit:
-          type: [integer, "null"]
-          description: Remaining claims in a bounded run; `null` means unlimited.
-        runnerActive:
-          type: boolean
-        runnerId:
-          type: string
-          description: Reporting runner's id. Omitted when no runner has checked in.
-        lastHeartbeat:
-          type: string
-          format: date-time
-          description: UTC RFC 3339 heartbeat timestamp. Omitted when never seen.
-        runnerUpdate:
-          $ref: "#/components/schemas/RunnerUpdate"
-        avgProcessingSeconds:
-          type: [number, "null"]
-          description: Per-run aggregate; `null` until the runner/worker populate `run_metrics`.
-        totalEmbedTokens:
-          type: [integer, "null"]
-          description: Per-run aggregate; `null` until the runner/worker populate `run_metrics`.
-        eta:
-          description: >
-            Empirical ETA (CONTRACT §4); `null` when no estimate could be
-            computed (no history, or a predict-inputs read error).
-          oneOf:
-            - $ref: "#/components/schemas/ETA"
-            - type: "null"
-        servers:
-          type: [array, "null"]
-          description: >
-            Configured-vs-observed transcription servers. `null` when none are
-            configured or observed, or when the supplementary query failed.
-          items: { $ref: "#/components/schemas/Server" }
-        endpoints:
-          type: [array, "null"]
-          description: >
-            AI endpoint registry (CONTRACT §2.14) with health probes. Normally
-            non-empty — at least the embeddings endpoint exists after config load.
-          items: { $ref: "#/components/schemas/Endpoint" }
+        pending:
+          type: integer
         pipeline:
           description: Derived 3-stage lifecycle view; `null` only if it could not be computed.
           oneOf:
-            - $ref: "#/components/schemas/PipelineLifecycle"
+            - $ref: '#/components/schemas/PipelineLifecycle'
             - type: "null"
+        runLimit:
+          description: Remaining claims in a bounded run; `null` means unlimited.
+          type:
+            - integer
+            - "null"
+        runnerActive:
+          type: boolean
+        runnerId:
+          description: Reporting runner's id. Omitted when no runner has checked in.
+          type: string
+        runnerUpdate:
+          $ref: '#/components/schemas/RunnerUpdate'
+        servers:
+          description: |
+            Configured-vs-observed transcription servers. `null` when none are configured or observed, or when the supplementary query failed.
+          items:
+            $ref: '#/components/schemas/Server'
+          type:
+            - array
+            - "null"
+        totalEmbedTokens:
+          description: Per-run aggregate; `null` until the runner/worker populate `run_metrics`.
+          type:
+            - integer
+            - "null"
+        totalJobs:
+          type: integer
+        transcripts:
+          type: integer
+      required:
+        - pending
+        - claimed
+        - done
+        - failed
+        - transcripts
+        - chunks
+        - embedBacklog
+        - totalJobs
+        - doneLastHour
+        - paused
+        - runLimit
+        - runnerActive
+        - avgProcessingSeconds
+        - totalEmbedTokens
+        - eta
+        - servers
+        - endpoints
+        - pipeline
+      type: object
