@@ -4,6 +4,12 @@ deploy/
 .vscode/
 *.md
 docs/
+# …except the embedded OpenAPI spec and its package: internal/mcp/openapi.go
+# imports github.com/jedwards1230/earmark/docs, so excluding these from the
+# build context breaks the image build even though `go build` works in a full
+# checkout. CI does not build the image, so nothing else catches this.
+!docs/openapi.go
+!docs/openapi.yaml
 scripts/
 runner/
 worktrees/
