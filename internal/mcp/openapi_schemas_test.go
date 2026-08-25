@@ -135,10 +135,27 @@ func committedSchemas(t *testing.T, spec map[string]any) map[string]any {
 var annotationKeys = []string{
 	"description", "title", "enum", "format", "default",
 	"example", "examples", "pattern", "minimum", "maximum", "readOnly",
-	// `required` is carried forward only where it is not derived: request
-	// bodies, whose required-ness is handler policy. generateSchemas emits no
-	// `required` for a request, so this cannot mask a derived value.
-	"required",
+}
+
+// requestOnlyAnnotationKeys are carried forward for REQUEST schemas only.
+//
+// `required` is derived for responses (no omitempty ⇒ always marshalled) but is
+// handler policy for requests, so it is hand-authored there. Carrying it for
+// both would let the committed file overwrite the derived value and silently
+// mask real drift — adding omitempty to a response field would stop being
+// caught, which is exactly what mutation-testing this guard turned up.
+var requestOnlyAnnotationKeys = []string{"required"}
+
+// requestSchemaNames is the set of components whose bodies the server accepts
+// rather than sends.
+func requestSchemaNames() map[string]bool {
+	m := map[string]bool{}
+	for _, st := range schemaTypes() {
+		if st.Role == roleRequest {
+			m[st.Name] = true
+		}
+	}
+	return m
 }
 
 // mergeAnnotations copies the hand-authored keywords from the committed document
@@ -147,16 +164,21 @@ var annotationKeys = []string{
 // which is the intended behaviour: they described something the server no longer
 // sends.
 func mergeAnnotations(generated, committed map[string]any) map[string]any {
+	requests := requestSchemaNames()
 	out := make(map[string]any, len(generated))
 	for name, gen := range generated {
 		g, _ := gen.(map[string]any)
 		c, _ := committed[name].(map[string]any)
-		out[name] = mergeSchemaAnnotations(g, c)
+		keys := annotationKeys
+		if requests[name] {
+			keys = append(append([]string{}, annotationKeys...), requestOnlyAnnotationKeys...)
+		}
+		out[name] = mergeSchemaAnnotations(g, c, keys)
 	}
 	return out
 }
 
-func mergeSchemaAnnotations(gen, committed map[string]any) map[string]any {
+func mergeSchemaAnnotations(gen, committed map[string]any, keys []string) map[string]any {
 	if gen == nil {
 		return nil
 	}
@@ -167,7 +189,7 @@ func mergeSchemaAnnotations(gen, committed map[string]any) map[string]any {
 	if committed == nil {
 		return out
 	}
-	for _, k := range annotationKeys {
+	for _, k := range keys {
 		if v, ok := committed[k]; ok {
 			out[k] = v
 		}
@@ -181,7 +203,7 @@ func mergeSchemaAnnotations(gen, committed map[string]any) map[string]any {
 	for field, gv := range genProps {
 		gm, _ := gv.(map[string]any)
 		cm, _ := comProps[field].(map[string]any)
-		merged[field] = mergeSchemaAnnotations(gm, cm)
+		merged[field] = mergeSchemaAnnotations(gm, cm, annotationKeys)
 	}
 	out["properties"] = merged
 	return out

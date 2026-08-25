@@ -186,7 +186,7 @@ func jsonFieldName(f reflect.StructField) (string, jsonOpts, bool) {
 // distinction a consumer has to handle, and the one most likely to be got wrong
 // by hand.
 func typeSchema(t reflect.Type, refs map[reflect.Type]string, role payloadRole, omitempty bool) (map[string]any, error) {
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		inner, err := typeSchema(t.Elem(), refs, role, omitempty)
 		if err != nil {
 			return nil, err
