@@ -94,7 +94,8 @@ Listens on `MCP_HTTP_ADDR` (default `:8081`). Serves:
 
 - `/mcp` — streamable-HTTP MCP transport (8 tools: `list_books`, `semantic_search_audiobooks`, `text_search_audiobooks`, `get_transcript`, `get_chunk_context`, `list_transcript_corrections`, plus the two writing correction-review tools `decide_transcript_correction` and `create_transcript_correction` — CONTRACT §2.17)
 - `/` — htmx status dashboard (auto-refreshes `/status/data` fragment every 3 s)
-- `/api/v1/*` — JSON control API (pause/resume/run-N; mutating endpoints require `Authorization: Bearer $CONTROL_API_TOKEN`)
+- `/api/v1/*` — JSON control API (pause/resume/run-N, runner self-update; mutating endpoints require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed with `503` when it is unset)
+- `/api/v1/openapi.yaml` — this API's OpenAPI 3.1 contract ([`docs/openapi.yaml`](openapi.yaml)), served verbatim from bytes embedded in the binary so a deployed instance is self-describing. Read-only and unauthenticated; it covers the JSON control API only, not the htmx routes below
 - `/actions/*` — htmx-guarded dashboard actions (requeue, retry-failed)
 
 ### 4. Signal handling

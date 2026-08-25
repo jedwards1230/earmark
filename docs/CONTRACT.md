@@ -1372,6 +1372,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
 | `DELETE` | `/api/v1/pipeline/run` | bearer | — | `200` clears the bounded run (`run_limit→NULL`) |
 | `POST` | `/api/v1/runner/update` | bearer | `{"version":"<tag>"}` (empty/omitted clears) | `202 {runningVersion,desiredVersion,state,updateAvailable,…}` — request the runner self-update to `<tag>` (sets `desired_runner_version` + `'requested'`); the runner performs the swap (§1.4) |
+| `GET` | `/api/v1/openapi.yaml` | none | — | `200` this API's OpenAPI 3.1 contract (`application/yaml`), served verbatim from bytes embedded in the binary so a deployed instance is self-describing |
 
 **`pipeline` object** — a derived 3-stage lifecycle view (Transcribe → Eval → Embed) computed at read-time from already-fetched signals:
 
@@ -1408,6 +1409,14 @@ No new DB queries — the bucket counts are populated from a single FILTER-aggre
 (constant-time compared). When `CONTROL_API_TOKEN` is unset they **fail closed**
 with `503` — the pipeline can never be paused/driven by an unauthenticated
 caller. Read endpoints are always open. This is layered on the LAN-only ingress.
+
+**Machine-readable contract**: `docs/openapi.yaml` (OpenAPI 3.1) specifies the
+seven `/api/v1` operations above and is embedded in the binary, served at
+`GET /api/v1/openapi.yaml`. It covers **only** this JSON API — the htmx
+dashboard routes below return HTML fragments and are deliberately out of scope.
+The spec cannot drift: `apiRoutes` (internal/mcp/routes.go) is the single source
+of truth for route registration, and `TestOpenAPISync` fails the build on any
+route documented-but-unregistered or registered-but-undocumented.
 
 Single-job smoke test (one call):
 

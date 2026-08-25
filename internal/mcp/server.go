@@ -400,6 +400,8 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	PUT  /api/v1/pipeline/pause      — pause/resume (JSON, bearer token)
 //	POST /api/v1/pipeline/run        — run N jobs then auto-pause (JSON, bearer token)
 //	DELETE /api/v1/pipeline/run      — clear a bounded run (JSON, bearer token)
+//	POST /api/v1/runner/update       — request a runner self-update (JSON, bearer token)
+//	GET  /api/v1/openapi.yaml        — this API's OpenAPI 3.1 contract (YAML, no auth)
 //	GET  /health               — liveness probe (always 200 "ok")
 //	GET  /readyz               — readiness probe (200 if DB ping OK, 503 otherwise)
 //	*    /mcp                  — MCP streamable-HTTP handler
@@ -472,12 +474,11 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	// actions above. Reads are unauthenticated; mutations require the bearer token
 	// (requireToken). These specific method+path patterns don't conflict with the
 	// "/" catch-all or the method-less "/mcp" handler.
-	mux.HandleFunc("GET /api/v1/status", s.handleAPIStatus)
-	mux.HandleFunc("GET /api/v1/pipeline/pause", s.handleAPIPauseGet)
-	mux.HandleFunc("PUT /api/v1/pipeline/pause", s.requireToken(s.handleAPIPausePut))
-	mux.HandleFunc("POST /api/v1/pipeline/run", s.requireToken(s.handleAPIRun))
-	mux.HandleFunc("DELETE /api/v1/pipeline/run", s.requireToken(s.handleAPIRunClear))
-	mux.HandleFunc("POST /api/v1/runner/update", s.requireToken(s.handleAPIRunnerUpdate))
+	//
+	// The routes themselves live in the apiRoutes table in routes.go, which is the
+	// single source of truth shared with docs/openapi.yaml (TestOpenAPISync keeps
+	// the two in exact sync).
+	s.registerAPIRoutes(mux)
 
 	// Liveness — no external deps. Both /health (back-compat) and /healthz (the
 	// uniform name the ingest pod also exposes) are served so Helm probes can use

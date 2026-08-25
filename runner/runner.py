@@ -209,6 +209,29 @@ RUNNER_SELF_UPDATE_TIMEOUT: int = int(
     os.environ.get("RUNNER_SELF_UPDATE_TIMEOUT_SECONDS", "120")
 )
 
+# ─── runner_control.runner_update_state vocabulary ────────────────────────────
+#
+# The self-update state machine is a shared contract, not runner-local trivia.
+# The same five tokens are (a) the DB CHECK constraint on
+# runner_control.runner_update_state, (b) the `state` enum of the RunnerUpdate
+# schema in docs/openapi.yaml (served at GET /api/v1/openapi.yaml), and (c) what
+# POST /api/v1/runner/update writes. Naming them here keeps the Python half of
+# that contract in one place instead of as bare literals at each transition, so
+# a token can be grepped across the Go spec and this file together.
+#
+# The runner owns the requested → updating → success|failed transitions; the Go
+# side only ever writes 'requested' (a request) or 'idle' (a clear).
+UPDATE_STATE_IDLE: str = "idle"
+UPDATE_STATE_REQUESTED: str = "requested"
+UPDATE_STATE_UPDATING: str = "updating"
+UPDATE_STATE_SUCCESS: str = "success"
+UPDATE_STATE_FAILED: str = "failed"
+# The states an update is still in flight in — i.e. not yet finalized.
+UPDATE_STATES_IN_FLIGHT: tuple[str, ...] = (
+    UPDATE_STATE_REQUESTED,
+    UPDATE_STATE_UPDATING,
+)
+
 
 def _read_runner_version() -> str:
     """
@@ -730,7 +753,7 @@ def _should_self_update(
     """
     if not desired or desired == current:
         return False
-    return state == "requested"
+    return state == UPDATE_STATE_REQUESTED
 
 
 def _read_update_request(
@@ -927,9 +950,9 @@ def _maybe_self_update(conn: psycopg2.extensions.connection) -> bool:
 
     # We are already the desired version → close out any in-flight update.
     if desired and desired == RUNNER_VERSION:
-        if state in ("requested", "updating"):
+        if state in UPDATE_STATES_IN_FLIGHT:
             log.info("self-update to %s complete", desired)
-            _set_update_state(conn, "success", None)
+            _set_update_state(conn, UPDATE_STATE_SUCCESS, None)
         return False
 
     if not _should_self_update(RUNNER_VERSION, desired, state):
@@ -943,12 +966,12 @@ def _maybe_self_update(conn: psycopg2.extensions.connection) -> bool:
         return False
 
     log.info("self-update requested: %s -> %s", RUNNER_VERSION, desired)
-    _set_update_state(conn, "updating", None)
+    _set_update_state(conn, UPDATE_STATE_UPDATING, None)
     try:
         _perform_self_update(desired)  # type: ignore[arg-type]
     except Exception as exc:
         log.exception("self-update to %s failed", desired)
-        _set_update_state(conn, "failed", str(exc)[:MAX_ERROR_LEN])
+        _set_update_state(conn, UPDATE_STATE_FAILED, str(exc)[:MAX_ERROR_LEN])
         return False
 
     log.info("self-update staged (%s -> %s); re-execing", RUNNER_VERSION, desired)
