@@ -132,6 +132,23 @@ jobs:
             -o earmark-linux-amd64 \
             .
 
+      # Builds the image's builder stage — no push, no registry auth. The Go
+      # build above runs against a full checkout, so it cannot catch a path
+      # excluded by .dockerignore. That gap shipped a broken image once: the
+      # //go:embed of docs/openapi.yaml compiled fine in CI while `docs/` was
+      # excluded from the build context, so only the release build failed.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build image (builder stage, no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          target: builder
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Upload build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -148,6 +165,7 @@ jobs:
           echo "| Tests | passed |" >> $GITHUB_STEP_SUMMARY
           echo "| Lint | passed |" >> $GITHUB_STEP_SUMMARY
           echo "| Build (linux/amd64) | passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker build context | passed |" >> $GITHUB_STEP_SUMMARY
 
   ci:
     name: CI
