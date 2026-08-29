@@ -656,14 +656,14 @@
   (function () {
     var saved = null;
     function wraps(target) { return target.querySelectorAll('.table-wrap'); }
-    document.body.addEventListener('htmx:beforeSwap', function (e) {
-      var t = e.detail && e.detail.target;
+    document.body.addEventListener('htmx:before:swap', function (e) {
+      var t = e.detail && e.detail.ctx && e.detail.ctx.target;
       if (!t) return;
       saved = [];
       wraps(t).forEach(function (el) { saved.push([el.scrollLeft, el.scrollTop]); });
     });
-    document.body.addEventListener('htmx:afterSwap', function (e) {
-      var t = e.detail && e.detail.target;
+    document.body.addEventListener('htmx:after:swap', function (e) {
+      var t = e.detail && e.detail.ctx && e.detail.ctx.target;
       if (!t || !saved) { saved = null; return; }
       wraps(t).forEach(function (el, i) {
         var s = saved[i];
@@ -681,16 +681,16 @@
   (function () {
     var openIds = null;
     function bookDetails(target) { return target.querySelectorAll('details[data-book-id]'); }
-    document.body.addEventListener('htmx:beforeSwap', function (e) {
-      var t = e.detail && e.detail.target;
+    document.body.addEventListener('htmx:before:swap', function (e) {
+      var t = e.detail && e.detail.ctx && e.detail.ctx.target;
       if (!t) return;
       openIds = [];
       bookDetails(t).forEach(function (el) {
         if (el.open) { openIds.push(el.getAttribute('data-book-id')); }
       });
     });
-    document.body.addEventListener('htmx:afterSwap', function (e) {
-      var t = e.detail && e.detail.target;
+    document.body.addEventListener('htmx:after:swap', function (e) {
+      var t = e.detail && e.detail.ctx && e.detail.ctx.target;
       if (!t || !openIds) { openIds = null; return; }
       bookDetails(t).forEach(function (el) {
         if (openIds.indexOf(el.getAttribute('data-book-id')) !== -1) { el.open = true; }

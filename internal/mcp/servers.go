@@ -506,11 +506,10 @@ var serversPage = mustPage(`{{define "content"}}
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 <div id="servers-region"
      hx-get="/servers/data" hx-trigger="load, every 5s" hx-swap="innerHTML"
-     hx-sync="this:replace" hx-request='{"timeout": 5000}'
-     hx-on::response-error="document.getElementById('conn').hidden = false"
-     hx-on::send-error="document.getElementById('conn').hidden = false"
-     hx-on::timeout="document.getElementById('conn').hidden = false"
-     hx-on::after-request="if (event.detail.successful) document.getElementById('conn').hidden = true">
+     hx-sync="this:replace" hx-config='{"timeout": 5000}' hx-status:5xx="swap:none"
+     hx-on::response:error="document.getElementById('conn').hidden = false"
+     hx-on::error="document.getElementById('conn').hidden = false"
+     hx-on::after:request="if (event.detail.ctx.response?.status < 400) document.getElementById('conn').hidden = true">
   <p class="htmx-indicator">loading…</p>
 </div>
 {{end}}`)

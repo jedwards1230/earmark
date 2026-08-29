@@ -23,7 +23,7 @@ import (
 //go:embed layout.html htmx.min.js
 var dashboardFS embed.FS
 
-// htmxJS is the vendored, version-pinned htmx library (htmx.org v2.0.4), served
+// htmxJS is the vendored, version-pinned htmx library (htmx.org v4.0.0), served
 // from the binary so the dashboard needs no external CDN at runtime.
 var htmxJS = func() []byte {
 	b, err := dashboardFS.ReadFile("htmx.min.js")
@@ -234,11 +234,10 @@ var pipelinePage = mustPage(`{{define "content"}}
 <div id="action-error" aria-live="assertive"></div>
 <div id="data-region"
      hx-get="/status/data" hx-trigger="load, every 3s" hx-swap="innerHTML"
-     hx-sync="this:drop" hx-request='{"timeout": 5000}'
-     hx-on::response-error="document.getElementById('conn').hidden = false"
-     hx-on::send-error="document.getElementById('conn').hidden = false"
-     hx-on::timeout="document.getElementById('conn').hidden = false"
-     hx-on::after-request="if (event.detail.successful) document.getElementById('conn').hidden = true">
+     hx-sync="this:drop" hx-config='{"timeout": 5000}' hx-status:5xx="swap:none"
+     hx-on::response:error="document.getElementById('conn').hidden = false"
+     hx-on::error="document.getElementById('conn').hidden = false"
+     hx-on::after:request="if (event.detail.ctx.response?.status < 400) document.getElementById('conn').hidden = true">
   <p class="htmx-indicator">loading…</p>
 </div>
 <div id="failed-region" class="section" hx-get="/failed/data" hx-trigger="load" hx-swap="innerHTML">
