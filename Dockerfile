@@ -2,7 +2,7 @@
 # Multi-stage build for earmark Go service (linux/amd64 only)
 
 # ── Builder ────────────────────────────────────────────────────────────────────
-FROM golang:1.26.6-alpine AS builder
+FROM golang:1.27.0-alpine AS builder
 
 RUN apk add --no-cache ca-certificates git
 
