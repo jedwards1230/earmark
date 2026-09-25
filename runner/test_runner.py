@@ -979,6 +979,12 @@ class MapDbPathWindowsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             self._map("")
 
+    def test_dot_and_empty_components_are_collapsed(self) -> None:
+        # PurePosixPath drops "." and empty parts, so they never reach the
+        # component check; dot-leading/trailing names stay single components.
+        got = self._map("/books/./a//.hidden/b..m4b")
+        self.assertEqual(got, PureWindowsPath(r"\\nas\books\a\.hidden\b..m4b"))
+
     def test_posix_mount_still_works(self) -> None:
         # Same helper, Linux runner flavour.
         got = runner._map_db_path(

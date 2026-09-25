@@ -2107,6 +2107,9 @@ def _map_db_path(file_path: str, mount: PurePath, db_root: PurePosixPath) -> Pur
     else:
         rel = p
 
+    # PurePosixPath.parts never yields "" or "." (it collapses "//" and "/./"),
+    # so every part here is a real name or ".."; the flavour re-parse below
+    # therefore only trips on names the mount's OS would split or re-anchor.
     flavour = type(mount)
     for part in rel.parts:
         if part == "..":
