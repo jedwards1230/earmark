@@ -11,6 +11,7 @@ module's claim SQL is exercised against a fake cursor, so this runs anywhere:
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -2677,6 +2678,395 @@ class ResegmentOrderingTests(unittest.TestCase):
         ]
         segs = runner._words_to_segments(words, [None] * len(words))
         self._all_monotonic(segs)
+
+
+class RunnerTmpDirTests(unittest.TestCase):
+    """RUNNER_TMP_DIR resolution and its use by every temp-file call site.
+
+    The runner used to hard-code mkstemp(dir="/tmp"), which on Windows means
+    C:\\tmp — absent there, so every job failed at its first ffmpeg temp file.
+    """
+
+    def test_unset_or_blank_uses_platform_tempdir(self) -> None:
+        for raw in (None, "", "   "):
+            with self.subTest(raw=raw):
+                got = runner._resolve_tmp_dir(raw)
+                self.assertEqual(got, Path(os.path.abspath(tempfile.gettempdir())))
+                self.assertTrue(got.is_absolute())
+
+    def test_env_override_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(runner._resolve_tmp_dir(d), Path(d))
+            # Surrounding whitespace (a common env-file slip) is ignored.
+            self.assertEqual(runner._resolve_tmp_dir(f"  {d}\n"), Path(d))
+
+    def test_missing_dir_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "does-not-exist")
+            with self.assertRaisesRegex(ValueError, "RUNNER_TMP_DIR.*does not exist"):
+                runner._resolve_tmp_dir(missing)
+
+    @unittest.skipIf(
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        "POSIX mode bits; root bypasses them",
+    )
+    def test_read_only_dir_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o500)
+            try:
+                with self.assertRaisesRegex(ValueError, "not writable"):
+                    runner._resolve_tmp_dir(d)
+            finally:
+                os.chmod(d, 0o700)
+
+    def test_file_instead_of_dir_fails(self) -> None:
+        with tempfile.NamedTemporaryFile() as f:
+            with self.assertRaisesRegex(ValueError, "not a directory"):
+                runner._resolve_tmp_dir(f.name)
+
+    def test_windows_length_guard(self) -> None:
+        # A normal %TEMP% is fine...
+        runner._check_tmp_dir_length(
+            PureWindowsPath(r"C:\Users\svc-asr\AppData\Local\Temp")
+        )
+        # ...but a dir whose temp files would reach MAX_PATH is rejected.
+        long_dir = PureWindowsPath("C:\\" + "d" * 220)
+        with self.assertRaisesRegex(ValueError, "MAX_PATH"):
+            runner._check_tmp_dir_length(long_dir)
+        # POSIX has no MAX_PATH of that kind: never rejected.
+        runner._check_tmp_dir_length(PurePosixPath("/" + "d" * 400))
+
+    @unittest.skipUnless(
+        # PathFinder, not importlib.util.find_spec: psycopg2 is stubbed in
+        # sys.modules above, and this asks whether the REAL one is installed.
+        importlib.machinery.PathFinder.find_spec("psycopg2"),
+        "needs a real psycopg2: the subprocess imports runner.py unstubbed",
+    )
+    def test_startup_and_self_check_fail_on_missing_dir(self) -> None:
+        """Module import (so both service start and --self-check) must fail on a
+        bad RUNNER_TMP_DIR instead of letting every job fail at mkstemp."""
+        import subprocess as _sp
+
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "DATABASE_URL": "postgres://t@localhost/t"}
+            env["RUNNER_TMP_DIR"] = os.path.join(d, "missing")
+            bad = _sp.run(
+                [sys.executable, str(_RUNNER_PATH), "--self-check"],
+                capture_output=True, text=True, env=env, timeout=60, check=False,
+            )
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("RUNNER_TMP_DIR", bad.stderr)
+
+            env["RUNNER_TMP_DIR"] = d
+            good = _sp.run(
+                [sys.executable, str(_RUNNER_PATH), "--self-check"],
+                capture_output=True, text=True, env=env, timeout=60, check=False,
+            )
+            self.assertEqual(good.returncode, 0, good.stderr)
+            self.assertIn("self-check ok", good.stdout)
+
+    def test_ffmpeg_temp_files_land_in_runner_tmp_dir(self) -> None:
+        import unittest.mock as mock
+
+        saved = runner.RUNNER_TMP_DIR
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                runner.RUNNER_TMP_DIR = Path(d)
+                with mock.patch.object(runner.subprocess, "run"):
+                    mono = runner._to_mono_wav(Path("/fake/in.m4b"))
+                    chunk = runner._cut_window(Path("/fake/in.m4b"), 0.0, 10.0, 3)
+                for p, prefix in ((mono, "asr-mono-"), (chunk, "asr-chunk-3-")):
+                    with self.subTest(prefix=prefix):
+                        self.assertEqual(p.parent, Path(d))
+                        self.assertTrue(p.name.startswith(prefix))
+                        # The fd is closed before ffmpeg gets the path (Windows
+                        # cannot reopen a file this process holds open): the
+                        # file can be removed immediately.
+                        p.unlink()
+        finally:
+            runner.RUNNER_TMP_DIR = saved
+
+
+class BiasPhrasesFileTests(unittest.TestCase):
+    """The key_phrases file NeMo reads: location, encoding, closed before use."""
+
+    def setUp(self) -> None:
+        self._saved = (runner.ASR_BIASING_ENABLED, runner.RUNNER_TMP_DIR)
+        runner.ASR_BIASING_ENABLED = True
+
+    def tearDown(self) -> None:
+        runner.ASR_BIASING_ENABLED, runner.RUNNER_TMP_DIR = self._saved
+
+    def test_phrases_file_is_utf8_in_tmp_dir_and_closed(self) -> None:
+        import unittest.mock as mock
+
+        # Non-ASCII terms, including ones outside cp1252 (the Windows ANSI code
+        # page the old bare os.fdopen(fd, "w") would have used).
+        terms = ["Łódź", "Tōkyō", "Café", "Москва"]
+        seen: dict[str, object] = {}
+
+        def capture_apply(model: object, phrases_path: str, alpha: float) -> None:
+            seen["path"] = phrases_path
+            # NeMo opens the file by path; reading the raw bytes here proves it
+            # is complete (closed/flushed) and UTF-8 with "\n" line endings.
+            with open(phrases_path, "rb") as f:
+                seen["bytes"] = f.read()
+
+        provider = runner.NeMoParakeetProvider()
+        provider._asr_model = mock.MagicMock()
+        provider._diarize_model = None
+        real_fdopen = os.fdopen
+        with tempfile.TemporaryDirectory() as d:
+            runner.RUNNER_TMP_DIR = Path(d)
+            with mock.patch.object(runner, "_apply_boosting_config",
+                                   side_effect=capture_apply), \
+                 mock.patch.object(runner, "_clear_boosting_config"), \
+                 mock.patch.object(runner, "_transcribe_file", return_value={}), \
+                 mock.patch.object(runner.os, "fdopen",
+                                   side_effect=lambda *a, **k: real_fdopen(*a, **k)) as fdo:
+                provider.transcribe(Path("/fake/file.wav"), bias_terms=terms)
+            # The encoding must be explicit: on Linux CI the locale default is
+            # already UTF-8, so the bytes alone would not catch a regression.
+            self.assertEqual(fdo.call_args.kwargs.get("encoding"), "utf-8")
+            self.assertEqual(fdo.call_args.kwargs.get("newline"), "\n")
+            self.assertEqual(Path(seen["path"]).parent, Path(d))  # type: ignore[arg-type]
+            self.assertEqual(
+                seen["bytes"], ("\n".join(terms) + "\n").encode("utf-8")
+            )
+            self.assertEqual(os.listdir(d), [], "phrases file not deleted")
+
+    def test_use_triton_follows_availability(self) -> None:
+        import importlib.util as ilu
+        import unittest.mock as mock
+
+        with mock.patch.object(ilu, "find_spec", return_value=None):
+            self.assertFalse(runner._triton_available())
+        with mock.patch.object(ilu, "find_spec", return_value=object()):
+            self.assertTrue(runner._triton_available())
+
+
+class ExtendedLengthPathTests(unittest.TestCase):
+    r"""_extended_length_path: \\?\ form on Windows, identity on POSIX."""
+
+    W = PureWindowsPath
+
+    def test_unc_path(self) -> None:
+        got = runner._extended_length_path(self.W(r"\\nas\books\a b\c.m4b"))
+        self.assertEqual(str(got), r"\\?\UNC\nas\books\a b\c.m4b")
+        self.assertIsInstance(got, PureWindowsPath)
+
+    def test_drive_path(self) -> None:
+        got = runner._extended_length_path(self.W(r"C:\Users\svc\Temp\x.wav"))
+        self.assertEqual(str(got), r"\\?\C:\Users\svc\Temp\x.wav")
+
+    def test_forward_slashes_are_normalised(self) -> None:
+        got = runner._extended_length_path(self.W("C:/data/books/x.m4b"))
+        self.assertEqual(str(got), r"\\?\C:\data\books\x.m4b")
+
+    def test_never_double_prefixed(self) -> None:
+        for s in (r"\\?\UNC\nas\books\x.m4b", r"\\?\C:\x.m4b", r"\\.\pipe\x"):
+            with self.subTest(path=s):
+                self.assertEqual(str(runner._extended_length_path(self.W(s))), s)
+        once = runner._extended_length_path(self.W(r"\\nas\books\x.m4b"))
+        self.assertEqual(runner._extended_length_path(once), once)
+
+    def test_posix_paths_pass_through(self) -> None:
+        for p in (PurePosixPath("/mnt/media/books/x.m4b"), Path("/tmp/x.wav")):
+            with self.subTest(path=p):
+                self.assertIs(runner._extended_length_path(p), p)
+
+    def test_relative_or_dotdot_rejected(self) -> None:
+        # The prefix disables Win32 normalisation, so these must never get it.
+        for s in (r"books\x.m4b", r"C:books\x.m4b", r"\books\x.m4b",
+                  r"\\nas\books\..\secret\x.m4b"):
+            with self.subTest(path=s):
+                with self.assertRaises(ValueError):
+                    runner._extended_length_path(self.W(s))
+
+    def test_long_sfm_path_from_db_row(self) -> None:
+        """The real failure: a DB path whose re-rooted, SFM-encoded Windows host
+        path is >= 260 chars. The mapped path must convert losslessly."""
+        db_path = (
+            "/books/audio-libation/Neil Postman/Amusing Ourselves to Death: "
+            "Public Discourse in the Age of Show Business/Amusing Ourselves to "
+            "Death: Public Discourse in the Age of Show Business [B002V5ISZ6] - "
+            "02 - Part I: Chapter 1: The Medium Is the Metaphor.m4b"
+        )
+        mount = self.W(r"\\fileserver\books")
+        mapped = runner._map_db_path(db_path, mount, PurePosixPath("/books"), "sfm")
+        self.assertGreaterEqual(len(str(mapped)), 260)
+        got = runner._extended_length_path(mapped)
+        self.assertEqual(str(got), "\\\\?\\UNC\\" + str(mapped)[2:])
+        self.assertIn("\uf022", str(got))
+        # Containment still holds when both sides are in the same form.
+        self.assertTrue(got.is_relative_to(runner._extended_length_path(mount)))
+        self.assertFalse(
+            got.is_relative_to(runner._extended_length_path(self.W(r"\\fileserver\other")))
+        )
+
+
+class ResolveAudioPathExtendedTests(unittest.TestCase):
+    """_resolve_audio_path routes both sides of the guard through the helper."""
+
+    def test_both_sides_converted_after_resolve(self) -> None:
+        import unittest.mock as mock
+
+        saved = (runner.BOOKS_MOUNT, runner.BOOKS_DB_ROOT)
+        runner.BOOKS_MOUNT = Path("/mnt/media/books")
+        runner.BOOKS_DB_ROOT = PurePosixPath("/books")
+        calls: list[PurePosixPath] = []
+        real = runner._extended_length_path
+
+        def spy(p):  # type: ignore[no-untyped-def]
+            calls.append(p)
+            return real(p)
+
+        try:
+            with mock.patch.object(runner, "_extended_length_path", side_effect=spy):
+                got = runner._resolve_audio_path("/books/a/b.m4b")
+        finally:
+            runner.BOOKS_MOUNT, runner.BOOKS_DB_ROOT = saved
+        self.assertEqual(got, Path("/mnt/media/books/a/b.m4b"))
+        # The mount side of the guard goes through the helper too.
+        self.assertIn(Path("/mnt/media/books"), calls)
+
+    def test_windows_containment_mixed_prefix_and_case(self) -> None:
+        r"""What the double conversion is for: resolve() may hand back the audio
+        path prefixed (and in the server's case) but the mount unprefixed. Both
+        converted, containment holds; unconverted, it would not."""
+        W = PureWindowsPath
+        aud = runner._extended_length_path(W(r"\\?\UNC\FileServer\Books\a\b.m4b"))
+        mnt = runner._extended_length_path(W(r"\\fileserver\books"))
+        self.assertTrue(aud.is_relative_to(mnt))
+        self.assertFalse(aud.is_relative_to(W(r"\\fileserver\books")))
+        other = runner._extended_length_path(W(r"\\fileserver\private"))
+        self.assertFalse(aud.is_relative_to(other))
+
+
+class AudioProbeFailureTests(unittest.TestCase):
+    """ffprobe must be decoded as UTF-8 and fail with a readable error."""
+
+    def _run_result(self, stdout: object, stderr: object = "") -> object:
+        import unittest.mock as mock
+
+        fake = mock.MagicMock()
+        fake.stdout = stdout
+        fake.stderr = stderr
+        return fake
+
+    def test_decodes_utf8_with_replace(self) -> None:
+        import unittest.mock as mock
+
+        with mock.patch.object(runner.subprocess, "run",
+                               return_value=self._run_result('{"format": {}}')) as run:
+            runner._audio_probe(Path("/fake/x.m4b"))
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs.get("encoding"), "utf-8")
+        self.assertEqual(kwargs.get("errors"), "replace")
+
+    def test_no_stdout_raises_with_stderr(self) -> None:
+        # stdout=None is what a swallowed decode error in subprocess's Windows
+        # reader thread leaves behind; json.loads(None) was the old symptom.
+        import unittest.mock as mock
+
+        for out in (None, "", "  \n"):
+            with self.subTest(stdout=out):
+                with mock.patch.object(
+                    runner.subprocess, "run",
+                    return_value=self._run_result(out, "Invalid data found"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "ffprobe produced no output.*Invalid data found"
+                    ):
+                        runner._audio_probe(Path("/fake/x.m4b"))
+
+    def test_nonzero_exit_raises_with_stderr(self) -> None:
+        import subprocess as _sp
+        import unittest.mock as mock
+
+        err = _sp.CalledProcessError(1, "ffprobe", output="", stderr="No such file")
+        with mock.patch.object(runner.subprocess, "run", side_effect=err):
+            with self.assertRaisesRegex(RuntimeError, r"ffprobe failed \(exit 1\).*No such file"):
+                runner._audio_probe(Path("/fake/x.m4b"))
+
+    def test_invalid_json_raises(self) -> None:
+        import unittest.mock as mock
+
+        with mock.patch.object(runner.subprocess, "run",
+                               return_value=self._run_result("{not json")):
+            with self.assertRaisesRegex(RuntimeError, "not valid JSON"):
+                runner._audio_probe(Path("/fake/x.m4b"))
+
+    @unittest.skipIf(os.name == "nt", "fake ffprobe is a shebang script")
+    def test_real_process_non_ascii_tags(self) -> None:
+        """End to end through a real child process: a fake ffprobe on PATH emits
+        UTF-8 JSON with the curly-quote title that failed on Windows."""
+        import stat
+
+        title = "Part II: Chapter 7: \u201cNow . . . This\u201d"
+        payload = (
+            '{"streams": [{"channels": 1, "sample_rate": "16000"}], '
+            '"format": {"duration": "12.5", "size": "10", "tags": {"title": '
+            + __import__("json").dumps(title, ensure_ascii=False)
+            + "}}}"
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "payload.json").write_bytes(payload)
+            script = Path(d) / "ffprobe"
+            script.write_text(
+                f"#!{sys.executable}\n"
+                "import sys, pathlib\n"
+                f"sys.stdout.buffer.write(pathlib.Path({str(Path(d) / 'payload.json')!r})"
+                ".read_bytes())\n",
+                encoding="utf-8",
+            )
+            script.chmod(script.stat().st_mode | stat.S_IXUSR)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = d + os.pathsep + old_path
+            try:
+                got = runner._audio_probe(Path(d) / "x.m4b")
+            finally:
+                os.environ["PATH"] = old_path
+        self.assertAlmostEqual(got["duration"], 12.5)
+
+
+class WindowsProcessTests(unittest.TestCase):
+    """Self-update helpers that assumed POSIX process semantics."""
+
+    def test_process_user_without_getuid(self) -> None:
+        import unittest.mock as mock
+
+        had = hasattr(os, "getuid")
+        saved = getattr(os, "getuid", None)
+        try:
+            if had:
+                del os.getuid  # type: ignore[attr-defined]
+            with mock.patch.dict(os.environ, {"USERNAME": "svc-asr"}):
+                self.assertEqual(runner._process_user(), "user=svc-asr")
+        finally:
+            if had:
+                os.getuid = saved  # type: ignore[attr-defined,assignment]
+        if had:
+            self.assertTrue(runner._process_user().startswith("uid="))
+
+    def test_reexec_on_windows_exits_nonzero_instead_of_exec(self) -> None:
+        import unittest.mock as mock
+
+        with mock.patch.object(runner.os, "name", "nt"), \
+             mock.patch.object(runner.os, "execv") as execv:
+            with self.assertRaises(SystemExit) as cm:
+                runner._reexec()
+        execv.assert_not_called()
+        self.assertEqual(cm.exception.code, runner._REEXEC_RESTART_EXIT_CODE)
+        self.assertNotEqual(cm.exception.code, 0)
+
+    def test_reexec_on_posix_still_execs(self) -> None:
+        import unittest.mock as mock
+
+        with mock.patch.object(runner.os, "name", "posix"), \
+             mock.patch.object(runner.os, "execv") as execv:
+            runner._reexec()
+        execv.assert_called_once()
 
 
 if __name__ == "__main__":

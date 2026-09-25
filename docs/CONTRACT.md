@@ -251,7 +251,7 @@ WHERE  id     = $1;
 #### GPU/ASR host busy gate
 
 The runner honors a `RUNNER_BUSY_FLAG_PATH` environment variable (default
-`/tmp/earmark-busy`). When this file exists, the runner skips claiming
+`/tmp/earmark-asr-busy`). When this file exists, the runner skips claiming
 new jobs (finishes any in-flight job first, then pauses). An external process
 writes this file when the host should not accept new jobs and removes it when
 the host is available again. The runner checks the flag at the top of each poll
@@ -1199,7 +1199,8 @@ vars are new and **optional** — see §2.13 for the vocabulary.
 | `RUNNER_IDENTITY` | no | `asr-runner` (included in `claimed_by`) |
 | `RUNNER_POLL_INTERVAL_SECONDS` | no | `30` |
 | `RUNNER_HEARTBEAT_SECONDS` | no | `60` |
-| `RUNNER_BUSY_FLAG_PATH` | no | `/tmp/earmark-busy` |
+| `RUNNER_BUSY_FLAG_PATH` | no | `/tmp/earmark-asr-busy` (a native Windows runner sets an explicit path) |
+| `RUNNER_TMP_DIR` | no | Unset → the platform temp dir (`tempfile.gettempdir()`: `/tmp` on Linux unless `TMPDIR`/`TEMP`/`TMP` is set; the service account's `%TEMP%` on Windows). Directory for the runner's short-lived temp files: 16 kHz mono WAVs, chunk windows, and the context-biasing phrases file, each created with `mkstemp` and deleted after the job. Owner-only (`0600`) on POSIX; on Windows a file inherits the directory ACL, so point this at a directory only the service account can read. When set it also becomes Python's `tempfile.tempdir`, so NeMo's own temp files land there too. If set, it must already exist and be writable; on Windows it must also be short enough that temp paths stay under `MAX_PATH` (260). Otherwise startup and `--self-check` fail. |
 | `ASR_MODEL` | no | `nvidia/parakeet-tdt-0.6b-v3` (model id; written to `transcripts.model_name` + `run_metrics.asr_model`) |
 | `ASR_FAMILY` | no | Model-family id, e.g. `nemo-parakeet`, `whisper` (§2.13). Free-form-but-conventional. Written to `run_metrics.asr_family`. Unset → NULL ("unknown"). |
 | `ASR_RUNTIME` | no | Runtime id, e.g. `nemo-cuda`, `whisper.cpp-sycl` (§2.13). Free-form-but-conventional. Written to `run_metrics.asr_runtime`. Unset → NULL ("unknown"). |

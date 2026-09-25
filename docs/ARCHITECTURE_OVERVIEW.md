@@ -45,7 +45,7 @@ The walk runs at startup **and on a recurring ticker** (`SCAN_INTERVAL`, default
 
 ### Python ASR runner (external, GPU host)
 
-One or more Python runners on GPU hosts (configured via `ASR_SERVERS`; current default: NeMo Parakeet-TDT-0.6b-v3 on a CUDA host). Each runner polls `transcription_jobs` for `pending` rows via an atomic `FOR UPDATE SKIP LOCKED` claim, transcribes audio from NFS, and writes a structured `transcripts` row (segments as JSONB with word-level timestamps). Sends a heartbeat every 60s while running; the Go service resets stale claims after 30m. The runner honors a `runner_control` DB row (pause / bounded run) and a local busy-flag file (`/tmp/earmark-busy`) for GPU-contention gating. ASR backend family, runtime, and applied capabilities are recorded in `run_metrics` (CONTRACT §2.13, §1.5).
+One or more Python runners on GPU hosts (configured via `ASR_SERVERS`; current default: NeMo Parakeet-TDT-0.6b-v3 on a CUDA host). Each runner polls `transcription_jobs` for `pending` rows via an atomic `FOR UPDATE SKIP LOCKED` claim, transcribes audio from the books share (NFS on Linux, SMB/UNC on a Windows runner), and writes a structured `transcripts` row (segments as JSONB with word-level timestamps). Sends a heartbeat every 60s while running; the Go service resets stale claims after 30m. The runner honors a `runner_control` DB row (pause / bounded run) and a local busy-flag file (`RUNNER_BUSY_FLAG_PATH`, default `/tmp/earmark-asr-busy`) for GPU-contention gating. ASR backend family, runtime, and applied capabilities are recorded in `run_metrics` (CONTRACT §2.13, §1.5).
 
 ### embed worker (`internal/worker`)
 
