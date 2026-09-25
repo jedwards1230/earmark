@@ -19,6 +19,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from unittest import mock
 
 # ── Stub heavy/optional imports so runner.py imports with no DB or drivers ──────
 os.environ.setdefault("DATABASE_URL", "postgres://test@localhost/test")
@@ -3067,6 +3068,318 @@ class WindowsProcessTests(unittest.TestCase):
              mock.patch.object(runner.os, "execv") as execv:
             runner._reexec()
         execv.assert_called_once()
+
+
+# ── Keep-awake (RUNNER_KEEP_AWAKE) ─────────────────────────────────────────────
+_HOLD = 0x80000001  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+_RELEASE = 0x80000000  # ES_CONTINUOUS
+
+
+def _mock_kernel32(return_value: int = 1) -> mock.MagicMock:
+    k32 = mock.MagicMock()
+    k32.SetThreadExecutionState.return_value = return_value
+    return k32
+
+
+class ShouldKeepAwakeTests(unittest.TestCase):
+    """_should_keep_awake: in flight OR (claimable pending AND gate open) OR
+    batch phase in transcribe/analyze."""
+
+    def ka(self, **kw: object) -> bool:
+        args: dict[str, object] = {
+            "in_flight": False,
+            "pending_claimable": False,
+            "paused": False,
+            "run_limit": None,
+            "phase": "idle",
+        }
+        args.update(kw)
+        return runner._should_keep_awake(**args)  # type: ignore[arg-type]
+
+    def test_in_flight_alone_holds(self) -> None:
+        self.assertTrue(self.ka(in_flight=True))
+        # even when every gate says no
+        self.assertTrue(self.ka(in_flight=True, paused=True, run_limit=0, phase="analyze"))
+
+    def test_pending_with_open_gate_holds(self) -> None:
+        for phase in ("idle", None, "transcribe"):
+            for run_limit in (None, 3):
+                with self.subTest(phase=phase, run_limit=run_limit):
+                    self.assertTrue(
+                        self.ka(pending_claimable=True, run_limit=run_limit, phase=phase)
+                    )
+
+    def test_pending_but_paused_does_not_hold(self) -> None:
+        self.assertFalse(self.ka(pending_claimable=True, paused=True))
+        self.assertFalse(self.ka(pending_claimable=True, paused=True, phase=None))
+
+    def test_pending_but_run_limit_zero_does_not_hold(self) -> None:
+        self.assertFalse(self.ka(pending_claimable=True, run_limit=0))
+
+    def test_pending_during_analyze_holds_via_phase_only(self) -> None:
+        # (b) is closed by phase='analyze', but (c) keeps the judge's host awake.
+        self.assertTrue(self.ka(pending_claimable=True, phase="analyze"))
+
+    def test_batch_phase_holds_with_nothing_pending_and_paused(self) -> None:
+        for phase in ("transcribe", "analyze"):
+            with self.subTest(phase=phase):
+                self.assertTrue(self.ka(phase=phase, paused=True, run_limit=0))
+
+    def test_all_idle_releases(self) -> None:
+        self.assertFalse(self.ka())
+        self.assertFalse(self.ka(phase=None))
+        self.assertFalse(self.ka(phase="something-else"))
+
+
+class ParseKeepAwakeTests(unittest.TestCase):
+    def test_auto_unset_blank_follow_os(self) -> None:
+        for raw in (None, "", "   ", "auto", "AUTO", " Auto "):
+            with self.subTest(raw=raw):
+                self.assertTrue(runner._parse_keep_awake(raw, os_name="nt"))
+                self.assertFalse(runner._parse_keep_awake(raw, os_name="posix"))
+
+    def test_explicit_values_force(self) -> None:
+        for raw in ("true", "TRUE", " True ", "1", "yes", "on"):
+            with self.subTest(raw=raw):
+                self.assertTrue(runner._parse_keep_awake(raw, os_name="posix"))
+        for raw in ("false", "FALSE", " False ", "0", "no", "off"):
+            with self.subTest(raw=raw):
+                self.assertFalse(runner._parse_keep_awake(raw, os_name="nt"))
+
+    def test_invalid_raises(self) -> None:
+        for raw in ("bogus", "tru", "2"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                ValueError, "RUNNER_KEEP_AWAKE=.*is invalid"
+            ):
+                runner._parse_keep_awake(raw, os_name="nt")
+
+    def test_module_default_is_off_on_this_linux_test_host(self) -> None:
+        if os.environ.get("RUNNER_KEEP_AWAKE") is None and os.name != "nt":
+            self.assertFalse(runner.RUNNER_KEEP_AWAKE)
+            self.assertFalse(runner._keep_awake.enabled)
+
+
+class KeepAwakeTests(unittest.TestCase):
+    """_KeepAwake calls SetThreadExecutionState only on a state change."""
+
+    def test_acquire_and_release_flags(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        with self.assertLogs("asr-runner", level="INFO") as cm:
+            ka.update(True, "job in flight")
+        k32.SetThreadExecutionState.assert_called_once_with(_HOLD)
+        self.assertTrue(ka.held)
+        self.assertIn("keep-awake acquired (reason: job in flight)", "\n".join(cm.output))
+
+        k32.SetThreadExecutionState.reset_mock()
+        with self.assertLogs("asr-runner", level="INFO") as cm:
+            ka.release("idle")
+        k32.SetThreadExecutionState.assert_called_once_with(_RELEASE)
+        self.assertFalse(ka.held)
+        self.assertIn("keep-awake released (reason: idle)", "\n".join(cm.output))
+
+    def test_repeated_same_state_calls_once(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        for _ in range(5):
+            ka.update(True, "claimable pending work")
+        self.assertEqual(k32.SetThreadExecutionState.call_count, 1)
+        # Releasing while not held after a release is also a no-op.
+        ka.release("idle")
+        ka.release("idle")
+        ka.release("evaluation failed: x")
+        self.assertEqual(k32.SetThreadExecutionState.call_count, 2)
+
+    def test_initial_release_is_noop(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        ka.release("idle")
+        k32.SetThreadExecutionState.assert_not_called()
+
+    def test_disabled_never_calls(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(False, kernel32=k32)
+        ka.update(True, "job in flight")
+        ka.release("shutdown")
+        k32.SetThreadExecutionState.assert_not_called()
+        self.assertFalse(ka.enabled)
+        self.assertFalse(ka.unsupported)
+
+    def test_forced_on_without_kernel32_off_windows_is_unsupported_noop(self) -> None:
+        ka = runner._KeepAwake(True, os_name="posix")
+        self.assertFalse(ka.enabled)
+        self.assertTrue(ka.unsupported)
+        ka.update(True, "job in flight")  # must not touch ctypes.windll / raise
+        self.assertFalse(ka.held)
+
+    def test_failure_warns_once_and_retries(self) -> None:
+        k32 = _mock_kernel32(return_value=0)
+        ka = runner._KeepAwake(True, kernel32=k32)
+        with self.assertLogs("asr-runner", level="WARNING") as cm:
+            ka.update(True, "job in flight")
+            ka.update(True, "job in flight")
+            ka.update(True, "claimable pending work")
+        warnings = [r for r in cm.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("keep-awake acquire failed", warnings[0].getMessage())
+        self.assertEqual(k32.SetThreadExecutionState.call_count, 3)  # retried each poll
+        self.assertFalse(ka.held)
+
+        # Recovery: next attempt succeeds → state tracked + INFO transition.
+        k32.SetThreadExecutionState.return_value = 1
+        with self.assertLogs("asr-runner", level="INFO") as cm:
+            ka.update(True, "job in flight")
+        self.assertTrue(ka.held)
+        self.assertIn("keep-awake acquired", "\n".join(cm.output))
+
+    def test_exception_from_kernel32_is_treated_as_failure(self) -> None:
+        k32 = mock.MagicMock()
+        k32.SetThreadExecutionState.side_effect = OSError("boom")
+        ka = runner._KeepAwake(True, kernel32=k32)
+        with self.assertLogs("asr-runner", level="WARNING"):
+            ka.update(True, "job in flight")  # must not raise
+        self.assertFalse(ka.held)
+
+    def test_other_thread_warns(self) -> None:
+        import threading
+
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        ka.update(True, "job in flight")
+        with self.assertLogs("asr-runner", level="WARNING") as cm:
+            t = threading.Thread(target=ka.release, args=("idle",))
+            t.start()
+            t.join()
+        self.assertIn("different thread", "\n".join(cm.output))
+
+
+class _PendingCursor(FakeCursor):
+    def fetchone(self) -> object:
+        return self.conn.pending_row  # type: ignore[attr-defined]
+
+
+class _PendingConn(FakeConn):
+    def __init__(self, pending_row: object = None, fail: bool = False) -> None:
+        super().__init__(control_row=None, job_row=None)
+        self.pending_row = pending_row
+        self.fail = fail
+
+    def cursor(self) -> FakeCursor:
+        if self.fail:
+            raise RuntimeError("connection lost")
+        return _PendingCursor(self)
+
+
+class PendingWorkExistsTests(unittest.TestCase):
+    def test_query_matches_claim_filter_and_commits(self) -> None:
+        conn = _PendingConn(pending_row=(True,))
+        self.assertTrue(runner._pending_work_exists(conn))
+        sql = conn.executed[0][0]
+        self.assertIn("SELECT EXISTS", sql)
+        self.assertIn("FROM transcription_jobs", sql)
+        self.assertIn("status = 'pending'", sql)
+        self.assertIn("attempts < 3", sql)
+        # Same filter as the claim query, so "pending" means "claimable".
+        self.assertIn("status = 'pending'", runner._CLAIM_SQL)
+        self.assertIn("attempts < 3", runner._CLAIM_SQL)
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 0)
+
+    def test_false_and_dict_rows(self) -> None:
+        self.assertFalse(runner._pending_work_exists(_PendingConn(pending_row=(False,))))
+        self.assertTrue(runner._pending_work_exists(_PendingConn(pending_row={"exists": True})))
+        self.assertFalse(runner._pending_work_exists(_PendingConn(pending_row=None)))
+
+    def test_error_rolls_back_and_raises(self) -> None:
+        conn = _PendingConn(fail=True)
+        with self.assertRaises(RuntimeError):
+            runner._pending_work_exists(conn)
+        self.assertEqual(conn.rollbacks, 1)
+
+
+class EvaluateKeepAwakeTests(unittest.TestCase):
+    """_evaluate_keep_awake: query only when it matters; never raises."""
+
+    def test_disabled_runs_no_query(self) -> None:
+        conn = _PendingConn(fail=True)  # any query would raise
+        ka = runner._KeepAwake(False, kernel32=_mock_kernel32())
+        runner._evaluate_keep_awake(conn, False, False, None, "idle", keep_awake=ka)
+        self.assertEqual(conn.executed, [])
+
+    def test_pending_claimable_acquires(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        runner._evaluate_keep_awake(
+            _PendingConn(pending_row=(True,)), False, False, None, "idle", keep_awake=ka
+        )
+        k32.SetThreadExecutionState.assert_called_once_with(_HOLD)
+
+    def test_pending_but_paused_releases(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        ka.update(True, "job in flight")
+        with self.assertLogs("asr-runner", level="INFO") as cm:
+            runner._evaluate_keep_awake(
+                _PendingConn(pending_row=(True,)), False, True, None, "idle", keep_awake=ka
+            )
+        self.assertFalse(ka.held)
+        self.assertIn("keep-awake released (reason: idle)", "\n".join(cm.output))
+
+    def test_batch_phase_holds_without_querying(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        conn = _PendingConn(fail=True)
+        with self.assertLogs("asr-runner", level="INFO") as cm:
+            runner._evaluate_keep_awake(conn, False, True, 0, "analyze", keep_awake=ka)
+        self.assertTrue(ka.held)
+        self.assertIn("batch phase=analyze", "\n".join(cm.output))
+
+    def test_in_flight_holds_without_querying(self) -> None:
+        ka = runner._KeepAwake(True, kernel32=_mock_kernel32())
+        runner._evaluate_keep_awake(_PendingConn(fail=True), True, True, 0, "idle", keep_awake=ka)
+        self.assertTrue(ka.held)
+
+    def test_query_error_releases_and_does_not_raise(self) -> None:
+        k32 = _mock_kernel32()
+        ka = runner._KeepAwake(True, kernel32=k32)
+        ka.update(True, "claimable pending work")
+        conn = _PendingConn(fail=True)
+        with self.assertLogs("asr-runner", level="INFO") as cm:
+            runner._evaluate_keep_awake(conn, False, False, None, "idle", keep_awake=ka)
+        self.assertFalse(ka.held)
+        k32.SetThreadExecutionState.assert_called_with(_RELEASE)
+        self.assertIn("released (reason: evaluation failed: connection lost)", "\n".join(cm.output))
+
+
+class GateGpuInputsTests(unittest.TestCase):
+    def test_read_gate_inputs(self) -> None:
+        conn = _PhaseConn(
+            control_row={"paused": True, "run_limit": 4}, phase_row={"phase": "analyze"}
+        )
+        self.assertEqual(runner._read_gate_inputs(conn), (True, 4, "analyze"))
+
+    def test_passed_inputs_do_not_requery_runner_control(self) -> None:
+        conn = _PhaseConn(raise_on="runner_control WHERE")  # any read would degrade/raise
+        seen: list[str] = []
+        orig_cursor = conn.cursor
+
+        def spy_cursor() -> object:
+            cur = orig_cursor()
+            orig_execute = cur.execute
+
+            def execute(sql: str, params: object = None) -> None:
+                seen.append(sql)
+                orig_execute(sql, params)
+
+            cur.execute = execute  # type: ignore[method-assign]
+            return cur
+
+        conn.cursor = spy_cursor  # type: ignore[method-assign]
+        provider = _RecordingProvider()
+        skip = runner._gate_gpu(conn, provider, (False, None, "analyze"))
+        self.assertTrue(skip)
+        self.assertEqual(provider.parked, 1)
+        self.assertFalse(any(s.lstrip().upper().startswith("SELECT") for s in seen), seen)
 
 
 if __name__ == "__main__":

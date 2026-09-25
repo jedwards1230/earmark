@@ -425,6 +425,15 @@ starting a new Phase A. If a game starts mid-batch, gpu-arbiter stops the runner
 and judge; the coordinator's per-batch yield-check handles re-entry and the
 existing stale-job recovery (§1.3) reclaims interrupted jobs.
 
+**Keep-awake on an idle-sleeping GPU host.** When the runner lives on a host
+that sleeps when idle (e.g. a Windows GPU workstation, where `RUNNER_KEEP_AWAKE`
+defaults on — §2.4), it holds the host awake through **both** phases:
+**transcribe** (while claimable jobs are pending or a job is in flight) and
+**analyze** (the runner is parked, but the eval judge on the same host still
+needs it up). It releases once the coordinator returns to `phase='idle'` and no
+claimable work remains — the coordinator's exit `run_limit=0` makes any leftover
+`pending` rows unclaimable, so the host can sleep again.
+
 **Gate (the load-bearing rule):** the runner claims a job only when
 
 ```
@@ -1211,9 +1220,12 @@ vars are new and **optional** — see §2.13 for the vocabulary.
 | `BOOKS_MOUNT` | no | `/mnt/media/books` — this host's mount of the books share (an NFS path on Linux; a UNC path such as `\\nas\books` on a native Windows runner). DB `file_path`s are re-rooted onto it. |
 | `BOOKS_DB_ROOT` | no | `/books` — the producer-side root that absolute DB `file_path`s are rooted at (the Go service's container `BOOKS_DIR`). Always parsed as a POSIX path, whatever OS the runner is on. |
 | `BOOKS_PATH_ENCODING` | no | `none` (default) or `sfm`; any other value fails startup. `sfm` encodes NTFS-illegal characters in each re-rooted path component (never the `BOOKS_MOUNT` prefix) to the Services-for-Mac private-use code points: U+0001–U+001F → U+F001–U+F01F, `"` → U+F020, `*` → U+F021, `:` → U+F022, `<` → U+F023, `>` → U+F024, `?` → U+F025, `\` → U+F026, `\|` → U+F027. This is Samba's `macos_string_replace_map` (`source3/lib/string_replace.c`), which `vfs_fruit` installs as `catia:mappings` under `fruit:encoding = native`. As in Samba, there is no trailing-space or trailing-period rule. Use it when a Windows runner reads a share configured that way, so names containing `:` etc. resolve. |
+| `RUNNER_KEEP_AWAKE` | no | `auto` (default: on for Windows, off elsewhere), `true` or `false` (also `1`/`0`, `yes`/`no`, `on`/`off`; case-insensitive); any other value fails startup and `--self-check`. When on, the runner keeps an idle-sleeping host awake via `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED)` from its main-loop thread (never display-required or away mode), changing it only on a state transition. It holds while a job is in flight, while a claimable job (`pending`, `attempts < 3`) exists and the gate would let it be claimed (not `paused`, `run_limit` NULL or > 0, `phase` ≠ `analyze`), or while the batch `phase` is `transcribe` or `analyze` (§1.4); otherwise, or when an evaluation fails (e.g. the DB is unreachable), it releases and the host's normal idle timer resumes. Forcing `true` on a non-Windows host logs once and does nothing. Off → no extra queries. |
 
 **Breaking changes: none** for the existing runner — every new var is optional
-and the defaults preserve current behavior.
+and the defaults preserve current behavior, with one intended exception:
+`RUNNER_KEEP_AWAKE=auto` turns keep-awake on for Windows runners (set `false` to
+opt out); Linux runners are unchanged.
 
 #### Runner result obligation — report applied capabilities (SHOULD)
 

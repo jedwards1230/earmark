@@ -24,6 +24,32 @@ never mid-transcription, and only on a state change. The `phase` column is read
 defensively (it may not exist yet in the deployed DB — a separate PR adds it);
 a missing column/row degrades to 'idle' (model stays on GPU, today's behavior).
 
+Keep-awake (RUNNER_KEEP_AWAKE): on a GPU workstation that idle-sleeps, a sleeping
+host stops the queue. So while there is work the runner asks Windows to keep the
+system awake, and lets it sleep again once there is none. It holds the host awake
+when a job is in flight, when claimable pending work exists and the control gate
+would let it be claimed, or while the batch coordinator is in phase 'transcribe'
+or 'analyze' (during 'analyze' the runner is parked, but an eval judge on the same
+host is busy). It uses SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+— never ES_DISPLAY_REQUIRED / ES_AWAYMODE_REQUIRED — called only on a state change
+and only from the main-loop thread (the long-lived thread that runs main() and
+transcribes; the request is per-thread and dies with it). Any evaluation failure
+releases the hold rather than keeping a host awake while no progress is possible.
+This works from a Windows service in session 0 under a non-admin account: the API
+needs no privilege, the system "tracks each thread that calls
+SetThreadExecutionState" with no interactive-session requirement, and powercfg
+/requests + /requestsoverride list "Process, Service, or Driver" as the callers
+whose requests block sleep. It only blocks *idle* sleep — never a user-initiated
+sleep, lid close or power button — and is released as soon as the work is done,
+as the System Sleep Criteria page asks ("Avoid holding ES_SYSTEM_REQUIRED |
+ES_CONTINUOUS indefinitely").
+See: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate
+     https://learn.microsoft.com/en-us/windows/win32/power/system-sleep-criteria
+     https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options
+The host-local busy flag (RUNNER_BUSY_FLAG_PATH) is not an input: it pauses claims
+for another local GPU tenant, and that tenant's work is no reason to let the host
+sleep.
+
 Verified on RTX 5090 (Blackwell, torch 2.12.0+cu130, 2026-06-07): model load,
 transcribe(timestamps=True), word timestamps in seconds (hyp.timestamp['word']),
 segment text (hyp.timestamp['segment']), bfloat16, and the contract mapping all
@@ -71,6 +97,12 @@ Environment variables (systemd EnvironmentFile on Linux, the service XML on Wind
                                 with `fruit:encoding = native` + vfs_catia (e.g. TrueNAS
                                 aapl_name_mangling). Needed for names containing ':' etc. over SMB
                                 from Windows. Any other value is rejected at startup.
+    RUNNER_KEEP_AWAKE           default: auto (on for Windows, off elsewhere). true/false
+                                (also 1/0, yes/no, on/off; case-insensitive) force it. When on,
+                                hold the host awake while a job is in flight, claimable work is
+                                pending (not paused, run_limit not 0, phase not 'analyze'), or
+                                the batch phase is 'transcribe'/'analyze'. Forcing true on a
+                                non-Windows host logs once and no-ops. Invalid → startup fails.
 
 HF_TOKEN is NOT required — Parakeet-TDT and NeMo Sortformer are public models.
 """
@@ -78,6 +110,7 @@ HF_TOKEN is NOT required — Parakeet-TDT and NeMo Sortformer are public models.
 from __future__ import annotations
 
 import abc
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -387,6 +420,31 @@ BOOKS_PATH_ENCODING: str = _parse_books_path_encoding(
     os.environ.get("BOOKS_PATH_ENCODING")
 )
 
+_KEEP_AWAKE_TRUE: frozenset[str] = frozenset({"true", "1", "yes", "on"})
+_KEEP_AWAKE_FALSE: frozenset[str] = frozenset({"false", "0", "no", "off"})
+
+
+def _parse_keep_awake(raw: str | None, os_name: str = os.name) -> bool:
+    """Resolve RUNNER_KEEP_AWAKE. Unset/blank/`auto` → on only on Windows
+    (os.name == "nt"), the one platform the runner can hold awake; true/false
+    (or 1/0, yes/no, on/off; case-insensitive) force it. Raises ValueError on
+    anything else so a typo fails startup (and --self-check) loudly instead of
+    silently letting the host sleep mid-queue."""
+    value = (raw or "").strip().lower()
+    if value in ("", "auto"):
+        return os_name == "nt"
+    if value in _KEEP_AWAKE_TRUE:
+        return True
+    if value in _KEEP_AWAKE_FALSE:
+        return False
+    raise ValueError(
+        f"RUNNER_KEEP_AWAKE={raw!r} is invalid; expected one of "
+        f"['auto', 'true', 'false'] (or 1/0, yes/no, on/off)"
+    )
+
+
+RUNNER_KEEP_AWAKE: bool = _parse_keep_awake(os.environ.get("RUNNER_KEEP_AWAKE"))
+
 
 def _sfm_encode(component: str) -> str:
     """Encode one path component with Samba's SFM map (see _SFM_ENCODE_TABLE)."""
@@ -647,9 +705,23 @@ def _should_park(paused: bool, phase: str | None) -> bool:
     return phase not in _PHASE_ON_GPU
 
 
+def _read_gate_inputs(
+    conn: psycopg2.extensions.connection,
+) -> tuple[bool, int | None, str]:
+    """
+    Read the per-cycle control inputs (paused, run_limit, phase) once, so the
+    main loop can feed the same snapshot to both the GPU gate and the keep-awake
+    decision without re-reading runner_control. Both reads are advisory and
+    degrade safe (see _read_control_row / _read_phase).
+    """
+    paused, run_limit = _control_values(_read_control_row(conn))
+    return paused, run_limit, _read_phase(conn)
+
+
 def _gate_gpu(
     conn: psycopg2.extensions.connection,
     provider: "ASRProvider",
+    inputs: tuple[bool, int | None, str] | None = None,
 ) -> bool:
     """
     Run one per-cycle GPU gate decision (CONTRACT §1.4) and return whether the
@@ -670,9 +742,13 @@ def _gate_gpu(
     claim too (don't transcribe on a card we couldn't reclaim) and retry next poll.
     The decision (paused/phase) is computed via the pure helpers, so this function
     is testable with stubs and no real GPU.
+
+    `inputs` is an already-read (paused, run_limit, phase) snapshot from
+    _read_gate_inputs; None reads it here (same result, one extra round trip).
     """
-    paused, _ = _control_values(_read_control_row(conn))
-    phase = _read_phase(conn)
+    if inputs is None:
+        inputs = _read_gate_inputs(conn)
+    paused, _, phase = inputs
     should_park = _should_park(paused, phase)
     try:
         if should_park:
@@ -698,6 +774,225 @@ def _gate_gpu(
     if should_park:
         log.debug("GPU parked (paused=%s phase=%s) — skipping claim", paused, phase)
     return should_park
+
+
+# ---------------------------------------------------------------------------
+# Keep-awake (RUNNER_KEEP_AWAKE): hold an idle-sleeping host awake while there
+# is work, then let it sleep.
+# ---------------------------------------------------------------------------
+
+# SetThreadExecutionState flags. Only SYSTEM_REQUIRED is ever requested: the
+# runner needs the machine running, not the display on, and never away mode.
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+# Batch-coordinator phases during which the host must stay awake regardless of
+# the runner's own queue (CONTRACT §1.4): 'transcribe' drives ASR work, and
+# during 'analyze' the runner is parked but the eval judge on the same host is
+# busy.
+_KEEP_AWAKE_PHASES = frozenset({"transcribe", "analyze"})
+
+
+def _should_keep_awake(
+    in_flight: bool,
+    pending_claimable: bool,
+    paused: bool,
+    run_limit: int | None,
+    phase: str | None,
+) -> bool:
+    """
+    Decide whether the runner should hold the host awake. Pure (no side effects).
+
+    Hold iff ANY of:
+      (a) a job is in flight;
+      (b) claimable work is pending AND the control gate would let this runner
+          claim it: not paused, run_limit is NULL or > 0, and phase != 'analyze'
+          (`pending_claimable` is the claim query's row filter — a pending job
+          with attempts < 3 exists; this function applies the gate on top);
+      (c) the batch coordinator is active: phase in ('transcribe', 'analyze').
+          During 'analyze' the runner itself is parked, but the eval judge on the
+          same host needs it awake.
+    Otherwise release, so the host's normal idle-sleep timer applies.
+    """
+    if in_flight:
+        return True
+    if phase in _KEEP_AWAKE_PHASES:
+        return True
+    return (
+        pending_claimable
+        and not paused
+        and (run_limit is None or run_limit > 0)
+        and phase != "analyze"
+    )
+
+
+def _pending_work_exists(conn: psycopg2.extensions.connection) -> bool:
+    """
+    Report whether any job the claim query could pick up exists (same row filter
+    as _CLAIM_SQL: status 'pending' AND attempts < 3). Commits on success; on
+    error rolls back (leaving the connection clean) and RE-RAISES, so the caller
+    treats it as a keep-awake evaluation failure instead of guessing an answer.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM transcription_jobs "
+                "WHERE status = 'pending' AND attempts < 3)"
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001, S110 — best-effort cleanup; the original error re-raises
+            pass
+        raise
+    if row is None:
+        return False
+    value = next(iter(row.values())) if isinstance(row, dict) else row[0]
+    return bool(value)
+
+
+class _KeepAwake:
+    """
+    Stateful wrapper around Win32 SetThreadExecutionState.
+
+    Holding = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    releasing = SetThreadExecutionState(ES_CONTINUOUS). The call is made only on
+    a state change, never on every poll.
+
+    THREAD: the execution state is per-thread and is cleared when that thread
+    exits, so every call must come from the long-lived main-loop thread — the one
+    that runs main() and also transcribes. (NOT the per-job heartbeat thread,
+    which dies after each job and would take the hold with it.) ES_CONTINUOUS
+    persists until changed, so acquiring before the blocking
+    provider.transcribe(...) keeps the host awake for the whole job. The first
+    caller's thread id is recorded and a different caller is warned about.
+
+    A return of 0 means the call failed: log a WARNING once per attempted
+    transition (not every poll), leave the tracked state unchanged so the next
+    poll retries, and stay quiet on repeat failures of the same transition.
+
+    Disabled (RUNNER_KEEP_AWAKE off, or forced on where there is no kernel32)
+    → every method is a no-op. `kernel32` is injectable for tests; otherwise it
+    is resolved lazily via ctypes.windll (which only exists on Windows).
+    """
+
+    def __init__(
+        self, enabled: bool, kernel32: Any = None, os_name: str = os.name
+    ) -> None:
+        self.requested = enabled
+        self.enabled = enabled and (kernel32 is not None or os_name == "nt")
+        self._kernel32 = kernel32
+        self._held = False
+        self._failed_want: bool | None = None
+        self._thread_id: int | None = None
+        self._thread_warned = False
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    @property
+    def unsupported(self) -> bool:
+        """Forced on, but this OS has no SetThreadExecutionState → no-op."""
+        return self.requested and not self.enabled
+
+    def _set_state(self, flags: int) -> int:
+        if self._kernel32 is None:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            fn = kernel32.SetThreadExecutionState
+            # c_uint so 0x80000000 is passed as-is rather than overflowing c_int.
+            fn.argtypes = [ctypes.c_uint]
+            fn.restype = ctypes.c_uint
+            self._kernel32 = kernel32
+        return int(self._kernel32.SetThreadExecutionState(flags))
+
+    def _check_thread(self) -> None:
+        ident = threading.get_ident()
+        if self._thread_id is None:
+            self._thread_id = ident
+        elif ident != self._thread_id and not self._thread_warned:
+            self._thread_warned = True
+            log.warning(
+                "keep-awake called from a different thread than the main loop — "
+                "the execution state is per-thread and may not hold"
+            )
+
+    def update(self, want: bool, reason: str) -> None:
+        """Move to `want` (hold/release) if that is a change; no-op otherwise."""
+        if not self.enabled:
+            return
+        self._check_thread()
+        if want == self._held:
+            self._failed_want = None  # the pending transition is no longer wanted
+            return
+        flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED if want else _ES_CONTINUOUS
+        verb = "acquire" if want else "release"
+        try:
+            prev = self._set_state(flags)
+            error = "SetThreadExecutionState returned 0"
+        except Exception as exc:  # noqa: BLE001 — never let this break the loop
+            prev = 0
+            error = str(exc)
+        if not prev:
+            if self._failed_want != want:
+                self._failed_want = want
+                log.warning(
+                    "keep-awake %s failed (%s; reason: %s) — will retry next poll",
+                    verb,
+                    error,
+                    reason,
+                )
+            return
+        self._held = want
+        self._failed_want = None
+        log.info("keep-awake %s (reason: %s)", "acquired" if want else "released", reason)
+
+    def release(self, reason: str) -> None:
+        self.update(False, reason)
+
+
+_keep_awake = _KeepAwake(RUNNER_KEEP_AWAKE)
+
+
+def _evaluate_keep_awake(
+    conn: psycopg2.extensions.connection,
+    in_flight: bool,
+    paused: bool,
+    run_limit: int | None,
+    phase: str | None,
+    keep_awake: _KeepAwake | None = None,
+) -> None:
+    """
+    Per-cycle keep-awake evaluation: query (only if the answer matters) →
+    _should_keep_awake → update. Never raises: evaluation must not block or
+    break job processing, so any failure releases the hold instead.
+
+    Why release on failure rather than hold: holding on errors could keep a
+    workstation awake indefinitely while the DB is unreachable and no progress
+    is possible. Releasing is harmless for a transient blip — clearing
+    ES_SYSTEM_REQUIRED does not sleep the host, it only lets the normal idle
+    timer (minutes) resume counting, and the next successful poll re-acquires.
+
+    Disabled → returns without touching the DB (non-Windows runners see zero
+    extra queries).
+    """
+    ka = _keep_awake if keep_awake is None else keep_awake
+    if not ka.enabled:
+        return
+    try:
+        if in_flight:
+            ka.update(True, "job in flight")
+            return
+        if phase in _KEEP_AWAKE_PHASES:
+            ka.update(True, f"batch phase={phase}")
+            return
+        pending = _pending_work_exists(conn)
+        want = _should_keep_awake(False, pending, paused, run_limit, phase)
+        ka.update(want, "claimable pending work" if want else "idle")
+    except Exception as exc:  # noqa: BLE001 — keep-awake must never break the loop
+        ka.release(f"evaluation failed: {exc}")
 
 
 def _claim_one(conn: psycopg2.extensions.connection) -> dict[str, Any] | None:
@@ -2967,7 +3262,7 @@ def _make_provider(backend: str) -> ASRProvider:
 def main() -> None:
     log.info(
         "asr-runner starting: identity=%s backend=%s model=%s diarize=%s compute=%s "
-        "books_mount=%s books_db_root=%s books_path_encoding=%s",
+        "books_mount=%s books_db_root=%s books_path_encoding=%s keep_awake=%s",
         RUNNER_IDENTITY,
         ASR_BACKEND,
         ASR_MODEL_ID,
@@ -2976,7 +3271,14 @@ def main() -> None:
         BOOKS_MOUNT,
         BOOKS_DB_ROOT,
         BOOKS_PATH_ENCODING,
+        RUNNER_KEEP_AWAKE,
     )
+    if _keep_awake.unsupported:
+        log.warning(
+            "RUNNER_KEEP_AWAKE=true but keep-awake is unsupported on this OS "
+            "(os.name=%s) — ignoring",
+            os.name,
+        )
 
     # Instantiate and load the provider once at startup (model load is expensive;
     # amortized over all jobs in the queue).
@@ -3006,14 +3308,27 @@ def main() -> None:
             # mid-transcription — and isolates any GPU fault from the claim path.
             # When it returns True the model is parked (or could not be reclaimed):
             # skip the claim entirely, there's no point claiming a job we won't run.
-            if _gate_gpu(conn, provider):
+            #
+            # The gate inputs are read once and shared with the keep-awake
+            # evaluation (_evaluate_keep_awake never raises and is a no-op when
+            # disabled, so it cannot block or break the claim path).
+            gate_inputs = _read_gate_inputs(conn)
+            if _gate_gpu(conn, provider, gate_inputs):
+                _evaluate_keep_awake(conn, False, *gate_inputs)
                 conn.close()
                 _shutdown.wait(POLL_INTERVAL)
                 continue
 
             job = _claim_job(conn)
+            if job is None:
+                _evaluate_keep_awake(conn, False, *gate_inputs)
         except Exception as exc:
             log.error("DB error during claim: %s", exc)
+            # Release rather than hold: with the DB unreachable no progress is
+            # possible, and holding could keep the host awake indefinitely.
+            # Harmless for a blip — releasing only lets the idle timer resume
+            # counting; the next successful poll re-acquires.
+            _keep_awake.release(f"evaluation failed: {exc}")
             if conn is not None:
                 try:
                     conn.rollback()
@@ -3034,6 +3349,11 @@ def main() -> None:
         checksum: str = job["checksum"]
 
         log.info("Claimed job %s (file: %s)", job_id, file_path)
+
+        # Hold the host awake BEFORE the (blocking) transcription, on this — the
+        # main-loop — thread: ES_CONTINUOUS persists until changed, so the hold
+        # covers the whole job. The next cycle re-evaluates once it finishes.
+        _keep_awake.update(True, "job in flight")
 
         # Look up bias_terms for this book before starting the heartbeat thread.
         # This read uses the same connection as the claim (already committed), so
@@ -3098,6 +3418,7 @@ def main() -> None:
             except Exception:
                 pass
 
+    _keep_awake.release("shutdown")  # process exit would clear it too
     log.info("asr-runner shut down cleanly")
 
 
