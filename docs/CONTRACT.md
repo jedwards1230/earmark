@@ -1573,7 +1573,8 @@ with no change.
     "backend": "ollama",             // "ollama" | "vllm" | "openai-compat" (required)
     "baseURL": "http://ollama:11434/v1", // OpenAI-compatible base (http/https, required)
     "model": "nomic-embed-text",     // model id passed to the API (required)
-    "options": { "temperature": "0", "max_tokens": "256" } // optional; string values
+    "options": { "temperature": "0", "max_tokens": "256" }, // optional; string values
+    "apiKeyEnv": "LITELLM_API_KEY"   // optional; NAME of the env var holding the bearer token
   }
 ]
 ```
@@ -1582,6 +1583,19 @@ All three backends speak the OpenAI-compatible REST API; `backend` selects the
 dashboard label only (no behavioral difference today). `options` keys are
 forwarded as-is — known keys are `temperature`, `max_tokens`, `top_p`; unknown
 keys are preserved so a future backend needs no code change.
+
+`apiKeyEnv` authenticates an endpoint behind a gateway that requires
+`Authorization: Bearer <key>` (e.g. a LiteLLM virtual key). It holds the **name**
+of an environment variable, never the token: `AI_ENDPOINTS` is plaintext and
+`options` are rendered on the dashboard and in `/api/v1/status`. At startup the
+named var is read and the token is sent as the bearer on embeddings requests,
+eval-judge chat requests, and the `/models` health probe. The resolved token is
+never logged, rendered, or serialized; the var name may be. Omitted → no key:
+the embeddings client keeps sending its historical `Bearer ollama` placeholder
+and the probe sends no `Authorization` header, so existing Ollama/vLLM
+deployments are unchanged. For the eval judge, the resolved key takes precedence
+over the deprecated `options.apiKey` (still honored for back-compat; do not put
+real secrets there).
 
 #### `AI_ROLES` (JSON object)
 
@@ -1603,6 +1617,9 @@ cause invisible embed failures. earmark refuses to start when:
 - `AI_ENDPOINTS` is not valid JSON, or any entry has a missing `id`, duplicate
   `id`, missing `model`, unknown `type`/`backend`, or a `baseURL` that is not a
   valid http/https URL with a host.
+- An entry's `apiKeyEnv` is not a valid env var name (`[A-Za-z_][A-Za-z0-9_]*`),
+  or names a var that is unset or empty — a gateway that needs a key would
+  otherwise 401 every embed.
 - `AI_ENDPOINTS` is set but `AI_ROLES` is absent.
 - `AI_ROLES.embeddings` is empty, points at an unknown id, or points at a
   non-`embeddings` endpoint.
@@ -1615,7 +1632,8 @@ re-validated — the legacy path preserves the prior behavior.)
 
 Each endpoint is probed for liveness on every Models/Services page refresh and
 in `GET /api/v1/status` (§2.12): a `GET <baseURL>/models` request with a 2s
-timeout, TTL-cached so both render paths share one upstream call. State tokens:
+timeout (carrying the endpoint's bearer token when `apiKeyEnv` is set),
+TTL-cached so both render paths share one upstream call. State tokens:
 
 | Condition | Page label | API `state` |
 |---|---|---|
@@ -1665,6 +1683,8 @@ package.
 The chat endpoint is resolved in priority order:
 
 1. `AI_ROLES["eval"]` bound to a `chat` entry in `AI_ENDPOINTS` (preferred — see §2.14).
+   Its bearer token is the key resolved from the entry's `apiKeyEnv`, else the
+   deprecated `options.apiKey`.
 2. Standalone `EVAL_CHAT_*` env vars (fallback when no `eval` role is bound).
 
 The call uses the OpenAI-compatible `POST {base}/chat/completions` shape.

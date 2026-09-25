@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -481,6 +482,74 @@ func TestLoadConfig_AIEndpointsWinsOverLegacy(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "new-model", emb.Model)
 	assert.Equal(t, "http://new:11434/v1", emb.BaseURL)
+}
+
+// TestParseAIEndpoints_APIKeyEnv covers resolving an endpoint's bearer token
+// from the env var named by apiKeyEnv (CONTRACT §2.14).
+func TestParseAIEndpoints_APIKeyEnv(t *testing.T) {
+	const base = `"id":"e","type":"embeddings","backend":"openai-compat","baseURL":"http://litellm:4000/v1","model":"m"`
+	cases := []struct {
+		name    string
+		field   string // extra JSON field(s) appended to the entry
+		env     map[string]string
+		wantKey string
+		wantErr string
+	}{
+		{name: "absent means no key", field: ``, wantKey: ""},
+		{
+			name:    "set and present resolves",
+			field:   `,"apiKeyEnv":"TEST_EARMARK_AI_KEY"`,
+			env:     map[string]string{"TEST_EARMARK_AI_KEY": "  sk-litellm-123  "},
+			wantKey: "sk-litellm-123",
+		},
+		{
+			name:    "set but missing fails closed",
+			field:   `,"apiKeyEnv":"TEST_EARMARK_AI_KEY"`,
+			env:     map[string]string{"TEST_EARMARK_AI_KEY": ""},
+			wantErr: `apiKeyEnv "TEST_EARMARK_AI_KEY" is unset or empty`,
+		},
+		{
+			name:    "invalid name rejected",
+			field:   `,"apiKeyEnv":"sk-literal-token"`,
+			wantErr: "not a valid environment variable name",
+		},
+		{
+			name:    "leading digit rejected",
+			field:   `,"apiKeyEnv":"1KEY"`,
+			wantErr: "not a valid environment variable name",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			eps, err := parseAIEndpoints(`[{` + base + tc.field + `}]`)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, eps, 1)
+			assert.Equal(t, tc.wantKey, eps[0].APIKey)
+		})
+	}
+}
+
+// TestAIEndpoint_APIKeyNeverSerialized guards the json:"-" tag: the resolved
+// secret must not appear when an endpoint is marshalled, while the (non-secret)
+// variable name may.
+func TestAIEndpoint_APIKeyNeverSerialized(t *testing.T) {
+	ep := AIEndpoint{
+		ID: "e", Type: AIEndpointTypeEmbeddings, Backend: AIBackendOpenAI,
+		BaseURL: "http://litellm:4000/v1", Model: "m",
+		APIKeyEnv: "LITELLM_API_KEY", APIKey: "sk-super-secret",
+	}
+	b, err := json.Marshal(ep)
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "sk-super-secret")
+	assert.Contains(t, string(b), `"apiKeyEnv":"LITELLM_API_KEY"`)
 }
 
 // ─── EVAL_GATES_EMBED fail-closed startup (CONTRACT §2.4) ───────────────────

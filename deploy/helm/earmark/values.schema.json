@@ -149,7 +149,8 @@
               "options": {
                 "type": "object",
                 "additionalProperties": { "type": "string" }
-              }
+              },
+              "apiKeyEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
             }
           }
         },
@@ -279,6 +280,16 @@
           "properties": {
             "name":     { "type": "string", "minLength": 1 },
             "key":      { "type": "string", "minLength": 1 },
+            "itemPath": { "type": "string" }
+          }
+        },
+        "aiApiKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name":     { "type": "string", "minLength": 1 },
+            "key":      { "type": "string", "minLength": 1 },
+            "envName":  { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
             "itemPath": { "type": "string" }
           }
         }

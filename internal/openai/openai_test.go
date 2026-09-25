@@ -223,3 +223,41 @@ func TestNoPrefixForNonNomicModel(t *testing.T) {
 		t.Errorf("query input = %q, want verbatim %q", captured[0], "raw query")
 	}
 }
+
+// TestEmbeddingsAuthorizationHeader locks in the bearer token: the endpoint's
+// resolved APIKey when set (an authenticated gateway such as LiteLLM), else the
+// historical "ollama" placeholder so existing deployments are unchanged.
+func TestEmbeddingsAuthorizationHeader(t *testing.T) {
+	cases := []struct {
+		name   string
+		apiKey string
+		want   string
+	}{
+		{name: "no key keeps ollama placeholder", apiKey: "", want: "Bearer ollama"},
+		{name: "resolved key is sent", apiKey: "sk-litellm-virtual", want: "Bearer sk-litellm-virtual"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				data := []map[string]any{{"object": "embedding", "index": 0, "embedding": make([]float32, EmbeddingDimension)}}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+			}))
+			t.Cleanup(srv.Close)
+
+			ep := config.AIEndpoint{
+				ID: "e", Type: config.AIEndpointTypeEmbeddings, Backend: config.AIBackendOpenAI,
+				BaseURL: srv.URL + "/v1", Model: "nomic-embed-text", APIKey: tc.apiKey,
+			}
+			e := NewEmbeddings(&config.Config{AIEndpoints: []config.AIEndpoint{ep}, AIRoles: &config.AIRoles{Embeddings: "e"}})
+			if _, err := e.EmbedQuery("q"); err != nil {
+				t.Fatalf("EmbedQuery: %v", err)
+			}
+			if gotAuth != tc.want {
+				t.Errorf("Authorization = %q, want %q", gotAuth, tc.want)
+			}
+		})
+	}
+}

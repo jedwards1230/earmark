@@ -140,6 +140,19 @@ the two Deployments.
   value: {{ toJson . | quote }}
 {{- end }}
 {{- /*
+  AI gateway bearer token (CONTRACT §2.14). An AI_ENDPOINTS entry names the env
+  var holding its key via apiKeyEnv; this injects that var from the synced 1Password
+  Secret. Both pods load config (and fail closed if a named var is missing), so it
+  lives in commonEnv. Omitted when itemPath is empty.
+*/}}
+{{- if and .Values.secrets.enabled .Values.secrets.aiApiKey.itemPath }}
+- name: {{ required "secrets.aiApiKey.envName is required" .Values.secrets.aiApiKey.envName | quote }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.secrets.aiApiKey.name | quote }}
+      key: {{ .Values.secrets.aiApiKey.key | quote }}
+{{- end }}
+{{- /*
   Eval-layer chat endpoint (CONTRACT §2.15). Standalone EVAL_CHAT_* env vars
   consumed by internal/eval when a chat endpoint (e.g. vLLM) exists. Each is
   emitted only when set, so an unset evalChat leaves the eval layer unconfigured

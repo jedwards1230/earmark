@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -42,22 +43,33 @@ type endpointProbe struct {
 	State  endpointProbeState
 }
 
-// endpointProber resolves a (baseURL, model) pair to a health result.
+// endpointProber resolves a (baseURL, model) pair to a health result. apiKey is
+// the endpoint's resolved bearer token ("" = send no Authorization header), so
+// an authenticated gateway such as LiteLLM doesn't 401 the probe into "offline".
 // Implemented by httpEndpointProber in production and a static fake in the demo.
 type endpointProber interface {
-	Probe(ctx context.Context, baseURL, model string) endpointProbe
+	Probe(ctx context.Context, baseURL, model, apiKey string) endpointProbe
 }
 
 // httpEndpointProber polls an OpenAI-compatible /models endpoint with a short
-// timeout and a TTL cache keyed by baseURL, so the /servers fragment and
-// /api/v1/status share a single upstream call per refresh window.
+// timeout and a TTL cache keyed by baseURL (plus a hash of the key), so the
+// /servers fragment and /api/v1/status share a single upstream call per
+// refresh window.
 type httpEndpointProber struct {
 	client *http.Client
 	ttl    time.Duration
 	now    func() time.Time
 
 	mu    sync.Mutex
-	cache map[string]endpointProbeEntry
+	cache map[endpointProbeKey]endpointProbeEntry
+}
+
+// endpointProbeKey separates cache entries for the same baseURL probed with
+// different credentials, holding only a digest of the key so the raw secret is
+// never retained outside the config.
+type endpointProbeKey struct {
+	baseURL string
+	keySum  [sha256.Size]byte
 }
 
 type endpointProbeEntry struct {
@@ -81,23 +93,27 @@ func newHTTPEndpointProber(timeout, ttl time.Duration) *httpEndpointProber {
 		},
 		ttl:   ttl,
 		now:   time.Now,
-		cache: map[string]endpointProbeEntry{},
+		cache: map[endpointProbeKey]endpointProbeEntry{},
 	}
 }
 
-func (p *httpEndpointProber) Probe(ctx context.Context, baseURL, model string) endpointProbe {
+func (p *httpEndpointProber) Probe(ctx context.Context, baseURL, model, apiKey string) endpointProbe {
+	key := endpointProbeKey{baseURL: baseURL}
+	if apiKey != "" {
+		key.keySum = sha256.Sum256([]byte(apiKey))
+	}
 	p.mu.Lock()
-	entry, ok := p.cache[baseURL]
+	entry, ok := p.cache[key]
 	if ok && p.now().Sub(entry.at) >= p.ttl {
 		ok = false // expired
 	}
 	p.mu.Unlock()
 
 	if !ok {
-		entry = p.fetch(ctx, baseURL)
+		entry = p.fetch(ctx, baseURL, apiKey)
 		p.mu.Lock()
 		entry.at = p.now()
-		p.cache[baseURL] = entry
+		p.cache[key] = entry
 		p.mu.Unlock()
 	}
 
@@ -153,7 +169,7 @@ type openAIModelsList struct {
 	} `json:"data"`
 }
 
-func (p *httpEndpointProber) fetch(ctx context.Context, baseURL string) endpointProbeEntry {
+func (p *httpEndpointProber) fetch(ctx context.Context, baseURL, apiKey string) endpointProbeEntry {
 	rawURL := modelsURL(baseURL)
 	// Only http/https — reject file://, gopher://, etc. so a mis- or maliciously
 	// configured baseURL can't become an SSRF/file-read primitive.
@@ -163,6 +179,9 @@ func (p *httpEndpointProber) fetch(ctx context.Context, baseURL string) endpoint
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return endpointProbeEntry{ok: false}
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {

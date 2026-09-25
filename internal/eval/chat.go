@@ -58,9 +58,13 @@ type EvalEndpointSource interface {
 type EvalEndpoint struct {
 	BaseURL string
 	Model   string
+	// APIKey is the bearer token resolved from the endpoint's apiKeyEnv. It
+	// takes precedence over Options["apiKey"].
+	APIKey string
 	// Options are the endpoint's backend-specific key/values. An "apiKey" key
-	// (if present) supplies the bearer token; other keys are ignored by the
-	// dependency-free chat client here.
+	// is still honored as a back-compat bearer token when APIKey is empty, but
+	// options are plaintext and shown on the dashboard, so prefer apiKeyEnv.
+	// Other keys are ignored by the dependency-free chat client here.
 	Options map[string]string
 }
 
@@ -70,7 +74,8 @@ type EvalEndpoint struct {
 // registry, falling back to the standalone env vars):
 //
 //  1. If src has an AI_ROLES["eval"] binding to a chat AI_ENDPOINTS entry, use
-//     that endpoint's baseURL/model/options (apiKey via options["apiKey"]).
+//     that endpoint's baseURL/model. The bearer token is the key resolved from
+//     its apiKeyEnv, else options["apiKey"] (back-compat).
 //  2. Otherwise fall back to EVAL_CHAT_BASE_URL / EVAL_CHAT_MODEL /
 //     EVAL_CHAT_API_KEY (CONTRACT §2.15 stub, now the fallback).
 //  3. If neither resolves, return a clear "not configured" error.
@@ -81,10 +86,14 @@ type EvalEndpoint struct {
 func ResolveChatClient(src EvalEndpointSource) (ChatClient, error) {
 	if src != nil {
 		if ep, ok := src.EvalEndpoint(); ok {
+			apiKey := strings.TrimSpace(ep.APIKey)
+			if apiKey == "" {
+				apiKey = strings.TrimSpace(ep.Options["apiKey"])
+			}
 			cfg := chatConfig{
 				BaseURL: strings.TrimSpace(ep.BaseURL),
 				Model:   strings.TrimSpace(ep.Model),
-				APIKey:  strings.TrimSpace(ep.Options["apiKey"]),
+				APIKey:  apiKey,
 			}
 			if cfg.BaseURL == "" || cfg.Model == "" {
 				return nil, fmt.Errorf("eval chat endpoint (AI_ROLES.eval) is missing baseURL or model")

@@ -120,8 +120,14 @@ config:
   # aiEndpoints is pass-through JSON → the AI_ENDPOINTS env var (same precedent
   # as asrServers): the set of OpenAI-compatible AI endpoints this deployment
   # talks to. Each entry: {id, type: embeddings|chat, backend: ollama|vllm|
-  # openai-compat, baseURL, model, options?{...string}}; id/type/backend/baseURL/
-  # model are required by the app's validator.
+  # openai-compat, baseURL, model, options?{...string}, apiKeyEnv?}; id/type/
+  # backend/baseURL/model are required by the app's validator.
+  #
+  # apiKeyEnv is the NAME of an env var holding the endpoint's bearer token, for
+  # an authenticated gateway such as LiteLLM — never put the token itself in
+  # aiEndpoints (it is plaintext and options are shown on the dashboard). Wire the
+  # var with secrets.aiApiKey (envName defaults to LITELLM_API_KEY). A named var
+  # that is unset or empty is fatal at startup. Omit → no key (Ollama/vLLM).
   #
   # When aiEndpoints is EMPTY (the default), AI_ENDPOINTS/AI_ROLES are omitted and
   # the app synthesizes a `_legacy` embeddings endpoint from embeddingsBaseURL/
@@ -140,6 +146,10 @@ config:
   #     - {id: vllm-eval, type: chat, backend: vllm,
   #        baseURL: "http://vllm:8000/v1", model: qwen2.5-7b-instruct}
   #   aiRoles: {embeddings: ollama-embed, eval: vllm-eval}
+  # Behind LiteLLM (with secrets.aiApiKey.itemPath set):
+  #     - {id: litellm-embed, type: embeddings, backend: openai-compat,
+  #        baseURL: "http://litellm:4000/v1", model: nomic-embed-text,
+  #        apiKeyEnv: LITELLM_API_KEY}
   aiEndpoints: []
   aiRoles: {}
 
@@ -258,4 +268,16 @@ secrets:
   absToken:
     name: earmark-abs
     key: api_token
+    itemPath: ""
+
+  # Bearer token (e.g. a LiteLLM virtual key) for an authenticated AI gateway.
+  # When itemPath is set, the 1Password item is synced to a Secret and exposed to
+  # BOTH pods as the env var named by `envName`; point an aiEndpoints entry at it
+  # with `apiKeyEnv: <envName>` (CONTRACT §2.14). Leave itemPath empty to omit it
+  # — but then no endpoint may set apiKeyEnv, or the app fails at startup. `key`
+  # is the field label in the 1Password item holding the token.
+  aiApiKey:
+    name: earmark-litellm-key
+    key: API_KEY
+    envName: LITELLM_API_KEY
     itemPath: ""
