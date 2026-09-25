@@ -1207,7 +1207,8 @@ vars are new and **optional** — see §2.13 for the vocabulary.
 | `ASR_DIARIZE` | no | `false` (default). Set `true` to run speaker diarization (e.g. NeMo Sortformer) for multi-voice/full-cast titles. **Global** (per-job diarization is a deferred Phase-3 concern). |
 | `ASR_COMPUTE_TYPE` | no | `bfloat16` (native on RTX 5090 / Blackwell) |
 | `ASR_CHUNK_THRESHOLD_SECONDS` | no | `3600` — single-pass below this duration; chunked/buffered inference above |
-| `BOOKS_MOUNT` | no | `/srv/audiobooks` (NFS export path on the storage host) |
+| `BOOKS_MOUNT` | no | `/mnt/media/books` — this host's mount of the books share (an NFS path on Linux; a UNC path such as `\\nas\books` on a native Windows runner). DB `file_path`s are re-rooted onto it. |
+| `BOOKS_DB_ROOT` | no | `/books` — the producer-side root that absolute DB `file_path`s are rooted at (the Go service's container `BOOKS_DIR`). Always parsed as a POSIX path, whatever OS the runner is on. |
 
 **Breaking changes: none** for the existing runner — every new var is optional
 and the defaults preserve current behavior.

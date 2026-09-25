@@ -56,7 +56,7 @@ Environment variables (from systemd EnvironmentFile):
     RUNNER_POLL_INTERVAL_SECONDS  default: 30
     RUNNER_HEARTBEAT_SECONDS    default: 60
     RUNNER_BUSY_FLAG_PATH       default: /tmp/earmark-asr-busy
-    BOOKS_MOUNT                 default: /mnt/media/books (this host's NFS mount)
+    BOOKS_MOUNT                 default: /mnt/media/books (this host's books mount; a UNC path on Windows)
     BOOKS_DB_ROOT               default: /books (root the DB file_path is rooted at,
                                 i.e. the Go producer's container BOOKS_DIR; re-rooted onto BOOKS_MOUNT)
 
@@ -71,6 +71,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -82,7 +83,7 @@ import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any
 
 import psycopg2
@@ -264,7 +265,13 @@ BOOKS_MOUNT: Path = Path(
 # share at BOOKS_MOUNT (a different path), so paths are re-rooted from
 # BOOKS_DB_ROOT onto BOOKS_MOUNT before opening the file. Relative file_paths
 # (the CONTRACT's nominal form) are joined to BOOKS_MOUNT directly.
-BOOKS_DB_ROOT: Path = Path(os.environ.get("BOOKS_DB_ROOT", "/books"))
+# DB file_paths are always POSIX (the producer is a Linux container), whatever OS
+# this runner is on — so the root is a PurePosixPath, never a native Path. On
+# Windows a native Path("/books/...") has no drive, is_absolute() is False, and
+# the re-root would silently be skipped.
+BOOKS_DB_ROOT: PurePosixPath = PurePosixPath(
+    os.environ.get("BOOKS_DB_ROOT", "/books")
+)
 
 # Single-pass vs chunked threshold.
 #
@@ -1013,7 +1020,8 @@ def _fetch_bias_terms(
     any error) so the caller's subsequent heartbeat / mark_done calls are not
     affected.
     """
-    book_dir = os.path.dirname(file_path)
+    # posixpath, not os.path: file_path is a POSIX DB path even on a Windows runner.
+    book_dir = posixpath.dirname(file_path)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -2067,40 +2075,72 @@ def _parse_diarize_output(diar_output: Any) -> list[tuple[float, float, str]]:
     return turns
 
 
-def _resolve_audio_path(file_path: str) -> Path:
-    """Map a DB file_path to this host's local file under BOOKS_MOUNT.
+def _map_db_path(file_path: str, mount: PurePath, db_root: PurePosixPath) -> PurePath:
+    r"""Lexically map a DB file_path onto *mount* (pure — no filesystem access).
 
-    file_path is recorded by the Go producer rooted at its container books mount
-    (BOOKS_DB_ROOT, default /books), e.g. "/books/audio-custom/Author/Book.m4b".
-    This host mounts the same NFS share at BOOKS_MOUNT, so an absolute file_path
-    is re-rooted from BOOKS_DB_ROOT onto BOOKS_MOUNT; a relative file_path (the
-    CONTRACT's nominal form) is joined to BOOKS_MOUNT directly.
+    file_path is always a POSIX path (the Go producer runs in a Linux container),
+    so it is parsed as PurePosixPath regardless of the runner's OS. An absolute
+    file_path is re-rooted from *db_root*; a relative one (the CONTRACT's nominal
+    form) is taken as-is. The components are then joined onto *mount* one by one,
+    so the result uses the mount's own flavour — e.g. a Windows UNC share
+    (PureWindowsPath(r"\\host\books")) yields r"\\host\books\a\b.m4b".
 
-    Naively doing `BOOKS_MOUNT / file_path` is wrong: pathlib discards the base
-    when the right operand is absolute, so a "/books/…" path would resolve to
-    "/books/…" and miss the NFS mount entirely.
-
-    The result is validated to stay under BOOKS_MOUNT, which also rejects any
-    ".." traversal in the stored path.
+    Raises ValueError for an empty path, an absolute path outside *db_root*, any
+    ".." component (traversal), or a component the mount's flavour would not
+    treat as a single plain name (e.g. "C:x" or "a\..\b" on Windows, which
+    would otherwise re-anchor or escape the join).
     """
     if not file_path:
-        # Path("") is Path(".") → would resolve to BOOKS_MOUNT itself (a dir, not
-        # an audio file); reject explicitly rather than fail confusingly in ffprobe.
+        # "" → "." would map to the mount dir itself (a dir, not an audio file);
+        # reject explicitly rather than fail confusingly in ffprobe.
         raise ValueError("file_path must not be empty")
 
-    p = Path(file_path)
+    p = PurePosixPath(file_path)
     if p.is_absolute():
         try:
-            rel = p.relative_to(BOOKS_DB_ROOT)
+            rel = p.relative_to(db_root)
         except ValueError as exc:
             raise ValueError(
                 f"file_path {file_path!r} is absolute but not under "
-                f"BOOKS_DB_ROOT={BOOKS_DB_ROOT}"
+                f"BOOKS_DB_ROOT={db_root}"
             ) from exc
     else:
         rel = p
 
-    audio_path = (BOOKS_MOUNT / rel).resolve()
+    flavour = type(mount)
+    for part in rel.parts:
+        if part == "..":
+            raise ValueError(
+                f"file_path {file_path!r} escapes BOOKS_MOUNT (path traversal)"
+            )
+        parsed = flavour(part)
+        if parsed.anchor or parsed.parts != (part,):
+            raise ValueError(
+                f"file_path {file_path!r} has component {part!r} that is not a "
+                f"single plain name under BOOKS_MOUNT={mount}"
+            )
+    return mount.joinpath(*rel.parts)
+
+
+def _resolve_audio_path(file_path: str) -> Path:
+    r"""Map a DB file_path to this host's local file under BOOKS_MOUNT.
+
+    file_path is recorded by the Go producer rooted at its container books mount
+    (BOOKS_DB_ROOT, default /books), e.g. "/books/audio-custom/Author/Book.m4b".
+    This host mounts the same share at BOOKS_MOUNT (an NFS mount on Linux, a UNC
+    path such as \\nas\books on Windows), so an absolute file_path is
+    re-rooted from BOOKS_DB_ROOT onto BOOKS_MOUNT; a relative file_path is joined
+    to BOOKS_MOUNT directly. See _map_db_path for the lexical mapping.
+
+    Naively doing `BOOKS_MOUNT / file_path` is wrong: on POSIX pathlib discards
+    the base when the right operand is absolute, and on Windows a native
+    Path("/books/…") is not absolute at all, so the re-root is skipped and the
+    result is "<mount>\books\…".
+
+    The result is additionally validated (after resolve()) to stay under
+    BOOKS_MOUNT, which also guards against symlink escapes.
+    """
+    audio_path = Path(_map_db_path(file_path, BOOKS_MOUNT, BOOKS_DB_ROOT)).resolve()
     if not audio_path.is_relative_to(BOOKS_MOUNT.resolve()):
         raise ValueError(
             f"file_path {file_path!r} escapes BOOKS_MOUNT (path traversal)"

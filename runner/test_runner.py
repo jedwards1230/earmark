@@ -17,7 +17,7 @@ import sys
 import tempfile
 import types
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 # ── Stub heavy/optional imports so runner.py imports with no DB or drivers ──────
 os.environ.setdefault("DATABASE_URL", "postgres://test@localhost/test")
@@ -854,7 +854,7 @@ class ResolveAudioPathTests(unittest.TestCase):
         self._mount = runner.BOOKS_MOUNT
         self._dbroot = runner.BOOKS_DB_ROOT
         runner.BOOKS_MOUNT = Path("/mnt/media/books")
-        runner.BOOKS_DB_ROOT = Path("/books")
+        runner.BOOKS_DB_ROOT = PurePosixPath("/books")
 
     def tearDown(self) -> None:
         runner.BOOKS_MOUNT = self._mount
@@ -908,6 +908,83 @@ class ResolveAudioPathTests(unittest.TestCase):
         # Literal ".." inside a filename (not a path component) is not traversal.
         got = runner._resolve_audio_path("/books/audio/file..name.m4b")
         self.assertEqual(got, Path("/mnt/media/books/audio/file..name.m4b"))
+
+
+class MapDbPathWindowsTests(unittest.TestCase):
+    """_map_db_path on a Windows runner (simulated with PureWindowsPath on any OS).
+
+    Regression: a native Windows runner runs with BOOKS_MOUNT set to a UNC
+    share. A native WindowsPath("/books/...") has no drive, so is_absolute() was
+    False, the BOOKS_DB_ROOT re-root was skipped, and every job resolved to
+    \\\\host\\books\\books\\... -> "Audio file not found".
+    """
+
+    MOUNT = PureWindowsPath(r"\\nas\books")
+    DB_ROOT = PurePosixPath("/books")
+
+    def _map(self, file_path: str):
+        return runner._map_db_path(file_path, self.MOUNT, self.DB_ROOT)
+
+    def test_absolute_posix_db_path_is_rerooted_onto_unc_mount(self) -> None:
+        got = self._map(
+            "/books/audio-libation/Neil Postman/Amusing Ourselves to Death [B002V5ISZ6]"
+            "/Amusing Ourselves to Death [B002V5ISZ6] - 03 - Part I\u2215 Chapter 2.m4b"
+        )
+        self.assertEqual(
+            got,
+            PureWindowsPath(
+                r"\\nas\books\audio-libation\Neil Postman"
+                r"\Amusing Ourselves to Death [B002V5ISZ6]"
+                "\\Amusing Ourselves to Death [B002V5ISZ6] - 03 - Part I\u2215 Chapter 2.m4b"
+            ),
+        )
+        # The bug's signature: the DB root must not be duplicated under the mount.
+        self.assertNotIn("books\\books", str(got))
+        self.assertEqual(got.anchor, "\\\\nas\\books\\")
+
+    def test_colon_inside_filename_is_kept_as_one_component(self) -> None:
+        # ":" mid-name is not a drive; the lexical mapping keeps it verbatim
+        # (whether SMB can serve it is a share-config question, not ours).
+        got = self._map("/books/a/Part I: Chapter 2: Media as Epistemology.m4b")
+        self.assertEqual(got.name, "Part I: Chapter 2: Media as Epistemology.m4b")
+        self.assertEqual(got.parent, PureWindowsPath(r"\\nas\books\a"))
+
+    def test_relative_path_is_joined(self) -> None:
+        got = self._map("audio-libation/W. Gibson/Neuromancer/01.mp3")
+        self.assertEqual(
+            got, PureWindowsPath(r"\\nas\books\audio-libation\W. Gibson\Neuromancer\01.mp3")
+        )
+
+    def test_root_mismatch_is_rejected(self) -> None:
+        for bad in ("/etc/passwd", "/bookshelf/file.m4b"):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "not under"):
+                    self._map(bad)
+
+    def test_traversal_is_rejected(self) -> None:
+        for bad in ("/books/../../etc/passwd", "../x.m4b", "audio/../../../x.m4b", ".."):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "escapes BOOKS_MOUNT"):
+                    self._map(bad)
+
+    def test_windows_only_separators_and_drives_are_rejected(self) -> None:
+        # Single POSIX components that Windows would split or re-anchor: a
+        # backslash traversal, a drive-letter prefix, and a UNC-ish name.
+        for bad in ("/books/a\\..\\..\\x.m4b", "/books/C:x.m4b", "/books/a/D:/x.m4b"):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "single plain name"):
+                    self._map(bad)
+
+    def test_empty_string_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            self._map("")
+
+    def test_posix_mount_still_works(self) -> None:
+        # Same helper, Linux runner flavour.
+        got = runner._map_db_path(
+            "/books/a/b.m4b", PurePosixPath("/mnt/media/books"), self.DB_ROOT
+        )
+        self.assertEqual(got, PurePosixPath("/mnt/media/books/a/b.m4b"))
 
 
 class OffsetTimestampsTests(unittest.TestCase):
