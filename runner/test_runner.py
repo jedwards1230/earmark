@@ -11,6 +11,7 @@ module's claim SQL is exercised against a fake cursor, so this runs anywhere:
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -2705,6 +2706,19 @@ class RunnerTmpDirTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "RUNNER_TMP_DIR.*does not exist"):
                 runner._resolve_tmp_dir(missing)
 
+    @unittest.skipIf(
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        "POSIX mode bits; root bypasses them",
+    )
+    def test_read_only_dir_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o500)
+            try:
+                with self.assertRaisesRegex(ValueError, "not writable"):
+                    runner._resolve_tmp_dir(d)
+            finally:
+                os.chmod(d, 0o700)
+
     def test_file_instead_of_dir_fails(self) -> None:
         with tempfile.NamedTemporaryFile() as f:
             with self.assertRaisesRegex(ValueError, "not a directory"):
@@ -2722,6 +2736,12 @@ class RunnerTmpDirTests(unittest.TestCase):
         # POSIX has no MAX_PATH of that kind: never rejected.
         runner._check_tmp_dir_length(PurePosixPath("/" + "d" * 400))
 
+    @unittest.skipUnless(
+        # PathFinder, not importlib.util.find_spec: psycopg2 is stubbed in
+        # sys.modules above, and this asks whether the REAL one is installed.
+        importlib.machinery.PathFinder.find_spec("psycopg2"),
+        "needs a real psycopg2: the subprocess imports runner.py unstubbed",
+    )
     def test_startup_and_self_check_fail_on_missing_dir(self) -> None:
         """Module import (so both service start and --self-check) must fail on a
         bad RUNNER_TMP_DIR instead of letting every job fail at mkstemp."""
@@ -2795,13 +2815,20 @@ class BiasPhrasesFileTests(unittest.TestCase):
         provider = runner.NeMoParakeetProvider()
         provider._asr_model = mock.MagicMock()
         provider._diarize_model = None
+        real_fdopen = os.fdopen
         with tempfile.TemporaryDirectory() as d:
             runner.RUNNER_TMP_DIR = Path(d)
             with mock.patch.object(runner, "_apply_boosting_config",
                                    side_effect=capture_apply), \
                  mock.patch.object(runner, "_clear_boosting_config"), \
-                 mock.patch.object(runner, "_transcribe_file", return_value={}):
+                 mock.patch.object(runner, "_transcribe_file", return_value={}), \
+                 mock.patch.object(runner.os, "fdopen",
+                                   side_effect=lambda *a, **k: real_fdopen(*a, **k)) as fdo:
                 provider.transcribe(Path("/fake/file.wav"), bias_terms=terms)
+            # The encoding must be explicit: on Linux CI the locale default is
+            # already UTF-8, so the bytes alone would not catch a regression.
+            self.assertEqual(fdo.call_args.kwargs.get("encoding"), "utf-8")
+            self.assertEqual(fdo.call_args.kwargs.get("newline"), "\n")
             self.assertEqual(Path(seen["path"]).parent, Path(d))  # type: ignore[arg-type]
             self.assertEqual(
                 seen["bytes"], ("\n".join(terms) + "\n").encode("utf-8")
@@ -2900,9 +2927,20 @@ class ResolveAudioPathExtendedTests(unittest.TestCase):
         finally:
             runner.BOOKS_MOUNT, runner.BOOKS_DB_ROOT = saved
         self.assertEqual(got, Path("/mnt/media/books/a/b.m4b"))
-        # mapped (pre-resolve), resolved audio path, resolved mount.
-        self.assertEqual(len(calls), 3)
+        # The mount side of the guard goes through the helper too.
         self.assertIn(Path("/mnt/media/books"), calls)
+
+    def test_windows_containment_mixed_prefix_and_case(self) -> None:
+        r"""What the double conversion is for: resolve() may hand back the audio
+        path prefixed (and in the server's case) but the mount unprefixed. Both
+        converted, containment holds; unconverted, it would not."""
+        W = PureWindowsPath
+        aud = runner._extended_length_path(W(r"\\?\UNC\FileServer\Books\a\b.m4b"))
+        mnt = runner._extended_length_path(W(r"\\fileserver\books"))
+        self.assertTrue(aud.is_relative_to(mnt))
+        self.assertFalse(aud.is_relative_to(W(r"\\fileserver\books")))
+        other = runner._extended_length_path(W(r"\\fileserver\private"))
+        self.assertFalse(aud.is_relative_to(other))
 
 
 class AudioProbeFailureTests(unittest.TestCase):
@@ -2959,6 +2997,7 @@ class AudioProbeFailureTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not valid JSON"):
                 runner._audio_probe(Path("/fake/x.m4b"))
 
+    @unittest.skipIf(os.name == "nt", "fake ffprobe is a shebang script")
     def test_real_process_non_ascii_tags(self) -> None:
         """End to end through a real child process: a fake ffprobe on PATH emits
         UTF-8 JSON with the curly-quote title that failed on Windows."""
@@ -2995,15 +3034,16 @@ class WindowsProcessTests(unittest.TestCase):
     """Self-update helpers that assumed POSIX process semantics."""
 
     def test_process_user_without_getuid(self) -> None:
+        import unittest.mock as mock
+
         had = hasattr(os, "getuid")
         saved = getattr(os, "getuid", None)
         try:
             if had:
                 del os.getuid  # type: ignore[attr-defined]
-            os.environ["USERNAME"] = "svc-asr"
-            self.assertEqual(runner._process_user(), "user=svc-asr")
+            with mock.patch.dict(os.environ, {"USERNAME": "svc-asr"}):
+                self.assertEqual(runner._process_user(), "user=svc-asr")
         finally:
-            os.environ.pop("USERNAME", None)
             if had:
                 os.getuid = saved  # type: ignore[attr-defined,assignment]
         if had:

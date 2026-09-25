@@ -58,9 +58,10 @@ Environment variables (systemd EnvironmentFile on Linux, the service XML on Wind
     RUNNER_BUSY_FLAG_PATH       default: /tmp/earmark-asr-busy
     RUNNER_TMP_DIR              default: tempfile.gettempdir() (/tmp on Linux, %TEMP% on Windows).
                                 Where the mono/chunk WAVs and the biasing phrases file are
-                                created (mkstemp, owner-only). Must already exist, and on
-                                Windows be short enough that temp paths stay under MAX_PATH;
-                                otherwise startup and --self-check fail.
+                                created (mkstemp: 0600 on POSIX, directory ACL on Windows);
+                                when set, also Python's tempfile.tempdir. Must already exist
+                                and be writable, and on Windows be short enough that temp paths
+                                stay under MAX_PATH; otherwise startup and --self-check fail.
     BOOKS_MOUNT                 default: /mnt/media/books (this host's books mount; a UNC path on Windows)
     BOOKS_DB_ROOT               default: /books (root the DB file_path is rooted at,
                                 i.e. the Go producer's container BOOKS_DIR; re-rooted onto BOOKS_MOUNT)
@@ -300,7 +301,7 @@ def _resolve_tmp_dir(raw: str | None) -> Path:
     --self-check loudly instead of failing every job at mkstemp), otherwise
     tempfile.gettempdir(): /tmp on Linux unless TMPDIR/TEMP/TMP say otherwise,
     and the service account's %TEMP% on Windows, where "/tmp" means C:\tmp and
-    does not exist. Always returned absolute, since the paths built from it are
+    does not exist. It must be writable. Always returned absolute, since the paths built from it are
     handed to ffmpeg and NeMo.
     """
     if raw is None or not raw.strip():
@@ -311,18 +312,27 @@ def _resolve_tmp_dir(raw: str | None) -> Path:
             raise ValueError(
                 f"RUNNER_TMP_DIR={raw!r} does not exist or is not a directory"
             )
+        if not os.access(tmp_dir, os.W_OK):
+            raise ValueError(f"RUNNER_TMP_DIR={raw!r} is not writable by this process")
     tmp_dir = Path(os.path.abspath(tmp_dir))
     _check_tmp_dir_length(tmp_dir)
     return tmp_dir
 
 
 # Temp files (mono downmix, chunk windows, biasing phrases) are created here with
-# tempfile.mkstemp, which opens them O_EXCL with mode 0o600 (owner-only) on POSIX;
-# on Windows the file inherits the directory's ACL, and the service account's own
-# %TEMP% is private to it.
+# tempfile.mkstemp, which opens them O_EXCL with mode 0o600 (owner-only) on POSIX.
+# On Windows the file inherits the directory's ACL: the service account's own
+# %TEMP% is private to it, but if its profile is not loaded %TEMP% can fall back
+# to a shared dir — set RUNNER_TMP_DIR to a directory only the account can read.
 RUNNER_TMP_DIR: Path = _resolve_tmp_dir(os.environ.get("RUNNER_TMP_DIR"))
+if os.environ.get("RUNNER_TMP_DIR", "").strip():
+    # Also route NeMo's own tempfile use (transcribe manifests) here, so an
+    # explicit RUNNER_TMP_DIR covers every temp file this process creates.
+    tempfile.tempdir = str(RUNNER_TMP_DIR)
+# Made absolute here: on Windows the mount is converted to an extended-length
+# "\\?\" path (see _resolve_audio_path), which must be absolute.
 BOOKS_MOUNT: Path = Path(
-    os.environ.get("BOOKS_MOUNT", "/mnt/media/books")
+    os.path.abspath(os.environ.get("BOOKS_MOUNT", "/mnt/media/books"))
 )
 # Producer-side root the DB file_path is rooted at. The Go monitor records
 # file_path rooted at its container books mount (BOOKS_DIR, default /books) —
@@ -958,13 +968,12 @@ def _self_check_file(path: Path) -> tuple[bool, str]:
         for k, v in os.environ.items()
         if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
     }
-    # Pin the child's stdio to UTF-8 and decode it as such, so a traceback naming
-    # a non-ASCII path reads the same on Windows (where piped stdio otherwise
-    # uses the ANSI code page) as on Linux.
-    check_env["PYTHONIOENCODING"] = "utf-8"
     try:
         proc = subprocess.run(
-            [sys.executable, "-I", str(path), "--self-check"],
+            # -X utf8: the child's piped stdio is UTF-8 on Windows too (where it
+            # would otherwise be the ANSI code page), matching the decode below.
+            # A -X option, not PYTHONIOENCODING, because -I ignores PYTHON* env.
+            [sys.executable, "-I", "-X", "utf8", str(path), "--self-check"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -2194,6 +2203,8 @@ def _assign_speakers(
     log.info("Running NeMo Sortformer diarization on %s", audio_path)
 
     # MUST VERIFY ON THE GPU HOST: correct NeMo 2.7 Sortformer API.
+    # NOT verified: on Windows audio_path is the extended-length ("\\?\") source
+    # path, not a plain 16 kHz mono WAV like the ASR model receives.
     diar_output = diarize_model.diarize([str(audio_path)])
 
     # Parse diarization output into a list of (start, end, speaker) turns.
