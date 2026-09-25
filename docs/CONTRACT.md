@@ -1207,7 +1207,9 @@ vars are new and **optional** — see §2.13 for the vocabulary.
 | `ASR_DIARIZE` | no | `false` (default). Set `true` to run speaker diarization (e.g. NeMo Sortformer) for multi-voice/full-cast titles. **Global** (per-job diarization is a deferred Phase-3 concern). |
 | `ASR_COMPUTE_TYPE` | no | `bfloat16` (native on RTX 5090 / Blackwell) |
 | `ASR_CHUNK_THRESHOLD_SECONDS` | no | `3600` — single-pass below this duration; chunked/buffered inference above |
-| `BOOKS_MOUNT` | no | `/srv/audiobooks` (NFS export path on the storage host) |
+| `BOOKS_MOUNT` | no | `/mnt/media/books` — this host's mount of the books share (an NFS path on Linux; a UNC path such as `\\nas\books` on a native Windows runner). DB `file_path`s are re-rooted onto it. |
+| `BOOKS_DB_ROOT` | no | `/books` — the producer-side root that absolute DB `file_path`s are rooted at (the Go service's container `BOOKS_DIR`). Always parsed as a POSIX path, whatever OS the runner is on. |
+| `BOOKS_PATH_ENCODING` | no | `none` (default) or `sfm`; any other value fails startup. `sfm` encodes NTFS-illegal characters in each re-rooted path component (never the `BOOKS_MOUNT` prefix) to the Services-for-Mac private-use code points: U+0001–U+001F → U+F001–U+F01F, `"` → U+F020, `*` → U+F021, `:` → U+F022, `<` → U+F023, `>` → U+F024, `?` → U+F025, `\` → U+F026, `\|` → U+F027. This is Samba's `macos_string_replace_map` (`source3/lib/string_replace.c`), which `vfs_fruit` installs as `catia:mappings` under `fruit:encoding = native`. As in Samba, there is no trailing-space or trailing-period rule. Use it when a Windows runner reads a share configured that way, so names containing `:` etc. resolve. |
 
 **Breaking changes: none** for the existing runner — every new var is optional
 and the defaults preserve current behavior.

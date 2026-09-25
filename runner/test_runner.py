@@ -17,7 +17,7 @@ import sys
 import tempfile
 import types
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 # ── Stub heavy/optional imports so runner.py imports with no DB or drivers ──────
 os.environ.setdefault("DATABASE_URL", "postgres://test@localhost/test")
@@ -854,7 +854,7 @@ class ResolveAudioPathTests(unittest.TestCase):
         self._mount = runner.BOOKS_MOUNT
         self._dbroot = runner.BOOKS_DB_ROOT
         runner.BOOKS_MOUNT = Path("/mnt/media/books")
-        runner.BOOKS_DB_ROOT = Path("/books")
+        runner.BOOKS_DB_ROOT = PurePosixPath("/books")
 
     def tearDown(self) -> None:
         runner.BOOKS_MOUNT = self._mount
@@ -908,6 +908,171 @@ class ResolveAudioPathTests(unittest.TestCase):
         # Literal ".." inside a filename (not a path component) is not traversal.
         got = runner._resolve_audio_path("/books/audio/file..name.m4b")
         self.assertEqual(got, Path("/mnt/media/books/audio/file..name.m4b"))
+
+
+class MapDbPathWindowsTests(unittest.TestCase):
+    """_map_db_path on a Windows runner (simulated with PureWindowsPath on any OS).
+
+    Regression: a native Windows runner runs with BOOKS_MOUNT set to a UNC
+    share. A native WindowsPath("/books/...") has no drive, so is_absolute() was
+    False, the BOOKS_DB_ROOT re-root was skipped, and every job resolved to
+    \\\\host\\books\\books\\... -> "Audio file not found".
+    """
+
+    MOUNT = PureWindowsPath(r"\\nas\books")
+    DB_ROOT = PurePosixPath("/books")
+
+    def _map(self, file_path: str):
+        return runner._map_db_path(file_path, self.MOUNT, self.DB_ROOT)
+
+    def test_absolute_posix_db_path_is_rerooted_onto_unc_mount(self) -> None:
+        got = self._map(
+            "/books/audio-libation/Neil Postman/Amusing Ourselves to Death [B002V5ISZ6]"
+            "/Amusing Ourselves to Death [B002V5ISZ6] - 03 - Part I\u2215 Chapter 2.m4b"
+        )
+        self.assertEqual(
+            got,
+            PureWindowsPath(
+                r"\\nas\books\audio-libation\Neil Postman"
+                r"\Amusing Ourselves to Death [B002V5ISZ6]"
+                "\\Amusing Ourselves to Death [B002V5ISZ6] - 03 - Part I\u2215 Chapter 2.m4b"
+            ),
+        )
+        # The bug's signature: the DB root must not be duplicated under the mount.
+        self.assertNotIn("books\\books", str(got))
+        self.assertEqual(got.anchor, "\\\\nas\\books\\")
+
+    def test_colon_inside_filename_is_kept_as_one_component(self) -> None:
+        # ":" mid-name is not a drive; the lexical mapping keeps it verbatim
+        # (whether SMB can serve it is a share-config question, not ours).
+        got = self._map("/books/a/Part I: Chapter 2: Media as Epistemology.m4b")
+        self.assertEqual(got.name, "Part I: Chapter 2: Media as Epistemology.m4b")
+        self.assertEqual(got.parent, PureWindowsPath(r"\\nas\books\a"))
+
+    def test_relative_path_is_joined(self) -> None:
+        got = self._map("audio-libation/W. Gibson/Neuromancer/01.mp3")
+        self.assertEqual(
+            got, PureWindowsPath(r"\\nas\books\audio-libation\W. Gibson\Neuromancer\01.mp3")
+        )
+
+    def test_root_mismatch_is_rejected(self) -> None:
+        for bad in ("/etc/passwd", "/bookshelf/file.m4b"):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "not under"):
+                    self._map(bad)
+
+    def test_traversal_is_rejected(self) -> None:
+        for bad in ("/books/../../etc/passwd", "../x.m4b", "audio/../../../x.m4b", ".."):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "escapes BOOKS_MOUNT"):
+                    self._map(bad)
+
+    def test_windows_only_separators_and_drives_are_rejected(self) -> None:
+        # Single POSIX components that Windows would split or re-anchor: a
+        # backslash traversal, a drive-letter prefix, and a UNC-ish name.
+        for bad in ("/books/a\\..\\..\\x.m4b", "/books/C:x.m4b", "/books/a/D:/x.m4b"):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "single plain name"):
+                    self._map(bad)
+
+    def test_empty_string_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            self._map("")
+
+    def test_dot_and_empty_components_are_collapsed(self) -> None:
+        # PurePosixPath drops "." and empty parts, so they never reach the
+        # component check; dot-leading/trailing names stay single components.
+        got = self._map("/books/./a//.hidden/b..m4b")
+        self.assertEqual(got, PureWindowsPath(r"\\nas\books\a\.hidden\b..m4b"))
+
+    def test_posix_mount_still_works(self) -> None:
+        # Same helper, Linux runner flavour.
+        got = runner._map_db_path(
+            "/books/a/b.m4b", PurePosixPath("/mnt/media/books"), self.DB_ROOT
+        )
+        self.assertEqual(got, PurePosixPath("/mnt/media/books/a/b.m4b"))
+
+
+class BooksPathEncodingTests(unittest.TestCase):
+    """BOOKS_PATH_ENCODING=sfm: request names as a Samba share with
+    `fruit:encoding = native` (vfs_catia macos_string_replace_map) presents them."""
+
+    MOUNT = PureWindowsPath(r"\\nas\books")
+    DB_ROOT = PurePosixPath("/books")
+    TITLE = (
+        "Amusing Ourselves to Death: Public Discourse in the Age of Show Business"
+        " [B002V5ISZ6]"
+    )
+    FILE = TITLE + " - 03 - Part I: Chapter 2: Media as Epistemology.m4b"
+
+    def _map(self, file_path: str, encoding: str):
+        return runner._map_db_path(file_path, self.MOUNT, self.DB_ROOT, encoding)
+
+    def test_real_title_colons_in_dir_and_file_are_encoded(self) -> None:
+        got = self._map(f"/books/audio-libation/Neil Postman/{self.TITLE}/{self.FILE}", "sfm")
+        self.assertEqual(
+            got,
+            PureWindowsPath(
+                r"\\nas\books\audio-libation\Neil Postman",
+                self.TITLE.replace(":", "\uf022"),
+                self.FILE.replace(":", "\uf022"),
+            ),
+        )
+        # Only the relative components are encoded; the mount prefix is intact.
+        self.assertEqual(got.anchor, "\\\\nas\\books\\")
+        self.assertNotIn(":", str(got))
+
+    def test_none_is_passthrough(self) -> None:
+        got = self._map(f"/books/a/{self.FILE}", "none")
+        self.assertEqual(got.name, self.FILE)
+
+    def test_division_slash_is_untouched(self) -> None:
+        # U+2215 is what Libation writes for "/" in titles; it is not in the map.
+        got = self._map("/books/a/AC\u2215DC: Live.m4b", "sfm")
+        self.assertEqual(got.name, "AC\u2215DC\uf022 Live.m4b")
+
+    def test_full_sfm_table(self) -> None:
+        # Samba source3/lib/string_replace.c macos_string_replace_map.
+        expected = {
+            '"': "\uf020", "*": "\uf021", ":": "\uf022", "<": "\uf023",
+            ">": "\uf024", "?": "\uf025", "\\": "\uf026", "|": "\uf027",
+            "\x01": "\uf001", "\x1f": "\uf01f",
+        }
+        for raw, enc in expected.items():
+            with self.subTest(char=hex(ord(raw))):
+                self.assertEqual(runner._sfm_encode(f"a{raw}b"), f"a{enc}b")
+        # Everything outside the map, incl. "/" handling chars, is untouched.
+        self.assertEqual(runner._sfm_encode("plain name [1].m4b"), "plain name [1].m4b")
+
+    def test_trailing_dot_and_space_are_not_mapped(self) -> None:
+        # Samba's map has no trailing-char rule (unlike Apple's 0xF028/0xF029).
+        got = self._map("/books/Vol. 2./Chapter one .m4b ", "sfm")
+        self.assertEqual(got.parts[-2:], ("Vol. 2.", "Chapter one .m4b "))
+
+    def test_backslash_is_encoded_not_split_under_sfm(self) -> None:
+        # Raw "\\" would be a separator on Windows; encoded it is one plain name.
+        got = self._map("/books/a/b\\c.m4b", "sfm")
+        self.assertEqual(got.name, "b\uf026c.m4b")
+
+    def test_traversal_still_rejected_under_sfm(self) -> None:
+        for bad in ("/books/../x.m4b", "a/../../x.m4b"):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "escapes BOOKS_MOUNT"):
+                    self._map(bad, "sfm")
+
+    def test_drive_prefix_is_safe_under_sfm_but_rejected_under_none(self) -> None:
+        self.assertEqual(self._map("/books/C:x.m4b", "sfm").name, "C\uf022x.m4b")
+        with self.assertRaisesRegex(ValueError, "single plain name"):
+            self._map("/books/C:x.m4b", "none")
+
+    def test_parse_env_value(self) -> None:
+        self.assertEqual(runner._parse_books_path_encoding(None), "none")
+        self.assertEqual(runner._parse_books_path_encoding(""), "none")
+        self.assertEqual(runner._parse_books_path_encoding(" SFM "), "sfm")
+        for bad in ("catia", "native", "utf8"):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(ValueError, "BOOKS_PATH_ENCODING=.*invalid"):
+                    runner._parse_books_path_encoding(bad)
 
 
 class OffsetTimestampsTests(unittest.TestCase):
