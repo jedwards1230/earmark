@@ -2358,6 +2358,11 @@ def _resolve_audio_path(file_path: str) -> Path:
     mapped = Path(
         _map_db_path(file_path, BOOKS_MOUNT, BOOKS_DB_ROOT, BOOKS_PATH_ENCODING)
     )
+    # Prefix BEFORE resolve() too: resolve() (ntpath.realpath) opens the path to
+    # follow links, and an unprefixed path of 260+ chars cannot be opened, so it
+    # would come back unresolved (symlinks not followed). A prefixed input is
+    # resolved and returned still prefixed. The outer call is then a no-op
+    # safety net. Both are no-ops on POSIX.
     audio_path = _extended_length_path(_extended_length_path(mapped).resolve())
     mount_root = _extended_length_path(BOOKS_MOUNT.resolve())
     if not audio_path.is_relative_to(mount_root):
