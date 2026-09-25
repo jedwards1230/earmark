@@ -156,7 +156,7 @@ The ones you are most likely to set:
 | `BOOKS_DIR` | `/books` | Library root the monitor walks; mounted read-only in production |
 | `SCAN_INTERVAL` | `1h` | How often to re-walk `BOOKS_DIR`. fsnotify misses writes made by another NFS client, so this walk is what actually finds new books. `0` disables it |
 | `CHUNK_SIZE` | `512` | Target tokens per chunk |
-| `AI_ENDPOINTS` | — | JSON array of OpenAI-compatible endpoints: `{id, type: embeddings\|chat, backend, baseURL, model}`. When set, `AI_ROLES` is required and the `EMBEDDINGS_*` vars are ignored. A malformed value is fatal |
+| `AI_ENDPOINTS` | — | JSON array of OpenAI-compatible endpoints: `{id, type: embeddings\|chat, backend, baseURL, model, apiKeyEnv?}`. `apiKeyEnv` names the env var holding a bearer token for an authenticated gateway such as LiteLLM (the token itself never goes in this JSON). When set, `AI_ROLES` is required and the `EMBEDDINGS_*` vars are ignored. A malformed value is fatal |
 | `AI_ROLES` | — | JSON mapping roles to endpoint ids: `{"embeddings": "…", "eval": "…"}`. `embeddings` is required whenever `AI_ENDPOINTS` is set |
 | `EMBEDDINGS_BASE_URL` | `http://ollama:11434/v1` | **Deprecated** — synthesized into a `_legacy` endpoint when `AI_ENDPOINTS` is unset |
 | `EMBEDDINGS_MODEL` | `nomic-embed-text` | **Deprecated.** 768-dimension vectors |

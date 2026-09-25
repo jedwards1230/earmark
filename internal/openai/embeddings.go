@@ -50,10 +50,18 @@ type Embeddings struct {
 // preserve the previous behavior.
 func NewEmbeddings(cfg *config.Config) *Embeddings {
 	baseURL, model := cfg.EmbeddingsBaseURL, cfg.EmbeddingsModel
+	// Ollama ignores the bearer token but the client always sends one; keep the
+	// "ollama" placeholder when no key is configured so existing deployments
+	// send byte-identical requests. An authenticated gateway (e.g. LiteLLM)
+	// gets the key resolved from the endpoint's apiKeyEnv.
+	apiKey := "ollama"
 	if emb, ok := cfg.EmbeddingsEndpoint(); ok {
 		baseURL, model = emb.BaseURL, emb.Model
+		if emb.APIKey != "" {
+			apiKey = emb.APIKey
+		}
 	}
-	oaiCfg := openai.DefaultConfig("ollama") // key value unused by Ollama but required by the client
+	oaiCfg := openai.DefaultConfig(apiKey)
 	oaiCfg.BaseURL = baseURL
 	client := openai.NewClientWithConfig(oaiCfg)
 	return &Embeddings{

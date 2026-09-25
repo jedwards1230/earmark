@@ -35,7 +35,7 @@ func TestSortedOptions(t *testing.T) {
 // fakeEndpointProber returns a per-baseURL canned probe for view tests.
 type fakeEndpointProber struct{ byURL map[string]endpointProbe }
 
-func (f fakeEndpointProber) Probe(_ context.Context, baseURL, _ string) endpointProbe {
+func (f fakeEndpointProber) Probe(_ context.Context, baseURL, _, _ string) endpointProbe {
 	return f.byURL[baseURL]
 }
 
@@ -126,9 +126,63 @@ func TestHTTPEndpointProber_Ready(t *testing.T) {
 	defer srv.Close()
 
 	p := newHTTPEndpointProber(2*time.Second, 5*time.Second)
-	got := p.Probe(context.Background(), srv.URL+"/v1", "nomic-embed-text")
+	got := p.Probe(context.Background(), srv.URL+"/v1", "nomic-embed-text", "")
 	assert.True(t, got.Probed)
 	assert.Equal(t, epStateReady, got.State)
+}
+
+// An endpoint behind an authenticated gateway (LiteLLM) must be probed with
+// its bearer token, or the gateway's 401 reads as offline. No key → no header,
+// so an Ollama probe is unchanged.
+func TestHTTPEndpointProber_AuthorizationHeader(t *testing.T) {
+	cases := []struct {
+		name     string
+		apiKey   string
+		wantAuth string
+		want     endpointProbeState
+	}{
+		{name: "key sends bearer", apiKey: "sk-litellm", wantAuth: "Bearer sk-litellm", want: epStateReady},
+		{name: "no key sends no header", apiKey: "", wantAuth: "", want: epStateOffline},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				if gotAuth != "Bearer sk-litellm" {
+					w.WriteHeader(http.StatusUnauthorized) // gateway behavior
+					return
+				}
+				_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+			}))
+			defer srv.Close()
+
+			p := newHTTPEndpointProber(2*time.Second, 5*time.Second)
+			got := p.Probe(context.Background(), srv.URL+"/v1", "m", tc.apiKey)
+			assert.Equal(t, tc.wantAuth, gotAuth)
+			assert.Equal(t, tc.want, got.State)
+		})
+	}
+}
+
+// The cache separates the same baseURL probed with different keys, so a
+// keyless probe's 401 can't mask a keyed endpoint as offline (or vice versa).
+func TestHTTPEndpointProber_CacheSeparatesKeys(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Header.Get("Authorization") == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+	}))
+	defer srv.Close()
+
+	p := newHTTPEndpointProber(2*time.Second, 1*time.Hour)
+	assert.Equal(t, epStateOffline, p.Probe(context.Background(), srv.URL+"/v1", "m", "").State)
+	assert.Equal(t, epStateReady, p.Probe(context.Background(), srv.URL+"/v1", "m", "sk-a").State)
+	assert.Equal(t, 2, hits)
 }
 
 func TestHTTPEndpointProber_ModelMissing(t *testing.T) {
@@ -138,7 +192,7 @@ func TestHTTPEndpointProber_ModelMissing(t *testing.T) {
 	defer srv.Close()
 
 	p := newHTTPEndpointProber(2*time.Second, 5*time.Second)
-	got := p.Probe(context.Background(), srv.URL+"/v1", "nomic-embed-text")
+	got := p.Probe(context.Background(), srv.URL+"/v1", "nomic-embed-text", "")
 	assert.Equal(t, epStateModelMissing, got.State)
 }
 
@@ -150,7 +204,7 @@ func TestHTTPEndpointProber_EmptyListIsReady(t *testing.T) {
 
 	p := newHTTPEndpointProber(2*time.Second, 5*time.Second)
 	// Up + 200 but no model list → up-ness wins → ready.
-	got := p.Probe(context.Background(), srv.URL+"/v1", "nomic-embed-text")
+	got := p.Probe(context.Background(), srv.URL+"/v1", "nomic-embed-text", "")
 	assert.Equal(t, epStateReady, got.State)
 }
 
@@ -161,7 +215,7 @@ func TestHTTPEndpointProber_Non200IsOffline(t *testing.T) {
 	defer srv.Close()
 
 	p := newHTTPEndpointProber(2*time.Second, 5*time.Second)
-	got := p.Probe(context.Background(), srv.URL+"/v1", "m")
+	got := p.Probe(context.Background(), srv.URL+"/v1", "m", "")
 	assert.True(t, got.Probed)
 	assert.Equal(t, epStateOffline, got.State)
 }
@@ -169,13 +223,13 @@ func TestHTTPEndpointProber_Non200IsOffline(t *testing.T) {
 func TestHTTPEndpointProber_UnreachableIsOffline(t *testing.T) {
 	p := newHTTPEndpointProber(500*time.Millisecond, 5*time.Second)
 	// Reserved TEST-NET-1 address; connection should fail fast.
-	got := p.Probe(context.Background(), "http://192.0.2.1:9/v1", "m")
+	got := p.Probe(context.Background(), "http://192.0.2.1:9/v1", "m", "")
 	assert.Equal(t, epStateOffline, got.State)
 }
 
 func TestHTTPEndpointProber_RejectsNonHTTPScheme(t *testing.T) {
 	p := newHTTPEndpointProber(2*time.Second, 5*time.Second)
-	got := p.Probe(context.Background(), "file:///etc/passwd", "m")
+	got := p.Probe(context.Background(), "file:///etc/passwd", "m", "")
 	assert.Equal(t, epStateOffline, got.State)
 }
 
@@ -188,8 +242,8 @@ func TestHTTPEndpointProber_CachesPerURL(t *testing.T) {
 	defer srv.Close()
 
 	p := newHTTPEndpointProber(2*time.Second, 1*time.Hour) // long TTL
-	_ = p.Probe(context.Background(), srv.URL+"/v1", "m")
-	_ = p.Probe(context.Background(), srv.URL+"/v1", "m")
+	_ = p.Probe(context.Background(), srv.URL+"/v1", "m", "")
+	_ = p.Probe(context.Background(), srv.URL+"/v1", "m", "")
 	assert.Equal(t, 1, hits, "second probe within TTL must hit the cache, not the server")
 }
 

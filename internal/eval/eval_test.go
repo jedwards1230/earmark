@@ -309,6 +309,61 @@ func TestResolveChatClient_RegistryRoleWins(t *testing.T) {
 	}
 }
 
+// The bearer token precedence on the registry path: the key resolved from
+// apiKeyEnv, then options["apiKey"] (back-compat). EVAL_CHAT_API_KEY belongs to
+// the env-var fallback only and never leaks into a registry-bound judge.
+func TestResolveChatClient_APIKeyPrecedence(t *testing.T) {
+	cases := []struct {
+		name    string
+		src     EvalEndpointSource
+		envKey  string
+		wantKey string
+	}{
+		{
+			name:    "resolved key beats options apiKey",
+			src:     fakeSource{ok: true, ep: EvalEndpoint{BaseURL: "http://gw:4000/v1", Model: "m", APIKey: "sk-env", Options: map[string]string{"apiKey": "sk-opt"}}},
+			envKey:  "sk-fallback",
+			wantKey: "sk-env",
+		},
+		{
+			name:    "options apiKey when no resolved key",
+			src:     fakeSource{ok: true, ep: EvalEndpoint{BaseURL: "http://gw:4000/v1", Model: "m", Options: map[string]string{"apiKey": "sk-opt"}}},
+			envKey:  "sk-fallback",
+			wantKey: "sk-opt",
+		},
+		{
+			name:    "registry endpoint with no key sends none",
+			src:     fakeSource{ok: true, ep: EvalEndpoint{BaseURL: "http://gw:4000/v1", Model: "m"}},
+			envKey:  "sk-fallback",
+			wantKey: "",
+		},
+		{
+			name:    "env fallback uses EVAL_CHAT_API_KEY",
+			src:     fakeSource{ok: false},
+			envKey:  "sk-fallback",
+			wantKey: "sk-fallback",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EVAL_CHAT_BASE_URL", "http://env-fallback:9000/v1")
+			t.Setenv("EVAL_CHAT_MODEL", "env-model")
+			t.Setenv("EVAL_CHAT_API_KEY", tc.envKey)
+			c, err := ResolveChatClient(tc.src)
+			if err != nil {
+				t.Fatalf("ResolveChatClient: %v", err)
+			}
+			oc, ok := c.(*openAIChatClient)
+			if !ok {
+				t.Fatalf("want *openAIChatClient, got %T", c)
+			}
+			if oc.apiKey != tc.wantKey {
+				t.Errorf("apiKey = %q, want %q", oc.apiKey, tc.wantKey)
+			}
+		})
+	}
+}
+
 // No eval role bound → fall back to the EVAL_CHAT_* env vars.
 func TestResolveChatClient_FallsBackToEnvWhenNoRole(t *testing.T) {
 	t.Setenv("EVAL_CHAT_BASE_URL", "http://env-fallback:9000/v1")

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	neturl "net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -104,6 +105,14 @@ type AIEndpoint struct {
 	// Known keys: temperature, max_tokens, top_p. Unknown keys are forwarded
 	// as-is so future backends don't require code changes.
 	Options map[string]string `json:"options,omitempty"`
+	// APIKeyEnv names the environment variable holding this endpoint's bearer
+	// token (e.g. a LiteLLM virtual key). It is the variable NAME, not the
+	// secret: AI_ENDPOINTS is plaintext and its options are rendered on the
+	// dashboard, so the token itself never goes there. Empty = no key.
+	APIKeyEnv string `json:"apiKeyEnv,omitempty"`
+	// APIKey is the token resolved from APIKeyEnv by parseAIEndpoints. It is
+	// never serialized (json:"-"), so marshalling an endpoint cannot leak it.
+	APIKey string `json:"-"`
 }
 
 // AIRoles binds function names to endpoint IDs. The "embeddings" role is
@@ -211,8 +220,33 @@ func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
 		if ep.Model == "" {
 			return nil, fmt.Errorf("%s (%q): model is required", where, ep.ID)
 		}
+		if ep.APIKeyEnv != "" {
+			key, err := resolveAPIKeyEnv(ep.APIKeyEnv)
+			if err != nil {
+				return nil, fmt.Errorf("%s (%q): %w", where, ep.ID, err)
+			}
+			eps[i].APIKey = key
+		}
 	}
 	return eps, nil
+}
+
+// envNameRE matches a conventional environment variable name.
+var envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// resolveAPIKeyEnv reads an endpoint's bearer token from the named env var.
+// An unset or empty var is an error rather than "no key": an endpoint that
+// declares apiKeyEnv sits behind a gateway that requires one, so running
+// without it would 401 every call.
+func resolveAPIKeyEnv(name string) (string, error) {
+	if !envNameRE.MatchString(name) {
+		return "", fmt.Errorf("apiKeyEnv %q is not a valid environment variable name", name)
+	}
+	key := strings.TrimSpace(os.Getenv(name))
+	if key == "" {
+		return "", fmt.Errorf("apiKeyEnv %q is unset or empty", name)
+	}
+	return key, nil
 }
 
 // parseAIRoles decodes the AI_ROLES JSON object.

@@ -142,7 +142,7 @@ func (s *MCPServer) probeEndpoints(ctx context.Context) map[string]endpointProbe
 	}
 	out := make(map[string]endpointProbe, len(s.cfg.AIEndpoints))
 	for _, ep := range s.cfg.AIEndpoints {
-		out[ep.ID] = s.endpointProber.Probe(ctx, ep.BaseURL, ep.Model)
+		out[ep.ID] = s.endpointProber.Probe(ctx, ep.BaseURL, ep.Model, ep.APIKey)
 	}
 	if len(out) == 0 {
 		return nil

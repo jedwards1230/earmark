@@ -18,6 +18,7 @@ func (s configSource) EvalEndpoint() (EvalEndpoint, bool) {
 	return EvalEndpoint{
 		BaseURL: ep.BaseURL,
 		Model:   ep.Model,
+		APIKey:  ep.APIKey,
 		Options: ep.Options,
 	}, true
 }

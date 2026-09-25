@@ -202,7 +202,7 @@ var demoAIRoles = &config.AIRoles{Embeddings: "embed-1", Eval: "eval-1"}
 // of the base URL so the page renders both states with no network call.
 type demoEndpointProber struct{}
 
-func (demoEndpointProber) Probe(_ context.Context, baseURL, _ string) endpointProbe {
+func (demoEndpointProber) Probe(_ context.Context, baseURL, _, _ string) endpointProbe {
 	if strings.Contains(baseURL, "vllm") {
 		return endpointProbe{Probed: true, State: epStateOffline}
 	}
