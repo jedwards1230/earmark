@@ -40,7 +40,7 @@ clip: 9 × 600 s windows, 8.2 GB peak, 0 non-monotonic word boundaries, words
 spanning 0.96 s → 5399.68 s. NOT yet exercised on hardware: the diarization
 (Sortformer) path — it stays flagged below.
 
-Environment variables (from systemd EnvironmentFile):
+Environment variables (systemd EnvironmentFile on Linux, the service XML on Windows):
     DATABASE_URL                required  PostgreSQL DSN for earmark (earmark-pg)
     ASR_BACKEND                 default: nemo-parakeet (backend selector)
     ASR_FAMILY                  default: nemo-parakeet (CONTRACT §2.13 family id → run_metrics.asr_family)
@@ -56,6 +56,11 @@ Environment variables (from systemd EnvironmentFile):
     RUNNER_POLL_INTERVAL_SECONDS  default: 30
     RUNNER_HEARTBEAT_SECONDS    default: 60
     RUNNER_BUSY_FLAG_PATH       default: /tmp/earmark-asr-busy
+    RUNNER_TMP_DIR              default: tempfile.gettempdir() (/tmp on Linux, %TEMP% on Windows).
+                                Where the mono/chunk WAVs and the biasing phrases file are
+                                created (mkstemp, owner-only). Must already exist, and on
+                                Windows be short enough that temp paths stay under MAX_PATH;
+                                otherwise startup and --self-check fail.
     BOOKS_MOUNT                 default: /mnt/media/books (this host's books mount; a UNC path on Windows)
     BOOKS_DB_ROOT               default: /books (root the DB file_path is rooted at,
                                 i.e. the Go producer's container BOOKS_DIR; re-rooted onto BOOKS_MOUNT)
@@ -73,6 +78,7 @@ from __future__ import annotations
 
 import abc
 import hashlib
+import importlib.util
 import json
 import logging
 import math
@@ -89,8 +95,8 @@ import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path, PurePath, PurePosixPath
-from typing import Any
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from typing import Any, TypeVar
 
 import psycopg2
 import psycopg2.extras
@@ -262,6 +268,59 @@ HEARTBEAT_INTERVAL: int = int(os.environ.get("RUNNER_HEARTBEAT_SECONDS", "60"))
 BUSY_FLAG_PATH: Path = Path(
     os.environ.get("RUNNER_BUSY_FLAG_PATH", "/tmp/earmark-asr-busy")
 )
+
+# Windows' classic MAX_PATH. Paths at or over it fail every filesystem call
+# (open/stat/CreateProcess args included) unless written in the extended-length
+# "\\?\" form — see _extended_length_path.
+_WINDOWS_MAX_PATH: int = 260
+# Headroom a temp *file name* needs under RUNNER_TMP_DIR: the longest is
+# "asr-chunk-<win_idx>-<8 random>.wav" (~30 chars) plus a separator.
+_TMP_NAME_BUDGET: int = 48
+
+
+def _check_tmp_dir_length(tmp_dir: PurePath) -> None:
+    r"""Reject a Windows temp dir so long that the temp files under it would reach
+    MAX_PATH. Temp paths are handed to ffmpeg and NeMo in their plain form (NeMo's
+    audio loaders are not known to accept "\\?\" paths), so the dir has to be
+    short enough for that to be safe rather than silently failing mid-job."""
+    if isinstance(tmp_dir, PureWindowsPath) and (
+        len(str(tmp_dir)) + _TMP_NAME_BUDGET >= _WINDOWS_MAX_PATH
+    ):
+        raise ValueError(
+            f"RUNNER_TMP_DIR {str(tmp_dir)!r} is too long for Windows: temp files "
+            f"under it would reach MAX_PATH ({_WINDOWS_MAX_PATH}); use a directory "
+            f"under {_WINDOWS_MAX_PATH - _TMP_NAME_BUDGET} characters"
+        )
+
+
+def _resolve_tmp_dir(raw: str | None) -> Path:
+    r"""Resolve the directory every runner temp file is created in.
+
+    RUNNER_TMP_DIR when set (it must already exist — a typo fails startup and
+    --self-check loudly instead of failing every job at mkstemp), otherwise
+    tempfile.gettempdir(): /tmp on Linux unless TMPDIR/TEMP/TMP say otherwise,
+    and the service account's %TEMP% on Windows, where "/tmp" means C:\tmp and
+    does not exist. Always returned absolute, since the paths built from it are
+    handed to ffmpeg and NeMo.
+    """
+    if raw is None or not raw.strip():
+        tmp_dir = Path(tempfile.gettempdir())
+    else:
+        tmp_dir = Path(raw.strip())
+        if not tmp_dir.is_dir():
+            raise ValueError(
+                f"RUNNER_TMP_DIR={raw!r} does not exist or is not a directory"
+            )
+    tmp_dir = Path(os.path.abspath(tmp_dir))
+    _check_tmp_dir_length(tmp_dir)
+    return tmp_dir
+
+
+# Temp files (mono downmix, chunk windows, biasing phrases) are created here with
+# tempfile.mkstemp, which opens them O_EXCL with mode 0o600 (owner-only) on POSIX;
+# on Windows the file inherits the directory's ACL, and the service account's own
+# %TEMP% is private to it.
+RUNNER_TMP_DIR: Path = _resolve_tmp_dir(os.environ.get("RUNNER_TMP_DIR"))
 BOOKS_MOUNT: Path = Path(
     os.environ.get("BOOKS_MOUNT", "/mnt/media/books")
 )
@@ -899,11 +958,17 @@ def _self_check_file(path: Path) -> tuple[bool, str]:
         for k, v in os.environ.items()
         if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
     }
+    # Pin the child's stdio to UTF-8 and decode it as such, so a traceback naming
+    # a non-ASCII path reads the same on Windows (where piped stdio otherwise
+    # uses the ANSI code page) as on Linux.
+    check_env["PYTHONIOENCODING"] = "utf-8"
     try:
         proc = subprocess.run(
             [sys.executable, "-I", str(path), "--self-check"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=RUNNER_SELF_UPDATE_TIMEOUT,
             check=False,
             env=check_env,
@@ -915,6 +980,15 @@ def _self_check_file(path: Path) -> tuple[bool, str]:
             :MAX_ERROR_LEN
         ]
     return True, ""
+
+
+def _process_user() -> str:
+    """Identify the account this process runs as, for error messages. os.getuid
+    does not exist on Windows (AttributeError), so fall back to the user name."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        return f"uid={getuid()}"
+    return f"user={os.environ.get('USERNAME', 'unknown')}"
 
 
 def _perform_self_update(desired: str) -> None:
@@ -932,7 +1006,7 @@ def _perform_self_update(desired: str) -> None:
     if not os.access(install_dir, os.W_OK):
         raise RuntimeError(
             f"install dir {install_dir} is not writable by the runner user "
-            f"(uid={os.getuid()}): self-update needs the install dir + runner.py "
+            f"({_process_user()}): self-update needs the install dir + runner.py "
             f"owned by the runner user (see the asr-runner role / earmark#92)"
         )
     data = _fetch_runner_source(desired)
@@ -971,10 +1045,27 @@ def _perform_self_update(desired: str) -> None:
         log.warning("self-update swapped but VERSION file write failed: %s", exc)
 
 
+# Exit status used on Windows in place of an exec (see _reexec): non-zero so the
+# service wrapper's on-failure restart fires. EX_TEMPFAIL — "try again".
+_REEXEC_RESTART_EXIT_CODE: int = 75
+
+
 def _reexec() -> None:
     """Replace this process image with a fresh interpreter running the (now
     swapped) runner file. systemd keeps the unit; the new process reads the new
     VERSION file and reports the new version on its next heartbeat."""
+    if os.name == "nt":
+        # Windows has no exec: os.execv starts a NEW process and exits this one
+        # with status 0. The service wrapper (WinSW) supervises this PID, so a
+        # clean exit reads as "service stopped" — the child it spawned would run
+        # unsupervised, and no restart would fire. Exit non-zero instead, so the
+        # wrapper's on-failure restart relaunches onto the swapped file.
+        log.info(
+            "self-update staged; exiting for the service wrapper to restart "
+            "onto %s (no exec on Windows)",
+            RUNNER_INSTALL_PATH,
+        )
+        sys.exit(_REEXEC_RESTART_EXIT_CODE)
     log.info("re-execing into %s", RUNNER_INSTALL_PATH)
     try:
         os.execv(sys.executable, [sys.executable, str(RUNNER_INSTALL_PATH)])
@@ -1214,6 +1305,12 @@ def _sanitize_probe_text(value: Any, max_len: int) -> str:
     return cleaned
 
 
+def _probe_stderr(stderr: Any) -> str:
+    """ffprobe's stderr, trimmed for an error message (or a placeholder)."""
+    text = stderr.strip() if isinstance(stderr, str) else ""
+    return text[:500] if text else "(no stderr)"
+
+
 def _audio_probe(audio_path: Path) -> dict[str, Any]:
     """
     Return audio metadata via a single ffprobe call.
@@ -1226,21 +1323,49 @@ def _audio_probe(audio_path: Path) -> dict[str, Any]:
         format_name    str     — container format (e.g. "mov,mp4,m4a,3gp,3g2,mj2")
         size_bytes     int     — file size in bytes (from format.size)
     """
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            "-select_streams", "a:0",  # first audio stream only
-            str(audio_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    data = json.loads(result.stdout)
+    # ffprobe writes its JSON as UTF-8 on every platform. Decode it as such
+    # (errors="replace": a stray invalid byte in a tag must not fail the job);
+    # text=True alone decodes with the locale code page — cp1252 on Windows —
+    # which cannot decode bytes such as 0x9D (the tail of UTF-8 U+201D, a
+    # closing curly quote in a title tag). On Windows that decode happens in
+    # subprocess's reader thread, whose exception is swallowed, leaving stdout
+    # None and failing the job as json.loads(None).
+    #
+    # "-v error" (not "quiet") so a failure explains itself on stderr.
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                "-select_streams", "a:0",  # first audio stream only
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"ffprobe failed (exit {exc.returncode}) on {str(audio_path)!r}: "
+            f"{_probe_stderr(exc.stderr)}"
+        ) from exc
+    if not result.stdout or not result.stdout.strip():
+        raise RuntimeError(
+            f"ffprobe produced no output for {str(audio_path)!r}: "
+            f"{_probe_stderr(getattr(result, 'stderr', None))}"
+        )
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"ffprobe output for {str(audio_path)!r} is not valid JSON ({exc}): "
+            f"{_probe_stderr(getattr(result, 'stderr', None))}"
+        ) from exc
 
     fmt = data.get("format", {})
     streams = data.get("streams", [{}])
@@ -1293,7 +1418,9 @@ def _to_mono_wav(audio_path: Path) -> Path:
     sample rate Parakeet-TDT was trained on).  Using ``-y`` (overwrite) is safe
     because the target is a fresh temp file.
     """
-    fd, tmp = tempfile.mkstemp(prefix="asr-mono-", suffix=".wav", dir="/tmp")
+    fd, tmp = tempfile.mkstemp(
+        prefix="asr-mono-", suffix=".wav", dir=RUNNER_TMP_DIR
+    )
     os.close(fd)
     try:
         subprocess.run(
@@ -1790,7 +1917,7 @@ def _cut_window(
     boundaries across all seams.
     """
     fd, tmp = tempfile.mkstemp(
-        prefix=f"asr-chunk-{win_idx}-", suffix=".wav", dir="/tmp"
+        prefix=f"asr-chunk-{win_idx}-", suffix=".wav", dir=RUNNER_TMP_DIR
     )
     os.close(fd)
     try:
@@ -2210,16 +2337,67 @@ def _resolve_audio_path(file_path: str) -> Path:
 
     The result is additionally validated (after resolve()) to stay under
     BOOKS_MOUNT, which also guards against symlink escapes.
+
+    On Windows the result is in extended-length form (see _extended_length_path)
+    so books whose host path reaches MAX_PATH still open. Both sides of the
+    containment check are put in that form after resolve(), because resolve()
+    keeps a "\\?\" prefix it was given but may or may not add one itself; on
+    POSIX both conversions are no-ops.
     """
-    audio_path = Path(
+    mapped = Path(
         _map_db_path(file_path, BOOKS_MOUNT, BOOKS_DB_ROOT, BOOKS_PATH_ENCODING)
-    ).resolve()
-    if not audio_path.is_relative_to(BOOKS_MOUNT.resolve()):
+    )
+    audio_path = _extended_length_path(_extended_length_path(mapped).resolve())
+    mount_root = _extended_length_path(BOOKS_MOUNT.resolve())
+    if not audio_path.is_relative_to(mount_root):
         raise ValueError(
             f"file_path {file_path!r} escapes BOOKS_MOUNT (path traversal): "
             f"resolved to host path {str(audio_path)!r}"
         )
     return audio_path
+
+
+PurePathT = TypeVar("PurePathT", bound=PurePath)
+
+_EXTENDED_PREFIX: str = "\\\\?\\"
+_EXTENDED_UNC_PREFIX: str = "\\\\?\\UNC\\"
+_DEVICE_PREFIX: str = "\\\\.\\"
+
+
+def _extended_length_path(path: PurePathT) -> PurePathT:
+    r"""Return *path* in Windows extended-length form; POSIX paths pass through.
+
+    Windows refuses any path of MAX_PATH (260) characters or more — in os.stat,
+    open, and in the ffprobe/ffmpeg command lines — unless it is written as
+    \\?\C:\... (drive) or \\?\UNC\server\share\... (UNC). A book whose re-rooted
+    and SFM-encoded host path crosses 260 then fails as "Audio file not found"
+    even though it exists. The prefix is applied unconditionally, not only to
+    long paths, so every book takes the same code path.
+
+    The prefix switches off Win32 normalisation: the path is used verbatim, so it
+    must already be absolute, backslash-separated, and free of "." / "..".
+    PureWindowsPath renders "/" as "\" and drops "." components; a relative path
+    or a ".." (which _map_db_path already rejects) raises ValueError here rather
+    than being passed through with a meaning Windows would no longer normalise.
+    Already-prefixed paths (and \\.\ device paths) are returned unchanged, so the
+    conversion is idempotent.
+    """
+    if not isinstance(path, PureWindowsPath):
+        return path
+    text = str(path)
+    if text.startswith((_EXTENDED_PREFIX, _DEVICE_PREFIX)):
+        return path
+    if not path.is_absolute():
+        raise ValueError(
+            f"cannot make an extended-length path from non-absolute {text!r}"
+        )
+    if ".." in path.parts:
+        raise ValueError(
+            f"cannot make an extended-length path from {text!r}: it contains '..'"
+        )
+    if text.startswith("\\\\"):
+        return type(path)(_EXTENDED_UNC_PREFIX + text[2:])
+    return type(path)(_EXTENDED_PREFIX + text)
 
 
 # ---------------------------------------------------------------------------
@@ -2466,7 +2644,11 @@ def _apply_boosting_config(
       - per-stream path (enable_per_stream_biasing) CRASHES TDT word-timestamp
         computation (_compute_offsets_tdt: NoneType) — do NOT use it.
       - inline key_phrases_list=[...] silently NO-OPS — must be a FILE.
-      - use_triton=True enables GPU-accelerated trie traversal (safe on RTX 5090).
+      - use_triton only when Triton is importable (_triton_available): it enables
+        GPU-accelerated trie traversal (safe on RTX 5090), but an explicit True
+        overrides NeMo's own availability check and fails decoding where Triton
+        is not installed — e.g. a native Windows runner, which has no official
+        Triton wheels.
     """
     from omegaconf import open_dict  # type: ignore[import]
     from nemo.collections.asr.parts.context_biasing.boosting_graph_batched import (  # type: ignore[import]
@@ -2478,11 +2660,18 @@ def _apply_boosting_config(
             key_phrases_file=phrases_path,
             context_score=1.0,
             depth_scaling=2.0,  # MUST be 2.0 for TDT (1.0 = Canary-only)
-            use_triton=True,
+            use_triton=_triton_available(),
         )
         model.cfg.decoding.greedy.boosting_tree_alpha = alpha
 
     model.change_decoding_strategy(model.cfg.decoding)
+
+
+def _triton_available() -> bool:
+    """Whether Triton can be imported here — NeMo's own TRITON_AVAILABLE test.
+    BoostingTreeModelConfig.use_triton is a plain bool (no "auto"), so the
+    runner decides instead of hard-coding True."""
+    return importlib.util.find_spec("triton") is not None
 
 
 def _clear_boosting_config(model: Any) -> None:
@@ -2652,12 +2841,20 @@ class NeMoParakeetProvider(ASRProvider):
         # Explicit 0o600: mkstemp guarantees owner-only by default, but an operator
         # umask misconfiguration could widen those bits.  Bias terms are domain
         # terminology from book metadata — defense-in-depth keeps them private.
+        #
+        # UTF-8 + "\n" explicitly: the terms come from book metadata and are often
+        # non-ASCII, and the platform default on Windows is the ANSI code page
+        # (cp1252), which either raises on the write or hands NeMo mojibake. The
+        # file is fully written and CLOSED before NeMo opens it by path — Windows
+        # will not let another open (or the unlink below) touch a file this
+        # process still holds open — and the chmod runs under the fdopen so a
+        # failure there still closes the fd before the unlink.
         fd, phrases_path = tempfile.mkstemp(
-            prefix="asr-bias-", suffix=".txt", dir="/tmp"
+            prefix="asr-bias-", suffix=".txt", dir=RUNNER_TMP_DIR
         )
-        os.chmod(phrases_path, 0o600)
         try:
-            with os.fdopen(fd, "w") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                os.chmod(phrases_path, 0o600)
                 fh.write("\n".join(active_terms) + "\n")
 
             log.info(
