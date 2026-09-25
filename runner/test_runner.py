@@ -993,6 +993,88 @@ class MapDbPathWindowsTests(unittest.TestCase):
         self.assertEqual(got, PurePosixPath("/mnt/media/books/a/b.m4b"))
 
 
+class BooksPathEncodingTests(unittest.TestCase):
+    """BOOKS_PATH_ENCODING=sfm: request names as a Samba share with
+    `fruit:encoding = native` (vfs_catia macos_string_replace_map) presents them."""
+
+    MOUNT = PureWindowsPath(r"\\nas\books")
+    DB_ROOT = PurePosixPath("/books")
+    TITLE = (
+        "Amusing Ourselves to Death: Public Discourse in the Age of Show Business"
+        " [B002V5ISZ6]"
+    )
+    FILE = TITLE + " - 03 - Part I: Chapter 2: Media as Epistemology.m4b"
+
+    def _map(self, file_path: str, encoding: str):
+        return runner._map_db_path(file_path, self.MOUNT, self.DB_ROOT, encoding)
+
+    def test_real_title_colons_in_dir_and_file_are_encoded(self) -> None:
+        got = self._map(f"/books/audio-libation/Neil Postman/{self.TITLE}/{self.FILE}", "sfm")
+        self.assertEqual(
+            got,
+            PureWindowsPath(
+                r"\\nas\books\audio-libation\Neil Postman",
+                self.TITLE.replace(":", "\uf022"),
+                self.FILE.replace(":", "\uf022"),
+            ),
+        )
+        # Only the relative components are encoded; the mount prefix is intact.
+        self.assertEqual(got.anchor, "\\\\nas\\books\\")
+        self.assertNotIn(":", str(got))
+
+    def test_none_is_passthrough(self) -> None:
+        got = self._map(f"/books/a/{self.FILE}", "none")
+        self.assertEqual(got.name, self.FILE)
+
+    def test_division_slash_is_untouched(self) -> None:
+        # U+2215 is what Libation writes for "/" in titles; it is not in the map.
+        got = self._map("/books/a/AC\u2215DC: Live.m4b", "sfm")
+        self.assertEqual(got.name, "AC\u2215DC\uf022 Live.m4b")
+
+    def test_full_sfm_table(self) -> None:
+        # Samba source3/lib/string_replace.c macos_string_replace_map.
+        expected = {
+            '"': "\uf020", "*": "\uf021", ":": "\uf022", "<": "\uf023",
+            ">": "\uf024", "?": "\uf025", "\\": "\uf026", "|": "\uf027",
+            "\x01": "\uf001", "\x1f": "\uf01f",
+        }
+        for raw, enc in expected.items():
+            with self.subTest(char=hex(ord(raw))):
+                self.assertEqual(runner._sfm_encode(f"a{raw}b"), f"a{enc}b")
+        # Everything outside the map, incl. "/" handling chars, is untouched.
+        self.assertEqual(runner._sfm_encode("plain name [1].m4b"), "plain name [1].m4b")
+
+    def test_trailing_dot_and_space_are_not_mapped(self) -> None:
+        # Samba's map has no trailing-char rule (unlike Apple's 0xF028/0xF029).
+        got = self._map("/books/Vol. 2./Chapter one .m4b ", "sfm")
+        self.assertEqual(got.parts[-2:], ("Vol. 2.", "Chapter one .m4b "))
+
+    def test_backslash_is_encoded_not_split_under_sfm(self) -> None:
+        # Raw "\\" would be a separator on Windows; encoded it is one plain name.
+        got = self._map("/books/a/b\\c.m4b", "sfm")
+        self.assertEqual(got.name, "b\uf026c.m4b")
+
+    def test_traversal_still_rejected_under_sfm(self) -> None:
+        for bad in ("/books/../x.m4b", "a/../../x.m4b"):
+            with self.subTest(path=bad):
+                with self.assertRaisesRegex(ValueError, "escapes BOOKS_MOUNT"):
+                    self._map(bad, "sfm")
+
+    def test_drive_prefix_is_safe_under_sfm_but_rejected_under_none(self) -> None:
+        self.assertEqual(self._map("/books/C:x.m4b", "sfm").name, "C\uf022x.m4b")
+        with self.assertRaisesRegex(ValueError, "single plain name"):
+            self._map("/books/C:x.m4b", "none")
+
+    def test_parse_env_value(self) -> None:
+        self.assertEqual(runner._parse_books_path_encoding(None), "none")
+        self.assertEqual(runner._parse_books_path_encoding(""), "none")
+        self.assertEqual(runner._parse_books_path_encoding(" SFM "), "sfm")
+        for bad in ("catia", "native", "utf8"):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(ValueError, "BOOKS_PATH_ENCODING=.*invalid"):
+                    runner._parse_books_path_encoding(bad)
+
+
 class OffsetTimestampsTests(unittest.TestCase):
     """_offset_timestamps rebases per-window timestamps to absolute file time
     and drops entries outside the window's core (de-duplicating seams)."""

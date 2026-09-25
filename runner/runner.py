@@ -59,6 +59,12 @@ Environment variables (from systemd EnvironmentFile):
     BOOKS_MOUNT                 default: /mnt/media/books (this host's books mount; a UNC path on Windows)
     BOOKS_DB_ROOT               default: /books (root the DB file_path is rooted at,
                                 i.e. the Go producer's container BOOKS_DIR; re-rooted onto BOOKS_MOUNT)
+    BOOKS_PATH_ENCODING         default: none. `sfm` encodes the NTFS-illegal characters in each
+                                re-rooted path component (never the BOOKS_MOUNT prefix) to the
+                                Services-for-Mac private-use code points, matching a Samba share
+                                with `fruit:encoding = native` + vfs_catia (e.g. TrueNAS
+                                aapl_name_mangling). Needed for names containing ':' etc. over SMB
+                                from Windows. Any other value is rejected at startup.
 
 HF_TOKEN is NOT required — Parakeet-TDT and NeMo Sortformer are public models.
 """
@@ -272,6 +278,50 @@ BOOKS_MOUNT: Path = Path(
 BOOKS_DB_ROOT: PurePosixPath = PurePosixPath(
     os.environ.get("BOOKS_DB_ROOT", "/books")
 )
+
+# Samba's Services-for-Mac character map (source3/lib/string_replace.c,
+# `macos_string_replace_map`), which vfs_fruit installs as `catia:mappings` when
+# `fruit:encoding = native`. A file stored on the server as "a:b" is presented to
+# SMB clients as "a\uf022b", so a Windows runner must request the mapped name.
+# Samba maps these characters wherever they occur; it has NO trailing space /
+# trailing period rule (the 0xF028/0xF029 code points of Apple's SFM table are
+# not in Samba's map), so neither do we.
+_SFM_ENCODE_TABLE: dict[int, str] = {
+    **{c: chr(0xF000 + c) for c in range(0x01, 0x20)},
+    ord('"'): "\uf020",
+    ord("*"): "\uf021",
+    ord(":"): "\uf022",
+    ord("<"): "\uf023",
+    ord(">"): "\uf024",
+    ord("?"): "\uf025",
+    ord("\\"): "\uf026",
+    ord("|"): "\uf027",
+}
+
+_BOOKS_PATH_ENCODINGS: frozenset[str] = frozenset({"none", "sfm"})
+
+
+def _parse_books_path_encoding(raw: str | None) -> str:
+    """Validate BOOKS_PATH_ENCODING ("none" when unset/blank). Raises ValueError
+    on anything else so a typo fails startup (and --self-check) loudly instead
+    of silently failing every job with "file not found"."""
+    value = (raw or "none").strip().lower() or "none"
+    if value not in _BOOKS_PATH_ENCODINGS:
+        raise ValueError(
+            f"BOOKS_PATH_ENCODING={raw!r} is invalid; expected one of "
+            f"{sorted(_BOOKS_PATH_ENCODINGS)}"
+        )
+    return value
+
+
+BOOKS_PATH_ENCODING: str = _parse_books_path_encoding(
+    os.environ.get("BOOKS_PATH_ENCODING")
+)
+
+
+def _sfm_encode(component: str) -> str:
+    """Encode one path component with Samba's SFM map (see _SFM_ENCODE_TABLE)."""
+    return component.translate(_SFM_ENCODE_TABLE)
 
 # Single-pass vs chunked threshold.
 #
@@ -2075,7 +2125,12 @@ def _parse_diarize_output(diar_output: Any) -> list[tuple[float, float, str]]:
     return turns
 
 
-def _map_db_path(file_path: str, mount: PurePath, db_root: PurePosixPath) -> PurePath:
+def _map_db_path(
+    file_path: str,
+    mount: PurePath,
+    db_root: PurePosixPath,
+    encoding: str = "none",
+) -> PurePath:
     r"""Lexically map a DB file_path onto *mount* (pure — no filesystem access).
 
     file_path is always a POSIX path (the Go producer runs in a Linux container),
@@ -2084,6 +2139,11 @@ def _map_db_path(file_path: str, mount: PurePath, db_root: PurePosixPath) -> Pur
     form) is taken as-is. The components are then joined onto *mount* one by one,
     so the result uses the mount's own flavour — e.g. a Windows UNC share
     (PureWindowsPath(r"\\host\books")) yields r"\\host\books\a\b.m4b".
+
+    With encoding="sfm" each relative component (never the mount prefix) is
+    passed through _sfm_encode after validation, so "Part I: Chapter 2" is
+    requested as "Part I\uf022 Chapter 2" — the name a Samba share with
+    `fruit:encoding = native` presents for that file.
 
     Raises ValueError for an empty path, an absolute path outside *db_root*, any
     ".." component (traversal), or a component the mount's flavour would not
@@ -2110,19 +2170,27 @@ def _map_db_path(file_path: str, mount: PurePath, db_root: PurePosixPath) -> Pur
     # PurePosixPath.parts never yields "" or "." (it collapses "//" and "/./"),
     # so every part here is a real name or ".."; the flavour re-parse below
     # therefore only trips on names the mount's OS would split or re-anchor.
+    # The traversal check runs on the raw POSIX parts; the flavour re-parse runs
+    # on the component as it will actually be requested (after encoding), so a
+    # ':' that sfm maps to U+F022 is legitimate while an unencoded "C:x" on a
+    # Windows mount is still rejected.
     flavour = type(mount)
+    out: list[str] = []
     for part in rel.parts:
         if part == "..":
             raise ValueError(
                 f"file_path {file_path!r} escapes BOOKS_MOUNT (path traversal)"
             )
-        parsed = flavour(part)
-        if parsed.anchor or parsed.parts != (part,):
+        name = _sfm_encode(part) if encoding == "sfm" else part
+        parsed = flavour(name)
+        if parsed.anchor or parsed.parts != (name,):
             raise ValueError(
-                f"file_path {file_path!r} has component {part!r} that is not a "
-                f"single plain name under BOOKS_MOUNT={mount}"
+                f"file_path {file_path!r} has component {name!r} that is not a "
+                f"single plain name under BOOKS_MOUNT={mount} "
+                f"(BOOKS_PATH_ENCODING={encoding})"
             )
-    return mount.joinpath(*rel.parts)
+        out.append(name)
+    return mount.joinpath(*out)
 
 
 def _resolve_audio_path(file_path: str) -> Path:
@@ -2143,10 +2211,13 @@ def _resolve_audio_path(file_path: str) -> Path:
     The result is additionally validated (after resolve()) to stay under
     BOOKS_MOUNT, which also guards against symlink escapes.
     """
-    audio_path = Path(_map_db_path(file_path, BOOKS_MOUNT, BOOKS_DB_ROOT)).resolve()
+    audio_path = Path(
+        _map_db_path(file_path, BOOKS_MOUNT, BOOKS_DB_ROOT, BOOKS_PATH_ENCODING)
+    ).resolve()
     if not audio_path.is_relative_to(BOOKS_MOUNT.resolve()):
         raise ValueError(
-            f"file_path {file_path!r} escapes BOOKS_MOUNT (path traversal)"
+            f"file_path {file_path!r} escapes BOOKS_MOUNT (path traversal): "
+            f"resolved to host path {str(audio_path)!r}"
         )
     return audio_path
 
@@ -2682,12 +2753,16 @@ def _make_provider(backend: str) -> ASRProvider:
 
 def main() -> None:
     log.info(
-        "asr-runner starting: identity=%s backend=%s model=%s diarize=%s compute=%s",
+        "asr-runner starting: identity=%s backend=%s model=%s diarize=%s compute=%s "
+        "books_mount=%s books_db_root=%s books_path_encoding=%s",
         RUNNER_IDENTITY,
         ASR_BACKEND,
         ASR_MODEL_ID,
         ASR_DIARIZE,
         ASR_COMPUTE_TYPE,
+        BOOKS_MOUNT,
+        BOOKS_DB_ROOT,
+        BOOKS_PATH_ENCODING,
     )
 
     # Instantiate and load the provider once at startup (model load is expensive;
@@ -2785,8 +2860,10 @@ def main() -> None:
             audio_path = _resolve_audio_path(file_path)
             if not audio_path.exists():
                 raise FileNotFoundError(
-                    f"Audio file not found at {audio_path}. "
-                    f"Check BOOKS_MOUNT={BOOKS_MOUNT} and NFS mount."
+                    f"Audio file not found: db path {file_path!r} -> host path "
+                    f"{str(audio_path)!r}. Check BOOKS_MOUNT={BOOKS_MOUNT}, "
+                    f"BOOKS_DB_ROOT={BOOKS_DB_ROOT}, "
+                    f"BOOKS_PATH_ENCODING={BOOKS_PATH_ENCODING} and the share mount."
                 )
 
             result = provider.transcribe(audio_path, bias_terms=bias_terms)
