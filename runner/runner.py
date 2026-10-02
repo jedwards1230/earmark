@@ -566,11 +566,12 @@ def _handle_signal(signum: int, _frame: Any) -> None:
 
 def _shutdown_signals(sigmod: Any = signal) -> list[int]:
     """The signals that request a graceful stop: SIGTERM, SIGINT (Ctrl+C) and,
-    on Windows, SIGBREAK (CTRL_BREAK_EVENT). WinSW stops the service with a
-    console control event; left unhandled, SIGBREAK's default action kills the
-    process with a non-zero status, which the wrapper's on-failure restart reads
-    as a crash and respawns the runner — racing an Ansible restart into an
-    orphaned second runner. Handled, every stop exits 0."""
+    on Windows, SIGBREAK (CTRL_BREAK_EVENT). WinSW stops the service with
+    CTRL_C_EVENT, which Python delivers as SIGINT; without this handler that is a
+    KeyboardInterrupt (and an unhandled SIGBREAK kills the process), so the runner
+    exits non-zero, the wrapper's on-failure restart reads that as a crash and
+    respawns it — racing an Ansible restart into an orphaned second runner.
+    Handled, every stop releases any in-flight job and exits 0."""
     sigs = [sigmod.SIGTERM, sigmod.SIGINT]
     if hasattr(sigmod, "SIGBREAK"):
         sigs.append(sigmod.SIGBREAK)

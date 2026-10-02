@@ -3495,9 +3495,21 @@ class GracefulShutdownTests(_MainLoopHarness):
     def test_signal_mid_transcription_releases_job_and_exits_cleanly(self) -> None:
         import signal as _signal
 
-        provider = _LoopProvider(
-            on_transcribe=lambda: runner._handle_signal(_signal.SIGTERM, None)
-        )
+        # SIGINT is what WinSW's stop (CTRL_C_EVENT) delivers; SIGTERM is systemd's.
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            with self.subTest(signal=sig):
+                runner._shutdown.clear()
+                self.conns.clear()
+                self._assert_released_on(sig)
+
+    def test_sigint_handler_is_installed(self) -> None:
+        import signal as _signal
+
+        # Not Python's default KeyboardInterrupt handler, which would exit non-zero.
+        self.assertIs(_signal.getsignal(_signal.SIGINT), runner._handle_signal)
+
+    def _assert_released_on(self, sig: int) -> None:
+        provider = _LoopProvider(on_transcribe=lambda: runner._handle_signal(sig, None))
         self._run_main(provider)
 
         self.assertEqual(provider.transcribed, 1)
