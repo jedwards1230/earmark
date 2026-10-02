@@ -415,8 +415,11 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
 **Robustness contract:** the coordinator **always restores `phase='idle'` and
 the pre-batch `run_limit`** on exit — normal completion, error, AND
 `SIGINT`/`SIGTERM` — so it never gets stuck mid-phase and never leaves the
-runner budget-gated. At startup it reads `run_limit`; the value is put back on
-exit when the run started from `phase` idle and `run_limit` was `NULL` or `> 0`
+runner budget-gated. At startup it swaps `run_limit` to `0` and keeps the old
+value, in one transaction under the same `runner_control` row lock
+(`FOR UPDATE`) the runner's claim takes, so the runner cannot spend the
+operator's budget while the coordinator waits (e.g. yielding to a game). The
+captured value is put back on exit when the run started from `phase` idle and `run_limit` was `NULL` or `> 0`
 (an operator's bounded run in progress). Otherwise — `run_limit=0` (a spent
 budget), a non-idle starting phase (residue of an interrupted run), or an
 unreadable control row — it restores `NULL` (unlimited, normal continuous

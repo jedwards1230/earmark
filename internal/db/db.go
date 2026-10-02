@@ -2852,6 +2852,46 @@ func (db *DB) SetRunLimit(ctx context.Context, limit *int, by string) error {
 	return nil
 }
 
+// SwapRunLimit atomically sets run_limit to limit and returns the value it
+// replaced (nil = unlimited, also for a missing row). The read takes the same
+// `FOR UPDATE` row lock as the runner's claim transaction, so no claim can
+// decrement the counter between the read and the write — the returned value is
+// exactly the budget that was left. Used by `earmark batch` to capture the
+// operator's budget and park the runner in one step.
+func (db *DB) SwapRunLimit(ctx context.Context, limit *int, by string) (prev *int, err error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("swap run limit: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+
+	err = tx.QueryRow(ctx, swapRunLimitSelectSQL).Scan(&prev)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("swap run limit: read: %w", err)
+	}
+	if _, err := tx.Exec(ctx, swapRunLimitWriteSQL, limit, by); err != nil {
+		return nil, fmt.Errorf("swap run limit: write: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("swap run limit: commit: %w", err)
+	}
+	return prev, nil
+}
+
+// swapRunLimitSelectSQL / swapRunLimitWriteSQL are package vars so a test can
+// pin the row lock that makes SwapRunLimit atomic against the runner's claim.
+var (
+	swapRunLimitSelectSQL = `SELECT run_limit FROM runner_control WHERE id = 1 FOR UPDATE`
+	swapRunLimitWriteSQL  = `
+		INSERT INTO runner_control (id, paused, run_limit, updated_at, updated_by)
+		VALUES (1, false, $1, now(), $2)
+		ON CONFLICT (id) DO UPDATE
+			SET run_limit = EXCLUDED.run_limit,
+			    updated_at = EXCLUDED.updated_at,
+			    updated_by = EXCLUDED.updated_by
+	`
+)
+
 // PipelinePhase values gate the batched two-phase pipeline (CONTRACT §1.4).
 // PhaseIdle is the default (both ASR runner and embed worker run freely);
 // PhaseTranscribe is the ASR-only phase (embed worker idles); PhaseAnalyze is
@@ -3485,6 +3525,23 @@ func (db *DB) GetEvalChunksForBook(ctx context.Context, substr string, limit int
 	`, likePattern(substr), limit)
 	if err != nil {
 		return nil, fmt.Errorf("eval chunks for book query: %w", err)
+	}
+	defer rows.Close()
+	return scanEvalChunks(rows)
+}
+
+// GetEvalChunksForTranscript returns a transcript's STORED chunk rows (their
+// real IDs and pristine text), in chunk order. Read-only. Used by the eval
+// backfill for transcripts that were already embedded: those rows may carry
+// random IDs (the ungated worker path), so findings must reference the stored
+// IDs rather than regenerated UUIDv5 ones. Empty when not yet embedded.
+func (db *DB) GetEvalChunksForTranscript(ctx context.Context, transcriptID string) ([]EvalChunk, error) {
+	rows, err := db.pool.Query(ctx, evalChunkSelectSQL+`
+		WHERE c.transcript_id = $1
+		ORDER BY c.chunk_index
+	`, transcriptID)
+	if err != nil {
+		return nil, fmt.Errorf("eval chunks for transcript query: %w", err)
 	}
 	defer rows.Close()
 	return scanEvalChunks(rows)

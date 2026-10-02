@@ -29,12 +29,13 @@ const actor = "batch"
 //
 // Writes: SetPipelinePhase (the transcribe/analyze/idle selector) and
 // SetRunLimit (the bounded-run counter the ASR runner decrements). Reads:
-// GetPipelinePhase (for resume reconciliation), GetControl (the pre-batch
-// run_limit put back on exit) and GetServiceStatus (the queue snapshot used to
-// decide when a phase is complete).
+// GetPipelinePhase (for resume reconciliation) and GetServiceStatus (the queue
+// snapshot used to decide when a phase is complete). SwapRunLimit both reads
+// and writes: it parks the runner (run_limit=0) and returns the pre-batch
+// budget put back on exit, atomically against the runner's claim.
 type PhaseStore interface {
 	GetPipelinePhase(ctx context.Context) (string, error)
-	GetControl(ctx context.Context) (paused bool, runLimit *int, err error)
+	SwapRunLimit(ctx context.Context, limit *int, by string) (prev *int, err error)
 	SetPipelinePhase(ctx context.Context, phase, by string) error
 	SetRunLimit(ctx context.Context, limit *int, by string) error
 	GetServiceStatus(ctx context.Context) (*db.QueueStats, error)
@@ -436,10 +437,17 @@ func analyzeDrained(st *db.QueueStats, evalGatesEmbed bool) bool {
 	return st.EmbedBacklog == 0
 }
 
-// captureRestoreLimit decides which run_limit the exit cleanup puts back. The
-// pre-batch value is restored when it is meaningful: the run started from phase
-// idle AND run_limit was NULL (unlimited) or > 0 (an operator's bounded run
-// still in progress).
+// captureRestoreLimit parks the runner (run_limit=0) and decides which run_limit
+// the exit cleanup puts back. Capture and park are ONE atomic swap under the
+// runner_control row lock the runner's claim also takes, so the runner cannot
+// claim against (and decrement) the operator's budget between the read and the
+// park — e.g. while the coordinator then blocks yielding to a game — and the
+// restore never refunds claims that were already made. From here on the
+// coordinator owns the budget until exit.
+//
+// The pre-batch value is restored when it is meaningful: the run started from
+// phase idle AND run_limit was NULL (unlimited) or > 0 (an operator's bounded
+// run still in progress).
 //
 // Everything else falls back to nil (unlimited — normal continuous operation):
 //   - a non-idle starting phase: the values are residue of a coordinator that
@@ -448,11 +456,13 @@ func analyzeDrained(st *db.QueueStats, evalGatesEmbed bool) bool {
 //     parked the runner at 0 on exit. Restoring it would gate the runner
 //     indefinitely ("Run limit reached (run_limit=0) - skipping claim"), so newly
 //     ingested books would never transcribe;
-//   - a GetControl read error (logged, never fatal).
+//   - a failed swap (logged, never fatal — the run proceeds and Phase A sets
+//     its own budget).
 //
 // The pause flag is the operator's stop switch and is never touched.
 func captureRestoreLimit(ctx context.Context, p func(string, ...any), store PhaseStore, phase string) *int {
-	_, limit, err := store.GetControl(ctx)
+	zero := 0
+	limit, err := store.SwapRunLimit(ctx, &zero, actor)
 	if err != nil {
 		p("WARNING: could not read the pre-batch run budget (%v) — will restore run_limit=unlimited on exit.\n", err)
 		return nil

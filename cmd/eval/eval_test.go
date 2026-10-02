@@ -184,6 +184,7 @@ func TestRunOutput_ReportsSkippedChunks(t *testing.T) {
 // fakeBackfillDB implements backfillDB for unit tests without a live DB.
 type fakeBackfillDB struct {
 	transcripts   []*db.Transcript
+	stored        map[string][]db.EvalChunk // transcript ID → stored chunk rows
 	findings      []db.Finding
 	evalMetrics   []db.EvalMetrics
 	findingsErr   error
@@ -196,6 +197,10 @@ func (f *fakeBackfillDB) GetUnevaluatedJobTranscripts(_ context.Context) ([]*db.
 		return nil, f.transcriptErr
 	}
 	return f.transcripts, nil
+}
+
+func (f *fakeBackfillDB) GetEvalChunksForTranscript(_ context.Context, transcriptID string) ([]db.EvalChunk, error) {
+	return f.stored[transcriptID], nil
 }
 
 func (f *fakeBackfillDB) InsertFindings(_ context.Context, findings []db.Finding) error {
@@ -370,6 +375,44 @@ func TestRunBackfill_ChunksMatchEmbedPass(t *testing.T) {
 		if f.StartSec != c.StartSec || f.EndSec != c.EndSec {
 			t.Errorf("finding span [%v,%v] != embed chunk span [%v,%v]", f.StartSec, f.EndSec, c.StartSec, c.EndSec)
 		}
+	}
+}
+
+// TestRunBackfill_EmbeddedTranscriptUsesStoredChunkIDs: an already-embedded
+// transcript (ungated path → random chunk IDs) must be judged against its
+// STORED rows, so findings reference chunk IDs that exist — regenerated UUIDv5
+// IDs would point at nothing.
+func TestRunBackfill_EmbeddedTranscriptUsesStoredChunkIDs(t *testing.T) {
+	tr := &db.Transcript{ID: "t-emb", JobID: "j-emb", FilePath: "/books/Dune/Ch4.m4b",
+		RawText: "Alpha one. Charlie two."}
+	stored := []db.EvalChunk{
+		{ChunkID: "11111111-1111-4111-8111-111111111111", TranscriptID: "t-emb", TranscriptionRunID: "j-emb",
+			FilePath: tr.FilePath, ChunkIndex: 0, StartSec: 0, EndSec: 3, Text: "Alpha one."},
+		{ChunkID: "22222222-2222-4222-8222-222222222222", TranscriptID: "t-emb", TranscriptionRunID: "j-emb",
+			FilePath: tr.FilePath, ChunkIndex: 1, StartSec: 3, EndSec: 6, Text: "Charlie two."},
+	}
+	fdb := &fakeBackfillDB{
+		transcripts: []*db.Transcript{tr},
+		stored:      map[string][]db.EvalChunk{"t-emb": stored},
+	}
+	judge := evalpkg.NewJudge(textGatedChat{
+		needle: "Charlie",
+		resp:   `{"findings":[{"original_text":"Charlie","issue_type":"misheard_proper_noun","suggested_correction":"Charley","confidence":0.9}]}`,
+	})
+
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 8}, true); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+	if len(fdb.findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d:\n%s", len(fdb.findings), out.String())
+	}
+	f := fdb.findings[0]
+	if f.ChunkID == nil || *f.ChunkID != stored[1].ChunkID {
+		t.Errorf("finding chunk ID = %v, want the stored row's ID %s", f.ChunkID, stored[1].ChunkID)
+	}
+	if f.ChunkTextSHA256 == nil || *f.ChunkTextSHA256 != patch.ChunkHash(stored[1].Text) {
+		t.Errorf("chunk hash must fingerprint the stored pristine text")
 	}
 }
 

@@ -32,7 +32,7 @@ type fakeStore struct {
 	hadFirstStatus        bool
 
 	// optional error injections
-	getControlErr  error
+	swapErr        error
 	setPhaseErr    error
 	getStatusErr   error
 	getStatusAfter int // return getStatusErr only on/after this many status calls
@@ -52,13 +52,21 @@ func (f *fakeStore) GetPipelinePhase(context.Context) (string, error) {
 	return f.phase, nil
 }
 
-func (f *fakeStore) GetControl(context.Context) (bool, *int, error) {
+func (f *fakeStore) SwapRunLimit(_ context.Context, limit *int, _ string) (*int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.getControlErr != nil {
-		return false, nil, f.getControlErr
+	if f.swapErr != nil {
+		return nil, f.swapErr
 	}
-	return false, f.runLimit, nil
+	prev := f.runLimit
+	f.runLimit = limit
+	return prev, nil
+}
+
+func (f *fakeStore) currentRunLimit() *int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runLimit
 }
 
 func (f *fakeStore) SetPipelinePhase(_ context.Context, phase, _ string) error {
@@ -321,6 +329,48 @@ func TestRun_RestoresIdleOnCancel(t *testing.T) {
 	}
 }
 
+// parkCheckArbiter records the store's run_limit at each Gaming() call.
+type parkCheckArbiter struct {
+	store *fakeStore
+	seen  []*int
+	calls int
+}
+
+func (a *parkCheckArbiter) Gaming(context.Context) (bool, bool) {
+	a.calls++
+	a.seen = append(a.seen, a.store.currentRunLimit())
+	return a.calls == 1, true // gaming once, then free
+}
+
+// TestRun_ParksOperatorBudgetBeforeYielding: an operator's bounded run (5 left)
+// is captured and parked at 0 in one swap BEFORE the coordinator blocks on the
+// game yield, so the runner cannot spend it meanwhile; the exact 5 comes back
+// on exit (no refund of claims made during the batch).
+func TestRun_ParksOperatorBudgetBeforeYielding(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 2},
+		&db.QueueStats{Pending: 0, Claimed: 0, RunLimit: ptr(0)},
+		&db.QueueStats{Pending: 0, Claimed: 0, EmbedBacklog: 0},
+	)
+	store.runLimit = ptr(5)
+	arb := &parkCheckArbiter{store: store}
+
+	if err := Run(context.Background(), io.Discard, store, arb, fastOpts()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(arb.seen) == 0 {
+		t.Fatal("arbiter never consulted")
+	}
+	for i, rl := range arb.seen {
+		if rl == nil || *rl != 0 {
+			t.Errorf("Gaming() call %d saw run_limit=%s; the runner must be parked at 0 while yielding", i, formatRunLimit(rl))
+		}
+	}
+	if got := store.currentRunLimit(); got == nil || *got != 5 {
+		t.Errorf("exit must restore the operator's 5, got %s", formatRunLimit(got))
+	}
+}
+
 // TestRun_RestoresPreBatchRunLimit pins the exit-restore policy across every
 // exit path: a meaningful pre-batch budget (NULL or > 0, phase idle) is put
 // back; a spent 0, residue from an interrupted run, or an unreadable control
@@ -359,7 +409,7 @@ func TestRun_RestoresPreBatchRunLimit(t *testing.T) {
 			}
 			store := newFakeStore(tc.phase, statuses...)
 			store.runLimit = tc.pre
-			store.getControlErr = tc.controlErr
+			store.swapErr = tc.controlErr
 			if tc.statusErr {
 				store.getStatusErr = errors.New("db boom")
 				store.getStatusAfter = 2

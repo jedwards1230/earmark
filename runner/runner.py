@@ -3339,13 +3339,15 @@ def _transcribe_interruptibly(
 ) -> Any:
     """Run provider.transcribe() with the stop-signal window open, so a
     SIGTERM/SIGINT/SIGBREAK aborts it with _ShutdownInterrupt (see
-    _handle_signal) instead of the stop waiting out a multi-minute job. A stop
-    already requested before the window opens aborts immediately."""
+    _handle_signal) instead of the stop waiting out a multi-minute job. The
+    window opens BEFORE the shutdown check, so a signal can't slip in between
+    the two: one that arrived earlier is caught by the check, one that arrives
+    later raises from the handler."""
     global _transcribe_interruptible
-    if _shutdown.is_set():
-        raise _ShutdownInterrupt(0)
     _transcribe_interruptible = True
     try:
+        if _shutdown.is_set():
+            raise _ShutdownInterrupt(0)
         return provider.transcribe(audio_path, bias_terms=bias_terms)
     finally:
         _transcribe_interruptible = False

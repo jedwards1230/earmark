@@ -3565,6 +3565,26 @@ class ShutdownSignalTests(unittest.TestCase):
         self.assertFalse(runner._transcribe_interruptible)
         runner._handle_signal(15, None)  # a second signal does not raise again
 
+    def test_signal_between_window_open_and_check_still_aborts(self) -> None:
+        # A signal landing just as the shutdown flag is checked (the race window
+        # between "check" and "open the interrupt window") must abort, not let a
+        # multi-minute transcription start.
+        provider = _LoopProvider()
+
+        class _SignalOnCheck:
+            def set(self) -> None:
+                pass
+
+            def is_set(self) -> bool:
+                runner._handle_signal(15, None)
+                return False
+
+        with mock.patch.object(runner, "_shutdown", _SignalOnCheck()), \
+                self.assertRaises(runner._ShutdownInterrupt):
+            runner._transcribe_interruptibly(provider, Path("x.mp3"), None)
+        self.assertEqual(provider.transcribed, 0)
+        self.assertFalse(runner._transcribe_interruptible)
+
     def test_self_update_reexec_exit_code_unchanged(self) -> None:
         self.assertEqual(runner._REEXEC_RESTART_EXIT_CODE, 75)
 
