@@ -32,6 +32,7 @@ type fakeStore struct {
 	hadFirstStatus        bool
 
 	// optional error injections
+	getControlErr  error
 	setPhaseErr    error
 	getStatusErr   error
 	getStatusAfter int // return getStatusErr only on/after this many status calls
@@ -49,6 +50,15 @@ func (f *fakeStore) GetPipelinePhase(context.Context) (string, error) {
 		return db.PhaseIdle, nil
 	}
 	return f.phase, nil
+}
+
+func (f *fakeStore) GetControl(context.Context) (bool, *int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getControlErr != nil {
+		return false, nil, f.getControlErr
+	}
+	return false, f.runLimit, nil
 }
 
 func (f *fakeStore) SetPipelinePhase(_ context.Context, phase, _ string) error {
@@ -166,8 +176,8 @@ func TestRun_FullCycleDrivesPhaseTransitions(t *testing.T) {
 			t.Fatalf("phase transitions = %v, want %v", got, want)
 		}
 	}
-	if store.runLimit == nil || *store.runLimit != 0 {
-		t.Errorf("run_limit should be set to 0 (idle-but-armed, never unlimited) on exit, got %v", store.runLimit)
+	if store.runLimit != nil {
+		t.Errorf("run_limit should be restored to its pre-batch NULL (unlimited) on exit, got %d", *store.runLimit)
 	}
 }
 
@@ -182,8 +192,8 @@ func TestRun_RestoresIdleOnNormalCompletionWithNoWork(t *testing.T) {
 	if len(got) != 1 || got[0] != db.PhaseIdle {
 		t.Errorf("with no work, only an idle restore should occur, got %v", got)
 	}
-	if store.runLimit == nil || *store.runLimit != 0 {
-		t.Errorf("run_limit should be 0 on the no-work exit path, got %v", store.runLimit)
+	if store.runLimit != nil {
+		t.Errorf("run_limit should be restored to NULL on the no-work exit path, got %d", *store.runLimit)
 	}
 }
 
@@ -277,8 +287,8 @@ func TestRun_RestoresIdleOnError(t *testing.T) {
 	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
 		t.Errorf("idle must be restored even on error; transitions=%v", got)
 	}
-	if store.runLimit == nil || *store.runLimit != 0 {
-		t.Errorf("run_limit must be set to 0 on error exit, got %v", store.runLimit)
+	if store.runLimit != nil {
+		t.Errorf("run_limit must be restored to NULL on error exit, got %d", *store.runLimit)
 	}
 }
 
@@ -306,8 +316,82 @@ func TestRun_RestoresIdleOnCancel(t *testing.T) {
 	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
 		t.Errorf("idle must be restored on cancel; transitions=%v", got)
 	}
-	if store.runLimit == nil || *store.runLimit != 0 {
-		t.Errorf("run_limit should be 0 on the cancel exit path, got %v", store.runLimit)
+	if store.runLimit != nil {
+		t.Errorf("run_limit should be restored to NULL on the cancel exit path, got %d", *store.runLimit)
+	}
+}
+
+// TestRun_RestoresPreBatchRunLimit pins the exit-restore policy across every
+// exit path: a meaningful pre-batch budget (NULL or > 0, phase idle) is put
+// back; a spent 0, residue from an interrupted run, or an unreadable control
+// row falls back to NULL (unlimited) so the runner is never left budget-gated.
+func TestRun_RestoresPreBatchRunLimit(t *testing.T) {
+	transcribeThenDrain := func() []*db.QueueStats {
+		return []*db.QueueStats{
+			{Pending: 2},
+			{Pending: 0, Claimed: 0, RunLimit: ptr(0)},
+			{Pending: 0, Claimed: 0, EmbedBacklog: 0},
+		}
+	}
+	tests := []struct {
+		name       string
+		phase      string
+		pre        *int
+		controlErr error
+		statusErr  bool // fail the transcribe poll (error exit path)
+		cancel     bool // cancel mid-transcribe (signal exit path)
+		want       *int
+		wantLog    string
+	}{
+		{name: "unlimited stays unlimited", phase: db.PhaseIdle, pre: nil, want: nil, wantLog: "run_limit=unlimited (NULL)"},
+		{name: "operator bounded run restored", phase: db.PhaseIdle, pre: ptr(5), want: ptr(5), wantLog: "run_limit=5)"},
+		{name: "spent 0 becomes unlimited", phase: db.PhaseIdle, pre: ptr(0), want: nil, wantLog: "spent budget"},
+		{name: "residue of interrupted transcribe", phase: db.PhaseTranscribe, pre: ptr(3), want: nil, wantLog: "left over from an interrupted run"},
+		{name: "control read error", phase: db.PhaseIdle, pre: ptr(5), controlErr: errors.New("boom"), want: nil, wantLog: "could not read the pre-batch run budget"},
+		{name: "error exit restores captured", phase: db.PhaseIdle, pre: ptr(4), statusErr: true, want: ptr(4)},
+		{name: "cancel exit restores captured", phase: db.PhaseIdle, pre: ptr(4), cancel: true, want: ptr(4)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			statuses := transcribeThenDrain()
+			if tc.cancel {
+				statuses = []*db.QueueStats{{Pending: 2}, {Pending: 1, Claimed: 1, RunLimit: ptr(1)}}
+			}
+			store := newFakeStore(tc.phase, statuses...)
+			store.runLimit = tc.pre
+			store.getControlErr = tc.controlErr
+			if tc.statusErr {
+				store.getStatusErr = errors.New("db boom")
+				store.getStatusAfter = 2
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				go func() {
+					time.Sleep(20 * time.Millisecond)
+					cancel()
+				}()
+			}
+
+			var out strings.Builder
+			o := fastOpts()
+			o.PollInterval = 5 * time.Millisecond
+			_ = Run(ctx, &out, store, &fakeArbiter{}, o)
+
+			got := store.runLimit
+			if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
+				t.Errorf("restored run_limit = %s, want %s\n%s", formatRunLimit(got), formatRunLimit(tc.want), out.String())
+			}
+			if tr := store.transitions(); len(tr) == 0 || tr[len(tr)-1] != db.PhaseIdle {
+				t.Errorf("phase must end idle; transitions=%v", tr)
+			}
+			if !strings.Contains(out.String(), "Restored pipeline to idle (phase=idle, run_limit="+formatRunLimit(tc.want)+")") {
+				t.Errorf("final log line must state what was restored:\n%s", out.String())
+			}
+			if tc.wantLog != "" && !strings.Contains(out.String(), tc.wantLog) {
+				t.Errorf("output missing %q:\n%s", tc.wantLog, out.String())
+			}
+		})
 	}
 }
 

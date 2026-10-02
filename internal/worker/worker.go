@@ -594,19 +594,7 @@ func (w *Worker) embedTranscript(cfg *config.Config, t *db.Transcript) error {
 // even if the judge endpoint is down). Chunks must already have their IDs
 // assigned so the returned findings reference the rows the worker will insert.
 func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
-	evalChunks := make([]db.EvalChunk, len(chunks))
-	for i, c := range chunks {
-		evalChunks[i] = db.EvalChunk{
-			ChunkID:            c.ID,
-			TranscriptID:       t.ID,
-			TranscriptionRunID: t.JobID,
-			FilePath:           c.FilePath,
-			ChunkIndex:         c.ChunkIndex,
-			StartSec:           c.StartSec,
-			EndSec:             c.EndSec,
-			Text:               c.Text,
-		}
-	}
+	evalChunks := EvalChunksFor(t, chunks)
 
 	evalStart := time.Now()
 	w.appendEvent(db.PipelineEvent{
@@ -901,6 +889,43 @@ func buildChunksFromSegments(t *db.Transcript, chunkSize int) []db.Chunk {
 // the overlay in here would put corrected text in front of the judge and make
 // every new finding stale on arrival.
 func (w *Worker) chunkTranscript(t *db.Transcript, chunkSize int, deterministicIDs bool) ([]db.Chunk, error) {
+	if len(t.Segments) == 0 {
+		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
+			"transcript_id", t.ID)
+	}
+	return pristineChunks(t, chunkSize, deterministicIDs)
+}
+
+// PristineChunks is chunkTranscript's chunking with deterministic IDs, for
+// callers outside the worker that must address the exact chunk rows the embed
+// pass inserts — the `earmark eval --backfill-unevaluated` sweep. Using any
+// other chunker there (e.g. raw-text token chunking for a transcript that has
+// segments) judges text that differs from what is stored under the same
+// ChunkUUID, so every finding's anchors and chunk hash would be wrong.
+func PristineChunks(t *db.Transcript, chunkSize int) ([]db.Chunk, error) {
+	return pristineChunks(t, chunkSize, true)
+}
+
+// EvalChunksFor converts pristine chunks into the judge's input shape, carrying
+// the transcript/run attribution every finding needs.
+func EvalChunksFor(t *db.Transcript, chunks []db.Chunk) []db.EvalChunk {
+	evalChunks := make([]db.EvalChunk, len(chunks))
+	for i, c := range chunks {
+		evalChunks[i] = db.EvalChunk{
+			ChunkID:            c.ID,
+			TranscriptID:       t.ID,
+			TranscriptionRunID: t.JobID,
+			FilePath:           c.FilePath,
+			ChunkIndex:         c.ChunkIndex,
+			StartSec:           c.StartSec,
+			EndSec:             c.EndSec,
+			Text:               c.Text,
+		}
+	}
+	return evalChunks
+}
+
+func pristineChunks(t *db.Transcript, chunkSize int, deterministicIDs bool) ([]db.Chunk, error) {
 	if chunkSize <= 0 {
 		chunkSize = 512
 	}
@@ -910,8 +935,6 @@ func (w *Worker) chunkTranscript(t *db.Transcript, chunkSize int, deterministicI
 	// it wants exactly that — and it never writes either of them back.
 	var chunks []db.Chunk
 	if len(t.Segments) == 0 {
-		w.log.Warn("transcript has no segments; using raw-text chunking (timestamps will be zero)",
-			"transcript_id", t.ID)
 		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
 		if len(texts) == 0 {
 			return nil, fmt.Errorf("no chunks produced for transcript %s", t.ID)

@@ -19,6 +19,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, ClassVar
 from unittest import mock
 
 # ── Stub heavy/optional imports so runner.py imports with no DB or drivers ──────
@@ -3380,6 +3381,180 @@ class GateGpuInputsTests(unittest.TestCase):
         self.assertTrue(skip)
         self.assertEqual(provider.parked, 1)
         self.assertFalse(any(s.lstrip().upper().startswith("SELECT") for s in seen), seen)
+
+
+class _LoopProvider:
+    """Minimal provider for driving main(): load() is a no-op and transcribe()
+    runs a caller-supplied hook (e.g. to deliver a stop signal mid-job)."""
+
+    def __init__(self, on_transcribe: Any = None) -> None:
+        self.on_transcribe = on_transcribe
+        self.transcribed = 0
+
+    def load(self) -> None:
+        pass
+
+    def capabilities(self) -> set[str]:
+        return set()
+
+    def transcribe(self, _audio_path: Any, bias_terms: Any = None) -> Any:
+        self.transcribed += 1
+        if self.on_transcribe is not None:
+            self.on_transcribe()
+        return object()
+
+
+class _ClosableConn(FakeConn):
+    def close(self) -> None:
+        pass
+
+
+class _MainLoopHarness(unittest.TestCase):
+    """Drives runner.main() for a cycle or two with the DB, GPU gate and
+    keep-awake stubbed, so loop-level behaviour (heartbeat placement, shutdown)
+    is testable without a database or ML stack."""
+
+    def setUp(self) -> None:
+        runner._shutdown.clear()
+        runner._transcribe_interruptible = False
+        self.addCleanup(runner._shutdown.clear)
+        self.conns: list[FakeConn] = []
+        stack = [
+            mock.patch.object(runner, "_connect", side_effect=self._new_conn),
+            mock.patch.object(runner, "_maybe_self_update", return_value=False),
+            mock.patch.object(runner, "_read_gate_inputs", return_value=(False, 0, "idle")),
+            mock.patch.object(runner, "_gate_gpu", return_value=False),
+            mock.patch.object(runner, "_evaluate_keep_awake"),
+            mock.patch.object(runner, "POLL_INTERVAL", 0),
+        ]
+        for p in stack:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _new_conn(self) -> FakeConn:
+        conn = _ClosableConn(control_row=self.control_row, job_row=self.job_row)
+        self.conns.append(conn)
+        return conn
+
+    def _sql(self) -> list[str]:
+        return [s for c in self.conns for s, _ in c.executed]
+
+
+class GatedRunnerHeartbeatTests(_MainLoopHarness):
+    """A budget-gated runner (run_limit=0, `earmark batch` analyze phase or a
+    stale coordinator exit) is alive: it must keep stamping the runner-level
+    liveness heartbeat every cycle even though it claims nothing."""
+
+    control_row = (False, 0)  # not paused, run_limit=0 → gated
+    job_row = None
+
+    def test_gated_cycle_still_stamps_liveness_heartbeat(self) -> None:
+        cycles = {"n": 0}
+        real_claim = runner._claim_job
+
+        def claim_then_stop_after_two(conn: Any) -> Any:
+            cycles["n"] += 1
+            if cycles["n"] >= 2:
+                runner._shutdown.set()
+            return real_claim(conn)
+
+        with mock.patch.object(runner, "_make_provider", return_value=_LoopProvider()), \
+                mock.patch.object(runner, "_claim_job", side_effect=claim_then_stop_after_two), \
+                self.assertLogs(runner.log, level="INFO") as logs:
+            runner.main()
+
+        stamps = [s for s in self._sql() if "runner_heartbeat_at = now()" in s]
+        self.assertEqual(len(stamps), 2, "one liveness stamp per gated poll cycle")
+        self.assertFalse(any("SET    status     = 'claimed'" in s for s in self._sql()))
+        self.assertTrue(any("Run limit reached" in m for m in logs.output))
+
+
+class GracefulShutdownTests(_MainLoopHarness):
+    """A stop signal (SIGTERM / SIGINT / Windows SIGBREAK) mid-job releases the
+    job back to pending and main() returns normally (exit 0) — never marks the
+    job failed, never exits non-zero (which WinSW's on-failure restart would
+    treat as a crash and respawn a second runner)."""
+
+    control_row = (False, None)  # not paused, unlimited
+    job_row: ClassVar[dict[str, str]] = {
+        "id": "job-1",
+        "file_path": "Author/Book/01.mp3",
+        "checksum": "abc",
+    }
+
+    def _run_main(self, provider: _LoopProvider) -> None:
+        with mock.patch.object(runner, "_make_provider", return_value=provider), \
+                mock.patch.object(runner, "_resolve_audio_path") as resolve, \
+                mock.patch.object(runner, "_mark_done") as mark_done, \
+                mock.patch.object(runner, "_mark_failed") as mark_failed, \
+                mock.patch.object(runner, "_write_run_metrics"):
+            resolve.return_value.exists.return_value = True
+            runner.main()  # returning (not raising / sys.exit) == exit status 0
+        self.mark_done, self.mark_failed = mark_done, mark_failed
+
+    def test_signal_mid_transcription_releases_job_and_exits_cleanly(self) -> None:
+        import signal as _signal
+
+        provider = _LoopProvider(
+            on_transcribe=lambda: runner._handle_signal(_signal.SIGTERM, None)
+        )
+        self._run_main(provider)
+
+        self.assertEqual(provider.transcribed, 1)
+        self.mark_done.assert_not_called()
+        self.mark_failed.assert_not_called()
+        release = [
+            (s, p) for c in self.conns for s, p in c.executed
+            if "SET    status     = 'pending'" in s
+        ]
+        self.assertEqual(len(release), 1, self._sql())
+        sql, params = release[0]
+        self.assertIn("attempts   = GREATEST(attempts - 1, 0)", sql)
+        self.assertIn("claimed_by = %s", sql)
+        self.assertEqual(params, ("job-1", runner.RUNNER_IDENTITY))
+        self.assertFalse(runner._transcribe_interruptible)
+
+    def test_stop_requested_before_transcribe_releases_without_running(self) -> None:
+        provider = _LoopProvider()
+        real_claim = runner._claim_job
+
+        def claim_then_signal(conn: Any) -> Any:
+            job = real_claim(conn)
+            runner._shutdown.set()  # signal lands between claim and transcribe
+            return job
+
+        with mock.patch.object(runner, "_claim_job", side_effect=claim_then_signal):
+            self._run_main(provider)
+        self.assertEqual(provider.transcribed, 0)
+        self.mark_failed.assert_not_called()
+        self.assertTrue(any("SET    status     = 'pending'" in s for s in self._sql()))
+
+
+class ShutdownSignalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        runner._shutdown.clear()
+        runner._transcribe_interruptible = False
+        self.addCleanup(runner._shutdown.clear)
+
+    def test_windows_sigbreak_is_a_shutdown_signal(self) -> None:
+        win = types.SimpleNamespace(SIGTERM=15, SIGINT=2, SIGBREAK=21)
+        self.assertEqual(runner._shutdown_signals(win), [15, 2, 21])
+        posix = types.SimpleNamespace(SIGTERM=15, SIGINT=2)
+        self.assertEqual(runner._shutdown_signals(posix), [15, 2])
+
+    def test_handler_outside_transcription_only_requests_stop(self) -> None:
+        runner._handle_signal(2, None)  # must not raise between jobs
+        self.assertTrue(runner._shutdown.is_set())
+
+    def test_handler_inside_transcription_raises_once(self) -> None:
+        runner._transcribe_interruptible = True
+        with self.assertRaises(runner._ShutdownInterrupt):
+            runner._handle_signal(15, None)
+        self.assertFalse(runner._transcribe_interruptible)
+        runner._handle_signal(15, None)  # a second signal does not raise again
+
+    def test_self_update_reexec_exit_code_unchanged(self) -> None:
+        self.assertEqual(runner._REEXEC_RESTART_EXIT_CODE, 75)
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ func newStatsCollector(src StatsSource, timeout time.Duration) *statsCollector {
 			nil, nil),
 		lastHeartbeatSecs: prometheus.NewDesc(
 			"earmark_runner_last_heartbeat_seconds",
-			"Seconds since the runner's last CLAIM-ACTIVITY (it only stamps a heartbeat while a job is claimed — there is no idle heartbeat). NOT emitted when there is no claim/completion history. Cannot distinguish 'idle, queue empty' from 'down': pair with earmark_jobs{status=pending|claimed}>0 before alerting.",
+			"Seconds since the runner's last CLAIM-ACTIVITY (it only stamps a heartbeat while a job is claimed — there is no idle heartbeat). NOT emitted when there is no claim/completion history. Cannot distinguish 'idle' from 'down' — and grows for days while pending>0 when the runner is deliberately gated (paused, run_limit=0, batch analyze phase). For runner liveness alert on earmark_runner_alive_seconds instead.",
 			nil, nil),
 		aliveSecs: prometheus.NewDesc(
 			"earmark_runner_alive_seconds",

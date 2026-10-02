@@ -405,6 +405,17 @@ func TestDemoLifecycleScenariosRender(t *testing.T) {
 			},
 			wantAbsent: []string{"Winding down"},
 		},
+		{
+			// `earmark batch` Phase B with tracks held for the next batch: used to
+			// render "IDLE" + "Winding down" + "exhausted (0 left)".
+			scenario: "batch-analyze",
+			wantContains: []string{
+				"ANALYZING",
+				"Batch analyze phase — eval / embed on GPU · 78 tracks queued for the next batch",
+				"held for the batch analyze phase",
+			},
+			wantAbsent: []string{"Winding down", "exhausted (0 left)", "is transcribing"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.scenario, func(t *testing.T) {
@@ -450,4 +461,94 @@ func containsStr(s, sub string) bool {
 		}
 		return false
 	}())
+}
+
+// TestApplyLifecycleStateLine pins the lifecycle overrides of the base state
+// line, in particular the batch analyze phase with work held for the next batch
+// (phase=analyze, pending>0, claimed=0), which used to read "IDLE".
+func TestApplyLifecycleStateLine(t *testing.T) {
+	tests := []struct {
+		name      string
+		stats     *db.QueueStats
+		phase     string
+		evalOn    bool
+		baseClass string // StateClass from newStatusData before the override
+		baseLabel string
+		wantLabel string
+		wantSub   string // substring the SubText must contain
+	}{
+		{
+			name:  "batch analyze with held work",
+			stats: statsOf(78, 0, 327, 407, 300, 6, false), phase: db.PhaseAnalyze, evalOn: true,
+			baseClass: "state-idle", baseLabel: "IDLE",
+			wantLabel: "ANALYZING",
+			wantSub:   "Batch analyze phase — eval / embed on GPU · 78 tracks queued for the next batch",
+		},
+		{
+			name:  "batch analyze, eval not in pipeline",
+			stats: statsOf(1, 0, 10, 11, 0, 3, false), phase: db.PhaseAnalyze, evalOn: false,
+			baseClass: "state-idle", baseLabel: "IDLE",
+			wantLabel: "ANALYZING",
+			wantSub:   "Batch analyze phase — embed on GPU · 1 track queued for the next batch",
+		},
+		{
+			name:  "analyze with transcribe drained stays winding down",
+			stats: statsOf(0, 0, 317, 317, 290, 12, false), phase: db.PhaseAnalyze, evalOn: true,
+			baseClass: "state-idle", baseLabel: "IDLE",
+			wantLabel: "WINDING DOWN",
+			wantSub:   "Winding down — GPU still working (eval)",
+		},
+		{
+			name:  "analyze never hides a stalled runner",
+			stats: statsOf(5, 0, 120, 125, 100, 0, false), phase: db.PhaseAnalyze, evalOn: true,
+			baseClass: "state-stalled", baseLabel: "STALLED",
+			wantLabel: "STALLED",
+		},
+		{
+			name:  "paused in analyze stays paused",
+			stats: statsOf(78, 0, 327, 407, 300, 6, true), phase: db.PhaseAnalyze, evalOn: true,
+			baseClass: "state-paused", baseLabel: "PAUSED",
+			wantLabel: "PAUSED",
+		},
+		{
+			name:  "idle phase with pending work is not relabeled analyzing",
+			stats: statsOf(4, 0, 10, 14, 10, 0, false), phase: db.PhaseIdle, evalOn: true,
+			baseClass: "state-idle", baseLabel: "IDLE",
+			wantLabel: "IDLE",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := statusData{StateLabel: tc.baseLabel, StateClass: tc.baseClass, SubText: "base"}
+			data.Lifecycle = computePipelineLifecycle(tc.stats, tc.phase, arbiterStatus{}, false, tc.evalOn)
+			applyLifecycleStateLine(&data, tc.stats)
+			if data.StateLabel != tc.wantLabel {
+				t.Errorf("label = %q, want %q (sub %q)", data.StateLabel, tc.wantLabel, data.SubText)
+			}
+			if tc.wantSub != "" && !containsStr(data.SubText, tc.wantSub) {
+				t.Errorf("SubText = %q, want it to contain %q", data.SubText, tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestRunBudgetText(t *testing.T) {
+	zero, one, many := 0, 1, 1200
+	tests := []struct {
+		limit *int
+		phase string
+		want  string
+	}{
+		{nil, db.PhaseIdle, "unlimited"},
+		{&zero, db.PhaseIdle, "exhausted (0 left)"},
+		{&zero, db.PhaseTranscribe, "exhausted (0 left)"},
+		{&zero, db.PhaseAnalyze, "held for the batch analyze phase (resumes next batch)"},
+		{&one, db.PhaseTranscribe, "1 job left"},
+		{&many, db.PhaseIdle, "1,200 jobs left"},
+	}
+	for _, tc := range tests {
+		if got := runBudgetText(tc.limit, tc.phase); got != tc.want {
+			t.Errorf("runBudgetText(%v, %q) = %q, want %q", tc.limit, tc.phase, got, tc.want)
+		}
+	}
 }

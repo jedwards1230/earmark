@@ -21,10 +21,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jedwards1230/earmark/internal/chunker"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/worker"
 	"github.com/spf13/cobra"
 )
 
@@ -237,31 +237,16 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 		// what the embed worker will replay onto. Feeding the judge the corrected
 		// projection instead would make every backfilled finding stale on arrival.
 		//
-		// TODO(pre-existing, out of scope): this chunks with the RAW-TEXT chunker
-		// while addressing rows by db.ChunkUUID(t.ID, i). For a transcript that
-		// has segments, the embed worker derives its chunks from those segments,
-		// so the text judged here can disagree with the text stored under the
-		// same chunk UUID. Predates the correction overlay; fixing it means
-		// sharing the worker's segment-aware chunking here.
-		//
-		// Build EvalChunks from raw text with deterministic UUIDs so findings
-		// reference the same chunk IDs that the embed pass used/will use.
-		var evalChunks []db.EvalChunk
-		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
-		for i, text := range texts {
-			evalChunks = append(evalChunks, db.EvalChunk{
-				ChunkID:            db.ChunkUUID(t.ID, i),
-				TranscriptID:       t.ID,
-				TranscriptionRunID: t.JobID,
-				FilePath:           t.FilePath,
-				ChunkIndex:         i,
-				Text:               text,
-			})
-		}
-		if len(evalChunks) == 0 {
+		// Chunk with the embed worker's own (segment-aware) chunking and
+		// deterministic UUIDs, so each finding's chunk ID, anchors and chunk hash
+		// refer to the exact text the embed pass stores under that ID. Plain
+		// raw-text token chunking would disagree for any transcript with segments.
+		chunks, cerr := worker.PristineChunks(t, chunkSize)
+		if cerr != nil {
 			p("  skip %s (no chunks produced)\n", filepath.Base(t.FilePath))
 			continue
 		}
+		evalChunks := worker.EvalChunksFor(t, chunks)
 
 		started := time.Now()
 		findings, stats, jerr := evalpkg.RunOnChunks(ctx, judge, nil, evalChunks, false)
