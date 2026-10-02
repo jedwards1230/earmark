@@ -1778,12 +1778,18 @@ func phaseReason(phase string, paused bool) string {
 // runBudgetText renders the current bounded-run state for the Pipeline page: the
 // remaining-claim count when a run_limit is set, or "unlimited" when nil. A
 // run_limit of 0 means a bounded run has drained (the runner declines further
-// claims until re-armed), so it reads "exhausted" rather than "0 jobs".
-func runBudgetText(limit *int) string {
+// claims until re-armed), so it reads "exhausted" rather than "0 jobs" — except
+// in the batch analyze phase, where the `earmark batch` coordinator holds the
+// budget at 0 on purpose while eval/embed own the GPU, so "exhausted" would read
+// like an error.
+func runBudgetText(limit *int, phase string) string {
 	if limit == nil {
 		return "unlimited"
 	}
 	if *limit <= 0 {
+		if phase == db.PhaseAnalyze {
+			return "held for the batch analyze phase (resumes next batch)"
+		}
 		return "exhausted (0 left)"
 	}
 	if *limit == 1 {
@@ -2002,7 +2008,7 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 	// (no extra query). ControlEnabled gates the live writes so the controls render
 	// honestly disabled on a token-less deployment.
 	data.RunLimit = stats.RunLimit
-	data.RunBudgetText = runBudgetText(stats.RunLimit)
+	data.RunBudgetText = runBudgetText(stats.RunLimit, phase)
 	data.ControlEnabled = s.controlToken != ""
 
 	// Pipeline lifecycle (3-stage: Transcribe → Eval → Embed). Computed here so
@@ -2025,28 +2031,7 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 		data.Lifecycle = computePipelineLifecycle(stats, phase, primaryArbiter, gpuProbed, s.evalInPipeline)
 		data.PrimaryArbiter = primaryArbiter
 		data.PipelineBar = computePipelineBar(stats.PipelineBuckets, stats.EvalCoverageDone)
-		// Override the default SubText (and, when needed, the RUNNING-but-transcribing
-		// label) with the lifecycle-aware message so the Pipeline page is honest about
-		// which stage owns the GPU. The base state machine only knows the ASR runner's
-		// claim heartbeat, so once transcribe drains it either says "IDLE" (heartbeat
-		// gone) or "RUNNING … is transcribing" (heartbeat fresh) — both wrong while the
-		// eval judge owns the GPU. The lifecycle knows better.
-		switch {
-		case data.Lifecycle.Activity == activityEvaluating && stats.Pending == 0 && stats.Claimed == 0:
-			// Transcribe drained; the eval judge is the one on the GPU. Relabel so the
-			// state line stops claiming the runner "is transcribing".
-			data.StateLabel, data.StateClass, data.DotClass = "WINDING DOWN", "state-running", "green"
-			data.SubText = "Winding down — GPU still working (eval)"
-		case data.Lifecycle.WindingDown() && data.StateClass == "state-idle":
-			data.SubText = "Winding down — GPU still working (eval / embed)"
-		case data.Lifecycle.FullyDone && !data.Lifecycle.GPUCommitted:
-			data.SubText = "Idle — safe to walk away"
-			if data.Lifecycle.GPUProbed && data.PrimaryArbiter.VRAMUsedMB != nil && *data.PrimaryArbiter.VRAMUsedMB > 1024 {
-				// Idle but the models are still resident in VRAM — the "why is 29 GB
-				// occupied while idle" answer surfaces right on the state line.
-				data.SubText = "Idle — safe to walk away · models resident"
-			}
-		}
+		applyLifecycleStateLine(&data, stats)
 	}
 
 	// Build the queue and activity feeds. The queue is built first (primary section);
@@ -2059,6 +2044,46 @@ func (s *MCPServer) renderStatusFragment(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 	if err := statusFragmentTmpl.Execute(w, data); err != nil {
 		s.logger.Error("status fragment render error", "error", err)
+	}
+}
+
+// applyLifecycleStateLine overrides the base state line (label + SubText) with
+// the lifecycle-aware message so the Pipeline page is honest about which stage
+// owns the GPU. The base state machine (newStatusData) only knows the ASR
+// runner's claim heartbeat, so once transcribe drains — or the batch coordinator
+// parks it for the analyze phase — it says "IDLE" (heartbeat gone) or "RUNNING …
+// is transcribing" (heartbeat fresh), both wrong while the eval judge / embed
+// worker owns the GPU. data.Lifecycle must already be computed.
+func applyLifecycleStateLine(data *statusData, stats *db.QueueStats) {
+	lc := data.Lifecycle
+	switch {
+	case lc.Activity == activityEvaluating && stats.Pending == 0 && stats.Claimed == 0:
+		// Transcribe drained; the eval judge is the one on the GPU. Relabel so the
+		// state line stops claiming the runner "is transcribing".
+		data.StateLabel, data.StateClass, data.DotClass = "WINDING DOWN", "state-running", "green"
+		data.SubText = "Winding down — GPU still working (eval)"
+	case lc.Phase == db.PhaseAnalyze && lc.Activity == activityEvaluating && data.StateClass == "state-idle":
+		// `earmark batch` Phase B with work still queued: the coordinator holds the
+		// pending tracks for the next batch (run_limit=0) while eval/embed run on
+		// the GPU. Not idle, and not winding down — the next batch follows.
+		work := "embed"
+		if lc.EvalInPipeline {
+			work = "eval / embed"
+		}
+		data.StateLabel, data.StateClass, data.DotClass = "ANALYZING", "state-running", "green"
+		data.SubText = "Batch analyze phase — " + work + " on GPU"
+		if stats.Pending > 0 {
+			data.SubText += fmt.Sprintf(" · %s track%s queued for the next batch", commafy(stats.Pending), plural(stats.Pending))
+		}
+	case lc.WindingDown() && data.StateClass == "state-idle":
+		data.SubText = "Winding down — GPU still working (eval / embed)"
+	case lc.FullyDone && !lc.GPUCommitted:
+		data.SubText = "Idle — safe to walk away"
+		if lc.GPUProbed && data.PrimaryArbiter.VRAMUsedMB != nil && *data.PrimaryArbiter.VRAMUsedMB > 1024 {
+			// Idle but the models are still resident in VRAM — the "why is 29 GB
+			// occupied while idle" answer surfaces right on the state line.
+			data.SubText = "Idle — safe to walk away · models resident"
+		}
 	}
 }
 

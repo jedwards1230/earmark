@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -29,9 +30,12 @@ const actor = "batch"
 // Writes: SetPipelinePhase (the transcribe/analyze/idle selector) and
 // SetRunLimit (the bounded-run counter the ASR runner decrements). Reads:
 // GetPipelinePhase (for resume reconciliation) and GetServiceStatus (the queue
-// snapshot used to decide when a phase is complete).
+// snapshot used to decide when a phase is complete). SwapRunLimit both reads
+// and writes: it parks the runner (run_limit=0) and returns the pre-batch
+// budget put back on exit, atomically against the runner's claim.
 type PhaseStore interface {
 	GetPipelinePhase(ctx context.Context) (string, error)
+	SwapRunLimit(ctx context.Context, limit *int, by string) (prev *int, err error)
 	SetPipelinePhase(ctx context.Context, phase, by string) error
 	SetRunLimit(ctx context.Context, limit *int, by string) error
 	GetServiceStatus(ctx context.Context) (*db.QueueStats, error)
@@ -172,9 +176,9 @@ func (o *Options) normalize() error {
 
 // Run executes the batch coordinator until the queue drains, MaxBatches is hit,
 // or the run is cancelled (SIGINT/SIGTERM, or the parent ctx). It ALWAYS
-// restores the pipeline to idle and clears the run budget on exit — normal
-// completion, error, or cancel — via a deferred restore, so the system never
-// gets stuck mid-phase.
+// restores the pipeline to idle and puts back the pre-batch run budget on exit
+// — normal completion, error, or cancel — via a deferred restore, so the system
+// never gets stuck mid-phase or with the runner budget-gated at 0.
 //
 // The SIGINT/SIGTERM handler is installed *inside* Run (not by the caller) so
 // that the signal-aware scope strictly encloses the restore-idle defer: there
@@ -195,20 +199,23 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	defer stop()
 	ctx = sigCtx
 
-	// Robustness: restore idle + clear budget on EVERY exit path. Uses
-	// context.Background() (not ctx) so the cleanup still runs after a
+	// Robustness: restore idle + the pre-batch run budget on EVERY exit path.
+	// restoreLimit starts nil (unlimited) and is overwritten once the pre-batch
+	// state has been read, so even an early failure leaves a runnable pipeline.
+	// Uses context.Background() (not ctx) so the cleanup still runs after a
 	// cancellation — the cancelled ctx would reject the writes otherwise.
+	var restoreLimit *int
 	defer func() {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if rerr := restoreIdle(restoreCtx, store); rerr != nil {
+		if rerr := restoreIdle(restoreCtx, store, restoreLimit); rerr != nil {
 			p("WARNING: failed to restore idle phase on exit: %v\n", rerr)
 			if err == nil {
 				err = fmt.Errorf("restore idle on exit: %w", rerr)
 			}
 			return
 		}
-		p("Restored pipeline to idle (run budget set to 0).\n")
+		p("Restored pipeline to idle (phase=idle, run_limit=%s).\n", formatRunLimit(restoreLimit))
 	}()
 
 	// Resume reconciliation: if a previous run died mid-batch in analyze, finish
@@ -217,12 +224,13 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	if err != nil {
 		return fmt.Errorf("read initial phase: %w", err)
 	}
+	restoreLimit = captureRestoreLimit(ctx, p, store, phase)
 	if phase == db.PhaseAnalyze {
 		p("Resuming: found phase=analyze; finishing the in-flight analyze batch first.\n")
 		// Clear any residual run budget left by a crash mid-Phase-A to 0. In the
 		// analyze phase the runner is off-GPU so a lingering run_limit is inert,
-		// but resetting it now keeps the resumed state clean and upholds the
-		// invariant that the coordinator never leaves run_limit NULL (=unlimited).
+		// but resetting it now keeps the resumed state clean: no stray claims
+		// between this resumed Phase B and the next Phase A.
 		zero := 0
 		if err := store.SetRunLimit(ctx, &zero, actor); err != nil {
 			return fmt.Errorf("clear run limit (resume): %w", err)
@@ -429,22 +437,72 @@ func analyzeDrained(st *db.QueueStats, evalGatesEmbed bool) bool {
 	return st.EmbedBacklog == 0
 }
 
-// restoreIdle returns the pipeline to a SAFE idle resting state: phase=idle and
-// run_limit=0. Called from the deferred cleanup on every exit path.
+// captureRestoreLimit parks the runner (run_limit=0) and decides which run_limit
+// the exit cleanup puts back. Capture and park are ONE atomic swap under the
+// runner_control row lock the runner's claim also takes, so the runner cannot
+// claim against (and decrement) the operator's budget between the read and the
+// park — e.g. while the coordinator then blocks yielding to a game — and the
+// restore never refunds claims that were already made. From here on the
+// coordinator owns the budget until exit.
 //
-// run_limit is set to 0 (NOT cleared to NULL): the runner's claim gate treats
-// NULL as *unlimited*, so leaving it NULL would let the runner drain the entire
-// backlog the moment it isn't paused — the opposite of the batched model.
-// run_limit=0 leaves the runner idle-but-armed: it claims nothing until the next
-// batch sets a budget, and never runs unbounded between batches.
-func restoreIdle(ctx context.Context, store PhaseStore) error {
+// The pre-batch value is restored when it is meaningful: the run started from
+// phase idle AND run_limit was NULL (unlimited) or > 0 (an operator's bounded
+// run still in progress).
+//
+// Everything else falls back to nil (unlimited — normal continuous operation):
+//   - a non-idle starting phase: the values are residue of a coordinator that
+//     died mid-batch, not an operator setting;
+//   - run_limit=0: a spent budget, typically left by an older coordinator that
+//     parked the runner at 0 on exit. Restoring it would gate the runner
+//     indefinitely ("Run limit reached (run_limit=0) - skipping claim"), so newly
+//     ingested books would never transcribe;
+//   - a failed swap (logged, never fatal — the run proceeds and Phase A sets
+//     its own budget).
+//
+// The pause flag is the operator's stop switch and is never touched.
+func captureRestoreLimit(ctx context.Context, p func(string, ...any), store PhaseStore, phase string) *int {
+	zero := 0
+	limit, err := store.SwapRunLimit(ctx, &zero, actor)
+	if err != nil {
+		p("WARNING: could not read the pre-batch run budget (%v) — will restore run_limit=unlimited on exit.\n", err)
+		return nil
+	}
+	switch {
+	case phase != db.PhaseIdle && phase != "":
+		p("Pre-batch phase=%s is left over from an interrupted run — will restore run_limit=unlimited on exit.\n", phase)
+		return nil
+	case limit != nil && *limit == 0:
+		p("Pre-batch run_limit=0 is a spent budget — will restore run_limit=unlimited on exit so the runner keeps claiming.\n")
+		return nil
+	default:
+		p("Pre-batch run_limit=%s — will restore it on exit.\n", formatRunLimit(limit))
+		return limit
+	}
+}
+
+// formatRunLimit renders a run_limit for log lines; nil is "unlimited (NULL)".
+func formatRunLimit(limit *int) string {
+	if limit == nil {
+		return "unlimited (NULL)"
+	}
+	return strconv.Itoa(*limit)
+}
+
+// restoreIdle returns the pipeline to its pre-batch resting state: phase=idle
+// and run_limit=limit (nil = unlimited), as chosen by captureRestoreLimit.
+// Called from the deferred cleanup on every exit path.
+//
+// Earlier versions always set run_limit=0 here ("idle-but-armed") so the runner
+// would not drain the backlog unbatched between coordinator runs. Nothing
+// re-runs the coordinator on a schedule, though, so that left the ASR runner
+// budget-gated indefinitely after a batch run and new books never transcribed.
+func restoreIdle(ctx context.Context, store PhaseStore, limit *int) error {
 	var errs []error
 	if err := store.SetPipelinePhase(ctx, db.PhaseIdle, actor); err != nil {
 		errs = append(errs, fmt.Errorf("clear phase: %w", err))
 	}
-	zero := 0
-	if err := store.SetRunLimit(ctx, &zero, actor); err != nil {
-		errs = append(errs, fmt.Errorf("set run limit to 0: %w", err))
+	if err := store.SetRunLimit(ctx, limit, actor); err != nil {
+		errs = append(errs, fmt.Errorf("restore run limit to %s: %w", formatRunLimit(limit), err))
 	}
 	return errors.Join(errs...)
 }

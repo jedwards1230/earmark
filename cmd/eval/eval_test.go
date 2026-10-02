@@ -9,6 +9,8 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/patch"
+	"github.com/jedwards1230/earmark/internal/worker"
 )
 
 // fakeRunner records the RunOptions it was called with and returns canned data.
@@ -182,6 +184,7 @@ func TestRunOutput_ReportsSkippedChunks(t *testing.T) {
 // fakeBackfillDB implements backfillDB for unit tests without a live DB.
 type fakeBackfillDB struct {
 	transcripts   []*db.Transcript
+	stored        map[string][]db.EvalChunk // transcript ID → stored chunk rows
 	findings      []db.Finding
 	evalMetrics   []db.EvalMetrics
 	findingsErr   error
@@ -194,6 +197,10 @@ func (f *fakeBackfillDB) GetUnevaluatedJobTranscripts(_ context.Context) ([]*db.
 		return nil, f.transcriptErr
 	}
 	return f.transcripts, nil
+}
+
+func (f *fakeBackfillDB) GetEvalChunksForTranscript(_ context.Context, transcriptID string) ([]db.EvalChunk, error) {
+	return f.stored[transcriptID], nil
 }
 
 func (f *fakeBackfillDB) InsertFindings(_ context.Context, findings []db.Finding) error {
@@ -294,6 +301,118 @@ func TestRunBackfill_WritePersistesFindingsAndEvalFinishedAt(t *testing.T) {
 	}
 	if em.Model != "fake-backfill-judge" {
 		t.Errorf("eval_metrics.Model = %q, want %q", em.Model, "fake-backfill-judge")
+	}
+}
+
+// textGatedChat returns resp only for chunks whose prompt contains needle (an
+// empty findings list otherwise), so a finding lands only on the chunk that
+// really holds the flagged text.
+type textGatedChat struct{ needle, resp string }
+
+func (c textGatedChat) Complete(_ context.Context, _, user string) (string, error) {
+	if strings.Contains(user, c.needle) {
+		return c.resp, nil
+	}
+	return `{"findings":[]}`, nil
+}
+func (c textGatedChat) Model() string { return "fake-backfill-judge" }
+
+// TestRunBackfill_ChunksMatchEmbedPass is the regression for the backfill
+// chunk-ID mismatch: for a transcript WITH segments the embed worker chunks by
+// segment, so the backfill must too. Raw-text token chunking under the same
+// db.ChunkUUID(t.ID, i) judged different text than the embed pass stores there,
+// so each finding's chunk ID, chunk hash and timestamps pointed at the wrong
+// text. Every finding must match the embed pass's chunk under its ID.
+func TestRunBackfill_ChunksMatchEmbedPass(t *testing.T) {
+	tr := &db.Transcript{
+		ID:       "t-seg",
+		JobID:    "j-seg",
+		FilePath: "/books/Dune/Ch3.m4b",
+		RawText:  "Alpha one two three four. Bravo five six seven eight. Charlie nine ten eleven twelve.",
+		Segments: []db.Segment{
+			{ID: 0, Start: 0, End: 4, Text: "Alpha one two three four."},
+			{ID: 1, Start: 4, End: 9, Text: "Bravo five six seven eight."},
+			{ID: 2, Start: 9, End: 15, Text: "Charlie nine ten eleven twelve."},
+		},
+	}
+	fdb := &fakeBackfillDB{transcripts: []*db.Transcript{tr}}
+	judge := evalpkg.NewJudge(textGatedChat{
+		needle: "Charlie",
+		resp:   `{"findings":[{"original_text":"Charlie","issue_type":"misheard_proper_noun","suggested_correction":"Charley","confidence":0.9}]}`,
+	})
+	cfg := &config.Config{ChunkSize: 8}
+
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, true); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+
+	embedChunks, err := worker.PristineChunks(tr, cfg.ChunkSize)
+	if err != nil {
+		t.Fatalf("PristineChunks: %v", err)
+	}
+	byID := make(map[string]db.Chunk, len(embedChunks))
+	for _, c := range embedChunks {
+		byID[c.ID] = c
+	}
+	if len(fdb.findings) == 0 {
+		t.Fatalf("expected a finding on the Charlie chunk:\n%s", out.String())
+	}
+	for _, f := range fdb.findings {
+		if f.ChunkID == nil {
+			t.Fatalf("finding has no chunk ID: %+v", f)
+		}
+		c, ok := byID[*f.ChunkID]
+		if !ok {
+			t.Fatalf("finding chunk ID %s is not an embed-pass chunk", *f.ChunkID)
+		}
+		if !strings.Contains(c.Text, f.OriginalText) {
+			t.Errorf("chunk %d text %q does not contain finding %q", c.ChunkIndex, c.Text, f.OriginalText)
+		}
+		if f.ChunkTextSHA256 == nil || *f.ChunkTextSHA256 != patch.ChunkHash(c.Text) {
+			t.Errorf("chunk hash does not match the embed pass's chunk %d text %q", c.ChunkIndex, c.Text)
+		}
+		if f.StartSec != c.StartSec || f.EndSec != c.EndSec {
+			t.Errorf("finding span [%v,%v] != embed chunk span [%v,%v]", f.StartSec, f.EndSec, c.StartSec, c.EndSec)
+		}
+	}
+}
+
+// TestRunBackfill_EmbeddedTranscriptUsesStoredChunkIDs: an already-embedded
+// transcript (ungated path → random chunk IDs) must be judged against its
+// STORED rows, so findings reference chunk IDs that exist — regenerated UUIDv5
+// IDs would point at nothing.
+func TestRunBackfill_EmbeddedTranscriptUsesStoredChunkIDs(t *testing.T) {
+	tr := &db.Transcript{ID: "t-emb", JobID: "j-emb", FilePath: "/books/Dune/Ch4.m4b",
+		RawText: "Alpha one. Charlie two."}
+	stored := []db.EvalChunk{
+		{ChunkID: "11111111-1111-4111-8111-111111111111", TranscriptID: "t-emb", TranscriptionRunID: "j-emb",
+			FilePath: tr.FilePath, ChunkIndex: 0, StartSec: 0, EndSec: 3, Text: "Alpha one."},
+		{ChunkID: "22222222-2222-4222-8222-222222222222", TranscriptID: "t-emb", TranscriptionRunID: "j-emb",
+			FilePath: tr.FilePath, ChunkIndex: 1, StartSec: 3, EndSec: 6, Text: "Charlie two."},
+	}
+	fdb := &fakeBackfillDB{
+		transcripts: []*db.Transcript{tr},
+		stored:      map[string][]db.EvalChunk{"t-emb": stored},
+	}
+	judge := evalpkg.NewJudge(textGatedChat{
+		needle: "Charlie",
+		resp:   `{"findings":[{"original_text":"Charlie","issue_type":"misheard_proper_noun","suggested_correction":"Charley","confidence":0.9}]}`,
+	})
+
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 8}, true); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+	if len(fdb.findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d:\n%s", len(fdb.findings), out.String())
+	}
+	f := fdb.findings[0]
+	if f.ChunkID == nil || *f.ChunkID != stored[1].ChunkID {
+		t.Errorf("finding chunk ID = %v, want the stored row's ID %s", f.ChunkID, stored[1].ChunkID)
+	}
+	if f.ChunkTextSHA256 == nil || *f.ChunkTextSHA256 != patch.ChunkHash(stored[1].Text) {
+		t.Errorf("chunk hash must fingerprint the stored pristine text")
 	}
 }
 

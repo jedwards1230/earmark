@@ -538,13 +538,48 @@ log = logging.getLogger("asr-runner")
 _shutdown = threading.Event()
 
 
+class _ShutdownInterrupt(BaseException):
+    """Raised by the signal handler to abort an in-flight transcription.
+
+    A BaseException (not Exception) so the job loop's ``except Exception`` —
+    which marks the job *failed* — never swallows it: a stop request is not the
+    job's fault, so the job is released back to ``pending`` instead.
+    """
+
+
+# True only while provider.transcribe() runs on the main thread. The signal
+# handler raises _ShutdownInterrupt only inside this window, so a stop request
+# can never land mid-_mark_done (half-written transcript) or mid-claim.
+_transcribe_interruptible = False
+
+
 def _handle_signal(signum: int, _frame: Any) -> None:
+    global _transcribe_interruptible
     log.info("Received signal %d — initiating graceful shutdown", signum)
     _shutdown.set()
+    if _transcribe_interruptible:
+        # Abort the transcription (once) so the stop completes within the
+        # service wrapper's stop timeout instead of after a multi-minute job.
+        _transcribe_interruptible = False
+        raise _ShutdownInterrupt(signum)
 
 
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
+def _shutdown_signals(sigmod: Any = signal) -> list[int]:
+    """The signals that request a graceful stop: SIGTERM, SIGINT (Ctrl+C) and,
+    on Windows, SIGBREAK (CTRL_BREAK_EVENT). WinSW stops the service with
+    CTRL_C_EVENT, which Python delivers as SIGINT; without this handler that is a
+    KeyboardInterrupt (and an unhandled SIGBREAK kills the process), so the runner
+    exits non-zero, the wrapper's on-failure restart reads that as a crash and
+    respawns it — racing an Ansible restart into an orphaned second runner.
+    Handled, every stop releases any in-flight job and exits 0."""
+    sigs = [sigmod.SIGTERM, sigmod.SIGINT]
+    if hasattr(sigmod, "SIGBREAK"):
+        sigs.append(sigmod.SIGBREAK)
+    return sigs
+
+
+for _sig in _shutdown_signals():
+    signal.signal(_sig, _handle_signal)
 
 # ---------------------------------------------------------------------------
 # Database helpers (engine-agnostic — preserved from original design)
@@ -1551,6 +1586,46 @@ def _mark_done(
         )
     conn.commit()
     log.info("Job %s marked done (file: %s)", job_id, file_path)
+
+
+def _release_job(conn: psycopg2.extensions.connection, job_id: str) -> None:
+    """
+    Hand an in-flight job back to the queue on a graceful stop.
+
+    Same reset as the Go stale-claim recovery (CONTRACT §1.3) but immediate, so
+    the job is not stranded in 'claimed' for STALE_JOB_TIMEOUT. The claim's
+    attempt is refunded: an operator/service stop is not the job's fault, and
+    repeated deploy restarts must not push a long book over the 3-attempt cap
+    (a job that crashes the runner never reaches this path, so the cap still
+    catches poison jobs). Guarded on status + claimed_by so it never touches a
+    job another runner (or the stale-claim sweep) has since taken over.
+
+    Best-effort: a failure is logged and the stale-claim recovery remains the
+    backstop.
+    """
+    try:
+        conn.rollback()  # discard any transaction the interrupted job left open
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE transcription_jobs
+                SET    status     = 'pending',
+                       claimed_by = NULL,
+                       claimed_at = NULL,
+                       attempts   = GREATEST(attempts - 1, 0),
+                       updated_at = now()
+                WHERE  id = %s AND status = 'claimed' AND claimed_by = %s
+                """,
+                (job_id, RUNNER_IDENTITY),
+            )
+        conn.commit()
+        log.info("Job %s released back to pending (graceful shutdown)", job_id)
+    except Exception as exc:
+        log.error("Failed to release job %s on shutdown: %s", job_id, exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 def _mark_failed(
@@ -3259,6 +3334,25 @@ def _make_provider(backend: str) -> ASRProvider:
 # ---------------------------------------------------------------------------
 
 
+def _transcribe_interruptibly(
+    provider: ASRProvider, audio_path: Path, bias_terms: list[str] | None
+) -> Any:
+    """Run provider.transcribe() with the stop-signal window open, so a
+    SIGTERM/SIGINT/SIGBREAK aborts it with _ShutdownInterrupt (see
+    _handle_signal) instead of the stop waiting out a multi-minute job. The
+    window opens BEFORE the shutdown check, so a signal can't slip in between
+    the two: one that arrived earlier is caught by the check, one that arrives
+    later raises from the handler."""
+    global _transcribe_interruptible
+    _transcribe_interruptible = True
+    try:
+        if _shutdown.is_set():
+            raise _ShutdownInterrupt(0)
+        return provider.transcribe(audio_path, bias_terms=bias_terms)
+    finally:
+        _transcribe_interruptible = False
+
+
 def main() -> None:
     log.info(
         "asr-runner starting: identity=%s backend=%s model=%s diarize=%s compute=%s "
@@ -3399,7 +3493,7 @@ def main() -> None:
                     f"BOOKS_PATH_ENCODING={BOOKS_PATH_ENCODING} and the share mount."
                 )
 
-            result = provider.transcribe(audio_path, bias_terms=bias_terms)
+            result = _transcribe_interruptibly(provider, audio_path, bias_terms)
             _mark_done(conn, job_id, file_path, checksum, result)
             # Best-effort metrics write — AFTER the transcript commit.
             # _write_run_metrics catches all exceptions internally and never
@@ -3407,6 +3501,11 @@ def main() -> None:
             # deployed) or any other failure cannot affect the transcript write.
             _write_run_metrics(conn, job_id, result)
 
+        except _ShutdownInterrupt:
+            log.warning(
+                "Shutdown requested mid-transcription — releasing job %s", job_id
+            )
+            _release_job(conn, job_id)
         except Exception as exc:
             log.exception("Transcription failed for job %s", job_id)
             _mark_failed(conn, job_id, str(exc))

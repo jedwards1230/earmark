@@ -21,10 +21,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jedwards1230/earmark/internal/chunker"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/worker"
 	"github.com/spf13/cobra"
 )
 
@@ -133,6 +133,9 @@ type backfillDB interface {
 	// GetUnevaluatedJobTranscripts returns done transcripts with eval_finished_at
 	// IS NULL, regardless of embed state. Used by --backfill-unevaluated.
 	GetUnevaluatedJobTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	// GetEvalChunksForTranscript returns the transcript's stored chunk rows
+	// (real IDs, pristine text); empty when it has not been embedded yet.
+	GetEvalChunksForTranscript(ctx context.Context, transcriptID string) ([]db.EvalChunk, error)
 	// InsertFindings persists advisory judge findings (best-effort in backfill).
 	InsertFindings(ctx context.Context, findings []db.Finding) error
 	// UpsertEvalMetrics writes eval_finished_at (the eval-completion latch) plus
@@ -189,12 +192,13 @@ func (d *dbRunner) Run(ctx context.Context, o evalpkg.RunOptions) ([]db.Finding,
 }
 
 // runBackfill judges every done transcript whose eval_finished_at IS NULL,
-// regardless of embed state. It chunks transcripts from raw text in memory
-// (not from transcript_chunks), so it works even when a transcript was processed
-// before the gated flow was enabled. For each transcript it:
+// regardless of embed state, so it also covers transcripts processed before the
+// gated flow was enabled. For each transcript it:
 //
-//  1. Chunks the raw text using deterministic UUIDv5 IDs (CONTRACT §1.5) so
-//     findings reference the chunk rows that the embed pass will/did insert.
+//  1. Picks the chunks findings must reference: the stored transcript_chunks
+//     rows when already embedded (their real IDs, which may be random from the
+//     ungated path), else the embed worker's own chunking with deterministic
+//     UUIDv5 IDs (CONTRACT §1.5) — the rows the gated embed pass will insert.
 //  2. Runs the judge over the chunks.
 //  3. Persists findings (best-effort — a write failure is logged and skipped).
 //  4. Writes eval_finished_at via UpsertEvalMetrics (the latch for the gate).
@@ -237,30 +241,27 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 		// what the embed worker will replay onto. Feeding the judge the corrected
 		// projection instead would make every backfilled finding stale on arrival.
 		//
-		// TODO(pre-existing, out of scope): this chunks with the RAW-TEXT chunker
-		// while addressing rows by db.ChunkUUID(t.ID, i). For a transcript that
-		// has segments, the embed worker derives its chunks from those segments,
-		// so the text judged here can disagree with the text stored under the
-		// same chunk UUID. Predates the correction overlay; fixing it means
-		// sharing the worker's segment-aware chunking here.
-		//
-		// Build EvalChunks from raw text with deterministic UUIDs so findings
-		// reference the same chunk IDs that the embed pass used/will use.
-		var evalChunks []db.EvalChunk
-		texts := chunker.Chunker(t.RawText, chunkSize, chunker.SplitTypeToken)
-		for i, text := range texts {
-			evalChunks = append(evalChunks, db.EvalChunk{
-				ChunkID:            db.ChunkUUID(t.ID, i),
-				TranscriptID:       t.ID,
-				TranscriptionRunID: t.JobID,
-				FilePath:           t.FilePath,
-				ChunkIndex:         i,
-				Text:               text,
-			})
+		// Every finding's chunk ID, anchors and chunk hash must refer to the exact
+		// text stored under that ID:
+		//   - Already embedded: judge the STORED rows (real IDs + pristine
+		//     source text). Those rows may carry random IDs from the ungated
+		//     worker path, so regenerated UUIDv5 IDs would not exist.
+		//   - Not embedded yet: regenerate with the embed worker's own
+		//     (segment-aware) chunking and deterministic UUIDs — the IDs the
+		//     gated embed pass will insert, exactly as its own eval pass does.
+		evalChunks, cerr := bdb.GetEvalChunksForTranscript(ctx, t.ID)
+		if cerr != nil {
+			p("  warn %s: read stored chunks failed (%v); skipping (will retry next backfill)\n",
+				filepath.Base(t.FilePath), cerr)
+			continue
 		}
 		if len(evalChunks) == 0 {
-			p("  skip %s (no chunks produced)\n", filepath.Base(t.FilePath))
-			continue
+			chunks, perr := worker.PristineChunks(t, chunkSize)
+			if perr != nil {
+				p("  skip %s (no chunks produced)\n", filepath.Base(t.FilePath))
+				continue
+			}
+			evalChunks = worker.EvalChunksFor(t, chunks)
 		}
 
 		started := time.Now()

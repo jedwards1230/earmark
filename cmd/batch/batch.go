@@ -68,7 +68,9 @@ Each batch:
   4. Repeat until no pending jobs remain, --max-batches is hit, or interrupted.
 
 On exit (normal, error, or SIGINT/SIGTERM) the phase is ALWAYS restored to idle
-and the run budget cleared, so the pipeline returns to normal continuous mode.
+and the run budget put back to its pre-batch value (unlimited when it was unset,
+spent at 0, or left over from an interrupted run), so the pipeline returns to
+normal continuous mode instead of leaving the ASR runner budget-gated.
 
 The coordinator is DB-driven and resumable: it keeps no critical state in
 memory. If it restarts mid-batch and finds phase=analyze, it finishes Phase B

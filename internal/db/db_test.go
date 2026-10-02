@@ -1852,6 +1852,21 @@ func TestGetUnevaluatedJobTranscriptsSQL(t *testing.T) {
 	_ = d.GetUnevaluatedJobTranscripts // must be accessible (not renamed)
 }
 
+// TestSwapRunLimitSQL pins what makes SwapRunLimit atomic against the runner's
+// claim: the read takes the runner_control row lock (`FOR UPDATE`, the same lock
+// the claim transaction holds while it decrements), and the write is an upsert
+// of run_limit only — never the pause flag.
+func TestSwapRunLimitSQL(t *testing.T) {
+	if !strings.Contains(swapRunLimitSelectSQL, "FOR UPDATE") ||
+		!strings.Contains(swapRunLimitSelectSQL, "runner_control") {
+		t.Errorf("swap read must lock the runner_control row: %q", swapRunLimitSelectSQL)
+	}
+	if !strings.Contains(swapRunLimitWriteSQL, "SET run_limit = EXCLUDED.run_limit") ||
+		strings.Contains(swapRunLimitWriteSQL, "SET paused") || strings.Contains(swapRunLimitWriteSQL, "paused = EXCLUDED") {
+		t.Errorf("swap write must set run_limit and leave paused alone: %q", swapRunLimitWriteSQL)
+	}
+}
+
 // ─── Two-pass query selection (eval pass vs embed pass) ──────────────────────
 
 // transcriptScanColumns mirrors the 11-column SELECT order shared by

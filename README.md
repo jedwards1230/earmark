@@ -67,7 +67,7 @@ make dashboard      # or: go run . mcp --demo   →  http://localhost:8081/
 
 This renders the full status dashboard against synthetic data — no Postgres, no
 `DATABASE_URL`. Set `DEMO_SCENARIO` to render a different state — `active` is the default;
-`empty`, `stale`, `failed`, `winddown`, and `multibackend` are also available.
+`empty`, `stale`, `failed`, `winddown`, `idle`, `batch-analyze`, and `multibackend` are also available.
 
 ## Commands
 

@@ -413,11 +413,20 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
      it drains across cycles, oldest-first, looping immediately on a full batch.
 
 **Robustness contract:** the coordinator **always restores `phase='idle'` and
-sets `run_limit=0`** on exit — normal completion, error, AND `SIGINT`/`SIGTERM` —
-leaving the runner idle-but-armed (claims nothing until the next batch sets a
-budget) and never gets stuck mid-phase. It sets `run_limit=0`, **not** `NULL`:
-`NULL` means *unlimited*, so clearing it would let the runner drain the whole
-backlog the moment it isn't paused — the opposite of the batched model.
+the pre-batch `run_limit`** on exit — normal completion, error, AND
+`SIGINT`/`SIGTERM` — so it never gets stuck mid-phase and never leaves the
+runner budget-gated. At startup it swaps `run_limit` to `0` and keeps the old
+value, in one transaction under the same `runner_control` row lock
+(`FOR UPDATE`) the runner's claim takes, so the runner cannot spend the
+operator's budget while the coordinator waits (e.g. yielding to a game). The
+captured value is put back on exit when the run started from `phase` idle and `run_limit` was `NULL` or `> 0`
+(an operator's bounded run in progress). Otherwise — `run_limit=0` (a spent
+budget), a non-idle starting phase (residue of an interrupted run), or an
+unreadable control row — it restores `NULL` (unlimited, normal continuous
+operation). The final log line states the restored value. `paused` is never
+touched. (Earlier versions set `run_limit=0` on exit; with nothing re-running the
+coordinator, that left the runner logging `Run limit reached (run_limit=0)`
+indefinitely and new books never transcribed.)
 It is **DB-driven and resumable**: it holds no critical state in memory and
 derives everything (current phase, job counts, backlog) from the DB. On restart
 it reconciles — if it finds `phase='analyze'`, it finishes Phase B before
@@ -431,8 +440,8 @@ defaults on — §2.4), it holds the host awake through **both** phases:
 **transcribe** (while claimable jobs are pending or a job is in flight) and
 **analyze** (the runner is parked, but the eval judge on the same host still
 needs it up). It releases once the coordinator returns to `phase='idle'` and no
-claimable work remains — the coordinator's exit `run_limit=0` makes any leftover
-`pending` rows unclaimable, so the host can sleep again.
+claimable work remains (or the gate makes it unclaimable), so the host can
+sleep again.
 
 **Gate (the load-bearing rule):** the runner claims a job only when
 
@@ -869,9 +878,13 @@ performed the startup walk, so it waits for the first tick.
 > on **every** poll cycle (working, idle, or paused), surfaced as
 > `earmark_runner_alive_seconds` (§2.16) — this IS true idle liveness: a small
 > value with an empty queue is idle-done, a large/growing value is the runner
-> down. Alerts keyed on the old claim-activity gauge MUST still pair it with a
-> queue-non-empty + not-paused condition; alerts on liveness should use
-> `earmark_runner_alive_seconds`.
+> down. The liveness stamp is written before the claim gate, so a runner that is
+> alive but gated (`paused`, `run_limit=0`, `phase='analyze'`) keeps it fresh
+> while its claim-activity age grows for as long as the gate holds — even with
+> `pending > 0`. Alerts on runner liveness MUST use
+> `earmark_runner_alive_seconds`; the claim-activity gauge only answers "has
+> anything been transcribed lately", and pairing it with queue-non-empty +
+> not-paused still misfires under `run_limit=0` or the analyze phase.
 
 ---
 
@@ -1867,7 +1880,7 @@ histogram are incremented at the Go-emitted pipeline event sites.
 | `earmark_jobs` | gauge | `status` (`pending`/`claimed`/`done`/`failed`) | Current `transcription_jobs` count by status. |
 | `earmark_embed_backlog` | gauge | — | Completed transcripts with no chunks yet (the embed worker's needs-embedding set). |
 | `earmark_eval_coverage_ratio` | gauge | — | Done jobs judged (`run_metrics.eval_finished_at` non-NULL) ÷ done jobs; `0` when no done jobs. |
-| `earmark_runner_last_heartbeat_seconds` | gauge | — | Seconds since the runner's last **claim-activity**. The runner only stamps a heartbeat while a job is claimed (no idle heartbeat, §1.7), so this is NOT idle liveness and CANNOT distinguish "idle, queue empty" from "down". **Omitted entirely when there is no claim/completion history** (so an alert can't misread a multi-day age). Pair with `earmark_jobs{status="pending"}+earmark_jobs{status="claimed"}>0` before alerting. |
+| `earmark_runner_last_heartbeat_seconds` | gauge | — | Seconds since the runner's last **claim-activity**. The runner only stamps a heartbeat while a job is claimed (no idle heartbeat, §1.7), so this is NOT idle liveness and CANNOT distinguish "idle, queue empty" from "down". **Omitted entirely when there is no claim/completion history** (so an alert can't misread a multi-day age). It also grows while work is pending if the runner is deliberately gated (`paused`, `run_limit=0`, batch analyze phase), so it is not a liveness signal even with a non-empty queue — alert on `earmark_runner_alive_seconds` for that (§1.7). |
 | `earmark_runner_alive_seconds` | gauge | — | Seconds since the runner's last **liveness** heartbeat (`runner_control.runner_heartbeat_at`), stamped **every** poll cycle — working, idle, or paused. Unlike `earmark_runner_last_heartbeat_seconds` this stays fresh on a drained queue, so it distinguishes "idle, queue empty" (small value) from "runner down" (large/growing value). **Omitted until the runner has stamped at least once.** |
 | `earmark_runner_available` | gauge | — | `1` when the GPU host is free for transcription (gpu-arbiter not gaming), `0` when gaming/evicting. Omitted until a `runner_availability` event has been observed. |
 | `earmark_stage_duration_seconds` | histogram | `stage` | Per-stage processing duration, observed at Go-emitted finish events (`embed`, `eval`). |

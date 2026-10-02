@@ -98,6 +98,9 @@ heartbeat), `failed` (failures incl. a long multi-line error), `multibackend`
 (three ASR families — Parakeet/Whisper/Canary — across three servers),
 `winddown` (transcribe drained but the eval judge still owns the GPU — the
 "Winding down — GPU still working (eval)" state line + `active on GPU` marker),
+`batch-analyze` (`earmark batch` Phase B: phase=analyze, run_limit=0, tracks held
+pending for the next batch while eval runs on the GPU — the "ANALYZING" state
+line and the "held for the batch analyze phase" run budget),
 or `idle` (fully done, GPU util 0 but ~29 GB VRAM still occupied — the
 "Idle — safe to walk away · models resident" answer to "why is VRAM held while
 idle"). To see the connection-lost banner, open the page then stop the server —

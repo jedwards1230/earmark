@@ -40,6 +40,9 @@ func doneRatio(b db.BookSummary) float64 {
 //	multibackend     — three ASR families (Parakeet/Whisper/Canary) on three
 //	                   hosts so the Servers page's Family/Runtime columns,
 //	                   capability badges, and skipped-reason tooltips render
+//	batch-analyze    — `earmark batch` Phase B: phase=analyze, run_limit=0,
+//	                   tracks held pending for the next batch, eval on the GPU
+//	                   → "ANALYZING" state line + "held" run budget
 type demoDB struct {
 	scenario string
 	paused   *bool // heap-backed so value-receiver SetPaused can mutate it
@@ -218,6 +221,8 @@ func (demoEndpointProber) Probe(_ context.Context, baseURL, _, _ string) endpoin
 //	           VRAM, parakeet + gemma3 both running ("active on GPU").
 //	idle     — fully done: GPU util 0 but ~29 GB VRAM still occupied with the
 //	           models resident-but-not-active ("idle · models resident").
+//	batch-analyze — ASR runner parked for the batch analyze phase, the eval
+//	           judge (ollama) alone on the GPU.
 type demoGPUProber struct{ scenario string }
 
 func (p demoGPUProber) Probe(_ context.Context, url string) arbiterStatus {
@@ -243,6 +248,14 @@ func (p demoGPUProber) Probe(_ context.Context, url string) arbiterStatus {
 				ResidentUnits: []residentUnit{
 					{Unit: "asr-runner.service", Running: false},
 					{Unit: "ollama.service", Running: false},
+				}}
+		case "batch-analyze":
+			// Phase B: the runner has parked its model; the eval judge owns the GPU.
+			return arbiterStatus{Reachable: true, State: "available",
+				ASRRunning: bp(false), VRAMUsedMB: ip(22528), VRAMTotalMB: ip(32607),
+				ResidentUnits: []residentUnit{
+					{Unit: "asr-runner.service", Running: false},
+					{Unit: "ollama.service", Running: true},
 				}}
 		default: // winddown / active — eval judge actively owns the GPU (high VRAM)
 			return arbiterStatus{Reachable: true, State: "available",
@@ -329,8 +342,8 @@ func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, er
 					LastFinished: tp(now.Add(-2 * time.Hour)), AvgProcessingSeconds: fp(498.0)},
 			},
 		}, nil
-	case "winddown", "idle":
-		// Transcribe has drained — no live runner claim. Hosts still report their
+	case "winddown", "idle", "batch-analyze":
+		// Transcribe has drained (or is held for the next batch) — no live runner claim. Hosts still report their
 		// finished-job history so the Servers page stays populated, but the live
 		// transcribe block is empty (consistent with the Pipeline page's drained
 		// transcribe stage).
@@ -570,13 +583,15 @@ func (d demoDB) ClearRunnerUpdate(context.Context, string) error               {
 // GetPipelinePhase reports a per-scenario coordinator phase so the read-only
 // phase badge renders a representative state with no database: the live "active"
 // scenario is mid-transcribe, the crashed-runner "stale" scenario is in the
-// analyze phase, and every other scenario is idle (the default).
+// analyze phase (as are winddown and batch-analyze), and every other scenario is
+// idle (the default).
 func (d demoDB) GetPipelinePhase(context.Context) (string, error) {
 	switch d.scenario {
 	case "active":
 		return db.PhaseTranscribe, nil
-	case "winddown", "stale":
+	case "winddown", "stale", "batch-analyze":
 		// winddown: transcribe drained, the eval judge is mid-analyze on the GPU.
+		// batch-analyze: `earmark batch` Phase B with tracks held for the next batch.
 		// stale: crashed runner left the coordinator parked in analyze.
 		return db.PhaseAnalyze, nil
 	default: // idle, empty, failed, multibackend → idle
@@ -653,6 +668,33 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 				Failed:          2,
 			},
 		}
+	case "batch-analyze":
+		// The live `earmark batch` Phase B state the dashboard used to mislabel
+		// "IDLE": phase=analyze, run_limit=0 (the coordinator holds transcription),
+		// 78 tracks deliberately left pending for the next batch, nothing claimed,
+		// and the eval judge working through the just-transcribed batch on the GPU.
+		hb := now.Add(-25 * time.Minute) // last claim heartbeat: end of Phase A
+		emb := now.Add(-40 * time.Second)
+		avg := 489.0
+		tok := int64(6_950_000)
+		libDur := 1_188_000.0
+		libWords := int64(12_400_000)
+		q = &db.QueueStats{
+			Pending: 78, Claimed: 0, Done: 327, Failed: 2,
+			Transcripts: 327, Chunks: 18980, EmbedBacklog: 6, LastEmbedAt: &emb,
+			TotalJobs: 407, DoneLastHour: 10,
+			EvalCoverageDone: 321,
+			RunnerActive:     false, RunnerID: "demo-runner", LastHeartbeat: &hb,
+			AvgProcessingSeconds: &avg, TotalEmbedTokens: &tok,
+			TotalDurationSeconds: &libDur, TotalWords: &libWords, BooksFullyDone: 50, BooksTotal: 60,
+			PipelineBuckets: db.PipelineBuckets{
+				Pending:         78,
+				TranscribedOnly: 6,
+				EvaldOnly:       4,
+				EmbeddedReady:   317,
+				Failed:          2,
+			},
+		}
 	case "idle":
 		// The after-eval state: fully done (pending 0, claimed 0, EmbedBacklog 0,
 		// eval coverage 100%), phase idle, GPU util 0 — yet ~29 GB VRAM is still
@@ -717,6 +759,10 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 	}
 	q.Paused = d.isPaused()
 	q.RunLimit = d.runLimit
+	if d.scenario == "batch-analyze" && q.RunLimit == nil {
+		zero := 0
+		q.RunLimit = &zero // held at 0 by the batch coordinator for Phase B
+	}
 	// Runner version-skew fixture so the /servers update card renders without a
 	// DB: the active/failed scenarios show an available update, others show the
 	// runner current (no card content beyond the running version).
@@ -1158,7 +1204,8 @@ func renumber(p string, n int) string {
 // StartDemoDashboard starts the HTTP transport (status dashboard + /mcp +
 // /health + /readyz) backed by synthetic data, with no database connection.
 // Intended for local UI iteration and AI-agent visual verification only.
-// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend to render a state.
+// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend|winddown|idle|batch-analyze
+// to render a state.
 func StartDemoDashboard(addr string) error {
 	if addr == "" {
 		addr = ":8081"
