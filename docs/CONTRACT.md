@@ -1916,15 +1916,21 @@ A job is selected when any of these holds:
 2. it is latched but `eval_skipped > 0` (the old ungated path latched partial
    runs);
 3. it is latched but a per-job `pipeline_events` row with `stage='eval'` and
-   `event='error'` — or `event='finish'` with `detail.skipped > 0` — was written
-   at/after that job's `eval_started_at` (the old gated pass latched every judge
-   failure and zeroed `eval_skipped`, so the event log is the only record; this
-   is how the ~85 historical eval errors are found).
+   `event='error'` — or `event='finish'` with a numeric `detail.skipped > 0` —
+   was written at/after that job's `eval_started_at` (the old gated pass latched
+   every judge failure and zeroed `eval_skipped`, so the event log is the only
+   record; this is how the ~85 historical eval errors are found);
+4. it is latched but `eval_chunks` is lower than the number of
+   `transcript_chunks` rows the transcript has (the old CLI backfill stopped on
+   the first client timeout and still latched, with `eval_skipped = 0`, the
+   chunks judged so far, and no event). A transcript re-embedded with a
+   different `CHUNK_SIZE` after a complete judge run also matches; re-judging it
+   is harmless because findings are de-duplicated.
 
 Findings already recorded for a transcript (same chunk, span, issue type and
 correction) are not inserted again. A successful re-judge writes a new
-`eval_started_at`, `eval_skipped = 0`, and clears the failure record, so the job
-leaves all three conditions. Same `--write` / dry-run / `--limit` semantics as
+`eval_started_at`, `eval_skipped = 0`, `eval_chunks` = every chunk, and clears
+the failure record, so the job leaves all four conditions. Same `--write` / dry-run / `--limit` semantics as
 `--backfill-unevaluated`; the two flags are mutually exclusive.
 
 ```bash

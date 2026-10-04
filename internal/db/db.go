@@ -3698,10 +3698,20 @@ func (db *DB) GetUnevaluatedJobTranscripts(ctx context.Context, after Transcript
 //  3. LEGACY: latched, but a per-job eval error event — or an eval finish event
 //     reporting skipped chunks — was logged at/after that run's eval_started_at.
 //     The pre-fix gated pass latched every judge failure (and zeroed
-//     eval_skipped), so the event log is the only surviving record.
+//     eval_skipped), so the event log is the only surviving record. The
+//     detail->'skipped' cast is guarded by jsonb_typeof so a non-numeric value
+//     can never fail the whole query.
+//  4. LEGACY: latched, but fewer chunks were judged than the transcript has
+//     stored (eval_chunks < count of transcript_chunks). The pre-fix CLI
+//     backfill aborted on the first client timeout and still latched with
+//     eval_skipped = 0, the chunks judged so far, and no event — this is the
+//     only trace it leaves. (A transcript re-embedded with a different
+//     CHUNK_SIZE after a complete judge run also matches; re-judging it is
+//     harmless, findings are de-duplicated.)
 //
-// A successful re-judge writes a new eval_started_at (after those events) and
-// eval_skipped = 0 and clears eval_failed_at, so the job drops out of all three.
+// A successful re-judge writes a new eval_started_at (after those events),
+// eval_skipped = 0, eval_chunks = every stored chunk, and clears eval_failed_at,
+// so the job drops out of all four.
 const evalErrorTranscriptsSQL = `
 		SELECT t.id, t.job_id, t.file_path, t.checksum,
 		       t.language, t.duration_seconds, t.speaker_count,
@@ -3719,8 +3729,14 @@ const evalErrorTranscriptsSQL = `
 		        WHERE pe.job_id = j.id
 		          AND pe.stage = 'eval'
 		          AND (pe.event = 'error'
-		               OR (pe.event = 'finish' AND COALESCE((pe.detail->>'skipped')::int, 0) > 0))
+		               OR (pe.event = 'finish'
+		                   AND CASE WHEN jsonb_typeof(pe.detail->'skipped') = 'number'
+		                            THEN (pe.detail->>'skipped')::numeric > 0
+		                            ELSE false END))
 		          AND pe.created_at >= COALESCE(rm.eval_started_at, '-infinity'::timestamptz)
+		      )
+		      OR COALESCE(rm.eval_chunks, 0) < (
+		        SELECT count(*) FROM transcript_chunks c WHERE c.transcript_id = t.id
 		      )
 		    ))
 		  )

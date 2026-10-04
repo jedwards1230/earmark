@@ -102,7 +102,11 @@ func TestEvalErrorTranscriptsSQL_Shape(t *testing.T) {
 		"COALESCE(rm.eval_skipped, 0) > 0",
 		"pe.stage = 'eval'",
 		"pe.event = 'error'",
-		"(pe.detail->>'skipped')::int",
+		"jsonb_typeof(pe.detail->'skipped') = 'number'",
+		"THEN (pe.detail->>'skipped')::numeric > 0 ELSE false END",
+		// Legacy CLI backfill that stopped on a client timeout: latched with
+		// eval_skipped = 0 and no event, but fewer chunks judged than stored.
+		"OR COALESCE(rm.eval_chunks, 0) < ( SELECT count(*) FROM transcript_chunks c WHERE c.transcript_id = t.id )",
 		"pe.created_at >= COALESCE(rm.eval_started_at, '-infinity'::timestamptz)",
 		"ORDER BY t.created_at ASC, t.id ASC",
 		"LIMIT $3",
@@ -241,5 +245,21 @@ func TestResolvedModelColumns(t *testing.T) {
 	}
 	if got, _ := ex.args[0][7].(*string); got != nil {
 		t.Errorf("empty resolved model must bind NULL, got %q", *got)
+	}
+}
+
+// The skipped-count cast must only run on numeric JSON, and the short-run
+// predicate must sit inside the latched branch (an unlatched job is the
+// --backfill-unevaluated selection's business).
+func TestEvalErrorTranscriptsSQL_GuardsAndPlacement(t *testing.T) {
+	sql := norm(evalErrorTranscriptsSQL)
+	if strings.Contains(sql, "(pe.detail->>'skipped')::int") {
+		t.Errorf("unguarded ::int cast on detail.skipped:\n%s", sql)
+	}
+	latched := strings.Index(sql, "OR (rm.eval_finished_at IS NOT NULL AND (")
+	short := strings.Index(sql, "COALESCE(rm.eval_chunks, 0) <")
+	keyset := strings.Index(sql, "AND ($1::timestamptz IS NULL")
+	if latched < 0 || short < latched || short > keyset {
+		t.Errorf("short-run predicate must be inside the latched branch:\n%s", sql)
 	}
 }
