@@ -139,15 +139,31 @@ func (r *Resolver) match(dir string) (compiled, bool) {
 	return compiled{}, false
 }
 
-// asinBracket matches a bracketed catalogue id embedded in a directory/title,
-// e.g. "[B08GB58KD5]" (Audible ASIN) or a bracketed all-digit id "[1984832069]".
-// The captured group is the id itself, without the brackets.
-var asinBracket = regexp.MustCompile(`\[((?:B0[0-9A-Z]{8})|(?:[0-9]{6,}))\]`)
+// asinIDPattern is the catalogue-id alternation shared by the extract and strip
+// regexes so the two can never drift apart. It accepts, inside square brackets:
+//
+//   - an Audible ASIN: "B0" + 8 alphanumerics ("B08GB58KD5");
+//   - an ISBN-10 whose check digit is X: 9 digits + "X" ("059341635X") — Audible
+//     reuses the ISBN-10 as the ASIN for many print-first titles, and ~1 in 11
+//     ISBN-10s ends in the X check digit;
+//   - an all-digit catalogue id of 6+ digits ("1984832069", ISBN-10/13, etc.).
+//
+// It is always anchored by the surrounding brackets, so an arbitrary 10-letter
+// word ("[Remastered]", "[Unabridged]") never matches: the only letters allowed
+// are the fixed "B0" prefix and a single trailing X after exactly nine digits.
+const asinIDPattern = `B0[0-9A-Z]{8}|[0-9]{9}X|[0-9]{6,}`
 
-// ExtractASIN returns the bracketed catalogue id (ASIN or numeric id) embedded in
-// a book directory or title, e.g. "Project Hail Mary [B08GB58KD5]" → "B08GB58KD5".
-// Returns "" when no bracketed id is present. Matching is case-insensitive on the
-// "B0" prefix form so "[b08gb58kd5]" resolves too.
+// asinBracket matches a bracketed catalogue id embedded in a directory/title,
+// e.g. "[B08GB58KD5]" (Audible ASIN), "[059341635X]" (ISBN-10 with an X check
+// digit) or a bracketed all-digit id "[1984832069]". The captured group is the
+// id itself, without the brackets. Matched against UPPER-cased input.
+var asinBracket = regexp.MustCompile(`\[(` + asinIDPattern + `)\]`)
+
+// ExtractASIN returns the bracketed catalogue id (ASIN, ISBN-10 with an X check
+// digit, or numeric id) embedded in a book directory or title, e.g.
+// "Project Hail Mary [B08GB58KD5]" → "B08GB58KD5". Returns "" when no bracketed
+// id is present. Matching is case-insensitive ("[b08gb58kd5]" and "[059341635x]"
+// resolve too) and the result is always upper-cased.
 func ExtractASIN(s string) string {
 	m := asinBracket.FindStringSubmatch(strings.ToUpper(s))
 	if m == nil {
@@ -167,7 +183,7 @@ func StripASIN(title string) string {
 
 // asinBracketAnyCase is the case-insensitive variant used for stripping (the
 // title text we strip from is not upper-cased first, unlike ExtractASIN).
-var asinBracketAnyCase = regexp.MustCompile(`(?i)\s*\[(?:B0[0-9A-Z]{8}|[0-9]{6,})\]`)
+var asinBracketAnyCase = regexp.MustCompile(`(?i)\s*\[(?:` + asinIDPattern + `)\]`)
 
 // trailingTrack strips a trailing track/part/chapter/disc marker and its number
 // (e.g. " - Track 202", " Part 1", " - 01", " CD2") so a per-track filename

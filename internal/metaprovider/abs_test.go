@@ -308,3 +308,42 @@ func TestABSProviderImplementsInterface(t *testing.T) {
 	t.Parallel()
 	var _ metaprovider.MetadataProvider = metaprovider.NewABSProvider("http://x", "tok", "lib", nil)
 }
+
+// TestABSProvider_Lookup_ISBNXCheckDigit is the provider-level form of the live
+// bug: a book directory keyed by an ISBN-10 ending in the X check digit
+// ("[059341635X]") previously yielded no ASIN, so the ABS lookup was skipped and
+// the path title — bracket and all — was used. It must now resolve via ABS and
+// return the clean catalogue title.
+func TestABSProvider_Lookup_ISBNXCheckDigit(t *testing.T) {
+	t.Parallel()
+
+	const (
+		itemID = "isbn-x-item"
+		asin   = "059341635X"
+		libID  = "lib-id"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/libraries/" + libID + "/items":
+			_, _ = w.Write(absItemsFixture(itemID, asin))
+		case "/api/items/" + itemID:
+			_, _ = w.Write(absItemDetailFixture(itemID))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := metaprovider.NewABSProvider(srv.URL, "tok", libID, srv.Client())
+	got, err := p.Lookup(context.Background(),
+		"/books/audio-libation/Andy Weir/Project Hail Mary [059341635X]/01.m4b", "01.m4b")
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	if got.ASIN != asin {
+		t.Errorf("ASIN = %q, want %q (X check digit must be extracted)", got.ASIN, asin)
+	}
+	if got.Title != "Project Hail Mary" {
+		t.Errorf("Title = %q, want the clean ABS title", got.Title)
+	}
+}
