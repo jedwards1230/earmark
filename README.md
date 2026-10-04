@@ -79,7 +79,7 @@ This renders the full status dashboard against synthetic data — no Postgres, n
 | `earmark list` | List content from the database |
 | `earmark search <query>` | Semantic search from the CLI (`--text` for keyword, `--limit`, `--precision`) |
 | `earmark requeue [book]` | Re-transcribe, retry failed, or re-embed (`--reembed`, `--failed`; dry-run unless `--yes`) |
-| `earmark eval [book]` | Read-only LLM judge — flags suspected transcript errors (dry-run unless `--write`) |
+| `earmark eval [book]` | Read-only LLM judge — flags suspected transcript errors (dry-run unless `--write`). `--backfill-unevaluated` judges every transcript not yet judged (the judging pass when `EVAL_IN_PIPELINE=false`); `--backfill-eval-errors` re-judges transcripts whose judging failed; `--limit N` caps either |
 | `earmark batch` | Two-phase pipeline coordinator that time-shares a GPU with other tenants |
 | `earmark backfill-metadata` | Re-derive book metadata for existing jobs without re-transcribing |
 | `earmark version` | Version, commit, build time |
@@ -165,6 +165,8 @@ The ones you are most likely to set:
 | `METADATA_PROVIDER` | `path` | `path`, `abs` (Audiobookshelf — needs `ABS_URL` + `ABS_TOKEN`), or `chain:abs,path` |
 | `LIBRARY_COLLECTIONS` | — | JSON describing each library root's directory layout, so author/title labels come from config rather than a hardcoded path shape |
 | `ASR_SERVERS` | — | JSON describing the transcription hosts, for the Servers dashboard page. Read-only — it does not route work |
+| `EVAL_IN_PIPELINE` | `false` | Run the eval judge inline before embedding. Leave `false` to keep embedding independent of the judge and run `earmark eval --backfill-unevaluated --write` as its own pass |
+| `EVAL_REASONING_EFFORT` / `EVAL_CHAT_TEMPLATE_KWARGS` | `auto` | Thinking-suppression fields sent to the judge: on for local models, omitted when the model id contains `anthropic/` (a LiteLLM alias that hides the provider needs `omit`); `omit` or an explicit value overrides |
 | `CONTROL_API_TOKEN` | — | Bearer token for the mutating control API; unset means those endpoints fail closed |
 | `LOG_FORMAT` | `pretty` | `pretty` or `json` |
 

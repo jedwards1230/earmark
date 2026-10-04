@@ -20,12 +20,17 @@ import (
 // Fields match the actual ABS API (confirmed against a live instance):
 //   - authorName, narratorName, seriesName are flat strings (the items-list shape)
 //   - asin is the Audible ASIN or numeric catalogue id
+//   - description is the publisher blurb (may contain HTML; stored verbatim)
+//   - genres is a string array; isbn is a flat string
 type absMetadata struct {
-	Title        string `json:"title"`
-	AuthorName   string `json:"authorName"`
-	NarratorName string `json:"narratorName"`
-	SeriesName   string `json:"seriesName"`
-	ASIN         string `json:"asin"`
+	Title        string   `json:"title"`
+	AuthorName   string   `json:"authorName"`
+	NarratorName string   `json:"narratorName"`
+	SeriesName   string   `json:"seriesName"`
+	ASIN         string   `json:"asin"`
+	Description  string   `json:"description"`
+	Genres       []string `json:"genres"`
+	ISBN         string   `json:"isbn"`
 }
 
 // absChapter is one element of media.chapters[] in a full item response.
@@ -146,13 +151,16 @@ func (p *ABSProvider) Lookup(ctx context.Context, filePath, _ string) (BookMeta,
 	}
 
 	meta := BookMeta{
-		Title:    minimal.Title,
-		Author:   minimal.AuthorName,
-		Narrator: minimal.NarratorName,
-		Series:   minimal.SeriesName,
-		ASIN:     minimal.ASIN,
-		Chapters: chapters,
-		Source:   "abs",
+		Title:       minimal.Title,
+		Author:      minimal.AuthorName,
+		Narrator:    minimal.NarratorName,
+		Series:      minimal.SeriesName,
+		ASIN:        minimal.ASIN,
+		Description: strings.TrimSpace(minimal.Description),
+		Genres:      cleanGenres(minimal.Genres),
+		ISBN:        strings.TrimSpace(minimal.ISBN),
+		Chapters:    chapters,
+		Source:      "abs",
 	}
 	p.log.Debug("ABS lookup hit", "asin", asin, "title", meta.Title, "chapters", len(chapters))
 	return meta, nil
@@ -198,6 +206,18 @@ func (p *ABSProvider) fetchChapters(ctx context.Context, itemID string) ([]Chapt
 		return nil, err
 	}
 	return mapABSChapters(item.Media.Chapters), nil
+}
+
+// cleanGenres trims each genre and drops blanks, returning nil when nothing
+// remains so an empty list is stored as NULL ("not populated"), not '{}'.
+func cleanGenres(in []string) []string {
+	var out []string
+	for _, g := range in {
+		if g = strings.TrimSpace(g); g != "" {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // mapABSChapters converts ABS chapter objects to the canonical Chapter type.

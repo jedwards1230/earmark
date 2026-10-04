@@ -308,3 +308,140 @@ func TestABSProviderImplementsInterface(t *testing.T) {
 	t.Parallel()
 	var _ metaprovider.MetadataProvider = metaprovider.NewABSProvider("http://x", "tok", "lib", nil)
 }
+
+// TestABSProvider_Lookup_ISBNXCheckDigit is the provider-level form of the live
+// bug: a book directory keyed by an ISBN-10 ending in the X check digit
+// ("[059341635X]") previously yielded no ASIN, so the ABS lookup was skipped and
+// the path title — bracket and all — was used. It must now resolve via ABS and
+// return the clean catalogue title.
+func TestABSProvider_Lookup_ISBNXCheckDigit(t *testing.T) {
+	t.Parallel()
+
+	const (
+		itemID = "isbn-x-item"
+		asin   = "059341635X"
+		libID  = "lib-id"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/libraries/" + libID + "/items":
+			_, _ = w.Write(absItemsFixture(itemID, asin))
+		case "/api/items/" + itemID:
+			_, _ = w.Write(absItemDetailFixture(itemID))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := metaprovider.NewABSProvider(srv.URL, "tok", libID, srv.Client())
+	got, err := p.Lookup(context.Background(),
+		"/books/audio-libation/Andy Weir/Project Hail Mary [059341635X]/01.m4b", "01.m4b")
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	if got.ASIN != asin {
+		t.Errorf("ASIN = %q, want %q (X check digit must be extracted)", got.ASIN, asin)
+	}
+	if got.Title != "Project Hail Mary" {
+		t.Errorf("Title = %q, want the clean ABS title", got.Title)
+	}
+}
+
+// absEnrichedItemsJSON is a verbatim-shaped ABS /api/libraries/{id}/items body
+// (minified list shape) carrying the catalogue-enrichment fields earmark now
+// stores: description, genres (string array) and isbn.
+const absEnrichedItemsJSON = `{
+  "results": [
+    {
+      "id": "li_enriched",
+      "media": {
+        "metadata": {
+          "title": "Project Hail Mary",
+          "authorName": "Andy Weir",
+          "narratorName": "Ray Porter",
+          "seriesName": "",
+          "asin": "B08G9PRS1K",
+          "isbn": " 9780593135204 ",
+          "description": "  <p>Ryland Grace is the sole survivor on a desperate mission.</p> ",
+          "genres": ["Science Fiction & Fantasy", " ", "Science Fiction"],
+          "publishedYear": "2021"
+        }
+      }
+    }
+  ],
+  "total": 1, "limit": 500, "page": 0
+}`
+
+// TestABSProvider_Lookup_DecodesEnrichment asserts description, genres and isbn
+// are decoded from the ABS item metadata and normalized (trimmed; blank genres
+// dropped).
+func TestABSProvider_Lookup_DecodesEnrichment(t *testing.T) {
+	t.Parallel()
+	const libID = "lib-id"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/libraries/" + libID + "/items":
+			_, _ = w.Write([]byte(absEnrichedItemsJSON))
+		case "/api/items/li_enriched":
+			_, _ = w.Write(absItemDetailFixture("li_enriched"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := metaprovider.NewABSProvider(srv.URL, "tok", libID, srv.Client())
+	got, err := p.Lookup(context.Background(),
+		"/books/audio-libation/Andy Weir/Project Hail Mary [B08G9PRS1K]/01.m4b", "01.m4b")
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	if want := "<p>Ryland Grace is the sole survivor on a desperate mission.</p>"; got.Description != want {
+		t.Errorf("Description = %q, want %q", got.Description, want)
+	}
+	if got.ISBN != "9780593135204" {
+		t.Errorf("ISBN = %q, want trimmed 9780593135204", got.ISBN)
+	}
+	wantGenres := []string{"Science Fiction & Fantasy", "Science Fiction"}
+	if len(got.Genres) != len(wantGenres) {
+		t.Fatalf("Genres = %q, want %q", got.Genres, wantGenres)
+	}
+	for i := range wantGenres {
+		if got.Genres[i] != wantGenres[i] {
+			t.Errorf("Genres[%d] = %q, want %q", i, got.Genres[i], wantGenres[i])
+		}
+	}
+}
+
+// TestABSProvider_Lookup_MissingEnrichmentIsZero asserts an item without the
+// enrichment fields yields zero values (nil genres) so the upsert stores NULL
+// and keeps any previously stored value.
+func TestABSProvider_Lookup_MissingEnrichmentIsZero(t *testing.T) {
+	t.Parallel()
+	const (
+		libID  = "lib-id"
+		itemID = "plain-item"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/libraries/" + libID + "/items":
+			_, _ = w.Write(absItemsFixture(itemID, "B08G9PRS1K"))
+		case "/api/items/" + itemID:
+			_, _ = w.Write(absItemDetailFixture(itemID))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := metaprovider.NewABSProvider(srv.URL, "tok", libID, srv.Client())
+	got, err := p.Lookup(context.Background(),
+		"/books/audio-libation/Andy Weir/Project Hail Mary [B08G9PRS1K]/01.m4b", "01.m4b")
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	if got.Description != "" || got.ISBN != "" || got.Genres != nil {
+		t.Errorf("enrichment = (%q, %q, %v), want all zero", got.Description, got.ISBN, got.Genres)
+	}
+}

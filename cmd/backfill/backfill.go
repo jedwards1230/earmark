@@ -1,7 +1,7 @@
 // Package backfill implements the `earmark backfill-metadata` command.
 // It iterates over every known book directory (via GetBookSummaries) and runs
 // the configured MetadataProvider.Lookup for each, UPSERTing any new metadata
-// (chapters, narrator, series, ASIN) into book_metadata — so already-transcribed
+// (chapters, narrator, series, ASIN, description, genres, ISBN) into book_metadata — so already-transcribed
 // books gain ABS chapter data without requiring re-transcription.
 //
 // Usage:

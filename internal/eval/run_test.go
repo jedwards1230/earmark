@@ -3,6 +3,8 @@ package eval
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jedwards1230/earmark/internal/db"
@@ -17,13 +19,17 @@ type scriptedChat struct {
 }
 
 type step struct {
-	resp string
-	err  error
+	resp   string
+	err    error
+	cancel context.CancelFunc // when set, called before returning (caller stops)
 }
 
 func (s *scriptedChat) Complete(_ context.Context, _, _ string) (string, error) {
 	st := s.steps[s.n]
 	s.n++
+	if st.cancel != nil {
+		st.cancel()
+	}
 	return st.resp, st.err
 }
 func (s *scriptedChat) Model() string { return "scripted-judge" }
@@ -49,7 +55,7 @@ func TestRun_TransientJudgeErrorSkipsChunkAndContinues(t *testing.T) {
 	chat := &scriptedChat{steps: []step{
 		{resp: oneFinding}, // chunk a → 1 finding
 		{err: errors.New("connection reset by peer")}, // chunk b → transient error
-		{resp: oneFinding},                            // chunk c → 1 finding
+		{resp: oneFinding}, // chunk c → 1 finding
 	}}
 	reader := fakeReader{chunks: threeChunks()}
 	writer := &fakeWriter{}
@@ -72,15 +78,17 @@ func TestRun_TransientJudgeErrorSkipsChunkAndContinues(t *testing.T) {
 // A cancelled context aborts the run, but returns the findings collected so far
 // rather than discarding them.
 func TestRun_ContextCancelAbortsButReturnsPartial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	chat := &scriptedChat{steps: []step{
-		{resp: oneFinding},      // chunk a → 1 finding
-		{err: context.Canceled}, // chunk b → cancellation
-		{resp: oneFinding},      // chunk c → never reached
+		{resp: oneFinding},                      // chunk a → 1 finding
+		{err: context.Canceled, cancel: cancel}, // chunk b → the caller cancels
+		{resp: oneFinding},                      // chunk c → never reached
 	}}
 	reader := fakeReader{chunks: threeChunks()}
 	writer := &fakeWriter{}
 
-	findings, stats, err := Run(context.Background(), reader, NewJudge(chat), writer, RunOptions{Book: "Book", Write: true})
+	findings, stats, err := Run(ctx, reader, NewJudge(chat), writer, RunOptions{Book: "Book", Write: true})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got: %v", err)
 	}
@@ -93,5 +101,41 @@ func TestRun_ContextCancelAbortsButReturnsPartial(t *testing.T) {
 	// On abort we do not persist (the caller asked to stop).
 	if stats.Persisted || len(writer.inserted) != 0 {
 		t.Errorf("aborted run must not persist: persisted=%v inserted=%d", stats.Persisted, len(writer.inserted))
+	}
+}
+
+// A chat client's own per-request timeout (http.Client.Timeout) surfaces as an
+// error that satisfies errors.Is(err, context.DeadlineExceeded) while the
+// caller's context is still live. It must be treated as a per-chunk failure —
+// skipped and counted — not as a stop request that aborts the whole run (which
+// is what used to turn one slow chunk into a failed transcript).
+func TestRun_ClientTimeoutSkipsChunkNotRun(t *testing.T) {
+	clientTimeout := fmt.Errorf("chat request: %w (Client.Timeout exceeded while awaiting headers)", context.DeadlineExceeded)
+	chat := &scriptedChat{steps: []step{
+		{resp: oneFinding},
+		{err: clientTimeout},
+		{resp: oneFinding},
+	}}
+	findings, stats, err := RunOnChunks(context.Background(), NewJudge(chat), nil, threeChunks(), false)
+	if err != nil {
+		t.Fatalf("a per-request timeout must not abort the run, got: %v", err)
+	}
+	if len(findings) != 2 || stats.ChunksEvaluated != 2 || stats.ChunksSkipped != 1 {
+		t.Fatalf("findings=%d evaluated=%d skipped=%d; want 2/2/1", len(findings), stats.ChunksEvaluated, stats.ChunksSkipped)
+	}
+	if stats.Complete() {
+		t.Error("a run with a skipped chunk must not be Complete()")
+	}
+	if !strings.Contains(stats.FirstError, "Client.Timeout") {
+		t.Errorf("FirstError = %q, want the timeout message", stats.FirstError)
+	}
+}
+
+func TestRunStats_Complete(t *testing.T) {
+	if !(RunStats{ChunksEvaluated: 3}).Complete() {
+		t.Error("no skipped chunks → Complete")
+	}
+	if (RunStats{ChunksEvaluated: 2, ChunksSkipped: 1}).Complete() {
+		t.Error("a skipped chunk → not Complete")
 	}
 }

@@ -99,6 +99,16 @@ type ChatClient interface {
 	Model() string
 }
 
+// ModelReportingClient is an optional ChatClient extension for endpoints that
+// report which model actually served a request (the OpenAI response "model"
+// field). A router such as LiteLLM can resolve an alias to a dated id or fall
+// back to a different model, so the judge records that alongside the requested
+// Model(). openAIChatClient implements it; a ChatClient that doesn't simply
+// records no resolved model.
+type ModelReportingClient interface {
+	CompleteWithModel(ctx context.Context, system, user string) (Completion, error)
+}
+
 // ChunkReader is the read-only slice of the DB the judge needs to fetch chunks.
 // Intentionally read-only — there is no transcript-mutating method here.
 type ChunkReader interface {
@@ -149,6 +159,9 @@ func (j *Judge) Model() string {
 type Result struct {
 	Chunk    db.EvalChunk
 	Findings []db.Finding
+	// ResolvedModel is the model the endpoint reported serving this chunk
+	// ("" when unknown).
+	ResolvedModel string
 }
 
 // JudgeChunk evaluates a single chunk: build the prompt, call the model, parse
@@ -157,9 +170,13 @@ type Result struct {
 // caller persists via FindingWriter only when not in dry-run.
 func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) {
 	system, user := buildPrompt(c)
-	raw, err := j.chat.Complete(ctx, system, user)
+	raw, resolved, err := j.complete(ctx, system, user)
 	if err != nil {
 		return Result{Chunk: c}, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
+	}
+	if resolved != "" && resolved != j.chat.Model() {
+		j.logger.Debug("judge request served by a different model id",
+			"chunk_id", c.ChunkID, "requested", j.chat.Model(), "resolved", resolved)
 	}
 
 	parsed, perr := parseFindings(raw)
@@ -169,7 +186,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		// advisory; a parse miss costs nothing.
 		j.logger.Warn("dropping unparseable judge response",
 			"chunk_id", c.ChunkID, "error", perr)
-		return Result{Chunk: c}, nil
+		return Result{Chunk: c, ResolvedModel: resolved}, nil
 	}
 
 	parsed = j.floorFindings(c, parsed)
@@ -193,6 +210,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 			SuggestedCorrection: optionalStr(p.SuggestedCorrection),
 			Confidence:          p.Confidence,
 			Model:               model,
+			ResolvedModel:       optionalStr(resolved),
 			TranscriptionRunID:  optionalStr(runID),
 			AnchorOffset:        optionalInt(p.AnchorOffset),
 			AnchorOccurrence:    optionalInt(p.AnchorOccurrence),
@@ -202,7 +220,18 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 			ChunkTextSHA256: optionalStr(patch.ChunkHash(c.Text)),
 		})
 	}
-	return Result{Chunk: c, Findings: findings}, nil
+	return Result{Chunk: c, Findings: findings, ResolvedModel: resolved}, nil
+}
+
+// complete calls the chat client, using CompleteWithModel when the client
+// reports its resolved model.
+func (j *Judge) complete(ctx context.Context, system, user string) (string, string, error) {
+	if mr, ok := j.chat.(ModelReportingClient); ok {
+		r, err := mr.CompleteWithModel(ctx, system, user)
+		return r.Content, r.ResolvedModel, err
+	}
+	raw, err := j.chat.Complete(ctx, system, user)
+	return raw, "", err
 }
 
 // floorFindings drops findings below the confidence floor (j.minConf). Applied
