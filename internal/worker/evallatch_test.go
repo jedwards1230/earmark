@@ -52,6 +52,7 @@ func TestEvalTranscript_JudgeErrorDoesNotLatch(t *testing.T) {
 			}
 
 			require.NoError(t, w.evalTranscript(cfg, tr))
+			require.Len(t, fdb.evalMetrics, 1, "exactly one outcome record (the failure) per judge run")
 			for _, m := range fdb.evalMetrics {
 				require.True(t, m.FinishedAt.IsZero(),
 					"judge failed on every chunk → eval_finished_at must NOT be latched (got %v, chunks=%d skipped=%d)",

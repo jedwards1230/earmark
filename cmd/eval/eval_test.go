@@ -276,7 +276,7 @@ func TestRunBackfill_DryRunDoesNotWrite(t *testing.T) {
 	judge := evalpkg.NewJudge(fakeBackfillChat{
 		resp: `{"findings":[{"original_text":"Atreides","issue_type":"misheard_proper_noun","confidence":0.9}]}`,
 	})
-	cfg := &config.Config{ChunkSize: 32}
+	cfg := &config.Config{ChunkSize: 32, EvalGatesEmbed: true}
 
 	var out strings.Builder
 	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, backfillOptions{}); err != nil {
@@ -311,7 +311,7 @@ func TestRunBackfill_WritePersistesFindingsAndEvalFinishedAt(t *testing.T) {
 	judge := evalpkg.NewJudge(fakeBackfillChat{
 		resp: `{"findings":[{"original_text":"fear","issue_type":"misheard_word","suggested_correction":"spice","confidence":0.85}]}`,
 	})
-	cfg := &config.Config{ChunkSize: 32}
+	cfg := &config.Config{ChunkSize: 32, EvalGatesEmbed: true}
 
 	var out strings.Builder
 	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, backfillOptions{write: true}); err != nil {
@@ -372,7 +372,7 @@ func TestRunBackfill_ChunksMatchEmbedPass(t *testing.T) {
 		needle: "Charlie",
 		resp:   `{"findings":[{"original_text":"Charlie","issue_type":"misheard_proper_noun","suggested_correction":"Charley","confidence":0.9}]}`,
 	})
-	cfg := &config.Config{ChunkSize: 8}
+	cfg := &config.Config{ChunkSize: 8, EvalGatesEmbed: true}
 
 	var out strings.Builder
 	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, backfillOptions{write: true}); err != nil {
@@ -454,7 +454,7 @@ func TestRunBackfill_EmbeddedTranscriptUsesStoredChunkIDs(t *testing.T) {
 func TestRunBackfill_EmptyQueueReportsNoWork(t *testing.T) {
 	fdb := &fakeBackfillDB{}
 	judge := evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[]}`})
-	cfg := &config.Config{ChunkSize: 32}
+	cfg := &config.Config{ChunkSize: 32, EvalGatesEmbed: true}
 
 	var out strings.Builder
 	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, backfillOptions{}); err != nil {
@@ -476,7 +476,7 @@ func TestRunBackfill_MultipleTranscriptsEachGetEvalMetrics(t *testing.T) {
 		},
 	}
 	judge := evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[]}`})
-	cfg := &config.Config{ChunkSize: 32}
+	cfg := &config.Config{ChunkSize: 32, EvalGatesEmbed: true}
 
 	var out strings.Builder
 	if err := runBackfill(context.Background(), &out, fdb, judge, cfg, backfillOptions{write: true}); err != nil {
@@ -510,8 +510,11 @@ func TestRunBackfill_JudgeErrorDoesNotLatch(t *testing.T) {
 	}}}
 	judge := evalpkg.NewJudge(errBackfillChat{})
 	var out strings.Builder
-	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32}, backfillOptions{write: true}); err != nil {
+	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32, EvalGatesEmbed: true}, backfillOptions{write: true}); err != nil {
 		t.Fatalf("runBackfill: %v", err)
+	}
+	if len(fdb.evalMetrics) != 1 {
+		t.Fatalf("want exactly one outcome record (the failure), got %d", len(fdb.evalMetrics))
 	}
 	for _, m := range fdb.evalMetrics {
 		if !m.FinishedAt.IsZero() {
@@ -550,7 +553,7 @@ func TestRunBackfill_PartialFailureRecordsFailure(t *testing.T) {
 		resp:  `{"findings":[{"original_text":"spice","issue_type":"misheard_word","suggested_correction":"spies","confidence":0.9}]}`,
 	})
 	var out strings.Builder
-	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 8}, backfillOptions{write: true}); err != nil {
+	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 8, EvalGatesEmbed: true}, backfillOptions{write: true}); err != nil {
 		t.Fatalf("runBackfill: %v", err)
 	}
 	if len(fdb.evalMetrics) != 1 {
@@ -598,6 +601,9 @@ func TestRunBackfill_EvalErrorsReJudgesAndDedupes(t *testing.T) {
 	if !strings.Contains(out.String(), "1 already recorded") {
 		t.Errorf("report should count the deduped finding:\n%s", out.String())
 	}
+	if got := fdb.evalMetrics[0].Findings; got != 1 {
+		t.Errorf("eval_findings = %d, want 1 (only the findings this run recorded)", got)
+	}
 }
 
 // The sweep walks the selection in keyset pages and honors --limit; a dry run
@@ -615,7 +621,7 @@ func TestRunBackfill_PagesAndLimit(t *testing.T) {
 	t.Run("dry run walks every page", func(t *testing.T) {
 		fdb := &fakeBackfillDB{transcripts: all}
 		var out strings.Builder
-		if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32},
+		if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32, EvalGatesEmbed: true},
 			backfillOptions{pageSize: 2}); err != nil {
 			t.Fatalf("runBackfill: %v", err)
 		}
@@ -633,7 +639,7 @@ func TestRunBackfill_PagesAndLimit(t *testing.T) {
 	t.Run("limit caps the run", func(t *testing.T) {
 		fdb := &fakeBackfillDB{transcripts: all}
 		var out strings.Builder
-		if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32},
+		if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32, EvalGatesEmbed: true},
 			backfillOptions{write: true, limit: 3, pageSize: 2}); err != nil {
 			t.Fatalf("runBackfill: %v", err)
 		}
@@ -670,5 +676,42 @@ func TestRunBackfill_JudgesTranscriptsEmbeddedWithoutEval(t *testing.T) {
 	}
 	if len(fdb.evalMetrics) != 1 || fdb.evalMetrics[0].Failed() || fdb.evalMetrics[0].JobID != "j-emb" {
 		t.Fatalf("want the transcript latched, got %+v", fdb.evalMetrics)
+	}
+}
+
+// Ungated (EVAL_GATES_EMBED=false) deployments assign RANDOM chunk IDs when the
+// embed worker inserts chunks, so a transcript with no stored chunks cannot be
+// judged yet: regenerated UUIDv5 IDs would never exist (orphaned findings, no
+// FK) and the latch would stop it from ever being judged against its real
+// chunks. It must be skipped and left unlatched.
+func TestRunBackfill_UngatedSkipsNotYetEmbedded(t *testing.T) {
+	calls := 0
+	fdb := &fakeBackfillDB{transcripts: []*db.Transcript{{
+		ID: "t-pending", JobID: "j-pending", FilePath: "/books/Dune/Ch8.m4b", RawText: "Fear is the mind killer.",
+	}}}
+	judge := evalpkg.NewJudge(flakyBackfillChat{calls: &calls, resp: `{"findings":[]}`})
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32}, backfillOptions{write: true}); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("judge called %d times; a not-yet-embedded transcript must not be judged when ungated", calls)
+	}
+	if len(fdb.findings) != 0 || len(fdb.evalMetrics) != 0 {
+		t.Errorf("must write nothing (no orphan findings, no latch): findings=%d metrics=%d", len(fdb.findings), len(fdb.evalMetrics))
+	}
+	if !strings.Contains(out.String(), "not embedded yet") {
+		t.Errorf("report should explain the skip:\n%s", out.String())
+	}
+
+	// Same transcript under the gate: the embed pass will insert the
+	// deterministic IDs, so it is judged and latched.
+	fdb = &fakeBackfillDB{transcripts: fdb.transcripts}
+	if err := runBackfill(context.Background(), &out, fdb, evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[]}`}),
+		&config.Config{ChunkSize: 32, EvalGatesEmbed: true}, backfillOptions{write: true}); err != nil {
+		t.Fatalf("runBackfill (gated): %v", err)
+	}
+	if len(fdb.evalMetrics) != 1 || fdb.evalMetrics[0].Failed() {
+		t.Errorf("gated: want the transcript latched, got %+v", fdb.evalMetrics)
 	}
 }

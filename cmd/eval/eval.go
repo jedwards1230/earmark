@@ -286,7 +286,7 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 		chunkSize = 512
 	}
 
-	var seen, latched, failed, totalChunks, totalFindings, totalSkipped, totalDupes int
+	var seen, latched, failed, notEmbedded, totalChunks, totalFindings, totalSkipped, totalDupes int
 	var cursor db.TranscriptCursor
 	for {
 		want := pageSize
@@ -306,7 +306,7 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 			}
 			seen++
 			cursor = db.CursorAfter(t)
-			res, err := backfillOne(ctx, p, bdb, judge, chunkSize, t, o.write)
+			res, err := backfillOne(ctx, p, bdb, judge, chunkSize, cfg.EvalGatesEmbed, t, o.write)
 			if err != nil {
 				return err
 			}
@@ -319,6 +319,8 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 				latched++
 			case res.failed:
 				failed++
+			case res.notEmbedded:
+				notEmbedded++
 			}
 		}
 		if len(page) < want {
@@ -330,7 +332,10 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 		p("No %s — nothing to backfill.\n", what)
 		return nil
 	}
-	p("\nBackfill: %d %s judged.\n", seen, what)
+	p("\nBackfill: %d %s selected.\n", seen, what)
+	if notEmbedded > 0 {
+		p("%d transcript(s) skipped: not embedded yet (EVAL_GATES_EMBED=false assigns chunk IDs at embed time); re-run after the embed worker catches up.\n", notEmbedded)
+	}
 	if !o.write {
 		p("(dry-run) pass --write to record %d new finding(s) across %d transcript(s) (%d chunk(s) would be skipped by judge errors).\n",
 			totalFindings, seen, totalSkipped)
@@ -348,12 +353,22 @@ type backfillResult struct {
 	dupes       int  // findings skipped because they were already recorded
 	latched     bool // eval_finished_at written
 	failed      bool // failure recorded (left unlatched)
+	notEmbedded bool // skipped: ungated and no stored chunks yet
 }
 
 // backfillOne judges one transcript and (under write) records its outcome.
 // It returns an error only when the context was cancelled.
+//
+// gated is cfg.EvalGatesEmbed. It decides what to do with a transcript that has
+// no stored chunks yet: under the gate the embed pass will insert chunks with the
+// deterministic UUIDv5 IDs, so judging regenerated chunks is safe; WITHOUT the
+// gate the embed worker assigns RANDOM chunk IDs at insert time, so findings
+// judged now would reference chunk IDs that will never exist (orphans — there
+// is no FK) while the latch would stop the job from ever being judged again.
+// Such a transcript is skipped and left unlatched; the next backfill run judges
+// it once it has been embedded.
 func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, judge *evalpkg.Judge,
-	chunkSize int, t *db.Transcript, write bool) (backfillResult, error) {
+	chunkSize int, gated bool, t *db.Transcript, write bool) (backfillResult, error) {
 	var res backfillResult
 	name := filepath.Base(t.FilePath)
 	if t.RawText == "" {
@@ -382,6 +397,11 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 		return res, nil
 	}
 	if len(evalChunks) == 0 {
+		if !gated {
+			res.notEmbedded = true
+			p("  skip %s (not embedded yet; chunk IDs unknown until the embed worker inserts them — left unlatched for the next run)\n", name)
+			return res, nil
+		}
 		chunks, perr := worker.PristineChunks(t, chunkSize)
 		if perr != nil {
 			p("  skip %s (no chunks produced)\n", name)
@@ -443,7 +463,9 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 		ResolvedModel: stats.ResolvedModel,
 		Chunks:        stats.ChunksEvaluated,
 		Skipped:       stats.ChunksSkipped,
-		Findings:      stats.FindingsFound,
+		// Findings recorded by THIS run — duplicates of an earlier partial
+		// run's rows are not counted twice.
+		Findings: len(fresh),
 	}
 	if stats.Complete() && persistErr == nil {
 		m.FinishedAt = finished

@@ -1858,7 +1858,15 @@ runs as its own pass, `earmark eval --backfill-unevaluated --write [--limit N]`,
 on whatever schedule the deployment chooses (e.g. a CronJob). That pass selects
 every done transcript without the `eval_finished_at` latch regardless of embed
 state, judges its **stored** chunk rows (so findings reference the real chunk
-IDs), and latches it on success (§1.5).
+IDs), and latches it on success (§1.5). Without the gate the embed worker assigns
+**random** chunk IDs at insert time, so a transcript that has **not been embedded
+yet** is skipped and left unlatched — judging regenerated chunks would record
+findings against IDs that never exist (orphans; there is no FK) and latch the job
+for good. The next run judges it once it is embedded. (Under
+`EVAL_GATES_EMBED=true` chunk IDs are deterministic UUIDv5, so a not-yet-embedded
+transcript is judged on regenerated chunks, exactly like the gated eval pass.)
+`eval_findings` counts the findings that run actually recorded (re-judge
+duplicates of an earlier partial run are not counted twice).
 
 **Gated mode (`EVAL_GATES_EMBED=true`).** When the gate is enabled, eval is
 mandatory per-track (not optional/sampled) for any transcript to become
