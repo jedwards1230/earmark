@@ -859,6 +859,22 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("run_metrics eval-slice migration: %w", err)
 	}
 
+	// Eval-failure migration (CONTRACT §1.5, latch-only-on-success): a judge run
+	// that could not evaluate every chunk no longer writes eval_finished_at; it
+	// records the failure here instead so it is visible and re-judgeable
+	// (`earmark eval --backfill-unevaluated` / `--backfill-eval-errors`).
+	// eval_failed_at IS NOT NULL also releases the gated embed pass (fail-open:
+	// a judge outage never blocks search). A later successful judge run clears
+	// all three. Additive + nullable.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE run_metrics
+			ADD COLUMN IF NOT EXISTS eval_failed_at     TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS eval_failed_chunks INT,
+			ADD COLUMN IF NOT EXISTS eval_error         TEXT;
+	`); err != nil {
+		return fmt.Errorf("run_metrics eval-failure migration: %w", err)
+	}
+
 	// completed_at + trigger (CONTRACT §1.1): stamp completed_at = now() whenever a
 	// transcription_jobs row transitions INTO status='done'. The runner owns the
 	// mark-done UPDATE (the Go side never marks jobs done), so a trigger is the
@@ -971,8 +987,10 @@ func (db *DB) GetCompletedTranscripts(ctx context.Context) ([]*Transcript, error
 }
 
 // GetUnevaluatedTranscripts returns done transcripts that have not been eval'd
-// (run_metrics.eval_finished_at IS NULL or no run_metrics row) AND have no
-// chunks yet (not yet embedded). This is the eval-pass selection for the
+// or attempted (run_metrics has neither eval_finished_at nor eval_failed_at, or
+// there is no run_metrics row) AND have no chunks yet (not yet embedded).
+// Excluding recorded failures is what stops the pipeline re-judging a failing
+// transcript every cycle; failures are retried by the operator-run backfill. This is the eval-pass selection for the
 // EVAL_GATES_EMBED two-pass gated flow (CONTRACT §2.4, §1.5).
 //
 // The eval pass judges these transcripts and writes eval_finished_at so the
@@ -1004,7 +1022,8 @@ const unevaluatedTranscriptsSQL = `
 		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM run_metrics rm
-		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
+		    WHERE rm.job_id = j.id
+		      AND (rm.eval_finished_at IS NOT NULL OR rm.eval_failed_at IS NOT NULL)
 		  )
 		ORDER BY t.created_at ASC
 		LIMIT $1
@@ -1019,13 +1038,15 @@ func (db *DB) getUnevaluatedTranscripts(ctx context.Context, q rowQuerier, limit
 }
 
 // GetEvaluatedUnembeddedTranscripts returns done transcripts that have been
-// eval'd (run_metrics.eval_finished_at IS NOT NULL) AND have no chunks yet
-// (not yet embedded). This is the embed-pass selection for the EVAL_GATES_EMBED
+// eval'd (run_metrics.eval_finished_at IS NOT NULL) — or whose judge attempt
+// failed (eval_failed_at IS NOT NULL: the gate fails open) — AND have no chunks
+// yet (not yet embedded). This is the embed-pass selection for the EVAL_GATES_EMBED
 // two-pass gated flow (CONTRACT §2.4, §1.5).
 //
-// A transcript appearing here is guaranteed to have been judged; the caller
-// embeds it and it becomes searchable. eval_finished_at IS NOT NULL is the
-// hand-off latch that separates the eval pass from the embed pass.
+// A transcript appearing here is guaranteed to have had a judge attempt; the
+// caller embeds it and it becomes searchable. eval_finished_at (success) or
+// eval_failed_at (failure) is the hand-off that separates the eval pass from
+// the embed pass.
 //
 // limit bounds the rows loaded per call (each row carries the transcript's
 // segments JSONB), so a large backlog never OOM-kills the pod — the worker
@@ -1036,7 +1057,7 @@ func (db *DB) GetEvaluatedUnembeddedTranscripts(ctx context.Context, limit int) 
 }
 
 // evaluatedUnembeddedTranscriptsSQL is the embed-pass selection: done jobs that
-// ARE eval'd (run_metrics.eval_finished_at IS NOT NULL) and NOT embedded (no
+// ARE eval'd or failed eval (eval_finished_at / eval_failed_at set) and NOT embedded (no
 // transcript_chunks). The LIMIT is parameterized ($1) so the worker bounds each
 // cycle's memory. Exported as a package const so the execution-level test can
 // match it exactly.
@@ -1048,7 +1069,7 @@ const evaluatedUnembeddedTranscriptsSQL = `
 		JOIN transcription_jobs j ON j.id = t.job_id
 		JOIN run_metrics rm ON rm.job_id = j.id
 		WHERE j.status = 'done'
-		  AND rm.eval_finished_at IS NOT NULL
+		  AND (rm.eval_finished_at IS NOT NULL OR rm.eval_failed_at IS NOT NULL)
 		  AND NOT EXISTS (
 		    SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id
 		  )
@@ -1339,15 +1360,33 @@ type EmbedMetrics struct {
 // It is the fourth column-selective writer (after the monitor, runner, and embed
 // worker). FinishedAt is the per-job eval-completion marker: a job has been
 // judged iff run_metrics.eval_finished_at IS NOT NULL.
+//
+// One value describes ONE judge attempt, which either succeeded or failed:
+//
+//   - Success: FinishedAt is set (the latch) and FailedAt is zero. Written by
+//     upsertEvalMetricsSQL, which also clears any earlier failure record.
+//   - Failure: FinishedAt is ZERO (never latched) and FailedAt is set, with
+//     FailedChunks / Error describing what went wrong. Written by
+//     recordEvalFailureSQL, which touches only the eval_failed_* / eval_error
+//     columns — so a failed re-judge of an already-latched job never erases the
+//     earlier successful run's latch or counts.
 type EvalMetrics struct {
 	JobID      string
 	StartedAt  time.Time
-	FinishedAt time.Time
-	Model      string // judge model id (chat client's Model())
-	Chunks     int    // ChunksEvaluated
-	Skipped    int    // ChunksSkipped (transient per-chunk judge errors)
-	Findings   int    // FindingsFound
+	FinishedAt time.Time // the latch; zero on a failed attempt
+	Model      string    // judge model id (chat client's Model())
+	Chunks     int       // ChunksEvaluated
+	Skipped    int       // ChunksSkipped (transient per-chunk judge errors)
+	Findings   int       // FindingsFound
+
+	// Failure record (zero on success).
+	FailedAt     time.Time // when the failed attempt ended
+	FailedChunks int       // chunks the judge could not evaluate
+	Error        string    // short reason (first judge error / persist error)
 }
+
+// Failed reports whether m records a failed judge attempt (nothing latched).
+func (m EvalMetrics) Failed() bool { return m.FinishedAt.IsZero() }
 
 // UpsertAudioBytes records the audio file size for a job (the monitor's slice of
 // run_metrics). Best-effort: callers should log-and-continue on error so a
@@ -1401,10 +1440,12 @@ func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 }
 
 // upsertEvalMetricsSQL is the column-selective UPSERT for the eval slice of
-// run_metrics. A package-level var (not a constant) so tests can assert its
-// shape — that it touches ONLY the eval_* columns + updated_at, never clobbering
-// the monitor's audio_bytes, the runner's transcription slice, or the embed
-// worker's columns on the same job_id row.
+// run_metrics, used for a SUCCESSFUL judge run. A package-level var (not a
+// constant) so tests can assert its shape — that it touches ONLY the eval_*
+// columns + updated_at, never clobbering the monitor's audio_bytes, the runner's
+// transcription slice, or the embed worker's columns on the same job_id row. It
+// also clears the failure record (eval_failed_at / eval_failed_chunks /
+// eval_error) so a re-judged job drops out of the eval-error backfill.
 //
 // Parameter order: $1=job_id $2=eval_started_at $3=eval_finished_at $4=eval_model
 //
@@ -1415,28 +1456,71 @@ var upsertEvalMetricsSQL = `
 	        eval_chunks, eval_skipped, eval_findings)
 	VALUES ($1, $2, $3, $4, $5, $6, $7)
 	ON CONFLICT (job_id) DO UPDATE
-	SET eval_started_at  = EXCLUDED.eval_started_at,
-	    eval_finished_at = EXCLUDED.eval_finished_at,
-	    eval_model       = EXCLUDED.eval_model,
-	    eval_chunks      = EXCLUDED.eval_chunks,
-	    eval_skipped     = EXCLUDED.eval_skipped,
-	    eval_findings    = EXCLUDED.eval_findings,
-	    updated_at       = now()
+	SET eval_started_at    = EXCLUDED.eval_started_at,
+	    eval_finished_at   = EXCLUDED.eval_finished_at,
+	    eval_model         = EXCLUDED.eval_model,
+	    eval_chunks        = EXCLUDED.eval_chunks,
+	    eval_skipped       = EXCLUDED.eval_skipped,
+	    eval_findings      = EXCLUDED.eval_findings,
+	    eval_failed_at     = NULL,
+	    eval_failed_chunks = NULL,
+	    eval_error         = NULL,
+	    updated_at         = now()
 `
 
-// UpsertEvalMetrics records eval timing, judge model, and chunk/skip/finding
-// counts for a job (the eval layer's slice of run_metrics, CONTRACT §1.5). Only
-// the eval_* columns are written, so it never clobbers the monitor's,  runner's,
-// or embed worker's columns on the same row. eval_finished_at is the per-job
-// eval-completion marker.
+// recordEvalFailureSQL records a FAILED judge attempt. It deliberately does not
+// write eval_finished_at (the latch) — that is the whole point: a failure must
+// stay re-judgeable — nor the success columns, so a failed re-judge of a job
+// that was latched earlier leaves that run's record intact. Package var for the
+// same shape test as upsertEvalMetricsSQL.
+//
+// Parameter order: $1=job_id $2=eval_failed_at $3=eval_failed_chunks $4=eval_error
+var recordEvalFailureSQL = `
+	INSERT INTO run_metrics (job_id, eval_failed_at, eval_failed_chunks, eval_error)
+	VALUES ($1, $2, $3, $4)
+	ON CONFLICT (job_id) DO UPDATE
+	SET eval_failed_at     = EXCLUDED.eval_failed_at,
+	    eval_failed_chunks = EXCLUDED.eval_failed_chunks,
+	    eval_error         = EXCLUDED.eval_error,
+	    updated_at         = now()
+`
+
+// maxEvalErrorLen bounds eval_error so a pathological upstream error body can't
+// bloat run_metrics.
+const maxEvalErrorLen = 500
+
+// UpsertEvalMetrics records one judge attempt for a job (the eval layer's slice
+// of run_metrics, CONTRACT §1.5). A successful attempt (m.FinishedAt set) writes
+// the eval_* columns including the eval_finished_at latch and clears any prior
+// failure; a failed attempt (m.Failed()) writes only the failure record and
+// never the latch. Only eval columns are touched, so it never clobbers the
+// monitor's, runner's, or embed worker's columns on the same row.
 //
 // Best-effort: callers should log-and-continue on error so a metrics write never
 // fails the underlying eval/embed step.
 func (db *DB) UpsertEvalMetrics(ctx context.Context, m EvalMetrics) error {
-	_, err := db.pool.Exec(ctx, upsertEvalMetricsSQL,
+	return upsertEvalMetrics(ctx, db.pool, m)
+}
+
+func upsertEvalMetrics(ctx context.Context, ex execer, m EvalMetrics) error {
+	if m.Failed() {
+		failedAt := m.FailedAt
+		if failedAt.IsZero() {
+			failedAt = time.Now()
+		}
+		reason := m.Error
+		if r := []rune(reason); len(r) > maxEvalErrorLen {
+			reason = string(r[:maxEvalErrorLen])
+		}
+		if _, err := ex.Exec(ctx, recordEvalFailureSQL,
+			m.JobID, failedAt, m.FailedChunks, nonEmpty(reason)); err != nil {
+			return fmt.Errorf("record eval failure: %w", err)
+		}
+		return nil
+	}
+	if _, err := ex.Exec(ctx, upsertEvalMetricsSQL,
 		m.JobID, m.StartedAt, m.FinishedAt, m.Model,
-		m.Chunks, m.Skipped, m.Findings)
-	if err != nil {
+		m.Chunks, m.Skipped, m.Findings); err != nil {
 		return fmt.Errorf("upsert eval metrics: %w", err)
 	}
 	return nil
@@ -2134,8 +2218,9 @@ type QueueStats struct {
 	EmbedBacklog int
 
 	// EvalBacklog counts done transcripts that have not been eval'd
-	// (run_metrics.eval_finished_at IS NULL) AND have no chunks yet. This is the
-	// eval-pass backlog when EVAL_GATES_EMBED=true — Phase B is complete only
+	// (run_metrics.eval_finished_at IS NULL and no recorded eval_failed_at — a
+	// failed judge run is not retried by the pipeline, so it is not backlog)
+	// AND have no chunks yet. This is the eval-pass backlog when EVAL_GATES_EMBED=true — Phase B is complete only
 	// when BOTH EvalBacklog==0 AND EmbedBacklog==0. Always 0 when the gate is
 	// disabled (ungated deployments ignore it). CONTRACT §1.4, §1.5.
 	EvalBacklog int
@@ -2335,7 +2420,8 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM run_metrics rm
-		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
+		    WHERE rm.job_id = j.id
+		      AND (rm.eval_finished_at IS NOT NULL OR rm.eval_failed_at IS NOT NULL)
 		  )
 	`).Scan(&q.EvalBacklog); err != nil {
 		return nil, fmt.Errorf("eval backlog count: %w", err)
@@ -3510,20 +3596,40 @@ var evalChunkSelectSQL = `
 	JOIN transcripts t ON t.id = c.transcript_id
 `
 
-// GetUnevaluatedJobTranscripts returns done transcripts whose run_metrics row
-// has eval_finished_at IS NULL (or has no run_metrics row at all), regardless of
-// whether the transcript has already been embedded. This is the backfill
-// selection for `earmark eval --backfill-unevaluated` (CONTRACT §2.15, §1.5):
-// it judges any done transcript that slipped through before EVAL_GATES_EMBED was
-// enabled, writing eval_finished_at so they are retroactively covered.
-//
-// Unlike GetUnevaluatedTranscripts (which restricts to not-yet-embedded), this
-// method returns ALL done+not-eval'd transcripts, including already-embedded
-// ones, because the backfill command runs against live data and must not miss
-// anything. The caller (cmd/eval --backfill-unevaluated) persists findings and
-// eval_finished_at via the existing eval + UpsertEvalMetrics path.
-func (db *DB) GetUnevaluatedJobTranscripts(ctx context.Context) ([]*Transcript, error) {
-	rows, err := db.pool.Query(ctx, `
+// TranscriptCursor is a keyset position over transcripts ordered by
+// (created_at, id). The zero value means "from the beginning". Keyset paging
+// (rather than OFFSET or "re-select until empty") is what lets a backfill walk a
+// selection in bounded pages even when a page's rows do NOT drop out of the
+// selection — a dry run, or a transcript whose judge run failed again.
+type TranscriptCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// CursorAfter returns the cursor positioned just past t.
+func CursorAfter(t *Transcript) TranscriptCursor {
+	return TranscriptCursor{CreatedAt: t.CreatedAt, ID: t.ID}
+}
+
+// keysetArgs maps a cursor to the ($1, $2) pair the keyset predicate expects:
+// both NULL for the zero cursor (start of the selection).
+func (c TranscriptCursor) keysetArgs() (any, any) {
+	if c.ID == "" {
+		return nil, nil
+	}
+	return c.CreatedAt, c.ID
+}
+
+// transcriptKeysetPredicate is the shared "strictly after the cursor" clause.
+// $1/$2 are the cursor's created_at/id (both NULL = from the start).
+const transcriptKeysetPredicate = `($1::timestamptz IS NULL OR (t.created_at, t.id) > ($1::timestamptz, $2::uuid))`
+
+// unevaluatedJobTranscriptsSQL is the --backfill-unevaluated selection: done
+// jobs with no eval_finished_at latch, REGARDLESS of embed state, one keyset
+// page at a time ($3 = page size). Unlike the gated eval pass it also includes
+// jobs whose last judge attempt FAILED (eval_failed_at set, no latch) — that is
+// how a failure recorded by the pipeline gets retried.
+const unevaluatedJobTranscriptsSQL = `
 		SELECT t.id, t.job_id, t.file_path, t.checksum,
 		       t.language, t.duration_seconds, t.speaker_count,
 		       t.segments, t.raw_text, t.model_name, t.created_at
@@ -3534,12 +3640,141 @@ func (db *DB) GetUnevaluatedJobTranscripts(ctx context.Context) ([]*Transcript, 
 		    SELECT 1 FROM run_metrics rm
 		    WHERE rm.job_id = j.id AND rm.eval_finished_at IS NOT NULL
 		  )
-		ORDER BY t.created_at ASC
-	`)
+		  AND ` + transcriptKeysetPredicate + `
+		ORDER BY t.created_at ASC, t.id ASC
+		LIMIT $3
+	`
+
+// GetUnevaluatedJobTranscripts returns one page (at most limit rows, after
+// cursor) of done transcripts whose run_metrics row has eval_finished_at IS NULL
+// (or has no run_metrics row at all), regardless of whether the transcript has
+// already been embedded. This is the backfill selection for
+// `earmark eval --backfill-unevaluated` (CONTRACT §2.15, §1.5): it judges any
+// done transcript that slipped through before EVAL_GATES_EMBED was enabled,
+// that was embedded with EVAL_IN_PIPELINE=false (eval decoupled from embed), or
+// whose last judge attempt failed (latch-only-on-success).
+//
+// Unlike GetUnevaluatedTranscripts (which restricts to not-yet-embedded), this
+// method returns ALL done+not-eval'd transcripts, including already-embedded
+// ones. It is paged so the sweep never loads every transcript's segments JSONB
+// at once; a non-positive limit is normalized to defaultSelectLimit.
+func (db *DB) GetUnevaluatedJobTranscripts(ctx context.Context, after TranscriptCursor, limit int) ([]*Transcript, error) {
+	return getTranscriptPage(ctx, db.pool, unevaluatedJobTranscriptsSQL, after, limit, "unevaluated job transcripts")
+}
+
+// evalErrorTranscriptsSQL is the --backfill-eval-errors selection: done jobs
+// whose judging is known to have gone wrong, one keyset page at a time:
+//
+//  1. eval_failed_at IS NOT NULL — a failure recorded under latch-only-on-success.
+//  2. LEGACY: latched (eval_finished_at set) although chunks were skipped
+//     (eval_skipped > 0) — the pre-fix pipeline latched partial runs.
+//  3. LEGACY: latched, but a per-job eval error event — or an eval finish event
+//     reporting skipped chunks — was logged at/after that run's eval_started_at.
+//     The pre-fix gated pass latched every judge failure (and zeroed
+//     eval_skipped), so the event log is the only surviving record.
+//
+// A successful re-judge writes a new eval_started_at (after those events) and
+// eval_skipped = 0 and clears eval_failed_at, so the job drops out of all three.
+const evalErrorTranscriptsSQL = `
+		SELECT t.id, t.job_id, t.file_path, t.checksum,
+		       t.language, t.duration_seconds, t.speaker_count,
+		       t.segments, t.raw_text, t.model_name, t.created_at
+		FROM transcripts t
+		JOIN transcription_jobs j ON j.id = t.job_id
+		JOIN run_metrics rm ON rm.job_id = j.id
+		WHERE j.status = 'done'
+		  AND (
+		    rm.eval_failed_at IS NOT NULL
+		    OR (rm.eval_finished_at IS NOT NULL AND (
+		      COALESCE(rm.eval_skipped, 0) > 0
+		      OR EXISTS (
+		        SELECT 1 FROM pipeline_events pe
+		        WHERE pe.job_id = j.id
+		          AND pe.stage = 'eval'
+		          AND (pe.event = 'error'
+		               OR (pe.event = 'finish' AND COALESCE((pe.detail->>'skipped')::int, 0) > 0))
+		          AND pe.created_at >= COALESCE(rm.eval_started_at, '-infinity'::timestamptz)
+		      )
+		    ))
+		  )
+		  AND ` + transcriptKeysetPredicate + `
+		ORDER BY t.created_at ASC, t.id ASC
+		LIMIT $3
+	`
+
+// GetEvalErrorTranscripts returns one page (at most limit rows, after cursor) of
+// done transcripts whose judging failed — including legacy ones the pre-fix
+// pipeline latched as done anyway (see evalErrorTranscriptsSQL). This is the
+// selection for `earmark eval --backfill-eval-errors`. Read-only.
+func (db *DB) GetEvalErrorTranscripts(ctx context.Context, after TranscriptCursor, limit int) ([]*Transcript, error) {
+	return getTranscriptPage(ctx, db.pool, evalErrorTranscriptsSQL, after, limit, "eval-error transcripts")
+}
+
+// getTranscriptPage runs one keyset-paged transcript selection.
+func getTranscriptPage(ctx context.Context, q rowQuerier, sql string, after TranscriptCursor, limit int, what string) ([]*Transcript, error) {
+	c1, c2 := after.keysetArgs()
+	rows, err := q.Query(ctx, sql, c1, c2, normalizeSelectLimit(limit))
 	if err != nil {
-		return nil, fmt.Errorf("query unevaluated job transcripts: %w", err)
+		return nil, fmt.Errorf("query %s: %w", what, err)
 	}
 	return scanTranscriptRows(rows) // scanTranscriptRows closes rows
+}
+
+// FindingKey identifies a finding for de-duplication on re-judge: the same
+// chunk, span, issue type and correction.
+type FindingKey struct {
+	ChunkID             string
+	OriginalText        string
+	IssueType           string
+	SuggestedCorrection string
+}
+
+// KeyOf returns f's de-duplication key.
+func KeyOf(f Finding) FindingKey {
+	k := FindingKey{OriginalText: f.OriginalText, IssueType: f.IssueType}
+	if f.ChunkID != nil {
+		k.ChunkID = *f.ChunkID
+	}
+	if f.SuggestedCorrection != nil {
+		k.SuggestedCorrection = *f.SuggestedCorrection
+	}
+	return k
+}
+
+// findingKeysSQL reads the dedupe keys of a transcript's existing findings.
+const findingKeysSQL = `
+	SELECT COALESCE(chunk_id::text, ''), original_text, issue_type,
+	       COALESCE(suggested_correction, '')
+	FROM transcript_findings
+	WHERE transcript_id = $1
+`
+
+// GetFindingKeys returns the de-duplication keys of every finding already
+// recorded for a transcript (any patch_state). Read-only. A re-judge of a
+// transcript whose earlier judge run partially succeeded uses it to skip the
+// findings that run already recorded, so retrying never doubles them up.
+func (db *DB) GetFindingKeys(ctx context.Context, transcriptID string) (map[FindingKey]bool, error) {
+	return getFindingKeys(ctx, db.pool, transcriptID)
+}
+
+func getFindingKeys(ctx context.Context, q rowQuerier, transcriptID string) (map[FindingKey]bool, error) {
+	rows, err := q.Query(ctx, findingKeysSQL, transcriptID)
+	if err != nil {
+		return nil, fmt.Errorf("query finding keys: %w", err)
+	}
+	defer rows.Close()
+	keys := map[FindingKey]bool{}
+	for rows.Next() {
+		var k FindingKey
+		if err := rows.Scan(&k.ChunkID, &k.OriginalText, &k.IssueType, &k.SuggestedCorrection); err != nil {
+			return nil, fmt.Errorf("scan finding key: %w", err)
+		}
+		keys[k] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate finding keys: %w", err)
+	}
+	return keys, nil
 }
 
 // GetEvalChunksForBook returns the chunks whose file_path contains substr

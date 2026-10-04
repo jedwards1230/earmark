@@ -403,10 +403,11 @@ it never touches CUDA. Per batch, repeated until no pending jobs remain,
      combined chunk→eval→embed path as before; Phase B completes when the embed
      backlog (`EmbedBacklog`) is 0.
    - **Gated** (`EVAL_GATES_EMBED=true`): the worker runs an eval pass first
-     (select done, not-eval'd, not-embedded → judge → write `eval_finished_at`),
-     then an embed pass (select done, eval'd, not-embedded → embed). Phase B
+     (select done, not-attempted, not-embedded → judge → write `eval_finished_at`
+     on success, or the `eval_failed_*` record on failure — §1.5), then an
+     embed pass (select done, eval'd-or-failed, not-embedded → embed). Phase B
      completes when **both** the eval backlog (`EvalBacklog`: done,
-     not-eval'd, not-embedded count) AND the embed backlog are 0. Both passes'
+     not-attempted, not-embedded count) AND the embed backlog are 0. Both passes'
      selections are **bounded by `EMBED_BATCH_SIZE` (§2.4, default 32) with
      `ORDER BY t.created_at ASC LIMIT $1`** so the worker never loads an
      unbounded transcript backlog (and its `segments` JSONB) into memory at once;
@@ -604,6 +605,9 @@ CREATE TABLE IF NOT EXISTS run_metrics (
   -- best-effort. eval_finished_at IS NOT NULL is the per-job eval-completion marker.
   eval_started_at TIMESTAMPTZ, eval_finished_at TIMESTAMPTZ, eval_model TEXT,
   eval_chunks INT, eval_skipped INT, eval_findings INT,
+  -- Eval failure record (latch-only-on-success): set by a judge run that could
+  -- not evaluate every chunk; cleared by the next successful run.
+  eval_failed_at TIMESTAMPTZ, eval_failed_chunks INT, eval_error TEXT,
   -- ASR backend descriptor (§2.13). All nullable, runner-owned, best-effort.
   asr_family TEXT, asr_runtime TEXT,
   caps_applied JSONB, caps_requested JSONB, caps_skipped_reason JSONB,
@@ -633,7 +637,7 @@ no breaking change.** Their shapes and the capability vocabulary are defined in
 | **Go monitor** | at enqueue (file size from `os.Stat`) | `audio_bytes` |
 | **Python ASR runner** | after transcribing | `audio_channels`, `audio_sample_rate`, `audio_codec`, `audio_format`, `transcribe_started_at`, `transcribe_finished_at`, `asr_model`, `compute_type`, `runner_host`, `chunked`, `n_windows`, `char_count`, `word_count`, `segment_count`; **SHOULD also** `asr_family`, `asr_runtime`, `caps_applied`, `caps_requested`, `caps_skipped_reason`, `mean_word_confidence` (the §2.13 backend descriptor) |
 | **Go embed worker** | after `transcript_chunks` insert | `embed_started_at`, `embed_finished_at`, `embed_model`, `embed_chunk_count`, `embed_prompt_tokens`, `embed_total_tokens` |
-| **Go eval layer** | after the in-pipeline judge runs over a transcript's chunks (`EVAL_IN_PIPELINE`) | `eval_started_at`, `eval_finished_at`, `eval_model`, `eval_chunks`, `eval_skipped`, `eval_findings` |
+| **Go eval layer** | after the in-pipeline judge runs over a transcript's chunks (`EVAL_IN_PIPELINE`), or `earmark eval --backfill-*` judges one | success: `eval_started_at`, `eval_finished_at`, `eval_model`, `eval_chunks`, `eval_skipped`, `eval_findings` (and clears the failure record); failure: `eval_failed_at`, `eval_failed_chunks`, `eval_error` only |
 
 **Eval slice + completion marker.** `eval_finished_at IS NOT NULL` is the
 **per-job eval-completion marker** — a job has been judged iff its `run_metrics`
@@ -642,8 +646,31 @@ row has a non-NULL `eval_finished_at`. Eval coverage is thus a real ratio
 (a clean job has 0 findings but is still "evaluated"). `eval_model` is the judge
 model id; `eval_chunks`/`eval_skipped`/`eval_findings` are the run's
 `ChunksEvaluated`/`ChunksSkipped`/`FindingsFound`. The eval slice is written
-**only by the in-pipeline path** (`EVAL_IN_PIPELINE`), where the chunk set maps
-cleanly to one job (`job_id`). The **standalone** `earmark eval` / `/actions/eval*`
+**only by the per-job paths** — the in-pipeline judge (`EVAL_IN_PIPELINE`) and
+the `earmark eval --backfill-*` sweeps — where the chunk set maps cleanly to one
+job (`job_id`).
+
+**Latch only on success.** `eval_finished_at` is written **only when the judge
+evaluated every chunk of the transcript AND its findings were stored**. A run
+that skipped any chunk (endpoint error, a single request hitting the chat
+client's 120 s timeout, …) or failed to store its findings does **not** latch:
+it records `eval_failed_at` (when), `eval_failed_chunks` (how many chunks it
+could not judge — all of them when the findings write failed) and `eval_error`
+(the first judge error / the persist error, ≤500 chars) and leaves the eval
+success columns alone, so a failed re-judge of an already-latched job never
+erases that job's earlier successful run. Its partial findings are still
+inserted (advisory signal is not discarded); the re-judge paths skip findings
+already recorded for the transcript, so a retry never doubles them. A shutdown
+mid-judge records nothing. The next successful run latches and clears the three
+failure columns. Rationale: a latched job is never re-judged, so a failure
+latched as done (the pre-fix behavior) was lost for good.
+
+**No hot retry loop.** The pipeline never retries a failed judge run by itself:
+the gated eval pass selects only jobs with **neither** `eval_finished_at` nor
+`eval_failed_at`, so a failed job leaves its selection after one attempt. Retries
+are operator-driven and bounded: `earmark eval --backfill-unevaluated` (selects
+`eval_finished_at IS NULL`, which includes recorded failures) and `earmark eval
+--backfill-eval-errors` (§2.15), both with `--limit`. The **standalone** `earmark eval` / `/actions/eval*`
 paths evaluate a whole book (many jobs) or a library-wide sample, so they do
 **not** write the per-job `run_metrics` eval slice (the mapping to a single job
 is ambiguous); they emit a `pipeline_events` `stage='eval'` row instead (§1.7).
@@ -651,9 +678,13 @@ is ambiguous); they emit a `pipeline_events` `stage='eval'` row instead (§1.7).
 **`eval_finished_at` as the embed gate (`EVAL_GATES_EMBED=true`).** When
 `EVAL_GATES_EMBED` is enabled, `eval_finished_at IS NOT NULL` is **the latch
 that allows a transcript to be embedded**: the embed pass selects only transcripts
-whose `run_metrics.eval_finished_at IS NOT NULL` (eval'd) AND have no chunks (not
-yet embedded). Under this gate the invariant `embedded ⟹ eval'd` holds: a
-transcript is never searchable until it has been judged. Column ownership is
+whose `run_metrics.eval_finished_at IS NOT NULL` (eval'd) — **or whose judge
+attempt failed (`eval_failed_at IS NOT NULL`)** — AND have no chunks (not yet
+embedded). Under this gate the invariant is `embedded ⟹ judge attempted`: a
+transcript is never searchable until the judge has run on it. The gate **fails
+open** on a judge failure — exactly as it did before latch-only-on-success, when
+the failure was latched as done — so a judge outage never blocks search; the
+difference is that the failure now stays visible and re-judgeable. Column ownership is
 preserved — the eval pass writes `eval_finished_at` (its column), the embed pass
 writes the embed slice, the runner writes the transcribe slice; no clobber.
 
@@ -676,8 +707,11 @@ double-insert of the same chunk, not a silent mismatch).
 existing deployment from ungated to gated (`EVAL_GATES_EMBED=true`), the
 ~embedded-but-never-judged corpus needs a one-time backfill. The command selects
 done jobs whose `eval_finished_at IS NULL` **regardless of embed state** (so it
-covers the ~790 already-embedded tracks), judges them, and writes
-`eval_finished_at`. It is read-only over transcripts: it only INSERTs findings and
+covers the ~790 already-embedded tracks, any job whose judge run failed, and
+everything embedded while `EVAL_IN_PIPELINE=false`), judges them, and writes
+`eval_finished_at` (on success — see "Latch only on success"). It walks the
+selection in keyset pages of 32 (`ORDER BY created_at, id`), never loading the
+whole backlog's `segments` at once. It is read-only over transcripts: it only INSERTs findings and
 UPSERTs the eval `run_metrics` slice — it does NOT re-embed or touch
 `transcript_chunks`. After the backfill, `embedded ⟹ eval'd` holds for the
 existing corpus, matching the invariant the gate enforces going forward. The
@@ -1161,7 +1195,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
 | `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval). Default off → eval stays on-demand and the worker is unchanged. Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
-| `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-eval'd, not-embedded transcripts and judges them (writing `eval_finished_at`); an **embed pass** then selects done, eval'd, not-embedded transcripts and embeds them. The `eval_finished_at` latch (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ eval'd`. **Fail-closed** (two conditions, both fatal at startup): (1) if no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`); and (2) if `EVAL_IN_PIPELINE` is not also `true`. The gate makes eval a strict prerequisite for embedding, and the eval judge is only built when `EVAL_IN_PIPELINE=true`; so `EVAL_GATES_EMBED=true` **requires** `EVAL_IN_PIPELINE=true` (and a resolvable judge) — otherwise the worker would run gated with a nil judge, stalling the corpus (or risking a nil-judge deref). Both failures fail at startup, never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
+| `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-yet-attempted, not-embedded transcripts and judges them (writing `eval_finished_at` on a complete run, the `eval_failed_*` record otherwise); an **embed pass** then selects done, eval'd-or-failed, not-embedded transcripts and embeds them. The `eval_finished_at` latch / `eval_failed_at` record (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ judge attempted` (a judge failure fails open; it is retried by `earmark eval --backfill-*`, never in a hot loop). **Fail-closed** (two conditions, both fatal at startup): (1) if no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`); and (2) if `EVAL_IN_PIPELINE` is not also `true`. The gate makes eval a strict prerequisite for embedding, and the eval judge is only built when `EVAL_IN_PIPELINE=true`; so `EVAL_GATES_EMBED=true` **requires** `EVAL_IN_PIPELINE=true` (and a resolvable judge) — otherwise the worker would run gated with a nil judge, stalling the corpus (or risking a nil-judge deref). Both failures fail at startup, never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
 | `GPU_ARBITER_URL` | no | gpu-arbiter `/status` URL (e.g. `http://gpu-host:48750/status`) read by the `earmark batch` coordinator (§1.4) to yield the GPU to games. **Read-only** — the coordinator only `GET`s it, never `POST`s. Unset or unreachable → the coordinator logs it and proceeds (degrades gracefully). The `batch --gpu-arbiter-url` flag overrides it. |
 | `ARBITER_WAIT_CMD` | no | Explicit path to a gpu-arbiter binary the `earmark batch` coordinator should delegate waits to (§1.4). Lower precedence than the `batch --arbiter-wait-cmd` flag, higher than `gpu-arbiter` auto-detected on `PATH`. Unset → the coordinator auto-detects on `PATH`, falling back to its built-in HTTP poll loop if nothing resolves. Purely an optimization — never required. |
 | `ASR_SERVERS` | no | JSON array declaring the transcription servers (ASR runners) for this deployment, so the Servers dashboard page can show a configured-but-idle server (e.g. a fallback). Empty → the page lists only observed runners. Cosmetic/read-only: a malformed value logs a warning and is ignored, and the list does **not** influence job routing (the runner claims work itself). See below. |
@@ -1813,13 +1847,45 @@ are fatal, so a worker is never constructed with `EvalGatesEmbed=true` and a
 nil judge.
 
 **`earmark eval --backfill-unevaluated`** is the one-time migration command for
-existing deployments enabling the gate. It selects done jobs with
-`eval_finished_at IS NULL` regardless of embed state, judges them, and writes
-`eval_finished_at`. It is safe over live embedded data: it only INSERTs findings
-and UPSERTs the eval slice — it does NOT touch `transcript_chunks` or
-`transcripts`. Run with `--write` to persist; omit for a dry-run preview. Cost is
-bounded per `--sample N` / `--limit N` flags. After the command completes,
-`embedded ⟹ eval'd` holds for the existing corpus.
+existing deployments enabling the gate, the retry path for judge runs that
+failed, and the judging pass for a deployment that keeps the judge out of the
+embed path (below). It selects done jobs with `eval_finished_at IS NULL`
+regardless of embed state, judges them, and writes `eval_finished_at` — only
+when every chunk was judged (§1.5 "Latch only on success"); a failed transcript
+gets the `eval_failed_*` record and is picked up again by the next run. It is
+safe over live embedded data: it only INSERTs findings and UPSERTs the eval
+slice — it does NOT touch `transcript_chunks` or `transcripts`. Run with
+`--write` to persist; omit for a dry-run preview. `--limit N` caps the
+transcripts judged per run (0 = all); the selection is walked in keyset pages of
+32 so memory stays bounded. After the command completes, `embedded ⟹ eval'd`
+holds for the existing corpus (minus any transcripts the judge failed on, which
+remain selectable).
+
+**`earmark eval --backfill-eval-errors`** re-judges done jobs whose judging
+**failed**, including legacy ones the pre-fix pipeline latched as done anyway.
+A job is selected when any of these holds:
+
+1. `run_metrics.eval_failed_at IS NOT NULL` (a failure recorded under the
+   latch-only-on-success rule);
+2. it is latched but `eval_skipped > 0` (the old ungated path latched partial
+   runs);
+3. it is latched but a per-job `pipeline_events` row with `stage='eval'` and
+   `event='error'` — or `event='finish'` with `detail.skipped > 0` — was written
+   at/after that job's `eval_started_at` (the old gated pass latched every judge
+   failure and zeroed `eval_skipped`, so the event log is the only record; this
+   is how the ~85 historical eval errors are found).
+
+Findings already recorded for a transcript (same chunk, span, issue type and
+correction) are not inserted again. A successful re-judge writes a new
+`eval_started_at`, `eval_skipped = 0`, and clears the failure record, so the job
+leaves all three conditions. Same `--write` / dry-run / `--limit` semantics as
+`--backfill-unevaluated`; the two flags are mutually exclusive.
+
+```bash
+earmark eval --backfill-eval-errors --limit 10           # preview the first 10
+earmark eval --backfill-eval-errors --limit 10 --write   # re-judge them
+earmark eval --backfill-eval-errors --write              # all of them
+```
 
 **Noise filters (applied per chunk, before persistence).** Two precision filters
 trim the judge's over-flagging, in this order:

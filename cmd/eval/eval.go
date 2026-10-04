@@ -9,7 +9,13 @@
 // --backfill-unevaluated: a special mode that selects ALL done transcripts whose
 // eval_finished_at IS NULL (regardless of embed state) and judges them. It is
 // safe to run over live data — it only writes to transcript_findings and
-// run_metrics (eval_finished_at). CONTRACT §2.15.
+// run_metrics (the eval slice). CONTRACT §2.15. It is also the judging pass for
+// a deployment that runs with EVAL_IN_PIPELINE=false (eval decoupled from
+// embed): schedule it and embedding never waits on a judge call.
+//
+// --backfill-eval-errors: re-judges done transcripts whose judging FAILED —
+// including legacy ones the pre-fix pipeline latched as done anyway (found via
+// eval_skipped > 0 and the pipeline_events eval error log). CONTRACT §2.15.
 package eval
 
 import (
@@ -19,6 +25,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
@@ -36,9 +43,10 @@ type runner interface {
 
 type options struct {
 	sample              int  // judge a random sample of N chunks library-wide (instead of a book)
-	limit               int  // cap chunks evaluated for a book (0 → package default)
+	limit               int  // cap chunks evaluated for a book / transcripts for a backfill (0 → default/all)
 	write               bool // persist findings; without it the command is a dry-run preview
 	backfillUnevaluated bool // judge ALL done transcripts with eval_finished_at IS NULL
+	backfillEvalErrors  bool // re-judge done transcripts whose judging failed
 }
 
 var opts options
@@ -59,9 +67,20 @@ vLLM) as a fallback. EVAL_CHAT_API_KEY is optional.
 
 --backfill-unevaluated judges ALL done transcripts whose eval_finished_at IS NULL
 regardless of whether they have been embedded. It is safe to run over live data;
-it only writes to transcript_findings and run_metrics (eval_finished_at). Use it
+it only writes to transcript_findings and run_metrics (the eval slice). Use it
 to retroactively cover transcripts that were processed before EVAL_GATES_EMBED was
-enabled (CONTRACT §2.15, §1.5).
+enabled, to retry judge runs that failed, and as the scheduled judging pass when
+EVAL_IN_PIPELINE=false keeps the judge out of the embed path (CONTRACT §2.15, §1.5).
+
+--backfill-eval-errors re-judges done transcripts whose judging failed: those
+with a recorded failure (run_metrics.eval_failed_at), and LEGACY ones the old
+pipeline latched as done despite a judge error (eval_skipped > 0, or an eval
+error event in pipeline_events). Findings already recorded for a transcript are
+not inserted twice.
+
+In both backfill modes eval_finished_at is written only when EVERY chunk was
+judged; otherwise the failure is recorded and the transcript stays eligible for
+the next run. --limit N caps how many transcripts one run judges (0 = all).
 
 Examples:
   earmark eval "Project Hail Mary"              # preview findings for one book
@@ -69,17 +88,22 @@ Examples:
   earmark eval --sample 50                      # preview a 50-chunk library sample
   earmark eval --sample 50 --write              # record a 50-chunk sample
   earmark eval --backfill-unevaluated           # preview backfill (dry-run)
-  earmark eval --backfill-unevaluated --write   # backfill all unevaluated transcripts`,
+  earmark eval --backfill-unevaluated --write   # backfill all unevaluated transcripts
+  earmark eval --backfill-eval-errors --limit 10          # preview the first 10 re-judges
+  earmark eval --backfill-eval-errors --limit 10 --write  # re-judge them`,
 	Run: runEval,
 }
 
 func init() {
 	EvalCmd.Flags().IntVar(&opts.sample, "sample", 0, "judge a random sample of N chunks library-wide")
-	EvalCmd.Flags().IntVar(&opts.limit, "limit", 0, "max chunks to evaluate for a book (0 = default)")
+	EvalCmd.Flags().IntVar(&opts.limit, "limit", 0, "max chunks to evaluate for a book (0 = default); with --backfill-*, max transcripts to judge (0 = all)")
 	EvalCmd.Flags().BoolVar(&opts.write, "write", false, "persist findings (otherwise dry-run preview)")
 	EvalCmd.Flags().BoolVar(&opts.write, "yes", false, "alias for --write")
 	EvalCmd.Flags().BoolVar(&opts.backfillUnevaluated, "backfill-unevaluated", false,
 		"judge ALL done transcripts with eval_finished_at IS NULL (regardless of embed state)")
+	EvalCmd.Flags().BoolVar(&opts.backfillEvalErrors, "backfill-eval-errors", false,
+		"re-judge done transcripts whose judging failed (incl. legacy runs latched despite an error)")
+	EvalCmd.MarkFlagsMutuallyExclusive("backfill-unevaluated", "backfill-eval-errors")
 }
 
 func runEval(cmd *cobra.Command, args []string) {
@@ -112,8 +136,13 @@ func runEval(cmd *cobra.Command, args []string) {
 	// with eval_finished_at IS NULL (regardless of embed state). This is an offline
 	// sweep over raw transcript text, not over transcript_chunks, so it uses a
 	// different DB query and chunker path (CONTRACT §2.15).
-	if opts.backfillUnevaluated {
-		if err := runBackfill(context.Background(), os.Stdout, database, judge, cfg, opts.write); err != nil {
+	if opts.backfillUnevaluated || opts.backfillEvalErrors {
+		mode := backfillUnevaluated
+		if opts.backfillEvalErrors {
+			mode = backfillEvalErrors
+		}
+		bo := backfillOptions{mode: mode, write: opts.write, limit: opts.limit}
+		if err := runBackfill(context.Background(), os.Stdout, database, judge, cfg, bo); err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -130,18 +159,41 @@ func runEval(cmd *cobra.Command, args []string) {
 // backfillDB is the narrow slice of db.DB the backfill execution path needs.
 // It is a proper interface so the backfill path is testable without a live DB.
 type backfillDB interface {
-	// GetUnevaluatedJobTranscripts returns done transcripts with eval_finished_at
-	// IS NULL, regardless of embed state. Used by --backfill-unevaluated.
-	GetUnevaluatedJobTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	// GetUnevaluatedJobTranscripts returns one keyset page of done transcripts
+	// with eval_finished_at IS NULL, regardless of embed state.
+	GetUnevaluatedJobTranscripts(ctx context.Context, after db.TranscriptCursor, limit int) ([]*db.Transcript, error)
+	// GetEvalErrorTranscripts returns one keyset page of done transcripts whose
+	// judging failed (incl. legacy latched-despite-error runs).
+	GetEvalErrorTranscripts(ctx context.Context, after db.TranscriptCursor, limit int) ([]*db.Transcript, error)
 	// GetEvalChunksForTranscript returns the transcript's stored chunk rows
 	// (real IDs, pristine text); empty when it has not been embedded yet.
 	GetEvalChunksForTranscript(ctx context.Context, transcriptID string) ([]db.EvalChunk, error)
-	// InsertFindings persists advisory judge findings (best-effort in backfill).
+	// GetFindingKeys returns the dedupe keys of the transcript's existing
+	// findings, so a re-judge never inserts the same finding twice.
+	GetFindingKeys(ctx context.Context, transcriptID string) (map[db.FindingKey]bool, error)
+	// InsertFindings persists advisory judge findings.
 	InsertFindings(ctx context.Context, findings []db.Finding) error
-	// UpsertEvalMetrics writes eval_finished_at (the eval-completion latch) plus
-	// per-run counts. Writing it is what makes a transcript "covered" by the
-	// backfill pass. Best-effort in backfill: a write failure is logged + skipped.
+	// UpsertEvalMetrics records the attempt: the eval_finished_at latch on a
+	// complete run, the failure record otherwise.
 	UpsertEvalMetrics(ctx context.Context, m db.EvalMetrics) error
+}
+
+// backfillMode selects which transcripts a backfill run judges.
+type backfillMode int
+
+const (
+	backfillUnevaluated backfillMode = iota // eval_finished_at IS NULL
+	backfillEvalErrors                      // judging failed (incl. legacy latched errors)
+)
+
+// backfillOptions are the knobs for one runBackfill call.
+type backfillOptions struct {
+	mode  backfillMode
+	write bool
+	// limit caps the transcripts judged in this run; 0 = all.
+	limit int
+	// pageSize is the keyset page size (rows loaded per query); 0 → default.
+	pageSize int
 }
 
 // dbRunner adapts the DB + judge to the runner interface.
@@ -191,133 +243,234 @@ func (d *dbRunner) Run(ctx context.Context, o evalpkg.RunOptions) ([]db.Finding,
 	return findings, stats, err
 }
 
-// runBackfill judges every done transcript whose eval_finished_at IS NULL,
-// regardless of embed state, so it also covers transcripts processed before the
-// gated flow was enabled. For each transcript it:
+// defaultBackfillPageSize bounds the transcripts (each with its segments JSONB)
+// loaded per selection query — mirroring EMBED_BATCH_SIZE's OOM guard.
+const defaultBackfillPageSize = 32
+
+// runBackfill judges every transcript the selected mode returns, walking the
+// selection in keyset pages so memory stays bounded (and a dry run, whose rows
+// never drop out of the selection, still terminates). For each transcript it:
 //
 //  1. Picks the chunks findings must reference: the stored transcript_chunks
 //     rows when already embedded (their real IDs, which may be random from the
 //     ungated path), else the embed worker's own chunking with deterministic
 //     UUIDv5 IDs (CONTRACT §1.5) — the rows the gated embed pass will insert.
 //  2. Runs the judge over the chunks.
-//  3. Persists findings (best-effort — a write failure is logged and skipped).
-//  4. Writes eval_finished_at via UpsertEvalMetrics (the latch for the gate).
+//  3. Persists findings not already recorded for the transcript (a re-judge of
+//     a partially successful earlier run would otherwise double them up).
+//  4. Writes eval_finished_at ONLY if every chunk was judged and the findings
+//     were stored; otherwise records the failure (eval_failed_at /
+//     eval_failed_chunks / eval_error) so the next run picks it up again.
 //
-// This is a sweep command — it is NOT bounded by book or sample. In dry-run mode
-// (write=false) it prints what it would record but writes nothing.
-func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *evalpkg.Judge, cfg *config.Config, write bool) error {
+// In dry-run mode (write=false) it prints what it would record but writes
+// nothing. A cancelled context stops the sweep without recording anything for
+// the in-flight transcript.
+func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *evalpkg.Judge, cfg *config.Config, o backfillOptions) error {
 	p := func(format string, a ...any) { _, _ = fmt.Fprintf(out, format, a...) }
 
-	transcripts, err := bdb.GetUnevaluatedJobTranscripts(ctx)
-	if err != nil {
-		return fmt.Errorf("query unevaluated transcripts: %w", err)
+	selectPage := bdb.GetUnevaluatedJobTranscripts
+	what := "done transcript(s) with eval_finished_at IS NULL"
+	if o.mode == backfillEvalErrors {
+		selectPage = bdb.GetEvalErrorTranscripts
+		what = "done transcript(s) whose judging failed"
 	}
-
-	if len(transcripts) == 0 {
-		p("No unevaluated done transcripts found — nothing to backfill.\n")
-		return nil
+	pageSize := o.pageSize
+	if pageSize <= 0 {
+		pageSize = defaultBackfillPageSize
 	}
-	p("Backfill: %d done transcript(s) with eval_finished_at IS NULL.\n", len(transcripts))
-
 	chunkSize := cfg.ChunkSize
 	if chunkSize <= 0 {
 		chunkSize = 512
 	}
 
-	var totalChunks, totalFindings, totalSkipped int
-	for _, t := range transcripts {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	var seen, latched, failed, totalChunks, totalFindings, totalSkipped, totalDupes int
+	var cursor db.TranscriptCursor
+	for {
+		want := pageSize
+		if o.limit > 0 && o.limit-seen < want {
+			want = o.limit - seen
 		}
-		if t.RawText == "" {
-			p("  skip %s (empty raw text)\n", filepath.Base(t.FilePath))
-			continue
+		if want <= 0 {
+			break
 		}
-
-		// ORIGINAL-text consumer (CONTRACT §2.17 reader audit), and correct as-is:
-		// the backfill judge must see PRISTINE text. raw_text is immutable
-		// provenance that no Go code ever writes, and replay always starts from
-		// pristine — so anchors and chunk_text_sha256 recorded here line up with
-		// what the embed worker will replay onto. Feeding the judge the corrected
-		// projection instead would make every backfilled finding stale on arrival.
-		//
-		// Every finding's chunk ID, anchors and chunk hash must refer to the exact
-		// text stored under that ID:
-		//   - Already embedded: judge the STORED rows (real IDs + pristine
-		//     source text). Those rows may carry random IDs from the ungated
-		//     worker path, so regenerated UUIDv5 IDs would not exist.
-		//   - Not embedded yet: regenerate with the embed worker's own
-		//     (segment-aware) chunking and deterministic UUIDs — the IDs the
-		//     gated embed pass will insert, exactly as its own eval pass does.
-		evalChunks, cerr := bdb.GetEvalChunksForTranscript(ctx, t.ID)
-		if cerr != nil {
-			p("  warn %s: read stored chunks failed (%v); skipping (will retry next backfill)\n",
-				filepath.Base(t.FilePath), cerr)
-			continue
+		page, err := selectPage(ctx, cursor, want)
+		if err != nil {
+			return fmt.Errorf("query backfill transcripts: %w", err)
 		}
-		if len(evalChunks) == 0 {
-			chunks, perr := worker.PristineChunks(t, chunkSize)
-			if perr != nil {
-				p("  skip %s (no chunks produced)\n", filepath.Base(t.FilePath))
-				continue
+		for _, t := range page {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			evalChunks = worker.EvalChunksFor(t, chunks)
-		}
-
-		started := time.Now()
-		findings, stats, jerr := evalpkg.RunOnChunks(ctx, judge, nil, evalChunks, false)
-		finished := time.Now()
-		if jerr != nil {
-			p("  warn %s: judge error (%v); writing eval_finished_at=0 findings\n",
-				filepath.Base(t.FilePath), jerr)
-		}
-		totalChunks += stats.ChunksEvaluated
-		totalFindings += stats.FindingsFound
-		totalSkipped += stats.ChunksSkipped
-
-		if !write {
-			p("  [dry-run] %s: %d chunks, %d findings\n",
-				filepath.Base(t.FilePath), stats.ChunksEvaluated, stats.FindingsFound)
-			continue
-		}
-
-		// Persist findings before eval_finished_at (same ordering discipline as
-		// the worker's evalTranscript: never set the latch before the evidence).
-		if len(findings) > 0 {
-			if ferr := bdb.InsertFindings(ctx, findings); ferr != nil {
-				p("  warn %s: persist findings failed (%v); writing eval_finished_at anyway\n",
-					filepath.Base(t.FilePath), ferr)
+			seen++
+			cursor = db.CursorAfter(t)
+			res, err := backfillOne(ctx, p, bdb, judge, chunkSize, t, o.write)
+			if err != nil {
+				return err
+			}
+			totalChunks += res.stats.ChunksEvaluated
+			totalSkipped += res.stats.ChunksSkipped
+			totalFindings += res.newFindings
+			totalDupes += res.dupes
+			switch {
+			case res.latched:
+				latched++
+			case res.failed:
+				failed++
 			}
 		}
-
-		// Write eval_finished_at — the latch that marks this transcript as covered.
-		m := db.EvalMetrics{
-			JobID:      t.JobID,
-			StartedAt:  started,
-			FinishedAt: finished,
-			Model:      judge.Model(),
-			Chunks:     stats.ChunksEvaluated,
-			Skipped:    stats.ChunksSkipped,
-			Findings:   stats.FindingsFound,
+		if len(page) < want {
+			break // selection exhausted
 		}
-		if merr := bdb.UpsertEvalMetrics(ctx, m); merr != nil {
-			p("  warn %s: eval_finished_at write failed (%v); transcript will be re-judged on next backfill\n",
-				filepath.Base(t.FilePath), merr)
-			continue
-		}
-		p("  done %s: %d chunks, %d findings, eval_finished_at written\n",
-			filepath.Base(t.FilePath), stats.ChunksEvaluated, stats.FindingsFound)
 	}
 
-	if !write {
-		p("\n(dry-run) pass --write to record %d finding(s) across %d transcript(s).\n",
-			totalFindings, len(transcripts))
+	if seen == 0 {
+		p("No %s — nothing to backfill.\n", what)
 		return nil
 	}
-
-	p("\nBackfill complete: %d chunk(s) evaluated, %d finding(s) recorded, %d chunk(s) skipped.\n",
-		totalChunks, totalFindings, totalSkipped)
+	p("\nBackfill: %d %s judged.\n", seen, what)
+	if !o.write {
+		p("(dry-run) pass --write to record %d new finding(s) across %d transcript(s) (%d chunk(s) would be skipped by judge errors).\n",
+			totalFindings, seen, totalSkipped)
+		return nil
+	}
+	p("Backfill complete: %d chunk(s) evaluated, %d new finding(s) recorded (%d already present), %d chunk(s) skipped; %d transcript(s) latched, %d left unlatched for retry.\n",
+		totalChunks, totalFindings, totalDupes, totalSkipped, latched, failed)
 	return nil
+}
+
+// backfillResult is one transcript's backfill outcome.
+type backfillResult struct {
+	stats       evalpkg.RunStats
+	newFindings int  // findings not already recorded for the transcript
+	dupes       int  // findings skipped because they were already recorded
+	latched     bool // eval_finished_at written
+	failed      bool // failure recorded (left unlatched)
+}
+
+// backfillOne judges one transcript and (under write) records its outcome.
+// It returns an error only when the context was cancelled.
+func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, judge *evalpkg.Judge,
+	chunkSize int, t *db.Transcript, write bool) (backfillResult, error) {
+	var res backfillResult
+	name := filepath.Base(t.FilePath)
+	if t.RawText == "" {
+		p("  skip %s (empty raw text)\n", name)
+		return res, nil
+	}
+
+	// ORIGINAL-text consumer (CONTRACT §2.17 reader audit), and correct as-is:
+	// the backfill judge must see PRISTINE text. raw_text is immutable
+	// provenance that no Go code ever writes, and replay always starts from
+	// pristine — so anchors and chunk_text_sha256 recorded here line up with
+	// what the embed worker will replay onto. Feeding the judge the corrected
+	// projection instead would make every backfilled finding stale on arrival.
+	//
+	// Every finding's chunk ID, anchors and chunk hash must refer to the exact
+	// text stored under that ID:
+	//   - Already embedded: judge the STORED rows (real IDs + pristine
+	//     source text). Those rows may carry random IDs from the ungated
+	//     worker path, so regenerated UUIDv5 IDs would not exist.
+	//   - Not embedded yet: regenerate with the embed worker's own
+	//     (segment-aware) chunking and deterministic UUIDs — the IDs the
+	//     gated embed pass will insert, exactly as its own eval pass does.
+	evalChunks, cerr := bdb.GetEvalChunksForTranscript(ctx, t.ID)
+	if cerr != nil {
+		p("  warn %s: read stored chunks failed (%v); skipping (will retry next backfill)\n", name, cerr)
+		return res, nil
+	}
+	if len(evalChunks) == 0 {
+		chunks, perr := worker.PristineChunks(t, chunkSize)
+		if perr != nil {
+			p("  skip %s (no chunks produced)\n", name)
+			return res, nil
+		}
+		evalChunks = worker.EvalChunksFor(t, chunks)
+	}
+
+	started := time.Now()
+	findings, stats, jerr := evalpkg.RunOnChunks(ctx, judge, nil, evalChunks, false)
+	finished := time.Now()
+	res.stats = stats
+	if jerr != nil {
+		// RunOnChunks only errors when ctx was cancelled: stop, record nothing.
+		return res, jerr
+	}
+
+	// Drop findings an earlier (partial) judge run already recorded.
+	fresh := findings
+	if len(findings) > 0 {
+		existing, kerr := bdb.GetFindingKeys(ctx, t.ID)
+		if kerr != nil {
+			p("  warn %s: read existing findings failed (%v); skipping (will retry next backfill)\n", name, kerr)
+			return res, nil
+		}
+		fresh = make([]db.Finding, 0, len(findings))
+		for _, f := range findings {
+			if !existing[db.KeyOf(f)] {
+				fresh = append(fresh, f)
+			}
+		}
+	}
+	res.newFindings = len(fresh)
+	res.dupes = len(findings) - len(fresh)
+
+	if !write {
+		state := "would latch"
+		if !stats.Complete() {
+			state = fmt.Sprintf("would stay unlatched: %d chunk(s) failed: %s", stats.ChunksSkipped, stats.FirstError)
+		}
+		p("  [dry-run] %s: %d/%d chunks judged, %d new finding(s) (%d already recorded) — %s\n",
+			name, stats.ChunksEvaluated, len(evalChunks), len(fresh), res.dupes, state)
+		return res, nil
+	}
+
+	// Persist findings before the latch (same ordering discipline as the worker:
+	// never set the latch before the evidence).
+	var persistErr error
+	if len(fresh) > 0 {
+		if persistErr = bdb.InsertFindings(ctx, fresh); persistErr != nil {
+			p("  warn %s: persist findings failed (%v)\n", name, persistErr)
+		}
+	}
+
+	m := db.EvalMetrics{
+		JobID:     t.JobID,
+		StartedAt: started,
+		Model:     judge.Model(),
+		Chunks:    stats.ChunksEvaluated,
+		Skipped:   stats.ChunksSkipped,
+		Findings:  stats.FindingsFound,
+	}
+	if stats.Complete() && persistErr == nil {
+		m.FinishedAt = finished
+	} else {
+		m.FailedAt = finished
+		m.FailedChunks = stats.ChunksSkipped
+		var reasons []string
+		if stats.ChunksSkipped > 0 {
+			reasons = append(reasons, fmt.Sprintf("%d of %d chunks failed: %s",
+				stats.ChunksSkipped, len(evalChunks), stats.FirstError))
+		}
+		if persistErr != nil {
+			m.FailedChunks = len(evalChunks)
+			reasons = append(reasons, "persist findings: "+persistErr.Error())
+		}
+		m.Error = strings.Join(reasons, "; ")
+	}
+	if merr := bdb.UpsertEvalMetrics(ctx, m); merr != nil {
+		p("  warn %s: eval run_metrics write failed (%v); transcript will be re-judged on next backfill\n", name, merr)
+		return res, nil
+	}
+	if m.Failed() {
+		res.failed = true
+		p("  FAIL %s: %d/%d chunks judged, %d new finding(s) — left unlatched (%s)\n",
+			name, stats.ChunksEvaluated, len(evalChunks), len(fresh), m.Error)
+		return res, nil
+	}
+	res.latched = true
+	p("  done %s: %d chunks, %d new finding(s) (%d already recorded), eval_finished_at written\n",
+		name, stats.ChunksEvaluated, len(fresh), res.dupes)
+	return res, nil
 }
 
 // run holds the testable logic: validate flags, run the judge, and report.

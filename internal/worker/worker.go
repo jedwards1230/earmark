@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -359,9 +360,9 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	// replay always starts from the pristine regenerated text. Show it the
 	// corrected surface and every new finding is born stale, because its hash
 	// could never match the projection's input.
-	var inlineFindings []db.Finding
+	var judged *judgeOutcome
 	if w.judge != nil {
-		inlineFindings = w.judgeChunks(t, pristine)
+		judged = w.judgeChunks(t, pristine)
 	}
 
 	// EMBED PATH — replay the accepted corrections onto a COPY of the pristine
@@ -415,18 +416,15 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	// Persist the replay outcome now that the projection it describes exists.
 	w.persistReplay(t, replay)
 
-	// Persist in-pipeline findings now that their chunks exist. Best-effort: a
-	// findings-write failure leaves chunks searchable but un-flagged (advisory),
-	// which is the safe direction — the reverse (findings without chunks) is what
-	// the post-insert ordering exists to prevent.
-	if len(inlineFindings) > 0 {
-		if err := w.db.InsertFindings(w.ctx, inlineFindings); err != nil {
-			w.log.Warn("persist in-pipeline findings failed (chunks inserted; findings dropped)",
-				"transcript_id", t.ID, "file", t.FilePath, "findings", len(inlineFindings), "error", err)
-		} else {
-			w.log.Info("in-pipeline eval findings persisted",
-				"transcript_id", t.ID, "findings", len(inlineFindings))
-		}
+	// Persist in-pipeline findings now that their chunks exist, then record the
+	// judge outcome. Best-effort: a findings-write failure leaves chunks
+	// searchable but un-flagged (advisory), which is the safe direction — the
+	// reverse (findings without chunks) is what the post-insert ordering exists
+	// to prevent. The outcome is recorded only here, after the findings are
+	// durable, so eval_finished_at never latches a run whose findings were lost
+	// (latch-only-on-success, CONTRACT §1.5).
+	if judged != nil {
+		w.persistJudged(t, judged)
 	}
 
 	w.log.Info("transcript embedded",
@@ -446,8 +444,11 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 //  1. Chunks the transcript with deterministic UUIDs (so the embed pass later
 //     produces the same IDs).
 //  2. Runs the judge over the chunks.
-//  3. Persists findings.
-//  4. Writes eval_finished_at (the embed-gate latch, CONTRACT §1.5).
+//  3. Persists findings (including a partial run's).
+//  4. Writes eval_finished_at (the embed-gate latch, CONTRACT §1.5) ONLY when
+//     every chunk was judged and the findings were stored; otherwise records
+//     the failure (eval_failed_at / eval_failed_chunks / eval_error), which
+//     releases the embed pass without latching (latch-only-on-success).
 //
 // It does NOT embed — that is the embed pass's job. The gate's fail-closed
 // startup validation (config.LoadConfig) guarantees a judge is built whenever
@@ -475,34 +476,35 @@ func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 		return err
 	}
 
-	evalStart := time.Now()
-	var inlineFindings []db.Finding
-	if w.judge != nil {
-		inlineFindings = w.judgeChunks(t, chunks)
-	} else {
+	if w.judge == nil {
+		// Misconfiguration fallback (validated out at startup): latch with zero
+		// findings so the gated embed pass is never stalled behind a judge that
+		// does not exist. judgeModel() is nil-safe.
 		w.log.Warn("eval pass: no judge configured (EVAL_IN_PIPELINE not set); "+
 			"writing eval_finished_at with zero findings so embed pass can proceed",
 			"transcript_id", t.ID)
-	}
-	evalFinished := time.Now()
-
-	// Persist findings before the eval_finished_at latch so the DB is never in
-	// a state where the latch is set but the findings are absent.
-	if len(inlineFindings) > 0 {
-		if err := w.db.InsertFindings(w.ctx, inlineFindings); err != nil {
-			w.log.Warn("eval pass: persist findings failed (writing eval_finished_at anyway — findings lost)",
-				"transcript_id", t.ID, "findings", len(inlineFindings), "error", err)
-		}
+		now := time.Now()
+		w.recordEvalMetrics(t, eval.RunStats{}, now, now, w.judgeModel())
+		return nil
 	}
 
-	// Write eval_finished_at — the latch that allows the embed pass to pick this
-	// transcript up. We write it even when findings is empty (a clean transcript)
-	// or when the judge was nil (misconfiguration fallback) so the pipeline never
-	// stalls on a latch that is never set. judgeModel() is nil-safe.
-	stats := eval.RunStats{ChunksEvaluated: len(chunks), FindingsFound: len(inlineFindings)}
-	w.recordEvalMetrics(t, stats, evalStart, evalFinished, w.judgeModel())
+	judged := w.judgeChunks(t, chunks)
+	if judged.stopped() {
+		// Shutdown mid-judge: record nothing. The job stays unlatched AND
+		// unfailed, so the eval pass simply re-selects it after restart.
+		return judged.err
+	}
+
+	// Persist findings, then record the outcome: the latch on a complete run,
+	// a failure record otherwise. A failure record also releases the embed pass
+	// (fail-open — a judge outage never blocks search) without latching, so the
+	// job stays visible to `earmark eval --backfill-unevaluated` and is NOT
+	// re-judged in a hot loop by this pass (it no longer matches its selection).
+	w.persistJudged(t, judged)
 	w.log.Info("eval pass: finished", "file", t.FilePath, "chunks", len(chunks),
-		"findings", len(inlineFindings), "duration", evalFinished.Sub(evalStart).Round(time.Millisecond))
+		"evaluated", judged.stats.ChunksEvaluated, "skipped", judged.stats.ChunksSkipped,
+		"findings", len(judged.findings), "latched", judged.complete(),
+		"duration", judged.finished.Sub(judged.started).Round(time.Millisecond))
 	return nil
 }
 
@@ -586,17 +588,58 @@ func (w *Worker) embedTranscript(cfg *config.Config, t *db.Transcript) error {
 	return nil
 }
 
+// judgeOutcome is the result of one in-pipeline judge run over a transcript.
+// It is computed before embedding but persisted (findings + run_metrics) only
+// after the chunks exist — see persistJudged.
+type judgeOutcome struct {
+	findings []db.Finding
+	stats    eval.RunStats
+	// err is non-nil only when the run was stopped by the worker's context
+	// (shutdown); per-chunk judge errors are counted in stats instead.
+	err        error
+	chunks     int
+	started    time.Time
+	finished   time.Time
+	persistErr error // set by persistJudged when InsertFindings fails
+}
+
+// stopped reports whether the run was aborted by shutdown (nothing to record).
+func (o *judgeOutcome) stopped() bool { return o.err != nil }
+
+// complete is the latch-only-on-success rule: every chunk judged AND the
+// findings durably stored. Anything less leaves the job unlatched.
+func (o *judgeOutcome) complete() bool {
+	return o.err == nil && o.stats.Complete() && o.persistErr == nil
+}
+
+// failureReason summarizes why a run is not complete, for run_metrics.eval_error.
+func (o *judgeOutcome) failureReason() string {
+	var parts []string
+	if o.stats.ChunksSkipped > 0 {
+		parts = append(parts, fmt.Sprintf("%d of %d chunks failed: %s",
+			o.stats.ChunksSkipped, o.chunks, o.stats.FirstError))
+	}
+	if o.persistErr != nil {
+		parts = append(parts, "persist findings: "+o.persistErr.Error())
+	}
+	return strings.Join(parts, "; ")
+}
+
 // judgeChunks runs the judge over the transcript's chunks and RETURNS the
-// findings WITHOUT persisting them (write=false) — the caller persists after the
-// chunks are inserted, so a later embedding failure can't leave orphaned
-// findings. Best-effort: any error is logged and yields nil findings so the
-// embed step always proceeds (eval is advisory; the corpus must stay searchable
-// even if the judge endpoint is down). Chunks must already have their IDs
-// assigned so the returned findings reference the rows the worker will insert.
-func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
+// outcome WITHOUT persisting anything (write=false) — the caller persists after
+// the chunks are inserted (persistJudged), so a later embedding failure can't
+// leave orphaned findings. It never fails the embed: per-chunk judge errors are
+// counted (stats.ChunksSkipped), and only a worker shutdown sets err. Chunks
+// must already have their IDs assigned so the findings reference the rows the
+// worker will insert.
+//
+// Events: eval/start, then eval/finish for a complete run, or eval/error when
+// any chunk failed (or the run was stopped) — so a failed judge run is visible
+// in the audit log, not only in run_metrics.
+func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) *judgeOutcome {
 	evalChunks := EvalChunksFor(t, chunks)
 
-	evalStart := time.Now()
+	o := &judgeOutcome{chunks: len(evalChunks), started: time.Now()}
 	w.appendEvent(db.PipelineEvent{
 		JobID:      t.JobID,
 		FilePath:   t.FilePath,
@@ -605,11 +648,21 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 		RunnerHost: db.HostGoWorker,
 		Model:      w.judge.Model(),
 	})
-	findings, stats, err := eval.RunOnChunks(w.ctx, w.judge, nil, evalChunks, false)
-	evalFinished := time.Now()
-	if err != nil {
-		w.log.Warn("in-pipeline eval failed (continuing to embed)",
-			"transcript_id", t.ID, "file", t.FilePath, "error", err)
+	o.findings, o.stats, o.err = eval.RunOnChunks(w.ctx, w.judge, nil, evalChunks, false)
+	o.finished = time.Now()
+	detail := map[string]any{
+		"evaluated": o.stats.ChunksEvaluated,
+		"skipped":   o.stats.ChunksSkipped,
+	}
+
+	if o.err != nil || !o.stats.Complete() {
+		reason := o.failureReason()
+		if o.err != nil {
+			reason = o.err.Error()
+		}
+		w.log.Warn("in-pipeline eval incomplete (continuing to embed; not latched)",
+			"transcript_id", t.ID, "file", t.FilePath,
+			"evaluated", o.stats.ChunksEvaluated, "skipped", o.stats.ChunksSkipped, "reason", reason)
 		w.appendEvent(db.PipelineEvent{
 			JobID:      t.JobID,
 			FilePath:   t.FilePath,
@@ -617,21 +670,18 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 			Event:      db.EventError,
 			RunnerHost: db.HostGoWorker,
 			Model:      w.judge.Model(),
-			DurationMS: db.Int64Ptr(evalFinished.Sub(evalStart).Milliseconds()),
-			Reason:     err.Error(),
+			DurationMS: db.Int64Ptr(o.finished.Sub(o.started).Milliseconds()),
+			ItemCount:  db.IntPtr(len(o.findings)),
+			Reason:     reason,
+			Detail:     detail,
 		})
-		return nil
+		return o
 	}
+
 	w.log.Info("in-pipeline eval judged",
 		"transcript_id", t.ID,
-		"chunks", stats.ChunksEvaluated,
-		"findings", stats.FindingsFound)
-
-	// Per-run observability: record eval timing, judge model, and counts. The
-	// chunk set maps cleanly to this one job (t.JobID), so the run_metrics eval
-	// slice attribution is unambiguous. Best-effort — a metrics write must not
-	// fail the embed step (eval is advisory).
-	w.recordEvalMetrics(t, stats, evalStart, evalFinished, w.judgeModel())
+		"chunks", o.stats.ChunksEvaluated,
+		"findings", o.stats.FindingsFound)
 	w.appendEvent(db.PipelineEvent{
 		JobID:      t.JobID,
 		FilePath:   t.FilePath,
@@ -639,15 +689,62 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) []db.Finding {
 		Event:      db.EventFinish,
 		RunnerHost: db.HostGoWorker,
 		Model:      w.judge.Model(),
-		DurationMS: db.Int64Ptr(evalFinished.Sub(evalStart).Milliseconds()),
-		ItemCount:  db.IntPtr(stats.FindingsFound),
-		Detail: map[string]any{
-			"evaluated": stats.ChunksEvaluated,
-			"skipped":   stats.ChunksSkipped,
-		},
+		DurationMS: db.Int64Ptr(o.finished.Sub(o.started).Milliseconds()),
+		ItemCount:  db.IntPtr(o.stats.FindingsFound),
+		Detail:     detail,
 	})
-	w.metrics.RecordStageFinish(db.StageEval, evalFinished.Sub(evalStart))
-	return findings
+	w.metrics.RecordStageFinish(db.StageEval, o.finished.Sub(o.started))
+	return o
+}
+
+// persistJudged stores a judge run's findings and then its run_metrics outcome:
+// the eval_finished_at latch when the run is complete, a failure record
+// (eval_failed_at / eval_failed_chunks / eval_error) otherwise.
+//
+// Partial findings from an incomplete run ARE persisted — they are valid
+// advisory signal, and dropping them would lose it if the job is never
+// re-judged. The re-judge paths (`earmark eval --backfill-*`) skip findings
+// already recorded for the transcript, so a retry never doubles them up.
+//
+// A stopped run (shutdown) records nothing. Best-effort throughout: failures
+// are logged, never returned, because eval is advisory.
+func (w *Worker) persistJudged(t *db.Transcript, o *judgeOutcome) {
+	if o.stopped() {
+		return
+	}
+	if len(o.findings) > 0 {
+		if err := w.db.InsertFindings(w.ctx, o.findings); err != nil {
+			o.persistErr = err
+			w.log.Warn("persist in-pipeline findings failed (eval left unlatched for re-judge)",
+				"transcript_id", t.ID, "file", t.FilePath, "findings", len(o.findings), "error", err)
+		} else {
+			w.log.Info("in-pipeline eval findings persisted",
+				"transcript_id", t.ID, "findings", len(o.findings))
+		}
+	}
+	if o.complete() {
+		w.recordEvalMetrics(t, o.stats, o.started, o.finished, w.judgeModel())
+		return
+	}
+	failedChunks := o.stats.ChunksSkipped
+	if o.persistErr != nil {
+		// The findings of every evaluated chunk were lost with the write.
+		failedChunks = o.chunks
+	}
+	if err := w.db.UpsertEvalMetrics(w.ctx, db.EvalMetrics{
+		JobID:        t.JobID,
+		StartedAt:    o.started,
+		Model:        w.judgeModel(),
+		Chunks:       o.stats.ChunksEvaluated,
+		Skipped:      o.stats.ChunksSkipped,
+		Findings:     o.stats.FindingsFound,
+		FailedAt:     o.finished,
+		FailedChunks: failedChunks,
+		Error:        o.failureReason(),
+	}); err != nil {
+		w.log.Warn("eval failure record write failed (continuing)",
+			"transcript_id", t.ID, "job_id", t.JobID, "error", err)
+	}
 }
 
 // appendEvent records one pipeline_events row, best-effort: a write failure is
