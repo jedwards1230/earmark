@@ -835,6 +835,12 @@ Rules:
   contain HTML); `genres` is the ABS genre list (blank entries dropped; an empty
   list is NULL); `isbn` is the ABS `isbn` field. No reader consumes these three
   yet — they are stored for later enrichment work.
+- **Enrichment never clears a field.** Because every ABS enrichment column
+  (narrator, series, asin, chapters, description, genres, isbn) is
+  `COALESCE`-guarded, a lookup can only add or overwrite values, never remove
+  one: if ABS later drops a genre list or blanks a description, the stored value
+  stays. Clearing one takes a manual `UPDATE book_metadata SET <col> = NULL`
+  (then a re-lookup repopulates whatever ABS still has).
   `bias_terms` is always overwritten (not COALESCE-guarded) so an improved
   metadata source is reflected on the next write.
 - `chapters` is nullable and left `NULL` when no ABS provider is configured.
@@ -1198,8 +1204,8 @@ All env var names are fixed. No synonyms, no alternatives.
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
-| `EVAL_REASONING_EFFORT` | no | `auto`. The judge request's `reasoning_effort`. `auto`: `"none"` for local models, omitted for hosted `anthropic/*` routes; `omit`: never sent; any other value is sent verbatim. See §2.15. |
-| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto`. The judge request's `chat_template_kwargs`. `auto`: `{"enable_thinking": false}` for local models, omitted for hosted `anthropic/*` routes; `omit`: never sent; a JSON object is sent verbatim. Anything else is a configuration error (the eval client fails to resolve). See §2.15. |
+| `EVAL_REASONING_EFFORT` | no | `auto`. The judge request's `reasoning_effort`. `auto`: `"none"` for local models, omitted when the model id contains `anthropic/` (aliases that hide the provider need `omit`); `omit`: never sent; any other value is sent verbatim. See §2.15. |
+| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto`. The judge request's `chat_template_kwargs`. `auto`: `{"enable_thinking": false}` for local models, omitted when the model id contains `anthropic/` (aliases that hide the provider need `omit`); `omit`: never sent; a JSON object is sent verbatim. Anything else is a configuration error (the eval client fails to resolve). See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
 | `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval) — each chunk can then hold the embed for up to the chat client's 120 s request timeout. When false (**decoupled mode**) the worker builds no judge and makes **no judge call** on the embed path, so embedding never waits on the judge; judging runs as its own pass, `earmark eval --backfill-unevaluated --write` (§2.15), which picks up every done transcript without an `eval_finished_at` latch, embedded or not. (Decoupled mode implies `EVAL_GATES_EMBED=false` — the gate is fatal without `EVAL_IN_PIPELINE=true`.) Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
 | `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-yet-attempted, not-embedded transcripts and judges them (writing `eval_finished_at` on a complete run, the `eval_failed_*` record otherwise); an **embed pass** then selects done, eval'd-or-failed, not-embedded transcripts and embeds them. The `eval_finished_at` latch / `eval_failed_at` record (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ judge attempted` (a judge failure fails open; it is retried by `earmark eval --backfill-*`, never in a hot loop). **Fail-closed** (two conditions, both fatal at startup): (1) if no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`); and (2) if `EVAL_IN_PIPELINE` is not also `true`. The gate makes eval a strict prerequisite for embedding, and the eval judge is only built when `EVAL_IN_PIPELINE=true`; so `EVAL_GATES_EMBED=true` **requires** `EVAL_IN_PIPELINE=true` (and a resolvable judge) — otherwise the worker would run gated with a nil judge, stalling the corpus (or risking a nil-judge deref). Both failures fail at startup, never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
@@ -1783,8 +1789,12 @@ content (`ErrThinkingOnlyResponse`). The two families spell it differently, so b
 default (`auto`) the judge sends both `reasoning_effort: "none"` and
 `chat_template_kwargs: {"enable_thinking": false}`. Hosted provider routes reject
 or mis-map those fields (Anthropic has no `"none"` effort and no chat-template
-passthrough), so for a model id starting with `anthropic/` (LiteLLM's provider
-route convention, case-insensitive) `auto` omits **both**. Either field can be
+passthrough), so for a model id containing `anthropic/` anywhere (LiteLLM's
+provider route convention, case-insensitive — so nested routes like
+`bedrock/anthropic/…` match too) `auto` omits **both**. A LiteLLM **alias** that
+hides the provider (e.g. model `judge` mapped to Claude in the proxy config)
+cannot be detected from the id: set `EVAL_REASONING_EFFORT=omit` and
+`EVAL_CHAT_TEMPLATE_KWARGS=omit` for it. Either field can be
 forced per deployment: `omit` never sends it; any other value is sent verbatim
 (`EVAL_CHAT_TEMPLATE_KWARGS` must then be a JSON object). Everything else in the
 request is route-independent: `response_format` (JSON schema), `temperature: 0`,

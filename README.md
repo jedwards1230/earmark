@@ -166,7 +166,7 @@ The ones you are most likely to set:
 | `LIBRARY_COLLECTIONS` | — | JSON describing each library root's directory layout, so author/title labels come from config rather than a hardcoded path shape |
 | `ASR_SERVERS` | — | JSON describing the transcription hosts, for the Servers dashboard page. Read-only — it does not route work |
 | `EVAL_IN_PIPELINE` | `false` | Run the eval judge inline before embedding. Leave `false` to keep embedding independent of the judge and run `earmark eval --backfill-unevaluated --write` as its own pass |
-| `EVAL_REASONING_EFFORT` / `EVAL_CHAT_TEMPLATE_KWARGS` | `auto` | Thinking-suppression fields sent to the judge: on for local models, omitted for hosted `anthropic/*` routes; `omit` or an explicit value overrides |
+| `EVAL_REASONING_EFFORT` / `EVAL_CHAT_TEMPLATE_KWARGS` | `auto` | Thinking-suppression fields sent to the judge: on for local models, omitted when the model id contains `anthropic/` (a LiteLLM alias that hides the provider needs `omit`); `omit` or an explicit value overrides |
 | `CONTROL_API_TOKEN` | — | Bearer token for the mutating control API; unset means those endpoints fail closed |
 | `LOG_FORMAT` | `pretty` | `pretty` or `json` |
 

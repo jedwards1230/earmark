@@ -59,18 +59,24 @@ const (
 	thinkingOmit = "omit"
 )
 
-// hostedRoutePrefixes are model-id prefixes that name a hosted provider route
+// hostedRouteMarkers are model-id segments that name a hosted provider route
 // (LiteLLM's "<provider>/<model>" convention) rather than a local Ollama/vLLM
-// model. Hosted APIs reject or mis-map the local thinking knobs — Anthropic has
-// no reasoning_effort "none" and no chat_template_kwargs — so by default
-// neither is sent to them.
-var hostedRoutePrefixes = []string{"anthropic/"}
+// model. They match ANYWHERE in the id, so nested routes such as
+// "bedrock/anthropic/claude-…" or "openrouter/anthropic/…" count too. Hosted
+// APIs reject or mis-map the local thinking knobs — Anthropic has no
+// reasoning_effort "none" and no chat_template_kwargs — so by default neither
+// is sent to them.
+//
+// A LiteLLM alias that hides the provider (e.g. model "judge" mapped to an
+// Anthropic model in the proxy config) cannot be detected from the id: set
+// EVAL_REASONING_EFFORT=omit and EVAL_CHAT_TEMPLATE_KWARGS=omit for it.
+var hostedRouteMarkers = []string{"anthropic/"}
 
 // isHostedRoute reports whether model names a hosted provider route.
 func isHostedRoute(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
-	for _, p := range hostedRoutePrefixes {
-		if strings.HasPrefix(m, p) {
+	for _, marker := range hostedRouteMarkers {
+		if strings.Contains(m, marker) {
 			return true
 		}
 	}

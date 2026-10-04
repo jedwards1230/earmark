@@ -163,6 +163,9 @@ func TestIsHostedRoute(t *testing.T) {
 	for model, want := range map[string]bool{
 		"anthropic/claude-sonnet-4-5": true,
 		" anthropic/x":                true,
+		"bedrock/anthropic/claude-x":  true, // nested route
+		"openrouter/Anthropic/claude": true,
+		"judge":                       false, // alias hiding the provider: needs explicit omit
 		"qwen3:8b":                    false,
 		"qwen2.5:7b-instruct":         false,
 		"claude-local-finetune":       false, // not a provider route
