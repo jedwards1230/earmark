@@ -41,8 +41,14 @@ type BookMeta struct {
 	Narrator string
 	Series   string
 	ASIN     string
-	Chapters []Chapter
-	Source   string
+	// Description, Genres and ISBN are catalogue enrichment from ABS (zero for
+	// PathProvider). Stored in book_metadata (CONTRACT §1.6); not yet read back
+	// by any consumer.
+	Description string
+	Genres      []string
+	ISBN        string
+	Chapters    []Chapter
+	Source      string
 }
 
 // MetadataProvider looks up metadata for one book given its canonical file

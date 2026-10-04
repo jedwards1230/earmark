@@ -829,6 +829,18 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("run_metrics asr-descriptor migration: %w", err)
 	}
 
+	// book_metadata catalogue-enrichment migration (CONTRACT §1.6): description,
+	// genres and isbn decoded from ABS. All nullable and additive — a PathProvider
+	// deployment keeps them NULL. genres is TEXT[] to match bias_terms.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE book_metadata
+			ADD COLUMN IF NOT EXISTS description TEXT,
+			ADD COLUMN IF NOT EXISTS genres      TEXT[],
+			ADD COLUMN IF NOT EXISTS isbn        TEXT;
+	`); err != nil {
+		return fmt.Errorf("book_metadata enrichment migration: %w", err)
+	}
+
 	// Eval-slice migration (CONTRACT §1.5): add the six eval_* columns to an
 	// existing run_metrics table — the LLM-judge's slice (a fourth column-selective
 	// writer, UpsertEvalMetrics). All additive + nullable, so a deployment that
@@ -1441,29 +1453,39 @@ func (db *DB) UpsertEvalMetrics(ctx context.Context, m EvalMetrics) error {
 // Parameter order: $1=book_dir $2=title $3=author $4=narrator $5=series
 //
 //	$6=asin $7=chapters(jsonb) $8=bias_terms $9=source
+//	$10=description $11=genres(text[]) $12=isbn
+//
+// description/genres/isbn follow the ABS-enrichment rule: a non-NULL value from
+// a re-lookup overwrites (refreshes) the stored one; NULL (a PathProvider call,
+// or ABS returning nothing) keeps it.
 var upsertBookMetadataSQL = `
 	INSERT INTO book_metadata
-	       (book_dir, title, author, narrator, series, asin, chapters, bias_terms, source, updated_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, now())
+	       (book_dir, title, author, narrator, series, asin, chapters, bias_terms, source,
+	        description, genres, isbn, updated_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, now())
 	ON CONFLICT (book_dir) DO UPDATE
-	SET title      = EXCLUDED.title,
-	    author     = EXCLUDED.author,
-	    narrator   = COALESCE(EXCLUDED.narrator,   book_metadata.narrator),
-	    series     = COALESCE(EXCLUDED.series,     book_metadata.series),
-	    asin       = COALESCE(EXCLUDED.asin,       book_metadata.asin),
-	    chapters   = COALESCE(EXCLUDED.chapters,   book_metadata.chapters),
+	SET title       = EXCLUDED.title,
+	    author      = EXCLUDED.author,
+	    narrator    = COALESCE(EXCLUDED.narrator,    book_metadata.narrator),
+	    series      = COALESCE(EXCLUDED.series,      book_metadata.series),
+	    asin        = COALESCE(EXCLUDED.asin,        book_metadata.asin),
+	    chapters    = COALESCE(EXCLUDED.chapters,    book_metadata.chapters),
+	    description = COALESCE(EXCLUDED.description, book_metadata.description),
+	    genres      = COALESCE(EXCLUDED.genres,      book_metadata.genres),
+	    isbn        = COALESCE(EXCLUDED.isbn,        book_metadata.isbn),
 	    bias_terms = EXCLUDED.bias_terms,
-	    source     = EXCLUDED.source,
-	    updated_at = now()
+	    source      = EXCLUDED.source,
+	    updated_at  = now()
 `
 
 // UpsertBookMetadata writes or refreshes the book_metadata row for a book
 // directory. The UPSERT is column-selective: it always updates title, author,
 // source, and bias_terms (every call re-derives bias_terms from the current
 // meta so the list stays current when metadata improves), and additionally
-// updates narrator, series, asin, and chapters when the provider returned them
-// (non-zero values only — a PathProvider result never clobbers ABS-sourced
-// chapter data because PathProvider sets none of those fields).
+// updates narrator, series, asin, chapters, description, genres, and isbn when
+// the provider returned them (non-zero values only — a PathProvider result
+// never clobbers ABS-sourced data because PathProvider sets none of those
+// fields). A re-lookup that does return them overwrites the stored values.
 //
 // bias_terms is derived by calling metaprovider.DeriveBiasTerms(meta) and is
 // always written — even when the derived list is empty (an empty array is
@@ -1473,12 +1495,18 @@ var upsertBookMetadataSQL = `
 //
 // chapters is serialised as JSONB when non-empty; a nil or empty slice leaves
 // the column NULL (not an empty array), consistent with the "not yet populated"
-// sentinel used by chapter readers.
+// sentinel used by chapter readers. genres follows the same rule.
 //
 // Best-effort: callers must log and continue on error so a metadata write
 // never fails enqueue. A missing row in book_metadata is always a no-op for
 // the rest of the pipeline.
 func (db *DB) UpsertBookMetadata(ctx context.Context, bookDir string, meta metaprovider.BookMeta) error {
+	return upsertBookMetadata(ctx, db.pool, bookDir, meta)
+}
+
+// upsertBookMetadata is UpsertBookMetadata against any execer, so the bound
+// arguments are execution-testable with pgxmock.
+func upsertBookMetadata(ctx context.Context, ex execer, bookDir string, meta metaprovider.BookMeta) error {
 	// Serialise chapters to JSONB; nil when no chapters (leave column NULL).
 	var chaptersJSON []byte
 	if len(meta.Chapters) > 0 {
@@ -1489,34 +1517,38 @@ func (db *DB) UpsertBookMetadata(ctx context.Context, bookDir string, meta metap
 		}
 	}
 
-	// Narrator is only non-empty for "abs" or richer sources. We coerce a nil
-	// narrator to NULL by using a pointer — pgx handles *string → NULL cleanly.
-	var narrator, series, asin *string
-	if meta.Narrator != "" {
-		narrator = &meta.Narrator
-	}
-	if meta.Series != "" {
-		series = &meta.Series
-	}
-	if meta.ASIN != "" {
-		asin = &meta.ASIN
-	}
-
 	// Derive ASR bias terms from the current metadata. An empty list is stored
 	// as NULL (nil slice) rather than an empty array — consistent with the
 	// "not yet populated" sentinel used by other nullable columns.
 	biasTerms := metaprovider.DeriveBiasTerms(meta)
-	var biasTermsArg interface{}
+	var biasTermsArg any
 	if len(biasTerms) > 0 {
 		biasTermsArg = biasTerms
 	}
+	var genresArg any
+	if len(meta.Genres) > 0 {
+		genresArg = meta.Genres
+	}
 
-	_, err := db.pool.Exec(ctx, upsertBookMetadataSQL,
-		bookDir, meta.Title, meta.Author, narrator, series, asin, chaptersJSON, biasTermsArg, meta.Source)
+	// Optional enrichment columns: "" → NULL via a nil *string so the COALESCE
+	// in the UPSERT keeps whatever a richer provider stored earlier.
+	_, err := ex.Exec(ctx, upsertBookMetadataSQL,
+		bookDir, meta.Title, meta.Author,
+		nonEmpty(meta.Narrator), nonEmpty(meta.Series), nonEmpty(meta.ASIN),
+		chaptersJSON, biasTermsArg, meta.Source,
+		nonEmpty(meta.Description), genresArg, nonEmpty(meta.ISBN))
 	if err != nil {
 		return fmt.Errorf("upsert book_metadata: %w", err)
 	}
 	return nil
+}
+
+// nonEmpty maps "" to a nil *string (SQL NULL), else a pointer to s.
+func nonEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // GetBookChapters reads the chapters JSONB column from book_metadata for the

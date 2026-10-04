@@ -734,6 +734,10 @@ CREATE TABLE IF NOT EXISTS book_metadata (
   chapters   JSONB,
   bias_terms TEXT[],
   source     TEXT,
+  -- ABS catalogue enrichment (additive, nullable; ADD COLUMN IF NOT EXISTS).
+  description TEXT,
+  genres      TEXT[],
+  isbn        TEXT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -743,7 +747,7 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 | Writer | When | Columns it writes |
 |--------|------|-------------------|
 | **Go monitor** | at every enqueue (via `db.UpsertBookMetadata`) | `title`, `author`, `bias_terms`, `source` |
-| **Go monitor — ABS path** | when METADATA_PROVIDER includes ABS | `narrator`, `series`, `asin`, `chapters` |
+| **Go monitor — ABS path** | when METADATA_PROVIDER includes ABS | `narrator`, `series`, `asin`, `chapters`, `description`, `genres`, `isbn` |
 
 #### Column readers
 
@@ -784,7 +788,14 @@ Rules:
 - Every write is **best-effort** — a `book_metadata` failure MUST NOT fail
   enqueue. The monitor logs and continues.
 - The UPSERT is column-selective for ABS enrichment columns (narrator, series,
-  asin, chapters) so a PathProvider call can never clobber ABS-sourced data.
+  asin, chapters, description, genres, isbn) so a PathProvider call can never
+  clobber ABS-sourced data: a NULL/empty value keeps the stored one, while a
+  non-empty value from a re-lookup (the monitor at enqueue, or `earmark
+  backfill-metadata --yes`) **overwrites** it — that is how the enrichment is
+  refreshed. `description` is the ABS publisher blurb stored verbatim (it may
+  contain HTML); `genres` is the ABS genre list (blank entries dropped; an empty
+  list is NULL); `isbn` is the ABS `isbn` field. No reader consumes these three
+  yet — they are stored for later enrichment work.
   `bias_terms` is always overwritten (not COALESCE-guarded) so an improved
   metadata source is reflected on the next write.
 - `chapters` is nullable and left `NULL` when no ABS provider is configured.

@@ -244,11 +244,17 @@ CREATE TABLE IF NOT EXISTS book_metadata (
     chapters   JSONB,
     bias_terms TEXT[],
     source     TEXT,
+    description TEXT,   -- ABS publisher blurb (verbatim, may contain HTML)
+    genres      TEXT[], -- ABS genre list
+    isbn        TEXT,   -- ABS isbn
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
 `bias_terms` is re-derived from metadata on every write (never COALESCE-guarded).
+`description`, `genres` and `isbn` (added via `ADD COLUMN IF NOT EXISTS`) are
+ABS-only enrichment: a non-empty value from a re-lookup overwrites the stored
+one, an empty/NULL value keeps it.
 
 `chapters` is a JSONB array of `{"Index","Title","StartSec","EndSec"}` objects
 whose times are **book-absolute** — measured from the start of the whole book,
