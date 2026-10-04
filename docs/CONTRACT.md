@@ -672,7 +672,10 @@ the gated eval pass selects only jobs with **neither** `eval_finished_at` nor
 `eval_failed_at`, so a failed job leaves its selection after one attempt. Retries
 are operator-driven and bounded: `earmark eval --backfill-unevaluated` (selects
 `eval_finished_at IS NULL`, which includes recorded failures) and `earmark eval
---backfill-eval-errors` (§2.15), both with `--limit`. The **standalone** `earmark eval` / `/actions/eval*`
+--backfill-eval-errors` (§2.15), both with `--limit`. If the outcome itself
+cannot be written (latch or failure record — e.g. `run_metrics` unavailable),
+the job is still unattempted and will be re-selected, so the gated loop backs
+off for the poll interval instead of draining a "full" batch immediately. The **standalone** `earmark eval` / `/actions/eval*`
 paths evaluate a whole book (many jobs) or a library-wide sample, so they do
 **not** write the per-job `run_metrics` eval slice (the mapping to a single job
 is ambiguous); they emit a `pipeline_events` `stage='eval'` row instead (§1.7).

@@ -4,6 +4,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -239,11 +240,19 @@ func (w *Worker) Start(cfg *config.Config) {
 				w.sleep(pollInterval)
 				continue
 			}
+			// outcomeLost: a judge outcome (latch or failure record) could not
+			// be written, so that job is still unattempted in the DB and will be
+			// re-selected. Back off for a poll interval rather than drain-fast,
+			// or a down run_metrics table would re-judge it in a hot loop.
+			outcomeLost := false
 			for _, t := range unevaluated {
 				if w.ctx.Err() != nil {
 					return
 				}
 				if err := w.evalTranscript(cfg, t); err != nil {
+					if errors.Is(err, errEvalOutcomeNotRecorded) {
+						outcomeLost = true
+					}
 					w.log.Error("failed to eval transcript",
 						"transcript_id", t.ID, "file", t.FilePath, "error", err)
 				}
@@ -275,7 +284,7 @@ func (w *Worker) Start(cfg *config.Config) {
 			// an empty queue while keeping a 4000-item backlog from idling for hours.
 			fullBatch := len(unevaluated) >= batchSize || len(evaluated) >= batchSize ||
 				staleRebuilt >= batchSize
-			if !fullBatch {
+			if !fullBatch || outcomeLost {
 				w.sleep(pollInterval)
 			}
 		} else {
@@ -451,7 +460,9 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	// durable, so eval_finished_at never latches a run whose findings were lost
 	// (latch-only-on-success, CONTRACT §1.5).
 	if judged != nil {
-		w.persistJudged(t, judged)
+		// An outcome-write error is already logged; it cannot loop here because
+		// the transcript is embedded and leaves the ungated selection.
+		_ = w.persistJudged(t, judged)
 	}
 
 	w.log.Info("transcript embedded",
@@ -511,7 +522,9 @@ func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 			"writing eval_finished_at with zero findings so embed pass can proceed",
 			"transcript_id", t.ID)
 		now := time.Now()
-		w.recordEvalMetrics(t, eval.RunStats{}, now, now, w.judgeModel())
+		if err := w.recordEvalMetrics(t, eval.RunStats{}, now, now, w.judgeModel()); err != nil {
+			return fmt.Errorf("%w: %w", errEvalOutcomeNotRecorded, err)
+		}
 		return nil
 	}
 
@@ -527,7 +540,9 @@ func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 	// (fail-open — a judge outage never blocks search) without latching, so the
 	// job stays visible to `earmark eval --backfill-unevaluated` and is NOT
 	// re-judged in a hot loop by this pass (it no longer matches its selection).
-	w.persistJudged(t, judged)
+	if err := w.persistJudged(t, judged); err != nil {
+		return fmt.Errorf("%w: %w", errEvalOutcomeNotRecorded, err)
+	}
 	w.log.Info("eval pass: finished", "file", t.FilePath, "chunks", len(chunks),
 		"evaluated", judged.stats.ChunksEvaluated, "skipped", judged.stats.ChunksSkipped,
 		"findings", len(judged.findings), "latched", judged.complete(),
@@ -738,11 +753,13 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) *judgeOutcome 
 // re-judged. The re-judge paths (`earmark eval --backfill-*`) skip findings
 // already recorded for the transcript, so a retry never doubles them up.
 //
-// A stopped run (shutdown) records nothing. Best-effort throughout: failures
-// are logged, never returned, because eval is advisory.
-func (w *Worker) persistJudged(t *db.Transcript, o *judgeOutcome) {
+// A stopped run (shutdown) records nothing. Best-effort: nothing here fails
+// the embed (eval is advisory). It returns an error only when the run_metrics
+// outcome itself (latch or failure record) could not be written — the job is
+// then still "unattempted" in the DB, which the gated loop must back off on.
+func (w *Worker) persistJudged(t *db.Transcript, o *judgeOutcome) error {
 	if o.stopped() {
-		return
+		return nil
 	}
 	if len(o.findings) > 0 {
 		if err := w.db.InsertFindings(w.ctx, o.findings); err != nil {
@@ -755,8 +772,7 @@ func (w *Worker) persistJudged(t *db.Transcript, o *judgeOutcome) {
 		}
 	}
 	if o.complete() {
-		w.recordEvalMetrics(t, o.stats, o.started, o.finished, w.judgeModel())
-		return
+		return w.recordEvalMetrics(t, o.stats, o.started, o.finished, w.judgeModel())
 	}
 	failedChunks := o.stats.ChunksSkipped
 	if o.persistErr != nil {
@@ -776,8 +792,14 @@ func (w *Worker) persistJudged(t *db.Transcript, o *judgeOutcome) {
 	}); err != nil {
 		w.log.Warn("eval failure record write failed (continuing)",
 			"transcript_id", t.ID, "job_id", t.JobID, "error", err)
+		return fmt.Errorf("record eval failure: %w", err)
 	}
+	return nil
 }
+
+// errEvalOutcomeNotRecorded marks an eval-pass error where the judge outcome
+// (latch or failure record) could not be written to run_metrics.
+var errEvalOutcomeNotRecorded = errors.New("eval outcome not recorded")
 
 // appendEvent records one pipeline_events row, best-effort: a write failure is
 // logged and swallowed so an audit-event failure never affects the pipeline.
@@ -802,8 +824,8 @@ func (w *Worker) judgeModel() string {
 // transcript's job (CONTRACT §1.5). eval_finished_at is the per-job eval-
 // completion marker. The model is passed in (computed nil-safely by the caller
 // via judgeModel) so this never dereferences a nil judge. Best-effort: a DB
-// error is logged and swallowed.
-func (w *Worker) recordEvalMetrics(t *db.Transcript, stats eval.RunStats, started, finished time.Time, model string) {
+// error is logged (and returned, for the gated loop's backoff).
+func (w *Worker) recordEvalMetrics(t *db.Transcript, stats eval.RunStats, started, finished time.Time, model string) error {
 	m := db.EvalMetrics{
 		JobID:         t.JobID,
 		StartedAt:     started,
@@ -817,7 +839,9 @@ func (w *Worker) recordEvalMetrics(t *db.Transcript, stats eval.RunStats, starte
 	if err := w.db.UpsertEvalMetrics(w.ctx, m); err != nil {
 		w.log.Warn("eval metrics write failed (continuing)",
 			"transcript_id", t.ID, "job_id", t.JobID, "error", err)
+		return fmt.Errorf("upsert eval metrics: %w", err)
 	}
+	return nil
 }
 
 // recordEmbedMetrics UPSERTs the embed worker's slice of run_metrics for a

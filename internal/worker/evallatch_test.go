@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -172,4 +173,45 @@ func TestProcessTranscript_JudgeFailureEmbedsButDoesNotLatch(t *testing.T) {
 	require.Len(t, fdb.evalMetrics, 1)
 	require.True(t, fdb.evalMetrics[0].Failed(), "judge failure must not latch")
 	require.Equal(t, len(fdb.chunks), fdb.evalMetrics[0].FailedChunks)
+}
+
+// If the judge outcome (latch or failure record) cannot be written, the job is
+// still unattempted in the DB and will be re-selected. evalTranscript must say
+// so, and the gated loop must back off instead of draining a "full" batch of
+// the same job in a hot loop.
+func TestEvalTranscript_OutcomeWriteFailureIsReported(t *testing.T) {
+	for name, chat := range map[string]eval.ChatClient{
+		"latch write fails":   workerFakeChat{resp: `{"findings":[]}`},
+		"failure write fails": errChat{err: errors.New("judge down")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fdb := &fakeDB{evalMetErr: errors.New("run_metrics down")}
+			w := &Worker{
+				ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"),
+				judge: eval.NewJudge(chat), evalGatesEmbed: true,
+			}
+			tr := &db.Transcript{ID: "tid-ow", JobID: "job-ow", FilePath: "/b/a/t/ch.mp3", RawText: longTranscript}
+			err := w.evalTranscript(&config.Config{ChunkSize: 8, EvalGatesEmbed: true}, tr)
+			require.ErrorIs(t, err, errEvalOutcomeNotRecorded)
+		})
+	}
+}
+
+func TestStart_GatedBacksOffWhenOutcomeNotRecorded(t *testing.T) {
+	fdb := &fakeDB{
+		evalMetErr: errors.New("run_metrics down"),
+		// Not scripted: every eval-pass call returns this one transcript — a FULL
+		// batch at batch size 1, which would normally mean "drain immediately".
+		transcripts: []*db.Transcript{{ID: "tid-loop", JobID: "job-loop", FilePath: "/b/x.mp3", RawText: longTranscript}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{
+		done: make(chan struct{}), ctx: ctx, cancel: cancel, db: fdb, log: log.NewLogger("worker-test"),
+		judge: eval.NewJudge(workerFakeChat{resp: `{"findings":[]}`}), evalGatesEmbed: true,
+	}
+	go w.Start(&config.Config{ChunkSize: 8, EmbedBatchSize: 1, EvalGatesEmbed: true})
+	time.Sleep(200 * time.Millisecond)
+	w.Stop()
+	require.LessOrEqual(t, fdb.evalCallCount(), 2,
+		"an unrecorded eval outcome must back off for the poll interval, not re-judge in a hot loop")
 }
