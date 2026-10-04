@@ -681,6 +681,11 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) *judgeOutcome 
 		"evaluated": o.stats.ChunksEvaluated,
 		"skipped":   o.stats.ChunksSkipped,
 	}
+	if o.stats.ResolvedModel != "" {
+		// The event's model column is the REQUESTED judge model; record what the
+		// endpoint actually served alongside it.
+		detail["resolved_model"] = o.stats.ResolvedModel
+	}
 
 	if o.err != nil || !o.stats.Complete() {
 		reason := o.failureReason()
@@ -800,13 +805,14 @@ func (w *Worker) judgeModel() string {
 // error is logged and swallowed.
 func (w *Worker) recordEvalMetrics(t *db.Transcript, stats eval.RunStats, started, finished time.Time, model string) {
 	m := db.EvalMetrics{
-		JobID:      t.JobID,
-		StartedAt:  started,
-		FinishedAt: finished,
-		Model:      model,
-		Chunks:     stats.ChunksEvaluated,
-		Skipped:    stats.ChunksSkipped,
-		Findings:   stats.FindingsFound,
+		JobID:         t.JobID,
+		StartedAt:     started,
+		FinishedAt:    finished,
+		Model:         model,
+		ResolvedModel: stats.ResolvedModel,
+		Chunks:        stats.ChunksEvaluated,
+		Skipped:       stats.ChunksSkipped,
+		Findings:      stats.FindingsFound,
 	}
 	if err := w.db.UpsertEvalMetrics(w.ctx, m); err != nil {
 		w.log.Warn("eval metrics write failed (continuing)",

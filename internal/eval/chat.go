@@ -39,6 +39,79 @@ type chatConfig struct {
 	BaseURL string
 	Model   string
 	APIKey  string
+	// ReasoningEffort / ChatTemplateKwargs are the thinking-suppression fields
+	// to send; "" / nil omits them. Resolved by thinkingControls.
+	ReasoningEffort    string
+	ChatTemplateKwargs map[string]any
+}
+
+// Thinking-control env vars (CONTRACT §2.15). Both default to "auto".
+const (
+	// envReasoningEffort overrides the reasoning_effort request field:
+	// unset/"auto" → per-route default, "omit" → never sent, any other value →
+	// sent verbatim (e.g. "none", "low").
+	envReasoningEffort = "EVAL_REASONING_EFFORT"
+	// envChatTemplateKwargs overrides chat_template_kwargs: unset/"auto" →
+	// per-route default, "omit" → never sent, a JSON object → sent verbatim.
+	envChatTemplateKwargs = "EVAL_CHAT_TEMPLATE_KWARGS"
+
+	thinkingAuto = "auto"
+	thinkingOmit = "omit"
+)
+
+// hostedRoutePrefixes are model-id prefixes that name a hosted provider route
+// (LiteLLM's "<provider>/<model>" convention) rather than a local Ollama/vLLM
+// model. Hosted APIs reject or mis-map the local thinking knobs — Anthropic has
+// no reasoning_effort "none" and no chat_template_kwargs — so by default
+// neither is sent to them.
+var hostedRoutePrefixes = []string{"anthropic/"}
+
+// isHostedRoute reports whether model names a hosted provider route.
+func isHostedRoute(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, p := range hostedRoutePrefixes {
+		if strings.HasPrefix(m, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// thinkingControls resolves the reasoning_effort / chat_template_kwargs to send
+// for model. Default ("auto"): keep today's local-model behavior —
+// reasoning_effort "none" plus {"enable_thinking": false}, which is what stops
+// Qwen-family models on Ollama from spending the reply on chain-of-thought —
+// except for hosted routes (isHostedRoute), where both are omitted. Either can
+// be forced per deployment through EVAL_REASONING_EFFORT /
+// EVAL_CHAT_TEMPLATE_KWARGS. An unparseable kwargs value is a configuration
+// error (fail loud rather than silently drop the knob).
+func thinkingControls(model string) (string, map[string]any, error) {
+	hosted := isHostedRoute(model)
+
+	effort := ""
+	switch v := strings.TrimSpace(os.Getenv(envReasoningEffort)); strings.ToLower(v) {
+	case "", thinkingAuto:
+		if !hosted {
+			effort = "none"
+		}
+	case thinkingOmit:
+	default:
+		effort = v
+	}
+
+	var kwargs map[string]any
+	switch v := strings.TrimSpace(os.Getenv(envChatTemplateKwargs)); strings.ToLower(v) {
+	case "", thinkingAuto:
+		if !hosted {
+			kwargs = map[string]any{"enable_thinking": false}
+		}
+	case thinkingOmit:
+	default:
+		if err := json.Unmarshal([]byte(v), &kwargs); err != nil || kwargs == nil {
+			return "", nil, fmt.Errorf("%s must be \"auto\", \"omit\" or a JSON object: %q", envChatTemplateKwargs, v)
+		}
+	}
+	return effort, kwargs, nil
 }
 
 // EvalEndpointSource is the minimal slice of the parsed config the eval layer
@@ -101,7 +174,7 @@ func ResolveChatClient(src EvalEndpointSource) (ChatClient, error) {
 			if err := validateBaseURL(cfg.BaseURL); err != nil {
 				return nil, fmt.Errorf("invalid eval endpoint baseURL: %w", err)
 			}
-			return newOpenAIChatClient(cfg), nil
+			return withThinkingControls(cfg)
 		}
 	}
 
@@ -116,6 +189,18 @@ func ResolveChatClient(src EvalEndpointSource) (ChatClient, error) {
 	if err := validateBaseURL(cfg.BaseURL); err != nil {
 		return nil, fmt.Errorf("invalid EVAL_CHAT_BASE_URL: %w", err)
 	}
+	return withThinkingControls(cfg)
+}
+
+// withThinkingControls resolves the per-route thinking knobs into cfg and
+// builds the client.
+func withThinkingControls(cfg chatConfig) (ChatClient, error) {
+	effort, kwargs, err := thinkingControls(cfg.Model)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ReasoningEffort = effort
+	cfg.ChatTemplateKwargs = kwargs
 	return newOpenAIChatClient(cfg), nil
 }
 
@@ -154,14 +239,16 @@ func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {
 		// this timeout.
 		http: &http.Client{Timeout: 120 * time.Second},
 
-		// Pin the reply shape server-side, and ask any thinking-capable model to
-		// stop thinking. Both reasoning spellings are sent: endpoints that do not
-		// recognise a field ignore it, and the two model families disagree on
-		// which one to honour. If a reasoning model ignores both, Complete fails
-		// with ErrThinkingOnlyResponse rather than reporting a clean transcript.
+		// Pin the reply shape server-side, and (per thinkingControls) ask a
+		// local thinking-capable model to stop thinking. Both reasoning
+		// spellings are sent by default: local endpoints that do not recognise
+		// a field ignore it, and the two model families disagree on which one
+		// to honour. Hosted routes get neither by default — they reject them.
+		// If a reasoning model ignores both, Complete fails with
+		// ErrThinkingOnlyResponse rather than reporting a clean transcript.
 		responseFormat:     findingsResponseFormat,
-		reasoningEffort:    "none",
-		chatTemplateKwargs: map[string]any{"enable_thinking": false},
+		reasoningEffort:    cfg.ReasoningEffort,
+		chatTemplateKwargs: cfg.ChatTemplateKwargs,
 	}
 }
 
@@ -217,9 +304,21 @@ type chatMessage struct {
 }
 
 type chatResponse struct {
+	// Model is the model that actually served the request. A router (LiteLLM)
+	// may resolve the requested alias to a dated id or fall back to another
+	// model, so it is recorded alongside the requested one.
+	Model   string `json:"model"`
 	Choices []struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
+}
+
+// Completion is one chat reply plus the model the endpoint reports serving it.
+type Completion struct {
+	Content string
+	// ResolvedModel is the response's "model" field; "" when the endpoint
+	// omits it.
+	ResolvedModel string
 }
 
 // ErrThinkingOnlyResponse means the model returned reasoning but no answer.
@@ -228,9 +327,16 @@ type chatResponse struct {
 var ErrThinkingOnlyResponse = errors.New("model returned reasoning but empty content (thinking not suppressed)")
 
 // Complete posts a system+user prompt to /chat/completions and returns the first
-// choice's message content. Temperature is 0 for a deterministic, reproducible
-// judge (the same span should flag the same way run to run).
+// choice's message content. See CompleteWithModel.
 func (c *openAIChatClient) Complete(ctx context.Context, system, user string) (string, error) {
+	r, err := c.CompleteWithModel(ctx, system, user)
+	return r.Content, err
+}
+
+// CompleteWithModel is Complete plus the resolved model the endpoint reports.
+// Temperature is 0 for a deterministic, reproducible judge (the same span
+// should flag the same way run to run).
+func (c *openAIChatClient) CompleteWithModel(ctx context.Context, system, user string) (Completion, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:       c.model,
 		Temperature: 0,
@@ -243,12 +349,12 @@ func (c *openAIChatClient) Complete(ctx context.Context, system, user string) (s
 		ChatTemplateKwargs: c.chatTemplateKwargs,
 	})
 	if err != nil {
-		return "", fmt.Errorf("marshal chat request: %w", err)
+		return Completion{}, fmt.Errorf("marshal chat request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("build chat request: %w", err)
+		return Completion{}, fmt.Errorf("build chat request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
@@ -257,24 +363,24 @@ func (c *openAIChatClient) Complete(ctx context.Context, system, user string) (s
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("chat request: %w", err)
+		return Completion{}, fmt.Errorf("chat request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("read chat response: %w", err)
+		return Completion{}, fmt.Errorf("read chat response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("chat endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return Completion{}, fmt.Errorf("chat endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
 	var parsed chatResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return "", fmt.Errorf("unmarshal chat response: %w", err)
+		return Completion{}, fmt.Errorf("unmarshal chat response: %w", err)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("chat endpoint returned no choices")
+		return Completion{}, fmt.Errorf("chat endpoint returned no choices")
 	}
 
 	msg := parsed.Choices[0].Message
@@ -283,7 +389,7 @@ func (c *openAIChatClient) Complete(ctx context.Context, system, user string) (s
 	// across every chunk the judge touches.
 	if strings.TrimSpace(msg.Content) == "" &&
 		(strings.TrimSpace(msg.Reasoning) != "" || strings.TrimSpace(msg.ReasoningContent) != "") {
-		return "", ErrThinkingOnlyResponse
+		return Completion{}, ErrThinkingOnlyResponse
 	}
-	return msg.Content, nil
+	return Completion{Content: msg.Content, ResolvedModel: strings.TrimSpace(parsed.Model)}, nil
 }

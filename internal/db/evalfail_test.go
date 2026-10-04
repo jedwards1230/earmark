@@ -211,3 +211,35 @@ func TestGetCompletedTranscripts_Paged(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The resolved judge model is written next to the requested one: on each
+// finding (resolved_model, $16) and on the run's eval slice
+// (eval_resolved_model, $8).
+func TestResolvedModelColumns(t *testing.T) {
+	ins := norm(insertFindingSQL)
+	if !strings.Contains(ins, "chunk_text_sha256, resolved_model)") || !strings.Contains(ins, "$15, $16)") {
+		t.Errorf("insertFindingSQL must write resolved_model as $16:\n%s", ins)
+	}
+	up := norm(upsertEvalMetricsSQL)
+	if !strings.Contains(up, "eval_findings, eval_resolved_model)") || !strings.Contains(up, "$7, $8)") ||
+		!strings.Contains(up, "eval_resolved_model = EXCLUDED.eval_resolved_model") {
+		t.Errorf("upsertEvalMetricsSQL must write eval_resolved_model as $8:\n%s", up)
+	}
+
+	ex := &captureExecer{}
+	m := EvalMetrics{JobID: "j", FinishedAt: time.Now(), Model: "anthropic/claude-sonnet-4-5", ResolvedModel: "claude-sonnet-4-5-20250929"}
+	if err := upsertEvalMetrics(context.Background(), ex, m); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ex.args[0][7].(*string); got == nil || *got != m.ResolvedModel {
+		t.Errorf("$8 = %v, want %q", ex.args[0][7], m.ResolvedModel)
+	}
+	ex = &captureExecer{}
+	m.ResolvedModel = ""
+	if err := upsertEvalMetrics(context.Background(), ex, m); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ex.args[0][7].(*string); got != nil {
+		t.Errorf("empty resolved model must bind NULL, got %q", *got)
+	}
+}

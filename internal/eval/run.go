@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jedwards1230/earmark/internal/db"
 )
@@ -32,6 +33,27 @@ type RunStats struct {
 	// FirstError is the first per-chunk judge error's message ("" when none) —
 	// recorded as run_metrics.eval_error when the run fails.
 	FirstError string
+	// ResolvedModel lists the distinct models the endpoint reported serving
+	// the run, comma-joined in first-seen order ("" when none reported). More
+	// than one means a router fell back mid-run.
+	ResolvedModel string
+}
+
+// addResolved folds one chunk's resolved model into s.ResolvedModel.
+func (s *RunStats) addResolved(model string) {
+	if model == "" {
+		return
+	}
+	for _, m := range strings.Split(s.ResolvedModel, ",") {
+		if m == model {
+			return
+		}
+	}
+	if s.ResolvedModel == "" {
+		s.ResolvedModel = model
+		return
+	}
+	s.ResolvedModel += "," + model
 }
 
 // Complete reports whether every chunk was judged (none skipped). This is the
@@ -107,6 +129,7 @@ func runChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks [
 			continue
 		}
 		stats.ChunksEvaluated++
+		stats.addResolved(res.ResolvedModel)
 		all = append(all, res.Findings...)
 	}
 

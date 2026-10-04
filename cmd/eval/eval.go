@@ -233,6 +233,9 @@ func (d *dbRunner) Run(ctx context.Context, o evalpkg.RunOptions) ([]db.Finding,
 				"persisted": stats.Persisted,
 			},
 		}
+		if stats.ResolvedModel != "" {
+			ev.Detail["resolved_model"] = stats.ResolvedModel
+		}
 		if o.Book != "" {
 			ev.FilePath = o.Book
 		}
@@ -434,12 +437,13 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	}
 
 	m := db.EvalMetrics{
-		JobID:     t.JobID,
-		StartedAt: started,
-		Model:     judge.Model(),
-		Chunks:    stats.ChunksEvaluated,
-		Skipped:   stats.ChunksSkipped,
-		Findings:  stats.FindingsFound,
+		JobID:         t.JobID,
+		StartedAt:     started,
+		Model:         judge.Model(),
+		ResolvedModel: stats.ResolvedModel,
+		Chunks:        stats.ChunksEvaluated,
+		Skipped:       stats.ChunksSkipped,
+		Findings:      stats.FindingsFound,
 	}
 	if stats.Complete() && persistErr == nil {
 		m.FinishedAt = finished

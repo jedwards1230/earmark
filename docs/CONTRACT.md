@@ -608,6 +608,8 @@ CREATE TABLE IF NOT EXISTS run_metrics (
   -- Eval failure record (latch-only-on-success): set by a judge run that could
   -- not evaluate every chunk; cleared by the next successful run.
   eval_failed_at TIMESTAMPTZ, eval_failed_chunks INT, eval_error TEXT,
+  -- Model(s) the judge endpoint reported serving (vs eval_model = requested).
+  eval_resolved_model TEXT,
   -- ASR backend descriptor (§2.13). All nullable, runner-owned, best-effort.
   asr_family TEXT, asr_runtime TEXT,
   caps_applied JSONB, caps_requested JSONB, caps_skipped_reason JSONB,
@@ -637,7 +639,7 @@ no breaking change.** Their shapes and the capability vocabulary are defined in
 | **Go monitor** | at enqueue (file size from `os.Stat`) | `audio_bytes` |
 | **Python ASR runner** | after transcribing | `audio_channels`, `audio_sample_rate`, `audio_codec`, `audio_format`, `transcribe_started_at`, `transcribe_finished_at`, `asr_model`, `compute_type`, `runner_host`, `chunked`, `n_windows`, `char_count`, `word_count`, `segment_count`; **SHOULD also** `asr_family`, `asr_runtime`, `caps_applied`, `caps_requested`, `caps_skipped_reason`, `mean_word_confidence` (the §2.13 backend descriptor) |
 | **Go embed worker** | after `transcript_chunks` insert | `embed_started_at`, `embed_finished_at`, `embed_model`, `embed_chunk_count`, `embed_prompt_tokens`, `embed_total_tokens` |
-| **Go eval layer** | after the in-pipeline judge runs over a transcript's chunks (`EVAL_IN_PIPELINE`), or `earmark eval --backfill-*` judges one | success: `eval_started_at`, `eval_finished_at`, `eval_model`, `eval_chunks`, `eval_skipped`, `eval_findings` (and clears the failure record); failure: `eval_failed_at`, `eval_failed_chunks`, `eval_error` only |
+| **Go eval layer** | after the in-pipeline judge runs over a transcript's chunks (`EVAL_IN_PIPELINE`), or `earmark eval --backfill-*` judges one | success: `eval_started_at`, `eval_finished_at`, `eval_model`, `eval_resolved_model`, `eval_chunks`, `eval_skipped`, `eval_findings` (and clears the failure record); failure: `eval_failed_at`, `eval_failed_chunks`, `eval_error` only |
 
 **Eval slice + completion marker.** `eval_finished_at IS NOT NULL` is the
 **per-job eval-completion marker** — a job has been judged iff its `run_metrics`
@@ -1193,6 +1195,8 @@ All env var names are fixed. No synonyms, no alternatives.
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
+| `EVAL_REASONING_EFFORT` | no | `auto`. The judge request's `reasoning_effort`. `auto`: `"none"` for local models, omitted for hosted `anthropic/*` routes; `omit`: never sent; any other value is sent verbatim. See §2.15. |
+| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto`. The judge request's `chat_template_kwargs`. `auto`: `{"enable_thinking": false}` for local models, omitted for hosted `anthropic/*` routes; `omit`: never sent; a JSON object is sent verbatim. Anything else is a configuration error (the eval client fails to resolve). See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
 | `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval) — each chunk can then hold the embed for up to the chat client's 120 s request timeout. When false (**decoupled mode**) the worker builds no judge and makes **no judge call** on the embed path, so embedding never waits on the judge; judging runs as its own pass, `earmark eval --backfill-unevaluated --write` (§2.15), which picks up every done transcript without an `eval_finished_at` latch, embedded or not. (Decoupled mode implies `EVAL_GATES_EMBED=false` — the gate is fatal without `EVAL_IN_PIPELINE=true`.) Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
 | `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-yet-attempted, not-embedded transcripts and judges them (writing `eval_finished_at` on a complete run, the `eval_failed_*` record otherwise); an **embed pass** then selects done, eval'd-or-failed, not-embedded transcripts and embeds them. The `eval_finished_at` latch / `eval_failed_at` record (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ judge attempted` (a judge failure fails open; it is retried by `earmark eval --backfill-*`, never in a hot loop). **Fail-closed** (two conditions, both fatal at startup): (1) if no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`); and (2) if `EVAL_IN_PIPELINE` is not also `true`. The gate makes eval a strict prerequisite for embedding, and the eval judge is only built when `EVAL_IN_PIPELINE=true`; so `EVAL_GATES_EMBED=true` **requires** `EVAL_IN_PIPELINE=true` (and a resolvable judge) — otherwise the worker would run gated with a nil judge, stalling the corpus (or risking a nil-judge deref). Both failures fail at startup, never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
@@ -1767,6 +1771,30 @@ The call uses the OpenAI-compatible `POST {base}/chat/completions` shape.
 | `EVAL_CHAT_BASE_URL` | if no `eval` role in `AI_ROLES` | OpenAI-compatible base URL, e.g. `http://vllm:8000/v1` |
 | `EVAL_CHAT_MODEL` | if no `eval` role in `AI_ROLES` | judge model id |
 | `EVAL_CHAT_API_KEY` | no | bearer token if the endpoint requires one |
+| `EVAL_REASONING_EFFORT` | no | `auto` \| `omit` \| a literal value — see "Thinking controls" below |
+| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto` \| `omit` \| a JSON object — see "Thinking controls" below |
+
+**Thinking controls.** Local reasoning models (Qwen-family on Ollama) must be
+told not to think, or they spend the reply on chain-of-thought and return empty
+content (`ErrThinkingOnlyResponse`). The two families spell it differently, so by
+default (`auto`) the judge sends both `reasoning_effort: "none"` and
+`chat_template_kwargs: {"enable_thinking": false}`. Hosted provider routes reject
+or mis-map those fields (Anthropic has no `"none"` effort and no chat-template
+passthrough), so for a model id starting with `anthropic/` (LiteLLM's provider
+route convention, case-insensitive) `auto` omits **both**. Either field can be
+forced per deployment: `omit` never sends it; any other value is sent verbatim
+(`EVAL_CHAT_TEMPLATE_KWARGS` must then be a JSON object). Everything else in the
+request is route-independent: `response_format` (JSON schema), `temperature: 0`,
+and the bearer token from the endpoint's `apiKeyEnv` (§2.14).
+
+**Resolved model.** The judge records the model the endpoint **reports** serving
+each request (the response's `model` field) next to the requested id, because a
+router can resolve an alias to a dated id or fall back to another model:
+`transcript_findings.resolved_model` per finding (`model` stays the requested
+id) and `run_metrics.eval_resolved_model` per judged job (distinct values,
+comma-joined in first-seen order, if a router switched models mid-run). Both are
+NULL when the endpoint omits the field. In-pipeline and standalone eval events
+carry it as `detail.resolved_model`.
 
 #### `transcript_findings` table
 
@@ -1783,7 +1811,8 @@ CREATE TABLE transcript_findings (
     issue_type           TEXT        NOT NULL,    -- see vocabulary below
     suggested_correction TEXT,                    -- ADVISORY ONLY — never applied
     confidence           FLOAT8      NOT NULL,    -- judge self-score 0..1 (the triage/scoring signal)
-    model                TEXT        NOT NULL,    -- judge model id (attribution)
+    model                TEXT        NOT NULL,    -- judge model id REQUESTED (attribution)
+    resolved_model       TEXT,                    -- model the endpoint reported serving it (NULL = not reported)
     transcription_run_id UUID,                    -- transcription_jobs.id — per-backend/run attribution
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );

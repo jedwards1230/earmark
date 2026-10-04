@@ -65,6 +65,9 @@ func TestEvalInPipelineFalse_EmbedNeverCallsJudge(t *testing.T) {
 			}
 			require.Positive(t, calls.Load(), "control: the inline judge does call the endpoint")
 			require.Len(t, fdb.evalMetrics, 1)
+			require.Equal(t, "qwen3:8b", fdb.evalMetrics[0].Model, "requested model")
+			require.Equal(t, "judge", fdb.evalMetrics[0].ResolvedModel,
+				"the response's model field is recorded as the resolved model")
 		})
 	}
 }

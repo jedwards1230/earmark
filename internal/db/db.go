@@ -875,6 +875,19 @@ func (db *DB) initialize(ctx context.Context) error {
 		return fmt.Errorf("run_metrics eval-failure migration: %w", err)
 	}
 
+	// Resolved-judge-model migration (CONTRACT §1.5, §2.15): the model the chat
+	// endpoint REPORTS serving (its response "model" field), recorded next to
+	// the requested one. A router (LiteLLM) can resolve an alias to a dated id
+	// or fall back to another model, so the requested id alone is not proof of
+	// what judged a chunk. Nullable: NULL when the endpoint omits the field and
+	// on every row written before this column existed.
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE transcript_findings ADD COLUMN IF NOT EXISTS resolved_model TEXT;
+		ALTER TABLE run_metrics ADD COLUMN IF NOT EXISTS eval_resolved_model TEXT;
+	`); err != nil {
+		return fmt.Errorf("resolved judge model migration: %w", err)
+	}
+
 	// completed_at + trigger (CONTRACT §1.1): stamp completed_at = now() whenever a
 	// transcription_jobs row transitions INTO status='done'. The runner owns the
 	// mark-done UPDATE (the Go side never marks jobs done), so a trigger is the
@@ -1384,10 +1397,13 @@ type EvalMetrics struct {
 	JobID      string
 	StartedAt  time.Time
 	FinishedAt time.Time // the latch; zero on a failed attempt
-	Model      string    // judge model id (chat client's Model())
-	Chunks     int       // ChunksEvaluated
-	Skipped    int       // ChunksSkipped (transient per-chunk judge errors)
-	Findings   int       // FindingsFound
+	Model      string    // judge model id (chat client's Model()) — the REQUESTED model
+	// ResolvedModel is the model(s) the endpoint reported serving the run
+	// (comma-joined if a router fell back mid-run); "" → NULL.
+	ResolvedModel string
+	Chunks        int // ChunksEvaluated
+	Skipped       int // ChunksSkipped (transient per-chunk judge errors)
+	Findings      int // FindingsFound
 
 	// Failure record (zero on success).
 	FailedAt     time.Time // when the failed attempt ended
@@ -1459,16 +1475,17 @@ func (db *DB) UpsertEmbedMetrics(ctx context.Context, m EmbedMetrics) error {
 //
 // Parameter order: $1=job_id $2=eval_started_at $3=eval_finished_at $4=eval_model
 //
-//	$5=eval_chunks $6=eval_skipped $7=eval_findings
+//	$5=eval_chunks $6=eval_skipped $7=eval_findings $8=eval_resolved_model
 var upsertEvalMetricsSQL = `
 	INSERT INTO run_metrics
 	       (job_id, eval_started_at, eval_finished_at, eval_model,
-	        eval_chunks, eval_skipped, eval_findings)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)
+	        eval_chunks, eval_skipped, eval_findings, eval_resolved_model)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	ON CONFLICT (job_id) DO UPDATE
 	SET eval_started_at    = EXCLUDED.eval_started_at,
 	    eval_finished_at   = EXCLUDED.eval_finished_at,
 	    eval_model         = EXCLUDED.eval_model,
+	    eval_resolved_model = EXCLUDED.eval_resolved_model,
 	    eval_chunks        = EXCLUDED.eval_chunks,
 	    eval_skipped       = EXCLUDED.eval_skipped,
 	    eval_findings      = EXCLUDED.eval_findings,
@@ -1530,7 +1547,7 @@ func upsertEvalMetrics(ctx context.Context, ex execer, m EvalMetrics) error {
 	}
 	if _, err := ex.Exec(ctx, upsertEvalMetricsSQL,
 		m.JobID, m.StartedAt, m.FinishedAt, m.Model,
-		m.Chunks, m.Skipped, m.Findings); err != nil {
+		m.Chunks, m.Skipped, m.Findings, nonEmpty(m.ResolvedModel)); err != nil {
 		return fmt.Errorf("upsert eval metrics: %w", err)
 	}
 	return nil
@@ -3876,8 +3893,11 @@ type Finding struct {
 	IssueType           string
 	SuggestedCorrection *string
 	Confidence          float64
-	Model               string
-	TranscriptionRunID  *string
+	// Model is the judge model REQUESTED; ResolvedModel is the one the endpoint
+	// reported serving the chunk (NULL when it did not say).
+	Model              string
+	ResolvedModel      *string
+	TranscriptionRunID *string
 	// AnchorOffset / AnchorOccurrence pin which span of the chunk this refers
 	// to. NULL when the model did not report a usable position.
 	AnchorOffset     *int
@@ -3895,8 +3915,8 @@ var insertFindingSQL = `
 	       (transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
 	        original_text, issue_type, suggested_correction, confidence, model,
 	        transcription_run_id, anchor_offset, anchor_occurrence,
-	        chunk_text_sha256)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+	        chunk_text_sha256, resolved_model)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 `
 
 // InsertFindings stores judge findings in one transaction. Insert-only: it never
@@ -3917,6 +3937,7 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 			f.TranscriptID, f.FilePath, f.ChunkID, f.ChunkIndex, f.StartSec, f.EndSec,
 			f.OriginalText, f.IssueType, f.SuggestedCorrection, f.Confidence, f.Model,
 			f.TranscriptionRunID, f.AnchorOffset, f.AnchorOccurrence, f.ChunkTextSHA256,
+			f.ResolvedModel,
 		); err != nil {
 			return fmt.Errorf("insert finding %d: %w", i, err)
 		}
