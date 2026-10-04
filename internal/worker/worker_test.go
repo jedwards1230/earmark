@@ -67,6 +67,8 @@ type fakeDB struct {
 	// gate can be observed: in the "transcribe" phase the worker idles BEFORE
 	// polling, so the count stays 0.
 	getCompletedCalls int
+	completedLimits   []int
+	completedCursors  []db.TranscriptCursor
 
 	// Gated-flow (EVAL_GATES_EMBED) selection plumbing. When evalQueues is
 	// non-nil, GetUnevaluatedTranscripts pops and returns its head per call (so a
@@ -181,11 +183,24 @@ func (f *fakeDB) MarkFindingsStale(_ context.Context, ids []string, reason strin
 	return nil
 }
 
-func (f *fakeDB) GetCompletedTranscripts(_ context.Context) ([]*db.Transcript, error) {
+// GetCompletedTranscripts emulates the keyset-paged ungated selection over
+// f.transcripts (slice order = created_at order): rows strictly after the
+// cursor, capped at limit. It records each call's limit and cursor.
+func (f *fakeDB) GetCompletedTranscripts(_ context.Context, after db.TranscriptCursor, limit int) ([]*db.Transcript, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getCompletedCalls++
-	return f.transcripts, nil
+	f.completedLimits = append(f.completedLimits, limit)
+	f.completedCursors = append(f.completedCursors, after)
+	start := 0
+	if after.ID != "" {
+		for i, t := range f.transcripts {
+			if t.ID == after.ID {
+				start = i + 1
+			}
+		}
+	}
+	return capBatch(f.transcripts[start:], limit), nil
 }
 
 // GetUnevaluatedTranscripts stubs the eval-pass selection. When evalQueues is

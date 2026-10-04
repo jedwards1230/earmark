@@ -645,3 +645,30 @@ func TestRunBackfill_PagesAndLimit(t *testing.T) {
 		}
 	})
 }
+
+// Decoupled mode (EVAL_IN_PIPELINE=false): the worker embeds without judging,
+// so the transcript is embedded but never latched. --backfill-unevaluated is the
+// pass that judges it — against its STORED chunk rows (their real IDs) — and
+// latches it.
+func TestRunBackfill_JudgesTranscriptsEmbeddedWithoutEval(t *testing.T) {
+	tr := &db.Transcript{ID: "t-emb", JobID: "j-emb", FilePath: "/books/Dune/Ch7.m4b", RawText: "Fear is the mind killer."}
+	storedID := "22222222-2222-2222-2222-222222222222" // random ID from the ungated embed
+	fdb := &fakeBackfillDB{
+		transcripts: []*db.Transcript{tr},
+		stored: map[string][]db.EvalChunk{tr.ID: {{
+			ChunkID: storedID, TranscriptID: tr.ID, TranscriptionRunID: tr.JobID,
+			FilePath: tr.FilePath, Text: "Fear is the mind killer.",
+		}}},
+	}
+	judge := evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[{"original_text":"killer","issue_type":"misheard_word","suggested_correction":"filler","confidence":0.9}]}`})
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32}, backfillOptions{write: true}); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+	if len(fdb.findings) != 1 || fdb.findings[0].ChunkID == nil || *fdb.findings[0].ChunkID != storedID {
+		t.Fatalf("finding must reference the stored chunk row %s, got %+v", storedID, fdb.findings)
+	}
+	if len(fdb.evalMetrics) != 1 || fdb.evalMetrics[0].Failed() || fdb.evalMetrics[0].JobID != "j-emb" {
+		t.Fatalf("want the transcript latched, got %+v", fdb.evalMetrics)
+	}
+}

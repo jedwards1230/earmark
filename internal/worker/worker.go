@@ -25,9 +25,11 @@ import (
 
 // DBInterface is the subset of db.DB used by the worker.
 type DBInterface interface {
-	// GetCompletedTranscripts returns done transcripts not yet embedded
-	// (ungated path: EVAL_GATES_EMBED=false).
-	GetCompletedTranscripts(ctx context.Context) ([]*db.Transcript, error)
+	// GetCompletedTranscripts returns one keyset page (≤ limit rows after the
+	// cursor) of transcripts not yet embedded (ungated path:
+	// EVAL_GATES_EMBED=false). The worker walks every page each cycle, so the
+	// memory bound never costs coverage.
+	GetCompletedTranscripts(ctx context.Context, after db.TranscriptCursor, limit int) ([]*db.Transcript, error)
 	// GetUnevaluatedTranscripts returns done, not-eval'd, not-embedded
 	// transcripts — the eval-pass selection for EVAL_GATES_EMBED=true. limit
 	// bounds the rows loaded per call so a large backlog can't OOM the pod; the
@@ -278,33 +280,58 @@ func (w *Worker) Start(cfg *config.Config) {
 			}
 		} else {
 			// Ungated single-pass flow (default): combined chunk→eval→embed.
-			transcripts, err := w.db.GetCompletedTranscripts(w.ctx)
-			if err != nil {
-				w.log.Error("poll for completed transcripts failed", "error", err)
+			embedded, ok := w.drainCompleted(cfg)
+			if !ok {
+				return // shutting down
+			}
+			// Only idle when nothing was embedded AND nothing was rebuilt — a
+			// rebuild-only cycle must not be mistaken for an empty queue. The
+			// drain already walked the whole selection, so a transcript that
+			// keeps failing (and stays selected) waits out the poll interval
+			// instead of being retried in a hot loop.
+			if embedded == 0 && staleRebuilt == 0 {
 				w.sleep(pollInterval)
+			}
+		}
+	}
+}
+
+// drainCompleted is one ungated cycle: it walks the not-yet-embedded selection
+// in keyset pages of EMBED_BATCH_SIZE, processing each page before loading the
+// next, until a short page shows the selection is exhausted. Memory is bounded
+// by one page of transcripts (each carrying its segments JSONB) instead of the
+// whole backlog, and — unlike a plain "first N" LIMIT — transcripts that fail
+// to embed (and so stay in the selection) can never starve the ones behind
+// them, because the cursor moves past them.
+//
+// Returns how many transcripts it embedded successfully, and false when the
+// worker is shutting down. A selection error is logged and ends the cycle.
+func (w *Worker) drainCompleted(cfg *config.Config) (int, bool) {
+	batchSize := embedBatchSize(cfg)
+	var cursor db.TranscriptCursor
+	embedded := 0
+	for {
+		page, err := w.db.GetCompletedTranscripts(w.ctx, cursor, batchSize)
+		if err != nil {
+			w.log.Error("poll for completed transcripts failed", "error", err)
+			return embedded, true
+		}
+		for _, t := range page {
+			if w.ctx.Err() != nil {
+				return embedded, false
+			}
+			cursor = db.CursorAfter(t)
+			if err := w.processTranscript(cfg, t); err != nil {
+				w.log.Error("failed to process transcript",
+					"transcript_id", t.ID,
+					"file", t.FilePath,
+					"error", err)
 				continue
 			}
-
-			// Only idle when there was nothing to embed AND nothing to rebuild —
-			// a rebuild-only cycle must not be mistaken for an empty queue.
-			if len(transcripts) == 0 {
-				if staleRebuilt == 0 {
-					w.sleep(pollInterval)
-				}
-				continue
-			}
-
-			for _, t := range transcripts {
-				if w.ctx.Err() != nil {
-					return
-				}
-				if err := w.processTranscript(cfg, t); err != nil {
-					w.log.Error("failed to process transcript",
-						"transcript_id", t.ID,
-						"file", t.FilePath,
-						"error", err)
-				}
-			}
+			embedded++
+		}
+		if len(page) < batchSize {
+			return embedded, true
 		}
 	}
 }

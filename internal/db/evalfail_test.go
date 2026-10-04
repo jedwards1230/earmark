@@ -165,3 +165,49 @@ func TestGetFindingKeys_Scans(t *testing.T) {
 		t.Errorf("KeyOf must match the stored key; got %v", keys)
 	}
 }
+
+// The ungated selection is bounded and keyset-paged (Phase 0a item 1), and the
+// backfill's unevaluated selection deliberately does NOT filter on embed state
+// (it is how transcripts embedded with EVAL_IN_PIPELINE=false get judged).
+func TestPagedSelections_Shape(t *testing.T) {
+	completed := norm(completedTranscriptsSQL)
+	for _, want := range []string{
+		"NOT EXISTS ( SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id )",
+		"(t.created_at, t.id) > ($1::timestamptz, $2::uuid)",
+		"ORDER BY t.created_at ASC, t.id ASC",
+		"LIMIT $3",
+	} {
+		if !strings.Contains(completed, want) {
+			t.Errorf("completedTranscriptsSQL missing %q:\n%s", want, completed)
+		}
+	}
+	uneval := norm(unevaluatedJobTranscriptsSQL)
+	if strings.Contains(uneval, "transcript_chunks") {
+		t.Errorf("backfill selection must cover embedded transcripts (no transcript_chunks filter):\n%s", uneval)
+	}
+	if !strings.Contains(uneval, "rm.eval_finished_at IS NOT NULL") || strings.Contains(uneval, "eval_failed_at") {
+		t.Errorf("backfill selection must key only on the latch, so recorded failures are retried:\n%s", uneval)
+	}
+}
+
+func TestGetCompletedTranscripts_Paged(t *testing.T) {
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+	rows := pgxmock.NewRows(transcriptScanColumns)
+	addTranscriptRow(rows, "t1", "j1")
+	addTranscriptRow(rows, "t2", "j2")
+	mock.ExpectQuery(completedTranscriptsSQL).WithArgs(nil, nil, 2).WillReturnRows(rows)
+	got, err := getTranscriptPage(context.Background(), mock, completedTranscriptsSQL, TranscriptCursor{}, 2, "completed transcripts")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %d rows, err %v", len(got), err)
+	}
+	if c := CursorAfter(got[1]); c.ID != "t2" || !c.CreatedAt.Equal(got[1].CreatedAt) {
+		t.Errorf("CursorAfter = %+v, want t2 @ its created_at", c)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
