@@ -35,27 +35,66 @@ func TestResolveASIN(t *testing.T) {
 	}
 }
 
-// TestTitlesMatch pins the cross-check that guards the embedded tag:
-// normalized token overlap against the smaller title.
+// TestTitlesMatch pins the cross-check that guards the embedded tag: two-way
+// coverage over each title's forms (series groups removed, either side of a
+// colon). Series siblings and other products must NOT match.
 func TestTitlesMatch(t *testing.T) {
 	tests := []struct {
 		a, b string
 		want bool
 	}{
+		// same book
 		{"Children of Dune", "Children of Dune", true},
 		{"Children of Dune: Dune Chronicles, Book 3", "Children of Dune", true},
+		{"Leviathan Wakes", "Leviathan Wakes (The Expanse, Book 1)", true},
+		{"Leviathan Wakes [The Expanse #1]", "Leviathan Wakes", true},
 		{"Project Hail Mary", "project hail mary [B08G9PRS1K]", true},
 		{"Muad'Dib's Legacy", "Muad’Dib’s Legacy", true},
+		{"Golden Son", "Red Rising: Golden Son", true}, // series prefix before the colon
+		{"The Way of Kings (Unabridged)", "The Way of Kings", true},
+		// series siblings and other products (review B3)
+		{"Dune", "Dune Messiah", false},
+		{"Dune", "Children of Dune", false},
+		{"Dune Messiah", "Children of Dune", false},
+		{"Project Hail Mary", "Hail Mary", false},
+		{"Red Rising", "Red Rising: Golden Son", false},
+		{"Fourth Wing", "Fourth Wing (1 of 2) [Dramatized Adaptation]", false},
+		{"Leviathan Wakes", "Caliban's War (The Expanse, Book 2)", false},
+		// unrelated / degenerate
 		{"Eragon", "Children of Dune", false},
 		{"The Way of Kings", "The Name of the Wind", false},
-		{"Dune Messiah", "Children of Dune", false}, // 1 of 2 identity tokens
 		{"", "Children of Dune", false},
 		{"The", "The", false}, // stopwords only: no identity
 	}
 	for _, tc := range tests {
-		if got := TitlesMatch(tc.a, tc.b); got != tc.want {
-			t.Errorf("TitlesMatch(%q, %q) = %v (overlap %.2f), want %v",
-				tc.a, tc.b, got, TitleOverlap(tc.a, tc.b), tc.want)
+		for _, pair := range [][2]string{{tc.a, tc.b}, {tc.b, tc.a}} {
+			if got := TitlesMatch(pair[0], pair[1]); got != tc.want {
+				t.Errorf("TitlesMatch(%q, %q) = %v, want %v", pair[0], pair[1], got, tc.want)
+			}
 		}
+	}
+}
+
+// TestSameBook adds the author check and author-token removal.
+func TestSameBook(t *testing.T) {
+	ref := func(title, author string) BookRef { return BookRef{Title: title, Author: author} }
+	tests := []struct {
+		name        string
+		record, own BookRef
+		want        bool
+	}{
+		{"same title and author", ref("Children of Dune", "Frank Herbert"), ref("Children of Dune", "Frank Herbert"), true},
+		{"co-author listed in the record", ref("Children of Dune", "Frank Herbert, Brian Herbert"), ref("Children of Dune", "Frank Herbert"), true},
+		{"unknown path author", ref("Children of Dune", "Frank Herbert"), ref("Children of Dune", ""), true},
+		{"author in the path title", ref("Children of Dune", "Frank Herbert"), ref("Frank Herbert - Children of Dune", "Frank Herbert"), true},
+		{"same title, different author", ref("Shift", "Hugh Howey"), ref("Shift", "Tim Kring"), false},
+		{"series sibling, same author", ref("Dune", "Frank Herbert"), ref("Dune Messiah", "Frank Herbert"), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SameBook(tc.record, tc.own); got != tc.want {
+				t.Errorf("SameBook(%+v, %+v) = %v, want %v", tc.record, tc.own, got, tc.want)
+			}
+		})
 	}
 }

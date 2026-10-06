@@ -151,7 +151,7 @@ func NewABSProvider(baseURL, token, libraryID string, client *http.Client) *ABSP
 // source, consulted only when neither the directory nor the filename carries
 // an ASIN. A record found that way is used only if its title matches the
 // book's path-derived title (library.TitlesMatch); otherwise the path metadata
-// is returned with IdentityStatus "conflict".
+// is returned with IdentityStatus "conflict". The match is library.SameBook.
 func (p *ABSProvider) Lookup(ctx context.Context, filePath, sampleName string) (BookMeta, error) {
 	asin, source := library.ResolveASIN(filePath, "")
 	if source == library.ASINSourceDir {
@@ -193,7 +193,7 @@ func (p *ABSProvider) Lookup(ctx context.Context, filePath, sampleName string) (
 	// keeps its path-derived identity, so a bad tag can never attach another
 	// book's description and chapters.
 	if source == library.ASINSourceEmbeddedTag {
-		if conflict, own := p.embeddedConflict(ctx, filePath, sampleName, minimal.Title); conflict {
+		if conflict, own := p.embeddedConflict(ctx, filePath, sampleName, minimal); conflict {
 			p.log.Warn("embedded ASIN names a different book; recording conflict and not using it",
 				"asin", asin, "record_title", minimal.Title, "book_title", own.Title, "file", filePath)
 			own.IdentityStatus = IdentityConflict
@@ -221,11 +221,12 @@ func (p *ABSProvider) Lookup(ctx context.Context, filePath, sampleName string) (
 }
 
 // embeddedConflict cross-checks a record fetched by embedded tag against the
-// book's path-derived title. It returns true (with the path metadata the book
-// keeps) when the titles do not match. Without a title source there is
-// nothing to check against, which is itself a conflict: the tag is never
-// trusted unchecked.
-func (p *ABSProvider) embeddedConflict(ctx context.Context, filePath, sampleName, recordTitle string) (bool, BookMeta) {
+// book's path-derived title and author (library.SameBook: two-way title
+// coverage, and the authors must agree when both are known). It returns true
+// (with the path metadata the book keeps) on a mismatch. Without a title
+// source there is nothing to check against, which is itself a conflict: the
+// tag is never trusted unchecked.
+func (p *ABSProvider) embeddedConflict(ctx context.Context, filePath, sampleName string, record absMetadata) (bool, BookMeta) {
 	if p.titles == nil {
 		return true, BookMeta{}
 	}
@@ -233,7 +234,10 @@ func (p *ABSProvider) embeddedConflict(ctx context.Context, filePath, sampleName
 	if err != nil || own.Title == "" {
 		return true, own
 	}
-	return !library.TitlesMatch(recordTitle, own.Title), own
+	return !library.SameBook(
+		library.BookRef{Title: record.Title, Author: record.AuthorName},
+		library.BookRef{Title: own.Title, Author: own.Author},
+	), own
 }
 
 // findByASIN fetches the library items list and scans for the given ASIN.

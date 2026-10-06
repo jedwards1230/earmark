@@ -157,3 +157,27 @@ func TestNew_WithEmbeddedASINSource(t *testing.T) {
 		t.Errorf("meta = %+v, want ABS via embedded tag", meta)
 	}
 }
+
+// TestABSProvider_EmbeddedTag_SiblingAndAuthorConflicts (review B3): a tag
+// naming a series sibling or a same-titled book by another author is a
+// conflict, not a match.
+func TestABSProvider_EmbeddedTag_SiblingAndAuthorConflicts(t *testing.T) {
+	for name, path := range map[string]string{
+		"title is a subset of the record": "/books/Andy Weir/Hail Mary/01.m4b",
+		"same title, other author":        "/books/Tim Kring/Project Hail Mary/01.m4b",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var lists atomic.Int32
+			srv := absServer(t, &lists) // record: "Project Hail Mary" by Andy Weir
+			p := metaprovider.NewABSProvider(srv.URL, "tok", "lib", srv.Client()).
+				WithEmbeddedASIN(&fakeEmbedded{tag: "B08G9PRS1K"}, metaprovider.NewPathProvider("", "/books"))
+			meta, err := p.Lookup(context.Background(), path, "01.m4b")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if meta.IdentityStatus != metaprovider.IdentityConflict || meta.ASIN != "" || len(meta.Chapters) != 0 {
+				t.Errorf("meta = %+v, want a conflict with no record data", meta)
+			}
+		})
+	}
+}
