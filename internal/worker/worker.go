@@ -139,7 +139,7 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 			w.log.Warn("EVAL_IN_PIPELINE set but no eval chat endpoint resolved — inline eval disabled",
 				"error", err)
 		} else {
-			w.judge = eval.NewJudge(chat)
+			w.judge = eval.NewJudgeForConfig(chat, cfg)
 			w.log.Info("in-pipeline eval enabled", "judge_model", chat.Model(),
 				"eval_gates_embed", cfg.EvalGatesEmbed)
 		}

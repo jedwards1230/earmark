@@ -442,6 +442,11 @@ type Config struct {
 	// after LoadConfig.
 	AIRoles *AIRoles
 
+	// Models — the model registry (CONTRACT §2.18) parsed from MODELS_FILE:
+	// per-step expected model, revision pin and prompt version, stamped into
+	// provenance recipes. Empty (never nil) after LoadConfig when unset.
+	Models *ModelRegistry
+
 	// Debug enables verbose structured logging.
 	Debug bool
 
@@ -583,6 +588,12 @@ func LoadConfig() (*Config, error) {
 				"the gate makes eval a strict prerequisite for embedding, and the eval " +
 				"judge is only built when EVAL_IN_PIPELINE=true")
 		}
+	}
+
+	// Model registry (CONTRACT §2.18). After the AI registry: pinned aliases
+	// are checked against the endpoints it binds. Fail-closed like §2.14.
+	if err := cfg.loadModelRegistry(); err != nil {
+		return nil, err
 	}
 
 	cfg.Debug = parseBoolEnv("DEBUG")

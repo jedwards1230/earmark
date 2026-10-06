@@ -219,12 +219,12 @@ func TestGetCompletedTranscripts_Paged(t *testing.T) {
 }
 
 // The resolved judge model is written next to the requested one: on each
-// finding (resolved_model, $16) and on the run's eval slice
-// (eval_resolved_model, $8).
+// finding (resolved_model, $16, followed by its recipe_id, $17) and on the
+// run's eval slice (eval_resolved_model, $8).
 func TestResolvedModelColumns(t *testing.T) {
 	ins := norm(insertFindingSQL)
-	if !strings.Contains(ins, "chunk_text_sha256, resolved_model)") || !strings.Contains(ins, "$15, $16)") {
-		t.Errorf("insertFindingSQL must write resolved_model as $16:\n%s", ins)
+	if !strings.Contains(ins, "chunk_text_sha256, resolved_model, recipe_id)") || !strings.Contains(ins, "$15, $16, $17)") {
+		t.Errorf("insertFindingSQL must write resolved_model as $16 and recipe_id as $17:\n%s", ins)
 	}
 	up := norm(upsertEvalMetricsSQL)
 	if !strings.Contains(up, "eval_findings, eval_resolved_model)") || !strings.Contains(up, "$7, $8)") ||

@@ -28,6 +28,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/patch"
+	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
 // defaultMaxFindingsPerChunk bounds how many findings the judge keeps for a
@@ -133,7 +134,21 @@ type Judge struct {
 	// minConf drops findings whose confidence is below this floor; 0 disables.
 	// Resolved once from EVAL_MIN_CONFIDENCE at construction.
 	minConf float64
+	// pin is the model registry's entry for the propose step (CONTRACT §2.18).
+	pin ModelPin
 }
+
+// ModelPin is the model registry's pin for the judge: the model expected to
+// answer for the requested alias, and its revision (config.ModelPin, without
+// the eval core importing config).
+type ModelPin struct {
+	ExpectedModel string
+	Revision      string
+}
+
+// proposeStepVersion is bumped whenever the judge's own logic (parsing,
+// filtering, capping, anchoring) changes which findings it writes (§1.9).
+const proposeStepVersion = 1
 
 // NewJudge constructs a Judge backed by the given chat client.
 func NewJudge(chat ChatClient) *Judge {
@@ -143,6 +158,50 @@ func NewJudge(chat ChatClient) *Judge {
 		maxPerChunk: maxFindingsPerChunk(),
 		minConf:     minConfidence(),
 	}
+}
+
+// SetModelPin records the registry pin for the propose step; it feeds the
+// judge's recipe.
+func (j *Judge) SetModelPin(pin ModelPin) { j.pin = pin }
+
+// Recipe is the judge's CURRENT recipe (CONTRACT §1.9): what it asks for, the
+// model expected to answer (the registry's pin, else the requested model), the
+// prompt version and hash, and the parameters that shape its findings.
+func (j *Judge) Recipe() recipe.Recipe {
+	model := j.Model()
+	expected := j.pin.ExpectedModel
+	if expected == "" {
+		expected = model
+	}
+	return recipe.Recipe{
+		Step:          recipe.StepPropose,
+		StepVersion:   proposeStepVersion,
+		CodeVersion:   recipe.CodeVersion(),
+		ModelAlias:    model,
+		ModelResolved: expected,
+		ModelRevision: j.pin.Revision,
+		PromptVersion: judgePromptVersion,
+		PromptSHA256:  judgePromptSHA256(),
+		Params: map[string]any{
+			// openAIChatClient always sends temperature 0.
+			"temperature":            0,
+			"min_confidence":         j.minConf,
+			"max_findings_per_chunk": j.maxPerChunk,
+		},
+	}
+}
+
+// recipeFor is the recipe that actually produced a reply: the current recipe
+// with model_resolved set to the model the endpoint REPORTED serving it ("what
+// answered"). A fallback model therefore stamps a different recipe, which
+// InsertFindings registers on the fly. An endpoint that reports nothing keeps
+// the expected model.
+func (j *Judge) recipeFor(resolved string) recipe.Recipe {
+	r := j.Recipe()
+	if resolved != "" {
+		r.ModelResolved = resolved
+	}
+	return r
 }
 
 // Model reports the judge's chat model id (for run_metrics.eval_model
@@ -193,6 +252,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 	parsed = j.capFindings(c, parsed)
 
 	model := j.chat.Model()
+	rec := j.recipeFor(resolved)
 	findings := make([]db.Finding, 0, len(parsed))
 	chunkID := c.ChunkID
 	chunkIndex := c.ChunkIndex
@@ -218,6 +278,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 			// lets the apply path later prove it is editing the same revision
 			// the model reviewed, instead of text that changed in between.
 			ChunkTextSHA256: optionalStr(patch.ChunkHash(c.Text)),
+			Recipe:          &rec,
 		})
 	}
 	return Result{Chunk: c, Findings: findings, ResolvedModel: resolved}, nil

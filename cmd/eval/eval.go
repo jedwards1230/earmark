@@ -144,7 +144,7 @@ func runEval(cmd *cobra.Command, args []string) {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-	judge := evalpkg.NewJudge(chat)
+	judge := evalpkg.NewJudgeForConfig(chat, cfg)
 
 	// --backfill-unevaluated: a separate execution path that judges done transcripts
 	// with eval_finished_at IS NULL (regardless of embed state). This is an offline

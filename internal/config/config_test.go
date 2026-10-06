@@ -21,7 +21,7 @@ func clearContractEnvVars(t *testing.T) {
 		"CHUNK_SIZE", "EMBED_BATCH_SIZE", "DEBUG", "DEBUG_DB_RESET",
 		"ASR_SERVERS", "AI_ENDPOINTS", "AI_ROLES",
 		"EVAL_GATES_EMBED", "EVAL_IN_PIPELINE",
-		"EVAL_CHAT_BASE_URL", "EVAL_CHAT_MODEL",
+		"EVAL_CHAT_BASE_URL", "EVAL_CHAT_MODEL", "MODELS_FILE",
 	}
 	for _, k := range vars {
 		t.Setenv(k, "") // t.Setenv restores on cleanup

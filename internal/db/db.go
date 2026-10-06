@@ -32,6 +32,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/patch"
+	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
 // ─── Deterministic chunk UUID ────────────────────────────────────────────────
@@ -192,6 +193,8 @@ type DB struct {
 	cfg  *config.Config
 	log  log.Logger
 	meta metaprovider.MetadataProvider
+	// embedRecipe stamps every chunk InsertChunks writes (CONTRACT §1.9).
+	embedRecipe recipe.Recipe
 }
 
 // New opens a PostgreSQL connection pool and runs schema migrations.
@@ -223,6 +226,7 @@ func New(cfg *config.Config) (*DB, error) {
 		log:  logger,
 		meta: metaprovider.New(cfg),
 	}
+	db.embedRecipe = db.EmbedRecipe()
 
 	if err := db.initialize(context.Background()); err != nil {
 		pool.Close()
@@ -646,7 +650,8 @@ func (db *DB) emitEvent(ctx context.Context, e PipelineEvent) {
 // AND the position columns (file_path, start_sec, end_sec, speaker). A
 // re-chunk can shift a chunk's boundaries without changing its index; keeping
 // the old timestamps would point search hits and get_chunk_context at audio
-// the text no longer covers.
+// the text no longer covers. recipe_id ($11) is refreshed too: a rebuilt
+// chunk was made by this process's embed recipe (CONTRACT §1.9).
 //
 // embedding_stale is deliberately NOT touched on conflict. Clearing it here
 // would be a lost update: a human accept that lands between the worker's
@@ -657,9 +662,9 @@ func (db *DB) emitEvent(ctx context.Context, e PipelineEvent) {
 var insertChunkSQL = `
 	INSERT INTO transcript_chunks
 	       (id, transcript_id, file_path, chunk_index, start_sec, end_sec,
-	        text, source_text, speaker, embedding)
+	        text, source_text, speaker, embedding, recipe_id)
 	VALUES (COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()),
-	        $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10)
+	        $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10, $11)
 	ON CONFLICT (transcript_id, chunk_index) DO UPDATE
 	SET text        = EXCLUDED.text,
 	    source_text = EXCLUDED.source_text,
@@ -667,7 +672,8 @@ var insertChunkSQL = `
 	    file_path   = EXCLUDED.file_path,
 	    start_sec   = EXCLUDED.start_sec,
 	    end_sec     = EXCLUDED.end_sec,
-	    speaker     = EXCLUDED.speaker
+	    speaker     = EXCLUDED.speaker,
+	    recipe_id   = EXCLUDED.recipe_id
 `
 
 // findingChunkAddressDoc — how a finding names its chunk, shared by every
@@ -821,7 +827,10 @@ func (db *DB) pruneChunksTx(ctx context.Context, b txBeginner, transcriptID stri
 // Lock order: the findings the prune may retire are locked FIRST
 // (lockTailFindingsSQL), then the chunk rows (upsert, prune). SetPatchState
 // takes a finding and then its chunk, so both paths lock findings → chunks and
-// an accept racing a rebuild waits rather than deadlocks.
+// an accept racing a rebuild waits rather than deadlocks. The embed recipe
+// is registered first, in the same transaction: it touches only the recipes
+// table, which no finding/chunk lock holder waits on, and every chunk written
+// is stamped with it (CONTRACT §1.9) — including rows a rebuild refreshes.
 func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 	return db.insertChunks(ctx, db.pool, chunks)
 }
@@ -853,6 +862,10 @@ func (db *DB) insertChunks(ctx context.Context, b txBeginner, chunks []Chunk) er
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	recipeID, err := registerRecipe(ctx, tx, db.embedRecipe)
+	if err != nil {
+		return fmt.Errorf("chunk recipe: %w", err)
+	}
 	for _, tid := range order {
 		if err := lockTailFindings(ctx, tx, tid, keep[tid]); err != nil {
 			return err
@@ -861,7 +874,7 @@ func (db *DB) insertChunks(ctx context.Context, b txBeginner, chunks []Chunk) er
 	for _, c := range chunks {
 		if _, err := tx.Exec(ctx, insertChunkSQL,
 			c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
-			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding),
+			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding), recipeID,
 		); err != nil {
 			return fmt.Errorf("insert chunk %d: %w", c.ChunkIndex, err)
 		}
@@ -3563,6 +3576,9 @@ type Finding struct {
 	// ChunkTextSHA256 fingerprints the chunk as the judge saw it, so the apply
 	// path can refuse to edit a revision the model never reviewed.
 	ChunkTextSHA256 *string
+	// Recipe is how the finding was made (CONTRACT §1.9): InsertFindings
+	// registers it and stamps its ID into recipe_id. nil → recipe_id NULL.
+	Recipe *recipe.Recipe
 }
 
 // insertFindingSQL is the INSERT for one finding. Package var so a test can
@@ -3573,13 +3589,16 @@ var insertFindingSQL = `
 	       (transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
 	        original_text, issue_type, suggested_correction, confidence, model,
 	        transcription_run_id, anchor_offset, anchor_occurrence,
-	        chunk_text_sha256, resolved_model)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+	        chunk_text_sha256, resolved_model, recipe_id)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 `
 
 // InsertFindings stores judge findings in one transaction. Insert-only: it never
 // updates or deletes any row, and writes to no table other than
-// transcript_findings. A nil/empty slice is a no-op.
+// transcript_findings — and recipes, where it registers (insert-if-absent) each
+// finding's recipe before stamping its ID, so a recipe first seen mid-run (a
+// fallback model answering) is recorded on the fly. A nil/empty slice is a
+// no-op.
 func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 	if len(findings) == 0 {
 		return nil
@@ -3590,12 +3609,22 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	registered := map[*recipe.Recipe]*string{}
 	for i, f := range findings {
+		recipeID, ok := registered[f.Recipe]
+		if !ok && f.Recipe != nil {
+			id, err := registerRecipe(ctx, tx, *f.Recipe)
+			if err != nil {
+				return fmt.Errorf("finding %d: %w", i, err)
+			}
+			recipeID = &id
+			registered[f.Recipe] = recipeID
+		}
 		if _, err := tx.Exec(ctx, insertFindingSQL,
 			f.TranscriptID, f.FilePath, f.ChunkID, f.ChunkIndex, f.StartSec, f.EndSec,
 			f.OriginalText, f.IssueType, f.SuggestedCorrection, f.Confidence, f.Model,
 			f.TranscriptionRunID, f.AnchorOffset, f.AnchorOccurrence, f.ChunkTextSHA256,
-			f.ResolvedModel,
+			f.ResolvedModel, recipeID,
 		); err != nil {
 			return fmt.Errorf("insert finding %d: %w", i, err)
 		}

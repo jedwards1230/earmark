@@ -83,6 +83,16 @@ func modelWantsTaskPrefixes(model string) bool {
 // BaseURL returns the configured embeddings endpoint, for diagnostics/logging.
 func (e *Embeddings) BaseURL() string { return e.baseURL }
 
+// DocumentPrefix is the task prefix prepended to stored passages ("" when this
+// model takes none). Recorded in the embed recipe (CONTRACT §1.9): it changes
+// every stored vector, so it is part of how a chunk was made.
+func (e *Embeddings) DocumentPrefix() string {
+	if e == nil || !e.prefixed {
+		return ""
+	}
+	return documentPrefix
+}
+
 // EmbeddingUsage is the provider-reported token usage for an embeddings call.
 // Ollama does not reliably populate these for embeddings (they are frequently
 // zero), so callers that need an authoritative count should also tokenize the
