@@ -7,100 +7,146 @@ import (
 )
 
 // earmark runs two processes against one database (earmark-ingest and
-// earmark-mcp) and both call initialize() on startup. Concurrent DDL from two
-// sessions deadlocks — observed in production 2026-08-14 (CREATE FUNCTION,
-// "while updating tuple in relation pg_proc") and 2026-08-19 (DROP TRIGGER).
+// earmark-mcp) and both migrate on startup. Concurrent DDL from two sessions
+// deadlocks — observed in production 2026-08-14 (CREATE FUNCTION, "while
+// updating tuple in relation pg_proc") and 2026-08-19 (DROP TRIGGER).
 //
 // The advisory lock is what serializes them. These tests assert its properties
 // at the source level, the same way findings_test.go guards the eval layer's
-// read-only SQL, because the real failure needs two concurrent connections to a
-// live Postgres and so cannot be reproduced in a unit test.
+// read-only SQL. The runtime behaviour — waiting, serializing, not leaking — is
+// proven against a real Postgres by migrate_integration_test.go.
 
-// TestSchemaInitLockIsTransactionScoped is the important one.
-//
-// pg_advisory_xact_lock is released automatically on COMMIT or ROLLBACK.
-// pg_advisory_lock is NOT — it is session-scoped and survives the transaction.
-// Since initialize() runs on a POOLED connection, a session-scoped lock would
-// be released only when that connection closes; the pool would hand the still-
-// locked connection to the next borrower and every subsequent initialize()
-// would block forever.
-//
-// Swapping one for the other looks like a harmless rename and would deadlock
-// the service permanently instead of transiently. Hence the test.
-func TestSchemaInitLockIsTransactionScoped(t *testing.T) {
-	if !strings.Contains(schemaInitLockSQL, "pg_advisory_xact_lock") {
-		t.Errorf("schema-init lock must be transaction-scoped, got: %s", schemaInitLockSQL)
+// TestSchemaLockWaits: a try-lock returns false instead of waiting, which would
+// let the loser skip the lock and race the DDL anyway — the exact bug this is
+// meant to prevent.
+func TestSchemaLockWaits(t *testing.T) {
+	if !strings.Contains(schemaLockSQL, "pg_advisory_lock($1)") {
+		t.Errorf("schema lock must be a waiting pg_advisory_lock on the key, got: %s", schemaLockSQL)
 	}
-
-	// Reject the session-scoped variants. Checked as a whole-token prefix so
-	// "pg_advisory_xact_lock" does not trip the "pg_advisory_lock" check.
-	for _, banned := range []string{
-		"pg_advisory_lock(",
-		"pg_advisory_lock_shared(",
-		"pg_try_advisory_lock(",
-	} {
-		if strings.Contains(schemaInitLockSQL, banned) {
-			t.Errorf("schema-init lock uses session-scoped %s — it runs on a pooled "+
-				"connection and would leak the lock to the next borrower:\n%s",
-				banned, schemaInitLockSQL)
+	for _, banned := range []string{"pg_try_advisory", "_shared("} {
+		if strings.Contains(schemaLockSQL, banned) {
+			t.Errorf("schema lock must be an exclusive WAITING lock, found %q: %s", banned, schemaLockSQL)
 		}
 	}
-
-	// A try-lock returns false instead of waiting, which would let the loser
-	// skip the lock and race anyway — the exact bug this is meant to prevent.
-	if strings.Contains(schemaInitLockSQL, "pg_try_advisory") {
-		t.Errorf("schema-init lock must WAIT, not try-and-continue: %s", schemaInitLockSQL)
+	if !strings.Contains(schemaUnlockSQL, "pg_advisory_unlock($1)") {
+		t.Errorf("schema unlock must release the same session lock, got: %s", schemaUnlockSQL)
 	}
 }
 
 // TestSchemaInitLockKeyIsStable guards the other way this silently stops
 // working: the key is only meaningful if every process uses the same one. A
 // per-process or randomized key would acquire a lock nobody contends for, and
-// the deadlock would return with the lock still apparently "in place".
+// the deadlock would return with the lock still apparently "in place". The
+// value is also the one the pre-goose initialize() used, so old and new pods
+// rolling together still serialize.
 func TestSchemaInitLockKeyIsStable(t *testing.T) {
 	if schemaInitLockKey == 0 {
 		t.Error("schema-init lock key must be a fixed non-zero constant")
 	}
-	// Reading it twice must give the same value — trivially true for a const,
-	// which is the point: this fails to compile if someone makes it a variable
-	// computed at startup (e.g. from a hostname or PID).
 	if schemaInitLockKey != 0x4541524D_5343484D {
-		t.Errorf("schema-init lock key changed to %#x — every earmark process must "+
-			"use the SAME key or initialization is not serialized at all",
+		t.Errorf("schema-init lock key changed to %#x — every earmark process (old and new) must "+
+			"use the SAME key or migration is not serialized at all",
 			schemaInitLockKey)
 	}
 }
 
-// TestSchemaInitAcquiresLockFirst asserts ordering: the lock must be taken
-// before any DDL. A statement executed before it takes locks outside the
-// serialized region, which reintroduces the deadlock while looking fixed.
-//
-// Verified against the source because the ordering lives in a function body
-// rather than in an inspectable package var.
-func TestSchemaInitAcquiresLockFirst(t *testing.T) {
+// migrateBody returns the source of migrate().
+func migrateBody(t *testing.T) string {
+	t.Helper()
+	src, err := os.ReadFile("migrate.go")
+	if err != nil {
+		t.Fatalf("read migrate.go: %v", err)
+	}
+	text := string(src)
+	const marker = "func migrateTo(ctx context.Context"
+	start := strings.Index(text, marker)
+	if start < 0 {
+		t.Fatal("could not find migrateTo() — this test needs updating")
+	}
+	body := text[start:]
+	if end := strings.Index(body, "\n}\n"); end >= 0 {
+		body = body[:end]
+	}
+	return body
+}
+
+// TestSchemaLockIsOnADedicatedConnection guards the leak. The lock is
+// session-scoped (it has to span goose's per-migration transactions), and a
+// session lock left on a POOLED connection would be handed to the next borrower
+// and block every later migration forever. So it must live on a handle that is
+// not db.pool, keeps no idle connections, and is closed when migrate returns.
+func TestSchemaLockIsOnADedicatedConnection(t *testing.T) {
+	body := migrateBody(t)
+	for _, want := range []string{
+		"stdlib.OpenDB(",                       // its own database/sql handle
+		"defer func() { _ = sqlDB.Close() }()", // physically closed on return
+		"SetMaxIdleConns(0)",                   // a returned connection is closed, never parked
+		"lockConn.Close()",                     // the lock connection is given back (and so closed)
+		"schemaUnlockSQL",                      // and the lock is released explicitly first
+		"context.WithoutCancel(",               // even when ctx was cancelled
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("migrate() no longer contains %q — the session lock could outlive it", want)
+		}
+	}
+	if strings.Contains(body, ".pool") || strings.Contains(body, "pgxpool.") {
+		t.Error("migrate() references a pool — the session lock must never run on the service's pgxpool")
+	}
+}
+
+// TestSchemaLockPrecedesGoose asserts ordering: the lock must be taken before
+// goose does anything, because goose's Up creates its version table (DDL)
+// before any locker it is given would run. And goose must NOT be handed a
+// session locker of its own: on its own connection with the same key it would
+// wait for this lock forever.
+func TestSchemaLockPrecedesGoose(t *testing.T) {
+	body := migrateBody(t)
+	lockAt := strings.Index(body, "schemaLockSQL")
+	if lockAt < 0 {
+		t.Fatal("migrate() does not acquire the schema advisory lock")
+	}
+	for _, call := range []string{"newMigrationProvider(", ".UpTo(ctx", "GetDBVersion("} {
+		at := strings.Index(body, call)
+		if at < 0 {
+			t.Errorf("migrate() no longer calls %s — this test needs updating", call)
+			continue
+		}
+		if at < lockAt {
+			t.Errorf("%s runs before the schema lock is acquired — goose would create "+
+				"goose_db_version outside the serialized region", call)
+		}
+	}
+
+	src, err := os.ReadFile("migrate.go")
+	if err != nil {
+		t.Fatalf("read migrate.go: %v", err)
+	}
+	if strings.Contains(string(src), "goose.WithSessionLocker(") || strings.Contains(string(src), "goose.WithLocker(") {
+		t.Error("goose must not get its own locker: it would self-deadlock against migrate()'s lock")
+	}
+}
+
+// TestInitializeOnlyMigrates: the inline DDL is gone. initialize() is the lock +
+// goose path and nothing else; schema changes are numbered migrations.
+func TestInitializeOnlyMigrates(t *testing.T) {
 	src, err := os.ReadFile("db.go")
 	if err != nil {
 		t.Fatalf("read db.go: %v", err)
 	}
 	text := string(src)
-
 	const marker = "func (db *DB) initialize(ctx context.Context) error {"
 	start := strings.Index(text, marker)
 	if start < 0 {
 		t.Fatal("could not find initialize() — this test needs updating")
 	}
 	body := text[start:]
-
-	lockAt := strings.Index(body, "schemaInitLockSQL")
-	if lockAt < 0 {
-		t.Fatal("initialize() does not acquire the schema-init advisory lock")
+	body = body[:strings.Index(body, "\n}\n")]
+	if !strings.Contains(body, "migrate(") {
+		t.Error("initialize() must run the goose migrations")
 	}
-
-	// The first DDL in the body must come after the lock.
-	for _, ddl := range []string{"CREATE EXTENSION", "CREATE TABLE", "ALTER TABLE", "DROP TRIGGER"} {
-		if at := strings.Index(body, ddl); at >= 0 && at < lockAt {
-			t.Errorf("%q is executed before the advisory lock is acquired — "+
-				"it takes locks outside the serialized region and can still deadlock", ddl)
+	for _, ddl := range []string{"CREATE ", "ALTER ", "DROP ", "Exec("} {
+		if strings.Contains(body, ddl) {
+			t.Errorf("initialize() contains %q — schema changes belong in internal/db/migrations", ddl)
 		}
 	}
 }
