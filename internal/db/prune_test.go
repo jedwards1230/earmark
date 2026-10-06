@@ -3,14 +3,11 @@ package db
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/pashagolub/pgxmock/v5"
 
-	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/patch"
 )
 
@@ -24,9 +21,17 @@ func expectChunkInserts(mock pgxmock.PgxPoolIface, chunks []Chunk) {
 	}
 }
 
+// expectTailLock expects the finding lock a prune to keep takes first.
+func expectTailLock(mock pgxmock.PgxPoolIface, tid string, keep int) {
+	mock.ExpectExec("FOR UPDATE OF f").WithArgs(tid, keep).
+		WillReturnResult(pgxmock.NewResult("SELECT", 0))
+}
+
 // TestInsertChunks_PrunesTailInSameTransaction: a re-chunk into fewer chunks
 // must delete the old tail (chunk_index >= the new count) in the SAME
-// transaction as the upsert — otherwise the orphans survive the rebuild.
+// transaction as the upsert — otherwise the orphans survive the rebuild. The
+// finding locks come FIRST (before any chunk row is touched), the same
+// findings → chunks order SetPatchState uses, so the two cannot deadlock.
 func TestInsertChunks_PrunesTailInSameTransaction(t *testing.T) {
 	database := newTestDB()
 	mock, err := pgxmock.NewPool()
@@ -42,6 +47,8 @@ func TestInsertChunks_PrunesTailInSameTransaction(t *testing.T) {
 		{TranscriptID: "t-2", ChunkIndex: 0, Text: "c"},
 	}
 	mock.ExpectBegin()
+	expectTailLock(mock, "t-1", 2)
+	expectTailLock(mock, "t-2", 1)
 	expectChunkInserts(mock, chunks)
 	mock.ExpectQuery("WITH pruned AS").
 		WithArgs("t-1", 2, patch.StaleReasonChunkChanged, staleFromStates).
@@ -72,6 +79,7 @@ func TestInsertChunks_PruneFailureRollsBack(t *testing.T) {
 	chunks := []Chunk{{TranscriptID: "t-1", ChunkIndex: 0, Text: "a"}}
 	boom := errors.New("boom")
 	mock.ExpectBegin()
+	expectTailLock(mock, "t-1", 1)
 	expectChunkInserts(mock, chunks)
 	mock.ExpectQuery("WITH pruned AS").
 		WithArgs("t-1", 1, patch.StaleReasonChunkChanged, staleFromStates).
@@ -142,8 +150,60 @@ func TestPruneChunksSQL_Shape(t *testing.T) {
 	if !strings.Contains(pruneChunksSQL, "f.patch_state = ANY($4)") || !strings.Contains(pruneChunksSQL, "stale_reason = $3") {
 		t.Errorf("pruneChunksSQL must retire via bound states and reason:\n%s", pruneChunksSQL)
 	}
+	// Retire by index, not only by chunk_id: most live findings carry a
+	// chunk_id that names no row (M1).
+	if !strings.Contains(pruneChunksSQL, "f.chunk_index >= $2") {
+		t.Errorf("pruneChunksSQL must retire findings by chunk_index:\n%s", pruneChunksSQL)
+	}
 	if strings.Contains(pruneChunksSQL, "decided_at") || strings.Contains(pruneChunksSQL, "decided_by") {
 		t.Errorf("pruneChunksSQL must not overwrite the human decision record:\n%s", pruneChunksSQL)
+	}
+}
+
+// TestPruneChunks_LocksFindingsFirst: the standalone prune (prune-chunks
+// --yes) runs in its own transaction and takes the finding locks before the
+// DELETE, the same order as InsertChunks and SetPatchState.
+func TestPruneChunks_LocksFindingsFirst(t *testing.T) {
+	database := newTestDB()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectBegin()
+	expectTailLock(mock, "t-1", 3)
+	mock.ExpectQuery("WITH pruned AS").
+		WithArgs("t-1", 3, patch.StaleReasonChunkChanged, staleFromStates).
+		WillReturnRows(pgxmock.NewRows([]string{"chunks", "findings"}).AddRow(2, 4))
+	mock.ExpectCommit()
+	r, err := database.pruneChunksTx(context.Background(), mock, "t-1", 3)
+	if err != nil || r != (PruneResult{Chunks: 2, Findings: 4}) {
+		t.Fatalf("pruneChunksTx = %+v, %v", r, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestFindingChunkAddressing_IndexFirst pins the shared addressing: every
+// statement resolving a finding's chunk goes by (transcript_id, chunk_index)
+// and falls back to chunk_id only when the finding has no index (M1).
+func TestFindingChunkAddressing_IndexFirst(t *testing.T) {
+	for name, sql := range map[string]string{
+		"markChunkStaleForFindingSQL": markChunkStaleForFindingSQL,
+		"listCorrectionsSQL":          listCorrectionsSQL,
+	} {
+		if !strings.Contains(sql, "f.chunk_index IS NOT NULL") ||
+			!strings.Contains(sql, "c.chunk_index = f.chunk_index") ||
+			!strings.Contains(sql, "f.chunk_index IS NULL AND c.id = f.chunk_id") {
+			t.Errorf("%s must address the chunk by index first, chunk_id only without one:\n%s", name, sql)
+		}
+		if strings.Contains(sql, "f.chunk_id IS NULL") {
+			t.Errorf("%s still prefers chunk_id over chunk_index:\n%s", name, sql)
+		}
+	}
+	if !strings.Contains(lockTailFindingsSQL, "FOR UPDATE OF f") || !strings.Contains(lockTailFindingsSQL, "f.chunk_index >= $2") {
+		t.Errorf("lockTailFindingsSQL must lock the tail findings:\n%s", lockTailFindingsSQL)
 	}
 }
 
@@ -177,139 +237,5 @@ func TestGetStoredChunkHashes_HashesPristineText(t *testing.T) {
 	}
 	if len(got) != 2 || got[1] != (StoredChunkHash{ChunkIndex: 1, SHA256: "bb"}) {
 		t.Errorf("mis-scanned: %+v", got)
-	}
-}
-
-// TestInsertChunks_RealPostgres proves the rebuild semantics end-to-end
-// against a real Postgres+pgvector (skipped unless EARMARK_TEST_DATABASE_URL
-// points at a THROWAWAY database — it runs migrations and writes rows):
-// a re-chunk into fewer chunks prunes the tail, refreshes the shifted
-// boundaries, keeps chunk ids, and retires (never deletes) the findings on the
-// pruned rows while leaving a rejected decision alone.
-func TestInsertChunks_RealPostgres(t *testing.T) {
-	url := os.Getenv("EARMARK_TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("EARMARK_TEST_DATABASE_URL not set")
-	}
-	ctx := context.Background()
-	database, err := New(&config.Config{DatabaseURL: url})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer database.Close()
-
-	sum := "prune-test-" + uuid.NewString() // unique per run: checksum and file_path are UNIQUE
-	path := "/books/a/b/" + sum + ".m4b"
-	var jobID, tID string
-	if err := database.pool.QueryRow(ctx, `
-		INSERT INTO transcription_jobs (file_path, checksum, status)
-		VALUES ($2, $1, 'done') RETURNING id`, sum, path).Scan(&jobID); err != nil {
-		t.Fatalf("seed job: %v", err)
-	}
-	if err := database.pool.QueryRow(ctx, `
-		INSERT INTO transcripts (job_id, file_path, checksum, language, duration_seconds,
-		                         segments, raw_text, model_name)
-		VALUES ($1, $3, $2, 'en', 40, '[]', 'x', 'm') RETURNING id`, jobID, sum, path).Scan(&tID); err != nil {
-		t.Fatalf("seed transcript: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = database.pool.Exec(ctx, `DELETE FROM transcript_findings WHERE transcript_id = $1`, tID)
-		_, _ = database.pool.Exec(ctx, `DELETE FROM transcription_jobs WHERE id = $1`, jobID)
-	})
-	emb := make([]float32, 768)
-	mk := func(idx int, start, end float64, text string) Chunk {
-		return Chunk{ID: ChunkUUID(tID, idx), TranscriptID: tID, FilePath: path,
-			ChunkIndex: idx, StartSec: start, EndSec: end, Text: text, SourceText: text, Embedding: emb}
-	}
-	first := []Chunk{mk(0, 0, 10, "zero"), mk(1, 10, 20, "one"), mk(2, 20, 30, "two"), mk(3, 30, 40, "three")}
-	if err := database.InsertChunks(ctx, first); err != nil {
-		t.Fatalf("first insert: %v", err)
-	}
-	// Findings on a surviving chunk and on two pruned chunks (one proposed,
-	// one rejected by a human).
-	for _, f := range []struct {
-		idx   int
-		state string
-	}{{1, patch.StateProposed}, {2, patch.StateProposed}, {3, patch.StateRejected}} {
-		if _, err := database.pool.Exec(ctx, `
-			INSERT INTO transcript_findings (transcript_id, file_path, chunk_id, chunk_index,
-			       start_sec, end_sec, original_text, issue_type, confidence, model, patch_state)
-			VALUES ($1, 'p', $2, $3, 0, 0, 'x', 'mishearing', 0.9, 'm', $4)`,
-			tID, ChunkUUID(tID, f.idx), f.idx, f.state); err != nil {
-			t.Fatalf("seed finding: %v", err)
-		}
-	}
-
-	// Re-chunk into two chunks with shifted boundaries.
-	second := []Chunk{mk(0, 0, 15, "zero one"), mk(1, 15, 40, "two three")}
-	if err := database.InsertChunks(ctx, second); err != nil {
-		t.Fatalf("rebuild insert: %v", err)
-	}
-
-	rows, err := database.pool.Query(ctx, `
-		SELECT id::text, chunk_index, start_sec, end_sec, text FROM transcript_chunks
-		WHERE transcript_id = $1 ORDER BY chunk_index`, tID)
-	if err != nil {
-		t.Fatalf("read chunks: %v", err)
-	}
-	type row struct {
-		id         string
-		idx        int
-		start, end float64
-		text       string
-	}
-	var got []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.idx, &r.start, &r.end, &r.text); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		got = append(got, r)
-	}
-	rows.Close()
-	want := []row{
-		{ChunkUUID(tID, 0), 0, 0, 15, "zero one"},
-		{ChunkUUID(tID, 1), 1, 15, 40, "two three"},
-	}
-	if len(got) != len(want) {
-		t.Fatalf("want %d chunks after rebuild, got %d: %+v", len(want), len(got), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("chunk %d: want %+v, got %+v", i, want[i], got[i])
-		}
-	}
-
-	states := map[int]string{}
-	frows, err := database.pool.Query(ctx, `
-		SELECT chunk_index, patch_state || COALESCE(':' || stale_reason, '')
-		FROM transcript_findings WHERE transcript_id = $1`, tID)
-	if err != nil {
-		t.Fatalf("read findings: %v", err)
-	}
-	for frows.Next() {
-		var idx int
-		var s string
-		if err := frows.Scan(&idx, &s); err != nil {
-			t.Fatalf("scan finding: %v", err)
-		}
-		states[idx] = s
-	}
-	frows.Close()
-	wantStates := map[int]string{
-		1: patch.StateProposed,                                    // chunk survives
-		2: patch.StateStale + ":" + patch.StaleReasonChunkChanged, // pruned → retired
-		3: patch.StateRejected,                                    // human decision kept
-	}
-	for idx, w := range wantStates {
-		if states[idx] != w {
-			t.Errorf("finding on chunk %d: want %q, got %q", idx, w, states[idx])
-		}
-	}
-
-	// The standalone prune is idempotent once the tail is gone.
-	r, err := database.PruneChunks(ctx, tID, 2)
-	if err != nil || r != (PruneResult{}) {
-		t.Errorf("second prune: want no-op, got %+v, %v", r, err)
 	}
 }

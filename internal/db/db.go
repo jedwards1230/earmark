@@ -1342,14 +1342,47 @@ var insertChunkSQL = `
 	    speaker     = EXCLUDED.speaker
 `
 
+// findingChunkAddressDoc — how a finding names its chunk, shared by every
+// statement that resolves one (pruneChunksSQL, markChunkStaleForFindingSQL,
+// listCorrectionsSQL):
+//
+// A finding is addressed by (transcript_id, chunk_index) whenever it recorded
+// a chunk_index, and by chunk_id only when it did not. chunk_index is the
+// address the replay uses (the overlay is keyed by it), so every other
+// statement must resolve the SAME row. chunk_id is NOT reliable on its own:
+// 25,442 of 32,337 live findings (2026-10-06) carry a UUIDv5 chunk_id while
+// the row at their index has a random id from the ungated embed path, so a
+// chunk_id-first lookup matches nothing for them. Wherever both resolve to a
+// row they resolve to the same one (ids and indexes are paired by
+// construction; verified live: 0 findings whose chunk_id names a row at a
+// different index), so index-first addressing is a strict superset. The two
+// arms are mutually exclusive, so a finding never matches two chunks.
+
+// lockTailFindingsSQL row-locks the findings a prune to `keep` may retire,
+// BEFORE any chunk row is touched. SetPatchState locks a finding and then its
+// chunk; taking the finding locks first here gives the prune the same order,
+// so an accept racing a rebuild waits instead of deadlocking. A decision that
+// committed first is then retired by the prune (the state guard re-checks);
+// one that waits sees `stale` afterwards and gets ErrPatchStateConflict.
+var lockTailFindingsSQL = `
+	SELECT f.id FROM transcript_findings f
+	WHERE f.transcript_id = $1
+	  AND (f.chunk_index >= $2
+	       OR (f.chunk_index IS NULL AND f.chunk_id IN (
+	           SELECT c.id FROM transcript_chunks c
+	           WHERE c.transcript_id = $1 AND c.chunk_index >= $2)))
+	ORDER BY f.id
+	FOR UPDATE OF f
+`
+
 // pruneChunksSQL deletes a transcript's chunk rows at chunk_index >= $2 — the
 // tail a re-chunk into FEWER chunks leaves behind — and, in the same statement,
-// retires the findings anchored to those rows.
+// retires the findings addressed to that tail.
 //
 // Nothing has a foreign key to transcript_chunks (transcript_findings.chunk_id
 // is a bare UUID, by design — CONTRACT §2.15), so the DELETE can never fail or
-// cascade. Findings are NEVER deleted: those on a pruned row in a state that
-// may legally become `stale` ($4 = staleFromStates: proposed, accepted,
+// cascade. Findings are NEVER deleted: those addressed to the tail in a state
+// that may legally become `stale` ($4 = staleFromStates: proposed, accepted,
 // applied) are moved to `stale` with reason $3 (chunk_changed) — exactly what
 // the replay already does to an accepted/applied correction whose chunk_index
 // no longer exists (applyOverlay's "orphaned" set). decided_at/decided_by are
@@ -1358,24 +1391,25 @@ var insertChunkSQL = `
 // on a pruned chunk would flag no chunk for rebuild and sit `accepted`
 // forever, invisible.
 //
-// A finding is matched to a pruned row by chunk_id, or — for rows written
-// before chunk_id was populated — by (transcript_id, chunk_index).
+// "Addressed to the tail" follows the shared finding→chunk addressing (see
+// findingChunkAddressDoc above): chunk_index >= $2, or — only for a
+// finding with no chunk_index — a chunk_id naming a pruned row. Matching by
+// chunk_id alone would miss every finding whose chunk_id never named a real
+// row. A finding at chunk_index >= $2 is retired even when no row was pruned
+// for it: the text it describes is not in the new projection either way.
 var pruneChunksSQL = `
 	WITH pruned AS (
 	    DELETE FROM transcript_chunks
 	    WHERE transcript_id = $1 AND chunk_index >= $2
-	    RETURNING id, chunk_index
+	    RETURNING id
 	), retired AS (
 	    UPDATE transcript_findings f
 	    SET patch_state  = 'stale',
 	        stale_reason = $3
 	    WHERE f.transcript_id = $1
 	      AND f.patch_state = ANY($4)
-	      AND EXISTS (
-	          SELECT 1 FROM pruned p
-	          WHERE f.chunk_id = p.id
-	             OR (f.chunk_id IS NULL AND f.chunk_index = p.chunk_index)
-	      )
+	      AND (f.chunk_index >= $2
+	           OR (f.chunk_index IS NULL AND f.chunk_id IN (SELECT id FROM pruned)))
 	    RETURNING f.id
 	)
 	SELECT (SELECT count(*) FROM pruned), (SELECT count(*) FROM retired)
@@ -1392,7 +1426,18 @@ type rowQueryer interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// lockTailFindings takes the finding locks a prune to keep needs, before any
+// chunk row is locked (see lockTailFindingsSQL).
+func lockTailFindings(ctx context.Context, e execer, transcriptID string, keep int) error {
+	if _, err := e.Exec(ctx, lockTailFindingsSQL, transcriptID, keep); err != nil {
+		return fmt.Errorf("lock findings at chunk_index >= %d for transcript %s: %w", keep, transcriptID, err)
+	}
+	return nil
+}
+
 // pruneChunks runs pruneChunksSQL for one transcript, keeping chunk_index < keep.
+// The caller must already hold the finding locks (lockTailFindings) in the
+// same transaction.
 func pruneChunks(ctx context.Context, q rowQueryer, transcriptID string, keep int) (PruneResult, error) {
 	var r PruneResult
 	if err := q.QueryRow(ctx, pruneChunksSQL, transcriptID, keep,
@@ -1403,15 +1448,35 @@ func pruneChunks(ctx context.Context, q rowQueryer, transcriptID string, keep in
 }
 
 // PruneChunks deletes the transcript's chunk rows at chunk_index >= keep and
-// retires the findings anchored to them (see pruneChunksSQL). It is the
-// one-off cleanup behind `earmark prune-chunks --yes` for orphans written
-// before InsertChunks pruned them itself. keep must be positive: a transcript
-// is never pruned down to nothing.
+// retires the findings addressed to them (see pruneChunksSQL), in one
+// transaction that takes the finding locks first. It is the one-off cleanup
+// behind `earmark prune-chunks --yes` for orphans written before InsertChunks
+// pruned them itself. keep must be positive: a transcript is never pruned down
+// to nothing.
 func (db *DB) PruneChunks(ctx context.Context, transcriptID string, keep int) (PruneResult, error) {
+	return db.pruneChunksTx(ctx, db.pool, transcriptID, keep)
+}
+
+func (db *DB) pruneChunksTx(ctx context.Context, b txBeginner, transcriptID string, keep int) (PruneResult, error) {
 	if keep <= 0 {
 		return PruneResult{}, fmt.Errorf("prune chunks for transcript %s: keep must be positive, got %d", transcriptID, keep)
 	}
-	return pruneChunks(ctx, db.pool, transcriptID, keep)
+	tx, err := b.Begin(ctx)
+	if err != nil {
+		return PruneResult{}, fmt.Errorf("begin prune tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockTailFindings(ctx, tx, transcriptID, keep); err != nil {
+		return PruneResult{}, err
+	}
+	r, err := pruneChunks(ctx, tx, transcriptID, keep)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PruneResult{}, fmt.Errorf("commit prune for transcript %s: %w", transcriptID, err)
+	}
+	return r, nil
 }
 
 // InsertChunks stores a transcript's freshly (re)built chunks with their
@@ -1424,6 +1489,11 @@ func (db *DB) PruneChunks(ctx context.Context, transcriptID string, keep int) (P
 // re-chunks into fewer chunks leaves the old tail behind — orphans that still
 // match searches and still carry findings. Chunks for several transcripts may
 // be passed; each is pruned against its own highest index.
+//
+// Lock order: the findings the prune may retire are locked FIRST
+// (lockTailFindingsSQL), then the chunk rows (upsert, prune). SetPatchState
+// takes a finding and then its chunk, so both paths lock findings → chunks and
+// an accept racing a rebuild waits rather than deadlocks.
 func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 	return db.insertChunks(ctx, db.pool, chunks)
 }
@@ -1434,23 +1504,12 @@ func (db *DB) insertChunks(ctx context.Context, b txBeginner, chunks []Chunk) er
 		// transcript's chunks on an empty rebuild.
 		return nil
 	}
-	tx, err := b.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin chunk tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 
 	// keep[t] = highest chunk_index written for transcript t, plus one. Ordered
-	// by first appearance so the prune statements run deterministically.
+	// by first appearance so the lock and prune statements run deterministically.
 	keep := map[string]int{}
 	var order []string
 	for _, c := range chunks {
-		if _, err := tx.Exec(ctx, insertChunkSQL,
-			c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
-			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding),
-		); err != nil {
-			return fmt.Errorf("insert chunk %d: %w", c.ChunkIndex, err)
-		}
 		k, ok := keep[c.TranscriptID]
 		if !ok {
 			order = append(order, c.TranscriptID)
@@ -1459,12 +1518,32 @@ func (db *DB) insertChunks(ctx context.Context, b txBeginner, chunks []Chunk) er
 			keep[c.TranscriptID] = c.ChunkIndex + 1
 		}
 	}
+
+	tx, err := b.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin chunk tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, tid := range order {
+		if err := lockTailFindings(ctx, tx, tid, keep[tid]); err != nil {
+			return err
+		}
+	}
+	for _, c := range chunks {
+		if _, err := tx.Exec(ctx, insertChunkSQL,
+			c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
+			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding),
+		); err != nil {
+			return fmt.Errorf("insert chunk %d: %w", c.ChunkIndex, err)
+		}
+	}
 	for _, tid := range order {
 		r, err := pruneChunks(ctx, tx, tid, keep[tid])
 		if err != nil {
 			return err
 		}
-		if r.Chunks > 0 {
+		if r.Chunks > 0 || r.Findings > 0 {
 			db.log.Info("pruned orphan chunks left by a previous chunking",
 				"transcript_id", tid, "kept", keep[tid],
 				"pruned_chunks", r.Chunks, "retired_findings", r.Findings)
