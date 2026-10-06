@@ -16,6 +16,7 @@ version is in `goose_db_version`.
 | 2 | `00002_recipes.sql` | `recipes`; `recipe_id` on `transcripts`, `transcript_findings`, `transcript_chunks`; legacy backfill |
 | 3 | `00003_stale_work.sql` | `current_recipes`; the `stale_work` view |
 | 4 | `00004_unanchorable.sql` | `unanchorable` patch state; `unanchorable_reason`, `reanchored_at` on `transcript_findings` |
+| 5 | `00005_requeue_archive.sql` | `superseded` patch state + `superseded_at`; `transcript_findings.transcript_id` nullable, FK to `transcripts(id) ON DELETE SET NULL`, CHECK `transcript_id IS NOT NULL OR patch_state = 'superseded'`; existing orphans archived as `superseded` first; `stale_work` skips superseded findings |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -323,14 +324,16 @@ for the `list_books` inventory and its `series` filter.
 Advisory suspected-error findings recorded by the read-only LLM judge
 (`internal/eval`, `earmark eval`). The eval layer is **strictly read-then-insert**:
 it READS `transcripts`/`transcript_chunks` and INSERTs here; it NEVER updates,
-deletes, or alters the transcript tables, and this table has no FK that could
-cascade a mutation back into them. `suggested_correction` is informational only —
-never applied.
+deletes, or alters the transcript tables. The one foreign key points the other
+way and never cascades into them: `transcript_id → transcripts(id) ON DELETE SET
+NULL` (migration 5), so a requeue that deletes a transcript keeps its findings,
+archived as `superseded` with `transcript_id` NULL (CONTRACT §1.4).
+`suggested_correction` is informational only — never applied.
 
 ```sql
 CREATE TABLE IF NOT EXISTS transcript_findings (
     id                   UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-    transcript_id        UUID        NOT NULL,
+    transcript_id        UUID        REFERENCES transcripts (id) ON DELETE SET NULL,  -- NULL only when superseded (CHECK)
     file_path            TEXT        NOT NULL,
     chunk_id             UUID,
     chunk_index          INTEGER,
@@ -353,7 +356,9 @@ the transcript, so findings are attributable per ASR backend/run.
 
 Additive columns from the reviewable-patch migration are omitted above for
 brevity: `patch_state` (the `proposed → accepted → applied → reverted` /
-`rejected` / `stale` / `unanchorable` machine), the anchor trio (`anchor_offset`,
+`rejected` / `stale` / `unanchorable` machine, plus the terminal `superseded`
+that requeue archives every state into), `superseded_at` (when a requeue
+archived it; migration 5), the anchor trio (`anchor_offset`,
 `anchor_occurrence`, `chunk_text_sha256`), `decided_at`/`decided_by`,
 `applied_at`/`applied_before_text`/`applied_after_text` (**span**-level, not
 whole-chunk), and `stale_reason`. This table is the authoritative home of a
@@ -369,6 +374,7 @@ Migration 4 adds the re-anchor pass's columns (`earmark reanchor`, CONTRACT
 unanchorable_reason TEXT,         -- 'anchor_not_found' | 'anchor_ambiguous'; set iff patch_state = 'unanchorable'
 reanchored_at       TIMESTAMPTZ,  -- last time earmark reanchor wrote this row's anchor or state; NULL = never
 -- CHECK patch_state IN (proposed, accepted, rejected, applied, stale, reverted, unanchorable)
+--   (migration 5 appends 'superseded')
 -- CHECK (patch_state = 'unanchorable') = (unanchorable_reason IS NOT NULL)
 ```
 
@@ -377,7 +383,9 @@ A re-anchor rewrites the existing anchor columns in place — `chunk_id`,
 `anchor_occurrence` — and never touches a finding outside
 `proposed`/`unanchorable`. `start_sec`/`end_sec` keep the judged audio window
 (the next re-anchor searches by it). An `unanchorable` row keeps its original
-anchor.
+anchor. A requeue supersedes `unanchorable` findings like any other and clears
+their `unanchorable_reason` (the CHECK above); the re-anchor pass never reads a
+`superseded` row or one with a NULL `transcript_id`.
 
 ### 8. `recipes` — Provenance (CONTRACT §1.9)
 
@@ -420,7 +428,7 @@ The ingest process upserts the current `embed` and `propose` recipes at
 startup. Right after the first deploy every legacy row is stale (≈39,644 chunks and
 ≈32,337 findings on production): none was made by the current configuration. `stale_work` lists every output row whose recipe differs from its
 step's current recipe in anything but `code_version` (unstamped rows count as
-stale; steps without a current recipe and human corrections never appear).
+stale; steps without a current recipe, human corrections and superseded findings never appear).
 
 ## Relationships
 

@@ -83,7 +83,7 @@ This renders the full status dashboard against synthetic data — no Postgres, n
 | `earmark serve` | Standalone HTTP search API — `GET /search` on `:8080` |
 | `earmark list` | List content from the database |
 | `earmark search <query>` | Semantic search from the CLI (`--text` for keyword, `--limit`, `--precision`) |
-| `earmark requeue [book]` | Re-transcribe, retry failed, or re-embed (`--reembed`, `--failed`; dry-run unless `--yes`) |
+| `earmark requeue [book]` | Re-transcribe, retry failed, or re-embed (`--reembed`, `--failed`; dry-run unless `--yes`). Re-transcribing archives the old transcript's findings as `superseded` (never deleted) and judges the new one fresh; `--reembed` keeps findings |
 | `earmark reanchor` | Re-anchor proposed findings to the current chunks after a re-chunk; unplaceable ones become `unanchorable` (`--book`, `--limit`, `--batch`; dry-run unless `--yes`). See CONTRACT §2.17 |
 | `earmark eval [book]` | Read-only LLM judge — flags suspected transcript errors (dry-run unless `--write`). `--backfill-unevaluated` judges every transcript not yet judged (the judging pass when `EVAL_IN_PIPELINE=false`); `--backfill-eval-errors` re-judges transcripts whose judging failed; `--limit N` caps the transcripts judged successfully (skipped/failed ones don't count); `--max-attempts N` caps judge calls (default 3×`--limit`); exits non-zero when it judged but latched nothing. Run `prune-chunks --yes` before a backfill |
 | `earmark prune-chunks` | Delete orphan chunk rows a re-chunk into fewer chunks left behind (CONTRACT §2.17; dry-run unless `--yes`) |
@@ -121,7 +121,7 @@ gate on proposed transcript corrections:
 | `list_books` | Library inventory: author, title, series, track progress, duration, word count |
 | `semantic_search_audiobooks` | Vector-similarity search; hits carry a cosine similarity score |
 | `text_search_audiobooks` | Trigram literal/keyword search |
-| `get_transcript` | Read a track's full transcript as timestamped segments (paginated) |
+| `get_transcript` | Read a track's full transcript (paginated): the corrected text when it has reviewed corrections (chunks, no word timestamps), else timestamped ASR segments |
 | `get_chunk_context` | Expand the chunks surrounding a search hit |
 | `list_transcript_corrections` | Worklist of proposed/decided transcript corrections |
 | `decide_transcript_correction` | **Writes.** Accept, reject, revert, or reconsider a correction |

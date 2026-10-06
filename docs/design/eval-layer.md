@@ -89,9 +89,10 @@ Notes:
 
 - `transcript_id` is **not** a foreign key with `ON DELETE CASCADE` back into
   the transcript table in a way that would let findings mutate transcripts.
-  Findings are downstream, advisory observations; a requeue that drops a
-  transcript may orphan findings, which is acceptable (they describe a now-stale
-  run; cleanup is a separate, additive concern, mirroring `run_metrics`).
+  Findings are downstream, advisory observations. *(Superseded: since migration
+  5 it is a foreign key `ON DELETE SET NULL`, and a requeue archives the
+  transcript's findings as `superseded` instead of orphaning them — CONTRACT
+  §1.4.)*
 - `transcription_run_id` is the `transcription_jobs.id` of the run that produced
   the transcript. This is what makes findings **attributable per backend/run** —
   the same judge over Parakeet vs Whisper output yields two run ids you can

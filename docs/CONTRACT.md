@@ -572,26 +572,85 @@ In addition to the runner/service transitions above, an operator may move a job
 `failed` job returns to `pending`. It is always operator-initiated (never the
 runner) and is transactional:
 
-- **Re-transcribe**: delete the job's row in `transcripts` (which cascades to
-  `transcript_chunks`), delete the job's `run_metrics` row, and `UPDATE … SET
-  status='pending', attempts=0, error=NULL, claimed_by=NULL, claimed_at=NULL`.
-  All in **one transaction**. The runner then re-processes it like any pending
-  job. The `run_metrics` delete is required because requeue *updates* the job row
-  rather than deleting it, so the `run_metrics → transcription_jobs ON DELETE
-  CASCADE` never fires; left in place, the row would describe the now-deleted
-  transcript (orphaned telemetry for the prior run).
-- **Re-embed only**: delete the matching rows in `transcript_chunks` and leave
-  `transcripts`/`transcription_jobs` untouched. The Go worker re-embeds on its
-  next poll (it selects transcripts with no chunks). Use after an embedding
-  model or `CHUNK_SIZE` change — no re-transcription.
+- **Re-transcribe** (requeue = archive, then re-judge). In **one transaction**,
+  in this order:
+  1. `UPDATE transcription_jobs SET status='pending', attempts=0, error=NULL,
+     claimed_by=NULL, claimed_at=NULL … RETURNING id, file_path` — the selector
+     (path substring, `--failed`, one id, one book dir). Every later step is
+     keyed on the returned job ids, so all entry points behave identically.
+  2. **Lock the transcripts**: `SELECT 1 FROM transcripts WHERE job_id =
+     ANY($1) FOR UPDATE`. This conflicts with the `FOR KEY SHARE` lock the
+     foreign-key check takes on every finding `INSERT` (a judge run, a human
+     direct edit), so concurrent writers are serialized: an insert already in
+     flight commits first and is archived by step 3; one that starts later
+     blocks until the requeue commits and then fails with a foreign-key
+     violation. Without it, a finding committed between steps 3 and 4 would
+     survive as a live-looking row with no transcript.
+  3. **Archive the findings**: every `transcript_findings` row of those jobs'
+     transcripts moves to `patch_state='superseded'` with `superseded_at=now()`
+     (§2.17). This includes human decisions — `accepted`, `applied`, `rejected`,
+     `reverted` and `origin='human'` corrections — which are archived, **never
+     deleted**. The from-states are derived from `patch.CanTransition`.
+  4. Delete the transcripts. `transcript_chunks` cascade; the findings keep
+     their rows and get `transcript_id = NULL` through the foreign key's
+     `ON DELETE SET NULL`. Step 3 must come first: afterwards the findings can no
+     longer be found by transcript.
+  5. Delete the jobs' `run_metrics` rows. Required because requeue *updates* the
+     job row rather than deleting it, so `run_metrics → transcription_jobs ON
+     DELETE CASCADE` never fires; left in place, the row would describe the
+     now-deleted transcript and keep its `eval_finished_at` latch.
 
-Both modes regenerate every chunk: the same `chunk_index` can now hold
+  The runner then re-processes the job like any pending job, and the **new
+  transcript is judged fresh**: it has a new id, so it has no findings (the eval
+  dedupe keys are per transcript), nothing to replay, and a clear eval latch.
+  Superseded findings stay readable for audit and the bench
+  (`list_transcript_corrections state=superseded`). The CLI
+  (`earmark requeue <substr>` / `--failed`), the dashboard buttons
+  (`/actions/requeue`, `/actions/retry-failed`, `/actions/book-requeue`) all go
+  through this one code path (`db.requeue`).
+- **Re-embed only** (`--reembed`): delete the matching rows in
+  `transcript_chunks` and leave `transcripts`/`transcription_jobs` — and the
+  findings — untouched. The Go worker re-embeds on its next poll (it selects
+  transcripts with no chunks). Use after an embedding model or `CHUNK_SIZE`
+  change — no re-transcription. Findings are **not** superseded: the transcript
+  they describe still exists. Their `chunk_id` no longer names a live chunk, but
+  the overlay is keyed by transcript and `chunk_index` and guarded by the chunk
+  hash, so accepted/applied corrections replay onto a rebuild that reproduces the
+  same chunk text, and are retired as `stale` (`chunk_changed`) when it does not
+  (e.g. after a `CHUNK_SIZE` change). Re-anchoring findings to re-chunked text is
+  the re-anchor pass's job, not requeue's.
+
+A re-embed regenerates every chunk: the same `chunk_index` can now hold
 different text — under the same deterministic id (`ChunkUUID(transcript_id,
 chunk_index)`) or a new one — and a `CHUNK_SIZE` change also moves the
-boundaries. Either way every finding's anchor is orphaned (the hash, not the
-id, is what proves an anchor current). Run
-`earmark reanchor` once the worker has rebuilt the chunks (§2.17
-"Re-anchoring"); until it runs, replaying an old finding retires it as `stale`.
+boundaries. Either way the kept findings' anchors are orphaned (the hash, not
+the id, is what proves an anchor current). Run `earmark reanchor` once the
+worker has rebuilt the chunks (§2.17 "Re-anchoring"); until it runs, replaying
+an old finding retires it as `stale`. A re-transcribe needs no re-anchor: its
+findings are superseded and the new transcript is judged fresh.
+
+**The `transcript_findings.transcript_id` foreign key** (migration 5).
+`REFERENCES transcripts(id) ON DELETE SET NULL`, so a finding can never point at a
+transcript that does not exist. Before it existed, requeue left findings
+orphaned (no FK); migration 5 archives any such orphans as `superseded` (with
+`transcript_id = NULL`, `superseded_at` NULL — when their requeue happened was
+never recorded) before adding the constraint, validated in the same
+transaction (live 2026-10-06: 0 orphans of 32,337 findings, so validation is a
+millisecond index anti-join). The FK deliberately does **not** cascade: a
+transcript delete must never delete a human decision.
+
+A NULL `transcript_id` therefore always means "archived by a requeue", and the
+database enforces it: `CHECK (transcript_id IS NOT NULL OR patch_state =
+'superseded')` (`transcript_findings_null_transcript_superseded`). A transcript
+`DELETE` that would leave a live finding behind — any delete other than
+requeue's, or a requeue that missed a row — fails instead of orphaning it.
+Together with the row lock in step 2, an `INSERT` of a finding for a transcript
+that a requeue is replacing either lands first and is archived, or fails with a
+foreign-key violation once the requeue has committed. The migration sets
+`lock_timeout = '5s'`: its `ALTER`s hold `ACCESS EXCLUSIVE` on
+`transcript_findings` for the transaction, and behind a long reader they would
+otherwise queue and stall every later reader; a timed-out migration fails the
+process start, which retries it.
 
 ### 1.5 Per-run observability — `run_metrics` table
 
@@ -988,6 +1047,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 2 | `00002_recipes.sql` | `recipes` + nullable `recipe_id` on `transcripts`, `transcript_findings`, `transcript_chunks`; legacy backfill (§1.9). |
 | 3 | `00003_stale_work.sql` | `current_recipes` + the `stale_work` view (§1.9). |
 | 4 | `00004_unanchorable.sql` | The `unanchorable` patch state, `unanchorable_reason` and `reanchored_at` on `transcript_findings` (§2.17 "Re-anchoring"). |
+| 5 | `00005_requeue_archive.sql` | Requeue archives findings (§1.4 "Operator requeue"): `patch_state` gains `superseded`, `superseded_at` column, `transcript_findings.transcript_id` becomes nullable with a foreign key to `transcripts(id) ON DELETE SET NULL` and a CHECK that only superseded findings may have no transcript; existing orphans are archived as `superseded` first; `stale_work` skips superseded findings. Not purely additive — see §1.4. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. Migrations stay additive unless a change says otherwise, and
@@ -1166,7 +1226,8 @@ fields, prompt version and hash, and `params` — **not** `code_version`, so a
 release that changes nothing does not mark the library stale; a logic change
 bumps `step_version`. Unstamped rows are stale whenever their step has a
 current recipe; a step with no current recipe (asr, today) reports nothing;
-human corrections are never listed. Metrics over it arrive in PR 0b-4.
+human corrections and `superseded` findings (archived by a requeue, §1.4 —
+not work to redo; filtered since migration 5) are never listed. Metrics over it arrive in PR 0b-4.
 
 **Expect a large `stale_work` right after the first deploy.** Every legacy row
 has `step_version` 0 and no prompt hash, so none is equivalent to a current
@@ -1264,14 +1325,15 @@ chunk is *tens of consecutive segments* grouped to a token budget), while a
 (silence-gap split with a duration cap, §1.2.1 — typically a few seconds, many
 per chunk) that always carries its own `words[]`. The search tools +
 `get_chunk_context` operate on **chunks**; `get_transcript` paginates
-**segments** (and, with `includeWordTimestamps=true`, their per-word times).
+**segments** (and, with `includeWordTimestamps=true`, their per-word times) — or,
+for a track with reviewed corrections, **chunks** of the corrected text.
 
 | Tool | Purpose | Key params |
 |------|---------|-----------|
 | `list_books` | Library **inventory**: per book → author, title, track progress (done/total), total duration, word count, embedded-chunk count. Em dash / 0 for books with no `run_metrics` yet. Ordered **transcribed-first** (fully-done books, then partial, then fully-pending). Leads with a one-line whole-library summary (`Library: T books — P fully transcribed, Q with pending tracks.` — TRUE totals across the library, not just the page). `format=flat` (default) **omits each book's `dir:` line** to keep the payload small; `format=tree` groups rows under their authors **and** keeps the `dir:` line; `format=series` groups rows under their **series name**, ordered by sequence within each group, with a trailing **"No series"** group so no book disappears (a book in several series is listed under each — by design). | `author?` (substring filter), `series?` (case-insensitive substring on `book_metadata.series`, §1.6 — so `Dune` matches both `Dune #2` and `The Dune Sequence #13`; books with no series row are excluded), `format?` (`flat` default \| `tree` \| `series`), `limit?` (default 50), `offset?` |
 | `semantic_search_audiobooks` | Vector-similarity (meaning) search; hits show a real cosine `similarity: NN%`. Whole library by default; `book` scopes it. `snippet?` caps each hit's quoted text (leading **preview** — no sub-chunk match position). | `query` (required), `book?`, `threshold?` (0.3), `limit?` (10), `snippet?` (max chars; floored to 80) |
 | `text_search_audiobooks` | Trigram literal/keyword search; hits are labelled **"ranked by trigram match"** (NOT a similarity %, which would mislead on a literal hit). Whole library by default; `book` scopes it. `snippet?` returns an excerpt **centred on the literal match**. | `query` (required), `book?`, `limit?` (10), `snippet?` (max chars; floored to 80) |
-| `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. Per-word timestamps are **hidden by default**; `includeWordTimestamps=true` adds each segment's `words[]` (word/start/end, plus score/speaker when present) for "exactly when was X said" queries. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments), `includeWordTimestamps?` (false) |
+| `get_transcript` | Read a track's full transcript (paginated — `raw_text` can be 600k+ chars). When the track has reviewed corrections it serves the **corrected** text — the chunk projection search returns — as **chunks** with their time ranges and no word timestamps (`corrected: true`); otherwise the ASR record as timestamped **segments** (`corrected: false`). Multi-track book → returns a track chooser to pick a `trackID`. Per-word timestamps are **hidden by default**; `includeWordTimestamps=true` returns the ASR segments with each segment's `words[]` (word/start/end, plus score/speaker when present) for "exactly when was X said" queries — always the uncorrected text, flagged in `note` when corrections exist. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments; 10 chunks, max 25, in corrected mode), `includeWordTimestamps?` (false) |
 | `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (**default 1** → ~3 chunks; clamped to 0–50 to bound the response size) |
 | `list_transcript_corrections` | Read-only review **worklist** (§2.17): each row is a finding with pristine chunk context, an anchor-resolution status, and its legal next actions (`allowedActions`). Defaults to the undecided (`proposed`) queue. | `state?` (comma-separated patch states, or `all`/`any`; default `proposed`), `book?`, `path?`, `id?` (a single finding), `min_confidence?` (0), `limit?` (20, capped 200), `offset?` (0) |
 | `decide_transcript_correction` | **Writes.** Accept / reject / revert / reconsider one finding — drives `db.SetPatchState`, validated against `patch.CanTransition` and compare-and-swapped on the expected current state. Accept/revert flag the chunk `embedding_stale`; reject changes no text. An `unanchorable` finding offers no action (only `earmark reanchor` moves it, §2.17). | `id` (required), `action` (required: `accept`\|`reject`\|`revert`\|`reconsider`), `decided_by?` (default `"agent"`, stored `mcp:`-prefixed), `expected_state?` (optional CAS guard) |
@@ -1286,12 +1348,29 @@ human-readable text, which is kept as the spec-required back-compat fallback
 row's `content` honouring the `snippet` window when one is set);
 `list_books` → `{ format, books[], totals, total, offset, nextOffset? }`;
 `get_transcript` → `{ kind: "transcript", filePath, language, modelName,
-durationSeconds, segments[], offset, limit, totalSegments, nextOffset? }` for a
+durationSeconds, corrected, unit, segments[] | chunks[], offset, limit,
+totalSegments, totalChunks?, correctedChunks?, note?, nextOffset? }` for a
 page, or `{ kind: "trackChooser", book, tracks[] }` when a book has multiple
-tracks. Each segment is `{ start, end, text }`; with `includeWordTimestamps=true`
-it also carries `words[]` — each `{ word, start, end, score?, speaker? }`
-(`score`/`speaker` present only when the ASR backend supplied them). The `words`
-field is **omitted entirely** by default, so the default response is unchanged.
+tracks. `corrected` is always present and says which text the page is:
+`false` → `unit: "segment"`, `segments[]` from the immutable ASR record;
+`true` → `unit: "chunk"`, `chunks[]` of the corrected projection (§2.17), each
+`{ chunkID, chunkIndex, start, end, text, corrected }` (`corrected` marks a
+chunk that differs from the ASR text), with **no word timestamps**.
+`offset`/`limit`/`nextOffset` count `unit`s. A track is served corrected when at
+least one of its chunks' projected `text` differs from its pristine
+`source_text` — i.e. exactly when search would return different text from the
+ASR record; an accepted correction not yet rebuilt into the projection does not
+count yet. `totalChunks`/`correctedChunks` are set whenever corrections exist,
+including when `includeWordTimestamps=true` forces the ASR segments (then
+`note` says the text is UNCORRECTED and how to get the corrected text). If the
+corrected text cannot be read the call fails (`isError`) rather than serving
+the ASR text as though there were no corrections. Each segment is `{ start, end,
+text }`; with `includeWordTimestamps=true` it also carries `words[]` — each `{
+word, start, end, score?, speaker? }` (`score`/`speaker` present only when the
+ASR backend supplied them). The `words` field is **omitted entirely** by
+default. (**Additive response-shape change**: `corrected`/`unit` are new on every
+transcript page; a track with no corrections returns the same `segments[]` page
+as before, and a track *with* corrections now returns `chunks[]` instead.)
 Bad user input (missing/unmatched `book`, bad `chunkID`, etc.) returns a
 tool-execution error (`isError`), never a protocol error.
 
@@ -2088,7 +2167,8 @@ a fallback answer is a different, re-runnable recipe. Bump `judgePromptVersion`
 ```sql
 CREATE TABLE transcript_findings (
     id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    transcript_id        UUID        NOT NULL,   -- no cascade-mutate into transcripts
+    transcript_id        UUID        REFERENCES transcripts (id) ON DELETE SET NULL,
+                                                  -- NULL once a requeue replaced the transcript (§1.4); never cascades into transcripts
     file_path            TEXT        NOT NULL,
     chunk_id             UUID,                    -- the evaluated chunk (nullable)
     chunk_index          INTEGER,
@@ -2102,7 +2182,8 @@ CREATE TABLE transcript_findings (
     resolved_model       TEXT,                    -- model the endpoint reported serving it (NULL = not reported)
     transcription_run_id UUID,                    -- transcription_jobs.id — per-backend/run attribution
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    recipe_id            TEXT REFERENCES recipes (recipe_id)  -- propose recipe that made it (§1.9); NULL for origin='human'
+    recipe_id            TEXT REFERENCES recipes (recipe_id), -- propose recipe that made it (§1.9); NULL for origin='human'
+    superseded_at        TIMESTAMPTZ          -- when a requeue archived it (§2.17 superseded); NULL otherwise
 );
 -- indexes: file_path, transcript_id, transcription_run_id, issue_type, recipe_id
 ```
@@ -2150,7 +2231,7 @@ state, judges its **stored** chunk rows (so findings reference the real chunk
 IDs), and latches it on success (§1.5). Without the gate the embed worker assigns
 **random** chunk IDs at insert time, so a transcript that has **not been embedded
 yet** is skipped and left unlatched — judging regenerated chunks would record
-findings against IDs that never exist (orphans; there is no FK) and latch the job
+findings against IDs that never exist (orphans; `chunk_id` has no FK) and latch the job
 for good. The next run judges it once it is embedded. (Under
 `EVAL_GATES_EMBED=true` chunk IDs are deterministic UUIDv5, so a not-yet-embedded
 transcript is judged on regenerated chunks, exactly like the gated eval pass.)
@@ -2301,7 +2382,10 @@ by confidence DESC. Rows link to the **book** they belong to (`/book?dir=…`); 
 deeper track-segment jump is deferred. The Book page's per-book section also
 exposes the scoped clear (`POST /actions/findings-clear?dir=…`, token-gated,
 re-renders the Book fragment). All of this is read-only/advisory surfacing — no
-new route, env var, or column; informational only.
+new route, env var, or column; informational only. The rollups, worklists and
+the library's per-book findings count all **exclude `superseded`** findings
+(archived by a requeue, §1.4), so a re-judged book is not counted twice; they
+stay readable through `list_transcript_corrections state=superseded`.
 
 #### Two payoffs
 
@@ -2374,6 +2458,8 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
     │               └──> proposed            └──> stale
     │
     └──reanchor──> unanchorable ──reanchor──> proposed
+
+(any state) ──requeue──> superseded            (terminal)
 ```
 
 - **proposed** — the judge's output. Existing rows migrate here by default.
@@ -2393,10 +2479,25 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
   or in more than one candidate place (`anchor_ambiguous`), recorded in
   `unanchorable_reason`. **Not terminal**, unlike `stale`: a later re-anchor
   (after another re-chunk) that places the span returns it to `proposed`. It is
-  never in the overlay, and its only legal move is back to `proposed` — it can
-  never be accepted or applied. Both moves belong to the re-anchor pass, not to
-  a reviewer: `patch.IsMachineTransition` marks them, and the review tool
-  (`decide_transcript_correction`) offers no action on an unanchorable finding.
+  never in the overlay, and its only legal moves are back to `proposed` (a
+  re-anchor placed it) or to `superseded` (a requeue replaced its transcript) —
+  it can never be accepted or applied. Both re-anchor moves belong to the
+  re-anchor pass, not to a reviewer: `patch.IsMachineTransition` marks them, and
+  the review tool (`decide_transcript_correction`) offers no action on an
+  unanchorable finding.
+- **superseded** — the finding's transcript was replaced by an operator requeue
+  (§1.4). Set by requeue only, from **any** other state — human decisions and
+  `unanchorable` included — in the same transaction as the transcript delete,
+  stamped `superseded_at` (an `unanchorable` finding's `unanchorable_reason` is
+  cleared: the schema allows it only on `unanchorable` rows); `transcript_id`
+  then becomes NULL. `patch.IsMachineTransition` marks the move, so
+  `SetPatchState` refuses it. **Terminal**, and
+  **excluded from the overlay** (`GetCorrectionOverlay` selects only
+  `accepted`/`applied`): the text it describes no longer exists, and the new
+  transcript is judged fresh. Kept for audit and the bench; never deleted, and
+  no review action (`accept`/`reject`/`revert`/`reconsider`) applies to it.
+  The re-anchor pass never reads a superseded finding (nor, equivalently, one
+  with a NULL `transcript_id`).
 
 `proposed → applied` is deliberately **illegal**. Reaching `applied` requires
 passing through `accepted`, which is the human gate; skipping it would be an
@@ -2450,8 +2551,9 @@ their span (as a substring) in the chunk at their `chunk_index`.
 
 `earmark reanchor [--book S] [--limit N] [--batch N] [--yes]` re-anchors the
 backlog. It reads `proposed` and `unanchorable` findings only — a finding a
-human has decided (`accepted`, `applied`, `rejected`, `reverted`) or a `stale`
-one is never touched — and classifies each with `patch.Reanchor` against the
+human has decided (`accepted`, `applied`, `rejected`, `reverted`), a `stale`
+one, or a `superseded` one (archived by a requeue; its `transcript_id` may be
+NULL) is never touched — and classifies each with `patch.Reanchor` against the
 transcript's current **pristine** chunks (`COALESCE(source_text, text)`):
 
 | Outcome | Meaning | Write (`--yes`) |
@@ -2781,15 +2883,17 @@ audit trail of divergence between the ASR output and the reviewed text.
 | `db` transcript SELECTs (feed the chunker) | ORIGINAL | correct as-is |
 | `evalChunkSelectSQL` (feeds `earmark eval`) | ORIGINAL | selects `COALESCE(c.source_text, c.text)` |
 | search / `transcript_chunks.text` | CORRECTED | the overlay is replayed before embedding |
-| MCP `get_transcript`, web transcript reader (`GetTrackDetail` → segments) | CORRECTED | **KNOWN GAP** |
+| MCP `get_transcript` | CORRECTED | **closed**: serves the chunk projection (`transcript_chunks.text`, `GetCorrectedTranscriptPage`) when any chunk differs from its pristine text, `corrected: true`, no word timestamps; else the segments, `corrected: false` |
+| MCP `get_transcript` with `includeWordTimestamps=true` | ORIGINAL (by necessity) | word times exist only on segments; the response flags `corrected: false` and, when corrections exist, says so in `note` |
+| web transcript reader (`GetTrackDetail` → segments) | CORRECTED | **KNOWN GAP** |
 
-> **Known gap (accepted, documented, not fixed here).** The MCP `get_transcript`
-> tool and the web transcript reader render `transcripts.segments`. A reader
-> genuinely wants corrected text there — but segments are immutable provenance
-> and carry no corrections, so **search shows corrected text while the reader
-> shows uncorrected ASR.** Closing the gap means projecting corrections onto
-> segments at render time (segments have no chunk anchors today). Mutating
-> segments to "fix" it is forbidden: it would destroy the provenance record.
+> **Known gap (narrowed).** `get_transcript` now serves the corrected text —
+> the same projection search returns — at **chunk** granularity, because
+> corrections are anchored to chunks, not segments. What remains open: corrected
+> **word timestamps** (re-aligning corrected chunk text back onto segment/word
+> times — a later task), and the web transcript reader, which still renders
+> `transcripts.segments` and therefore uncorrected ASR. Mutating segments to
+> "fix" either is forbidden: it would destroy the provenance record.
 
 #### The review surface (MCP tools)
 

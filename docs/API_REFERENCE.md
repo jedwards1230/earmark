@@ -16,7 +16,7 @@ All tools are **read-only**. The two search tools default to the whole library; 
 
 Two granularities of the same text:
 - **chunk** — embedding/search unit (~hundreds per book; tens of consecutive ASR segments grouped together). Used by search tools and `get_chunk_context`.
-- **segment** — single ASR timestamp unit (thousands per book). Returned by `get_transcript`.
+- **segment** — single ASR timestamp unit (thousands per book). Returned by `get_transcript` for a track with no corrections (or with `includeWordTimestamps=true`); a corrected track is returned as chunks.
 
 ### Tool: `list_books`
 
@@ -72,14 +72,17 @@ Trigram literal/keyword search. Hits are labelled **"ranked by trigram match"** 
 
 ### Tool: `get_transcript`
 
-Full transcript for a track as paginated **segments** (raw ASR output; `raw_text` can be 600 k+ chars). Multi-track book → returns a track chooser first.
+Full transcript for a track, paginated (`raw_text` can be 600 k+ chars). Multi-track book → returns a track chooser first.
+
+When the track has reviewed corrections it serves the **corrected** text — the same text search returns — as **chunks** (`corrected: true`, `unit: "chunk"`, each chunk with its start/end time, no word timestamps). Otherwise it serves the raw ASR **segments** (`corrected: false`, `unit: "segment"`). `includeWordTimestamps=true` always returns the ASR segments with per-word times, and says in `note` when corrections exist. See CONTRACT §2.2.1.
 
 | Parameter | Type | Default | Notes |
 |-----------|------|---------|-------|
 | `book` | string | one required | Book title or ASIN |
 | `trackID` | string | one required | Track UUID (from chooser or search hit) |
-| `offset` | integer | 0 | Segment offset |
-| `limit` | integer | 50 | Segments per page |
+| `offset` | integer | 0 | Offset in the response's `unit` |
+| `limit` | integer | 50 | Segments per page; chunks per page when corrected (default 10, max 25) |
+| `includeWordTimestamps` | boolean | false | ASR segments with per-word times (uncorrected) |
 
 ### Tool: `get_chunk_context`
 
