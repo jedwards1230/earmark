@@ -256,12 +256,22 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 ABS-only enrichment: a non-empty value from a re-lookup overwrites the stored
 one, an empty/NULL value keeps it.
 
-`chapters` is a JSONB array of `{"Index","Title","StartSec","EndSec"}` objects
+`chapters` is a JSONB array of `{"Index","Title","StartSec","EndSec"}` objects (plus an optional `"RawTitle"`)
 whose times are **book-absolute** — measured from the start of the whole book,
 all tracks concatenated in play order (that is what Audiobookshelf's
 `media.chapters` reports). Mapping a `transcript_chunks` row into this list
 requires adding the chunk's track offset first; see the time-bases note under
 `transcripts` (§2).
+
+Chapter titles are cleaned of filename debris (`metaprovider.CleanChapterTitles`,
+CONTRACT §1.6): ABS file-derived titles such as `"12 - Project Hail Mary: Chapter
+11"` or `"<Book> [<ASIN>] - 01 - Chapter 1 (1)"` become `"Chapter 11"` /
+`"Chapter 1"`. Cleaning happens at ingest and again on read, so rows stored
+before it existed still read clean. When a title was changed at ingest the entry
+carries an optional `"RawTitle"` key holding the provider original; it is absent
+on entries whose title was already clean and on rows written before cleaning
+(their stored `Title` *is* the original). A re-lookup
+(`earmark backfill-metadata --yes`) rewrites a stored row with clean titles.
 
 `series` is a comma-joined list of `Name #Sequence` entries — a book can belong
 to several series, e.g. `"Dune #2, The Dune Sequence #13"`. The `#Sequence` part

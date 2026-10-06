@@ -153,6 +153,12 @@ func (r *Resolver) match(dir string) (compiled, bool) {
 // are the fixed "B0" prefix and a single trailing X after exactly nine digits.
 const asinIDPattern = `B0[0-9A-Z]{8}|[0-9]{9}X|[0-9]{6,}`
 
+// ASINIDPattern exports asinIDPattern (an unanchored, ungrouped regexp
+// alternation, upper-case) for other packages that must recognise the same
+// bracketed catalogue ids — e.g. metaprovider's chapter-title cleaner — so
+// their notion of "an id" cannot drift from ExtractASIN's.
+const ASINIDPattern = asinIDPattern
+
 // asinBracket matches a bracketed catalogue id embedded in a directory/title,
 // e.g. "[B08GB58KD5]" (Audible ASIN), "[059341635X]" (ISBN-10 with an X check
 // digit) or a bracketed all-digit id "[1984832069]". The captured group is the

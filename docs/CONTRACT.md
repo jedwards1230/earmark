@@ -845,11 +845,29 @@ Rules:
   metadata source is reflected on the next write.
 - `chapters` is nullable and left `NULL` when no ABS provider is configured.
 - **`chapters` times are BOOK-ABSOLUTE.** Each entry is
-  `{Index, Title, StartSec, EndSec}` with `StartSec`/`EndSec` measured from the
+  `{Index, Title, StartSec, EndSec}` (plus an optional `RawTitle`, see below) with `StartSec`/`EndSec` measured from the
   start of the **whole book** (all tracks concatenated in play order) — that is
   what Audiobookshelf's `media.chapters` reports. This is a *different time base*
   from `transcript_chunks.start_sec`, which is track-relative (§3); readers must
   add the track's book offset before mapping a chunk into this list (§2.2.1).
+- **`chapters` titles are cleaned of filename debris** by
+  `metaprovider.CleanChapterTitles`. ABS derives chapter titles from track file
+  names when a book has no embedded chapter metadata, so they arrive as
+  `"<N> - <Book>: <chapter>"` (e.g. `"12 - Project Hail Mary: Chapter 11"`) or as
+  a raw filename `"<Book> [<ASIN>] - <NN> - <chapter>[ (<k>)]"`. The cleaner strips
+  the `<N> - ` track number only when **every** chapter carries one equal to its
+  1-based position, strips the `<Book>: ` segment (and an immediate repeat of it)
+  only when every chapter shares it, and strips the filename form only on a
+  bracketed catalogue id followed by ` - <digits> - `; real titles such as
+  `"1984: Part One"`, `"0000"` or a list of genuine `"Part I: …"` titles are left
+  alone, and a strip that would leave an empty title is skipped. Cleaning runs
+  **at ingest** (`mapABSChapters`, so a lookup stores clean titles) **and on
+  read** (`db.decodeChapters`, so rows stored before cleaning existed surface
+  clean titles without a rewrite). It is idempotent. Whenever a title changes the
+  provider original is kept in an optional **`RawTitle`** key on that entry
+  (absent when the title was already clean) — nothing is discarded. A stored row
+  is rewritten with clean titles + `RawTitle` on its next re-lookup
+  (`earmark backfill-metadata --yes`).
 - The Go service creates the table in its schema-init transaction.
 
 ### 1.7 Append-only pipeline audit log — `pipeline_events` table
@@ -1102,7 +1120,8 @@ the book has a provider chapter list (`book_metadata.chapters`, §1.6 — in
 practice an ABS-enriched book). The formatter still **suppresses the chapter
 label entirely** when there is no real chapter data (chapter index 0 AND empty
 title) — no misleading `Chapter 0:` prefix is emitted. A populated chapter
-(non-zero index or a non-empty title) renders as `Chapter N: <title>`.
+(non-zero index or a non-empty title) renders as `Chapter N: <title>`, where
+`<title>` is the debris-cleaned chapter title (§1.6).
 
 **Chapter time bases (search + context):** a chunk's `startSec`/`endSec` are
 **track-relative** — offsets into the chunk's own audio file, because there is

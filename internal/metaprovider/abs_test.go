@@ -445,3 +445,57 @@ func TestABSProvider_Lookup_MissingEnrichmentIsZero(t *testing.T) {
 		t.Errorf("enrichment = (%q, %q, %v), want all zero", got.Description, got.ISBN, got.Genres)
 	}
 }
+
+// TestABSProvider_Lookup_CleansChapterTitles proves ingest-time cleaning: ABS
+// chapter titles carrying filename debris (the live "<N> - <Book>: <chapter>"
+// shape) come back from Lookup clean, with the provider original preserved in
+// RawTitle so the stored JSONB loses nothing.
+func TestABSProvider_Lookup_CleansChapterTitles(t *testing.T) {
+	t.Parallel()
+
+	const (
+		itemID   = "debris-item"
+		asin     = "B08G9PRS1K"
+		libID    = "lib-id"
+		filePath = "/books/audio-libation/Andy Weir/Project Hail Mary [B08G9PRS1K]/01.m4b"
+	)
+	detail, _ := json.Marshal(map[string]any{
+		"id": itemID,
+		"media": map[string]any{
+			"metadata": map[string]any{"title": "Project Hail Mary", "asin": asin},
+			"chapters": []map[string]any{
+				{"id": 0, "start": 0.0, "end": 17.18, "title": "1 - Project Hail Mary: Dedication"},
+				{"id": 1, "start": 17.18, "end": 2221.01, "title": "2 - Project Hail Mary: Chapter 1"},
+			},
+		},
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/libraries/" + libID + "/items":
+			_, _ = w.Write(absItemsFixture(itemID, asin))
+		case "/api/items/" + itemID:
+			_, _ = w.Write(detail)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	got, err := metaprovider.NewABSProvider(srv.URL, "tok", libID, srv.Client()).
+		Lookup(context.Background(), filePath, "01.m4b")
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	want := []metaprovider.Chapter{
+		{Index: 0, Title: "Dedication", RawTitle: "1 - Project Hail Mary: Dedication", StartSec: 0, EndSec: 17.18},
+		{Index: 1, Title: "Chapter 1", RawTitle: "2 - Project Hail Mary: Chapter 1", StartSec: 17.18, EndSec: 2221.01},
+	}
+	if len(got.Chapters) != len(want) {
+		t.Fatalf("len(Chapters) = %d, want %d", len(got.Chapters), len(want))
+	}
+	for i := range want {
+		if got.Chapters[i] != want[i] {
+			t.Errorf("Chapters[%d] = %+v, want %+v", i, got.Chapters[i], want[i])
+		}
+	}
+}

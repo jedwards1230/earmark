@@ -1676,11 +1676,23 @@ func (db *DB) GetBookChapters(ctx context.Context, bookDir string) ([]metaprovid
 	if err != nil {
 		return nil, fmt.Errorf("get book chapters: %w", err)
 	}
+	return decodeChapters(chaptersJSON)
+}
+
+// decodeChapters unmarshals a book_metadata.chapters JSONB value and cleans
+// the titles on read (metaprovider.CleanChapterTitles). Rows written before
+// ingest-time cleaning still hold filename-debris titles such as
+// "12 - Project Hail Mary: Chapter 11"; cleaning here makes every reader see
+// clean titles without rewriting the stored row (the stored original stays the
+// source of truth, and a re-lookup — `earmark backfill-metadata --yes` — then
+// stores the cleaned title plus RawTitle). Cleaning is idempotent, so rows
+// already cleaned at ingest pass through unchanged.
+func decodeChapters(chaptersJSON []byte) ([]metaprovider.Chapter, error) {
 	var chapters []metaprovider.Chapter
 	if err := json.Unmarshal(chaptersJSON, &chapters); err != nil {
 		return nil, fmt.Errorf("unmarshal chapters: %w", err)
 	}
-	return chapters, nil
+	return metaprovider.CleanChapterTitles(chapters), nil
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
@@ -2013,9 +2025,9 @@ func (db *DB) getBookMetaQ(ctx context.Context, q rowScanner, bookDir string) ([
 	if chaptersJSON == nil {
 		return nil, refs, nil
 	}
-	var chapters []metaprovider.Chapter
-	if err := json.Unmarshal(chaptersJSON, &chapters); err != nil {
-		return nil, refs, fmt.Errorf("unmarshal chapters: %w", err)
+	chapters, err := decodeChapters(chaptersJSON)
+	if err != nil {
+		return nil, refs, err
 	}
 	return chapters, refs, nil
 }
