@@ -1,23 +1,27 @@
 -- 00001_baseline.sql — the earmark schema as of v0.40.2, before goose.
 --
 -- This is the DDL the old inline db.initialize() ran on every boot, copied
--- VERBATIM and in the same order (CONTRACT §1.8). Verbatim matters: a fresh
--- database built from this file must be catalog-identical to one built by the
--- old code — same column order (CREATE TABLE then ADD COLUMN appends), the
--- same auto-named inline CHECKs alongside the named ones the old ALTERs added,
--- and byte-identical plpgsql bodies (prosrc keeps the indentation).
--- internal/db/migrate_integration_test.go proves that equality.
+-- VERBATIM and in the same order (CONTRACT §1.8), including its one DML
+-- statement: the duplicate-file_path DELETE that must run before
+-- transcription_jobs_file_path_unique is added (a no-op on an empty database).
+-- Verbatim matters: a fresh database built from this file must be
+-- catalog-identical to one built by the old code — same column order (CREATE
+-- TABLE then ADD COLUMN appends), the same auto-named inline CHECKs alongside
+-- the named ones the old ALTERs added, and byte-identical plpgsql bodies
+-- (prosrc keeps the indentation). internal/db/migrate_integration_test.go
+-- proves that equality.
 --
--- It is NOT a goose SQL migration. migrate.go registers version 1 as a Go
--- migration that executes this file on an EMPTY database and only records the
--- version on a pre-goose one (transcription_jobs already exists), so the
--- existing production database runs none of it. Goose's own file scan excludes
--- this name.
+-- It is NOT a goose SQL migration; goose's own file scan excludes this name.
+-- migrate.go registers version 1 as a Go migration that, under the schema lock:
+--   * executes this file on an EMPTY database;
+--   * only RECORDS version 1 on a pre-goose database that already has every
+--     object in it (the production case — none of this runs);
+--   * executes this file on a pre-goose database MISSING objects (last booted
+--     by an older earmark). Everything here is idempotent, so that finishes
+--     the job exactly as booting the v0.40.2 inline code would have — the
+--     dedup DELETE included.
 --
 -- Do not edit. Schema changes go in a new numbered migration.
---
--- One deliberate omission: the old path-dedup DELETE (a no-op on an empty
--- database) is dropped; its UNIQUE (file_path) constraint is kept.
 
 		CREATE EXTENSION IF NOT EXISTS vector;
 		CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -359,6 +363,19 @@
 
 		ALTER TABLE transcript_chunks
 			ADD COLUMN IF NOT EXISTS source_text TEXT;
+
+		DELETE FROM transcription_jobs t
+		USING (
+			SELECT file_path,
+			       (array_agg(id ORDER BY
+			           CASE status WHEN 'done' THEN 0 WHEN 'claimed' THEN 1
+			                       WHEN 'pending' THEN 2 ELSE 3 END,
+			           created_at ASC))[1] AS keep_id
+			FROM transcription_jobs
+			GROUP BY file_path
+			HAVING COUNT(*) > 1
+		) d
+		WHERE t.file_path = d.file_path AND t.id <> d.keep_id;
 
 		-- Idempotent + concurrency-safe: skip if the constraint already exists, and
 		-- still swallow the error if two pods race to create it on a fresh DB.

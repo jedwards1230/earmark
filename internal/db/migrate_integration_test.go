@@ -346,6 +346,43 @@ func TestIntegrationBaselineCatchesUpOlderLegacy(t *testing.T) {
 	}
 }
 
+// TestIntegrationBaselineCatchUpDedupsFilePaths: a pre-goose database from
+// before the one-job-per-file_path constraint can hold duplicate paths (a file
+// hashed mid-copy over NFS, then again complete). The v0.40.2 inline code
+// collapsed them before adding the UNIQUE constraint; catch-up must do the
+// same, or it fails with 23505 on every boot (a permanent crash loop). The
+// most-advanced job survives — a 'done' transcript is never discarded.
+func TestIntegrationBaselineCatchUpDedupsFilePaths(t *testing.T) {
+	dbURL := newTestDatabase(t)
+	applyLegacyInitialize(t, dbURL)
+	conn := connect(t, dbURL)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `
+		ALTER TABLE transcription_jobs DROP CONSTRAINT transcription_jobs_file_path_unique;
+		INSERT INTO transcription_jobs (id, file_path, checksum, status, created_at) VALUES
+		  ('00000000-0000-0000-0000-0000000000d1', '/b/A/01.m4b', 'partial', 'pending', now() - interval '2 hours'),
+		  ('00000000-0000-0000-0000-0000000000d2', '/b/A/01.m4b', 'complete', 'done',   now() - interval '1 hour'),
+		  ('00000000-0000-0000-0000-0000000000d3', '/b/B/01.m4b', 'only',     'pending', now());
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateTo(itCtx(t), dbURL, testLog(), 1); err != nil {
+		t.Fatalf("catch-up with duplicate file_paths: %v", err)
+	}
+	got := queryStrings(t, conn, `SELECT checksum FROM transcription_jobs ORDER BY file_path`)
+	if !slices.Equal(got, []string{"complete", "only"}) {
+		t.Errorf("jobs after catch-up = %v, want the done duplicate kept and the other path untouched", got)
+	}
+	var constrained bool
+	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_constraint
+		WHERE conname = 'transcription_jobs_file_path_unique')`).Scan(&constrained); err != nil {
+		t.Fatal(err)
+	}
+	if !constrained {
+		t.Error("catch-up did not restore transcription_jobs_file_path_unique")
+	}
+}
+
 // TestIntegrationLatestFromEmptyMatchesLatestFromLegacy: whichever way a
 // database arrives at the latest version — built fresh, or adopted from the
 // old code — it ends up with the same schema.
