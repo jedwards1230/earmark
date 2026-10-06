@@ -2456,7 +2456,7 @@ transcript's current **pristine** chunks (`COALESCE(source_text, text)`):
 
 | Outcome | Meaning | Write (`--yes`) |
 |---|---|---|
-| `already` | the existing anchor resolves: same `chunk_id`, hash matches, `Locate` places the span | none |
+| `already` | the existing anchor resolves — exactly what replay checks: the chunk the finding addresses (by `chunk_index`, by `chunk_id` only when it recorded no index — "How a finding names its chunk" below) still has the recorded hash and `Locate` places the span. The `chunk_id` itself is not compared — a legacy id that names no row does not stop the anchor from replaying | none |
 | `unique` | the one candidate is in the chunk the finding names (same `chunk_index`) | fresh anchor |
 | `moved` | the one candidate is in another chunk covering the judged audio window | fresh anchor, on that chunk |
 | `ambiguous` | two or more candidates | `unanchorable`, `anchor_ambiguous` |
@@ -2514,7 +2514,10 @@ batch: findings are read `FOR UPDATE SKIP LOCKED` (a finding a reviewer is
 deciding right now is skipped and picked up next run), then the batch's chunks
 `FOR SHARE` (the worker's rebuild upsert waits for the batch instead of changing
 the text mid-write; taken after the finding locks, in chunk order, so the two
-cannot deadlock). Both writes are compare-and-swaps on the state the row was
+cannot deadlock). That is the repo-wide order recipes → findings → chunks
+(§2.17 "Lock order"): re-anchoring takes no `recipes` lock, never waits on a
+finding (SKIP LOCKED), and only waits on chunk rows, which a rebuild locks
+after every finding lock it needs. Both writes are compare-and-swaps on the state the row was
 read in, and the anchor write re-checks the chunk's pristine hash in SQL, so a
 row decided or rebuilt between read and write matches nothing and is reported
 as skipped. Every state change is checked against `patch.CanTransition` first.
@@ -2621,8 +2624,8 @@ Accepting or reverting a finding sets `transcript_chunks.embedding_stale = true`
 for that one chunk, in the same transaction as the decision.
 
 **How a finding names its chunk.** Every statement that resolves a finding's
-chunk — this invalidation, the prune below, and the reviewer worklist
-(`listCorrectionsSQL`) — addresses it by `(transcript_id, chunk_index)` whenever
+chunk — this invalidation, the prune below, the reviewer worklist
+(`listCorrectionsSQL`) and the re-anchor pass's named chunk — addresses it by `(transcript_id, chunk_index)` whenever
 the finding recorded a `chunk_index`, and by `chunk_id` only when it did not.
 `chunk_index` is what the replay is keyed by, so every other statement must
 resolve the same row. `chunk_id` is not reliable alone: on 2026-10-06, 25,442

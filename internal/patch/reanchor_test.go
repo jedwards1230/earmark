@@ -93,10 +93,14 @@ func TestReanchor(t *testing.T) {
 		{"named chunk index no longer exists", legacy("rock", 9, 60, 90), OutcomeMoved, "c2", 22, 1},
 		{"named chunk now covers other audio: its match is not the judged span",
 			legacy("Stilgar", 4, 60, 90), OutcomeMoved, "c2", 0, 1},
-		{"unchanged named chunk is the judged text: decisive despite window copies",
+		{"unchanged named chunk with a stale chunk id still replays: already",
 			ReanchorFinding{OriginalText: "Stilgar", ChunkID: "old-id", ChunkIndex: idx(2), StartSec: 60, EndSec: 150,
 				ChunkHash: ChunkHash("Stilgar waited by the rock."), Offset: -1, Occurrence: -1},
-			OutcomeUnique, "c2", 0, 1},
+			OutcomeAnchored, "c2", 0, 0},
+		{"unchanged named chunk is the judged text: decisive despite window copies",
+			ReanchorFinding{OriginalText: "the", ChunkID: "old-id", ChunkIndex: idx(3), StartSec: 60, EndSec: 150,
+				ChunkHash: ChunkHash("Later, proganema was other the word."), Offset: -1, Occurrence: -1},
+			OutcomeUnique, "c3", 27, 1},
 		{"unchanged named chunk: a misquoted span is not moved elsewhere",
 			ReanchorFinding{OriginalText: "Chani", ChunkID: "c2", ChunkIndex: idx(2), StartSec: 60, EndSec: 90,
 				ChunkHash: ChunkHash("Stilgar waited by the rock."), Offset: -1, Occurrence: -1},
@@ -192,9 +196,33 @@ func TestReanchorAlreadyAnchored(t *testing.T) {
 		t.Fatalf("current anchor: outcome %s, want %s", got.Outcome, OutcomeAnchored)
 	}
 
+	// Findings are addressed by chunk_index first (findingChunkAddressDoc in
+	// internal/db): a chunk_id that does not name the row at the index does not
+	// stop the anchor from replaying, so it is still "already" — even where the
+	// span occurs twice and only the recorded occurrence places it.
+	stale := current
+	stale.ChunkID = "dead"
+	if got := Reanchor(stale, chunks); got.Outcome != OutcomeAnchored || got.Chunk.ID != "c2" {
+		t.Errorf("stale chunk id: outcome %s → %s, want %s in c2", got.Outcome, got.Chunk.ID, OutcomeAnchored)
+	}
+	c1 := chunks[1]
+	twice := ReanchorFinding{
+		OriginalText: "the fox", ChunkID: "dead", ChunkIndex: idx(1), StartSec: 30, EndSec: 60,
+		ChunkHash: ChunkHash(c1.Text), Offset: 12, Occurrence: 1,
+	}
+	if got := Reanchor(twice, chunks); got.Outcome != OutcomeAnchored || got.Chunk.ID != "c1" {
+		t.Errorf("stale chunk id, span twice: outcome %s → %s, want %s in c1 (not ambiguous → unanchorable)",
+			got.Outcome, got.Chunk.ID, OutcomeAnchored)
+	}
+	// No chunk_index recorded: the chunk_id is the address.
+	byID := current
+	byID.ChunkIndex = nil
+	if got := Reanchor(byID, chunks); got.Outcome != OutcomeAnchored || got.Chunk.ID != "c2" {
+		t.Errorf("addressed by chunk_id: outcome %s → %s, want %s in c2", got.Outcome, got.Chunk.ID, OutcomeAnchored)
+	}
+
 	// Each way an anchor can be out of date sends it back through the matcher.
 	for name, mut := range map[string]func(*ReanchorFinding){
-		"chunk id changed":   func(f *ReanchorFinding) { f.ChunkID = "dead" },
 		"chunk hash changed": func(f *ReanchorFinding) { f.ChunkHash = ChunkHash("other text") },
 		"no hash recorded":   func(f *ReanchorFinding) { f.ChunkHash = "" },
 	} {

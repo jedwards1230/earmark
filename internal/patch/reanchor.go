@@ -132,15 +132,7 @@ func Reanchor(f ReanchorFinding, chunks []ReanchorChunk) ReanchorResult {
 		return ReanchorResult{Outcome: OutcomeNone}
 	}
 
-	var named *ReanchorChunk
-	if f.ChunkIndex != nil {
-		for i := range chunks {
-			if chunks[i].Index == *f.ChunkIndex {
-				named = &chunks[i]
-				break
-			}
-		}
-	}
+	named := f.namedChunk(chunks)
 
 	if named != nil && isAnchored(f, *named) {
 		span, _ := Locate(named.Text, Anchor{OriginalText: f.OriginalText, Offset: f.Offset, Occurrence: f.Occurrence})
@@ -266,12 +258,33 @@ func decide(f ReanchorFinding, named *ReanchorChunk, hits []hit) ReanchorResult 
 	}
 }
 
+// namedChunk resolves the chunk a finding names with the repo-wide finding
+// address (findingChunkAddressDoc in internal/db): by chunk_index whenever the
+// finding recorded one, by chunk_id only when it did not. The overlay is keyed
+// by chunk_index, so this is the chunk replay would splice into. nil if the
+// address names no current chunk.
+func (f ReanchorFinding) namedChunk(chunks []ReanchorChunk) *ReanchorChunk {
+	for i := range chunks {
+		if f.ChunkIndex != nil {
+			if chunks[i].Index == *f.ChunkIndex {
+				return &chunks[i]
+			}
+		} else if f.ChunkID != "" && chunks[i].ID == f.ChunkID {
+			return &chunks[i]
+		}
+	}
+	return nil
+}
+
 // isAnchored reports whether a finding's EXISTING anchor still resolves against
-// the named chunk: it was recorded against this very chunk row, the chunk's
-// pristine text still hashes to what was recorded, and Locate places the span.
-// Exactly the checks Replay would make, so "already" means "would replay".
+// the named chunk (namedChunk): the chunk's pristine text still hashes to what
+// was recorded and Locate places the span. Exactly the checks Replay makes, so
+// "already" means "would replay". The chunk's id is deliberately not compared:
+// findings are addressed by chunk_index first, and most legacy judge findings
+// carry a chunk_id that never named the row at their index — the hash, not the
+// id, proves the anchor current.
 func isAnchored(f ReanchorFinding, c ReanchorChunk) bool {
-	if f.ChunkHash == "" || f.ChunkID == "" || f.ChunkID != c.ID {
+	if f.ChunkHash == "" {
 		return false
 	}
 	if ChunkHash(c.Text) != f.ChunkHash {

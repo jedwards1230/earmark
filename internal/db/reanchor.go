@@ -174,6 +174,12 @@ var reanchorChunksSQL = `
 // instead of changing the text between the read and the anchor write. Taken
 // AFTER the finding locks, in chunk order — the same order the rebuild upserts
 // in — so the two cannot deadlock.
+//
+// This is the repo-wide lock order, recipes → findings → chunks (InsertChunks,
+// SetPatchState): re-anchoring takes no recipes lock at all, its finding locks
+// are SKIP LOCKED (it never waits on a finding a rebuild's lockTailFindingsSQL
+// or a reviewer holds), and it only ever waits on chunk rows, which a rebuild
+// takes after every finding lock it needs.
 var reanchorChunksLockSQL = reanchorChunksSQL + `	FOR SHARE
 `
 

@@ -8,6 +8,9 @@
 --   SET statement_timeout='60s'; <this file, __FILTER__ := substr(f.transcript_id::text,1,1) = '0'>
 --
 -- Mirror rules (see patch.Reanchor / patch.WordOccurrences):
+--   * the named chunk is resolved by the finding address (chunk_index first,
+--     chunk_id only when chunk_index is NULL); "already" = its hash still
+--     matches and the recorded anchor locates — the chunk's id is not compared;
 --   * unchanged named chunk (hash match) decides alone;
 --   * else, with a window: the chunks overlapping [start_sec, end_sec) joined
 --     in chunk_index order with ' ' are searched as one text (w_joined, so a
@@ -38,12 +41,14 @@ WITH f AS (
          (c.id IS NOT NULL AND c.start_sec < f.end_sec AND c.end_sec > f.start_sec) AS n_in_window,
          EXISTS (SELECT 1 FROM transcript_chunks x WHERE x.transcript_id = f.transcript_id) AS has_chunks
     FROM f LEFT JOIN transcript_chunks c
-      ON c.transcript_id = f.transcript_id AND c.chunk_index = f.chunk_index
+      ON c.transcript_id = f.transcript_id
+     AND ((f.chunk_index IS NOT NULL AND c.chunk_index = f.chunk_index)
+          OR (f.chunk_index IS NULL AND c.id = f.chunk_id))
 ), a AS (
   SELECT n.*,
          (sha IS NOT NULL AND n_text IS NOT NULL
           AND encode(sha256(convert_to(n_text, 'UTF8')), 'hex') = sha) AS unchanged,
-         (has_chunks AND sha IS NOT NULL AND n_id IS NOT NULL AND n_id = chunk_id
+         (has_chunks AND sha IS NOT NULL AND n_id IS NOT NULL
           AND encode(sha256(convert_to(n_text, 'UTF8')), 'hex') = sha
           AND NOT blank
           AND ((off IS NOT NULL AND off >= 0 AND substr(n_text, off + 1, char_length(span)) = span)

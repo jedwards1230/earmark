@@ -32,25 +32,26 @@ const (
 	// deadChunk is the chunk id every legacy finding names: it no longer exists.
 	deadChunk = "00000000-0000-0000-0000-00000000dead"
 
-	fUnique       = "00000000-0000-0000-0000-0000000000f1"
-	fMovedWindow  = "00000000-0000-0000-0000-0000000000f2"
-	fOutsideWinA  = "00000000-0000-0000-0000-0000000000f3"
-	fAmbigNamed   = "00000000-0000-0000-0000-0000000000f4"
-	fOutsideWinB  = "00000000-0000-0000-0000-0000000000f5"
-	fSubword      = "00000000-0000-0000-0000-0000000000f6"
-	fCase         = "00000000-0000-0000-0000-0000000000f7"
-	fPunct        = "00000000-0000-0000-0000-0000000000f8"
-	fGone         = "00000000-0000-0000-0000-0000000000f9"
-	fHaikuAlready = "00000000-0000-0000-0000-0000000000e1"
-	fAccepted     = "00000000-0000-0000-0000-0000000000e2"
-	fUnanchorable = "00000000-0000-0000-0000-0000000000e3"
-	fPending      = "00000000-0000-0000-0000-0000000000e4"
-	fMisquoted    = "00000000-0000-0000-0000-0000000000e5"
-	fOutOfWindow  = "00000000-0000-0000-0000-0000000000e6"
-	fWindowAmbig  = "00000000-0000-0000-0000-0000000000e7"
-	fWindowless   = "00000000-0000-0000-0000-0000000000e8"
-	fStraddle     = "00000000-0000-0000-0000-0000000000e9"
-	fDecoy        = "00000000-0000-0000-0000-0000000000ea"
+	fUnique         = "00000000-0000-0000-0000-0000000000f1"
+	fMovedWindow    = "00000000-0000-0000-0000-0000000000f2"
+	fOutsideWinA    = "00000000-0000-0000-0000-0000000000f3"
+	fAmbigNamed     = "00000000-0000-0000-0000-0000000000f4"
+	fOutsideWinB    = "00000000-0000-0000-0000-0000000000f5"
+	fSubword        = "00000000-0000-0000-0000-0000000000f6"
+	fCase           = "00000000-0000-0000-0000-0000000000f7"
+	fPunct          = "00000000-0000-0000-0000-0000000000f8"
+	fGone           = "00000000-0000-0000-0000-0000000000f9"
+	fHaikuAlready   = "00000000-0000-0000-0000-0000000000e1"
+	fAccepted       = "00000000-0000-0000-0000-0000000000e2"
+	fUnanchorable   = "00000000-0000-0000-0000-0000000000e3"
+	fPending        = "00000000-0000-0000-0000-0000000000e4"
+	fMisquoted      = "00000000-0000-0000-0000-0000000000e5"
+	fOutOfWindow    = "00000000-0000-0000-0000-0000000000e6"
+	fWindowAmbig    = "00000000-0000-0000-0000-0000000000e7"
+	fWindowless     = "00000000-0000-0000-0000-0000000000e8"
+	fStraddle       = "00000000-0000-0000-0000-0000000000e9"
+	fDecoy          = "00000000-0000-0000-0000-0000000000ea"
+	fStaleIDAlready = "00000000-0000-0000-0000-0000000000eb"
 )
 
 // Pristine chunk text (source_text). Chunk 0's corrected surface (text)
@@ -67,6 +68,7 @@ func seedReanchor(t *testing.T, d *DB) {
 	t.Helper()
 	ctx := context.Background()
 	sha := patch.ChunkHash(raPristine[raC2])
+	shaC1 := patch.ChunkHash(raPristine[raC1])
 	off := strings.Index(raPristine[raC2], "rock")
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO transcription_jobs (id, file_path, checksum, status) VALUES
@@ -114,6 +116,12 @@ func seedReanchor(t *testing.T, d *DB) {
 		  -- chunk 2 (but is in chunk 4); the text did not move, so it is not moved
 		  ('`+fMisquoted+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+raC2+`', 2, 60, 90, 'Chani', 'misheard_proper_noun', 'Chani', 0.9,
 		   'anthropic/claude-haiku-4-5-20251001', 'proposed', '`+sha+`', 3, 0),
+		  -- a current anchor whose chunk_id names no row (findings are addressed
+		  -- by chunk_index first): the unchanged chunk 1 holds "the fox" twice,
+		  -- and the recorded occurrence places the second — it replays, so it is
+		  -- "already", never "ambiguous"
+		  ('`+fStaleIDAlready+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 1, 30, 60, 'the fox', 'misheard_word', 'a fox', 0.9,
+		   'anthropic/claude-haiku-4-5-20251001', 'proposed', '`+shaC1+`', 12, 1),
 		  -- a human decision with a dead anchor: out of scope, never touched
 		  ('`+fAccepted+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0, 0, 30, 'ganema', 'misheard_proper_noun', 'Ghanima', 0.9,
 		   'gemma3:12b', 'accepted', NULL, NULL, NULL);
@@ -207,7 +215,7 @@ func tally(total, already, unique, moved, ambiguous, none, pending int) Reanchor
 // classification promised, a re-run is a no-op, and a re-anchored finding
 // then survives accept + replay where its legacy anchor would have gone stale.
 func TestIntegrationReanchor(t *testing.T) {
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	seedReanchor(t, d)
 	ctx := context.Background()
 
@@ -218,7 +226,7 @@ func TestIntegrationReanchor(t *testing.T) {
 		// Idaho (straddler + decoy) · none: gan, Ganema, zzz, Chani and
 		// Stilgar (copies only outside the window), Duncan Idaho (lone straddler)
 		"gemma3:12b":                          tally(15, 0, 2, 3, 3, 6, 1),
-		"anthropic/claude-haiku-4-5-20251001": tally(2, 1, 0, 0, 0, 1, 0),
+		"anthropic/claude-haiku-4-5-20251001": tally(3, 2, 0, 0, 0, 1, 0),
 		"qwen3.8":                             tally(1, 0, 1, 0, 0, 0, 0),
 	}
 
@@ -296,6 +304,10 @@ func TestIntegrationReanchor(t *testing.T) {
 			t.Errorf("%s: unanchorable row lost its original chunk_id (%s)", id, a.ChunkID)
 		}
 	}
+	if a := readAnchor(t, d, fStaleIDAlready); a.State != patch.StateProposed || a.Reanchored ||
+		a.ChunkID != deadChunk || a.Sha != patch.ChunkHash(raPristine[raC1]) || a.Occ != 1 {
+		t.Errorf("stale-id current anchor was rewritten: %+v, want untouched (already)", a)
+	}
 	if a := readAnchor(t, d, fMisquoted); a.State != patch.StateUnanchorable ||
 		a.Reason != patch.UnanchorableNotFound || a.ChunkID != raC2 {
 		t.Errorf("misquoted span in an unchanged chunk: %+v, want unanchorable/anchor_not_found, still on chunk 2", a)
@@ -317,7 +329,7 @@ func TestIntegrationReanchor(t *testing.T) {
 	}
 	requireTallies(t, "re-run", rep, map[string]ReanchorTally{
 		"gemma3:12b":                          tally(15, 5, 0, 0, 3, 6, 1),
-		"anthropic/claude-haiku-4-5-20251001": tally(2, 1, 0, 0, 0, 1, 0),
+		"anthropic/claude-haiku-4-5-20251001": tally(3, 2, 0, 0, 0, 1, 0),
 		"qwen3.8":                             tally(1, 1, 0, 0, 0, 0, 0),
 	})
 	if after := findingsSnapshot(t, d); !reflect.DeepEqual(snap, after) {
@@ -359,7 +371,7 @@ func TestIntegrationReanchor(t *testing.T) {
 // transaction (a reviewer mid-decision) is skipped, not waited on and not
 // overwritten; the next run picks it up.
 func TestIntegrationReanchorSkipsLockedFindings(t *testing.T) {
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	seedReanchor(t, d)
 	ctx := context.Background()
 
@@ -400,7 +412,7 @@ func TestIntegrationReanchorSkipsLockedFindings(t *testing.T) {
 
 // TestIntegrationReanchorScope: --book and --limit narrow the run.
 func TestIntegrationReanchorScope(t *testing.T) {
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	seedReanchor(t, d)
 	ctx := context.Background()
 
@@ -425,7 +437,7 @@ func TestIntegrationReanchorScope(t *testing.T) {
 // without pulling chunk text out of Postgres) to the Go matcher: on the same
 // fixture both must count every outcome identically.
 func TestIntegrationReanchorSurvivalSQLMatchesGo(t *testing.T) {
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	seedReanchor(t, d)
 	ctx := context.Background()
 
@@ -484,7 +496,7 @@ func requireTallies(t *testing.T, label string, rep ReanchorReport, want map[str
 // the write lands matches zero rows (a conflict), and the finding is left for
 // the next run rather than anchored to text nobody verified.
 func TestIntegrationReanchorWriteRefusesRebuiltChunk(t *testing.T) {
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	seedReanchor(t, d)
 	ctx := context.Background()
 
