@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -188,40 +187,7 @@ func TestEvalChunkSelectSQL_FeedsTheJudgePristineText(t *testing.T) {
 // source_text is persisted alongside the corrected text, and embedding_stale is
 // NOT touched (the clear is watermark-guarded and happens afterwards).
 func TestInsertChunksWritesSourceTextAndLeavesStaleFlag(t *testing.T) {
-	raw, err := os.ReadFile("db.go")
-	if err != nil {
-		t.Fatalf("read db.go: %v", err)
-	}
-	src := string(raw)
-	start := strings.Index(src, "func (db *DB) InsertChunks(")
-	if start < 0 {
-		t.Fatal("InsertChunks not found — this test needs updating")
-	}
-	// Bound the window at the function's closing brace — a column-0 "}" in
-	// gofmt'd Go. A fixed byte count spills into whatever follows (and cannot
-	// fail cleanly if the file shrinks); cutting at the next "func " is also
-	// wrong, because it swallows that function's doc comment.
-	rest := src[start:]
-	body := rest
-	if end := strings.Index(rest, "\n}\n"); end >= 0 {
-		body = rest[:end+3]
-	}
-
-	// Assert on the SQL literal only. The surrounding comments legitimately
-	// discuss embedding_stale (explaining why it is NOT written), so matching on
-	// the whole function body would fail on its own documentation.
-	const execMarker = "tx.Exec(ctx, `"
-	open := strings.Index(body, execMarker)
-	if open < 0 {
-		t.Fatal("no SQL literal found in InsertChunks — this test needs updating")
-	}
-	open += len(execMarker) - 1
-	closeIdx := strings.Index(body[open+1:], "`")
-	if closeIdx < 0 {
-		t.Fatal("unterminated SQL literal in InsertChunks — this test needs updating")
-	}
-	sql := body[open+1 : open+1+closeIdx]
-
+	sql := insertChunkSQL
 	if !strings.Contains(sql, "source_text = EXCLUDED.source_text") {
 		t.Errorf("InsertChunks must persist source_text so a rebuilt chunk carries "+
 			"its pristine text:\n%s", sql)
