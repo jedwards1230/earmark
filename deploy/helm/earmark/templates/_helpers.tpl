@@ -239,6 +239,15 @@ AI_ENDPOINTS/AI_ROLES so the judge it runs is the one the Deployments see).
       name: {{ .Values.secrets.absToken.name | quote }}
       key: {{ .Values.secrets.absToken.key | quote }}
 {{- end }}
+{{- /*
+  MODELS_FILE (CONTRACT §2.18): the model registry, rendered from
+  config.models into the <fullname>-models ConfigMap and mounted read-only.
+  Unset → no env var, no mount (no pins).
+*/}}
+{{- if .Values.config.models }}
+- name: MODELS_FILE
+  value: /etc/earmark/models.yaml
+{{- end }}
 {{- end }}
 
 {{/*
@@ -273,6 +282,11 @@ Shared volumeMounts for both containers.
   readOnly: true
 - name: tmp
   mountPath: /tmp
+{{- if .Values.config.models }}
+- name: models
+  mountPath: /etc/earmark
+  readOnly: true
+{{- end }}
 {{- end }}
 
 {{/*
@@ -285,4 +299,9 @@ Shared volumes spec for both pods.
     readOnly: true
 - name: tmp
   emptyDir: {}
+{{- if .Values.config.models }}
+- name: models
+  configMap:
+    name: {{ include "earmark.fullname" . }}-models
+{{- end }}
 {{- end }}

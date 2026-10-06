@@ -154,6 +154,20 @@ config:
   aiEndpoints: []
   aiRoles: {}
 
+  # ── Model registry (CONTRACT §2.18) ────────────────────────────────────────
+  # Per pipeline step: the model expected to ANSWER for the alias aiEndpoints
+  # requests, its revision pin, and the prompt version. Stamped into provenance
+  # recipes (§1.9). Behind LiteLLM, pin steps.propose.expected_model to the id
+  # the endpoint reports, or every new finding reads as non-current in
+  # stale_work. Unset (the default) → no ConfigMap, no MODELS_FILE (no pins).
+  # Deliberately not declared here: config is hashed into checksum/config, so
+  # declaring an empty key would roll every pod on upgrade for no change.
+  # Example:
+  #   models:
+  #     steps:
+  #       propose: {expected_model: anthropic/claude-haiku-4-5-20251001, revision: "20251001"}
+  #       embed:   {expected_model: nomic-embed-text, revision: "sha256:0a109f422b47"}
+
   # ── Eval-layer chat endpoint (CONTRACT §2.15) ──────────────────────────────
   # Standalone EVAL_CHAT_* vars for internal/eval's read-only LLM judge, for when
   # a chat endpoint (e.g. vLLM) exists but the AI registry isn't wired yet. Each
