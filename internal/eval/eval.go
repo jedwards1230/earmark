@@ -253,7 +253,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 	}
 	if expected := j.Recipe().ModelResolved; servedUnexpectedModel(expected, resolved) {
 		j.resolvedWarn.Do(func() {
-			j.logger.Warn("the eval endpoint reported a different model than the propose recipe expects; "+
+			j.logger.WarnContext(ctx, "the eval endpoint reported a different model than the propose recipe expects; "+
 				"findings it answers are stamped with a non-current recipe and listed in stale_work. "+
 				"If this is the normal answer for the alias (e.g. LiteLLM reporting the provider id), "+
 				"pin steps.propose.expected_model in MODELS_FILE (CONTRACT §2.18); if it is a fallback, this is expected",

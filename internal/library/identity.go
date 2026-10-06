@@ -18,7 +18,7 @@ const (
 // asinExact matches a whole value that is a catalogue id of the same shapes
 // ExtractASIN accepts inside brackets. Used for the embedded tag, which is a
 // bare value rather than a bracketed path component.
-var asinExact = regexp.MustCompile(`^(?:` + asinIDPattern + `)$`)
+var asinExact = regexp.MustCompile(`^(?:` + ASINIDPattern + `)$`)
 
 // NormalizeASIN upper-cases and trims an embedded-tag ASIN and returns it if it
 // has a catalogue-id shape, else "". Tags are producer-supplied, so anything

@@ -39,7 +39,7 @@ const provSeedSQL = `
 // stamped once; a runner that reported nothing stays unstamped.
 func TestIntegrationStampASRRecipes(t *testing.T) {
 	ctx := context.Background()
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	if _, err := d.pool.Exec(ctx, provSeedSQL); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestIntegrationStampASRRecipes(t *testing.T) {
 // JSON object is reported, not stamped, and does not block the others.
 func TestIntegrationStampASRSkipsMalformedParams(t *testing.T) {
 	ctx := context.Background()
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	if _, err := d.pool.Exec(ctx, provSeedSQL+`
 		INSERT INTO transcription_jobs (id, file_path, checksum, status)
 		VALUES ('00000000-0000-0000-0000-00000000000c', '/b/Bad/01.m4b', 'c3', 'done');
@@ -125,7 +125,7 @@ func TestIntegrationStampASRSkipsMalformedParams(t *testing.T) {
 // and earmark_stale_items.
 func TestIntegrationRecipeInfoAndStaleCounts(t *testing.T) {
 	ctx := context.Background()
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	if _, err := d.pool.Exec(ctx, provSeedSQL); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestIntegrationRecipeInfoAndStaleCounts(t *testing.T) {
 // earlier match attached; an unresolved lookup keeps the last outcome.
 func TestIntegrationIdentityTransitions(t *testing.T) {
 	ctx := context.Background()
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	const dir = "/b/Herbert/Children of Dune"
 	type row struct {
 		asin, source, status, desc *string
@@ -252,7 +252,7 @@ func TestIntegrationIdentityTransitions(t *testing.T) {
 // of "unknown" is never stamped.
 func TestIntegrationStampASRPagesPastBadRows(t *testing.T) {
 	ctx := context.Background()
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	if _, err := d.pool.Exec(ctx, `
 		INSERT INTO transcription_jobs (id, file_path, checksum, status)
 		SELECT ('00000000-0000-0000-0000-0000000001' || lpad(g::text, 2, '0'))::uuid,
