@@ -105,8 +105,10 @@ func TestEvalErrorTranscriptsSQL_Shape(t *testing.T) {
 		"jsonb_typeof(pe.detail->'skipped') = 'number'",
 		"THEN (pe.detail->>'skipped')::numeric > 0 ELSE false END",
 		// Legacy CLI backfill that stopped on a client timeout: latched with
-		// eval_skipped = 0 and no event, but fewer chunks judged than stored.
-		"OR COALESCE(rm.eval_chunks, 0) < ( SELECT count(*) FROM transcript_chunks c WHERE c.transcript_id = t.id )",
+		// eval_skipped = 0 and no event, but fewer chunks judged than stored —
+		// counted only while the judged chunk set still exists.
+		"OR (rm.eval_resolved_model IS NULL AND COALESCE(rm.eval_chunks, 0) < ( SELECT count(*) FROM transcript_chunks c WHERE c.transcript_id = t.id )",
+		"AND NOT EXISTS ( SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id AND c.created_at > COALESCE(rm.eval_started_at, rm.eval_finished_at) ))",
 		"pe.created_at >= COALESCE(rm.eval_started_at, '-infinity'::timestamptz)",
 		"ORDER BY t.created_at ASC, t.id ASC",
 		"LIMIT $3",
@@ -250,16 +252,44 @@ func TestResolvedModelColumns(t *testing.T) {
 
 // The skipped-count cast must only run on numeric JSON, and the short-run
 // predicate must sit inside the latched branch (an unlatched job is the
-// --backfill-unevaluated selection's business).
+// --backfill-unevaluated selection's business). The short-run predicate is
+// also legacy-only (post-0a runs latch only on full success) and must not fire
+// once the chunk set was rewritten after the judge run: a re-embed replaces
+// every chunk, so the current count no longer describes the judged set.
 func TestEvalErrorTranscriptsSQL_GuardsAndPlacement(t *testing.T) {
 	sql := norm(evalErrorTranscriptsSQL)
 	if strings.Contains(sql, "(pe.detail->>'skipped')::int") {
 		t.Errorf("unguarded ::int cast on detail.skipped:\n%s", sql)
 	}
 	latched := strings.Index(sql, "OR (rm.eval_finished_at IS NOT NULL AND (")
-	short := strings.Index(sql, "COALESCE(rm.eval_chunks, 0) <")
 	keyset := strings.Index(sql, "AND ($1::timestamptz IS NULL")
-	if latched < 0 || short < latched || short > keyset {
-		t.Errorf("short-run predicate must be inside the latched branch:\n%s", sql)
+	if latched < 0 || keyset < latched {
+		t.Fatalf("latched branch must precede the keyset predicate:\n%s", sql)
+	}
+
+	// The short-run branch, in order: legacy guard, count comparison, then the
+	// no-newer-chunk guard — all one parenthesized OR arm.
+	branch := []string{
+		"OR (rm.eval_resolved_model IS NULL AND COALESCE(rm.eval_chunks, 0) <",
+		"SELECT count(*) FROM transcript_chunks c WHERE c.transcript_id = t.id",
+		"AND NOT EXISTS ( SELECT 1 FROM transcript_chunks c WHERE c.transcript_id = t.id AND c.created_at > COALESCE(rm.eval_started_at, rm.eval_finished_at) ))",
+	}
+	prev := latched
+	for _, part := range branch {
+		i := strings.Index(sql[prev:], part)
+		if i < 0 {
+			t.Errorf("short-run branch missing (or out of order) %q:\n%s", part, sql)
+			continue
+		}
+		prev += i
+		if prev > keyset {
+			t.Errorf("short-run part %q must sit inside the latched branch, before the keyset predicate:\n%s", part, sql)
+		}
+	}
+
+	// A bare, unguarded count comparison would re-select every transcript whose
+	// chunks were rebuilt since its (complete) judge run.
+	if strings.Contains(sql, "OR COALESCE(rm.eval_chunks, 0) <") {
+		t.Errorf("short-run predicate must not be an unguarded OR arm:\n%s", sql)
 	}
 }

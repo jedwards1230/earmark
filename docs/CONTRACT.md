@@ -1933,12 +1933,24 @@ A job is selected when any of these holds:
    was written at/after that job's `eval_started_at` (the old gated pass latched
    every judge failure and zeroed `eval_skipped`, so the event log is the only
    record; this is how the ~85 historical eval errors are found);
-4. it is latched but `eval_chunks` is lower than the number of
-   `transcript_chunks` rows the transcript has (the old CLI backfill stopped on
-   the first client timeout and still latched, with `eval_skipped = 0`, the
-   chunks judged so far, and no event). A transcript re-embedded with a
-   different `CHUNK_SIZE` after a complete judge run also matches; re-judging it
-   is harmless because findings are de-duplicated.
+4. it is latched with `eval_resolved_model IS NULL`, its `eval_chunks` is lower
+   than the number of `transcript_chunks` rows the transcript has, **and** no
+   chunk was added since that run's `eval_started_at` (`eval_finished_at` when
+   unset). The old CLI backfill stopped on the first client timeout and still
+   latched, with `eval_skipped = 0`, the chunks judged so far, and no event. A
+   NULL resolved model covers every pre-0a run plus post-0a runs whose endpoint
+   reported no model (or that latched with no judge configured); post-0a runs
+   latch only on full success, so they cannot have a short `eval_chunks`. The
+   chunk-age guard exists because chunks added after the run — a re-embed
+   (`requeue --reembed` deletes, the worker re-inserts) or a re-chunk that adds
+   rows — change the count without the judge having seen them. An in-place
+   stale rebuild keeps `created_at` and also keeps the count. `eval_started_at`
+   is host time and `created_at` is the database's `now()`, so clock skew
+   matters only for chunks written within the skew of the run (a lagging host
+   clock hides a match; a leading one can add a re-judge). **Known gap:** a
+   legacy aborted run whose chunks were added to or replaced after it cannot be
+   detected by this rule — the set it judged is gone from the count. Re-judge
+   such a book explicitly (`earmark eval <book> --write`) if needed.
 
 Findings already recorded for a transcript (same chunk, span, issue type and
 correction) are not inserted again. A successful re-judge writes a new
