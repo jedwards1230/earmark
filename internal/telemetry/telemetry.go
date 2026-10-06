@@ -91,6 +91,10 @@ type Telemetry struct {
 
 	stopOnce sync.Once
 	stop     chan struct{}
+	// runCtx parents every background refresh; Shutdown cancels it so an
+	// in-flight DB count is abandoned rather than waited out.
+	runCtx    context.Context
+	runCancel context.CancelFunc
 	wg       sync.WaitGroup
 }
 
@@ -102,6 +106,7 @@ var logger = log.NewLogger("telemetry")
 // returns a disabled Telemetry and installs nothing.
 func Setup(ctx context.Context) (*Telemetry, error) {
 	t := &Telemetry{stop: make(chan struct{})}
+	t.runCtx, t.runCancel = context.WithCancel(context.Background())
 	if envBool("OTEL_SDK_DISABLED") {
 		t.disabled = true
 		logger.Info("OpenTelemetry SDK disabled (OTEL_SDK_DISABLED)")
@@ -281,7 +286,7 @@ func (t *Telemetry) StartStaleRefresh(interval, timeout time.Duration, count fun
 		return
 	}
 	refresh := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(t.runCtx, timeout)
 		defer cancel()
 		n, err := count(ctx)
 		if err != nil {
@@ -316,8 +321,11 @@ func (t *Telemetry) Shutdown(ctx context.Context) error {
 	}
 	var errs []error
 	t.stopOnce.Do(func() {
+		// Stop the refresh loop and abandon an in-flight count first, then
+		// flush, so a hung DB never eats the flush budget (the k8s grace
+		// period).
 		close(t.stop)
-		t.wg.Wait()
+		t.runCancel()
 		if t.tp != nil {
 			if err := t.tp.Shutdown(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("tracer provider: %w", err))
@@ -327,6 +335,15 @@ func (t *Telemetry) Shutdown(ctx context.Context) error {
 			if err := t.mp.Shutdown(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("meter provider: %w", err))
 			}
+		}
+		// Wait for the refresh goroutine, but never past ctx: a count that
+		// ignores cancellation must not block exit.
+		done := make(chan struct{})
+		go func() { t.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			errs = append(errs, fmt.Errorf("stale refresh still running: %w", ctx.Err()))
 		}
 	})
 	return errors.Join(errs...)

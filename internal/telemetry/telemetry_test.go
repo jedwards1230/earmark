@@ -239,3 +239,43 @@ func scrape(t *testing.T, r *metrics.Registry) string {
 	}
 	return rec.Body.String()
 }
+
+// TestShutdownHonorsCtx (review M3): a stale-items refresh stuck on a hung DB
+// must not hold Shutdown past its context. A count that honors its context is
+// cancelled at once; one that ignores it is abandoned when ctx expires.
+func TestShutdownHonorsCtx(t *testing.T) {
+	for _, honors := range []bool{true, false} {
+		clearOTelEnv(t)
+		tel, err := telemetry.Setup(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := make(chan struct{})
+		release := make(chan struct{})
+		defer close(release)
+		tel.StartStaleRefresh(time.Hour, time.Minute, func(ctx context.Context) (map[string]int64, error) {
+			close(started)
+			if honors {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			<-release // a driver that ignores cancellation
+			return nil, nil
+		})
+		<-started
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		start := time.Now()
+		err = tel.Shutdown(ctx)
+		cancel()
+		d := time.Since(start)
+		if d > 2*time.Second {
+			t.Errorf("honors=%v: Shutdown took %v with a stuck refresh", honors, d)
+		}
+		if honors && err != nil {
+			t.Errorf("honors=%v: Shutdown = %v, want nil (refresh cancelled)", honors, err)
+		}
+		if !honors && err == nil {
+			t.Error("abandoned refresh: want a context error from Shutdown")
+		}
+	}
+}
