@@ -1484,7 +1484,12 @@ func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 	mock.ExpectQuery(requeueByID.resetJobs).
 		WithArgs(id).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, path))
-	// 2) archive its transcript's findings — every state but superseded,
+	// 2) lock its transcript rows so no finding insert slips in between the
+	//    supersede and the delete
+	mock.ExpectExec(requeueLockTranscriptsSQL).
+		WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// 2b) archive its transcript's findings — every state but superseded,
 	//    human decisions included
 	mock.ExpectExec(requeueSupersedeFindingsSQL).
 		WithArgs([]string{id}, patch.StatesAllowing(patch.StateSuperseded)).
@@ -1543,6 +1548,8 @@ func TestRequeueTxSupersedeFailureAborts(t *testing.T) {
 	}
 	mock.ExpectQuery(requeueFailed.resetJobs).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, "/b/x.m4b"))
+	mock.ExpectExec(requeueLockTranscriptsSQL).WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(requeueSupersedeFindingsSQL).
 		WithArgs([]string{id}, supersedeFromStates).
 		WillReturnError(errors.New("boom"))

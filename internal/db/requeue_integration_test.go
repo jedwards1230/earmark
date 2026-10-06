@@ -11,6 +11,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -205,6 +206,23 @@ func TestIntegrationFindingsTranscriptFK(t *testing.T) {
 		t.Fatalf("insert for a missing transcript: err = %v, want foreign_key_violation (23503)", err)
 	}
 
+	// A transcript delete that would leave a LIVE finding with no transcript is
+	// refused (transcript_findings_null_transcript_superseded) — only archived
+	// findings may lose their transcript.
+	_, err = conn.Exec(ctx, `DELETE FROM transcripts WHERE id = $1`, rqTranscriptB)
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "transcript_findings_null_transcript_superseded" {
+		t.Fatalf("delete with a live finding: err = %v, want the null-transcript CHECK (23514)", err)
+	}
+	_, err = conn.Exec(ctx, `INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec,
+		original_text, issue_type, confidence, model) VALUES (NULL, '/b/x.m4b', 0, 1, 'x', 'other', 0.5, 'm')`)
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Errorf("a live finding with no transcript was accepted: err = %v", err)
+	}
+
+	if _, err := conn.Exec(ctx, `UPDATE transcript_findings SET patch_state = 'superseded'
+		WHERE file_path = '/b/Author/B/01.m4b'`); err != nil {
+		t.Errorf("CHECK refuses superseded: %v", err)
+	}
 	if _, err := conn.Exec(ctx, `DELETE FROM transcripts WHERE id = $1`, rqTranscriptB); err != nil {
 		t.Fatal(err)
 	}
@@ -212,14 +230,115 @@ func TestIntegrationFindingsTranscriptFK(t *testing.T) {
 		WHERE file_path = '/b/Author/B/01.m4b' AND transcript_id IS NULL`); n != 1 {
 		t.Errorf("finding of a deleted transcript: %d rows with NULL transcript_id, want 1 (ON DELETE SET NULL)", n)
 	}
-
-	if _, err := conn.Exec(ctx, `UPDATE transcript_findings SET patch_state = 'superseded'
-		WHERE file_path = '/b/Author/B/01.m4b'`); err != nil {
-		t.Errorf("CHECK refuses superseded: %v", err)
-	}
-	_, err = conn.Exec(ctx, `UPDATE transcript_findings SET patch_state = 'bogus' WHERE file_path = '/b/Author/B/01.m4b'`)
+	_, err = conn.Exec(ctx, `UPDATE transcript_findings SET patch_state = 'bogus' WHERE file_path = '/b/Author/A/01.m4b'`)
 	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 		t.Errorf("CHECK admits an unknown state: err = %v", err)
+	}
+}
+
+// TestIntegrationRequeueSerializesConcurrentFindingInsert is the requeue/insert
+// race: a judge (or direct-edit) INSERT is in flight for the transcript a
+// requeue is replacing. The requeue's FOR UPDATE lock makes it wait for that
+// insert, so the finding commits first and is archived with the rest — never
+// left as a live finding with a NULL transcript_id. Without the lock the
+// supersede runs before the insert commits, misses the row, and the delete
+// either orphans it or (with the null-transcript CHECK) aborts the requeue.
+// An insert that arrives after the requeue commits fails on the foreign key.
+func TestIntegrationRequeueSerializesConcurrentFindingInsert(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	seedRequeueRows(t, dbURL)
+	conn := connect(t, dbURL)
+
+	writer := connect(t, dbURL)
+	wtx, err := writer.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wtx.Rollback(ctx) }()
+	if _, err := wtx.Exec(ctx, `INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec,
+		original_text, issue_type, suggested_correction, confidence, model)
+		VALUES ($1, '/b/Author/A/01.m4b', 30, 60, 'left', 'misheard_word', 'lift', 0.7, 'judge-in-flight')`,
+		rqTranscriptA); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.RequeueByID(ctx, rqJobA)
+		done <- err
+	}()
+
+	// Wait until the requeue is blocked on a row lock held by the writer.
+	deadline := time.Now().Add(10 * time.Second)
+	for countRows(t, conn, `SELECT count(*) FROM pg_stat_activity
+		WHERE datname = current_database() AND wait_event_type = 'Lock'`) == 0 {
+		select {
+		case err := <-done:
+			t.Fatalf("requeue finished (err=%v) without waiting for the in-flight insert", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("requeue never blocked on the in-flight insert")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := wtx.Commit(ctx); err != nil {
+		t.Fatalf("in-flight insert commit: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("requeue: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("requeue did not finish after the insert committed")
+	}
+
+	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
+		WHERE transcript_id IS NULL AND patch_state <> 'superseded'`); n != 0 {
+		t.Errorf("%d live findings orphaned by the requeue", n)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
+		WHERE model = 'judge-in-flight' AND patch_state = 'superseded'`); n != 1 {
+		t.Error("the in-flight finding was not archived with its transcript")
+	}
+
+	// After the requeue a late insert for the old transcript fails on the FK.
+	_, err = conn.Exec(ctx, `INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec,
+		original_text, issue_type, confidence, model)
+		VALUES ($1, '/b/Author/A/01.m4b', 0, 1, 'x', 'other', 0.5, 'late')`, rqTranscriptA)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Errorf("late insert for a requeued transcript: err = %v, want foreign_key_violation", err)
+	}
+}
+
+// TestIntegrationStaleWorkSkipsSuperseded: archived findings are not work to
+// redo, so stale_work stops listing them once a requeue supersedes them.
+func TestIntegrationStaleWorkSkipsSuperseded(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	seedRequeueRows(t, dbURL)
+	conn := connect(t, dbURL)
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO recipes (recipe_id, step, step_version, code_version) VALUES (repeat('a', 64), 'propose', 1, 'test');
+		INSERT INTO current_recipes (step, recipe_id) VALUES ('propose', repeat('a', 64));`); err != nil {
+		t.Fatal(err)
+	}
+	staleFindings := func() int {
+		return countRows(t, conn, `SELECT count(*) FROM stale_work WHERE source_table = 'transcript_findings'`)
+	}
+	// 6 judge findings on A + 1 on B have no recipe, so all 7 are stale work.
+	if n := staleFindings(); n != 7 {
+		t.Fatalf("stale findings before requeue = %d, want 7", n)
+	}
+	if _, err := d.RequeueByID(ctx, rqJobA); err != nil {
+		t.Fatal(err)
+	}
+	if n := staleFindings(); n != 1 {
+		t.Errorf("stale findings after requeue = %d, want only book B's 1", n)
 	}
 }
 
@@ -276,6 +395,10 @@ func TestIntegrationMigrationArchivesOrphans(t *testing.T) {
 		WHERE conname = 'transcript_findings_transcript_id_fkey' AND convalidated AND confdeltype = 'n'`); n != 1 {
 		t.Error("foreign key missing, not validated, or not ON DELETE SET NULL")
 	}
+	if n := countRows(t, conn, `SELECT count(*) FROM pg_constraint
+		WHERE conname = 'transcript_findings_null_transcript_superseded' AND convalidated`); n != 1 {
+		t.Error("null-transcript CHECK missing or not validated")
+	}
 	var def string
 	if err := conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint
 		WHERE conname = 'transcript_findings_patch_state_valid'`).Scan(&def); err != nil {
@@ -303,7 +426,8 @@ func TestIntegrationMigrationArchivesOrphans(t *testing.T) {
 	if strings.Contains(def, "superseded") || !strings.Contains(def, "unanchorable") {
 		t.Errorf("Down CHECK = %s", def)
 	}
-	if n := countRows(t, conn, `SELECT count(*) FROM pg_constraint WHERE conname = 'transcript_findings_transcript_id_fkey'`); n != 0 {
-		t.Error("Down kept the foreign key")
+	if n := countRows(t, conn, `SELECT count(*) FROM pg_constraint WHERE conname IN
+		('transcript_findings_transcript_id_fkey', 'transcript_findings_null_transcript_superseded')`); n != 0 {
+		t.Error("Down kept the foreign key or the null-transcript CHECK")
 	}
 }

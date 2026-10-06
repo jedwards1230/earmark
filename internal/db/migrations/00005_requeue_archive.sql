@@ -28,12 +28,31 @@
 -- validating anti-join over the transcripts primary key takes milliseconds.
 -- The orphan UPDATE above runs first, so validation cannot fail.
 --
+-- Two guards keep it that way:
+--   * CHECK (transcript_id IS NOT NULL OR patch_state = 'superseded'): a NULL
+--     transcript_id means "archived by a requeue", enforced by the database. A
+--     transcript delete that would leave a live finding behind (anything but a
+--     requeue, or a requeue that missed a row) fails instead of orphaning it.
+--   * requeue locks the transcript rows FOR UPDATE before superseding, so a
+--     finding INSERT racing it either lands first (and is archived) or fails
+--     on the foreign key after it commits (internal/db requeueTx).
+--
+-- stale_work stops listing superseded findings: they are an archive, not work
+-- to redo.
+--
+-- lock_timeout: the ALTERs take ACCESS EXCLUSIVE on transcript_findings and
+-- the foreign key SHARE ROW EXCLUSIVE on transcripts for the whole
+-- transaction. Behind a long reader they would queue and stall every later
+-- reader of the table, so the migration gives up after 5s instead (the
+-- process retries the migration on its next start).
+--
 -- The patch_state CHECK is rebuilt from its CURRENT value list plus
 -- 'superseded', rather than restated. Another migration in flight adds its own
 -- state to the same constraint; restating the list here would silently drop
 -- that state again, depending only on which file sorts last.
 
 -- +goose Up
+SET LOCAL lock_timeout = '5s';
 ALTER TABLE transcript_findings ALTER COLUMN transcript_id DROP NOT NULL;
 ALTER TABLE transcript_findings ADD COLUMN superseded_at TIMESTAMPTZ;
 
@@ -78,7 +97,54 @@ ALTER TABLE transcript_findings
     ADD CONSTRAINT transcript_findings_transcript_id_fkey
     FOREIGN KEY (transcript_id) REFERENCES transcripts (id) ON DELETE SET NULL;
 
+ALTER TABLE transcript_findings
+    ADD CONSTRAINT transcript_findings_null_transcript_superseded
+    CHECK (transcript_id IS NOT NULL OR patch_state = 'superseded');
+
 DROP FUNCTION pg_temp.set_patch_states(TEXT, TEXT);
+
+CREATE OR REPLACE VIEW stale_work AS
+WITH cur AS (
+    SELECT cr.step, r.recipe_id, r.step_version, r.model_alias, r.model_resolved,
+           r.model_revision, r.prompt_version, r.prompt_sha256, r.params
+      FROM current_recipes cr
+      JOIN recipes r ON r.recipe_id = cr.recipe_id
+)
+SELECT 'asr'::text AS step, 'transcripts'::text AS source_table, t.id AS row_id,
+       t.recipe_id, cur.recipe_id AS current_recipe_id
+  FROM transcripts t
+  JOIN cur ON cur.step = 'asr'
+  LEFT JOIN recipes r ON r.recipe_id = t.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+SELECT 'propose', 'transcript_findings', f.id, f.recipe_id, cur.recipe_id
+  FROM transcript_findings f
+  JOIN cur ON cur.step = 'propose'
+  LEFT JOIN recipes r ON r.recipe_id = f.recipe_id
+ WHERE f.origin = 'judge'
+   AND f.patch_state <> 'superseded'
+   AND (r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params))
+UNION ALL
+SELECT 'embed', 'transcript_chunks', c.id, c.recipe_id, cur.recipe_id
+  FROM transcript_chunks c
+  JOIN cur ON cur.step = 'embed'
+  LEFT JOIN recipes r ON r.recipe_id = c.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params);
 
 -- +goose Down
 -- Lossy, like every Down here: 'superseded' did not exist before, so archived
@@ -86,6 +152,50 @@ DROP FUNCTION pg_temp.set_patch_states(TEXT, TEXT);
 -- stale_reason='superseded'. transcript_id goes back to NOT NULL only when no
 -- row has lost its transcript; otherwise it stays nullable rather than delete
 -- or invent data.
+SET LOCAL lock_timeout = '5s';
+CREATE OR REPLACE VIEW stale_work AS
+WITH cur AS (
+    SELECT cr.step, r.recipe_id, r.step_version, r.model_alias, r.model_resolved,
+           r.model_revision, r.prompt_version, r.prompt_sha256, r.params
+      FROM current_recipes cr
+      JOIN recipes r ON r.recipe_id = cr.recipe_id
+)
+SELECT 'asr'::text AS step, 'transcripts'::text AS source_table, t.id AS row_id,
+       t.recipe_id, cur.recipe_id AS current_recipe_id
+  FROM transcripts t
+  JOIN cur ON cur.step = 'asr'
+  LEFT JOIN recipes r ON r.recipe_id = t.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+SELECT 'propose', 'transcript_findings', f.id, f.recipe_id, cur.recipe_id
+  FROM transcript_findings f
+  JOIN cur ON cur.step = 'propose'
+  LEFT JOIN recipes r ON r.recipe_id = f.recipe_id
+ WHERE f.origin = 'judge'
+   AND (r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params))
+UNION ALL
+SELECT 'embed', 'transcript_chunks', c.id, c.recipe_id, cur.recipe_id
+  FROM transcript_chunks c
+  JOIN cur ON cur.step = 'embed'
+  LEFT JOIN recipes r ON r.recipe_id = c.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params);
+
+ALTER TABLE transcript_findings DROP CONSTRAINT transcript_findings_null_transcript_superseded;
 ALTER TABLE transcript_findings DROP CONSTRAINT transcript_findings_transcript_id_fkey;
 
 UPDATE transcript_findings

@@ -151,6 +151,28 @@ func mustProvider(t *testing.T) *goose.Provider {
 	return p
 }
 
+// TestRequeueArchiveMigrationSetsLockTimeout: 00005 takes ACCESS EXCLUSIVE on
+// transcript_findings; behind a long reader it must fail fast rather than
+// queue and stall every later reader. Both directions set a local timeout
+// before their first DDL.
+func TestRequeueArchiveMigrationSetsLockTimeout(t *testing.T) {
+	src, err := migrationFiles.ReadFile("migrations/00005_requeue_archive.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, down, ok := strings.Cut(string(src), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	for name, part := range map[string]string{"Up": up, "Down": down} {
+		i := strings.Index(part, "SET LOCAL lock_timeout")
+		j := strings.Index(part, "ALTER TABLE")
+		if i < 0 || j < 0 || i > j {
+			t.Errorf("%s: SET LOCAL lock_timeout must precede the first ALTER TABLE", name)
+		}
+	}
+}
+
 // TestRecipesMigrationLocksStampedTables: 00002 computes the legacy recipe
 // set several times under READ COMMITTED. Writers must be frozen BEFORE the
 // first of those reads, or a concurrent commit can add a key the recipes

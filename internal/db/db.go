@@ -3695,6 +3695,44 @@ type BookFindings struct {
 	TopIssueType   string
 }
 
+// The /findings dashboard queries count LIVE findings only: superseded rows
+// (archived by a requeue, CONTRACT §1.4) describe a transcript that no longer
+// exists, so counting them next to the re-judged transcript's findings would
+// double a requeued book. They stay readable through
+// list_transcript_corrections state=superseded.
+const notSupersededSQL = `patch_state <> 'superseded'`
+
+var (
+	findingsTotalsSQL = `
+		SELECT COUNT(*),
+		       AVG(confidence),
+		       COUNT(*) FILTER (WHERE confidence >= 0.8),
+		       COUNT(*) FILTER (WHERE confidence >= 0.4 AND confidence < 0.8),
+		       COUNT(*) FILTER (WHERE confidence < 0.4)
+		FROM transcript_findings
+		WHERE ` + notSupersededSQL
+	findingsByIssueTypeSQL = `
+		SELECT issue_type, COUNT(*) AS n
+		FROM transcript_findings
+		WHERE ` + notSupersededSQL + `
+		GROUP BY issue_type
+		ORDER BY n DESC, issue_type`
+	findingsByBookSQL = `
+		WITH per_book AS (
+			SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir,
+			       MIN(file_path)        AS sample_path,
+			       COUNT(*)              AS n,
+			       AVG(confidence)       AS mean_conf,
+			       mode() WITHIN GROUP (ORDER BY issue_type) AS top_issue
+			FROM transcript_findings
+			WHERE ` + notSupersededSQL + `
+			GROUP BY book_dir
+		)
+		SELECT book_dir, sample_path, n, mean_conf, top_issue
+		FROM per_book
+		ORDER BY n DESC, book_dir`
+)
+
 // GetFindingsSummary returns the library-wide findings rollup (read-only) used by
 // the dashboard /findings page: totals, confidence buckets, an issue-type tally,
 // and a per-book breakdown. Empty (not nil-erroring) on a fresh install.
@@ -3703,25 +3741,13 @@ func (db *DB) GetFindingsSummary(ctx context.Context) (*FindingsSummary, error) 
 
 	// Totals + confidence buckets in one pass. MeanConfidence is nil when there
 	// are zero findings (AVG over no rows is NULL → nilable pointer).
-	if err := db.pool.QueryRow(ctx, `
-		SELECT COUNT(*),
-		       AVG(confidence),
-		       COUNT(*) FILTER (WHERE confidence >= 0.8),
-		       COUNT(*) FILTER (WHERE confidence >= 0.4 AND confidence < 0.8),
-		       COUNT(*) FILTER (WHERE confidence < 0.4)
-		FROM transcript_findings
-	`).Scan(&s.TotalFindings, &s.MeanConfidence,
+	if err := db.pool.QueryRow(ctx, findingsTotalsSQL).Scan(&s.TotalFindings, &s.MeanConfidence,
 		&s.HighConfidence, &s.MediumConfidence, &s.LowConfidence); err != nil {
 		return nil, fmt.Errorf("findings totals query: %w", err)
 	}
 
 	// Issue-type tally, most common first.
-	typeRows, err := db.pool.Query(ctx, `
-		SELECT issue_type, COUNT(*) AS n
-		FROM transcript_findings
-		GROUP BY issue_type
-		ORDER BY n DESC, issue_type
-	`)
+	typeRows, err := db.pool.Query(ctx, findingsByIssueTypeSQL)
 	if err != nil {
 		return nil, fmt.Errorf("findings issue-type query: %w", err)
 	}
@@ -3738,20 +3764,7 @@ func (db *DB) GetFindingsSummary(ctx context.Context) (*FindingsSummary, error) 
 	}
 
 	// Per-book rollup: group by book directory (dirname of file_path).
-	bookRows, err := db.pool.Query(ctx, `
-		WITH per_book AS (
-			SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir,
-			       MIN(file_path)        AS sample_path,
-			       COUNT(*)              AS n,
-			       AVG(confidence)       AS mean_conf,
-			       mode() WITHIN GROUP (ORDER BY issue_type) AS top_issue
-			FROM transcript_findings
-			GROUP BY book_dir
-		)
-		SELECT book_dir, sample_path, n, mean_conf, top_issue
-		FROM per_book
-		ORDER BY n DESC, book_dir
-	`)
+	bookRows, err := db.pool.Query(ctx, findingsByBookSQL)
 	if err != nil {
 		return nil, fmt.Errorf("findings per-book query: %w", err)
 	}
@@ -3807,6 +3820,7 @@ var (
 		       tf.issue_type, tf.suggested_correction, tf.confidence
 		FROM transcript_findings tf
 		LEFT JOIN transcription_jobs j ON j.file_path = tf.file_path
+		WHERE tf.` + notSupersededSQL + `
 		ORDER BY tf.confidence DESC, tf.file_path, tf.start_sec
 		LIMIT $1
 	`
@@ -3819,6 +3833,7 @@ var (
 		FROM transcript_findings tf
 		LEFT JOIN transcription_jobs j ON j.file_path = tf.file_path
 		WHERE tf.file_path LIKE $2 ESCAPE '\'
+		  AND tf.` + notSupersededSQL + `
 		ORDER BY tf.confidence DESC, tf.file_path, tf.start_sec
 		LIMIT $1
 	`
@@ -3883,6 +3898,7 @@ func (db *DB) listFindings(ctx context.Context, q rowQuerier, dir string, limit 
 var findingsCountByBookSQL = `
 	SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir, COUNT(*)
 	FROM transcript_findings
+	WHERE ` + notSupersededSQL + `
 	GROUP BY book_dir
 `
 
@@ -4148,6 +4164,18 @@ var (
 	}
 )
 
+// requeueLockTranscriptsSQL locks the requeued jobs' transcript rows before
+// their findings are archived. FOR UPDATE conflicts with the FOR KEY SHARE lock
+// the foreign-key check takes on every finding INSERT (a judge run, a human
+// direct edit): an insert already in flight commits first and is then seen by
+// the supersede below, and a later one blocks until the requeue commits and
+// then fails with a foreign-key violation. Without it, a finding committed
+// between the supersede and the delete would survive as a live-looking
+// 'proposed'/'accepted' row with a NULL transcript_id — which the
+// transcript_findings_null_transcript_superseded CHECK now refuses, aborting
+// the requeue. $1 is the requeued job-id array.
+const requeueLockTranscriptsSQL = `SELECT 1 FROM transcripts WHERE job_id = ANY($1) FOR UPDATE`
+
 // requeueSupersedeFindingsSQL archives the findings of the transcripts a
 // requeue is about to delete (CONTRACT §1.4, §2.17): they move to
 // 'superseded' and are stamped superseded_at. Human decisions (accepted,
@@ -4221,8 +4249,8 @@ func (db *DB) requeue(ctx context.Context, sel requeueSelector, args ...any) ([]
 }
 
 // requeueTx is the transaction-body core of requeue, split out so the
-// reset-jobs → supersede-findings → delete-transcripts → clear-metrics sequence
-// is testable against a pgxmock transaction. It does NOT begin/commit — the
+// reset-jobs → lock-transcripts → supersede-findings → delete-transcripts →
+// clear-metrics sequence is testable against a pgxmock transaction. It does NOT begin/commit — the
 // caller owns the tx lifecycle. Returns the reset jobs' ids and file paths
 // (parallel slices).
 //
@@ -4242,6 +4270,9 @@ func requeueTx(ctx context.Context, tx txQuerier, sel requeueSelector, args ...a
 		return nil, nil, nil
 	}
 
+	if _, err := tx.Exec(ctx, requeueLockTranscriptsSQL, ids); err != nil {
+		return nil, nil, fmt.Errorf("lock transcripts: %w", err)
+	}
 	if _, err := tx.Exec(ctx, requeueSupersedeFindingsSQL, ids, supersedeFromStates); err != nil {
 		return nil, nil, fmt.Errorf("supersede findings: %w", err)
 	}
