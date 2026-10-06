@@ -374,6 +374,18 @@ func (c *openAIChatClient) Endpoint() Endpoint {
 	return e
 }
 
+// StatusError is a non-200 reply from the chat endpoint. Error() keeps the
+// body for operator logs; telemetry records only the code (the body can echo
+// the request, i.e. transcript text — see errorClass).
+type StatusError struct {
+	Code int
+	Body string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("chat endpoint returned %d: %s", e.Code, e.Body)
+}
+
 // ErrThinkingOnlyResponse means the model returned reasoning but no answer.
 // Surfaced rather than swallowed: an empty judge reply must never be quietly
 // read as "no findings".
@@ -429,7 +441,7 @@ func (c *openAIChatClient) CompleteWithModel(ctx context.Context, system, user s
 		return Completion{}, fmt.Errorf("read chat response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Completion{}, fmt.Errorf("chat endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return Completion{}, &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(respBody))}
 	}
 
 	var parsed chatResponse

@@ -3,6 +3,8 @@ package eval
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,8 +156,8 @@ func TestJudgeChunk_GenAISpanError(t *testing.T) {
 	if got[0].Status.Code != codes.Error {
 		t.Errorf("status = %v, want Error", got[0].Status)
 	}
-	if _, ok := spanAttrs(got[0])["error.type"]; !ok {
-		t.Error("error span missing error.type")
+	if et := spanAttrs(got[0])["error.type"]; et.AsString() != "_OTHER" {
+		t.Errorf("error.type = %q, want _OTHER", et.AsString())
 	}
 	if _, ok := spanAttrs(got[0])["earmark.recipe_id"]; ok {
 		t.Error("a failed call stamped no recipe, but the span claims one")
@@ -180,5 +182,72 @@ func TestJudgeChunk_FallbackOutcome(t *testing.T) {
 	}
 	if pts := modelCallPoints(t, reader); pts["judge|earmark-judge|fallback"] != 1 {
 		t.Errorf("earmark_model_calls = %v, want judge|earmark-judge|fallback = 1", pts)
+	}
+}
+
+// TestJudgeChunk_ErrorSpanCarriesNoContent: an upstream validation error that
+// echoes the request (FastAPI/vLLM/LiteLLM 422 "input": …) must not put the
+// prompt or chunk text on the span — status, attributes or events. The span
+// records only the status code class.
+func TestJudgeChunk_ErrorSpanCarriesNoContent(t *testing.T) {
+	spans, _ := installTestProviders(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"detail":[{"msg":"bad","input":` + string(body) + `}]}`))
+	}))
+	defer srv.Close()
+
+	j := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: srv.URL + "/v1", Model: "m"}))
+	c := sampleChunk()
+	c.Text = "ganema said the sietch was quiet"
+	_, err := j.JudgeChunk(context.Background(), c)
+	if err == nil || !strings.Contains(err.Error(), c.Text) {
+		t.Fatalf("precondition: the returned error should carry the echoed body, got %v", err)
+	}
+
+	got := spans.GetSpans()
+	if len(got) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(got))
+	}
+	s := got[0]
+	if s.Status.Code != codes.Error {
+		t.Errorf("status = %v, want Error", s.Status)
+	}
+	if et := spanAttrs(s)["error.type"]; et.AsString() != "422" {
+		t.Errorf("error.type = %q, want 422", et.AsString())
+	}
+	leaks := func(where, v string) {
+		if strings.Contains(v, c.Text) || strings.Contains(v, "sietch") {
+			t.Errorf("%s carries chunk text: %.120q", where, v)
+		}
+	}
+	leaks("status description", s.Status.Description)
+	for k, v := range spanAttrs(s) {
+		leaks("attribute "+string(k), v.String())
+	}
+	for _, e := range s.Events {
+		leaks("event "+e.Name, e.Name)
+		for _, a := range e.Attributes {
+			leaks("event attribute "+string(a.Key), a.Value.String())
+		}
+	}
+}
+
+func TestErrorClass(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{&StatusError{Code: 503, Body: "secret"}, "503"},
+		{fmt.Errorf("judge chunk x: %w", &StatusError{Code: 429}), "429"},
+		{ErrThinkingOnlyResponse, "thinking_only"},
+		{fmt.Errorf("chat request: %w", context.DeadlineExceeded), "timeout"},
+		{context.Canceled, "canceled"},
+		{errors.New("unmarshal chat response: the text"), "_OTHER"},
+	} {
+		if got := errorClass(tc.err); got != tc.want {
+			t.Errorf("errorClass(%v) = %q, want %q", tc.err, got, tc.want)
+		}
 	}
 }

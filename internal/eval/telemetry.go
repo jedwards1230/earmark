@@ -2,6 +2,9 @@ package eval
 
 import (
 	"context"
+	"errors"
+	"net"
+	"strconv"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -96,9 +99,13 @@ func endChatSpan(ctx context.Context, span trace.Span, model, expected string, c
 	outcome := outcomeOK
 	if err != nil {
 		outcome = outcomeError
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		span.SetAttributes(semconv.ErrorType(err))
+		// Never err.Error(): an upstream error body can echo the request —
+		// the prompt and the chunk text (CONTRACT §2.16). Only a bounded
+		// classification goes on the span; the full error is still returned
+		// to the caller and logged there.
+		class := errorClass(err)
+		span.SetStatus(codes.Error, "chat call failed: "+class)
+		span.SetAttributes(semconv.ErrorTypeKey.String(class))
 	} else {
 		if comp.ResolvedModel != "" {
 			span.SetAttributes(semconv.GenAIResponseModel(comp.ResolvedModel))
@@ -116,4 +123,24 @@ func endChatSpan(ctx context.Context, span trace.Span, model, expected string, c
 		}
 	}
 	countModelCall(ctx, model, outcome)
+}
+
+// errorClass reduces a chat error to a bounded, content-free label for
+// error.type: the HTTP status code ("422"), "timeout", "canceled",
+// "thinking_only", else semconv's "_OTHER".
+func errorClass(err error) string {
+	var se *StatusError
+	var ne net.Error
+	switch {
+	case errors.As(err, &se):
+		return strconv.Itoa(se.Code)
+	case errors.Is(err, ErrThinkingOnlyResponse):
+		return "thinking_only"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return semconv.ErrorTypeOther.Value.AsString()
+	}
 }
