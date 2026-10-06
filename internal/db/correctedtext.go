@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // CorrectedChunk is one chunk of a track's CORRECTED text: the projection
@@ -70,9 +72,26 @@ func (db *DB) GetCorrectedTranscriptPage(ctx context.Context, jobID string, offs
 	return getCorrectedTranscriptPage(ctx, db.pool, jobID, offset, limit)
 }
 
-func getCorrectedTranscriptPage(ctx context.Context, q rowScanner, jobID string, offset, limit int) (*CorrectedTranscriptPage, error) {
+// txOptionsBeginner is the slice of the pool API that opens a transaction with
+// options. *pgxpool.Pool and pgxmock.PgxPoolIface both satisfy it.
+type txOptionsBeginner interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
+}
+
+// correctedPageTxOptions: both queries read ONE snapshot (REPEATABLE READ), so
+// the counts cannot disagree with the page's per-chunk flags when a rebuild
+// commits between them. Read-only, and rolled back rather than committed.
+var correctedPageTxOptions = pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}
+
+func getCorrectedTranscriptPage(ctx context.Context, b txOptionsBeginner, jobID string, offset, limit int) (*CorrectedTranscriptPage, error) {
+	tx, err := b.BeginTx(ctx, correctedPageTxOptions)
+	if err != nil {
+		return nil, fmt.Errorf("begin corrected transcript tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var p CorrectedTranscriptPage
-	if err := q.QueryRow(ctx, correctedChunkCountsSQL, jobID).Scan(&p.TotalChunks, &p.CorrectedChunks); err != nil {
+	if err := tx.QueryRow(ctx, correctedChunkCountsSQL, jobID).Scan(&p.TotalChunks, &p.CorrectedChunks); err != nil {
 		return nil, fmt.Errorf("corrected chunk counts for %s: %w", jobID, err)
 	}
 	if p.CorrectedChunks == 0 || limit <= 0 {
@@ -82,7 +101,7 @@ func getCorrectedTranscriptPage(ctx context.Context, q rowScanner, jobID string,
 		offset = 0
 	}
 
-	rows, err := q.Query(ctx, correctedChunkPageSQL, jobID, offset, limit)
+	rows, err := tx.Query(ctx, correctedChunkPageSQL, jobID, offset, limit)
 	if err != nil {
 		return nil, fmt.Errorf("corrected chunk page for %s: %w", jobID, err)
 	}

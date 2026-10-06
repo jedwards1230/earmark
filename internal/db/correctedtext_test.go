@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pashagolub/pgxmock/v5"
 )
 
@@ -22,12 +23,14 @@ func TestGetCorrectedTranscriptPageServesProjection(t *testing.T) {
 	defer mock.Close()
 
 	const job = "11111111-1111-1111-1111-111111111111"
+	mock.ExpectBeginTx(correctedPageTxOptions)
 	mock.ExpectQuery(correctedChunkCountsSQL).WithArgs(job).
 		WillReturnRows(pgxmock.NewRows([]string{"total", "corrected"}).AddRow(3, 1))
 	mock.ExpectQuery(correctedChunkPageSQL).WithArgs(job, 1, 2).
 		WillReturnRows(pgxmock.NewRows(correctedChunkCols).
 			AddRow("c1", 1, 30.0, 60.0, "Ghanima said", true).
 			AddRow("c2", 2, 60.0, 90.0, "nothing else", false))
+	mock.ExpectRollback()
 
 	p, err := getCorrectedTranscriptPage(context.Background(), mock, job, 1, 2)
 	if err != nil {
@@ -61,8 +64,10 @@ func TestGetCorrectedTranscriptPageNoCorrections(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer mock.Close()
+			mock.ExpectBeginTx(correctedPageTxOptions)
 			mock.ExpectQuery(correctedChunkCountsSQL).WithArgs("j").
 				WillReturnRows(pgxmock.NewRows([]string{"total", "corrected"}).AddRow(5, tc.corrected))
+			mock.ExpectRollback()
 
 			p, err := getCorrectedTranscriptPage(context.Background(), mock, "j", 0, tc.limit)
 			if err != nil {
@@ -75,6 +80,15 @@ func TestGetCorrectedTranscriptPageNoCorrections(t *testing.T) {
 				t.Errorf("page = %+v", p)
 			}
 		})
+	}
+}
+
+// TestCorrectedTranscriptPageOneSnapshot: both queries share one read-only
+// REPEATABLE READ snapshot, so the counts and the page cannot straddle a
+// rebuild.
+func TestCorrectedTranscriptPageOneSnapshot(t *testing.T) {
+	if correctedPageTxOptions.IsoLevel != pgx.RepeatableRead || correctedPageTxOptions.AccessMode != pgx.ReadOnly {
+		t.Fatalf("tx options = %+v, want read-only REPEATABLE READ", correctedPageTxOptions)
 	}
 }
 
