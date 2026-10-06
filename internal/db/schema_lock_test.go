@@ -150,3 +150,16 @@ func TestInitializeOnlyMigrates(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrationsStayInOrder pins CONTRACT §1.8: goose must reject an
+// out-of-order migration, so the provider is never built with
+// AllowOutofOrder (migrations merge and deploy strictly in version order).
+func TestMigrationsStayInOrder(t *testing.T) {
+	src, err := os.ReadFile("migrate.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(src), "WithAllowOutofOrder(") {
+		t.Error("migrate.go enables goose AllowOutofOrder; migrations must merge and deploy in order (CONTRACT §1.8)")
+	}
+}
