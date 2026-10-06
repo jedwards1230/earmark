@@ -441,6 +441,46 @@ func TestScanResultsSingleTrackBookChapterMapping(t *testing.T) {
 	}
 }
 
+// TestScanResultsCleansStoredChapterDebris covers clean-on-read: a
+// book_metadata.chapters row stored before ingest-time cleaning (raw JSON
+// captured from the live table — no RawTitle key, filename-debris titles)
+// must still surface a clean chapter title on search results.
+func TestScanResultsCleansStoredChapterDebris(t *testing.T) {
+	db := newTestDB()
+
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	const singleTrack = testCustomDir + "/The Coddling of the American Mind.m4b"
+	storedRaw := []byte(`[` +
+		`{"Index":0,"Title":"1 - Project Hail Mary: Dedication","StartSec":0,"EndSec":60},` +
+		`{"Index":1,"Title":"2 - Project Hail Mary: Chapter 1","StartSec":60,"EndSec":2000}]`)
+
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("chunk-1", "the astrophage", singleTrack, 3, 300.0, 320.0, nil, 0.9, 12)
+	mock.ExpectQuery("SELECT").WithArgs("astrophage", 10).WillReturnRows(rows)
+	expectBookContext(mock, testCustomDir, storedRaw, [][]any{
+		{singleTrack, fp(2000), testCustomChecksm},
+	})
+
+	got, err := db.textSearch(context.Background(), mock, "astrophage", 10)
+	if err != nil {
+		t.Fatalf("textSearch: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+	if got[0].ChapterIndex != 1 || got[0].ChapterTitle != "Chapter 1" {
+		t.Errorf("chapter = (%d, %q), want (1, %q)", got[0].ChapterIndex, got[0].ChapterTitle, "Chapter 1")
+	}
+}
+
 // TestScanResultsUnknownTrackDurationLeavesChapterUnset covers the honesty rule:
 // when a preceding track's duration is NULL (or 0) the book offset is unknowable,
 // so the chapter fields stay unset rather than reporting a plausible-but-wrong

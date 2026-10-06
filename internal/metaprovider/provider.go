@@ -22,9 +22,15 @@ import (
 // Chapter holds timestamp-bounded chapter information in seconds (matching
 // the transcript_chunks schema). Index is the ordinal within the book; Title,
 // StartSec, and EndSec are populated only when a provider has chapter data.
+//
+// Title is the cleaned display title (CleanChapterTitles strips filename
+// debris such as "12 - Project Hail Mary: " prefixes). RawTitle keeps the
+// provider's original title whenever cleaning changed it, and is empty (and
+// omitted from the stored JSONB) when the provider title was already clean.
 type Chapter struct {
 	Index    int
 	Title    string
+	RawTitle string `json:",omitempty"`
 	StartSec float64
 	EndSec   float64
 }

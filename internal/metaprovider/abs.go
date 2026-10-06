@@ -222,6 +222,8 @@ func cleanGenres(in []string) []string {
 
 // mapABSChapters converts ABS chapter objects to the canonical Chapter type.
 // The ABS chapter.id is an ordinal integer; we preserve it as the Chapter.Index.
+// Titles are run through CleanChapterTitles so new lookups store clean titles
+// (the provider original survives in Chapter.RawTitle).
 func mapABSChapters(absChaps []absChapter) []Chapter {
 	if len(absChaps) == 0 {
 		return nil
@@ -235,7 +237,7 @@ func mapABSChapters(absChaps []absChapter) []Chapter {
 			EndSec:   c.End,
 		}
 	}
-	return out
+	return CleanChapterTitles(out)
 }
 
 // getJSON executes a GET request authenticated with the configured bearer token
