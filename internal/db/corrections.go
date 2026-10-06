@@ -391,19 +391,22 @@ var (
 // offsets into the transcript, so a correction in one chunk never shifts
 // another's anchors.
 //
-// The chunk is addressed by chunk_id when the finding recorded one, falling
-// back to (transcript_id, chunk_index) for findings written before chunk_id was
-// populated. It writes ONLY transcript_chunks.embedding_stale — never the
-// chunk text, and never transcripts.
+// The chunk is addressed by (transcript_id, chunk_index) — the address the
+// replay rewrites — and by chunk_id only for a finding with no chunk_index
+// (findingChunkAddressDoc in db.go). Addressing by chunk_id first flagged
+// nothing for a finding whose chunk_id never named a real row (most live
+// judge findings), so an accept of one was never replayed. It writes ONLY
+// transcript_chunks.embedding_stale — never the chunk text, and never
+// transcripts.
 var markChunkStaleForFindingSQL = `
 	UPDATE transcript_chunks c
 	SET embedding_stale = true
 	FROM transcript_findings f
 	WHERE f.id = $1
-	  AND (c.id = f.chunk_id
-	       OR (f.chunk_id IS NULL
-	           AND c.transcript_id = f.transcript_id
-	           AND c.chunk_index = f.chunk_index))
+	  AND ((f.chunk_index IS NOT NULL
+	        AND c.transcript_id = f.transcript_id
+	        AND c.chunk_index = f.chunk_index)
+	       OR (f.chunk_index IS NULL AND c.id = f.chunk_id))
 `
 
 // isHumanDecision reports whether a target state is reached by a person rather
