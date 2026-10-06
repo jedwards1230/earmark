@@ -251,3 +251,39 @@ func TestErrorClass(t *testing.T) {
 		}
 	}
 }
+
+// TestSameModel (review M8): a route prefix on either side is not a fallback.
+func TestSameModel(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5-20251001", true},
+		{"anthropic/claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5-20251001", true},
+		{"Qwen3.8", "qwen3.8", true},
+		{"qwen3.8", "anthropic/claude-haiku-4-5-20251001", false},
+		{"claude-haiku-4-5", "claude-haiku-4-5-20251001", false},
+	} {
+		if got := sameModel(tc.a, tc.b); got != tc.want {
+			t.Errorf("sameModel(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+// TestJudgeChunk_PrefixIsNotFallback: a response reporting the pinned model
+// without its route prefix counts as ok, not fallback.
+func TestJudgeChunk_PrefixIsNotFallback(t *testing.T) {
+	_, reader := installTestProviders(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"claude-haiku-4-5-20251001","choices":[{"message":{"content":"{\"findings\":[]}"}}]}`))
+	}))
+	defer srv.Close()
+	j := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: srv.URL + "/v1", Model: "earmark-judge"}))
+	j.SetModelPin(ModelPin{ExpectedModel: "anthropic/claude-haiku-4-5-20251001"})
+	if _, err := j.JudgeChunk(context.Background(), sampleChunk()); err != nil {
+		t.Fatal(err)
+	}
+	if pts := modelCallPoints(t, reader); pts["judge|earmark-judge|ok"] != 1 {
+		t.Errorf("earmark_model_calls = %v, want judge|earmark-judge|ok = 1", pts)
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/library"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metrics"
 	"github.com/jedwards1230/earmark/internal/openai"
@@ -142,6 +143,12 @@ func (w *Worker) stampASR(limit int) {
 	for _, t := range stamped {
 		w.log.Debug("stamped asr recipe", "transcript_id", t.ID, "recipe_id", t.RecipeID)
 		if t.EmbeddedASIN == "" || w.refreshBook == nil {
+			continue
+		}
+		// The tag is only the third source: a path that already carries an
+		// ASIN (directory or filename) never consults it, so re-resolving
+		// would just repeat the ABS lookup.
+		if _, src := library.ResolveASIN(t.FilePath, ""); src != "" {
 			continue
 		}
 		dir := filepath.Dir(t.FilePath)

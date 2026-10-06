@@ -34,6 +34,9 @@ func TestStampASR_RefreshesBooksWithEmbeddedTag(t *testing.T) {
 			{ID: "1", FilePath: "/b/Herbert/Children of Dune/01.m4b", RecipeID: "r", EmbeddedASIN: "B002V57VRC"},
 			{ID: "2", FilePath: "/b/Herbert/Children of Dune/02.m4b", RecipeID: "r", EmbeddedASIN: "B002V57VRC"},
 			{ID: "3", FilePath: "/b/Weir/Hail Mary/01.m4b", RecipeID: "r"},
+			// The path already has an ASIN: the tag is never consulted, so no refresh.
+			{ID: "4", FilePath: "/b/Weir/Project Hail Mary [B08G9PRS1K]/01.m4b", RecipeID: "r", EmbeddedASIN: "B08G9PRS1K"},
+			{ID: "5", FilePath: "/b/Schumacher/Information [1629976067].m4b", RecipeID: "r", EmbeddedASIN: "1629976067"},
 		},
 		err: errors.New("one row had malformed asr_params"),
 	}

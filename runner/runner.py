@@ -1911,26 +1911,27 @@ def _file_sha256(path: Path) -> str:
 
 def _resolve_nemo_path(model_id: str) -> Path | None:
     """
-    Locate the .nemo file behind *model_id* in the local Hugging Face cache
-    (where NeMo's from_pretrained downloads it). Cache-only — never a network
-    call. Returns None when it cannot be found.
+    Locate the .nemo file behind *model_id* in the local Hugging Face cache,
+    the way NeMo's from_pretrained does: try_to_load_from_cache(repo_id,
+    "<model name>.nemo"). Cache-only — never a network call. Returns None
+    when it is not cached there (e.g. an NGC-hosted model, or a repo without
+    a .nemo, which NeMo keeps in its own cache); the recipe then has no
+    model_revision.
     """
+    filename = model_id.rsplit("/", 1)[-1] + ".nemo"
     try:
-        from huggingface_hub import snapshot_download  # type: ignore[import]
+        from huggingface_hub import try_to_load_from_cache  # type: ignore[import]
 
-        folder = Path(
-            snapshot_download(
-                repo_id=model_id, allow_patterns=["*.nemo"], local_files_only=True
-            )
-        )
+        found = try_to_load_from_cache(repo_id=model_id, filename=filename)
     except Exception as exc:  # noqa: BLE001 — provenance is best-effort
-        log.warning("cannot locate .nemo for %s in the HF cache: %s", model_id, exc)
+        log.warning("cannot look up %s for %s in the HF cache: %s", filename, model_id, exc)
         return None
-    files = sorted(folder.glob("*.nemo"))
-    if not files:
-        log.warning("no .nemo file in %s for %s", folder, model_id)
+    # try_to_load_from_cache returns a path str, None (unknown), or a
+    # "cached as missing" sentinel object.
+    if not isinstance(found, str):
+        log.warning("%s for %s is not in the HF cache", filename, model_id)
         return None
-    return files[0]
+    return Path(found)
 
 
 def _model_sha256(model_id: str) -> str | None:

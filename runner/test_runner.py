@@ -3742,3 +3742,36 @@ class ProvenanceRunnerVersionTests(unittest.TestCase):
     def test_known_passes_through(self) -> None:
         with mock.patch.object(runner, "RUNNER_VERSION", "v0.41.0"):
             self.assertEqual(runner._provenance_runner_version(), "v0.41.0")
+
+
+class ResolveNemoPathTests(unittest.TestCase):
+    """_resolve_nemo_path asks the HF cache for <name>.nemo, as NeMo does."""
+
+    def _with_hub(self, fn: Any):
+        hub = types.ModuleType("huggingface_hub")
+        hub.try_to_load_from_cache = fn  # type: ignore[attr-defined]
+        return mock.patch.dict(sys.modules, {"huggingface_hub": hub})
+
+    def test_cached_file(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake(repo_id: str, filename: str) -> str:
+            calls.append((repo_id, filename))
+            return "/cache/models--nvidia--parakeet-tdt-1.1b/snapshots/x/parakeet-tdt-1.1b.nemo"
+
+        with self._with_hub(fake):
+            p = runner._resolve_nemo_path("nvidia/parakeet-tdt-1.1b")
+        self.assertEqual(calls, [("nvidia/parakeet-tdt-1.1b", "parakeet-tdt-1.1b.nemo")])
+        self.assertEqual(p, Path("/cache/models--nvidia--parakeet-tdt-1.1b/snapshots/x/parakeet-tdt-1.1b.nemo"))
+
+    def test_not_cached_or_sentinel(self) -> None:
+        for ret in (None, object()):
+            with self._with_hub(lambda repo_id, filename, r=ret: r):
+                self.assertIsNone(runner._resolve_nemo_path("nvidia/parakeet-tdt-1.1b"))
+
+    def test_lookup_error(self) -> None:
+        def boom(repo_id: str, filename: str) -> str:
+            raise ValueError("bad repo id")
+
+        with self._with_hub(boom):
+            self.assertIsNone(runner._resolve_nemo_path("nvidia/parakeet-tdt-1.1b"))

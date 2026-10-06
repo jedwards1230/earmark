@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -109,7 +110,7 @@ func endChatSpan(ctx context.Context, span trace.Span, model, expected string, c
 	} else {
 		if comp.ResolvedModel != "" {
 			span.SetAttributes(semconv.GenAIResponseModel(comp.ResolvedModel))
-			if expected != "" && comp.ResolvedModel != expected {
+			if expected != "" && !sameModel(comp.ResolvedModel, expected) {
 				outcome = outcomeFallback
 			}
 		}
@@ -143,4 +144,19 @@ func errorClass(err error) string {
 	default:
 		return semconv.ErrorTypeOther.Value.AsString()
 	}
+}
+
+// sameModel compares model ids ignoring a router's route prefix and case: a
+// registry pin "anthropic/claude-haiku-4-5-20251001" and a LiteLLM response
+// reporting "claude-haiku-4-5-20251001" name the same model, so the call is
+// not a fallback.
+func sameModel(a, b string) bool {
+	last := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if i := strings.LastIndex(s, "/"); i >= 0 {
+			return s[i+1:]
+		}
+		return s
+	}
+	return last(a) == last(b)
 }
