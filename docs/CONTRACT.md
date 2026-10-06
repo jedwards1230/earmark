@@ -1423,6 +1423,28 @@ Published as `oci://ghcr.io/jedwards1230/charts/earmark`.
 The helmfile release and the ArgoCD Application CRD live in the private
 deployment repo, alongside the other cluster manifests.
 
+Rendered workloads: Deployments `<release>-ingest` (`earmark monitor`) and
+`<release>-mcp` (`earmark mcp`), and — only when `evalBackfill.enabled` (default
+`false`) — CronJob `<release>-eval-backfill`, which runs
+`earmark eval --backfill-unevaluated --write [--limit N]` (§2.15 decoupled mode).
+The CronJob shares the Deployments' image, `earmark.commonEnv` env block (so it
+judges with the same `AI_ENDPOINTS`/`AI_ROLES` and gateway key), pod/container
+security contexts, `nodeSelector` and `tolerations`; it mounts no books volume and
+exposes no ports. It gets the **whole** `commonEnv`, including env it never
+reads (`BOOKS_DIR`, `SCAN_INTERVAL`, `LIBRARY_COLLECTIONS`, `ASR_SERVERS`,
+`METADATA_PROVIDER`, `ABS_URL`/`ABS_LIBRARY_ID`) and the `ABS_TOKEN` secret ref
+(eval never calls Audiobookshelf). That is an accepted cost: one env block for
+every earmark pod is what keeps the judge config from drifting, and splitting
+`commonEnv` would reintroduce a second list to keep in step.
+`evalBackfill.extraEnv` appends judge-only env (e.g. `EVAL_REASONING_EFFORT=omit`)
+and is **additions only** — a name `commonEnv` already sets fails the render.
+`evalBackfill.extraArgs` appends extra `earmark eval` flags. Enabling the CronJob
+while `config.evalInPipeline: true` renders (a one-off backlog catch-up is
+legitimate) but `NOTES` warns that both paths will judge. Defaults: schedule
+`17 * * * *`, `--limit 25` (`0` omits the flag = no cap), `concurrencyPolicy: Forbid`, `backoffLimit: 0`,
+`activeDeadlineSeconds: 3000`, `startingDeadlineSeconds: 600`,
+`ttlSecondsAfterFinished: 86400`, history limits 3/3.
+
 Sync policy: **auto-sync** (`prune: true`, `selfHeal: true`) — this is a
 non-critical new service, not in the manual-sync exceptions list.
 
@@ -1893,7 +1915,8 @@ path always persists.
 recommended shape when the judge is slow or remote (e.g. a hosted model behind
 LiteLLM): the worker only embeds — no judge call can delay search — and judging
 runs as its own pass, `earmark eval --backfill-unevaluated --write [--limit N]`,
-on whatever schedule the deployment chooses (e.g. a CronJob). That pass selects
+on whatever schedule the deployment chooses (the chart's optional
+`evalBackfill` CronJob, §2.7). That pass selects
 every done transcript without the `eval_finished_at` latch regardless of embed
 state, judges its **stored** chunk rows (so findings reference the real chunk
 IDs), and latches it on success (§1.5). Without the gate the embed worker assigns

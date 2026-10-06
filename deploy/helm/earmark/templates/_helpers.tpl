@@ -24,6 +24,14 @@ Image tag — defaults to Chart.AppVersion.
 {{- end }}
 
 {{/*
+Full container image reference (repository:tag) — shared by both Deployments
+and the evalBackfill CronJob so every pod runs the same build.
+*/}}
+{{- define "earmark.image" -}}
+{{- printf "%s:%s" .Values.image.repository (include "earmark.imageTag" .) }}
+{{- end }}
+
+{{/*
 Common labels (all resources).
 */}}
 {{- define "earmark.labels" -}}
@@ -71,6 +79,15 @@ app.kubernetes.io/component: ingest
 {{- end }}
 
 {{/*
+evalBackfill component: name (the CronJob; Jobs/pods derive their names from it).
+Truncated to 52 chars: the CronJob controller appends an 11-char "-<timestamp>"
+suffix to Job names, which must stay within 63.
+*/}}
+{{- define "earmark.evalBackfill.name" -}}
+{{- printf "%s-eval-backfill" (include "earmark.fullname" .) | trunc 52 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Config checksum annotation — roll pods when ConfigMap/env config changes.
 Pass the entire .Values.config as the checksum source.
 */}}
@@ -80,7 +97,8 @@ checksum/config: {{ .Values.config | toJson | sha256sum }}
 
 {{/*
 Shared container env block (database + app config) — avoids duplication across
-the two Deployments.
+the two Deployments and the evalBackfill CronJob (which must load the identical
+AI_ENDPOINTS/AI_ROLES so the judge it runs is the one the Deployments see).
 */}}
 {{- define "earmark.commonEnv" -}}
 - name: DATABASE_URL

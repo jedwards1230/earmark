@@ -41,7 +41,7 @@ spec:
 
       containers:
         - name: earmark-ingest
-          image: "{{ .Values.image.repository }}:{{ include "earmark.imageTag" . }}"
+          image: {{ include "earmark.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
 
           # args overrides the Dockerfile CMD — always explicit, never rely on CMD.
