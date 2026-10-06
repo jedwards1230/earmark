@@ -373,9 +373,11 @@ reanchored_at       TIMESTAMPTZ,  -- last time earmark reanchor wrote this row's
 ```
 
 A re-anchor rewrites the existing anchor columns in place — `chunk_id`,
-`chunk_index`, `start_sec`/`end_sec` (from the chunk row), `chunk_text_sha256`,
-`anchor_offset`, `anchor_occurrence` — and never touches a finding outside
-`proposed`/`unanchorable`. An `unanchorable` row keeps its original anchor.
+`chunk_index` (from the chunk row), `chunk_text_sha256`, `anchor_offset`,
+`anchor_occurrence` — and never touches a finding outside
+`proposed`/`unanchorable`. `start_sec`/`end_sec` keep the judged audio window
+(the next re-anchor searches by it). An `unanchorable` row keeps its original
+anchor.
 
 ### 8. `recipes` — Provenance (CONTRACT §1.9)
 
