@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -301,5 +302,31 @@ func TestSetup_GRPCProtocolTurnsOTLPOff(t *testing.T) {
 	}
 	if !tel.OTLPTraces() {
 		t.Error("OTLP traces off despite OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf")
+	}
+}
+
+// TestShutdown_ConcurrentAndNil pins what `earmark mcp` and `earmark eval`
+// rely on: the signal handler and the main exit path may both call Shutdown at
+// once (sync.Once makes the loser wait for, then skip, the flush), and a nil
+// *Telemetry — Setup failed — is a no-op rather than a panic.
+func TestShutdown_ConcurrentAndNil(t *testing.T) {
+	clearOTelEnv(t)
+	tel, err := telemetry.Setup(context.Background())
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			shutdown(t, tel)
+		}()
+	}
+	wg.Wait()
+
+	var none *telemetry.Telemetry
+	if err := none.Shutdown(context.Background()); err != nil {
+		t.Errorf("nil Shutdown: %v", err)
 	}
 }
