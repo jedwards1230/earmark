@@ -266,8 +266,9 @@ requires adding the chunk's track offset first; see the time-bases note under
 Chapter titles are cleaned of filename debris (`metaprovider.CleanChapterTitles`,
 CONTRACT §1.6): ABS file-derived titles such as `"12 - Project Hail Mary: Chapter
 11"` or `"<Book> [<ASIN>] - 01 - Chapter 1 (1)"` become `"Chapter 11"` /
-`"Chapter 1"`. Cleaning happens at ingest and again on read, so rows stored
-before it existed still read clean. When a title was changed at ingest the entry
+`"Chapter 1"`. Cleaning happens at ingest and on read, so rows stored before
+it existed still read clean; a row whose entries already carry `"RawTitle"` was
+cleaned at ingest and is read back as stored (a list is cleaned at most once). When a title was changed at ingest the entry
 carries an optional `"RawTitle"` key holding the provider original; it is absent
 on entries whose title was already clean and on rows written before cleaning
 (their stored `Title` *is* the original). A re-lookup

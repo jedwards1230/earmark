@@ -863,7 +863,13 @@ Rules:
   alone, and a strip that would leave an empty title is skipped. Cleaning runs
   **at ingest** (`mapABSChapters`, so a lookup stores clean titles) **and on
   read** (`db.decodeChapters`, so rows stored before cleaning existed surface
-  clean titles without a rewrite). It is idempotent. Whenever a title changes the
+  clean titles without a rewrite). A list is cleaned **at most once**: cleaning
+  is not idempotent in general (`["1 - Book: 1 - Intro", "2 - Book: 2 - Body"]`
+  cleans to `["1 - Intro", "2 - Body"]`, which would strip again), so the read
+  path returns a stored list unchanged when any entry already carries `RawTitle`
+  (it was cleaned at ingest). The book segment is the text before the first
+  `": "`, so a book whose own title contains `": "` keeps a residue (never a
+  damaged title). Whenever a title changes the
   provider original is kept in an optional **`RawTitle`** key on that entry
   (absent when the title was already clean) — nothing is discarded. A stored row
   is rewritten with clean titles + `RawTitle` on its next re-lookup

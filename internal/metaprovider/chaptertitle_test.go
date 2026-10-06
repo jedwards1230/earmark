@@ -214,10 +214,9 @@ func TestCleanChapterTitlesKeepsRawTitle(t *testing.T) {
 	}
 }
 
-// TestCleanChapterTitlesIdempotent pins the property the read path relies on:
-// cleaning an already-cleaned list (as stored after an ingest-time clean)
-// changes nothing, including the preserved RawTitle.
-func TestCleanChapterTitlesIdempotent(t *testing.T) {
+// TestCleanChapterTitlesSecondPassOnLiveShapes: for every live debris shape a
+// second pass over cleaned output changes nothing (RawTitle included).
+func TestCleanChapterTitlesSecondPassOnLiveShapes(t *testing.T) {
 	t.Parallel()
 
 	lists := [][]string{
@@ -230,8 +229,27 @@ func TestCleanChapterTitlesIdempotent(t *testing.T) {
 		once := CleanChapterTitles(chaptersFromTitles(l...))
 		twice := CleanChapterTitles(once)
 		if !reflect.DeepEqual(once, twice) {
-			t.Errorf("not idempotent for %q:\n once  %+v\n twice %+v", l, once, twice)
+			t.Errorf("second pass changed %q:\n once  %+v\n twice %+v", l, once, twice)
 		}
+	}
+}
+
+// TestCleanChapterTitlesNotIdempotentInGeneral pins the counterexample that
+// makes "clean at most once" (db.decodeChapters' RawTitle guard) necessary: a
+// cleaned list can itself look like numbered debris.
+func TestCleanChapterTitlesNotIdempotentInGeneral(t *testing.T) {
+	t.Parallel()
+
+	once := CleanChapterTitles(chaptersFromTitles("1 - Book: 1 - Intro", "2 - Book: 2 - Body"))
+	if g, w := titlesOf(once), []string{"1 - Intro", "2 - Body"}; !reflect.DeepEqual(g, w) {
+		t.Fatalf("first pass = %q, want %q", g, w)
+	}
+	twice := CleanChapterTitles(once)
+	if g, w := titlesOf(twice), []string{"Intro", "Body"}; !reflect.DeepEqual(g, w) {
+		t.Fatalf("second pass = %q, want %q (the over-strip the read-path guard prevents)", g, w)
+	}
+	if twice[0].RawTitle != "1 - Book: 1 - Intro" {
+		t.Errorf("RawTitle overwritten on second pass: %q", twice[0].RawTitle)
 	}
 }
 

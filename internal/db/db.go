@@ -1685,12 +1685,21 @@ func (db *DB) GetBookChapters(ctx context.Context, bookDir string) ([]metaprovid
 // "12 - Project Hail Mary: Chapter 11"; cleaning here makes every reader see
 // clean titles without rewriting the stored row (the stored original stays the
 // source of truth, and a re-lookup — `earmark backfill-metadata --yes` — then
-// stores the cleaned title plus RawTitle). Cleaning is idempotent, so rows
-// already cleaned at ingest pass through unchanged.
+// stores the cleaned title plus RawTitle).
+//
+// Cleaning is not idempotent in general, so a list must be cleaned at most
+// once: when any entry already carries RawTitle the row was cleaned at ingest
+// and is returned exactly as stored. A row ingest left unchanged has no
+// RawTitle, but re-cleaning an unchanged list is a no-op.
 func decodeChapters(chaptersJSON []byte) ([]metaprovider.Chapter, error) {
 	var chapters []metaprovider.Chapter
 	if err := json.Unmarshal(chaptersJSON, &chapters); err != nil {
 		return nil, fmt.Errorf("unmarshal chapters: %w", err)
+	}
+	for _, c := range chapters {
+		if c.RawTitle != "" {
+			return chapters, nil
+		}
 	}
 	return metaprovider.CleanChapterTitles(chapters), nil
 }

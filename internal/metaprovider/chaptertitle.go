@@ -41,8 +41,15 @@ import (
 //
 // Nothing is lost: whenever a title changes, the original is kept in
 // Chapter.RawTitle (unless RawTitle already holds an earlier original).
-// Cleaning is idempotent — cleaning an already-clean list changes nothing — so
-// it is safe both at ingest (mapABSChapters) and on every read of stored rows.
+//
+// Cleaning is NOT idempotent in general: a cleaned title can itself look like
+// debris, e.g. ["1 - Book: 1 - Intro", "2 - Book: 2 - Body"] cleans to
+// ["1 - Intro", "2 - Body"] and a second pass would strip again. Callers must
+// therefore clean a list at most once. The read path (db.decodeChapters) keys
+// on RawTitle: a stored list where any entry carries RawTitle was cleaned at
+// ingest and is returned as stored. (A list that ingest left unchanged has no
+// RawTitle, but a second pass over an unchanged list is a no-op by
+// construction: its input is identical to the first pass's.)
 func CleanChapterTitles(chapters []Chapter) []Chapter {
 	if len(chapters) == 0 {
 		return chapters
@@ -106,8 +113,14 @@ func stripNumberedForm(titles []string) []string {
 }
 
 // stripSharedBookSegment removes a leading "<Book>: " segment shared by every
-// title (a title equal to "<Book>" alone is allowed and kept), then strips one
-// or more immediate repeats of the same segment. It needs at least two titles —
+// title. The segment is the text before the FIRST ": " — a known limitation:
+// when the book title itself contains ": " (e.g. "1 - Star Wars: Thrawn:
+// Chapter 1"), only "Star Wars: " is stripped and "Thrawn: Chapter 1" is left.
+// That leaves residue but never damages a real title, and the live library's
+// prefixes are always the short title before any colon ("Dune" for "Dune: The
+// Butlerian Jihad"), so it does not occur today. A title equal to "<Book>"
+// alone is allowed and kept; after the strip, one or more immediate repeats of
+// the same segment are stripped too. It needs at least two titles —
 // with one there is no consensus to tell a book title from a real "Part I:"
 // prefix — and leaves titles unchanged when no common segment exists.
 func stripSharedBookSegment(titles []string) []string {
