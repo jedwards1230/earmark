@@ -145,7 +145,7 @@ reversible. Full parameter documentation is in
 | `/api/v1/pipeline/pause`, `/api/v1/pipeline/run` | Pause/resume and run-N-then-pause. `PUT`/`POST`/`DELETE` require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed with `503` when it is unset |
 | `/api/v1/openapi.yaml` | OpenAPI 3.1 contract for the JSON control API, embedded in the binary (read-only, unauthenticated) |
 | `/healthz`, `/health` | Liveness |
-| `/metrics` | Prometheus metrics |
+| `/metrics` | Prometheus metrics — the pipeline gauges/counters plus the OpenTelemetry instruments (`earmark_build_info`, `earmark_recipe_info`, `earmark_stale_items`, `earmark_model_calls_total`), CONTRACT §2.16 |
 
 `earmark monitor` serves its own `/healthz` and `/metrics` on `INGEST_HTTP_ADDR` (`:8082`).
 
@@ -176,7 +176,8 @@ The ones you are most likely to set:
 | `EVAL_IN_PIPELINE` | `false` | Run the eval judge inline before embedding. Leave `false` to keep embedding independent of the judge and run `earmark eval --backfill-unevaluated --write` as its own pass |
 | `EVAL_REASONING_EFFORT` / `EVAL_CHAT_TEMPLATE_KWARGS` | `auto` | Thinking-suppression fields sent to the judge: on for local models, omitted when the model id contains `anthropic/` (a LiteLLM alias that hides the provider needs `omit`); `omit` or an explicit value overrides |
 | `CONTROL_API_TOKEN` | — | Bearer token for the mutating control API; unset means those endpoints fail closed |
-| `LOG_FORMAT` | `pretty` | `pretty` or `json` |
+| `LOG_FORMAT` | `pretty` | `pretty` or `json`. JSON records logged inside an OpenTelemetry span carry `trace_id`/`span_id` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP collector for traces (judge `gen_ai.*` spans) and pushed metrics. Unset → no OTLP at all. Protocol via `OTEL_EXPORTER_OTLP_PROTOCOL` (`http/protobuf` default, or `grpc`). Standard `OTEL_*` vars only: `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRICS_EXPORTER`, `OTEL_TRACES_EXPORTER`, `OTEL_SDK_DISABLED` (CONTRACT §2.16) |
 
 ## Deployment
 

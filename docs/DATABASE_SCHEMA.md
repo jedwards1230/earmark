@@ -17,6 +17,7 @@ version is in `goose_db_version`.
 | 3 | `00003_stale_work.sql` | `current_recipes`; the `stale_work` view |
 | 4 | `00004_unanchorable.sql` | `unanchorable` patch state; `unanchorable_reason`, `reanchored_at` on `transcript_findings` |
 | 5 | `00005_requeue_archive.sql` | `superseded` patch state + `superseded_at`; `transcript_findings.transcript_id` nullable, FK to `transcripts(id) ON DELETE SET NULL`, CHECK `transcript_id IS NOT NULL OR patch_state = 'superseded'`; existing orphans archived as `superseded` first; `stale_work` skips superseded findings |
+| 6 | `00006_asr_provenance_identity.sql` | runner-reported provenance on `transcripts` (`embedded_asin`, `asr_model_sha256`, `asr_runner_version`, `asr_params`) + partial index `transcripts_asr_unstamped_idx`; `book_metadata.asin_source` / `identity_status` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -91,13 +92,25 @@ CREATE TABLE transcripts (
     raw_text         TEXT        NOT NULL,  -- full transcript, concatenated
     model_name       TEXT        NOT NULL,  -- ASR model id, e.g. "nvidia/parakeet-tdt-0.6b-v3"
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    recipe_id        TEXT REFERENCES recipes (recipe_id), -- asr recipe (§8); NULL = unstamped
+    -- runner-reported (00006); NULL from a runner that predates it
+    embedded_asin      TEXT,   -- ASIN tag read from the audio by ffprobe (validated)
+    asr_model_sha256   TEXT,   -- sha256 of the .nemo file loaded
+    asr_runner_version TEXT,   -- runner version tag
+    asr_params         JSONB,  -- runner output-shaping settings
 
     CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
 );
 
 CREATE INDEX transcripts_file_path_idx     ON transcripts (file_path);
 CREATE INDEX transcripts_raw_text_trgm_idx ON transcripts USING gin (raw_text gin_trgm_ops);
+CREATE INDEX transcripts_asr_unstamped_idx ON transcripts (created_at)
+    WHERE recipe_id IS NULL AND asr_runner_version IS NOT NULL;
 ```
+
+The Go worker builds the asr recipe from the four runner-reported columns and
+stamps `recipe_id` (CONTRACT §1.9); `embedded_asin` is the third ASIN source
+for `book_metadata` (CONTRACT §1.6).
 
 #### ⚠️ Time bases: one transcript per TRACK, not per book
 
@@ -281,9 +294,19 @@ CREATE TABLE IF NOT EXISTS book_metadata (
     description TEXT,   -- ABS publisher blurb (verbatim, may contain HTML)
     genres      TEXT[], -- ABS genre list
     isbn        TEXT,   -- ABS isbn
+    asin_source     TEXT,  -- dir | filename | embedded_tag (00006)
+    identity_status TEXT,  -- exact | conflict; NULL = local-only / not resolved (00006)
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
+
+`asin_source` / `identity_status` record the ASIN step (CONTRACT §1.6): `exact`
+when the ABS record was matched by ASIN, `conflict` when the embedded tag named
+a record that is not this book (title two-way coverage, author check; the
+record is then not used). They are written as a pair whenever a lookup
+resolves identity, and kept when it resolves nothing; a conflict also clears
+the catalogue columns (`asin`, `description`, `chapters`, `genres`, `isbn`,
+`narrator`, `series`).
 
 `bias_terms` is re-derived from metadata on every write (never COALESCE-guarded).
 `description`, `genres` and `isbn` (added to existing tables by the pre-goose inline schema, now part of the baseline) are
@@ -390,7 +413,8 @@ their `unanchorable_reason` (the CHECK above); the re-anchor pass never reads a
 ### 8. `recipes` — Provenance (CONTRACT §1.9)
 
 Immutable, content-addressed records of how an output row was made. Written
-insert-if-absent by the Go writers (and, from PR 0b-4, the ASR runner); never
+insert-if-absent by the Go writers — for `asr`, the worker's
+`StampASRRecipes` from the runner-reported provenance columns (migration 6); never
 updated or deleted.
 
 ```sql
