@@ -94,7 +94,7 @@ type Telemetry struct {
 	// in-flight DB count is abandoned rather than waited out.
 	runCtx    context.Context
 	runCancel context.CancelFunc
-	wg       sync.WaitGroup
+	wg        sync.WaitGroup
 }
 
 var logger = log.NewLogger("telemetry")
