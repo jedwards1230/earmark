@@ -3,10 +3,14 @@ package log
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -34,6 +38,55 @@ func init() {
 	// parseable in Loki); any other value (incl. unset / "pretty") keeps the
 	// human-readable PrettyHandler. CONTRACT §2.4.
 	jsonFormat = strings.EqualFold(os.Getenv("LOG_FORMAT"), "json")
+}
+
+// out is where every Logger writes; nil means os.Stdout, resolved at write
+// time. MCP stdio mode points it at os.Stderr (SetOutput) because stdout
+// carries the JSON-RPC stream there.
+var out atomic.Pointer[io.Writer]
+
+// SetOutput redirects every Logger — including ones already created — to w.
+// A nil w restores the default (os.Stdout).
+func SetOutput(w io.Writer) {
+	if w == nil {
+		out.Store(nil)
+		return
+	}
+	out.Store(&w)
+}
+
+// output is the io.Writer loggers hold: it forwards to the current target.
+type output struct{}
+
+func (output) Write(p []byte) (int, error) {
+	if w := out.Load(); w != nil {
+		return (*w).Write(p)
+	}
+	return os.Stdout.Write(p)
+}
+
+// traceHandler adds trace_id and span_id to records logged with a context that
+// carries a valid OpenTelemetry span (logger.InfoContext(ctx, …) inside a
+// span), so a JSON log line joins its trace in the backend. Records without a
+// span are unchanged.
+type traceHandler struct{ slog.Handler }
+
+func (h traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		r.AddAttrs(
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()),
+		)
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return traceHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h traceHandler) WithGroup(name string) slog.Handler {
+	return traceHandler{h.Handler.WithGroup(name)}
 }
 
 // levelVar returns the minimum slog level for the current debug setting. The
@@ -77,7 +130,7 @@ func NewLogger(module string) Logger {
 	// gates (via minLevel) and renders the custom Verbose level with a readable
 	// name. The module attribute is carried the same way as the pretty path.
 	if jsonFormat {
-		h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		h := slog.NewJSONHandler(output{}, &slog.HandlerOptions{
 			Level: minLevel(),
 			ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 				if a.Key == slog.LevelKey {
@@ -88,11 +141,11 @@ func NewLogger(module string) Logger {
 				return a
 			},
 		})
-		return Logger{slog.New(h).With("module", module)}
+		return Logger{slog.New(traceHandler{h}).With("module", module)}
 	}
 
 	prettyHandler := &PrettyHandler{
-		l:        log.New(os.Stdout, "", 0),
+		l:        log.New(output{}, "", 0),
 		module:   module,
 		logLevel: logLevel,
 	}

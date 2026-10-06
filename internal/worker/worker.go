@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/library"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metrics"
 	"github.com/jedwards1230/earmark/internal/openai"
@@ -106,6 +108,56 @@ type Worker struct {
 	// metrics records Prometheus stage durations + counters (CONTRACT §2.16).
 	// nil-safe: a nil Registry makes the Record* calls no-ops.
 	metrics *metrics.Registry
+	// refreshBook re-derives a book's metadata from one of its files (the
+	// monitor's RefreshBookMetadata). Called after ASR stamping for files the
+	// runner found an embedded ASIN tag in. nil → skipped.
+	refreshBook func(ctx context.Context, filePath string)
+}
+
+// ASRStamper is the optional DB capability the worker uses to stamp new
+// transcripts with their asr recipe (CONTRACT §1.9). *db.DB implements it; a
+// DBInterface fake that does not simply skips the pass.
+type ASRStamper interface {
+	StampASRRecipes(ctx context.Context, limit int) ([]db.StampedTranscript, error)
+}
+
+// SetBookRefresher sets the hook that re-derives a book's metadata once the
+// runner has reported the embedded ASIN tag of one of its files.
+func (w *Worker) SetBookRefresher(f func(ctx context.Context, filePath string)) { w.refreshBook = f }
+
+// stampASR stamps transcripts the runner wrote with provenance (model, .nemo
+// sha256, runner version, params) with their asr recipe, then refreshes the
+// metadata of each book where a stamped file carries an embedded ASIN tag, so
+// the third ASIN source is applied as soon as it exists. Best-effort: errors
+// are logged, never fatal to the cycle.
+func (w *Worker) stampASR(limit int) {
+	st, ok := w.db.(ASRStamper)
+	if !ok {
+		return
+	}
+	stamped, err := st.StampASRRecipes(w.ctx, limit)
+	if err != nil {
+		w.log.Warn("asr recipe stamping incomplete", "stamped", len(stamped), "error", err)
+	}
+	refreshed := map[string]bool{}
+	for _, t := range stamped {
+		w.log.Debug("stamped asr recipe", "transcript_id", t.ID, "recipe_id", t.RecipeID)
+		if t.EmbeddedASIN == "" || w.refreshBook == nil {
+			continue
+		}
+		// The tag is only the third source: a path that already carries an
+		// ASIN (directory or filename) never consults it, so re-resolving
+		// would just repeat the ABS lookup.
+		if _, src := library.ResolveASIN(t.FilePath, ""); src != "" {
+			continue
+		}
+		dir := filepath.Dir(t.FilePath)
+		if refreshed[dir] {
+			continue
+		}
+		refreshed[dir] = true
+		w.refreshBook(w.ctx, t.FilePath)
+	}
 }
 
 // SetMetrics attaches a Prometheus registry so the worker records stage
@@ -216,6 +268,8 @@ func (w *Worker) Start(cfg *config.Config) {
 		// look at transcripts with no chunks yet — an already-embedded
 		// transcript would otherwise never be revisited and an accepted
 		// correction would never reach the searchable text.
+		w.stampASR(embedBatchSize(cfg))
+
 		staleRebuilt := w.rebuildStaleTranscripts(cfg)
 
 		if w.evalGatesEmbed {

@@ -202,6 +202,12 @@ func newMigrationProvider(sqlDB *sql.DB, logger log.Logger) (*goose.Provider, er
 	if err != nil {
 		return nil, fmt.Errorf("open embedded migrations: %w", err)
 	}
+	// Migrations are merged and deployed strictly in version order (CONTRACT
+	// §1.8). goose.WithAllowOutofOrder is deliberately NOT set and must stay
+	// off: an out-of-order file (a number below the database's version) makes
+	// startup fail loudly instead of silently applying a lower migration after
+	// a higher one. A branch with a higher number must not merge or deploy
+	// before the branches holding the lower numbers; renumber it instead.
 	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, fsys,
 		goose.WithExcludeNames([]string{baselineFileName}),
 		goose.WithGoMigrations(baselineMigration(logger)),

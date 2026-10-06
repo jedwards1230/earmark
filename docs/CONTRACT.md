@@ -94,6 +94,12 @@ CREATE TABLE transcripts (
     model_name          TEXT        NOT NULL,   -- ASR model used, e.g. "nvidia/parakeet-tdt-0.6b-v3"
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     recipe_id           TEXT        REFERENCES recipes (recipe_id),  -- asr recipe (§1.9); NULL = unstamped
+    -- Runner-reported provenance + identity (migration 00006); all NULL from a
+    -- runner that predates it.
+    embedded_asin       TEXT,       -- ASIN tag embedded in the audio (ffprobe), validated; §1.6
+    asr_model_sha256    TEXT,       -- sha256 of the .nemo file the runner loaded → recipe model_revision
+    asr_runner_version  TEXT,       -- runner version tag → recipe code_version
+    asr_params          JSONB,      -- runner output-shaping settings → recipe params
 
     CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
 );
@@ -101,7 +107,24 @@ CREATE TABLE transcripts (
 CREATE INDEX transcripts_file_path_idx ON transcripts (file_path);
 -- Full-text search on raw_text using pg_trgm (enable via: CREATE EXTENSION IF NOT EXISTS pg_trgm)
 CREATE INDEX transcripts_raw_text_trgm_idx ON transcripts USING gin (raw_text gin_trgm_ops);
+CREATE INDEX transcripts_asr_unstamped_idx ON transcripts (created_at)
+    WHERE recipe_id IS NULL AND asr_runner_version IS NOT NULL;
 ```
+
+**Runner-reported provenance (SHOULD, migration 00006).** A runner writes four
+more columns on its `INSERT`:
+
+| Column | Value |
+|---|---|
+| `embedded_asin` | The ASIN tag in the audio's ffprobe format (then stream) tags — key `ASIN`, `AUDIBLE_ASIN`, or a freeform `----:<mean>:ASIN`, case-insensitive — upper-cased, kept only if it has a catalogue-id shape (`B0` + 8 alphanumerics, 9 digits + `X`, or 6+ digits). NULL otherwise. The third ASIN source (§1.6). |
+| `asr_model_sha256` | Lowercase hex sha256 of the `.nemo` file the model was loaded from (located in the local Hugging Face cache with `try_to_load_from_cache(<repo>, <name>.nemo)`, as NeMo's `from_pretrained` does; hashed once per process, streamed). NULL when it is not cached there (e.g. an NGC-hosted model). |
+| `asr_runner_version` | The runner's version tag (`RUNNER_VERSION`). Its presence is what marks a row as provenance-bearing. NULL when the runner cannot tell its version (`unknown`), so the row is not stamped: no recipe is invented. |
+| `asr_params` | A JSON object of the settings that shape output: `backend`, `compute_type`, `chunk_threshold_seconds`, `chunk_window_seconds`, `chunk_overlap_seconds`, `segment_gap_seconds`, `segment_max_seconds`, `segment_max_words`, `diarize`, `biasing_enabled`, `language`, and `biasing_alpha` when biasing is on. Configuration only — per-job inputs (a book's bias terms) are not recipe. |
+
+The runner probes `information_schema` for these columns and falls back to the
+original nine-column `INSERT` when they are absent, so a runner that updates
+before earmark migrates keeps working. The Go worker turns them into the asr
+recipe (§1.9).
 
 #### 1.2.1 Segment JSON Schema (the `segments` JSONB column)
 
@@ -845,16 +868,71 @@ CREATE TABLE IF NOT EXISTS book_metadata (
   description TEXT,
   genres      TEXT[],
   isbn        TEXT,
+  -- ASIN identity (migration 00006, additive, nullable).
+  asin_source     TEXT CHECK (asin_source IN ('dir', 'filename', 'embedded_tag')),
+  identity_status TEXT CHECK (identity_status IN ('exact', 'conflict')),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
+
+#### Identity: where the ASIN comes from
+
+The ASIN is taken from, in order: the **directory** (`[B0…]` in the book
+directory path), the **filename**, then the **ASIN tag embedded in the audio**,
+which the ASR runner reads with ffprobe (the Go image has none) and reports in
+`transcripts.embedded_asin` (§1.2). The embedded tag is the least trusted
+source, so a record found through it is used only when it names the same book
+as the path (`library.SameBook`):
+
+- **Titles, two-way.** Titles are normalized (lower-cased, punctuation and
+  bracketed ids stripped, stopwords and the authors' name tokens dropped) and
+  compared in a few forms: whole, with series groups such as `(The Expanse,
+  Book 1)` removed, the part after the last colon (a series prefix: `Red
+  Rising: Golden Son`), and the part before the first colon only when what
+  follows is a series marker (`Children of Dune: Dune Chronicles, Book 3`).
+  Some pair of forms must cover **at least 80% of each title's tokens in both
+  directions** — so a series sibling (`Dune` vs `Dune Messiah`), a subset
+  (`Hail Mary` vs `Project Hail Mary`) or another product (`Fourth Wing (1 of
+  2) [Dramatized Adaptation]`) does not match. A record with a plain subtitle
+  the path lacks reads as a conflict: the safe direction.
+- **Authors.** When both the record's and the path's author are known they must
+  share a name token (`Frank Herbert` matches `Frank Herbert, Brian Herbert`).
+
+On a mismatch the record is **not** used: the
+book keeps its path metadata, no ASIN, and `identity_status = 'conflict'`
+(logged). So an ASIN typo or a reused tag can never attach another book's
+description and chapters.
+
+| `identity_status` | Meaning |
+|---|---|
+| `exact` | The catalogue (ABS) record was matched by ASIN (`asin_source` says from where). |
+| `conflict` | The embedded tag named a record that is not this book; it was not used. |
+| NULL | Not resolved against a catalogue: local-only (no ASIN anywhere — e.g. Libro.fm books), path-only provider, or not looked up since 00006. |
+
+`asin_source` and `identity_status` are written as a pair whenever a lookup
+resolves identity. A **conflict also clears** the catalogue columns (`asin`,
+`description`, `chapters`, `genres`, `isbn`, `narrator`, `series`), so data an
+earlier match attached never survives under a conflict. A lookup that resolves
+nothing (path-only, ABS unreachable) keeps the last outcome.
+
+The embedded tag only exists once a **provenance-aware runner** (migration
+00006) has transcribed the file: `transcripts.embedded_asin` is written only at
+transcription time, so transcripts made before the runner update have no tag,
+and nothing re-probes old files (`earmark backfill-metadata` finds no tag for
+them; re-transcription would). For files that do have one it is applied (a) by
+the Go worker right after it stamps the transcript (§1.9) — it re-runs the
+book's metadata lookup, unless the path already carries an ASIN — and (b) by
+`earmark backfill-metadata`. Only these write paths consult it; the hot read
+paths (search, dashboard) build providers without it and read the stored
+result.
 
 #### Column ownership
 
 | Writer | When | Columns it writes |
 |--------|------|-------------------|
 | **Go monitor** | at every enqueue (via `db.UpsertBookMetadata`) | `title`, `author`, `bias_terms`, `source` |
-| **Go monitor — ABS path** | when METADATA_PROVIDER includes ABS | `narrator`, `series`, `asin`, `chapters`, `description`, `genres`, `isbn` |
+| **Go monitor — ABS path** | when METADATA_PROVIDER includes ABS | `narrator`, `series`, `asin`, `chapters`, `description`, `genres`, `isbn`, `asin_source`, `identity_status` |
+| **Go worker** | after stamping a transcript with an `embedded_asin` | re-runs the monitor's lookup for that book (same columns) |
 
 #### Column readers
 
@@ -895,7 +973,7 @@ Rules:
 - Every write is **best-effort** — a `book_metadata` failure MUST NOT fail
   enqueue. The monitor logs and continues.
 - The UPSERT is column-selective for ABS enrichment columns (narrator, series,
-  asin, chapters, description, genres, isbn) so a PathProvider call can never
+  asin, chapters, description, genres, isbn, asin_source, identity_status) so a PathProvider call can never
   clobber ABS-sourced data: a NULL/empty value keeps the stored one, while a
   non-empty value from a re-lookup (the monitor at enqueue, or `earmark
   backfill-metadata --yes`) **overwrites** it — that is how the enrichment is
@@ -903,10 +981,10 @@ Rules:
   contain HTML); `genres` is the ABS genre list (blank entries dropped; an empty
   list is NULL); `isbn` is the ABS `isbn` field. No reader consumes these three
   yet — they are stored for later enrichment work.
-- **Enrichment never clears a field.** Because every ABS enrichment column
-  (narrator, series, asin, chapters, description, genres, isbn) is
-  `COALESCE`-guarded, a lookup can only add or overwrite values, never remove
-  one: if ABS later drops a genre list or blanks a description, the stored value
+- **Enrichment never clears a field — except on an identity conflict** (see
+  above). Because every ABS enrichment column (narrator, series, asin,
+  chapters, description, genres, isbn) is otherwise `COALESCE`-guarded, a
+  lookup can only add or overwrite values, never remove one: if ABS later drops a genre list or blanks a description, the stored value
   stays. Clearing one takes a manual `UPDATE book_metadata SET <col> = NULL`
   (then a re-lookup repopulates whatever ABS still has).
   `bias_terms` is always overwritten (not COALESCE-guarded) so an improved
@@ -1048,9 +1126,16 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 3 | `00003_stale_work.sql` | `current_recipes` + the `stale_work` view (§1.9). |
 | 4 | `00004_unanchorable.sql` | The `unanchorable` patch state, `unanchorable_reason` and `reanchored_at` on `transcript_findings` (§2.17 "Re-anchoring"). |
 | 5 | `00005_requeue_archive.sql` | Requeue archives findings (§1.4 "Operator requeue"): `patch_state` gains `superseded`, `superseded_at` column, `transcript_findings.transcript_id` becomes nullable with a foreign key to `transcripts(id) ON DELETE SET NULL` and a CHECK that only superseded findings may have no transcript; existing orphans are archived as `superseded` first; `stale_work` skips superseded findings. Not purely additive — see §1.4. |
+| 6 | `00006_asr_provenance_identity.sql` | Runner-reported provenance + `embedded_asin` on `transcripts`; `asin_source` / `identity_status` on `book_metadata` (§1.2, §1.6, §1.9). |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
-is never edited. Migrations stay additive unless a change says otherwise, and
+is never edited. **Migrations are merged and deployed strictly in version
+order.** goose runs without `AllowOutofOrder`, and that stays off: a process
+that finds a migration file numbered *below* the database's version refuses to
+start ("detected missing (out-of-order) migration"). So a branch carrying a
+higher number (e.g. 00006) must not merge or deploy before the branches
+carrying the lower ones (00004, 00005); otherwise renumber it at merge time to
+the next free version. Migrations stay additive unless a change says otherwise, and
 every table a migration adds is also dropped by `DEBUG_DB_RESET` (`resetSQL`,
 pinned by `TestIntegrationResetRebuildsFreshSchema`).
 
@@ -1163,7 +1248,7 @@ CREATE TABLE recipes (
 
 | Row | Column | Recipe of | Written by |
 |---|---|---|---|
-| `transcripts` | `recipe_id` | `asr` | the ASR runner — **not yet**: NULL for new transcripts until the runner stamps its recipe (.nemo sha, runner tag, dtype, window/overlap) in PR 0b-4 |
+| `transcripts` | `recipe_id` | `asr` | the Go worker (`db.StampASRRecipes`), from the runner-reported provenance columns (§1.2); rows from a runner that reports none stay NULL |
 | `transcript_findings` | `recipe_id` | `propose` (the judge) | `InsertFindings`; NULL for `origin='human'` rows |
 | `transcript_chunks` | `recipe_id` | `embed` (chunking + embedding) | `InsertChunks`, on insert and re-embed |
 
@@ -1190,6 +1275,19 @@ therefore has a different recipe, which `InsertFindings` registers on the fly
 in the same transaction. Embeddings responses are not read for a model yet: the
 embed recipe's `model_resolved` is the registry's expected model, else the
 alias.
+
+**ASR stamping.** The runner reports what it ran (§1.2: `model_name`,
+`asr_model_sha256`, `asr_runner_version`, `asr_params`); each worker cycle
+(`StampASRRecipes`, up to `EMBED_BATCH_SIZE` rows, via the partial index
+`transcripts_asr_unstamped_idx`) builds the asr recipe — `step_version` 1,
+`code_version` = runner version, `model_alias` = `model_resolved` = the loaded
+model, `model_revision` = the `.nemo` sha256, `params` = `asr_params` — registers
+it and sets `recipe_id` where it is still NULL, in one transaction. Rows without
+`asr_runner_version` are never stamped (nothing is invented). A runner model
+that differs from the registry's `asr` pin (§2.18) is logged; the recipe still
+records what actually ran. `asr` still has no **current** recipe: the Go side
+cannot know the runner's configuration before it reports, so asr rows are not
+yet reported stale.
 
 **Current steps.** `propose`: `step_version` 1, prompt `judge@v1` + sha256 of
 (system prompt, user template, response JSON schema), params `temperature`,
@@ -1227,7 +1325,8 @@ release that changes nothing does not mark the library stale; a logic change
 bumps `step_version`. Unstamped rows are stale whenever their step has a
 current recipe; a step with no current recipe (asr, today) reports nothing;
 human corrections and `superseded` findings (archived by a requeue, §1.4 —
-not work to redo; filtered since migration 5) are never listed. Metrics over it arrive in PR 0b-4.
+not work to redo; filtered since migration 5) are never listed.
+`earmark_stale_items{step}` (§2.16) counts it per step.
 
 **Expect a large `stale_work` right after the first deploy.** Every legacy row
 has `step_version` 0 and no prompt hash, so none is equivalent to a current
@@ -1518,7 +1617,12 @@ All env var names are fixed. No synonyms, no alternatives.
 | `BOOKS_DIR` | no | `/books` (read-only NFS mount inside container) |
 | `MCP_HTTP_ADDR` | no | `:8081` |
 | `INGEST_HTTP_ADDR` | no | `:8082`. The `earmark monitor` (ingest) process serves a minimal HTTP listener here for `/healthz` (liveness) and `/metrics` (Prometheus, §2.16). The mcp pod uses `MCP_HTTP_ADDR` for its surface; this is the ingest pod's only HTTP port. Chosen to avoid colliding with `:8081`. |
-| `LOG_FORMAT` | no | `pretty` (default — human-readable, ANSI-colored `PrettyHandler`). Set `json` for a `slog` JSON handler writing one JSON object per line to stdout (parseable in Loki). Both carry the `module` attribute and honor `LOG_DEBUG`/`LOG_VERBOSE`. Used by both Go pods. |
+| `LOG_FORMAT` | no | `pretty` (default — human-readable, ANSI-colored `PrettyHandler`). Set `json` for a `slog` JSON handler writing one JSON object per line to stdout (parseable in Loki); a record logged inside an OpenTelemetry span also carries `trace_id`/`span_id` (§2.16). Both carry the `module` attribute and honor `LOG_DEBUG`/`LOG_VERBOSE`. Used by both Go pods. `earmark mcp` in stdio mode writes all log lines to stderr. |
+| `OTEL_SDK_DISABLED` | no | `true` turns the OpenTelemetry SDK off entirely (§2.16). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | OTLP collector endpoint (also the per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_METRICS_ENDPOINT`). **Unset → no OTLP export at all.** No default in code; the cluster's collector belongs in deploy values. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | no | `http/protobuf` only (the default; per-signal variants honored). Any other value (e.g. `grpc`) turns that signal's OTLP export off with a warning. Point the endpoint at the collector's OTLP/HTTP port (Alloy: `:4318`). |
+| `OTEL_METRICS_EXPORTER` / `OTEL_TRACES_EXPORTER` | no | Exporter selection: metrics `prometheus,otlp` (default), traces `otlp` (default); `none` disables. OTLP still needs an endpoint. |
+| `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` | no | Resource attributes; `service.name` defaults to `earmark`. Other standard `OTEL_*` exporter variables (headers, insecure, timeout, export interval) are read by the exporters. |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
 | `SCAN_INTERVAL` | no | `1h` (Go duration string). How often the monitor **re-walks `BOOKS_DIR`** looking for new audio files, in addition to the walk it does at startup. Required for correctness on NFS: fsnotify/inotify only reports writes that pass through the monitor pod's own kernel, so a book written directly on the file server — or by any other NFS client — raises **no** watch event and would otherwise stay undiscovered until the pod restarted. The recurring walk is the backstop; fsnotify remains the low-latency path for local writes. The walk is metadata-only for known paths (already-queued `file_path`s are skipped without re-hashing, §1.1), so it is cheap over a multi-TB library. Per-entry errors (e.g. a transient NFS `EIO` on one subdirectory) are logged, counted, and skipped — one bad directory must never abort, and thereby silently disable, every subsequent scan. **`0` (or a negative value) disables periodic scanning**, leaving only the startup walk and fsnotify. |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
@@ -1619,6 +1723,15 @@ vars are new and **optional** — see §2.13 for the vocabulary.
 and the defaults preserve current behavior, with one intended exception:
 `RUNNER_KEEP_AWAKE=auto` turns keep-awake on for Windows runners (set `false` to
 opt out); Linux runners are unchanged.
+
+#### Runner result obligation — report provenance and the embedded ASIN (SHOULD)
+
+On the transcript `INSERT` the runner **SHOULD** write `embedded_asin`,
+`asr_model_sha256`, `asr_runner_version` and `asr_params` (§1.2) when the
+schema has them. No new env var: the sha256 is computed once per process at
+model load from the `.nemo` in the local Hugging Face cache, and `asr_params`
+is derived from the variables above. The runner does not compute recipe IDs;
+the Go worker does (§1.9).
 
 #### Runner result obligation — report applied capabilities (SHOULD)
 
@@ -2434,6 +2547,77 @@ histogram are incremented at the Go-emitted pipeline event sites.
 Standard `go_*` and `process_*` collectors are also registered for baseline
 observability. Both pods also serve `/healthz` (liveness, always-200).
 
+#### OpenTelemetry (metrics, traces, logs)
+
+Both Go pods (and `earmark eval`) run the OpenTelemetry SDK (`internal/telemetry`):
+one MeterProvider whose instruments are read by **both** a Prometheus pull
+exporter — served on the same `/metrics`, next to the metrics above, whose names
+are unchanged — and, when an OTLP endpoint is configured, an OTLP push exporter.
+The push also carries the client_golang metrics above (bridged, same names), so a
+push-only backend sees the whole surface. Traces go out over OTLP only. A
+setup error is logged and never stops a process. `earmark monitor` (after its
+graceful stop) and `earmark mcp` (on SIGTERM/SIGINT) flush and shut the
+providers down, bounded at 10 s / 5 s; `earmark eval` flushes when it
+finishes, but installs no signal handler, so an interrupted run drops its
+buffered spans. An in-flight `earmark_stale_items` count is cancelled first
+and never holds shutdown past that bound.
+
+Configuration is **only** the standard OpenTelemetry environment (§2.4) —
+nothing about any collector is hard-coded:
+
+| Variable | Effect |
+|---|---|
+| `OTEL_SDK_DISABLED=true` | Everything off: no OTel series on `/metrics`, no spans. The metrics above are unaffected. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT`) | Turns OTLP on. **Unset → no OTLP at all** (no SDK default endpoint), nothing dials. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` (or per signal) | `http/protobuf` only — the spec default and the one exporter earmark ships. Use the collector's OTLP/HTTP port (Alloy `:4318`, not the gRPC `:4317`). Any other value turns that signal's OTLP export off with a warning. |
+| `OTEL_METRICS_EXPORTER` | Comma list of `prometheus`, `otlp`, `none`. Default `prometheus,otlp` (otlp only with an endpoint). |
+| `OTEL_TRACES_EXPORTER` | `otlp` (default, only with an endpoint) or `none`. |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | Resource; `service.name` defaults to `earmark`, `service.version` to the build. |
+
+The exporters read the rest of the standard set themselves
+(`OTEL_EXPORTER_OTLP_HEADERS`, `_INSECURE`, `_TIMEOUT`,
+`OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_BSP_*`).
+
+> **Do not ingest metrics twice.** If the same Prometheus both scrapes
+> `/metrics` (PodMonitor) and receives the OTLP metric push, every series
+> arrives twice under different `job` labels. Pick one per deployment — e.g.
+> keep the scrape and set `OTEL_METRICS_EXPORTER=prometheus` while traces go
+> over OTLP.
+
+The Prometheus exporter emits no `target_info` and no `otel_scope_*` labels:
+the series below are the whole addition to `/metrics`.
+
+OpenTelemetry instruments (Prometheus names; the cardinality rule holds —
+labels are only step, recipe, model, fn, outcome; book, ASIN and chunk ids go
+on spans and logs, never labels):
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `earmark_build_info` | gauge = 1 | `version`, `commit` | The running build. |
+| `earmark_recipe_info` | gauge = 1 | `step`, `recipe`, `model`, `revision`, `prompt_version` | One per step in `current_recipes` (§1.9), loaded by the ingest pod at startup after it registers them. |
+| `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
+| `earmark_model_calls_total` | counter | `fn` (`judge`), `model` (requested), `outcome` (`ok` · `error` · `fallback`) | Every judge call. `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). |
+
+**Traces.** Each judge call is one `chat <model>` client span following the
+OpenTelemetry GenAI semantic conventions, **pinned to semconv v1.40.0** (they
+are still "development"; earmark's own `earmark.*` attributes are
+authoritative): `gen_ai.operation.name=chat`, `gen_ai.provider.name` (the
+LiteLLM route prefix of the model id, e.g. `anthropic`, else
+`openai_compatible`), `gen_ai.request.model`, `gen_ai.request.temperature`,
+`gen_ai.response.model` (the resolved model), `gen_ai.usage.input_tokens` /
+`output_tokens` (from the response `usage`), `server.address` / `server.port`,
+on failure an error status whose description and `error.type` are a bounded
+class only — the HTTP status code (`422`), `timeout`, `canceled`,
+`thinking_only` or `_OTHER` — never the error text, because an upstream error
+body can echo the request (no exception event is recorded; the full error
+still reaches the caller's logs), and `earmark.step`, `earmark.fn`,
+`earmark.recipe_id` (the recipe that stamped its findings), `earmark.transcript_id`,
+`earmark.chunk_id`. Prompt and completion content are **never** recorded.
+
+**Logs.** With `LOG_FORMAT=json`, a record logged with a context inside a span
+carries `trace_id` and `span_id`. In MCP stdio mode every log line goes to
+stderr (stdout carries JSON-RPC).
+
 ### 2.17 Reviewable Patches (human-gated apply)
 
 > Added 2026-08-18. This section is the counterpart to §2.15: it defines how a
@@ -2988,7 +3172,7 @@ steps:
   embed:                         # AI_ROLES.embeddings
     expected_model: nomic-embed-text
     revision: sha256:0a109f422b47
-  asr:                           # recorded for the runner's recipe (PR 0b-4); unused by Go today
+  asr:                           # checked against what the runner reports (§1.9 ASR stamping); a mismatch is logged
     expected_model: nvidia/parakeet-tdt-1.1b
 ```
 

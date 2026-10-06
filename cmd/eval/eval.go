@@ -31,6 +31,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/telemetry"
 	"github.com/jedwards1230/earmark/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -146,6 +147,26 @@ func runEval(cmd *cobra.Command, args []string) {
 	}
 	judge := evalpkg.NewJudgeForConfig(chat, cfg)
 
+	// OpenTelemetry (CONTRACT §2.16): judge calls emit gen_ai spans when an
+	// OTLP endpoint is configured. Flushed before the process exits.
+	tel, terr := telemetry.Setup(context.Background())
+	if terr != nil {
+		log.Printf("WARNING: OpenTelemetry disabled: %v", terr)
+	}
+	code := runJudge(database, judge, cfg, book)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := tel.Shutdown(ctx); err != nil {
+		log.Printf("OpenTelemetry shutdown: %v", err)
+	}
+	cancel()
+	if code != 0 {
+		database.Close()
+		os.Exit(code)
+	}
+}
+
+// runJudge runs the selected eval mode and returns the process exit code.
+func runJudge(database *db.DB, judge *evalpkg.Judge, cfg *config.Config, book string) int {
 	// --backfill-unevaluated: a separate execution path that judges done transcripts
 	// with eval_finished_at IS NULL (regardless of embed state). This is an offline
 	// sweep over raw transcript text, not over transcript_chunks, so it uses a
@@ -162,16 +183,17 @@ func runEval(cmd *cobra.Command, args []string) {
 		bo := backfillOptions{mode: mode, write: opts.write, limit: opts.limit, maxAttempts: opts.maxAttempts}
 		if err := runBackfill(context.Background(), os.Stdout, database, judge, cfg, bo); err != nil {
 			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	}
 
 	r := &dbRunner{reader: database, judge: judge, writer: database, events: database}
 	if err := run(context.Background(), os.Stdout, r, book, opts); err != nil {
 		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // backfillDB is the narrow slice of db.DB the backfill execution path needs.

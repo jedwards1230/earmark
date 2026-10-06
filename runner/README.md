@@ -19,6 +19,18 @@ different GPU tenant can use the card, and restores it (`asr_model.cuda()`) when
 active again. The `phase` column is read defensively — a DB without it behaves
 exactly as before.
 
+Each transcript row also carries what produced it and the book's embedded
+identity (CONTRACT §1.2, migration 00006): the ASIN tag ffprobe reports in the
+file's format/stream tags (`ASIN`, `AUDIBLE_ASIN`, `----:<mean>:ASIN`;
+validated, else NULL) as `embedded_asin`, and the provenance the Go side stamps
+the asr recipe from — `asr_model_sha256` (sha256 of the `.nemo` the HF cache holds for the model —
+`try_to_load_from_cache`, as NeMo does — streamed and computed once per
+process at model load), `asr_runner_version` (NULL when the version is
+unknown, so the row is not stamped), and `asr_params` (compute type, chunk/segment geometry,
+diarization, biasing). Against a database without those columns the runner
+writes the original row, so it can update before earmark migrates.
+OpenTelemetry in the runner is not implemented yet.
+
 `docs/CONTRACT.md` is **authoritative** for column names, env-var names, the
 capability vocabulary (§2.13), and the result shape. This file is just orientation.
 

@@ -1,13 +1,20 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	elog "github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/mcp"
+	"github.com/jedwards1230/earmark/internal/telemetry"
 	"github.com/spf13/cobra"
 )
 
@@ -61,6 +68,9 @@ func runMCP(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	// Set before anything logs — config and the DB connect already do.
+	configureLogOutput(os.Getenv("MCP_TRANSPORT"), os.Stderr)
+
 	// Load configuration
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -109,8 +119,43 @@ func runMCP(cmd *cobra.Command, args []string) {
 	}
 	diag("")
 
+	// OpenTelemetry (CONTRACT §2.16), from the OTEL_* environment only. A
+	// setup error is logged, never fatal.
+	tel, err := telemetry.Setup(context.Background())
+	if err != nil {
+		diag("WARNING: OpenTelemetry disabled: %v", err)
+	}
+	// Flush buffered spans and metrics on SIGINT/SIGTERM, then exit: the
+	// transports below have no graceful-stop path of their own.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tel.Shutdown(ctx); err != nil {
+			diag("OpenTelemetry shutdown: %v", err)
+		}
+		os.Exit(0)
+	}()
+
 	// Start the MCP service
-	if err := mcp.StartMCPService(database, cfg); err != nil {
+	err = mcp.StartMCPServiceWithTelemetry(database, cfg, tel)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if serr := tel.Shutdown(shutdownCtx); serr != nil {
+		diag("OpenTelemetry shutdown: %v", serr)
+	}
+	if err != nil {
 		log.Fatalf("Failed to start MCP service: %v", err)
+	}
+}
+
+// configureLogOutput sends every internal/log line to stderr when the MCP
+// transport is stdio (the default, transport ""), because stdout carries the
+// JSON-RPC stream there; internal/log otherwise writes to stdout.
+func configureLogOutput(transport string, stderr io.Writer) {
+	if transport == "" || transport == "stdio" {
+		elog.SetOutput(stderr)
 	}
 }

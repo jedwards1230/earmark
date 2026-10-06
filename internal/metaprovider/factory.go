@@ -33,7 +33,11 @@ var factoryLog = log.NewLogger("metaprovider-factory")
 // If ABS is requested but ABS_URL or ABS_TOKEN are unset, New logs a warning
 // and substitutes PathProvider for the ABS slot — so the binary starts cleanly
 // and degrades gracefully instead of hard-failing startup.
-func New(cfg providerConfig) MetadataProvider {
+func New(cfg providerConfig, opts ...Option) MetadataProvider {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	spec := strings.TrimSpace(cfg.GetMetadataProvider())
 	if spec == "" {
 		spec = "path"
@@ -46,7 +50,7 @@ func New(cfg providerConfig) MetadataProvider {
 		return pathP
 
 	case spec == "abs":
-		absP := buildABS(cfg, pathP)
+		absP := buildABS(cfg, pathP, o)
 		return absP
 
 	case strings.HasPrefix(spec, "chain:"):
@@ -58,7 +62,7 @@ func New(cfg providerConfig) MetadataProvider {
 			name = strings.TrimSpace(name)
 			switch name {
 			case "abs":
-				providers = append(providers, buildABS(cfg, pathP))
+				providers = append(providers, buildABS(cfg, pathP, o))
 			case "path":
 				providers = append(providers, pathP)
 			default:
@@ -79,7 +83,7 @@ func New(cfg providerConfig) MetadataProvider {
 
 // buildABS constructs an ABSProvider if credentials are present, or logs a
 // warning and returns fallback (typically PathProvider) when they are not.
-func buildABS(cfg providerConfig, fallback MetadataProvider) MetadataProvider {
+func buildABS(cfg providerConfig, fallback MetadataProvider, o options) MetadataProvider {
 	url := strings.TrimSpace(cfg.GetABSURL())
 	token := strings.TrimSpace(cfg.GetABSToken())
 	if url == "" || token == "" {
@@ -93,7 +97,27 @@ func buildABS(cfg providerConfig, fallback MetadataProvider) MetadataProvider {
 	}
 	factoryLog.Info("ABS metadata provider configured",
 		"url", url, "library_id", libraryID)
-	return NewABSProvider(url, token, libraryID, nil)
+	absP := NewABSProvider(url, token, libraryID, nil)
+	if o.embedded != nil {
+		absP.WithEmbeddedASIN(o.embedded, fallback)
+	}
+	return absP
+}
+
+// Option configures New.
+type Option func(*options)
+
+type options struct {
+	embedded EmbeddedASINSource
+}
+
+// WithEmbeddedASINSource makes the ABS provider consult the ASIN tag embedded
+// in the audio as the third ASIN source, cross-checked against the path title
+// (CONTRACT §1.6). Pass it on the write paths that persist book_metadata (the
+// monitor and backfill-metadata), not on hot read paths: it costs one indexed
+// transcripts lookup for every book whose path carries no ASIN.
+func WithEmbeddedASINSource(src EmbeddedASINSource) Option {
+	return func(o *options) { o.embedded = src }
 }
 
 // ParseChainSpec parses a "chain:p1,p2" spec into provider names, returning an

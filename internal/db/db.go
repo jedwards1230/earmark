@@ -1190,21 +1190,30 @@ func upsertEvalMetrics(ctx context.Context, ex execer, m EvalMetrics) error {
 // description/genres/isbn follow the ABS-enrichment rule: a non-NULL value from
 // a re-lookup overwrites (refreshes) the stored one; NULL (a PathProvider call,
 // or ABS returning nothing) keeps it.
+// upsertBookMetadataSQL: catalogue columns are COALESCE-guarded (a sparser
+// lookup never clears them) EXCEPT when the lookup resolved identity as a
+// conflict: then they are cleared, because whatever an earlier match attached
+// belongs to another book (CONTRACT §1.6). asin_source / identity_status are
+// written as a pair whenever the provider resolved identity (status non-NULL);
+// a lookup that resolved nothing (path-only, ABS down) keeps both.
 var upsertBookMetadataSQL = `
 	INSERT INTO book_metadata
 	       (book_dir, title, author, narrator, series, asin, chapters, bias_terms, source,
-	        description, genres, isbn, updated_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, now())
+	        description, genres, isbn, asin_source, identity_status, updated_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, now())
 	ON CONFLICT (book_dir) DO UPDATE
 	SET title       = EXCLUDED.title,
 	    author      = EXCLUDED.author,
-	    narrator    = COALESCE(EXCLUDED.narrator,    book_metadata.narrator),
-	    series      = COALESCE(EXCLUDED.series,      book_metadata.series),
-	    asin        = COALESCE(EXCLUDED.asin,        book_metadata.asin),
-	    chapters    = COALESCE(EXCLUDED.chapters,    book_metadata.chapters),
-	    description = COALESCE(EXCLUDED.description, book_metadata.description),
-	    genres      = COALESCE(EXCLUDED.genres,      book_metadata.genres),
-	    isbn        = COALESCE(EXCLUDED.isbn,        book_metadata.isbn),
+	    narrator = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED.narrator, book_metadata.narrator) END,
+	    series = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED.series, book_metadata.series) END,
+	    asin = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED.asin, book_metadata.asin) END,
+	    chapters = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED.chapters, book_metadata.chapters) END,
+	    description = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED.description, book_metadata.description) END,
+	    genres = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED.genres, book_metadata.genres) END,
+	    isbn = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED.isbn, book_metadata.isbn) END,
+	    asin_source     = CASE WHEN EXCLUDED.identity_status IS NOT NULL THEN EXCLUDED.asin_source
+	                           ELSE book_metadata.asin_source END,
+	    identity_status = COALESCE(EXCLUDED.identity_status, book_metadata.identity_status),
 	    bias_terms = EXCLUDED.bias_terms,
 	    source      = EXCLUDED.source,
 	    updated_at  = now()
@@ -1268,7 +1277,8 @@ func upsertBookMetadata(ctx context.Context, ex execer, bookDir string, meta met
 		bookDir, meta.Title, meta.Author,
 		nonEmpty(meta.Narrator), nonEmpty(meta.Series), nonEmpty(meta.ASIN),
 		chaptersJSON, biasTermsArg, meta.Source,
-		nonEmpty(meta.Description), genresArg, nonEmpty(meta.ISBN))
+		nonEmpty(meta.Description), genresArg, nonEmpty(meta.ISBN),
+		nonEmpty(meta.ASINSource), nonEmpty(meta.IdentityStatus))
 	if err != nil {
 		return fmt.Errorf("upsert book_metadata: %w", err)
 	}

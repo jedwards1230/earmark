@@ -1543,6 +1543,32 @@ def _fetch_bias_terms(
     return terms
 
 
+# Whether transcripts has the provenance columns (migration 00006). Probed once
+# per process, and only cached once True: a schema that lacks them now may be
+# migrated while the runner is up.
+_PROVENANCE_COLUMNS: bool = False
+
+
+def _has_provenance_columns(conn: psycopg2.extensions.connection) -> bool:
+    """True when transcripts has the 00006 provenance columns."""
+    global _PROVENANCE_COLUMNS
+    if _PROVENANCE_COLUMNS:
+        return True
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*) FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'transcripts'
+               AND column_name IN ('embedded_asin', 'asr_model_sha256',
+                                   'asr_runner_version', 'asr_params')
+            """
+        )
+        row = cur.fetchone()
+    _PROVENANCE_COLUMNS = bool(row) and int(row[0]) == 4
+    return _PROVENANCE_COLUMNS
+
+
 def _mark_done(
     conn: psycopg2.extensions.connection,
     job_id: str,
@@ -1554,27 +1580,54 @@ def _mark_done(
     Write transcript row and mark job done in a single transaction.
 
     result keys: language, duration_seconds, speaker_count, segments, raw_text
+    (+ optional embedded_asin)
+
+    When the database has the provenance columns (migration 00006) the row
+    also carries the ASR provenance the Go worker stamps the asr recipe from
+    (CONTRACT §1.9) and the embedded ASIN tag (§1.6). Against an older schema
+    the original INSERT is used, so a runner that updates before earmark
+    migrates keeps working.
     """
+    base = (
+        job_id,
+        file_path,
+        checksum,
+        result["language"],
+        result["duration_seconds"],
+        result.get("speaker_count"),
+        json.dumps(result["segments"]),
+        result["raw_text"],
+        ASR_MODEL_ID,
+    )
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO transcripts
-                (job_id, file_path, checksum, language, duration_seconds,
-                 speaker_count, segments, raw_text, model_name)
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
-            """,
-            (
-                job_id,
-                file_path,
-                checksum,
-                result["language"],
-                result["duration_seconds"],
-                result.get("speaker_count"),
-                json.dumps(result["segments"]),
-                result["raw_text"],
-                ASR_MODEL_ID,
-            ),
-        )
+        if _has_provenance_columns(conn):
+            cur.execute(
+                """
+                INSERT INTO transcripts
+                    (job_id, file_path, checksum, language, duration_seconds,
+                     speaker_count, segments, raw_text, model_name,
+                     embedded_asin, asr_model_sha256, asr_runner_version, asr_params)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                        %s, %s, %s, %s::jsonb)
+                """,
+                base
+                + (
+                    result.get("embedded_asin"),
+                    _ASR_MODEL_SHA256,
+                    _provenance_runner_version(),
+                    json.dumps(_asr_params(), sort_keys=True),
+                ),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO transcripts
+                    (job_id, file_path, checksum, language, duration_seconds,
+                     speaker_count, segments, raw_text, model_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                """,
+                base,
+            )
         cur.execute(
             """
             UPDATE transcription_jobs
@@ -1769,7 +1822,166 @@ def _audio_probe(audio_path: Path) -> dict[str, Any]:
         "codec_name": codec_name,
         "format_name": format_name,
         "size_bytes": size_bytes,
+        "embedded_asin": _extract_embedded_asin(data),
     }
+
+
+# ---------------------------------------------------------------------------
+# Embedded ASIN tag (CONTRACT §1.6 — the third ASIN source)
+# ---------------------------------------------------------------------------
+
+# Tag names (after normalisation, see _asin_tag_name) that carry an Audible ASIN.
+# ffprobe exposes an MP4 freeform atom as its bare name ("ASIN"), or with its
+# mean prefix ("----:com.apple.iTunes:ASIN"); an ID3 TXXX frame as its
+# description ("ASIN", "AUDIBLE_ASIN"). Libation/tone write AUDIBLE_ASIN.
+_ASIN_TAG_NAMES: frozenset[str] = frozenset({"ASIN", "AUDIBLE_ASIN", "AUDIBLEASIN"})
+
+# The catalogue-id shapes earmark accepts as an ASIN — the same alternation as
+# the Go side's library.asinIDPattern: an Audible "B0" id, an ISBN-10 with an X
+# check digit, or an all-digit id of 6+ digits.
+_ASIN_VALUE_RE = re.compile(r"B0[0-9A-Z]{8}|[0-9]{9}X|[0-9]{6,}")
+
+
+def _asin_tag_name(key: str) -> str:
+    """Normalise an ffprobe tag key: drop a freeform "----:<mean>:" prefix
+    (and any "iTunes:"-style namespace), upper-case."""
+    name = key.rsplit(":", 1)[-1] if ":" in key else key
+    return name.strip().upper()
+
+
+def _extract_embedded_asin(probe: dict[str, Any]) -> str | None:
+    """
+    Return the ASIN tag embedded in the audio, or None.
+
+    Looks in the container (format) tags first, then the selected audio
+    stream's tags. Tag VALUES are producer-supplied, so only a value with a
+    catalogue-id shape is returned (upper-cased, whitespace stripped);
+    anything else ("N/A", a URL, free text) is ignored rather than reported.
+    """
+    sources: list[Any] = [(probe.get("format") or {}).get("tags")]
+    for stream in probe.get("streams") or []:
+        if isinstance(stream, dict):
+            sources.append(stream.get("tags"))
+    for tags in sources:
+        if not isinstance(tags, dict):
+            continue
+        for key, value in tags.items():
+            if not isinstance(key, str) or _asin_tag_name(key) not in _ASIN_TAG_NAMES:
+                continue
+            if not isinstance(value, str):
+                continue
+            candidate = value.strip().upper()
+            if _ASIN_VALUE_RE.fullmatch(candidate):
+                return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ASR provenance (CONTRACT §1.9): the .nemo sha256 + parameters the Go side
+# builds the asr recipe from.
+# ---------------------------------------------------------------------------
+
+# path → sha256 hex. A model file is multi-GB and immutable for the life of the
+# process, so it is hashed at most once per process.
+_SHA256_CACHE: dict[str, str] = {}
+_SHA256_BLOCK: int = 8 * 1024 * 1024
+
+# Set by the provider's load(): the sha256 of the model file it loaded, or
+# None when it cannot be located (the asr recipe then has no model_revision).
+_ASR_MODEL_SHA256: str | None = None
+
+
+def _file_sha256(path: Path) -> str:
+    """sha256 of *path*, streamed in 8 MiB blocks and cached per process."""
+    key = str(path)
+    cached = _SHA256_CACHE.get(key)
+    if cached is not None:
+        return cached
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(_SHA256_BLOCK)
+            if not block:
+                break
+            h.update(block)
+    digest = h.hexdigest()
+    _SHA256_CACHE[key] = digest
+    return digest
+
+
+def _resolve_nemo_path(model_id: str) -> Path | None:
+    """
+    Locate the .nemo file behind *model_id* in the local Hugging Face cache,
+    the way NeMo's from_pretrained does: try_to_load_from_cache(repo_id,
+    "<model name>.nemo"). Cache-only — never a network call. Returns None
+    when it is not cached there (e.g. an NGC-hosted model, or a repo without
+    a .nemo, which NeMo keeps in its own cache); the recipe then has no
+    model_revision.
+    """
+    filename = model_id.rsplit("/", 1)[-1] + ".nemo"
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore[import]
+
+        found = try_to_load_from_cache(repo_id=model_id, filename=filename)
+    except Exception as exc:  # noqa: BLE001 — provenance is best-effort
+        log.warning("cannot look up %s for %s in the HF cache: %s", filename, model_id, exc)
+        return None
+    # try_to_load_from_cache returns a path str, None (unknown), or a
+    # "cached as missing" sentinel object.
+    if not isinstance(found, str):
+        log.warning("%s for %s is not in the HF cache", filename, model_id)
+        return None
+    return Path(found)
+
+
+def _model_sha256(model_id: str) -> str | None:
+    """sha256 of the .nemo file for *model_id*, or None when unavailable."""
+    path = _resolve_nemo_path(model_id)
+    if path is None:
+        return None
+    try:
+        digest = _file_sha256(path)
+    except OSError as exc:
+        log.warning("cannot hash %s: %s", path, exc)
+        return None
+    log.info("ASR model %s: %s sha256=%s", model_id, path.name, digest)
+    return digest
+
+
+def _provenance_runner_version() -> str | None:
+    """
+    The runner version recorded as the asr recipe's code_version, or None when
+    the runner cannot tell its own version ("unknown"): earmark never stamps a
+    recipe it would have to invent (CONTRACT §1.9), so such rows stay unstamped.
+    """
+    v = RUNNER_VERSION.strip()
+    if not v or v == "unknown":
+        return None
+    return v
+
+
+def _asr_params() -> dict[str, Any]:
+    """
+    The runner settings that shape transcript output — the asr recipe's
+    params (CONTRACT §1.9). Configuration only: per-job facts (whether this
+    book had bias terms) are inputs, not recipe.
+    """
+    params: dict[str, Any] = {
+        "backend": ASR_BACKEND,
+        "compute_type": ASR_COMPUTE_TYPE,
+        "chunk_threshold_seconds": CHUNK_THRESHOLD_SECONDS,
+        "chunk_window_seconds": CHUNK_WINDOW_SECONDS,
+        "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
+        "segment_gap_seconds": SEGMENT_GAP_SECONDS,
+        "segment_max_seconds": SEGMENT_MAX_SECONDS,
+        "segment_max_words": SEGMENT_MAX_WORDS,
+        "diarize": ASR_DIARIZE,
+        "biasing_enabled": ASR_BIASING_ENABLED,
+        "language": TRANSCRIPT_LANGUAGE,
+    }
+    if ASR_BIASING_ENABLED:
+        params["biasing_alpha"] = ASR_BIASING_ALPHA
+    return params
 
 
 def _audio_duration(audio_path: Path) -> float:
@@ -2073,6 +2285,8 @@ def _transcribe_file(
         "audio_codec": probe["codec_name"],
         "audio_format": probe["format_name"],
         "audio_bytes": probe["size_bytes"],
+        # transcripts.embedded_asin (CONTRACT §1.6)
+        "embedded_asin": probe.get("embedded_asin"),
         # run_metrics §2.13 backend descriptor
         **descriptor,
     }
@@ -3168,6 +3382,16 @@ class NeMoParakeetProvider(ASRProvider):
                 "nvidia/diar_sortformer_4spk-v1"
             )
             diarize_model = diarize_model.cuda().eval()
+
+        # Provenance (CONTRACT §1.9): hash the .nemo once per process so every
+        # transcript records exactly which weights produced it.
+        global _ASR_MODEL_SHA256
+        _ASR_MODEL_SHA256 = _model_sha256(ASR_MODEL_ID)
+        if _provenance_runner_version() is None:
+            log.warning(
+                "runner version unknown (no VERSION file / RUNNER_VERSION): "
+                "transcripts will not be stamped with an asr recipe"
+            )
 
         log.info("Models loaded successfully")
         self._asr_model = asr_model
