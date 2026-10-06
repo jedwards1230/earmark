@@ -55,7 +55,21 @@ type BookMeta struct {
 	ISBN        string
 	Chapters    []Chapter
 	Source      string
+	// ASINSource records where the ASIN came from (library.ASINSourceDir,
+	// ASINSourceFilename, ASINSourceEmbeddedTag); "" when there is none.
+	// IdentityStatus is IdentityExact when a catalogue record was matched by
+	// ASIN, IdentityConflict when the embedded tag named a record whose title
+	// does not match the book's (the tag is then NOT used), "" otherwise
+	// (local-only). Both are stored in book_metadata (CONTRACT §1.6).
+	ASINSource     string
+	IdentityStatus string
 }
+
+// Identity outcomes of the ASIN step (book_metadata.identity_status).
+const (
+	IdentityExact    = "exact"
+	IdentityConflict = "conflict"
+)
 
 // MetadataProvider looks up metadata for one book given its canonical file
 // path and one representative sample filename from that directory.

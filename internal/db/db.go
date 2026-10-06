@@ -1193,8 +1193,8 @@ func upsertEvalMetrics(ctx context.Context, ex execer, m EvalMetrics) error {
 var upsertBookMetadataSQL = `
 	INSERT INTO book_metadata
 	       (book_dir, title, author, narrator, series, asin, chapters, bias_terms, source,
-	        description, genres, isbn, updated_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, now())
+	        description, genres, isbn, asin_source, identity_status, updated_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, now())
 	ON CONFLICT (book_dir) DO UPDATE
 	SET title       = EXCLUDED.title,
 	    author      = EXCLUDED.author,
@@ -1205,6 +1205,8 @@ var upsertBookMetadataSQL = `
 	    description = COALESCE(EXCLUDED.description, book_metadata.description),
 	    genres      = COALESCE(EXCLUDED.genres,      book_metadata.genres),
 	    isbn        = COALESCE(EXCLUDED.isbn,        book_metadata.isbn),
+	    asin_source     = COALESCE(EXCLUDED.asin_source,     book_metadata.asin_source),
+	    identity_status = COALESCE(EXCLUDED.identity_status, book_metadata.identity_status),
 	    bias_terms = EXCLUDED.bias_terms,
 	    source      = EXCLUDED.source,
 	    updated_at  = now()
@@ -1268,7 +1270,8 @@ func upsertBookMetadata(ctx context.Context, ex execer, bookDir string, meta met
 		bookDir, meta.Title, meta.Author,
 		nonEmpty(meta.Narrator), nonEmpty(meta.Series), nonEmpty(meta.ASIN),
 		chaptersJSON, biasTermsArg, meta.Source,
-		nonEmpty(meta.Description), genresArg, nonEmpty(meta.ISBN))
+		nonEmpty(meta.Description), genresArg, nonEmpty(meta.ISBN),
+		nonEmpty(meta.ASINSource), nonEmpty(meta.IdentityStatus))
 	if err != nil {
 		return fmt.Errorf("upsert book_metadata: %w", err)
 	}

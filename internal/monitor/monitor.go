@@ -431,15 +431,17 @@ func (fm *FileMonitor) enqueueFile(filePath string) (created bool) {
 	// provider or DB error must never block enqueue — mirror the UpsertAudioBytes
 	// pattern exactly. The sampleName is the filename component, which the
 	// PathProvider uses to strip track-number prefixes and derive a title.
-	fm.upsertBookMetadata(ctx, filePath)
+	fm.RefreshBookMetadata(ctx, filePath)
 
 	return created
 }
 
-// upsertBookMetadata derives book metadata from filePath via the configured
+// RefreshBookMetadata derives book metadata from filePath via the configured
 // MetadataProvider and writes it to book_metadata. Best-effort: all errors are
-// logged and swallowed so enqueue is never blocked.
-func (fm *FileMonitor) upsertBookMetadata(ctx context.Context, filePath string) {
+// logged and swallowed so enqueue is never blocked. Called at enqueue, and by
+// the worker once the ASR runner has reported a file's embedded ASIN tag (the
+// third ASIN source, which does not exist before transcription).
+func (fm *FileMonitor) RefreshBookMetadata(ctx context.Context, filePath string) {
 	bookDir := filepath.Dir(filePath)
 	sampleName := filepath.Base(filePath)
 

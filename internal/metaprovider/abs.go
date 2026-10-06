@@ -90,6 +90,30 @@ type ABSProvider struct {
 	libraryID string
 	client    *http.Client
 	log       log.Logger
+
+	// embedded, when set, supplies the ASIN tag the ASR runner read from the
+	// audio — the third ASIN source (CONTRACT §1.6). titles derives the book's
+	// own title from its path for the cross-check that guards that source.
+	// Both nil → only the directory and the filename are consulted.
+	embedded EmbeddedASINSource
+	titles   MetadataProvider
+}
+
+// EmbeddedASINSource reports the ASIN tag embedded in an audio file, as the
+// ASR runner read it with ffprobe ("" when none or not yet transcribed).
+// *db.DB implements it from transcripts.embedded_asin.
+type EmbeddedASINSource interface {
+	EmbeddedASIN(ctx context.Context, filePath string) (string, error)
+}
+
+// WithEmbeddedASIN enables the embedded tag as the third ASIN source. titles
+// supplies the path-derived title the fetched record must match (normally the
+// PathProvider); a record whose title does not match is a conflict and is not
+// used.
+func (p *ABSProvider) WithEmbeddedASIN(src EmbeddedASINSource, titles MetadataProvider) *ABSProvider {
+	p.embedded = src
+	p.titles = titles
+	return p
 }
 
 // NewABSProvider constructs an ABSProvider. baseURL and token are injected from
@@ -122,16 +146,29 @@ func NewABSProvider(baseURL, token, libraryID string, client *http.Client) *ABSP
 // When both the directory and the filename carry an ASIN and they differ, the
 // directory ASIN wins (it identifies the book; the filename can be a per-track
 // variant) and a warning is logged to surface a likely misnaming.
-func (p *ABSProvider) Lookup(ctx context.Context, filePath, _ string) (BookMeta, error) {
-	asin := library.ExtractASIN(filepath.Dir(filePath))
-	if asin == "" {
-		asin = library.ExtractASIN(filepath.Base(filePath))
-	} else if fileASIN := library.ExtractASIN(filepath.Base(filePath)); fileASIN != "" && !strings.EqualFold(fileASIN, asin) {
-		p.log.Warn("ASIN mismatch between directory and filename; using directory ASIN",
-			"dir_asin", asin, "file_asin", fileASIN, "file", filePath)
+//
+// With WithEmbeddedASIN, the ASIN tag embedded in the audio is the third
+// source, consulted only when neither the directory nor the filename carries
+// an ASIN. A record found that way is used only if its title matches the
+// book's path-derived title (library.TitlesMatch); otherwise the path metadata
+// is returned with IdentityStatus "conflict".
+func (p *ABSProvider) Lookup(ctx context.Context, filePath, sampleName string) (BookMeta, error) {
+	asin, source := library.ResolveASIN(filePath, "")
+	if source == library.ASINSourceDir {
+		if fileASIN := library.ExtractASIN(filepath.Base(filePath)); fileASIN != "" && !strings.EqualFold(fileASIN, asin) {
+			p.log.Warn("ASIN mismatch between directory and filename; using directory ASIN",
+				"dir_asin", asin, "file_asin", fileASIN, "file", filePath)
+		}
+	}
+	if asin == "" && p.embedded != nil {
+		tag, err := p.embedded.EmbeddedASIN(ctx, filePath)
+		if err != nil {
+			p.log.Warn("embedded ASIN read failed (continuing without it)", "file", filePath, "error", err)
+		}
+		asin, source = library.ResolveASIN(filePath, tag)
 	}
 	if asin == "" {
-		p.log.Debug("no ASIN in path, skipping ABS lookup", "file", filePath)
+		p.log.Debug("no ASIN in path or embedded tag, skipping ABS lookup", "file", filePath)
 		return BookMeta{}, nil
 	}
 
@@ -150,6 +187,20 @@ func (p *ABSProvider) Lookup(ctx context.Context, filePath, _ string) (BookMeta,
 		return BookMeta{}, fmt.Errorf("abs fetch chapters for item %q: %w", itemID, err)
 	}
 
+	// The embedded tag is producer-supplied and the least trusted source: use
+	// the record it names only when its title matches the book's own. A
+	// mismatch (a wrong or reused tag) is recorded as a conflict and the book
+	// keeps its path-derived identity, so a bad tag can never attach another
+	// book's description and chapters.
+	if source == library.ASINSourceEmbeddedTag {
+		if conflict, own := p.embeddedConflict(ctx, filePath, sampleName, minimal.Title); conflict {
+			p.log.Warn("embedded ASIN names a different book; recording conflict and not using it",
+				"asin", asin, "record_title", minimal.Title, "book_title", own.Title, "file", filePath)
+			own.IdentityStatus = IdentityConflict
+			return own, nil
+		}
+	}
+
 	meta := BookMeta{
 		Title:       minimal.Title,
 		Author:      minimal.AuthorName,
@@ -161,9 +212,28 @@ func (p *ABSProvider) Lookup(ctx context.Context, filePath, _ string) (BookMeta,
 		ISBN:        strings.TrimSpace(minimal.ISBN),
 		Chapters:    chapters,
 		Source:      "abs",
+
+		ASINSource:     source,
+		IdentityStatus: IdentityExact,
 	}
 	p.log.Debug("ABS lookup hit", "asin", asin, "title", meta.Title, "chapters", len(chapters))
 	return meta, nil
+}
+
+// embeddedConflict cross-checks a record fetched by embedded tag against the
+// book's path-derived title. It returns true (with the path metadata the book
+// keeps) when the titles do not match. Without a title source there is
+// nothing to check against, which is itself a conflict: the tag is never
+// trusted unchecked.
+func (p *ABSProvider) embeddedConflict(ctx context.Context, filePath, sampleName, recordTitle string) (bool, BookMeta) {
+	if p.titles == nil {
+		return true, BookMeta{}
+	}
+	own, err := p.titles.Lookup(ctx, filePath, sampleName)
+	if err != nil || own.Title == "" {
+		return true, own
+	}
+	return !library.TitlesMatch(recordTitle, own.Title), own
 }
 
 // findByASIN fetches the library items list and scans for the given ASIN.

@@ -3591,3 +3591,141 @@ class ShutdownSignalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── Embedded ASIN tag + ASR provenance (CONTRACT §1.6, §1.9) ───────────────────
+class EmbeddedASINTests(unittest.TestCase):
+    """_extract_embedded_asin reads the ASIN tag from ffprobe JSON."""
+
+    def test_m4b_freeform_atom(self) -> None:
+        # ffprobe on an MP4/M4B: a freeform ----:com.apple.iTunes:ASIN atom.
+        probe = {"format": {"tags": {"title": "Children of Dune",
+                                     "----:com.apple.iTunes:ASIN": "B002V57VRC"}}}
+        self.assertEqual(runner._extract_embedded_asin(probe), "B002V57VRC")
+
+    def test_libation_audible_asin_lowercase_value(self) -> None:
+        probe = {"format": {"tags": {"AUDIBLE_ASIN": " b08g9prs1k "}}}
+        self.assertEqual(runner._extract_embedded_asin(probe), "B08G9PRS1K")
+
+    def test_mp3_txxx_lowercase_key(self) -> None:
+        # ffprobe on an MP3: an ID3 TXXX frame surfaces under its description.
+        probe = {"format": {"tags": {"asin": "059341635X"}}}
+        self.assertEqual(runner._extract_embedded_asin(probe), "059341635X")
+
+    def test_stream_tags_fallback(self) -> None:
+        probe = {"format": {"tags": {}}, "streams": [{"tags": {"ASIN": "B002V57VRC"}}]}
+        self.assertEqual(runner._extract_embedded_asin(probe), "B002V57VRC")
+
+    def test_junk_values_rejected(self) -> None:
+        for junk in ("N/A", "Children of Dune", "https://audible.com/pd/B002V57VRC", "", "B0SHORT"):
+            probe = {"format": {"tags": {"ASIN": junk}}}
+            self.assertIsNone(runner._extract_embedded_asin(probe), junk)
+
+    def test_unrelated_tags_ignored(self) -> None:
+        probe = {"format": {"tags": {"comment": "B002V57VRC", "isbn": "9780593135204"}}}
+        self.assertIsNone(runner._extract_embedded_asin(probe))
+
+    def test_no_tags(self) -> None:
+        self.assertIsNone(runner._extract_embedded_asin({}))
+        self.assertIsNone(runner._extract_embedded_asin({"format": {}, "streams": [{}]}))
+
+    def test_audio_probe_reports_asin(self) -> None:
+        import json as _json
+        fake = mock.MagicMock()
+        fake.stdout = _json.dumps({
+            "streams": [{"channels": 2, "sample_rate": "44100", "codec_name": "aac"}],
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "60",
+                       "size": "10", "tags": {"----:com.apple.iTunes:ASIN": "B002V57VRC"}},
+        })
+        with mock.patch.object(runner.subprocess, "run", return_value=fake):
+            probe = runner._audio_probe(Path("/fake/book.m4b"))
+        self.assertEqual(probe["embedded_asin"], "B002V57VRC")
+
+
+class ModelSHA256Tests(unittest.TestCase):
+    """_file_sha256 streams the model file and hashes it once per process."""
+
+    def setUp(self) -> None:
+        runner._SHA256_CACHE.clear()
+
+    def tearDown(self) -> None:
+        runner._SHA256_CACHE.clear()
+
+    def test_hash_matches_and_is_cached(self) -> None:
+        import hashlib as _hashlib
+        data = os.urandom(3 * 1024 + 7)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "model.nemo"
+            p.write_bytes(data)
+            with mock.patch.object(runner, "_SHA256_BLOCK", 1024):  # force several blocks
+                first = runner._file_sha256(p)
+            self.assertEqual(first, _hashlib.sha256(data).hexdigest())
+            # Second call must not re-read the (multi-GB in production) file.
+            with mock.patch("builtins.open", side_effect=AssertionError("re-read")) as m:
+                again = runner._file_sha256(p)
+            self.assertEqual(again, first)
+            m.assert_not_called()
+
+    def test_model_sha256_none_when_unresolvable(self) -> None:
+        with mock.patch.object(runner, "_resolve_nemo_path", return_value=None):
+            self.assertIsNone(runner._model_sha256("nvidia/parakeet-tdt-1.1b"))
+
+    def test_model_sha256_hashes_resolved_file(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "parakeet-tdt-1.1b.nemo"
+            p.write_bytes(b"weights")
+            with mock.patch.object(runner, "_resolve_nemo_path", return_value=p):
+                import hashlib as _hashlib
+                self.assertEqual(runner._model_sha256("m"), _hashlib.sha256(b"weights").hexdigest())
+
+
+class ProvenanceMarkDoneTests(unittest.TestCase):
+    """_mark_done writes the provenance columns when the schema has them."""
+
+    class _Cur(FakeCursor):
+        def fetchone(self) -> object:
+            if "information_schema.columns" in self.conn.last_sql:
+                return (self.conn.cols,)
+            return None
+
+    class _Conn(FakeConn):
+        def __init__(self, cols: int) -> None:
+            super().__init__(None, None)
+            self.cols = cols
+
+        def cursor(self) -> "ProvenanceMarkDoneTests._Cur":
+            return ProvenanceMarkDoneTests._Cur(self)
+
+    def setUp(self) -> None:
+        runner._PROVENANCE_COLUMNS = False
+
+    def tearDown(self) -> None:
+        runner._PROVENANCE_COLUMNS = False
+
+    def _result(self) -> dict[str, Any]:
+        return {"language": "en", "duration_seconds": 60.0, "speaker_count": None,
+                "segments": [], "raw_text": "x", "embedded_asin": "B002V57VRC"}
+
+    def test_writes_provenance_when_migrated(self) -> None:
+        import json as _json
+        conn = self._Conn(cols=4)
+        with mock.patch.object(runner, "_ASR_MODEL_SHA256", "abc123"), \
+             mock.patch.object(runner, "RUNNER_VERSION", "v0.41.0"):
+            runner._mark_done(conn, "job", "/b/x.m4b", "sum", self._result())
+        insert = [(s, p) for s, p in conn.executed if "INSERT INTO transcripts" in s]
+        self.assertEqual(len(insert), 1)
+        sql, params = insert[0]
+        self.assertIn("asr_model_sha256", sql)
+        self.assertEqual(params[9:12], ("B002V57VRC", "abc123", "v0.41.0"))
+        asr_params = _json.loads(params[12])
+        self.assertEqual(asr_params["compute_type"], runner.ASR_COMPUTE_TYPE)
+        self.assertEqual(asr_params["chunk_window_seconds"], runner.CHUNK_WINDOW_SECONDS)
+        self.assertEqual(asr_params["chunk_overlap_seconds"], runner.CHUNK_OVERLAP_SECONDS)
+        self.assertEqual(conn.commits, 1)
+
+    def test_legacy_insert_before_migration(self) -> None:
+        conn = self._Conn(cols=0)
+        runner._mark_done(conn, "job", "/b/x.m4b", "sum", self._result())
+        sql, params = [(s, p) for s, p in conn.executed if "INSERT INTO transcripts" in s][0]
+        self.assertNotIn("asr_model_sha256", sql)
+        self.assertEqual(len(params), 9)

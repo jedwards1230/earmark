@@ -22,6 +22,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/library"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/spf13/cobra"
 )
@@ -83,7 +84,9 @@ func runBackfill(cmd *cobra.Command, args []string) {
 	}
 	defer database.Close()
 
-	provider := metaprovider.New(cfg)
+	// The embedded ASIN tag (reported by the ASR runner) is the third ASIN
+	// source, after the directory and the filename (CONTRACT §1.6).
+	provider := metaprovider.New(cfg, metaprovider.WithEmbeddedASINSource(database))
 
 	if err := run(context.Background(), os.Stdout, database, provider, opts); err != nil {
 		fmt.Printf("error: %v\n", err)
@@ -154,6 +157,12 @@ func run(ctx context.Context, out io.Writer, q Backfiller, prov metaprovider.Met
 		var info []string
 		if meta.ASIN != "" {
 			info = append(info, "asin:"+meta.ASIN)
+		}
+		if meta.ASINSource == library.ASINSourceEmbeddedTag {
+			info = append(info, "from embedded tag")
+		}
+		if meta.IdentityStatus == metaprovider.IdentityConflict {
+			info = append(info, "identity CONFLICT: embedded tag names another title; not used")
 		}
 		if len(meta.Chapters) > 0 {
 			info = append(info, fmt.Sprintf("%d chapters", len(meta.Chapters)))
