@@ -101,11 +101,28 @@ type TranscriptSegment struct {
 	Words []TranscriptWord `json:"words,omitempty"`
 }
 
+// TranscriptChunk is one chunk of CORRECTED text in a get_transcript page
+// (corrected=true). Start/End bound the chunk in track-relative seconds; there
+// are no word timestamps. Corrected marks a chunk whose text differs from the
+// ASR output because a reviewed correction was replayed onto it.
+type TranscriptChunk struct {
+	ChunkID    string  `json:"chunkID"`
+	ChunkIndex int     `json:"chunkIndex"`
+	Start      float64 `json:"start"`
+	End        float64 `json:"end"`
+	Text       string  `json:"text"`
+	Corrected  bool    `json:"corrected"`
+}
+
 // TranscriptOutput is the structured payload for get_transcript. It is one of two
 // shapes, distinguished by `kind`:
 //
-//   - kind="transcript": a page of timestamped segments for a single track, with
-//     pagination footer fields. `tracks` is empty.
+//   - kind="transcript": a page of a single track's text, with pagination
+//     footer fields. `corrected` says which text it is:
+//     false → `segments` from the ASR record (unit="segment", word timestamps
+//     available); true → `chunks` of the corrected projection search returns
+//     (unit="chunk", no word timestamps). offset/limit/nextOffset count `unit`s.
+//     `tracks` is empty.
 //   - kind="trackChooser": the book has multiple tracks; `tracks` lists them so
 //     the caller can re-call with a trackID. The segment/pagination fields are
 //     zero.
@@ -122,6 +139,19 @@ type TranscriptOutput struct {
 	Limit           int                 `json:"limit"`
 	TotalSegments   int                 `json:"totalSegments"`
 	NextOffset      *int                `json:"nextOffset,omitempty"`
+
+	// Which text the page serves (kind="transcript"; see the type comment).
+	Corrected bool              `json:"corrected"`
+	Unit      string            `json:"unit,omitempty"`
+	Chunks    []TranscriptChunk `json:"chunks,omitempty"`
+	// TotalChunks / CorrectedChunks: the track's chunk count and how many carry
+	// a correction. Set whenever the track has corrections, including the
+	// includeWordTimestamps fallback to segments.
+	TotalChunks     int `json:"totalChunks,omitempty"`
+	CorrectedChunks int `json:"correctedChunks,omitempty"`
+	// Note explains a non-default choice of text, e.g. why corrections exist
+	// but the ASR segments were served.
+	Note string `json:"note,omitempty"`
 
 	// Track chooser (kind="trackChooser").
 	Book   string     `json:"book,omitempty"`

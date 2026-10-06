@@ -143,6 +143,17 @@ func (m *MockDBInterface) GetTrackDetail(ctx context.Context, id string) (*db.Tr
 	return td, args.Error(1)
 }
 
+// GetCorrectedTranscriptPage defaults to "no corrections" so get_transcript
+// tests that don't care keep serving the ASR segments.
+func (m *MockDBInterface) GetCorrectedTranscriptPage(ctx context.Context, jobID string, offset, limit int) (*db.CorrectedTranscriptPage, error) {
+	if !m.hasExpect("GetCorrectedTranscriptPage") {
+		return &db.CorrectedTranscriptPage{}, nil
+	}
+	args := m.Called(ctx, jobID, offset, limit)
+	p, _ := args.Get(0).(*db.CorrectedTranscriptPage)
+	return p, args.Error(1)
+}
+
 func (m *MockDBInterface) RequeueByDir(context.Context, string) ([]string, error) {
 	return nil, nil
 }
