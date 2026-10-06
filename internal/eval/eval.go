@@ -232,12 +232,23 @@ type Result struct {
 // caller persists via FindingWriter only when not in dry-run.
 func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) {
 	system, user := buildPrompt(c)
-	raw, resolved, err := j.complete(ctx, system, user)
+	var ep Endpoint
+	if er, ok := j.chat.(EndpointReporter); ok {
+		ep = er.Endpoint()
+	}
+	ctx, span := startChatSpan(ctx, j.chat.Model(), ep, chunkRef{transcriptID: c.TranscriptID, chunkID: c.ChunkID})
+	comp, err := j.complete(ctx, system, user)
+	resolved := comp.ResolvedModel
+	var recipeID string
+	if err == nil {
+		recipeID, _ = j.recipeFor(resolved).ID()
+	}
+	endChatSpan(ctx, span, j.chat.Model(), j.pin.ExpectedModel, comp, recipeID, err)
 	if err != nil {
 		return Result{Chunk: c}, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
 	}
 	if resolved != "" && resolved != j.chat.Model() {
-		j.logger.Debug("judge request served by a different model id",
+		j.logger.DebugContext(ctx, "judge request served by a different model id",
 			"chunk_id", c.ChunkID, "requested", j.chat.Model(), "resolved", resolved)
 	}
 	if expected := j.Recipe().ModelResolved; servedUnexpectedModel(expected, resolved) {
@@ -251,13 +262,13 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		})
 	}
 
-	parsed, perr := parseFindings(raw)
+	parsed, perr := parseFindings(comp.Content)
 	if perr != nil {
 		// A malformed judge response is a soft failure: log and treat the chunk
 		// as "no findings" rather than aborting the whole run. The judge is
 		// advisory; a parse miss costs nothing.
-		j.logger.Warn("dropping unparseable judge response",
-			"chunk_id", c.ChunkID, "error", perr)
+		j.logger.WarnContext(ctx, "dropping unparseable judge response",
+			"chunk_id", c.ChunkID, "recipe_id", recipeID, "error", perr)
 		return Result{Chunk: c, ResolvedModel: resolved}, nil
 	}
 
@@ -298,14 +309,13 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 }
 
 // complete calls the chat client, using CompleteWithModel when the client
-// reports its resolved model.
-func (j *Judge) complete(ctx context.Context, system, user string) (string, string, error) {
+// reports its resolved model (and usage).
+func (j *Judge) complete(ctx context.Context, system, user string) (Completion, error) {
 	if mr, ok := j.chat.(ModelReportingClient); ok {
-		r, err := mr.CompleteWithModel(ctx, system, user)
-		return r.Content, r.ResolvedModel, err
+		return mr.CompleteWithModel(ctx, system, user)
 	}
 	raw, err := j.chat.Complete(ctx, system, user)
-	return raw, "", err
+	return Completion{Content: raw}, err
 }
 
 // floorFindings drops findings below the confidence floor (j.minConf). Applied

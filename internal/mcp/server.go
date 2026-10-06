@@ -15,6 +15,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/metrics"
+	"github.com/jedwards1230/earmark/internal/telemetry"
 )
 
 // MCPServer wraps the MCP server functionality for the earmark service
@@ -544,7 +545,18 @@ func (s *MCPServer) Close() error {
 
 // StartMCPService is a convenience function to start MCP server with configuration
 func StartMCPService(database DBInterface, cfg *config.Config) error {
+	return StartMCPServiceWithTelemetry(database, cfg, nil)
+}
+
+// StartMCPServiceWithTelemetry is StartMCPService that also serves tel's
+// OpenTelemetry instruments on /metrics and bridges this server's metric
+// registry into tel's OTLP push (CONTRACT §2.16). tel may be nil.
+func StartMCPServiceWithTelemetry(database DBInterface, cfg *config.Config, tel *telemetry.Telemetry) error {
 	mcpServer := NewMCPServer(database, cfg)
+	if tel != nil {
+		mcpServer.metrics.AddGatherer(tel.Gatherer())
+		tel.SetLegacyGatherer(mcpServer.metrics.Gatherer())
+	}
 
 	// Check for MCP_TRANSPORT environment variable to determine transport type
 	transport := os.Getenv("MCP_TRANSPORT")

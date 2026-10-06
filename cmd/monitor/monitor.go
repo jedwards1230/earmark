@@ -18,6 +18,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/monitor"
 	"github.com/jedwards1230/earmark/internal/queue"
 	"github.com/jedwards1230/earmark/internal/recipe"
+	"github.com/jedwards1230/earmark/internal/telemetry"
 	"github.com/jedwards1230/earmark/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -58,9 +59,20 @@ func runMonitor(cmd *cobra.Command, args []string) {
 		log.Println("Debug reset completed - All data cleared")
 	}
 
-	registerCurrentRecipes(database, cfg)
+	// OpenTelemetry (CONTRACT §2.16): configured from the OTEL_* environment
+	// only. A setup error is logged, never fatal — telemetry must not stop
+	// ingest.
+	tel, err := telemetry.Setup(context.Background())
+	if err != nil {
+		log.Printf("WARNING: OpenTelemetry disabled: %v", err)
+	}
 
-	meta := metaprovider.New(cfg)
+	registerCurrentRecipes(database, cfg)
+	publishRecipeInfo(database, tel)
+
+	// The embedded ASIN tag the runner reports is the third ASIN source
+	// (CONTRACT §1.6); only this write path pays for consulting it.
+	meta := metaprovider.New(cfg, metaprovider.WithEmbeddedASINSource(database))
 
 	workQueue := queue.NewQueue()
 	fileMonitor := monitor.NewFileMonitor(cfg, database, meta)
@@ -71,6 +83,15 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	// durations + counters through the same registry.
 	reg := metrics.New(database, 2*time.Second)
 	w.SetMetrics(reg)
+	// OTel instruments are served on the same /metrics; the legacy registry
+	// rides along in the OTLP push (when configured).
+	reg.AddGatherer(tel.Gatherer())
+	tel.SetLegacyGatherer(reg.Gatherer())
+	tel.StartStaleRefresh(staleItemsInterval, 30*time.Second, database.StaleItemCounts)
+
+	// Once the runner reports a file's embedded ASIN tag, re-derive that
+	// book's metadata so the tag is applied as soon as it exists.
+	w.SetBookRefresher(fileMonitor.RefreshBookMetadata)
 
 	// Minimal HTTP listener for the ingest pod: /healthz (liveness) + /metrics
 	// (Prometheus). The ingest process has no MCP server, so this is its only HTTP
@@ -122,7 +143,41 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	log.Println("Waiting for all tasks to complete...")
 	wg.Wait()
 
+	// Flush buffered spans and a final metric export before exiting.
+	telCtx, telCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer telCancel()
+	if err := tel.Shutdown(telCtx); err != nil {
+		log.Printf("OpenTelemetry shutdown: %v", err)
+	}
+
 	log.Println("Monitor service shutdown complete")
+}
+
+// staleItemsInterval is how often earmark_stale_items re-counts the stale_work
+// view. Staleness only changes when a recipe or a model changes, so a slow
+// timer is plenty; one count is a single aggregate per step.
+const staleItemsInterval = 5 * time.Minute
+
+// publishRecipeInfo loads current_recipes into earmark_recipe_info. Best-effort.
+func publishRecipeInfo(database *db.DB, tel *telemetry.Telemetry) {
+	if tel == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cur, err := database.ListCurrentRecipes(ctx)
+	if err != nil {
+		log.Printf("WARNING: earmark_recipe_info not published: %v", err)
+		return
+	}
+	infos := make([]telemetry.RecipeInfo, 0, len(cur))
+	for _, c := range cur {
+		infos = append(infos, telemetry.RecipeInfo{
+			Step: c.Step, RecipeID: c.RecipeID, Model: c.Model,
+			Revision: c.Revision, PromptVersion: c.PromptVersion,
+		})
+	}
+	tel.SetRecipes(infos)
 }
 
 // registerCurrentRecipes records, per step, the recipe this deployment would

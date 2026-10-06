@@ -10,6 +10,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -317,6 +318,11 @@ type chatResponse struct {
 	Choices []struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
+	// Usage is the OpenAI token accounting; absent on some endpoints.
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage,omitempty"`
 }
 
 // Completion is one chat reply plus the model the endpoint reports serving it.
@@ -325,6 +331,47 @@ type Completion struct {
 	// ResolvedModel is the response's "model" field; "" when the endpoint
 	// omits it.
 	ResolvedModel string
+	// InputTokens / OutputTokens are the response's usage counts; HasUsage is
+	// false when the endpoint reported none.
+	InputTokens  int
+	OutputTokens int
+	HasUsage     bool
+}
+
+// Endpoint describes where a chat client sends requests, for telemetry
+// (gen_ai.provider.name, server.address, server.port).
+type Endpoint struct {
+	Provider string
+	Host     string
+	Port     int
+}
+
+// EndpointReporter is an optional ChatClient extension describing its
+// endpoint. openAIChatClient implements it.
+type EndpointReporter interface {
+	Endpoint() Endpoint
+}
+
+// Endpoint reports the client's provider and server. The provider is the
+// LiteLLM-style route prefix of the model id ("anthropic/…" → "anthropic"),
+// else "openai_compatible": the client speaks the OpenAI chat API, but the
+// server behind it (Ollama, vLLM, a LiteLLM alias) is not knowable from here.
+func (c *openAIChatClient) Endpoint() Endpoint {
+	e := Endpoint{Provider: "openai_compatible"}
+	if i := strings.Index(c.model, "/"); i > 0 {
+		e.Provider = strings.ToLower(c.model[:i])
+	}
+	if u, err := neturl.Parse(c.baseURL); err == nil {
+		e.Host = u.Hostname()
+		if p, err := strconv.Atoi(u.Port()); err == nil {
+			e.Port = p
+		} else if u.Scheme == "https" {
+			e.Port = 443
+		} else if u.Scheme == "http" {
+			e.Port = 80
+		}
+	}
+	return e
 }
 
 // ErrThinkingOnlyResponse means the model returned reasoning but no answer.
@@ -401,5 +448,11 @@ func (c *openAIChatClient) CompleteWithModel(ctx context.Context, system, user s
 		(strings.TrimSpace(msg.Reasoning) != "" || strings.TrimSpace(msg.ReasoningContent) != "") {
 		return Completion{}, ErrThinkingOnlyResponse
 	}
-	return Completion{Content: msg.Content, ResolvedModel: strings.TrimSpace(parsed.Model)}, nil
+	out := Completion{Content: msg.Content, ResolvedModel: strings.TrimSpace(parsed.Model)}
+	if parsed.Usage != nil {
+		out.InputTokens = parsed.Usage.PromptTokens
+		out.OutputTokens = parsed.Usage.CompletionTokens
+		out.HasUsage = true
+	}
+	return out, nil
 }

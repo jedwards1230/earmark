@@ -18,11 +18,13 @@ package metrics
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/predict"
@@ -41,6 +43,12 @@ type StatsSource interface {
 // and call the Record* methods from the event-emit sites.
 type Registry struct {
 	reg *prometheus.Registry
+
+	// extra holds additional gatherers served on the same /metrics — the
+	// OpenTelemetry Prometheus exporter's registry (internal/telemetry), so
+	// OTel instruments and these client_golang metrics share one endpoint.
+	mu    sync.RWMutex
+	extra []prometheus.Gatherer
 
 	jobsFailedTotal    prometheus.Counter
 	jobsCompletedTotal prometheus.Counter
@@ -82,10 +90,39 @@ func New(src StatsSource, scrapeTimeout time.Duration) *Registry {
 	return r
 }
 
-// Handler returns the /metrics HTTP handler for this registry.
+// Handler returns the /metrics HTTP handler for this registry and every
+// gatherer added with AddGatherer (looked up on each scrape, so the order of
+// Handler and AddGatherer calls does not matter).
 func (r *Registry) Handler() http.Handler {
-	return promhttp.HandlerFor(r.reg, promhttp.HandlerOpts{})
+	return promhttp.HandlerFor(gathererFunc(r.gather), promhttp.HandlerOpts{})
 }
+
+// Gatherer is this registry's own client_golang metrics (without any added
+// gatherers) — what internal/telemetry bridges into the OTLP push.
+func (r *Registry) Gatherer() prometheus.Gatherer { return r.reg }
+
+// AddGatherer serves g's metrics on /metrics alongside this registry's. A nil
+// g is ignored. Metric family names must not collide with this registry's.
+func (r *Registry) AddGatherer(g prometheus.Gatherer) {
+	if r == nil || g == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.extra = append(r.extra, g)
+}
+
+func (r *Registry) gather() ([]*dto.MetricFamily, error) {
+	r.mu.RLock()
+	gs := append(prometheus.Gatherers{r.reg}, r.extra...)
+	r.mu.RUnlock()
+	return gs.Gather()
+}
+
+// gathererFunc adapts a function to prometheus.Gatherer.
+type gathererFunc func() ([]*dto.MetricFamily, error)
+
+func (f gathererFunc) Gather() ([]*dto.MetricFamily, error) { return f() }
 
 // RecordStageFinish observes a stage's duration (on a Go-emitted finish event)
 // and bumps the completed counter for embed finishes. Safe to call on a nil
