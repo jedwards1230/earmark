@@ -47,6 +47,11 @@ Modes:
                               worker rebuild them (keeps the transcript; use
                               after changing the embedding model or chunk size)
 
+Re-transcribing archives the old transcript's findings — judge proposals and
+human decisions alike — as 'superseded': kept for audit, never replayed, never
+deleted. The new transcript is judged fresh. --reembed keeps the transcript, so
+it leaves findings as they are: corrections replay onto the rebuilt chunks.
+
 All modes preview matches and do nothing unless you pass --yes.
 
 Examples:
@@ -124,6 +129,9 @@ func run(ctx context.Context, out io.Writer, q Requeuer, substr string, o option
 		p("  [%s] %s\n", m.Status, filepath.Base(m.FilePath))
 	}
 
+	if !o.reembed {
+		p("\nTheir transcripts' findings (incl. human decisions) will be archived as superseded.\n")
+	}
 	if !o.yes {
 		p("\n(dry-run) pass --yes to %s these %d job(s).\n", action, len(matches))
 		return nil

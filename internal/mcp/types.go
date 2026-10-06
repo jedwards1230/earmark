@@ -178,20 +178,22 @@ func formatTrackChooser(book string, tracks []db.RecentJob) *mcp.CallToolResult 
 	)
 }
 
-// formatTranscriptPage renders a page of a track's transcript as timestamped
-// segments. raw_text can be hundreds of thousands of characters, so segments are
-// paginated by offset/limit with a footer pointing at the next page.
+// formatTranscriptPage renders a page of a track's ASR transcript as timestamped
+// segments (corrected=false). raw_text can be hundreds of thousands of
+// characters, so segments are paginated by offset/limit with a footer pointing
+// at the next page.
 //
 // includeWords gates the per-word timestamp array on each structured segment.
-// When false (the default), the structured payload is byte-identical to the
-// pre-word-timestamp shape (the `words` field is omitted via omitempty). The
+// When false (the default), segments omit the `words` field entirely. The
 // human-readable text rendering is unaffected by the flag.
 //
-// KNOWN GAP (CONTRACT §2.17): this renders transcripts.segments, the immutable
-// ASR record, so get_transcript shows UNCORRECTED text while search shows the
-// corrected projection. A reader would want corrected text, but segments are
-// provenance and are never rewritten — see db.GetTrackDetail.
-func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords bool) *mcp.CallToolResult {
+// This is the ASR record (transcripts.segments), which never carries
+// corrections. It is served when the track has none — the projection then says
+// the same thing and the segments add word timestamps — or when the caller asked
+// for word timestamps, which only the ASR record has. corr is the track's
+// correction counts (nil or zero when it has none); when corrections exist the
+// payload says so, so a caller never mistakes this for the corrected text.
+func formatTranscriptPage(d *db.TrackDetail, corr *db.CorrectedTranscriptPage, offset, limit int, includeWords bool) *mcp.CallToolResult {
 	// Defensive: the caller checks for nil, but guard here too so the helper is
 	// safe to reuse. A nil detail has no transcript to render.
 	if d == nil {
@@ -217,12 +219,23 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords boo
 		Limit:           limit,
 		TotalSegments:   totalSegs,
 		Segments:        []TranscriptSegment{},
+		Corrected:       false,
+		Unit:            "segment",
+	}
+	textLine := "Text: ASR segments (no corrections on this track)."
+	if corr != nil && corr.CorrectedChunks > 0 {
+		base.TotalChunks = corr.TotalChunks
+		base.CorrectedChunks = corr.CorrectedChunks
+		base.Note = fmt.Sprintf("UNCORRECTED: %d of %d chunks of this track carry reviewed corrections, "+
+			"but word timestamps exist only for the ASR record. Call again without includeWordTimestamps "+
+			"to read the corrected text.", corr.CorrectedChunks, corr.TotalChunks)
+		textLine = "Text: " + base.Note
 	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "Transcript: %s\n", d.FilePath)
-	fmt.Fprintf(&b, "Language: %s | Model: %s | Duration: %s\n\n",
-		d.Language, d.ModelName, fmtHMS(&d.DurationSeconds))
+	fmt.Fprintf(&b, "Language: %s | Model: %s | Duration: %s\n", d.Language, d.ModelName, fmtHMS(&d.DurationSeconds))
+	fmt.Fprintf(&b, "%s\n\n", textLine)
 
 	if offset >= totalSegs {
 		fmt.Fprintf(&b, "(offset %d is past the end — %d segments total)", offset, totalSegs)
@@ -251,6 +264,67 @@ func formatTranscriptPage(d *db.TrackDetail, offset, limit int, includeWords boo
 		fmt.Fprintf(&b, "Showing segments %d–%d of %d. Next page: offset=%d.", offset+1, end, totalSegs, end)
 	} else {
 		fmt.Fprintf(&b, "Showing segments %d–%d of %d (end of transcript).", offset+1, end, totalSegs)
+	}
+	return structuredResult(base, b.String())
+}
+
+// formatCorrectedTranscriptPage renders a page of a track's CORRECTED text
+// (corrected=true): chunks of the projection search returns, with each chunk's
+// time range and no word timestamps (CONTRACT §2.17). offset is in chunks; the
+// page holds at most limit chunks starting there.
+func formatCorrectedTranscriptPage(d *db.TrackDetail, p *db.CorrectedTranscriptPage, offset, limit int) *mcp.CallToolResult {
+	if d == nil || p == nil {
+		return errorResult("no transcript available")
+	}
+	base := TranscriptOutput{
+		Kind:            "transcript",
+		FilePath:        d.FilePath,
+		Language:        d.Language,
+		ModelName:       d.ModelName,
+		DurationSeconds: d.DurationSeconds,
+		Offset:          offset,
+		Limit:           limit,
+		TotalSegments:   len(d.Segments),
+		Corrected:       true,
+		Unit:            "chunk",
+		Chunks:          []TranscriptChunk{},
+		TotalChunks:     p.TotalChunks,
+		CorrectedChunks: p.CorrectedChunks,
+		Note: fmt.Sprintf("CORRECTED: the same text search returns, with reviewed corrections applied "+
+			"(%d of %d chunks changed). Paged by chunk; no word timestamps — pass "+
+			"includeWordTimestamps=true for the uncorrected ASR segments with word times.",
+			p.CorrectedChunks, p.TotalChunks),
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Transcript: %s\n", d.FilePath)
+	fmt.Fprintf(&b, "Language: %s | Model: %s | Duration: %s\n", d.Language, d.ModelName, fmtHMS(&d.DurationSeconds))
+	fmt.Fprintf(&b, "Text: %s\n\n", base.Note)
+
+	if offset >= p.TotalChunks || len(p.Chunks) == 0 {
+		fmt.Fprintf(&b, "(offset %d is past the end — %d chunks total)", offset, p.TotalChunks)
+		return structuredResult(base, b.String())
+	}
+
+	for _, c := range p.Chunks {
+		base.Chunks = append(base.Chunks, TranscriptChunk{
+			ChunkID: c.ID, ChunkIndex: c.ChunkIndex, Start: c.StartSec, End: c.EndSec,
+			Text: strings.TrimSpace(c.Text), Corrected: c.Corrected,
+		})
+		mark := ""
+		if c.Corrected {
+			mark = "(corrected) "
+		}
+		fmt.Fprintf(&b, "[%s → %s] %s%s\n\n", mmss(c.StartSec), mmss(c.EndSec), mark, strings.TrimSpace(c.Text))
+	}
+
+	end := offset + len(p.Chunks)
+	if end < p.TotalChunks {
+		next := end
+		base.NextOffset = &next
+		fmt.Fprintf(&b, "Showing chunks %d–%d of %d. Next page: offset=%d.", offset+1, end, p.TotalChunks, end)
+	} else {
+		fmt.Fprintf(&b, "Showing chunks %d–%d of %d (end of transcript).", offset+1, end, p.TotalChunks)
 	}
 	return structuredResult(base, b.String())
 }

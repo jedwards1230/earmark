@@ -216,3 +216,16 @@ func TestReanchor_LimitStopsTheWalk(t *testing.T) {
 		t.Errorf("a spent limit must not open another batch: %v", err)
 	}
 }
+
+// TestReanchorScopeExcludesSuperseded: the pass reads only the review queue
+// (proposed, unanchorable) — never requeue's terminal archive — and never pages
+// a NULL transcript_id (a superseded row whose transcript was deleted) as a
+// transcript to re-anchor.
+func TestReanchorScopeExcludesSuperseded(t *testing.T) {
+	if !slices.Equal(reanchorStates, []string{patch.StateProposed, patch.StateUnanchorable}) {
+		t.Errorf("reanchorStates = %v, want [proposed unanchorable]", reanchorStates)
+	}
+	if !strings.Contains(reanchorTranscriptsSQL, "transcript_id IS NOT NULL") {
+		t.Errorf("reanchorTranscriptsSQL must skip NULL transcript ids:\n%s", reanchorTranscriptsSQL)
+	}
+}

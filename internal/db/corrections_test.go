@@ -521,6 +521,11 @@ func TestSetPatchState_RejectsIllegalTransitions(t *testing.T) {
 		// Legal in the state machine, but only the re-anchor pass makes them.
 		{patch.StateProposed, patch.StateUnanchorable},
 		{patch.StateUnanchorable, patch.StateProposed},
+		// Legal in the state machine, but only a requeue archives (with its
+		// transcript, in one transaction).
+		{patch.StateProposed, patch.StateSuperseded},
+		{patch.StateAccepted, patch.StateSuperseded},
+		{patch.StateUnanchorable, patch.StateSuperseded},
 	}
 	for _, tc := range illegal {
 		t.Run(tc.from+"->"+tc.to, func(t *testing.T) {

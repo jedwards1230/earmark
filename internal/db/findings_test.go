@@ -156,8 +156,26 @@ func TestListFindingsSQL_ReadOnly(t *testing.T) {
 	if !strings.Contains(listFindingsInBookSQL, `file_path LIKE $2 ESCAPE '\'`) {
 		t.Errorf("listFindingsInBookSQL must scope via `file_path LIKE $2 ESCAPE '\\'`:\n%s", listFindingsInBookSQL)
 	}
-	if strings.Contains(listFindingsSQL, "WHERE") {
-		t.Errorf("listFindingsSQL (global) must not be scoped:\n%s", listFindingsSQL)
+	if strings.Contains(listFindingsSQL, "file_path LIKE") {
+		t.Errorf("listFindingsSQL (global) must not be scoped to a book:\n%s", listFindingsSQL)
+	}
+}
+
+// TestFindingsDashboardExcludesSuperseded: every /findings rollup and worklist
+// query counts live findings only — a requeued book's archived findings must
+// not be counted next to its re-judged ones.
+func TestFindingsDashboardExcludesSuperseded(t *testing.T) {
+	for name, sql := range map[string]string{
+		"findingsTotalsSQL":      findingsTotalsSQL,
+		"findingsByIssueTypeSQL": findingsByIssueTypeSQL,
+		"findingsByBookSQL":      findingsByBookSQL,
+		"listFindingsSQL":        listFindingsSQL,
+		"listFindingsInBookSQL":  listFindingsInBookSQL,
+		"findingsCountByBookSQL": findingsCountByBookSQL,
+	} {
+		if !strings.Contains(sql, "patch_state <> 'superseded'") {
+			t.Errorf("%s does not exclude superseded findings:\n%s", name, sql)
+		}
 	}
 }
 

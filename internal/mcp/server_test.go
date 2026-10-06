@@ -141,6 +141,10 @@ func (m *SimpleMockDB) GetBookTracks(_ context.Context, dir string) ([]db.Recent
 	}, nil
 }
 
+func (m *SimpleMockDB) GetCorrectedTranscriptPage(context.Context, string, int, int) (*db.CorrectedTranscriptPage, error) {
+	return &db.CorrectedTranscriptPage{}, nil
+}
+
 func (m *SimpleMockDB) GetTrackDetail(_ context.Context, jobID string) (*db.TrackDetail, error) {
 	spk := "SPEAKER_00"
 	return &db.TrackDetail{

@@ -109,11 +109,12 @@ func getTranscriptSchema() *jsonschema.Schema {
 	return objectSchema(nil, map[string]*jsonschema.Schema{
 		"book":    stringProp("A book title or directory substring to read (e.g. \"Project Hail Mary\"). Either this or trackID is required."),
 		"trackID": stringProp("A specific track/job id (UUID) to read. Takes precedence over `book`. Use when a book has multiple tracks."),
-		"offset":  numberProp("Segment offset to start the page at (default: 0)", 0),
-		"limit":   numberProp("Number of segments to return per page (default: 50)", 50),
+		"offset":  numberProp("Offset to start the page at, in the response's `unit` — segments, or chunks when the text is corrected (default: 0)", 0),
+		"limit":   numberProp("Page size: segments per page (default: 50), or chunks per page when the text is corrected (default: 10, max 25)", 50),
 		"includeWordTimestamps": boolProp("Include per-word timestamps (word/start/end, plus score/speaker when available) on each "+
 			"returned segment. Default false — omitted to keep the response small; enable it only when you need "+
-			"word-level timing (e.g. \"exactly when was X said\").", false),
+			"word-level timing (e.g. \"exactly when was X said\"). Word timestamps exist only for the ASR record, so "+
+			"this always returns the UNCORRECTED segments, even when the track has corrections.", false),
 	})
 }
 
@@ -133,7 +134,8 @@ func getChunkContextSchema() *jsonschema.Schema {
 func listCorrectionsSchema() *jsonschema.Schema {
 	return objectSchema(nil, map[string]*jsonschema.Schema{
 		"state": stringProp("Patch state(s) to list, comma-separated: proposed, accepted, applied, " +
-			"rejected, reverted, stale, unanchorable — or \"all\" for every state. Default: proposed (the undecided queue)."),
+			"rejected, reverted, stale, unanchorable, superseded (archived by a requeue) — or \"all\" for every state. " +
+			"Default: proposed (the undecided queue)."),
 		"book": stringProp("A book title or directory substring to scope to (e.g. \"Project Hail Mary\"). " +
 			"Resolved the same way the search tools resolve it. Ignored when `path` is given."),
 		"path": stringProp("An exact book directory or track file path to scope to. Matches that path and " +

@@ -226,15 +226,17 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	// Add get_transcript tool — read the full transcript text (paginated).
 	mcpServer.AddTool(&mcp.Tool{
 		Name: "get_transcript",
-		Description: "Read the full transcript of a book/track as timestamped segments, so you can " +
-			"READ the text rather than only search fragments. This paginates SEGMENTS (raw ASR " +
-			"timestamp units — there are far more segments than search chunks; a chunk is tens of " +
-			"consecutive segments grouped for embedding). Provide `book` (a title) or `trackID` (a job id " +
-			"from list_books / a track chooser). Transcripts are large, so segments are paginated via " +
-			"offset/limit; the response footer tells you the next offset. If a book has multiple tracks, this " +
-			"returns the track list so you can pick one by trackID. Per-word timestamps are HIDDEN by default; " +
-			"set includeWordTimestamps=true to get each segment's word-level start/end times (for queries like " +
-			"\"exactly when was X said\").",
+		Description: "Read the full transcript of a book/track, so you can READ the text rather than only " +
+			"search fragments. Provide `book` (a title) or `trackID` (a job id from list_books / a track chooser). " +
+			"If a book has multiple tracks, this returns the track list so you can pick one by trackID. " +
+			"WHICH TEXT: when the track has reviewed corrections, this serves the CORRECTED text — the same " +
+			"text search returns — as chunks (each with its start/end time, paged by CHUNK, default 10, max 25) " +
+			"and NO word timestamps; the response says `corrected: true`. Otherwise it serves the ASR record as " +
+			"timestamped SEGMENTS (`corrected: false`; far more segments than chunks — a chunk is tens of " +
+			"consecutive segments). offset/limit count whichever `unit` the response names, and the footer gives " +
+			"the next offset. Per-word timestamps are HIDDEN by default; includeWordTimestamps=true returns the " +
+			"ASR segments with each word's start/end (for \"exactly when was X said\") — always the UNCORRECTED " +
+			"text, flagged in `note` when corrections exist.",
 		Annotations:  annotations,
 		InputSchema:  getTranscriptSchema(),
 		OutputSchema: outputSchemaFor[TranscriptOutput](),

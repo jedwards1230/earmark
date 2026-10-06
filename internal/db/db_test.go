@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
+	"github.com/jedwards1230/earmark/internal/patch"
 )
 
 // scanResultColumns are the 9 columns SELECTed by findSimilar / TextSearch /
@@ -1452,13 +1454,17 @@ func TestSearchInBookScopesAndBypassesHNSW(t *testing.T) {
 	}
 }
 
-// TestRequeueTxClearsRunMetrics drives requeueTx (the requeue transaction body)
-// against a pgxmock transaction and asserts the run_metrics cleanup runs in the
-// SAME transaction as the transcript-delete + job-reset, keyed on the requeued
-// job ids. This is the data-integrity fix: requeue UPDATEs (not deletes) the job
-// row and deletes the transcript, so neither path cascades to run_metrics — the
-// orphaned telemetry row must be deleted explicitly here.
-func TestRequeueTxClearsRunMetrics(t *testing.T) {
+// TestRequeueTxSupersedesFindingsAndClearsRunMetrics drives requeueTx (the
+// requeue transaction body) against a pgxmock transaction and asserts that, in
+// the SAME transaction and in this order, it resets the job, archives the
+// transcript's findings as superseded, deletes the transcript, and clears the
+// job's run_metrics — all keyed on the requeued job ids.
+//
+// The supersede has to precede the delete: transcript_findings.transcript_id
+// is ON DELETE SET NULL, so once the transcript is gone its findings can no
+// longer be selected by transcript. Without the supersede step the findings of
+// a requeued transcript stay 'proposed'/'accepted'/… with nothing to anchor to.
+func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
 	if err != nil {
 		t.Fatalf("new mock pool: %v", err)
@@ -1474,15 +1480,25 @@ func TestRequeueTxClearsRunMetrics(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 
-	// 1) delete transcripts for the selected job
-	mock.ExpectExec(requeueByID.deleteTranscripts).
-		WithArgs(id).
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
-	// 2) reset the job → pending, RETURNING (id, file_path)
+	// 1) reset the selected job → pending, RETURNING (id, file_path)
 	mock.ExpectQuery(requeueByID.resetJobs).
 		WithArgs(id).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, path))
-	// 3) THE FIX: clear the now-orphaned run_metrics for that job id
+	// 2) lock its transcript rows so no finding insert slips in between the
+	//    supersede and the delete
+	mock.ExpectExec(requeueLockTranscriptsSQL).
+		WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// 2b) archive its transcript's findings — every state but superseded,
+	//    human decisions included
+	mock.ExpectExec(requeueSupersedeFindingsSQL).
+		WithArgs([]string{id}, patch.StatesAllowing(patch.StateSuperseded)).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 3))
+	// 3) delete the transcript (chunks cascade, findings' transcript_id → NULL)
+	mock.ExpectExec(requeueDeleteTranscriptsSQL).
+		WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	// 4) clear the now-orphaned run_metrics (and its eval latch)
 	mock.ExpectExec(requeueDeleteMetricsSQL).
 		WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -1492,17 +1508,64 @@ func TestRequeueTxClearsRunMetrics(t *testing.T) {
 		t.Fatalf("requeueTx: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations (run_metrics cleanup missing?): %v", err)
+		t.Fatalf("unmet expectations: %v", err)
 	}
 	if len(paths) != 1 || paths[0] != path {
 		t.Fatalf("paths = %v, want [%s]", paths, path)
 	}
+
+	// The archived states include the human decisions — requeue never leaves
+	// an accepted/applied/rejected finding live, and never deletes it.
+	for _, s := range []string{patch.StateProposed, patch.StateAccepted, patch.StateApplied,
+		patch.StateRejected, patch.StateReverted, patch.StateStale} {
+		if !slices.Contains(supersedeFromStates, s) {
+			t.Errorf("requeue does not supersede %q findings", s)
+		}
+	}
+	if slices.Contains(supersedeFromStates, patch.StateSuperseded) {
+		t.Error("requeue must not re-archive superseded findings")
+	}
+	if strings.Contains(strings.ToUpper(requeueSupersedeFindingsSQL), "DELETE") {
+		t.Error("superseding must UPDATE findings, never DELETE them")
+	}
 }
 
-// TestRequeueTxNoMetricsDeleteWhenNothingReset asserts the run_metrics delete is
-// skipped entirely when the reset matched no jobs (empty RETURNING) — so a
-// no-match requeue issues no spurious DELETE.
-func TestRequeueTxNoMetricsDeleteWhenNothingReset(t *testing.T) {
+// TestRequeueTxSupersedeFailureAborts asserts a failed supersede stops the
+// requeue before the transcript is deleted: the caller rolls back, so a
+// transcript is never deleted while its findings stay live.
+func TestRequeueTxSupersedeFailureAborts(t *testing.T) {
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	id := "11111111-1111-1111-1111-111111111111"
+	mock.ExpectBegin()
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	mock.ExpectQuery(requeueFailed.resetJobs).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, "/b/x.m4b"))
+	mock.ExpectExec(requeueLockTranscriptsSQL).WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(requeueSupersedeFindingsSQL).
+		WithArgs([]string{id}, supersedeFromStates).
+		WillReturnError(errors.New("boom"))
+
+	if _, _, err := requeueTx(context.Background(), tx, requeueFailed); err == nil ||
+		!strings.Contains(err.Error(), "supersede findings") {
+		t.Fatalf("err = %v, want a supersede failure", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestRequeueTxNothingResetIssuesNoWrites asserts a no-match requeue (empty
+// RETURNING) issues no supersede, delete, or run_metrics statement.
+func TestRequeueTxNothingResetIssuesNoWrites(t *testing.T) {
 	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
 	if err != nil {
 		t.Fatalf("new mock pool: %v", err)
@@ -1515,8 +1578,6 @@ func TestRequeueTxNoMetricsDeleteWhenNothingReset(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 
-	mock.ExpectExec(requeueFailed.deleteTranscripts).
-		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectQuery(requeueFailed.resetJobs).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"})) // no rows
 

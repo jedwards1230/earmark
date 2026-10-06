@@ -286,7 +286,7 @@ var failedFragmentTmpl = template.Must(template.New("failed").Funcs(tmplFuncs).P
       <td class="time-muted" title="{{formatTime .UpdatedAt}}">{{relTime .UpdatedAt}}</td>
       <td class="actions">
         <button class="btn" hx-post="/actions/requeue?id={{.ID}}&failed=1" hx-target="#failed-region" hx-swap="innerHTML"
-                hx-confirm="Re-transcribe this track? It is reset to pending and re-run.">requeue</button>
+                hx-confirm="Re-transcribe this track? It is reset to pending and re-run; its findings are archived as superseded.">requeue</button>
       </td>
     </tr>
   {{end}}
@@ -599,7 +599,7 @@ var statusFragmentTmpl = template.Must(template.New("status").Funcs(tmplFuncs).P
 <div class="failed-callout">
   <span>&#9888;&#xFE0F;&nbsp;{{commafy .Stats.Failed}} failed job{{if gt .Stats.Failed 1}}s{{end}} &nbsp;<a href="#failed-region">view failed jobs &#8250;</a></span>
   <button class="btn btn-warn" hx-post="/actions/retry-failed" hx-target="#data-region" hx-swap="innerHTML"
-          hx-confirm="Retry all {{.Stats.Failed}} failed job(s)? Each is reset to pending and re-transcribed.">retry all failed</button>
+          hx-confirm="Retry all {{.Stats.Failed}} failed job(s)? Each is reset to pending and re-transcribed; any findings are archived as superseded.">retry all failed</button>
 </div>
 {{end}}
 
@@ -809,7 +809,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
   <div class="book-path">{{.Dir}}</div>
   <div class="book-actions">
     <button class="btn btn-warn" hx-post="/actions/book-requeue?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
-            hx-confirm="Re-transcribe all {{.Total}} track(s) of this book? Deletes their transcripts + embeddings and re-runs the runner.">requeue entire book</button>
+            hx-confirm="Re-transcribe all {{.Total}} track(s) of this book? Deletes their transcripts + embeddings and re-runs the runner; their findings are archived as superseded.">requeue entire book</button>
     {{if .EvalConfigured}}
     <button class="btn btn-primary" hx-post="/actions/eval?dir={{.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
             hx-confirm="Run the read-only LLM judge over this book's chunks? It flags suspected transcription errors (advisory only — transcripts are never edited) and may take a minute.">run eval</button>
@@ -884,7 +884,7 @@ var bookFragmentTmpl = template.Must(template.New("book").Funcs(tmplFuncs).Parse
       <td class="actions">
         {{if or (eq .Status "done") (eq .Status "failed")}}
         <button class="btn" hx-post="/actions/requeue?id={{.ID}}&book={{$.DirQuery}}" hx-target="#book-region" hx-swap="innerHTML"
-                hx-confirm="Re-transcribe this track?">requeue</button>
+                hx-confirm="Re-transcribe this track? Its findings are archived as superseded.">requeue</button>
         {{end}}
       </td>
     </tr>
@@ -2650,9 +2650,10 @@ func (s *MCPServer) handleTrackPage(w http.ResponseWriter, r *http.Request) {
 // reader.
 //
 // KNOWN GAP (CONTRACT §2.17): the reader renders transcripts.segments — the
-// immutable ASR record — so it shows UNCORRECTED text while search shows the
+// immutable ASR record — so it shows UNCORRECTED text while search (and the
+// MCP get_transcript tool, via db.GetCorrectedTranscriptPage) shows the
 // corrected projection. Segments are provenance and are never rewritten; see
-// db.GetTrackDetail for why closing the gap is deferred.
+// db.GetTrackDetail.
 func (s *MCPServer) handleTrackData(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {

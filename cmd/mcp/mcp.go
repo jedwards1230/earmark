@@ -96,7 +96,7 @@ func runMCP(cmd *cobra.Command, args []string) {
 	diag("  - semantic_search_audiobooks: Search using semantic similarity")
 	diag("  - text_search_audiobooks: Search using trigram keyword match")
 	diag("  - list_books: Library inventory (flat or author tree)")
-	diag("  - get_transcript: Read a track's full transcript (paginated segments)")
+	diag("  - get_transcript: Read a track's full transcript (corrected chunks when reviewed corrections exist, else ASR segments; paginated)")
 	diag("  - get_chunk_context: Surrounding chunks around a search hit")
 	diag("")
 	diag("Transport: %s", transport)

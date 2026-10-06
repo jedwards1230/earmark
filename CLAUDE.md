@@ -50,9 +50,9 @@ MCP_TRANSPORT=http ./earmark mcp  # HTTP transport on :8081
 
 # Redo work without DEBUG_DB_RESET (dry-run unless --yes):
 ./earmark requeue "Project Hail Mary"          # preview matches
-./earmark requeue "Project Hail Mary" --yes    # re-transcribe (drops transcript+chunks, job→pending)
-./earmark requeue --failed --yes               # retry all failed jobs
-./earmark requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
+./earmark requeue "Project Hail Mary" --yes    # re-transcribe (findings→superseded, drops transcript+chunks, job→pending)
+./earmark requeue --failed --yes               # retry all failed jobs (same archive semantics)
+./earmark requeue --reembed "" --yes           # re-embed only (drop chunks, keep findings; e.g. after model/chunk change)
 ./earmark prune-chunks [--yes]                 # delete orphan chunk tails left by a re-chunk (CONTRACT §2.17); run before eval --backfill-*
 
 # After any re-chunk, re-anchor findings to the new chunks (dry-run unless --yes;
@@ -72,7 +72,11 @@ GPU_ARBITER_URL=http://gpu-host:48750/status ./earmark batch  # yield to games
 The status dashboard also exposes requeue as buttons: a per-row **requeue** on
 each done/failed job and a **retry all failed** button. They POST to
 `/actions/requeue?id=…` / `/actions/retry-failed` (htmx-guarded via the
-`HX-Request` header) and re-render the status fragment.
+`HX-Request` header) and re-render the status fragment. Every re-transcribe path
+(CLI, buttons, book requeue) runs the same transaction: the old transcript's
+findings — human decisions included — move to `superseded` (kept, never
+replayed), then the transcript is deleted; `transcript_findings.transcript_id`
+is a foreign key `ON DELETE SET NULL` (CONTRACT §1.4).
 
 For scripts/agents there is a JSON **control API** under `/api/v1` (see
 `docs/CONTRACT.md §2.12`): `GET /status`, `GET|PUT /pipeline/pause`, and

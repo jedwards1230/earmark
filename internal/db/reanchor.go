@@ -126,10 +126,18 @@ func (r ReanchorReport) Sum() ReanchorTally {
 // reanchorTranscriptsSQL pages the transcripts that have in-scope findings, by
 // keyset on transcript_id, so a run walks the library in bounded batches and
 // never holds more than one batch's chunk text.
+//
+// A superseded finding (requeue's archive, migration 5) is never in scope:
+// patch_state = ANY($1) is only proposed/unanchorable, and superseded is
+// terminal. transcript_id IS NOT NULL says the same thing a second way — a
+// NULL transcript_id is only ever a superseded row (the
+// transcript_findings_null_transcript_superseded CHECK), and a NULL would
+// otherwise page as a transcript id.
 var reanchorTranscriptsSQL = `
 	SELECT DISTINCT transcript_id
 	FROM transcript_findings
 	WHERE patch_state = ANY($1)
+	  AND transcript_id IS NOT NULL
 	  AND ($2::uuid IS NULL OR transcript_id > $2::uuid)
 	  AND file_path ILIKE $3
 	ORDER BY transcript_id

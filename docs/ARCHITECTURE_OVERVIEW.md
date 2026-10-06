@@ -72,7 +72,7 @@ Streamable-HTTP MCP server on `:8081/mcp`. Status dashboard (htmx, auto-refresh)
 | `list_books` | Library inventory with per-book progress, duration, word count. `flat` or `tree` format. |
 | `semantic_search_audiobooks` | Vector cosine similarity search (HNSW or exact scoped). Optional `book` scope, `snippet` excerpt. |
 | `text_search_audiobooks` | Trigram keyword search (`pg_trgm`). Hits labelled "ranked by trigram match". |
-| `get_transcript` | Paginated raw segments for a track (timestamped). |
+| `get_transcript` | A track's transcript, paginated: corrected chunks when it has reviewed corrections, else timestamped ASR segments (`corrected` says which). |
 | `get_chunk_context` | Neighbouring chunks around a chunk UUID. |
 
 Exposed to AI clients via mcp-proxy upstream key `"audiobooks"` at `http://earmark.earmark:8081/mcp`.

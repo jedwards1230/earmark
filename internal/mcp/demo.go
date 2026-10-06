@@ -1082,6 +1082,12 @@ func (d demoDB) GetBookTracks(_ context.Context, dir string) ([]db.RecentJob, er
 	return out, nil
 }
 
+// GetCorrectedTranscriptPage: the demo fixture's chunks carry no replayed
+// corrections, so get_transcript serves the ASR segments.
+func (d demoDB) GetCorrectedTranscriptPage(context.Context, string, int, int) (*db.CorrectedTranscriptPage, error) {
+	return &db.CorrectedTranscriptPage{}, nil
+}
+
 // GetTrackDetail returns a synthetic per-track detail for the /track page. A
 // trailing "#0" (or an id ending in an even index) is treated as a done track
 // with a full transcript + chunks; an odd index is a pending track with no

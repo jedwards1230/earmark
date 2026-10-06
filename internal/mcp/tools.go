@@ -75,6 +75,12 @@ type DBInterface interface {
 	// GetTrackDetail returns the full per-track view (job + transcript + metrics +
 	// segments + chunks) for one job UUID (the /track page).
 	GetTrackDetail(ctx context.Context, jobID string) (*db.TrackDetail, error)
+	// GetCorrectedTranscriptPage returns a page (offset/limit in chunks) of a
+	// track's CORRECTED text — the projection search returns — plus how many of
+	// its chunks carry a correction. limit <= 0 returns the counts only.
+	// get_transcript serves it instead of the ASR segments when any chunk is
+	// corrected (CONTRACT §2.17).
+	GetCorrectedTranscriptPage(ctx context.Context, jobID string, offset, limit int) (*db.CorrectedTranscriptPage, error)
 	// RequeueByDir re-transcribes every track in one book directory (book page).
 	RequeueByDir(ctx context.Context, dir string) ([]string, error)
 	// GetFailedJobs returns failed jobs with full triage detail (failures view).
@@ -475,8 +481,9 @@ func (h *ToolHandlers) handleListBooks(ctx context.Context, req *mcp.CallToolReq
 
 // handleGetTranscript returns a page of a track's transcript so the model can
 // read the full text. It resolves `book` → a track (disambiguating when a book
-// has multiple tracks), then returns timestamped segments with offset/limit
-// pagination.
+// has multiple tracks), then returns either the corrected chunk text (when the
+// track has reviewed corrections) or the timestamped ASR segments, with
+// offset/limit pagination. The payload's `corrected` field says which.
 func (h *ToolHandlers) handleGetTranscript(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args, err := parseArgs(req)
 	if err != nil {
@@ -527,7 +534,43 @@ func (h *ToolHandlers) handleGetTranscript(ctx context.Context, req *mcp.CallToo
 		return errorResult(fmt.Sprintf("Track %q is not transcribed yet (status: %s).", detail.FilePath, detail.Status)), nil
 	}
 
-	return formatTranscriptPage(detail, offset, limit, includeWords), nil
+	// Serve the CORRECTED text when the track has any (CONTRACT §2.17): the
+	// chunk projection search already returns, paged by chunk, without word
+	// timestamps. Word timestamps exist only for the ASR segments, so a caller
+	// that asks for them gets the segments — told that corrections exist. A
+	// failed read fails the call rather than silently serving uncorrected text
+	// as though there were no corrections.
+	chunkLimit := clampChunkLimit(args.getInt("limit", 0))
+	pageLimit := chunkLimit
+	if includeWords {
+		pageLimit = 0 // counts only
+	}
+	corr, err := h.db.GetCorrectedTranscriptPage(ctx, trackID, offset, pageLimit)
+	if err != nil {
+		h.logger.Error("get corrected transcript failed", "trackID", trackID, "error", err)
+		return errorResult(fmt.Sprintf("Failed to load corrected text for track %q: %v", trackID, err)), nil
+	}
+	if corr != nil && corr.CorrectedChunks > 0 && !includeWords {
+		return formatCorrectedTranscriptPage(detail, corr, offset, chunkLimit), nil
+	}
+	return formatTranscriptPage(detail, corr, offset, limit, includeWords), nil
+}
+
+// Chunk paging for get_transcript's corrected mode. A chunk is tens of
+// segments (~hundreds of words), so the segment default of 50 per page would
+// return most of a book; chunks page 10 at a time, at most 25.
+const (
+	defaultTranscriptChunkLimit = 10
+	maxTranscriptChunkLimit     = 25
+)
+
+// clampChunkLimit maps get_transcript's `limit` onto the chunk page size:
+// unset/invalid → the default, larger than the cap → the cap.
+func clampChunkLimit(limit int) int {
+	if limit < 1 {
+		return defaultTranscriptChunkLimit
+	}
+	return min(limit, maxTranscriptChunkLimit)
 }
 
 // handleGetContext retrieves surrounding chunks for better context

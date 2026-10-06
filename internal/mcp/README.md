@@ -95,16 +95,29 @@ similarity %). `snippet` centres the excerpt on the literal match.
 
 ### `get_transcript`
 
-Full transcript of a track as paginated timestamped **segments** (raw_text can be
-600k+ chars). Multi-track books return a track-chooser listing; pick a `trackID`
-to continue.
+Full transcript of a track, paginated (raw_text can be 600k+ chars).
+Multi-track books return a track-chooser listing; pick a `trackID` to continue.
+
+**Which text** (CONTRACT §2.2.1, §2.17). The structured payload's `corrected`
+field always says:
+
+- `corrected: true`, `unit: "chunk"` — the track has reviewed corrections, so it
+  serves the **corrected** text search returns: `chunks[]` of
+  `{chunkID, chunkIndex, start, end, text, corrected}`, paged by chunk, with
+  **no word timestamps** (corrected word timing is a later task).
+- `corrected: false`, `unit: "segment"` — no corrections: the ASR record as
+  timestamped `segments[]`.
+
+`includeWordTimestamps=true` always returns the ASR segments with `words[]`;
+when the track has corrections, `note` says the text is UNCORRECTED.
 
 | Param | Default | Notes |
 |-------|---------|-------|
 | `book` | — | one of `book` or `trackID` required |
 | `trackID` | — | job UUID from the track-chooser |
-| `offset` | 0 | segment offset |
-| `limit` | 50 | segments per page |
+| `offset` | 0 | offset in the response's `unit` (segments, or chunks when corrected) |
+| `limit` | 50 | segments per page; chunks per page when corrected (default 10, max 25) |
+| `includeWordTimestamps` | false | ASR segments with per-word times (uncorrected text) |
 
 ### `get_chunk_context`
 
@@ -126,7 +139,7 @@ the undecided (`proposed`) queue.
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `state` | `proposed` | comma-separated patch states (`proposed`, `accepted`, `applied`, `rejected`, `reverted`, `stale`, `unanchorable`), or `all`/`any` for every state |
+| `state` | `proposed` | comma-separated patch states (`proposed`, `accepted`, `applied`, `rejected`, `reverted`, `stale`, `unanchorable`, `superseded`), or `all`/`any` for every state. `superseded` = archived by a requeue (its transcript was replaced; `transcriptId` is empty) |
 | `book` | — | resolved the same way the search tools resolve it; ignored when `path` is given |
 | `path` | — | exact book directory or track file path; matches that path and anything beneath it |
 | `id` | — | a single finding UUID — overrides the other filters in practice |

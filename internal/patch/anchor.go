@@ -35,6 +35,7 @@ import (
 //	proposed -> rejected
 //	(any)    -> stale        (the underlying chunk changed underneath us)
 //	proposed <-> unanchorable (earmark reanchor could not place the span)
+//	(any)    -> superseded   (requeue replaced the transcript; terminal archive)
 const (
 	StateProposed = "proposed"
 	StateAccepted = "accepted"
@@ -48,6 +49,10 @@ const (
 	// place it and return it to proposed. It is never in the overlay and can
 	// never be accepted or applied — there is no text to apply it to.
 	StateUnanchorable = "unanchorable"
+	// StateSuperseded archives a finding whose transcript was replaced by an
+	// operator requeue (CONTRACT §1.4, §2.17). It is kept for audit and the
+	// bench, never replayed, and never leaves this state.
+	StateSuperseded = "superseded"
 )
 
 var (
@@ -186,6 +191,13 @@ func occurrences(runes, target []rune) []int {
 // CanTransition reports whether a patch may move from one state to another.
 // Centralised so the DB layer and the UI cannot disagree about what is legal.
 func CanTransition(from, to string) bool {
+	if to == StateSuperseded {
+		// Requeue archives EVERY finding of the transcript it replaces, human
+		// decisions included: the text they describe is gone, but the record of
+		// what was proposed and decided is kept. Any known state may be archived;
+		// an archived one may not be archived again.
+		return from != StateSuperseded && isState(from)
+	}
 	switch from {
 	case StateProposed:
 		return to == StateAccepted || to == StateRejected || to == StateStale || to == StateUnanchorable
@@ -205,6 +217,10 @@ func CanTransition(from, to string) bool {
 		// Only back to proposed, and only by a re-anchor that placed the span.
 		// Never to accepted/applied: there is no anchor to apply it at.
 		return to == StateProposed
+	case StateSuperseded:
+		// Terminal: its transcript no longer exists. The replacement transcript
+		// is judged fresh.
+		return false
 	default:
 		return false
 	}
