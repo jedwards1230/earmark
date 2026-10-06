@@ -195,6 +195,54 @@
         }
       }
     },
+    "evalBackfill": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled":                    { "type": "boolean" },
+        "schedule":                   { "type": "string", "minLength": 1 },
+        "limit":                      { "type": "integer", "minimum": 0 },
+        "extraArgs":                  { "type": "array", "items": { "type": "string" } },
+        "extraEnv": {
+          "type": "array",
+          "items": { "type": "object", "required": ["name"] }
+        },
+        "concurrencyPolicy":          { "type": "string", "enum": ["Allow", "Forbid", "Replace"] },
+        "startingDeadlineSeconds":    { "type": ["integer", "null"], "minimum": 0 },
+        "successfulJobsHistoryLimit": { "type": "integer", "minimum": 0 },
+        "failedJobsHistoryLimit":     { "type": "integer", "minimum": 0 },
+        "backoffLimit":               { "type": "integer", "minimum": 0 },
+        "activeDeadlineSeconds":      { "type": ["integer", "null"], "minimum": 1 },
+        "ttlSecondsAfterFinished":    { "type": ["integer", "null"], "minimum": 0 },
+        "suspend":                    { "type": "boolean" },
+        "podAnnotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu":    { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu":    { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
     "nodeSelector": {
       "type": "object",
       "additionalProperties": { "type": "string" }

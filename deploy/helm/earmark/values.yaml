@@ -11,9 +11,10 @@ mcp:
   replicaCount: 1
 
 # ── Pod metadata (shared by both the mcp and ingest deployments) ────────────────
-# -- Pod annotations (e.g. Velero backup-volumes hooks)
+# -- Pod annotations (e.g. Velero backup-volumes hooks). Not applied to the
+#    evalBackfill Job pods (see evalBackfill.podAnnotations).
 podAnnotations: {}
-# -- Additional pod labels
+# -- Additional pod labels (also applied to the evalBackfill Job pods)
 podLabels: {}
 
 service:
@@ -200,6 +201,64 @@ resources:
   limits:
     cpu: 500m
     memory: 512Mi
+
+# ── Eval backfill CronJob (CONTRACT §2.15, decoupled mode) ─────────────────────
+# Optional CronJob running `earmark eval --backfill-unevaluated --write
+# [--limit N]` — the judging pass for decoupled mode (config.evalInPipeline:
+# false), where the ingest worker embeds without judging. Each run judges up to
+# `limit` done transcripts that lack the eval_finished_at latch; a transcript
+# latches only on success, so a failed run is retried on the next schedule.
+#
+# Shares the Deployments' image, env (earmark.commonEnv — DATABASE_URL,
+# AI_ENDPOINTS/AI_ROLES, the AI gateway key), security contexts, nodeSelector
+# and tolerations. It needs an eval chat endpoint (config.aiRoles.eval or
+# config.evalChat). No books volume is mounted — eval reads stored chunks.
+# Disabled by default.
+evalBackfill:
+  enabled: false
+  # Standard five-field cron (UTC unless the cluster sets otherwise). Off the
+  # hour so it doesn't pile onto other top-of-hour jobs.
+  schedule: "17 * * * *"
+  # --limit: max transcripts judged per run. 0 = no cap (the flag is omitted and
+  # the pass judges every unevaluated transcript) — size against the judge's
+  # cost/throughput and activeDeadlineSeconds.
+  limit: 25
+  # Extra args appended after the built-in ones (e.g. ["--debug"]). Do NOT pass
+  # --backfill-eval-errors here: it is mutually exclusive with
+  # --backfill-unevaluated.
+  extraArgs: []
+  # Extra env vars (core/v1 EnvVar list) appended after the shared env — e.g.
+  # judge-only knobs the Deployments don't need in decoupled mode:
+  #   - {name: EVAL_REASONING_EFFORT, value: omit}
+  #   - {name: EVAL_CHAT_TEMPLATE_KWARGS, value: omit}
+  extraEnv: []
+  # Forbid: never start a run while the previous one is still judging.
+  concurrencyPolicy: Forbid
+  # Seconds after a missed schedule a run may still start; null omits the field
+  # (no deadline). Also stops the controller giving up after 100 missed runs.
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # 0: a failed run is not retried in-place — the next scheduled run picks the
+  # same unlatched transcripts back up.
+  backoffLimit: 0
+  # Hard wall-clock cap per run; keep it below the schedule interval. null omits.
+  activeDeadlineSeconds: 3000
+  # Garbage-collect finished Jobs after a day; null omits (history limits only).
+  ttlSecondsAfterFinished: 86400
+  # Pause scheduling without deleting the CronJob (or its history).
+  suspend: false
+  # Annotations for the Job pods only (podAnnotations above is NOT applied: its
+  # Velero hooks name volumes these pods don't have). podLabels IS applied.
+  podAnnotations: {}
+  # The judge is a remote HTTP call, so the pod itself is light.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 # Schedule on amd64 nodes only.
 nodeSelector:

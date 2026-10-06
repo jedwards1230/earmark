@@ -1,0 +1,107 @@
+{{- if .Values.evalBackfill.enabled }}
+# Eval backfill CronJob — the decoupled eval judge (CONTRACT §2.15).
+#
+# Runs: earmark eval --backfill-unevaluated --write [--limit N]
+#   - Judges done transcripts without the eval_finished_at latch, latching each
+#     only on success, so a failed run is retried on the next schedule.
+#   - Pairs with config.evalInPipeline: false (decoupled mode): the ingest worker
+#     embeds without judging and this pass is the only thing that runs the judge.
+#
+# Env comes from earmark.commonEnv — the SAME AI_ENDPOINTS/AI_ROLES (and gateway
+# key) the Deployments load, so the judge cannot drift from the chart config.
+# No books volume: the eval pass reads stored chunks from Postgres, never audio.
+# No ports: nothing to scrape, so the PodMonitor (which only targets the named
+# `http`/`metrics` ports) never picks these pods up.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "earmark.evalBackfill.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "earmark.labels" . | nindent 4 }}
+    app.kubernetes.io/component: eval-backfill
+spec:
+  schedule: {{ required "evalBackfill.schedule is required" .Values.evalBackfill.schedule | quote }}
+  concurrencyPolicy: {{ .Values.evalBackfill.concurrencyPolicy }}
+  {{- if not (kindIs "invalid" .Values.evalBackfill.startingDeadlineSeconds) }}
+  startingDeadlineSeconds: {{ int .Values.evalBackfill.startingDeadlineSeconds }}
+  {{- end }}
+  successfulJobsHistoryLimit: {{ int .Values.evalBackfill.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ int .Values.evalBackfill.failedJobsHistoryLimit }}
+  {{- if .Values.evalBackfill.suspend }}
+  suspend: true
+  {{- end }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ int .Values.evalBackfill.backoffLimit }}
+      {{- if not (kindIs "invalid" .Values.evalBackfill.activeDeadlineSeconds) }}
+      activeDeadlineSeconds: {{ int .Values.evalBackfill.activeDeadlineSeconds }}
+      {{- end }}
+      {{- if not (kindIs "invalid" .Values.evalBackfill.ttlSecondsAfterFinished) }}
+      ttlSecondsAfterFinished: {{ int .Values.evalBackfill.ttlSecondsAfterFinished }}
+      {{- end }}
+      template:
+        metadata:
+          labels:
+            {{- include "earmark.labels" . | nindent 12 }}
+            app.kubernetes.io/component: eval-backfill
+            {{- with .Values.podLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.evalBackfill.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          restartPolicy: Never
+          securityContext:
+            {{- include "earmark.podSecurityContext" . | nindent 12 }}
+
+          containers:
+            - name: eval-backfill
+              image: {{ include "earmark.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+              # args overrides the Dockerfile CMD — always explicit, never rely on CMD.
+              # --write is unconditional: a dry-run on a schedule judges nothing.
+              args:
+                - eval
+                - --backfill-unevaluated
+                - --write
+                {{- with .Values.evalBackfill.limit }}
+                - --limit
+                - {{ . | int | toString | quote }}
+                {{- end }}
+                {{- range .Values.evalBackfill.extraArgs }}
+                - {{ . | quote }}
+                {{- end }}
+
+              securityContext:
+                {{- include "earmark.containerSecurityContext" . | nindent 16 }}
+
+              env:
+                {{- include "earmark.commonEnv" . | nindent 16 }}
+                {{- with .Values.evalBackfill.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+
+              resources:
+                {{- toYaml .Values.evalBackfill.resources | nindent 16 }}
+
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          volumes:
+            - name: tmp
+              emptyDir: {}
+{{- end }}
