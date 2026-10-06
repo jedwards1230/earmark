@@ -150,3 +150,24 @@ func mustProvider(t *testing.T) *goose.Provider {
 	}
 	return p
 }
+
+// TestRecipesMigrationLocksStampedTables: 00002 computes the legacy recipe
+// set several times under READ COMMITTED. Writers must be frozen BEFORE the
+// first of those reads, or a concurrent commit can add a key the recipes
+// INSERT missed (FK failure) or be mislabelled by the constant default.
+func TestRecipesMigrationLocksStampedTables(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00002_recipes.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := stripSQLComments(string(b))
+	lockAt := strings.Index(src, "LOCK TABLE transcripts, transcript_findings, transcript_chunks IN SHARE ROW EXCLUSIVE MODE;")
+	if lockAt < 0 {
+		t.Fatal("00002 no longer locks transcripts, transcript_findings and transcript_chunks in SHARE ROW EXCLUSIVE mode")
+	}
+	for _, first := range []string{"FROM transcripts", "FROM transcript_findings", "FROM transcript_chunks", "ALTER TABLE"} {
+		if at := strings.Index(src, first); at >= 0 && at < lockAt {
+			t.Errorf("%q appears before the LOCK TABLE — it reads or alters a stamped table unlocked", first)
+		}
+	}
+}

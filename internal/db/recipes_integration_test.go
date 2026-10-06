@@ -84,16 +84,32 @@ func TestIntegrationLegacyRecipeBackfill(t *testing.T) {
 	dbURL := newTestDatabase(t)
 	applyLegacyInitialize(t, dbURL)
 	seedLegacyRows(t, dbURL)
+	conn := connect(t, dbURL)
+	// A second embedding model (job c), so job b's chunk — which has no
+	// recorded embed model — cannot be attributed and stays "unknown".
+	if _, err := conn.Exec(context.Background(), `
+		INSERT INTO transcription_jobs (id, file_path, checksum, status)
+		VALUES ('00000000-0000-0000-0000-00000000000c', '/b/C/01.m4b', 'c3', 'done');
+		INSERT INTO run_metrics (job_id, embed_model) VALUES ('00000000-0000-0000-0000-00000000000c', 'bge-m3');
+		INSERT INTO transcripts (id, job_id, file_path, checksum, language, duration_seconds,
+		                         segments, raw_text, model_name)
+		VALUES ('00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-00000000000c',
+		        '/b/C/01.m4b', 'c3', 'en', 60, '[]', 'x', 'nvidia/parakeet-tdt-1.1b');
+		INSERT INTO transcript_chunks (transcript_id, file_path, chunk_index, start_sec, end_sec, text, embedding)
+		VALUES ('00000000-0000-0000-0000-0000000000c1', '/b/C/01.m4b', 0, 0, 60, 'x', array_fill(0.4, ARRAY[768])::vector);
+	`); err != nil {
+		t.Fatal(err)
+	}
 	if err := migrate(itCtx(t), dbURL, testLog()); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	conn := connect(t, dbURL)
 
 	asr := legacyID(t, recipe.StepASR, "nvidia/parakeet-tdt-1.1b", "")
 	gemma := legacyID(t, recipe.StepPropose, "gemma3:12b", "")
 	qwen := legacyID(t, recipe.StepPropose, "qwen3.8", "")
 	haiku := legacyID(t, recipe.StepPropose, "anthropic/claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5-20251001")
 	nomic := legacyID(t, recipe.StepEmbed, "nomic-embed-text", "")
+	bge := legacyID(t, recipe.StepEmbed, "bge-m3", "")
 	unknownEmbed := legacyID(t, recipe.StepEmbed, "", "")
 
 	got := queryStrings(t, conn, `
@@ -105,6 +121,7 @@ func TestIntegrationLegacyRecipeBackfill(t *testing.T) {
 	want := []string{
 		"asr " + asr + " nvidia/parakeet-tdt-1.1b -",
 		"embed " + nomic + " nomic-embed-text -",
+		"embed " + bge + " bge-m3 -",
 		"embed " + unknownEmbed + " - -",
 		"propose " + haiku + " anthropic/claude-haiku-4-5-20251001 anthropic/claude-haiku-4-5-20251001",
 		"propose " + gemma + " gemma3:12b -",
@@ -130,6 +147,7 @@ func TestIntegrationLegacyRecipeBackfill(t *testing.T) {
 		{`SELECT coalesce(string_agg(DISTINCT recipe_id, ','), 'NULL') FROM transcript_findings WHERE origin = 'human'`, "NULL"},
 		{`SELECT string_agg(DISTINCT recipe_id, ',') FROM transcript_chunks WHERE file_path LIKE '/b/A/%'`, nomic},
 		{`SELECT string_agg(DISTINCT recipe_id, ',') FROM transcript_chunks WHERE file_path LIKE '/b/B/%'`, unknownEmbed},
+		{`SELECT string_agg(DISTINCT recipe_id, ',') FROM transcript_chunks WHERE file_path LIKE '/b/C/%'`, bge},
 		{`SELECT count(*)::text FROM transcript_chunks WHERE recipe_id IS NULL`, "0"},
 	} {
 		var g string
@@ -150,17 +168,16 @@ func TestIntegrationLegacyRecipeBackfill(t *testing.T) {
 // transcripts / 39,644 chunks / 32,337 findings): 0.9 s, versus 91 s for the
 // UPDATE path. And the default is gone afterwards: new rows are NULL until a
 // writer stamps them.
+//
+// Job b's chunk has NO recorded embed model (run_metrics is written after the
+// chunks commit, best-effort). With a single model in the library it is
+// attributed to that model, so the fast path still holds.
 func TestIntegrationLegacyBackfillWithoutRewrite(t *testing.T) {
 	dbURL := newTestDatabase(t)
 	applyLegacyInitialize(t, dbURL)
 	seedLegacyRows(t, dbURL)
 	conn := connect(t, dbURL)
 	ctx := context.Background()
-	// Give job b an embed model too, so every chunk maps to one embed recipe.
-	if _, err := conn.Exec(ctx, `INSERT INTO run_metrics (job_id, embed_model)
-		VALUES ('00000000-0000-0000-0000-00000000000b', 'nomic-embed-text')`); err != nil {
-		t.Fatal(err)
-	}
 	// relfilenode changes if the table is rewritten; a row's xmin changes if it
 	// is UPDATEd (a new tuple version). The fast path does neither.
 	physical := func() []string {

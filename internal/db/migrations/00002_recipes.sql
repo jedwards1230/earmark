@@ -19,6 +19,15 @@
 -- is invented.
 
 -- +goose Up
+-- Freeze the three stamped tables for the whole migration. The legacy recipe
+-- set is computed more than once below (INSERT … SELECT DISTINCT, the id list
+-- add_recipe_column reads, its UPDATE); under READ COMMITTED a writer
+-- committing in between could add a key the recipes INSERT missed (an FK
+-- failure) or, worse, be silently labelled by the constant default. SHARE ROW
+-- EXCLUSIVE blocks writers while letting readers (MCP search) continue until
+-- each ALTER takes its own ACCESS EXCLUSIVE lock.
+LOCK TABLE transcripts, transcript_findings, transcript_chunks IN SHARE ROW EXCLUSIVE MODE;
+
 CREATE TABLE recipes (
     recipe_id      TEXT        NOT NULL PRIMARY KEY,
     step           TEXT        NOT NULL
@@ -118,21 +127,37 @@ SELECT pg_temp.add_recipe_column('transcript_findings',
         WHERE origin = 'judge'$u$);
 
 -- embed: chunks record nothing; the embed worker's run_metrics slice records
--- the embedding model per job.
-INSERT INTO recipes (recipe_id, step, step_version, code_version, model_alias)
-SELECT DISTINCT pg_temp.legacy_recipe_id('embed', rm.embed_model, NULL), 'embed', 0,
-       'legacy-unknown', nullif(rm.embed_model, '')
+-- the embedding model per job. That slice is best-effort and written AFTER the
+-- chunks commit, so a job can have chunks but no embed_model (a pod stopped in
+-- between, or a failed metrics write). When the library was embedded with
+-- exactly ONE model, such chunks were embedded with it too — map them to it
+-- (keeping the cheap constant-default path) instead of minting a separate
+-- "unknown" recipe. With several models recorded the NULLs stay unknown: there
+-- is no way to tell which one made them.
+CREATE TEMP TABLE legacy_sole_embed_model ON COMMIT DROP AS
+SELECT CASE WHEN count(DISTINCT rm.embed_model) = 1 THEN min(rm.embed_model) END AS model
   FROM transcript_chunks c
   JOIN transcripts t ON t.id = c.transcript_id
-  LEFT JOIN run_metrics rm ON rm.job_id = t.job_id;
+  JOIN run_metrics rm ON rm.job_id = t.job_id
+ WHERE nullif(rm.embed_model, '') IS NOT NULL;
+
+INSERT INTO recipes (recipe_id, step, step_version, code_version, model_alias)
+SELECT DISTINCT pg_temp.legacy_recipe_id('embed', m.model, NULL), 'embed', 0, 'legacy-unknown', m.model
+  FROM (SELECT nullif(coalesce(nullif(rm.embed_model, ''),
+                               (SELECT model FROM legacy_sole_embed_model)), '') AS model
+          FROM transcript_chunks c
+          JOIN transcripts t ON t.id = c.transcript_id
+          LEFT JOIN run_metrics rm ON rm.job_id = t.job_id) m;
 
 SELECT pg_temp.add_recipe_column('transcript_chunks',
-    $q$SELECT DISTINCT pg_temp.legacy_recipe_id('embed', rm.embed_model, NULL)
+    $q$SELECT DISTINCT pg_temp.legacy_recipe_id('embed',
+             coalesce(nullif(rm.embed_model, ''), (SELECT model FROM legacy_sole_embed_model)), NULL)
          FROM transcript_chunks c
          JOIN transcripts t ON t.id = c.transcript_id
          LEFT JOIN run_metrics rm ON rm.job_id = t.job_id$q$,
     $u$UPDATE transcript_chunks c
-          SET recipe_id = pg_temp.legacy_recipe_id('embed', rm.embed_model, NULL)
+          SET recipe_id = pg_temp.legacy_recipe_id('embed',
+                coalesce(nullif(rm.embed_model, ''), (SELECT model FROM legacy_sole_embed_model)), NULL)
          FROM transcripts t
          LEFT JOIN run_metrics rm ON rm.job_id = t.job_id
         WHERE t.id = c.transcript_id$u$);
