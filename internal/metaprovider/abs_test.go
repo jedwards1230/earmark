@@ -459,7 +459,7 @@ func TestABSProvider_Lookup_CleansChapterTitles(t *testing.T) {
 		libID    = "lib-id"
 		filePath = "/books/audio-libation/Andy Weir/Project Hail Mary [B08G9PRS1K]/01.m4b"
 	)
-	detail, _ := json.Marshal(map[string]any{
+	detail, err := json.Marshal(map[string]any{
 		"id": itemID,
 		"media": map[string]any{
 			"metadata": map[string]any{"title": "Project Hail Mary", "asin": asin},
@@ -469,6 +469,9 @@ func TestABSProvider_Lookup_CleansChapterTitles(t *testing.T) {
 			},
 		},
 	})
+	if err != nil {
+		t.Fatalf("marshal item detail fixture: %v", err)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/libraries/" + libID + "/items":
