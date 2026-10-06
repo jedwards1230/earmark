@@ -29,7 +29,7 @@ func (c *captureExecer) Exec(_ context.Context, sql string, args ...any) (pgconn
 func TestUpsertBookMetadataSQL_RefreshesEnrichment(t *testing.T) {
 	sql := strings.Join(strings.Fields(upsertBookMetadataSQL), " ")
 	for _, c := range []string{"description", "genres", "isbn"} {
-		want := c + " = COALESCE(EXCLUDED." + c + ", book_metadata." + c + ")"
+		want := c + " = CASE WHEN EXCLUDED.identity_status = 'conflict' THEN NULL ELSE COALESCE(EXCLUDED." + c + ", book_metadata." + c + ") END"
 		if !strings.Contains(sql, want) {
 			t.Errorf("upsertBookMetadataSQL must refresh %s via %q:\n%s", c, want, sql)
 		}
@@ -90,14 +90,17 @@ func TestUpsertBookMetadata_BindsEnrichment(t *testing.T) {
 
 // TestUpsertBookMetadata_BindsIdentity pins the ASIN identity columns
 // (migration 00006): asin_source and identity_status bind at $13/$14, are
-// refreshed via COALESCE (a path-only re-lookup never erases a recorded
-// conflict or source), and bind NULL when unset.
+// written as a pair when identity was resolved and kept otherwise, and bind
+// NULL when unset. Behavior is proven against Postgres in
+// TestIntegrationIdentityTransitions.
 func TestUpsertBookMetadata_BindsIdentity(t *testing.T) {
 	sql := strings.Join(strings.Fields(upsertBookMetadataSQL), " ")
-	for _, c := range []string{"asin_source", "identity_status"} {
-		want := c + " = COALESCE(EXCLUDED." + c + ", book_metadata." + c + ")"
+	for _, want := range []string{
+		"identity_status = COALESCE(EXCLUDED.identity_status, book_metadata.identity_status)",
+		"asin_source = CASE WHEN EXCLUDED.identity_status IS NOT NULL THEN EXCLUDED.asin_source ELSE book_metadata.asin_source END",
+	} {
 		if !strings.Contains(sql, want) {
-			t.Errorf("upsertBookMetadataSQL must refresh %s via %q:\n%s", c, want, sql)
+			t.Errorf("upsertBookMetadataSQL missing %q:\n%s", want, sql)
 		}
 	}
 

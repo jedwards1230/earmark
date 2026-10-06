@@ -11,6 +11,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
@@ -166,5 +167,82 @@ func TestIntegrationRecipeInfoAndStaleCounts(t *testing.T) {
 	}
 	if n, err := d.StaleItemCounts(ctx); err != nil || n[recipe.StepEmbed] != 1 {
 		t.Errorf("StaleItemCounts after recipe change = %v, %v; want embed:1", n, err)
+	}
+}
+
+// TestIntegrationIdentityTransitions (review M4): book_metadata's identity
+// columns move with each resolved lookup, and a conflict clears whatever an
+// earlier match attached; an unresolved lookup keeps the last outcome.
+func TestIntegrationIdentityTransitions(t *testing.T) {
+	ctx := context.Background()
+	d := newIntegrationDB(t, newTestDatabase(t))
+	const dir = "/b/Herbert/Children of Dune"
+	type row struct {
+		asin, source, status, desc *string
+		chapters                   *string
+	}
+	read := func() row {
+		t.Helper()
+		var r row
+		if err := d.pool.QueryRow(ctx, `SELECT asin, asin_source, identity_status, description, chapters::text
+		                                  FROM book_metadata WHERE book_dir = $1`, dir).
+			Scan(&r.asin, &r.source, &r.status, &r.desc, &r.chapters); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	str := func(p *string) string {
+		if p == nil {
+			return "NULL"
+		}
+		return *p
+	}
+
+	// 1. exact via the embedded tag.
+	if err := d.UpsertBookMetadata(ctx, dir, metaprovider.BookMeta{
+		Title: "Children of Dune", Author: "Frank Herbert", ASIN: "B002V57VRC", Source: "abs",
+		Description: "Leto and Ghanima", Chapters: []metaprovider.Chapter{{Title: "One"}},
+		ASINSource: "embedded_tag", IdentityStatus: metaprovider.IdentityExact,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := read(); str(r.asin) != "B002V57VRC" || str(r.status) != "exact" || str(r.source) != "embedded_tag" {
+		t.Fatalf("after exact: asin=%s status=%s source=%s", str(r.asin), str(r.status), str(r.source))
+	}
+
+	// 2. a later lookup finds the tag names another book: conflict clears the
+	// attached record data and the source.
+	if err := d.UpsertBookMetadata(ctx, dir, metaprovider.BookMeta{
+		Title: "Children of Dune", Author: "Frank Herbert", Source: "path",
+		IdentityStatus: metaprovider.IdentityConflict,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := read()
+	if str(r.status) != "conflict" || r.asin != nil || r.desc != nil || r.chapters != nil || r.source != nil {
+		t.Fatalf("after conflict: asin=%s source=%s status=%s desc=%s chapters=%s; want conflict and NULLs",
+			str(r.asin), str(r.source), str(r.status), str(r.desc), str(r.chapters))
+	}
+
+	// 3. an unresolved lookup (path only, or ABS down) keeps the outcome.
+	if err := d.UpsertBookMetadata(ctx, dir, metaprovider.BookMeta{
+		Title: "Children of Dune", Author: "Frank Herbert", Source: "path",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := read(); str(r.status) != "conflict" {
+		t.Errorf("after an unresolved lookup: status=%s, want conflict kept", str(r.status))
+	}
+
+	// 4. resolved exact again (e.g. the directory gained an ASIN): the pair is
+	// rewritten.
+	if err := d.UpsertBookMetadata(ctx, dir, metaprovider.BookMeta{
+		Title: "Children of Dune", Author: "Frank Herbert", ASIN: "B002V57VRC", Source: "abs",
+		ASINSource: "dir", IdentityStatus: metaprovider.IdentityExact,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := read(); str(r.status) != "exact" || str(r.source) != "dir" || str(r.asin) != "B002V57VRC" {
+		t.Errorf("after exact again: asin=%s status=%s source=%s", str(r.asin), str(r.status), str(r.source))
 	}
 }
