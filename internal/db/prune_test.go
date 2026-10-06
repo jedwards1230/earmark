@@ -8,15 +8,43 @@ import (
 
 	"github.com/pashagolub/pgxmock/v5"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/patch"
 )
 
-// expectChunkInserts expects one upsert per chunk, in order.
-func expectChunkInserts(mock pgxmock.PgxPoolIface, chunks []Chunk) {
+// newChunkTestDB is newTestDB with an embed recipe, as New sets one: every
+// chunk InsertChunks writes is stamped with it (CONTRACT §1.9).
+func newChunkTestDB(t *testing.T) (*DB, string) {
+	t.Helper()
+	database := newTestDB()
+	database.embedRecipe = embedRecipe(&config.Config{
+		ChunkSize:   512,
+		AIEndpoints: []config.AIEndpoint{{ID: "e", Type: config.AIEndpointTypeEmbeddings, Model: "nomic-embed-text"}},
+		AIRoles:     &config.AIRoles{Embeddings: "e"},
+	}, "search_document: ")
+	id, err := database.embedRecipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return database, id
+}
+
+// expectRecipeRegistered expects the embed recipe to be registered — the
+// first statement of the transaction, before any finding or chunk lock.
+func expectRecipeRegistered(mock pgxmock.PgxPoolIface, recipeID string) {
+	mock.ExpectExec("INSERT INTO recipes").
+		WithArgs(recipeID, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+}
+
+// expectChunkInserts expects one upsert per chunk, in order, each stamped with
+// recipeID.
+func expectChunkInserts(mock pgxmock.PgxPoolIface, chunks []Chunk, recipeID string) {
 	for _, c := range chunks {
 		mock.ExpectExec("INSERT INTO transcript_chunks").
 			WithArgs(c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
-				c.Text, c.SourceText, c.Speaker, pgxmock.AnyArg()).
+				c.Text, c.SourceText, c.Speaker, pgxmock.AnyArg(), recipeID).
 			WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	}
 }
@@ -30,10 +58,12 @@ func expectTailLock(mock pgxmock.PgxPoolIface, tid string, keep int) {
 // TestInsertChunks_PrunesTailInSameTransaction: a re-chunk into fewer chunks
 // must delete the old tail (chunk_index >= the new count) in the SAME
 // transaction as the upsert — otherwise the orphans survive the rebuild. The
-// finding locks come FIRST (before any chunk row is touched), the same
-// findings → chunks order SetPatchState uses, so the two cannot deadlock.
+// embed recipe is registered first (recipes only), then the finding locks
+// come before any chunk row is touched — the same findings → chunks order
+// SetPatchState uses, so the two cannot deadlock — and every upsert carries
+// the recipe id.
 func TestInsertChunks_PrunesTailInSameTransaction(t *testing.T) {
-	database := newTestDB()
+	database, recipeID := newChunkTestDB(t)
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("new mock pool: %v", err)
@@ -47,9 +77,10 @@ func TestInsertChunks_PrunesTailInSameTransaction(t *testing.T) {
 		{TranscriptID: "t-2", ChunkIndex: 0, Text: "c"},
 	}
 	mock.ExpectBegin()
+	expectRecipeRegistered(mock, recipeID)
 	expectTailLock(mock, "t-1", 2)
 	expectTailLock(mock, "t-2", 1)
-	expectChunkInserts(mock, chunks)
+	expectChunkInserts(mock, chunks, recipeID)
 	mock.ExpectQuery("WITH pruned AS").
 		WithArgs("t-1", 2, patch.StaleReasonChunkChanged, staleFromStates).
 		WillReturnRows(pgxmock.NewRows([]string{"chunks", "findings"}).AddRow(3, 1))
@@ -69,7 +100,7 @@ func TestInsertChunks_PrunesTailInSameTransaction(t *testing.T) {
 // TestInsertChunks_PruneFailureRollsBack: if the prune fails the upsert must
 // not commit on its own — a half-replaced projection is worse than a retry.
 func TestInsertChunks_PruneFailureRollsBack(t *testing.T) {
-	database := newTestDB()
+	database, recipeID := newChunkTestDB(t)
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("new mock pool: %v", err)
@@ -79,8 +110,9 @@ func TestInsertChunks_PruneFailureRollsBack(t *testing.T) {
 	chunks := []Chunk{{TranscriptID: "t-1", ChunkIndex: 0, Text: "a"}}
 	boom := errors.New("boom")
 	mock.ExpectBegin()
+	expectRecipeRegistered(mock, recipeID)
 	expectTailLock(mock, "t-1", 1)
-	expectChunkInserts(mock, chunks)
+	expectChunkInserts(mock, chunks, recipeID)
 	mock.ExpectQuery("WITH pruned AS").
 		WithArgs("t-1", 1, patch.StaleReasonChunkChanged, staleFromStates).
 		WillReturnError(boom)
@@ -118,7 +150,7 @@ func TestInsertChunks_EmptyNeverPrunes(t *testing.T) {
 // position columns too — not just the text and embedding.
 func TestInsertChunkSQL_RefreshesPositionColumns(t *testing.T) {
 	for _, col := range []string{"file_path", "start_sec", "end_sec", "speaker",
-		"text", "source_text", "embedding"} {
+		"text", "source_text", "embedding", "recipe_id"} {
 		if !strings.Contains(insertChunkSQL, col+" ") || !strings.Contains(insertChunkSQL, "= EXCLUDED."+col) {
 			t.Errorf("insertChunkSQL must refresh %s on conflict:\n%s", col, insertChunkSQL)
 		}

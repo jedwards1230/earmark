@@ -11,11 +11,13 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/ingesthttp"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/metrics"
 	"github.com/jedwards1230/earmark/internal/monitor"
 	"github.com/jedwards1230/earmark/internal/queue"
+	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -55,6 +57,8 @@ func runMonitor(cmd *cobra.Command, args []string) {
 		}
 		log.Println("Debug reset completed - All data cleared")
 	}
+
+	registerCurrentRecipes(database, cfg)
 
 	meta := metaprovider.New(cfg)
 
@@ -119,4 +123,38 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	wg.Wait()
 
 	log.Println("Monitor service shutdown complete")
+}
+
+// registerCurrentRecipes records, per step, the recipe this deployment would
+// use right now (CONTRACT §1.9): the embed recipe always, the propose (judge)
+// recipe when an eval chat endpoint is configured. The stale_work view compares
+// every output row against these. Only the ingest process does this, so there
+// is one writer of "current"; an ad-hoc `earmark eval` with other settings
+// stamps its own recipe on its findings without redefining current.
+//
+// Best-effort: stamping does not depend on it (writes register their recipe
+// themselves), so a failure is logged, not fatal.
+func registerCurrentRecipes(database *db.DB, cfg *config.Config) {
+	current := []recipe.Recipe{database.EmbedRecipe()}
+	r, ok, err := eval.CurrentRecipe(cfg)
+	if err != nil {
+		log.Printf("WARNING: eval chat endpoint is misconfigured, no current propose recipe registered: %v", err)
+	}
+	if ok {
+		current = append(current, r)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := database.SetCurrentRecipes(ctx, current...); err != nil {
+		log.Printf("WARNING: could not register current recipes: %v", err)
+		return
+	}
+	for _, r := range current {
+		id, err := r.ID()
+		if err != nil {
+			log.Printf("WARNING: could not compute the current %s recipe id: %v", r.Step, err)
+			continue
+		}
+		log.Printf("current %s recipe %s (model %s, resolved %s)", r.Step, id, r.ModelAlias, r.ModelResolved)
+	}
 }

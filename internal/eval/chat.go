@@ -190,7 +190,7 @@ func ResolveChatClient(src EvalEndpointSource) (ChatClient, error) {
 		APIKey:  strings.TrimSpace(os.Getenv("EVAL_CHAT_API_KEY")),
 	}
 	if cfg.BaseURL == "" || cfg.Model == "" {
-		return nil, fmt.Errorf("eval chat endpoint not configured: bind AI_ROLES.eval to a chat AI_ENDPOINTS entry, or set EVAL_CHAT_BASE_URL and EVAL_CHAT_MODEL")
+		return nil, fmt.Errorf("%w: bind AI_ROLES.eval to a chat AI_ENDPOINTS entry, or set EVAL_CHAT_BASE_URL and EVAL_CHAT_MODEL", ErrChatNotConfigured)
 	}
 	if err := validateBaseURL(cfg.BaseURL); err != nil {
 		return nil, fmt.Errorf("invalid EVAL_CHAT_BASE_URL: %w", err)
@@ -330,6 +330,10 @@ type Completion struct {
 // ErrThinkingOnlyResponse means the model returned reasoning but no answer.
 // Surfaced rather than swallowed: an empty judge reply must never be quietly
 // read as "no findings".
+// ErrChatNotConfigured: no eval chat endpoint is configured at all (as opposed
+// to one that is configured but invalid).
+var ErrChatNotConfigured = errors.New("eval chat endpoint not configured")
+
 var ErrThinkingOnlyResponse = errors.New("model returned reasoning but empty content (thinking not suppressed)")
 
 // Complete posts a system+user prompt to /chat/completions and returns the first

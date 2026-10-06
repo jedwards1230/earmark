@@ -1,7 +1,29 @@
 # Database Schema Reference
 
-> **See CONTRACT.md §§1.1, 1.2, 1.5, 1.6, and 3 for authoritative definitions.**
+> **See CONTRACT.md §§1.1, 1.2, 1.5, 1.6, 1.8, 1.9 and 3 for authoritative definitions.**
 > This document summarises the current schema; CONTRACT.md wins on any discrepancy.
+
+## Migrations
+
+The schema is owned by [goose](https://github.com/pressly/goose) migrations
+embedded from `internal/db/migrations/` and applied by every earmark process on
+startup (`db.New`), serialized by an advisory lock (CONTRACT §1.8). The applied
+version is in `goose_db_version`.
+
+| Version | File | Adds |
+|---|---|---|
+| 1 | `00001_baseline.sql` | everything below as of v0.40.2 (the former inline `initialize()` DDL). On a database the old code built it is only *recorded*, never executed. |
+| 2 | `00002_recipes.sql` | `recipes`; `recipe_id` on `transcripts`, `transcript_findings`, `transcript_chunks`; legacy backfill |
+| 3 | `00003_stale_work.sql` | `current_recipes`; the `stale_work` view |
+
+New schema = a new numbered file. Never edit a shipped migration. Run the
+Postgres proofs locally with:
+
+```bash
+docker run -d --name earmark-it -e POSTGRES_PASSWORD=pw -p 55432:5432 pgvector/pgvector:pg16
+EARMARK_TEST_DATABASE_URL='postgres://postgres:pw@localhost:55432/postgres?sslmode=disable' \
+  go test -race -run Integration ./internal/db/
+```
 
 ## Extensions Required
 
@@ -115,6 +137,10 @@ report no chapter rather than a guess.
 ]
 ```
 
+`recipe_id` (migration 2, nullable FK → `recipes`) is the `asr` recipe that
+produced the transcript. Pre-existing rows carry a legacy recipe per
+`model_name`; the runner does not stamp new rows yet (NULL) — CONTRACT §1.9.
+
 ### 3. `transcript_chunks` — pgvector Embeddings (CONTRACT §3)
 
 Written by the Go worker after embedding each transcript.
@@ -133,6 +159,7 @@ CREATE TABLE transcript_chunks (
     embedding     VECTOR(768) NOT NULL,   -- nomic-embed-text; MUST match EMBEDDINGS_MODEL
     embedding_stale BOOLEAN   NOT NULL DEFAULT false,  -- needs re-embed (correction accepted/reverted)
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    recipe_id     TEXT        REFERENCES recipes (recipe_id),  -- embed recipe; restamped on re-embed (migration 2)
 
     CONSTRAINT transcript_chunks_transcript_chunk_unique UNIQUE (transcript_id, chunk_index)
 );
@@ -257,7 +284,7 @@ CREATE TABLE IF NOT EXISTS book_metadata (
 ```
 
 `bias_terms` is re-derived from metadata on every write (never COALESCE-guarded).
-`description`, `genres` and `isbn` (added via `ADD COLUMN IF NOT EXISTS`) are
+`description`, `genres` and `isbn` (added to existing tables by the pre-goose inline schema, now part of the baseline) are
 ABS-only enrichment: a non-empty value from a re-lookup overwrites the stored
 one, an empty/NULL value keeps it.
 
@@ -330,7 +357,52 @@ brevity: `patch_state` (the `proposed → accepted → applied → reverted` /
 `applied_at`/`applied_before_text`/`applied_after_text` (**span**-level, not
 whole-chunk), and `stale_reason`. This table is the authoritative home of a
 human-accepted correction — `transcript_chunks` only ever carries a replayed
-copy. CONTRACT §2.17 is the reference.
+copy. CONTRACT §2.17 is the reference. Also omitted: `origin` (`judge` |
+`human`), `resolved_model` (the model that answered), and `recipe_id`
+(migration 2; the judge's `propose` recipe, NULL for `origin='human'`).
+
+### 8. `recipes` — Provenance (CONTRACT §1.9)
+
+Immutable, content-addressed records of how an output row was made. Written
+insert-if-absent by the Go writers (and, from PR 0b-4, the ASR runner); never
+updated or deleted.
+
+```sql
+CREATE TABLE recipes (
+    recipe_id      TEXT        NOT NULL PRIMARY KEY,  -- hex sha256 of the canonical JSON (CONTRACT §1.9)
+    step           TEXT        NOT NULL,              -- asr | propose | decide | propagate | scan | format | embed
+    step_version   INTEGER     NOT NULL,              -- 0 = legacy
+    code_version   TEXT        NOT NULL,              -- "<tag>+<commit>" or 'legacy-unknown'
+    model_alias    TEXT,                              -- what was asked for
+    model_resolved TEXT,                              -- what answered
+    model_revision TEXT,
+    prompt_version TEXT,
+    prompt_sha256  TEXT,
+    params         JSONB       NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- index: (step, created_at)
+```
+
+Referenced by the nullable `recipe_id` on `transcripts` (asr),
+`transcript_findings` (propose) and `transcript_chunks` (embed), each indexed.
+
+### 9. `current_recipes` and the `stale_work` view (CONTRACT §1.9)
+
+```sql
+CREATE TABLE current_recipes (
+    step       TEXT        NOT NULL PRIMARY KEY,
+    recipe_id  TEXT        NOT NULL REFERENCES recipes (recipe_id),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- stale_work(step, source_table, row_id, recipe_id, current_recipe_id)
+```
+
+The ingest process upserts the current `embed` and `propose` recipes at
+startup. Right after the first deploy every legacy row is stale (≈39,644 chunks and
+≈32,337 findings on production): none was made by the current configuration. `stale_work` lists every output row whose recipe differs from its
+step's current recipe in anything but `code_version` (unstamped rows count as
+stale; steps without a current recipe and human corrections never appear).
 
 ## Relationships
 
@@ -339,6 +411,8 @@ transcription_jobs (1) ←── transcripts (1) ←── transcript_chunks (N)
                    (1) ←── run_metrics (0..1)
 book_metadata      (key: book_dir — filepath.Dir of any file_path in the book)
 runner_control     (singleton, id=1)
+recipes (1) ←── transcripts / transcript_findings / transcript_chunks (N, via nullable recipe_id)
+        (1) ←── current_recipes (one per step)
 ```
 
 Cascade deletes propagate: deleting a job removes its transcript, all chunks,

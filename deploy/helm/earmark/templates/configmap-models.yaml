@@ -1,0 +1,17 @@
+{{- /*
+  Model registry (CONTRACT §2.18): config.models rendered verbatim as
+  models.yaml, mounted at /etc/earmark and pointed to by MODELS_FILE (see
+  earmark.commonEnv / earmark.volumes). config.models is part of the
+  checksum/config annotation, so editing it rolls both Deployments.
+*/}}
+{{- if .Values.config.models }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "earmark.fullname" . }}-models
+  labels:
+    {{- include "earmark.labels" . | nindent 4 }}
+data:
+  models.yaml: |
+    {{- toYaml .Values.config.models | nindent 4 }}
+{{- end }}

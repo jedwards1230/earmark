@@ -19,6 +19,11 @@ go build ./...
 go test -v -race -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out | tail -1
 
+# Postgres integration tests (migrations, recipes) — skipped unless the env var is set
+docker run -d --name earmark-it -e POSTGRES_PASSWORD=pw -p 55432:5432 pgvector/pgvector:pg16
+EARMARK_TEST_DATABASE_URL='postgres://postgres:pw@localhost:55432/postgres?sslmode=disable' \
+  go test -race -run Integration ./internal/db/
+
 # Test (Python runner — installs lightweight test deps only, no GPU stack needed)
 pip install psycopg2-binary pytest
 python -m pytest runner/test_runner.py -v

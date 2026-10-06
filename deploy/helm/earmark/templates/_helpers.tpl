@@ -239,6 +239,15 @@ AI_ENDPOINTS/AI_ROLES so the judge it runs is the one the Deployments see).
       name: {{ .Values.secrets.absToken.name | quote }}
       key: {{ .Values.secrets.absToken.key | quote }}
 {{- end }}
+{{- /*
+  MODELS_FILE (CONTRACT §2.18): the model registry, rendered from
+  config.models into the <fullname>-models ConfigMap and mounted read-only.
+  Unset → no env var, no mount (no pins).
+*/}}
+{{- if .Values.config.models }}
+- name: MODELS_FILE
+  value: /etc/earmark/models.yaml
+{{- end }}
 {{- end }}
 
 {{/*
@@ -273,6 +282,30 @@ Shared volumeMounts for both containers.
   readOnly: true
 - name: tmp
   mountPath: /tmp
+{{- with include "earmark.modelsVolumeMount" . }}{{ . | nindent 0 }}{{- end }}
+{{- end }}
+
+{{/*
+Model registry mount/volume (CONTRACT §2.18) — every pod that gets
+earmark.commonEnv gets MODELS_FILE when config.models is set, so every such
+pod (both Deployments AND the evalBackfill CronJob, which judges and therefore
+stamps propose recipes) must mount the file too, or startup fails closed on an
+unreadable MODELS_FILE. Each renders nothing when config.models is unset.
+*/}}
+{{- define "earmark.modelsVolumeMount" -}}
+{{- if .Values.config.models -}}
+- name: models
+  mountPath: /etc/earmark
+  readOnly: true
+{{- end }}
+{{- end }}
+
+{{- define "earmark.modelsVolume" -}}
+{{- if .Values.config.models -}}
+- name: models
+  configMap:
+    name: {{ include "earmark.fullname" . }}-models
+{{- end }}
 {{- end }}
 
 {{/*
@@ -285,4 +318,5 @@ Shared volumes spec for both pods.
     readOnly: true
 - name: tmp
   emptyDir: {}
+{{- with include "earmark.modelsVolume" . }}{{ . | nindent 0 }}{{- end }}
 {{- end }}

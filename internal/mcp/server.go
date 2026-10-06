@@ -345,7 +345,7 @@ func (s *MCPServer) initEval(cfg *config.Config) {
 		s.logger.Info("eval layer disabled (no chat endpoint configured)", "reason", err)
 		return
 	}
-	judge := eval.NewJudge(chat)
+	judge := eval.NewJudgeForConfig(chat, cfg)
 	db := s.db
 	s.eval.configured = true
 	s.eval.run = func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {

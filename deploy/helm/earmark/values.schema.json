@@ -162,6 +162,27 @@
             "eval":       { "type": "string" }
           }
         },
+        "models": {
+          "description": "Model registry (CONTRACT §2.18), rendered to MODELS_FILE.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "steps": {
+              "type": "object",
+              "propertyNames": { "enum": ["asr", "propose", "decide", "propagate", "scan", "format", "embed"] },
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "alias":          { "type": "string" },
+                  "expected_model": { "type": "string" },
+                  "revision":       { "type": "string" },
+                  "prompt_version": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
         "evalChat": {
           "type": "object",
           "additionalProperties": false,

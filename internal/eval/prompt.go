@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
 // Issue-type vocabulary (closed set the prompt advertises). An unknown type from
@@ -142,13 +144,34 @@ func anchorValue(p *int) int {
 	return *p
 }
 
-// buildPrompt returns the (system, user) prompt pair for one chunk. The user
-// message carries the book/track path (light context) and the verbatim text.
+// userPromptTemplate is the user message wrapped around each chunk's text:
+// the book/track path (light context) and the span's time range. The verbatim
+// chunk text follows it.
+const userPromptTemplate = "Book/track: %s\nSpan time: %.1fs–%.1fs\n\nTranscript span:\n"
+
+// judgePromptVersion names the judge prompt for provenance (CONTRACT §1.9).
+// Bump it whenever systemPrompt, userPromptTemplate or the response schema
+// changes on purpose; TestJudgePromptVersionPinned fails until you do. (The
+// recipe also carries judgePromptSHA256, so even an unversioned edit yields a
+// new recipe — the version is the human-readable half.)
+const judgePromptVersion = "judge@v1"
+
+// judgePromptSHA256 hashes every prompt part the judge sends: the system
+// prompt, the user template, and the JSON schema the reply is pinned to.
+// Computed once; none of them change at runtime.
+var judgePromptSHA256 = sync.OnceValue(func() string {
+	schema, err := json.Marshal(findingsResponseFormat)
+	if err != nil {
+		// A package-level literal of maps and strings; marshalling cannot fail.
+		panic(fmt.Sprintf("marshal findings response format: %v", err))
+	}
+	return recipe.PromptSHA256(systemPrompt, userPromptTemplate, string(schema))
+})
+
+// buildPrompt returns the (system, user) prompt pair for one chunk.
 func buildPrompt(c db.EvalChunk) (system, user string) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Book/track: %s\n", c.FilePath)
-	fmt.Fprintf(&b, "Span time: %.1fs–%.1fs\n\n", c.StartSec, c.EndSec)
-	b.WriteString("Transcript span:\n")
+	fmt.Fprintf(&b, userPromptTemplate, c.FilePath, c.StartSec, c.EndSec)
 	b.WriteString(c.Text)
 	return systemPrompt, b.String()
 }

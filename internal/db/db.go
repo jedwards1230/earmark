@@ -32,6 +32,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/patch"
+	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
 // ─── Deterministic chunk UUID ────────────────────────────────────────────────
@@ -192,6 +193,8 @@ type DB struct {
 	cfg  *config.Config
 	log  log.Logger
 	meta metaprovider.MetadataProvider
+	// embedRecipe stamps every chunk InsertChunks writes (CONTRACT §1.9).
+	embedRecipe recipe.Recipe
 }
 
 // New opens a PostgreSQL connection pool and runs schema migrations.
@@ -223,6 +226,7 @@ func New(cfg *config.Config) (*DB, error) {
 		log:  logger,
 		meta: metaprovider.New(cfg),
 	}
+	db.embedRecipe = db.EmbedRecipe()
 
 	if err := db.initialize(context.Background()); err != nil {
 		pool.Close()
@@ -244,685 +248,19 @@ func (db *DB) Ping(ctx context.Context) error {
 	return db.pool.Ping(ctx)
 }
 
-// schemaInitLockKey is the advisory-lock key serializing schema initialization.
+// initialize brings the schema up to date (CONTRACT §1.8): goose migrations
+// from internal/db/migrations, run under the schema advisory lock on a
+// dedicated connection. See migrate for the locking design and
+// baselineMigration for how a pre-goose database is adopted without re-running
+// its DDL.
 //
-// The value is arbitrary; only its stability matters. Every process that runs
-// initialize() must use the SAME key or the serialization does not happen.
-// Chosen from "earmark schema init" so a stray lock is identifiable in
-// pg_locks rather than looking like a random number.
-const schemaInitLockKey int64 = 0x4541524D_5343484D // "EARM","SCHM"
-
-// schemaInitLockSQL acquires that lock. Package var (like insertFindingSQL) so
-// a test can assert its properties without a live database.
-//
-// It MUST stay pg_advisory_xact_lock (transaction-scoped), never
-// pg_advisory_lock (session-scoped). The session-scoped variant survives
-// COMMIT and is only released by an explicit unlock or by the connection
-// closing — and this runs on a POOLED connection, so a leaked lock would be
-// handed to the next borrower and block every later initialize() forever.
-var schemaInitLockSQL = `SELECT pg_advisory_xact_lock($1)`
-
-// initialize creates the CONTRACT schema and indexes in a single transaction.
-//
-// # Why the advisory lock
-//
-// earmark runs two processes against one database (earmark-ingest and
-// earmark-mcp), and both call initialize() on startup. In Kubernetes they are
-// rolled together, so they routinely execute this identical DDL block
-// concurrently — and concurrent DDL deadlocks:
-//
-//	Process A waits for AccessExclusiveLock on relation X
-//	Process B waits for ShareLock on A's transaction
-//
-// Observed in production on 2026-08-14 (earmark-mcp, during CREATE FUNCTION,
-// "while updating tuple in relation pg_proc") and again on 2026-08-19
-// (earmark-ingest, during DROP TRIGGER). The CREATE OR REPLACE FUNCTION +
-// DROP TRIGGER pair mutates pg_proc from both sessions at once, and they take
-// locks in opposing orders.
-//
-// It self-healed each time — the loser crashed, restarted, and succeeded
-// because the winner had finished — so the symptom was only a crash-loop on
-// deploy. But relying on "every statement is idempotent AND a retry always
-// follows" is luck, not design: a deadlock mid-DDL is a failure at an
-// arbitrary point, and only the IF NOT EXISTS guards made that survivable.
-//
-// pg_advisory_xact_lock makes the second process WAIT instead of racing. It is
-// transaction-scoped, so it is released on COMMIT or ROLLBACK — including the
-// deferred Rollback below and an outright process crash. There is no unlock
-// path to forget and no lock to leak.
+// The whole run is bounded by migrateDeadline (CONTRACT §1.8): a migration that
+// cannot finish fails startup with an error instead of hanging until the
+// liveness probe kills the pod mid-transaction.
 func (db *DB) initialize(ctx context.Context) error {
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin init tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// Must be the FIRST statement in the transaction: anything executed before
-	// it takes locks outside the serialized region and can still deadlock.
-	if _, err := tx.Exec(ctx, schemaInitLockSQL, schemaInitLockKey); err != nil {
-		return fmt.Errorf("acquire schema-init advisory lock: %w", err)
-	}
-
-	if _, err := tx.Exec(ctx, `
-		CREATE EXTENSION IF NOT EXISTS vector;
-		CREATE EXTENSION IF NOT EXISTS pg_trgm;
-	`); err != nil {
-		return fmt.Errorf("create extensions: %w", err)
-	}
-
-	if _, err := tx.Exec(ctx, `
-		-- transcription_jobs: job queue (CONTRACT §1.1)
-		CREATE TABLE IF NOT EXISTS transcription_jobs (
-			id           UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-			file_path    TEXT        NOT NULL,
-			checksum     TEXT        NOT NULL,
-			status       TEXT        NOT NULL DEFAULT 'pending'
-			             CHECK (status IN ('pending','claimed','done','failed')),
-			claimed_by   TEXT,
-			claimed_at   TIMESTAMPTZ,
-			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-			error        TEXT,
-			attempts     INTEGER     NOT NULL DEFAULT 0,
-			CONSTRAINT transcription_jobs_checksum_unique UNIQUE (checksum)
-		);
-
-		CREATE INDEX IF NOT EXISTS transcription_jobs_status_idx
-			ON transcription_jobs (status, created_at);
-		CREATE INDEX IF NOT EXISTS transcription_jobs_file_path_idx
-			ON transcription_jobs (file_path);
-
-		-- transcripts: completed transcript storage (CONTRACT §1.2)
-		CREATE TABLE IF NOT EXISTS transcripts (
-			id                  UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-			job_id              UUID        NOT NULL REFERENCES transcription_jobs(id) ON DELETE CASCADE,
-			file_path           TEXT        NOT NULL,
-			checksum            TEXT        NOT NULL,
-			language            TEXT        NOT NULL,
-			duration_seconds    FLOAT8      NOT NULL,
-			speaker_count       INTEGER,
-			segments            JSONB       NOT NULL,
-			raw_text            TEXT        NOT NULL,
-			model_name          TEXT        NOT NULL,
-			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-			CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
-		);
-
-		CREATE INDEX IF NOT EXISTS transcripts_file_path_idx
-			ON transcripts (file_path);
-		CREATE INDEX IF NOT EXISTS transcripts_raw_text_trgm_idx
-			ON transcripts USING gin (raw_text gin_trgm_ops);
-
-		-- transcript_chunks: pgvector embeddings (CONTRACT §3)
-		CREATE TABLE IF NOT EXISTS transcript_chunks (
-			id            UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-			transcript_id UUID        NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
-			file_path     TEXT        NOT NULL,
-			chunk_index   INTEGER     NOT NULL,
-			start_sec     FLOAT8      NOT NULL,
-			end_sec       FLOAT8      NOT NULL,
-			text          TEXT        NOT NULL,
-			speaker       TEXT,
-			embedding     VECTOR(768) NOT NULL,
-			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-			CONSTRAINT transcript_chunks_transcript_chunk_unique UNIQUE (transcript_id, chunk_index)
-		);
-
-		CREATE INDEX IF NOT EXISTS transcript_chunks_embedding_idx
-			ON transcript_chunks USING hnsw (embedding vector_cosine_ops);
-		CREATE INDEX IF NOT EXISTS transcript_chunks_file_path_idx
-			ON transcript_chunks (file_path);
-		CREATE INDEX IF NOT EXISTS transcript_chunks_text_trgm_idx
-			ON transcript_chunks USING gin (text gin_trgm_ops);
-
-		-- updated_at trigger for transcription_jobs
-		CREATE OR REPLACE FUNCTION transcription_jobs_set_updated_at()
-		RETURNS TRIGGER LANGUAGE plpgsql AS $$
-		BEGIN
-			NEW.updated_at = now();
-			RETURN NEW;
-		END;
-		$$;
-
-		DROP TRIGGER IF EXISTS transcription_jobs_updated_at ON transcription_jobs;
-		CREATE TRIGGER transcription_jobs_updated_at
-			BEFORE UPDATE ON transcription_jobs
-			FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_updated_at();
-
-		-- runner_control: singleton row gating the ASR runner's claims (CONTRACT §1.4).
-		-- The runner reads it before each claim; the Go service (dashboard + control
-		-- API) writes it. A DB row is the only channel the (separate-host) runner and
-		-- service share, and it is durable across reboots — unlike the gaming busy-
-		-- flag file, which lives in tmpfs on the GPU host.
-		--   paused    — true means decline all new claims.
-		--   run_limit — NULL means unlimited; a non-negative integer is a bounded run
-		--               (e.g. a single-job smoke test). The runner decrements it as
-		--               part of each claim and declines once it reaches 0.
-		--   phase     — batched two-phase pipeline selector (CONTRACT §1.4). NULL or
-		--               'idle' = normal (both ASR runner and embed worker run freely,
-		--               today's behavior); 'transcribe' = ASR-only phase (embed worker
-		--               idles); 'analyze' = embed-only phase (ASR paused). A future
-		--               coordinator flips this; default NULL keeps backward compat.
-		-- Gate: claim iff (NOT paused) AND (run_limit IS NULL OR run_limit > 0).
-		CREATE TABLE IF NOT EXISTS runner_control (
-			id         INTEGER     NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-			paused     BOOLEAN     NOT NULL DEFAULT false,
-			run_limit  INTEGER         CHECK (run_limit IS NULL OR run_limit >= 0),
-			phase      TEXT            CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze')),
-			-- The acknowledgement paired with the phase column above: phase is the
-			-- request (coordinator -> runner), this is the result (runner ->
-			-- coordinator). NULL means NOT parked — an un-stamped runner must never
-			-- read as a free GPU. Declared inline AND migrated, mirroring phase.
-			runner_gpu_parked BOOLEAN,
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_by TEXT
-		);
-		INSERT INTO runner_control (id, paused) VALUES (1, false)
-			ON CONFLICT (id) DO NOTHING;
-
-		-- run_metrics: per-run observability (CONTRACT §1.5). One row per job,
-		-- written by three independent writers that each UPSERT only their slice
-		-- of columns (all nullable) keyed on job_id:
-		--   Go monitor       — audio_bytes (file size at enqueue time)
-		--   Python runner     — audio probe (channels/sample_rate/codec/format) +
-		--                       transcription timing/model/counts
-		--   Go embed worker   — embedding timing/model/chunk count + token counts
-		-- ON DELETE CASCADE keeps the row's lifetime tied to the job.
-		CREATE TABLE IF NOT EXISTS run_metrics (
-			job_id              UUID        PRIMARY KEY REFERENCES transcription_jobs(id) ON DELETE CASCADE,
-			audio_bytes         BIGINT,
-			audio_channels      INT,
-			audio_sample_rate   INT,
-			audio_codec         TEXT,
-			audio_format        TEXT,
-			transcribe_started_at  TIMESTAMPTZ,
-			transcribe_finished_at TIMESTAMPTZ,
-			asr_model           TEXT,
-			compute_type        TEXT,
-			runner_host         TEXT,
-			chunked             BOOLEAN,
-			n_windows           INT,
-			char_count          INT,
-			word_count          INT,
-			segment_count       INT,
-			embed_started_at    TIMESTAMPTZ,
-			embed_finished_at   TIMESTAMPTZ,
-			embed_model         TEXT,
-			embed_chunk_count   INT,
-			embed_prompt_tokens INT,
-			embed_total_tokens  INT,
-			-- ASR backend descriptor (CONTRACT §1.5 / §2.13). Runner-owned,
-			-- all nullable, best-effort (SHOULD). Also added to existing tables
-			-- via the ADD COLUMN IF NOT EXISTS migration below.
-			asr_family           TEXT,
-			asr_runtime          TEXT,
-			caps_applied         JSONB,
-			caps_requested       JSONB,
-			caps_skipped_reason  JSONB,
-			mean_word_confidence FLOAT8,
-			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-		);
-
-		-- book_metadata: per-book enrichment (CONTRACT §1.6). One row per book
-		-- directory (book_dir = filepath.Dir of any track under the book). This is
-		-- the DB seam for the provider-architecture: the Go monitor writes the
-		-- initial row at enqueue time using the MetadataProvider; later PRs populate
-		-- the nullable columns (chapters in PR 4, bias_terms in PR 5). It is
-		-- additive and a missing row is a no-op (search results simply carry no
-		-- chapter label). chapters times are BOOK-absolute across all of the
-		-- book's tracks — see scanResults for the track-offset translation.
-		CREATE TABLE IF NOT EXISTS book_metadata (
-			book_dir    TEXT        NOT NULL PRIMARY KEY,
-			title       TEXT,
-			author      TEXT,
-			narrator    TEXT,
-			series      TEXT,
-			asin        TEXT,
-			chapters    JSONB,
-			bias_terms  TEXT[],
-			source      TEXT,
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-		);
-
-		-- transcript_findings: read-only LLM-as-judge output (CONTRACT §2.15).
-		-- Each row is an ADVISORY suspected transcription error recorded by the
-		-- eval layer (internal/eval). The eval layer is strictly read-then-insert:
-		-- it READS transcripts/segments/transcript_chunks and INSERTs here; it
-		-- NEVER updates/deletes/alters the transcript tables, and this table has
-		-- no FK that could cascade a mutation back into them (the immutability
-		-- asymmetry — a wrong flag is harmless, a wrong correction corrupts the
-		-- corpus, so corrections are never applied). suggested_correction is
-		-- informational only. transcription_run_id ties a finding to the job/run
-		-- (hence the ASR backend) that produced the transcript, so the same judge
-		-- over different backends yields a comparative quality metric (§2.15).
-		CREATE TABLE IF NOT EXISTS transcript_findings (
-			id                    UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-			transcript_id         UUID        NOT NULL,
-			file_path             TEXT        NOT NULL,
-			chunk_id              UUID,
-			chunk_index           INTEGER,
-			start_sec             FLOAT8      NOT NULL,
-			end_sec               FLOAT8      NOT NULL,
-			original_text         TEXT        NOT NULL,
-			issue_type            TEXT        NOT NULL,
-			suggested_correction  TEXT,
-			confidence            FLOAT8      NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
-			model                 TEXT        NOT NULL,
-			transcription_run_id  UUID,
-			created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
-		);
-
-		CREATE INDEX IF NOT EXISTS transcript_findings_file_path_idx
-			ON transcript_findings (file_path);
-		CREATE INDEX IF NOT EXISTS transcript_findings_transcript_id_idx
-			ON transcript_findings (transcript_id);
-		CREATE INDEX IF NOT EXISTS transcript_findings_run_id_idx
-			ON transcript_findings (transcription_run_id);
-		CREATE INDEX IF NOT EXISTS transcript_findings_issue_type_idx
-			ON transcript_findings (issue_type);
-
-		-- pipeline_events: append-only audit log of pipeline stage transitions
-		-- (CONTRACT §1.7). Every Go-observable stage boundary (enqueue, embed
-		-- start/finish, eval start/finish, fail/requeue, runner_availability,
-		-- heartbeat-derived) appends one immutable row. job_id is nullable so
-		-- runner_availability/heartbeat events (not tied to a job) can be recorded;
-		-- file_path is denormalized so a timeline survives a requeue mutating the
-		-- job row. Append-only by convention (no UPDATE/DELETE except the retention
-		-- prune of high-frequency heartbeat/availability rows and the ON DELETE
-		-- CASCADE that ties a job's history to the job). Writes are best-effort — a
-		-- failed insert logs and continues; it NEVER fails the pipeline stage.
-		CREATE TABLE IF NOT EXISTS pipeline_events (
-			id             BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-			job_id         UUID        REFERENCES transcription_jobs(id) ON DELETE CASCADE,
-			file_path      TEXT,
-			stage          TEXT        NOT NULL CHECK (stage IN
-			                 ('discover','enqueue','claim','transcribe','chunk','embed','eval',
-			                  'done','fail','requeue','heartbeat','runner_availability')),
-			event          TEXT        NOT NULL CHECK (event IN
-			                 ('start','finish','error','skip','retry','state')),
-			runner_host    TEXT,
-			model          TEXT,
-			model_version  TEXT,
-			duration_ms    BIGINT,
-			item_count     INT,
-			token_count    BIGINT,
-			attempt        INT,
-			reason         TEXT,
-			detail         JSONB,
-			created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-		);
-
-		CREATE INDEX IF NOT EXISTS pipeline_events_job_id_idx  ON pipeline_events (job_id, created_at);
-		CREATE INDEX IF NOT EXISTS pipeline_events_stage_idx   ON pipeline_events (stage, event, created_at);
-		CREATE INDEX IF NOT EXISTS pipeline_events_created_idx ON pipeline_events (created_at);
-	`); err != nil {
-		return fmt.Errorf("create schema: %w", err)
-	}
-
-	// run_limit migration: CREATE TABLE IF NOT EXISTS won't add the column to an
-	// existing prod table, so add it (and its CHECK) idempotently. ADD COLUMN IF
-	// NOT EXISTS is a no-op when present; the CHECK is guarded by pg_constraint and
-	// swallows the duplicate-on-race SQLSTATEs (same pattern as the file_path
-	// constraint below).
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS run_limit INTEGER;
-		DO $$ BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint WHERE conname = 'runner_control_run_limit_nonneg'
-			) THEN
-				ALTER TABLE runner_control
-					ADD CONSTRAINT runner_control_run_limit_nonneg
-					CHECK (run_limit IS NULL OR run_limit >= 0);
-			END IF;
-		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
-		END $$;
-	`); err != nil {
-		return fmt.Errorf("run_limit migration: %w", err)
-	}
-
-	// phase migration (CONTRACT §1.4): add the nullable phase column + its CHECK to
-	// an existing runner_control table. ADD COLUMN IF NOT EXISTS is a no-op when
-	// present; the CHECK is guarded by pg_constraint and swallows the duplicate-on-
-	// race SQLSTATEs (same pattern as run_limit above). Default NULL keeps the
-	// existing single-phase behavior (both runner and embed worker run freely).
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS phase TEXT;
-		DO $$ BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint WHERE conname = 'runner_control_phase_valid'
-			) THEN
-				ALTER TABLE runner_control
-					ADD CONSTRAINT runner_control_phase_valid
-					CHECK (phase IS NULL OR phase IN ('idle','transcribe','analyze'));
-			END IF;
-		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
-		END $$;
-	`); err != nil {
-		return fmt.Errorf("phase migration: %w", err)
-	}
-
-	// runner_heartbeat_at migration (CONTRACT §1.7): a liveness timestamp the
-	// runner stamps EVERY poll cycle — working, idle, or paused — so "alive but
-	// idle" is distinguishable from "down" (the per-job updated_at heartbeat goes
-	// quiet the moment the queue drains). Default NULL until the first stamp; the
-	// earmark_runner_alive_seconds metric is simply absent until then.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS runner_heartbeat_at TIMESTAMPTZ;
-	`); err != nil {
-		return fmt.Errorf("runner_heartbeat_at migration: %w", err)
-	}
-
-	// runner_gpu_parked migration (CONTRACT §1.4): the acknowledgement half of the
-	// phase hand-off. `phase` above is the REQUEST (coordinator -> runner); this is
-	// the RESULT (runner -> coordinator) — whether the model is, right now, actually
-	// off the GPU.
-	//
-	// It exists because a request is not a result: the runner parks only BETWEEN
-	// JOBS, so an in-flight transcription keeps the card after phase='analyze' is
-	// set. Without an acknowledgement a GPU coordinator can only trust the request
-	// blindly — and hand the card to something else while a tenant still holds it —
-	// or wait out a timeout and stop the service anyway, discarding the in-flight
-	// job the cooperative hand-off exists to protect.
-	//
-	// Default NULL, and NULL means NOT parked, so a database that has migrated but
-	// whose runner has not stamped yet degrades to the pre-existing behavior rather
-	// than to a false all-clear. Deliberately no CHECK constraint: this is a plain
-	// tri-state (true / false / not-yet-known) and all three values are meaningful.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS runner_gpu_parked BOOLEAN;
-	`); err != nil {
-		return fmt.Errorf("runner_gpu_parked migration: %w", err)
-	}
-
-	// Runner self-update migration (CONTRACT §1.4 + §2.12): version-skew detection
-	// + the update state machine. runner_version is the tag the runner reports it
-	// is RUNNING (stamped on the heartbeat); desired_runner_version is the tag the
-	// dashboard button asks it to run; the runner owns the
-	// requested→updating→success/failed transitions. All NULL until first use.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE runner_control
-			ADD COLUMN IF NOT EXISTS runner_version         TEXT,
-			ADD COLUMN IF NOT EXISTS desired_runner_version TEXT,
-			ADD COLUMN IF NOT EXISTS runner_update_state    TEXT,
-			ADD COLUMN IF NOT EXISTS runner_update_error    TEXT,
-			ADD COLUMN IF NOT EXISTS runner_update_at       TIMESTAMPTZ;
-		DO $$ BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint WHERE conname = 'runner_control_update_state_valid'
-			) THEN
-				ALTER TABLE runner_control
-					ADD CONSTRAINT runner_control_update_state_valid
-					CHECK (runner_update_state IS NULL OR runner_update_state IN
-						('idle','requested','updating','success','failed'));
-			END IF;
-		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
-		END $$;
-	`); err != nil {
-		return fmt.Errorf("runner self-update migration: %w", err)
-	}
-
-	// Reviewable-patch migration (CONTRACT §2.15 + §2.17). Turns each finding
-	// from a dead-end advisory row into a proposed patch a human can accept,
-	// reject, and apply.
-	//
-	// The anchor trio is the point of this migration. original_text alone is
-	// ambiguous — a span like "the fox" can occur more than once in a chunk, so
-	// a naive replace could edit the wrong occurrence. anchor_offset (rune index
-	// into the chunk text) plus anchor_occurrence pins the exact span, and
-	// chunk_text_sha256 records what the chunk looked like when the judge saw
-	// it. If the chunk has changed since, the patch is marked stale instead of
-	// applied to text the judge never actually reviewed.
-	//
-	// applied_before_text/applied_after_text make the apply reversible without
-	// re-deriving anything, so revert never has to trust the anchor a second
-	// time. All columns are NULL/defaulted so existing rows migrate silently as
-	// 'proposed'.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE transcript_findings
-			ADD COLUMN IF NOT EXISTS patch_state         TEXT NOT NULL DEFAULT 'proposed',
-			ADD COLUMN IF NOT EXISTS anchor_offset       INTEGER,
-			ADD COLUMN IF NOT EXISTS anchor_occurrence   INTEGER,
-			ADD COLUMN IF NOT EXISTS chunk_text_sha256   TEXT,
-			ADD COLUMN IF NOT EXISTS decided_at          TIMESTAMPTZ,
-			ADD COLUMN IF NOT EXISTS decided_by          TEXT,
-			ADD COLUMN IF NOT EXISTS applied_at          TIMESTAMPTZ,
-			ADD COLUMN IF NOT EXISTS applied_before_text TEXT,
-			ADD COLUMN IF NOT EXISTS applied_after_text  TEXT,
-			ADD COLUMN IF NOT EXISTS stale_reason        TEXT;
-		DO $$ BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint WHERE conname = 'transcript_findings_patch_state_valid'
-			) THEN
-				ALTER TABLE transcript_findings
-					ADD CONSTRAINT transcript_findings_patch_state_valid
-					CHECK (patch_state IN
-						('proposed','accepted','rejected','applied','stale','reverted'));
-			END IF;
-		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
-		END $$;
-		CREATE INDEX IF NOT EXISTS transcript_findings_patch_state_idx
-			ON transcript_findings (patch_state);
-	`); err != nil {
-		return fmt.Errorf("reviewable-patch migration: %w", err)
-	}
-
-	// Finding provenance (CONTRACT §2.17). A correction may now be authored by a
-	// reviewer directly, with no model having proposed it. Such a row is
-	// structurally identical to a judge finding — same table, same anchors, same
-	// replay — so without a provenance column the two are indistinguishable
-	// afterwards, and "judge precision" silently starts counting decisions a
-	// person already made.
-	//
-	// Additive and default-safe: every pre-existing row is a judge finding, which
-	// is exactly what the DEFAULT records. The CHECK keeps the column enumerable
-	// the same way patch_state is.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE transcript_findings
-			ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'judge';
-		DO $$ BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint WHERE conname = 'transcript_findings_origin_valid'
-			) THEN
-				ALTER TABLE transcript_findings
-					ADD CONSTRAINT transcript_findings_origin_valid
-					CHECK (origin IN ('judge','human'));
-			END IF;
-		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
-		END $$;
-	`); err != nil {
-		return fmt.Errorf("finding-origin migration: %w", err)
-	}
-
-	// Embedding invalidation (CONTRACT §2.17). transcript_chunks.embedding is
-	// VECTOR(768) NOT NULL, so a stale embedding cannot be signalled by nulling
-	// it. This flag is the marker instead: applying a patch rewrites the chunk
-	// text, which invalidates that ONE chunk's embedding and no other (chunks
-	// store their text denormalized and carry no absolute offsets into the
-	// transcript, so an edit never shifts a neighbour). The embed worker
-	// re-embeds flagged chunks and clears the flag.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE transcript_chunks
-			ADD COLUMN IF NOT EXISTS embedding_stale BOOLEAN NOT NULL DEFAULT false;
-		CREATE INDEX IF NOT EXISTS transcript_chunks_embedding_stale_idx
-			ON transcript_chunks (embedding_stale) WHERE embedding_stale;
-	`); err != nil {
-		return fmt.Errorf("embedding-stale migration: %w", err)
-	}
-
-	// Correction-overlay migration (CONTRACT §2.17). transcript_chunks is a
-	// DERIVED PROJECTION: the worker regenerates it from the immutable
-	// transcript source on every embed, so a correction written into `text`
-	// is destroyed by the next re-chunk. Corrections therefore live in
-	// transcript_findings and are REPLAYED onto the regenerated text.
-	//
-	// That split needs both texts on the row:
-	//
-	//	source_text = the pristine regenerated chunk (the projection's input)
-	//	text        = ApplyCorrections(source_text, overlay) — what is embedded,
-	//	              searched, and displayed
-	//
-	// The judge must always be shown source_text. It records rune anchors and
-	// chunk_text_sha256 against the text it saw, and replay always starts from
-	// pristine — feed it the corrected surface and every new finding is born
-	// stale.
-	//
-	// Additive and NULL-safe: legacy rows keep source_text NULL and are read as
-	// COALESCE(source_text, text), which is exactly right because a legacy row
-	// has no corrections applied.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE transcript_chunks
-			ADD COLUMN IF NOT EXISTS source_text TEXT;
-	`); err != nil {
-		return fmt.Errorf("chunk source-text migration: %w", err)
-	}
-
-	// Path-level dedup migration: the original dedup was checksum-only, so a file
-	// hashed mid-copy (over NFS) and again when complete produced two jobs for one
-	// file_path. Collapse any such duplicates (keep the most-advanced, else oldest
-	// — never discard a 'done' transcript) then enforce one job per file_path. The
-	// DELETE is a no-op on a clean DB; the ADD CONSTRAINT is idempotent.
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM transcription_jobs t
-		USING (
-			SELECT file_path,
-			       (array_agg(id ORDER BY
-			           CASE status WHEN 'done' THEN 0 WHEN 'claimed' THEN 1
-			                       WHEN 'pending' THEN 2 ELSE 3 END,
-			           created_at ASC))[1] AS keep_id
-			FROM transcription_jobs
-			GROUP BY file_path
-			HAVING COUNT(*) > 1
-		) d
-		WHERE t.file_path = d.file_path AND t.id <> d.keep_id;
-
-		-- Idempotent + concurrency-safe: skip if the constraint already exists, and
-		-- still swallow the error if two pods race to create it on a fresh DB.
-		-- (ADD CONSTRAINT on an existing constraint raises duplicate_table 42P07 —
-		-- the backing index relation already exists — not duplicate_object.)
-		DO $$ BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint WHERE conname = 'transcription_jobs_file_path_unique'
-			) THEN
-				ALTER TABLE transcription_jobs
-					ADD CONSTRAINT transcription_jobs_file_path_unique UNIQUE (file_path);
-			END IF;
-		EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
-		END $$;
-	`); err != nil {
-		return fmt.Errorf("file_path dedup migration: %w", err)
-	}
-
-	// ASR backend-descriptor migration (CONTRACT §1.5 / §2.13): add the six
-	// runner-owned columns to an existing run_metrics table. All additive +
-	// nullable, so the existing single NeMo runner that writes none of them keeps
-	// working (columns stay NULL → "unknown"). ADD COLUMN IF NOT EXISTS is a no-op
-	// when the column is already present, so this is safe to run on every boot.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE run_metrics
-			ADD COLUMN IF NOT EXISTS asr_family           TEXT,
-			ADD COLUMN IF NOT EXISTS asr_runtime          TEXT,
-			ADD COLUMN IF NOT EXISTS caps_applied         JSONB,
-			ADD COLUMN IF NOT EXISTS caps_requested       JSONB,
-			ADD COLUMN IF NOT EXISTS caps_skipped_reason  JSONB,
-			ADD COLUMN IF NOT EXISTS mean_word_confidence FLOAT8;
-	`); err != nil {
-		return fmt.Errorf("run_metrics asr-descriptor migration: %w", err)
-	}
-
-	// book_metadata catalogue-enrichment migration (CONTRACT §1.6): description,
-	// genres and isbn decoded from ABS. All nullable and additive — a PathProvider
-	// deployment keeps them NULL. genres is TEXT[] to match bias_terms.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE book_metadata
-			ADD COLUMN IF NOT EXISTS description TEXT,
-			ADD COLUMN IF NOT EXISTS genres      TEXT[],
-			ADD COLUMN IF NOT EXISTS isbn        TEXT;
-	`); err != nil {
-		return fmt.Errorf("book_metadata enrichment migration: %w", err)
-	}
-
-	// Eval-slice migration (CONTRACT §1.5): add the six eval_* columns to an
-	// existing run_metrics table — the LLM-judge's slice (a fourth column-selective
-	// writer, UpsertEvalMetrics). All additive + nullable, so a deployment that
-	// never runs eval keeps every column NULL. eval_finished_at IS NOT NULL is the
-	// per-job eval-completion marker (the first such marker — none existed before).
-	// ADD COLUMN IF NOT EXISTS is a no-op when already present, safe on every boot.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE run_metrics
-			ADD COLUMN IF NOT EXISTS eval_started_at  TIMESTAMPTZ,
-			ADD COLUMN IF NOT EXISTS eval_finished_at TIMESTAMPTZ,
-			ADD COLUMN IF NOT EXISTS eval_model       TEXT,
-			ADD COLUMN IF NOT EXISTS eval_chunks      INT,
-			ADD COLUMN IF NOT EXISTS eval_skipped     INT,
-			ADD COLUMN IF NOT EXISTS eval_findings    INT;
-	`); err != nil {
-		return fmt.Errorf("run_metrics eval-slice migration: %w", err)
-	}
-
-	// Eval-failure migration (CONTRACT §1.5, latch-only-on-success): a judge run
-	// that could not evaluate every chunk no longer writes eval_finished_at; it
-	// records the failure here instead so it is visible and re-judgeable
-	// (`earmark eval --backfill-unevaluated` / `--backfill-eval-errors`).
-	// eval_failed_at IS NOT NULL also releases the gated embed pass (fail-open:
-	// a judge outage never blocks search). A later successful judge run clears
-	// all three. Additive + nullable.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE run_metrics
-			ADD COLUMN IF NOT EXISTS eval_failed_at     TIMESTAMPTZ,
-			ADD COLUMN IF NOT EXISTS eval_failed_chunks INT,
-			ADD COLUMN IF NOT EXISTS eval_error         TEXT;
-	`); err != nil {
-		return fmt.Errorf("run_metrics eval-failure migration: %w", err)
-	}
-
-	// Resolved-judge-model migration (CONTRACT §1.5, §2.15): the model the chat
-	// endpoint REPORTS serving (its response "model" field), recorded next to
-	// the requested one. A router (LiteLLM) can resolve an alias to a dated id
-	// or fall back to another model, so the requested id alone is not proof of
-	// what judged a chunk. Nullable: NULL when the endpoint omits the field and
-	// on every row written before this column existed.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE transcript_findings ADD COLUMN IF NOT EXISTS resolved_model TEXT;
-		ALTER TABLE run_metrics ADD COLUMN IF NOT EXISTS eval_resolved_model TEXT;
-	`); err != nil {
-		return fmt.Errorf("resolved judge model migration: %w", err)
-	}
-
-	// completed_at + trigger (CONTRACT §1.1): stamp completed_at = now() whenever a
-	// transcription_jobs row transitions INTO status='done'. The runner owns the
-	// mark-done UPDATE (the Go side never marks jobs done), so a trigger is the
-	// only Go-only way to record completion time. Old 'done' rows keep NULL (no
-	// backfill — there is no historical completion time to recover). DoneLastHour
-	// uses COALESCE(completed_at, updated_at) so it stays correct on old rows.
-	if _, err := tx.Exec(ctx, `
-		ALTER TABLE transcription_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
-
-		CREATE OR REPLACE FUNCTION transcription_jobs_set_completed_at()
-		RETURNS TRIGGER LANGUAGE plpgsql AS $$
-		BEGIN
-			-- Stamp only on the transition INTO 'done' (so a heartbeat UPDATE on an
-			-- already-done row, or a requeue out of 'done', never re-stamps it).
-			IF NEW.status = 'done' AND (OLD.status IS DISTINCT FROM 'done') THEN
-				NEW.completed_at = now();
-			-- Leaving 'done' (e.g. operator requeue back to 'pending') clears it so
-			-- the column always reflects the current run's completion, not a stale one.
-			ELSIF NEW.status <> 'done' AND OLD.status = 'done' THEN
-				NEW.completed_at = NULL;
-			END IF;
-			RETURN NEW;
-		END;
-		$$;
-
-		DROP TRIGGER IF EXISTS transcription_jobs_completed_at ON transcription_jobs;
-		CREATE TRIGGER transcription_jobs_completed_at
-			BEFORE UPDATE ON transcription_jobs
-			FOR EACH ROW EXECUTE FUNCTION transcription_jobs_set_completed_at();
-	`); err != nil {
-		return fmt.Errorf("completed_at migration: %w", err)
-	}
-
-	return tx.Commit(ctx)
+	ctx, cancel := context.WithTimeout(ctx, migrateDeadline)
+	defer cancel()
+	return migrate(ctx, db.cfg.DatabaseURL, db.log)
 }
 
 // ─── Job queue ───────────────────────────────────────────────────────────────
@@ -1318,7 +656,8 @@ func (db *DB) emitEvent(ctx context.Context, e PipelineEvent) {
 // AND the position columns (file_path, start_sec, end_sec, speaker). A
 // re-chunk can shift a chunk's boundaries without changing its index; keeping
 // the old timestamps would point search hits and get_chunk_context at audio
-// the text no longer covers.
+// the text no longer covers. recipe_id ($11) is refreshed too: a rebuilt
+// chunk was made by this process's embed recipe (CONTRACT §1.9).
 //
 // embedding_stale is deliberately NOT touched on conflict. Clearing it here
 // would be a lost update: a human accept that lands between the worker's
@@ -1329,9 +668,9 @@ func (db *DB) emitEvent(ctx context.Context, e PipelineEvent) {
 var insertChunkSQL = `
 	INSERT INTO transcript_chunks
 	       (id, transcript_id, file_path, chunk_index, start_sec, end_sec,
-	        text, source_text, speaker, embedding)
+	        text, source_text, speaker, embedding, recipe_id)
 	VALUES (COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()),
-	        $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10)
+	        $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10, $11)
 	ON CONFLICT (transcript_id, chunk_index) DO UPDATE
 	SET text        = EXCLUDED.text,
 	    source_text = EXCLUDED.source_text,
@@ -1339,7 +678,8 @@ var insertChunkSQL = `
 	    file_path   = EXCLUDED.file_path,
 	    start_sec   = EXCLUDED.start_sec,
 	    end_sec     = EXCLUDED.end_sec,
-	    speaker     = EXCLUDED.speaker
+	    speaker     = EXCLUDED.speaker,
+	    recipe_id   = EXCLUDED.recipe_id
 `
 
 // findingChunkAddressDoc — how a finding names its chunk, shared by every
@@ -1493,7 +833,10 @@ func (db *DB) pruneChunksTx(ctx context.Context, b txBeginner, transcriptID stri
 // Lock order: the findings the prune may retire are locked FIRST
 // (lockTailFindingsSQL), then the chunk rows (upsert, prune). SetPatchState
 // takes a finding and then its chunk, so both paths lock findings → chunks and
-// an accept racing a rebuild waits rather than deadlocks.
+// an accept racing a rebuild waits rather than deadlocks. The embed recipe
+// is registered first, in the same transaction: it touches only the recipes
+// table, which no finding/chunk lock holder waits on, and every chunk written
+// is stamped with it (CONTRACT §1.9) — including rows a rebuild refreshes.
 func (db *DB) InsertChunks(ctx context.Context, chunks []Chunk) error {
 	return db.insertChunks(ctx, db.pool, chunks)
 }
@@ -1525,6 +868,10 @@ func (db *DB) insertChunks(ctx context.Context, b txBeginner, chunks []Chunk) er
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	recipeID, err := registerRecipe(ctx, tx, db.embedRecipe)
+	if err != nil {
+		return fmt.Errorf("chunk recipe: %w", err)
+	}
 	for _, tid := range order {
 		if err := lockTailFindings(ctx, tx, tid, keep[tid]); err != nil {
 			return err
@@ -1533,7 +880,7 @@ func (db *DB) insertChunks(ctx context.Context, b txBeginner, chunks []Chunk) er
 	for _, c := range chunks {
 		if _, err := tx.Exec(ctx, insertChunkSQL,
 			c.ID, c.TranscriptID, c.FilePath, c.ChunkIndex, c.StartSec, c.EndSec,
-			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding),
+			c.Text, c.SourceText, c.Speaker, pgvector.NewVector(c.Embedding), recipeID,
 		); err != nil {
 			return fmt.Errorf("insert chunk %d: %w", c.ChunkIndex, err)
 		}
@@ -4235,6 +3582,9 @@ type Finding struct {
 	// ChunkTextSHA256 fingerprints the chunk as the judge saw it, so the apply
 	// path can refuse to edit a revision the model never reviewed.
 	ChunkTextSHA256 *string
+	// Recipe is how the finding was made (CONTRACT §1.9): InsertFindings
+	// registers it and stamps its ID into recipe_id. nil → recipe_id NULL.
+	Recipe *recipe.Recipe
 }
 
 // insertFindingSQL is the INSERT for one finding. Package var so a test can
@@ -4245,13 +3595,16 @@ var insertFindingSQL = `
 	       (transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
 	        original_text, issue_type, suggested_correction, confidence, model,
 	        transcription_run_id, anchor_offset, anchor_occurrence,
-	        chunk_text_sha256, resolved_model)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+	        chunk_text_sha256, resolved_model, recipe_id)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 `
 
 // InsertFindings stores judge findings in one transaction. Insert-only: it never
 // updates or deletes any row, and writes to no table other than
-// transcript_findings. A nil/empty slice is a no-op.
+// transcript_findings — and recipes, where it registers (insert-if-absent) each
+// finding's recipe before stamping its ID, so a recipe first seen mid-run (a
+// fallback model answering) is recorded on the fly. A nil/empty slice is a
+// no-op.
 func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 	if len(findings) == 0 {
 		return nil
@@ -4262,12 +3615,22 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	registered := map[*recipe.Recipe]*string{}
 	for i, f := range findings {
+		recipeID, ok := registered[f.Recipe]
+		if !ok && f.Recipe != nil {
+			id, err := registerRecipe(ctx, tx, *f.Recipe)
+			if err != nil {
+				return fmt.Errorf("finding %d: %w", i, err)
+			}
+			recipeID = &id
+			registered[f.Recipe] = recipeID
+		}
 		if _, err := tx.Exec(ctx, insertFindingSQL,
 			f.TranscriptID, f.FilePath, f.ChunkID, f.ChunkIndex, f.StartSec, f.EndSec,
 			f.OriginalText, f.IssueType, f.SuggestedCorrection, f.Confidence, f.Model,
 			f.TranscriptionRunID, f.AnchorOffset, f.AnchorOccurrence, f.ChunkTextSHA256,
-			f.ResolvedModel,
+			f.ResolvedModel, recipeID,
 		); err != nil {
 			return fmt.Errorf("insert finding %d: %w", i, err)
 		}
@@ -4934,6 +4297,29 @@ func scanIDPaths(rows pgx.Rows) (ids, paths []string, err error) {
 	return ids, paths, nil
 }
 
+// resetSQL drops every object the migrations create, plus goose's version
+// table, so the re-migration that follows rebuilds the schema from version 1
+// exactly as on an empty database. Dropping only some tables (as the pre-goose
+// Reset did) no longer works: goose would see the recorded version and recreate
+// nothing. Every table a new migration adds MUST be listed here —
+// TestResetRebuildsFreshSchema (integration) fails if one survives.
+var resetSQL = `
+	DROP VIEW     IF EXISTS stale_work;
+	DROP TABLE    IF EXISTS current_recipes     CASCADE;
+	DROP TABLE    IF EXISTS transcript_findings CASCADE;
+	DROP TABLE    IF EXISTS transcript_chunks   CASCADE;
+	DROP TABLE    IF EXISTS transcripts         CASCADE;
+	DROP TABLE    IF EXISTS run_metrics         CASCADE;
+	DROP TABLE    IF EXISTS pipeline_events     CASCADE;
+	DROP TABLE    IF EXISTS transcription_jobs  CASCADE;
+	DROP TABLE    IF EXISTS book_metadata       CASCADE;
+	DROP TABLE    IF EXISTS runner_control      CASCADE;
+	DROP TABLE    IF EXISTS recipes             CASCADE;
+	DROP FUNCTION IF EXISTS transcription_jobs_set_updated_at()   CASCADE;
+	DROP FUNCTION IF EXISTS transcription_jobs_set_completed_at() CASCADE;
+	DROP TABLE    IF EXISTS goose_db_version;
+`
+
 // Reset drops all tables and re-initialises the schema (DEBUG_DB_RESET only).
 // A second confirmation env var DEBUG_DB_RESET_CONFIRM=yes-delete-everything
 // is required to prevent accidental data destruction.
@@ -4943,13 +4329,15 @@ func (db *DB) Reset(ctx context.Context) error {
 		db.log.Error("Reset() refused: set DEBUG_DB_RESET_CONFIRM=yes-delete-everything to confirm")
 		return fmt.Errorf("reset refused: DEBUG_DB_RESET_CONFIRM not set to 'yes-delete-everything'")
 	}
-	db.log.Warn("performing complete database reset")
-	if _, err := db.pool.Exec(ctx, `
-		DROP TABLE IF EXISTS transcript_chunks   CASCADE;
-		DROP TABLE IF EXISTS transcripts         CASCADE;
-		DROP TABLE IF EXISTS transcription_jobs  CASCADE;
-	`); err != nil {
-		return fmt.Errorf("drop tables: %w", err)
+	return resetSchema(ctx, db.pool, db.cfg.DatabaseURL, db.log)
+}
+
+// resetSchema is Reset after its confirmation guard: drop everything, then
+// migrate from scratch.
+func resetSchema(ctx context.Context, ex execer, databaseURL string, logger log.Logger) error {
+	logger.Warn("performing complete database reset")
+	if _, err := ex.Exec(ctx, resetSQL); err != nil {
+		return fmt.Errorf("drop schema: %w", err)
 	}
-	return db.initialize(ctx)
+	return migrate(ctx, databaseURL, logger)
 }

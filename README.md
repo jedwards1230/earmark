@@ -28,14 +28,19 @@ earmark mcp     (`earmark mcp`)
 
 The Go service and the ASR runner share nothing but the database — the schema and the
 env-var names are specified in [`docs/CONTRACT.md`](docs/CONTRACT.md), which is
-authoritative for both sides. The runner itself lives in [`runner/`](runner/README.md) and
+authoritative for both sides. Every finding and chunk records the **recipe** that made it
+(model asked for and model that answered, revision, prompt version and hash, parameters),
+and the `stale_work` view lists rows a newer recipe would produce differently
+(CONTRACT §1.9). The runner itself lives in [`runner/`](runner/README.md) and
 is deployed separately, on a GPU host.
 
 ## Quickstart
 
 Requires Go (the version is pinned in `go.mod`) and a PostgreSQL with the `vector` and
 `pg_trgm` extensions available. earmark creates those extensions and its own tables on
-first connect — there is no migration step to run.
+first connect: every process applies the embedded [goose](https://github.com/pressly/goose)
+migrations (`internal/db/migrations/`) at startup, so there is no separate migration step
+to run (see [`docs/CONTRACT.md`](docs/CONTRACT.md) §1.8).
 
 ```bash
 git clone https://github.com/jedwards1230/earmark.git
@@ -159,6 +164,7 @@ The ones you are most likely to set:
 | `CHUNK_SIZE` | `512` | Target tokens per chunk |
 | `AI_ENDPOINTS` | — | JSON array of OpenAI-compatible endpoints: `{id, type: embeddings\|chat, backend, baseURL, model, apiKeyEnv?}`. `apiKeyEnv` names the env var holding a bearer token for an authenticated gateway such as LiteLLM (the token itself never goes in this JSON). When set, `AI_ROLES` is required and the `EMBEDDINGS_*` vars are ignored. A malformed value is fatal |
 | `AI_ROLES` | — | JSON mapping roles to endpoint ids: `{"embeddings": "…", "eval": "…"}`. `embeddings` is required whenever `AI_ENDPOINTS` is set |
+| `MODELS_FILE` | — | Path to the model registry YAML: per pipeline step, the model expected to answer, its revision pin and prompt version. Stamped into the provenance recipe of every finding and chunk (CONTRACT §1.9, §2.18). A malformed file is fatal |
 | `EMBEDDINGS_BASE_URL` | `http://ollama:11434/v1` | **Deprecated** — synthesized into a `_legacy` endpoint when `AI_ENDPOINTS` is unset |
 | `EMBEDDINGS_MODEL` | `nomic-embed-text` | **Deprecated.** 768-dimension vectors |
 | `MCP_HTTP_ADDR` | `:8081` | Bind address for the HTTP transport and dashboard |
