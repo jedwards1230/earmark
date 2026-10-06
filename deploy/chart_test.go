@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -246,6 +247,12 @@ func helmInstallNotes(t *testing.T, sets ...string) string {
 		args = append(args, "--set", s)
 	}
 	out, err := exec.Command("helm", args...).CombinedOutput()
+	// Helm 3 still dials the cluster for a client dry-run (Helm 4 does not), and
+	// `helm template` never renders NOTES.txt — so without a reachable cluster
+	// there is no way to render the notes. Skip rather than fail CI.
+	if err != nil && strings.Contains(string(out), "Kubernetes cluster unreachable") {
+		t.Skipf("helm install --dry-run needs a cluster with this helm: %s", out)
+	}
 	require.NoError(t, err, "helm install --dry-run: %s", out)
 	return string(out)
 }
