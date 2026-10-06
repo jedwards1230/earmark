@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/recipe"
@@ -192,6 +193,36 @@ func TestJudgeWarnsOnceOnUnexpectedModel(t *testing.T) {
 			}
 			if got := strings.Count(buf.String(), "level=WARN"); got != tt.wantWarns {
 				t.Errorf("warnings over 3 chunks = %d, want %d:\n%s", got, tt.wantWarns, buf.String())
+			}
+		})
+	}
+}
+
+// TestCurrentRecipe_NotConfiguredVsMisconfigured: no eval endpoint at all is a
+// quiet "no propose recipe", while a configured-but-invalid one surfaces its
+// error so startup can warn instead of silently registering nothing.
+func TestCurrentRecipe_NotConfiguredVsMisconfigured(t *testing.T) {
+	cases := []struct {
+		name    string
+		baseURL string
+		model   string
+		wantOK  bool
+		wantErr bool
+	}{
+		{"not configured", "", "", false, false},
+		{"misconfigured", "ftp://judge.invalid", "m", false, true},
+		{"configured", "http://judge.invalid/v1", "m", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EVAL_CHAT_BASE_URL", tc.baseURL)
+			t.Setenv("EVAL_CHAT_MODEL", tc.model)
+			r, ok, err := CurrentRecipe(&config.Config{})
+			if ok != tc.wantOK || (err != nil) != tc.wantErr {
+				t.Fatalf("ok=%v err=%v, want ok=%v err=%v", ok, err, tc.wantOK, tc.wantErr)
+			}
+			if ok && r.Step != recipe.StepPropose {
+				t.Errorf("step = %q, want %q", r.Step, recipe.StepPropose)
 			}
 		})
 	}

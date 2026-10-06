@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"errors"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
@@ -57,12 +58,16 @@ func NewJudgeForConfig(chat ChatClient, cfg *config.Config) *Judge {
 }
 
 // CurrentRecipe resolves the judge cfg configures and returns its current
-// recipe, for registration at startup. ok=false when no eval chat endpoint is
-// configured (no judge, so no current propose recipe).
-func CurrentRecipe(cfg *config.Config) (recipe.Recipe, bool) {
+// recipe, for registration at startup. ok=false with a nil error when no eval
+// chat endpoint is configured (no judge, so no current propose recipe); a
+// configured-but-invalid endpoint returns the error so the caller can say so.
+func CurrentRecipe(cfg *config.Config) (r recipe.Recipe, ok bool, err error) {
 	chat, err := ResolveChatClient(ConfigSource(cfg))
-	if err != nil {
-		return recipe.Recipe{}, false
+	if errors.Is(err, ErrChatNotConfigured) {
+		return recipe.Recipe{}, false, nil
 	}
-	return NewJudgeForConfig(chat, cfg).Recipe(), true
+	if err != nil {
+		return recipe.Recipe{}, false, err
+	}
+	return NewJudgeForConfig(chat, cfg).Recipe(), true, nil
 }

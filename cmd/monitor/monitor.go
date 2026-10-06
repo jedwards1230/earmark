@@ -136,7 +136,11 @@ func runMonitor(cmd *cobra.Command, args []string) {
 // themselves), so a failure is logged, not fatal.
 func registerCurrentRecipes(database *db.DB, cfg *config.Config) {
 	current := []recipe.Recipe{database.EmbedRecipe()}
-	if r, ok := eval.CurrentRecipe(cfg); ok {
+	r, ok, err := eval.CurrentRecipe(cfg)
+	if err != nil {
+		log.Printf("WARNING: eval chat endpoint is misconfigured, no current propose recipe registered: %v", err)
+	}
+	if ok {
 		current = append(current, r)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -146,7 +150,11 @@ func registerCurrentRecipes(database *db.DB, cfg *config.Config) {
 		return
 	}
 	for _, r := range current {
-		id, _ := r.ID()
+		id, err := r.ID()
+		if err != nil {
+			log.Printf("WARNING: could not compute the current %s recipe id: %v", r.Step, err)
+			continue
+		}
 		log.Printf("current %s recipe %s (model %s, resolved %s)", r.Step, id, r.ModelAlias, r.ModelResolved)
 	}
 }
