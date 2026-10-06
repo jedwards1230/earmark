@@ -985,6 +985,41 @@ is never edited. Migrations stay additive unless a change says otherwise, and
 every table a migration adds is also dropped by `DEBUG_DB_RESET` (`resetSQL`,
 pinned by `TestIntegrationResetRebuildsFreshSchema`).
 
+**`DEBUG_DB_RESET` scope (wider than before goose).** The double-confirmation
+guard is unchanged (`DEBUG_DB_RESET=true` **and**
+`DEBUG_DB_RESET_CONFIRM=yes-delete-everything`). What it drops is not: the
+pre-goose reset dropped only `transcript_chunks`, `transcripts` and
+`transcription_jobs`, leaving the rest. A goose database must be dropped
+whole — otherwise the recorded version would make the re-migration create
+nothing — so the reset now drops **every** earmark object and
+`goose_db_version`, then migrates from version 1. That includes
+`transcript_findings` (**human corrections too**, `origin='human'`),
+`book_metadata`, `run_metrics`, `pipeline_events`, `recipes` /
+`current_recipes`, and `runner_control` — the runner comes back **unpaused**
+with no `run_limit`.
+
+**Deadlines.** A migration must not outlive the pod's patience:
+
+- `lock_timeout` = **30 s** on goose's connection (`migrateLockTimeout`). A DDL
+  statement queued behind a long reader (e.g. the old pod mid-search) fails
+  with SQLSTATE `55P03` instead of waiting — and, while waiting, holding up
+  every later reader of that table. The migration's transaction rolls back
+  cleanly and the next start retries. The advisory-lock wait is exempt
+  (`lock_timeout = 0` on the lock connection): queueing behind the other pod's
+  migration is the design.
+- The whole run, advisory-lock wait included, is bounded at **90 s**
+  (`migrateDeadline`, a context deadline in `initialize`) — just under the
+  ingest pod's liveness budget, so a migration that cannot finish fails startup
+  with an error in the log instead of being SIGKILLed mid-transaction.
+- The ingest pod's `/healthz` listener starts only after `db.New`, so a
+  migration counts against its liveness budget (`initialDelaySeconds` 10 +
+  3 × 30 s ≈ 100 s); the mcp pod's startup probe allows 300 s. Every migration
+  so far finishes in a few seconds at production size (00002: 0.9–2.8 s
+  measured). A migration that cannot — a large backfill — must be written to
+  stay inside that budget (batched, or outside startup), or the probes raised
+  for that release; serving `/healthz` before migrating is not done because the
+  listener is built around the metrics registry, which needs the database.
+
 **The baseline (version 1) adopts the existing database without touching it.**
 It is a Go migration with three outcomes, decided inside goose's transaction
 and under the schema lock:
@@ -993,7 +1028,7 @@ and under the schema lock:
 |---|---|---|
 | empty | no `transcription_jobs` | execute the baseline |
 | built by the old inline code | `transcription_jobs` exists and every baseline object is present | record version 1, execute **nothing** |
-| built by an *older* inline earmark | `transcription_jobs` exists, some baseline object missing | execute the baseline — it is idempotent (`IF NOT EXISTS` / guarded `DO` blocks), so this finishes the job exactly as booting the newer inline code would have |
+| built by an *older* inline earmark | `transcription_jobs` exists, some baseline object missing | execute the baseline. It is the v0.40.2 inline code verbatim — idempotent (`IF NOT EXISTS` / guarded `DO` blocks) and including its one DML step, the duplicate-`file_path` DELETE that runs before `transcription_jobs_file_path_unique` is added (keeping the most-advanced job, never a `done` one) — so it does what booting v0.40.2 would have done (`TestIntegrationBaselineCatchUpDedupsFilePaths`) |
 
 "Every baseline object" is an inventory parsed from the baseline file itself
 (tables, `ADD COLUMN` columns, indexes, named constraints, functions,
@@ -1098,7 +1133,13 @@ alias.
 told apart only by model name — no prompt, revision or runner hash was ever
 recorded, so none is invented: `asr` per `transcripts.model_name`; `propose`
 per `(model, resolved_model)` of judge findings; `embed` per
-`run_metrics.embed_model` of the chunk's job. Where every row of a table maps
+`run_metrics.embed_model` of the chunk's job — a chunk whose job recorded no
+embed model (that slice is best-effort and written after the chunks commit)
+is attributed to the library's embed model when exactly one is recorded, and
+to an "unknown" legacy recipe otherwise. Writers to the three stamped tables
+are blocked (`LOCK TABLE … IN SHARE ROW EXCLUSIVE MODE`) for the migration so
+the recipe set cannot change between the statements that compute it. Where
+every row of a table maps
 to one legacy recipe, the column is stamped through a constant default that
 Postgres keeps as the column's missing value and the default is then dropped —
 no rewrite, no `UPDATE` (at production size: 0.9 s, versus 91 s re-inserting
@@ -1117,6 +1158,21 @@ release that changes nothing does not mark the library stale; a logic change
 bumps `step_version`. Unstamped rows are stale whenever their step has a
 current recipe; a step with no current recipe (asr, today) reports nothing;
 human corrections are never listed. Metrics over it arrive in PR 0b-4.
+
+**Expect a large `stale_work` right after the first deploy.** Every legacy row
+has `step_version` 0 and no prompt hash, so none is equivalent to a current
+recipe: on production that is all ≈39,644 chunks and ≈32,337 judge findings
+(asr reports nothing — no current asr recipe yet). That is true, not noise:
+none of those rows was made by the current configuration. Chunks converge as
+the worker re-embeds; findings only by re-judging.
+
+**Pin `expected_model` behind an alias.** The current propose recipe expects
+the endpoint to report `MODELS_FILE` `steps.propose.expected_model`, or the
+requested model id when unpinned. LiteLLM usually reports the provider's id,
+not the alias — unpinned, every new finding is then stamped with a non-current
+recipe and listed as stale. The judge logs a warning on the first response
+from a model other than the expected one (that is only knowable once the
+endpoint answers), and an info line at startup when no pin is set.
 
 ---
 
@@ -2718,6 +2774,13 @@ response served by any other model (a LiteLLM fallback, or an alias silently
 re-pointed) stamps a different recipe and shows up in `stale_work`. Behind an
 alias, set `expected_model` to the id the endpoint actually reports, or every
 finding will read as a fallback.
+
+**Helm.** Set `config.models` to the YAML above (as values). The chart renders
+it into the `<fullname>-models` ConfigMap, mounts it read-only at
+`/etc/earmark/models.yaml` on every pod that uses the common env/volumes, and
+sets `MODELS_FILE`; `config.models` is in the config checksum, so editing it
+rolls the pods. Empty (the default) renders nothing. `values.schema.json`
+rejects unknown steps and fields.
 
 Validation is fail-closed like §2.14: an unreadable file, malformed YAML, an
 unknown step or field, or an `alias` that contradicts the endpoint registry

@@ -29,6 +29,12 @@ brings the schema to the latest version with the embedded goose migrations
 
 With nothing pending this is a few catalog reads — safe on every restart.
 
+Deadlines (CONTRACT §1.8): each DDL statement waits at most 30 s for a table
+lock (`lock_timeout`, SQLSTATE 55P03 → rolled back, retried on the next start);
+the whole run is capped at 90 s, just under the ingest liveness budget. The `/healthz` listener starts only after
+this, so a migration spends the ingest pod's liveness budget (~100 s); every
+migration so far takes seconds at production size.
+
 Then the ingest process registers the **current recipes** (CONTRACT §1.9): the embed
 recipe and, when an eval chat endpoint is configured, the judge's propose recipe
 (`current_recipes`, read by the `stale_work` view). Best-effort: a failure is logged.

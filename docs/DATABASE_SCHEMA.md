@@ -399,7 +399,8 @@ CREATE TABLE current_recipes (
 ```
 
 The ingest process upserts the current `embed` and `propose` recipes at
-startup. `stale_work` lists every output row whose recipe differs from its
+startup. Right after the first deploy every legacy row is stale (≈39,644 chunks and
+≈32,337 findings on production): none was made by the current configuration. `stale_work` lists every output row whose recipe differs from its
 step's current recipe in anything but `code_version` (unstamped rows count as
 stale; steps without a current recipe and human corrections never appear).
 
