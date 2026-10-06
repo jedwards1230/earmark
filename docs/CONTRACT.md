@@ -1639,7 +1639,9 @@ Rendered workloads: Deployments `<release>-ingest` (`earmark monitor`) and
 The CronJob shares the Deployments' image, `earmark.commonEnv` env block (so it
 judges with the same `AI_ENDPOINTS`/`AI_ROLES` and gateway key), pod/container
 security contexts, `nodeSelector` and `tolerations`; it mounts no books volume and
-exposes no ports. It gets the **whole** `commonEnv`, including env it never
+exposes no ports. When `config.models` is set it mounts the model registry like
+the Deployments do (`commonEnv` then sets `MODELS_FILE`, and the judge stamps
+propose recipes from it — §2.18). It gets the **whole** `commonEnv`, including env it never
 reads (`BOOKS_DIR`, `SCAN_INTERVAL`, `LIBRARY_COLLECTIONS`, `ASR_SERVERS`,
 `METADATA_PROVIDER`, `ABS_URL`/`ABS_LIBRARY_ID`) and the `ABS_TOKEN` secret ref
 (eval never calls Audiobookshelf). That is an accepted cost: one env block for
@@ -2559,7 +2561,10 @@ invisible forever. An empty chunk set never prunes.
 prune transaction (both `InsertChunks` and the standalone `prune-chunks`) takes
 the same order: before touching any chunk row it row-locks the findings it may
 retire (`SELECT … FOR UPDATE OF f` over the transcript's findings at
-`chunk_index >= keep`), then upserts and prunes. An accept racing a rebuild
+`chunk_index >= keep`), then upserts and prunes. `InsertChunks` registers its
+embed recipe (§1.9) first, in the same transaction — that touches only
+`recipes`, which no finding/chunk lock holder waits on — and the upsert
+refreshes `recipe_id` on conflict along with the other derived columns. An accept racing a rebuild
 therefore waits rather than deadlocks: if the accept committed first, the prune
 retires it (its state guard re-checks); if the prune locked first, the accept
 then finds the finding `stale` and gets `ErrPatchStateConflict`.
@@ -2682,7 +2687,8 @@ Three tools, three layers written:
 
 **Provenance: the `origin` column.** `transcript_findings.origin TEXT NOT NULL
 DEFAULT 'judge'`, `CHECK (origin IN ('judge','human'))`, added by an additive
-`ADD COLUMN IF NOT EXISTS` migration in `initialize()` (`internal/db/db.go`). A
+`ADD COLUMN IF NOT EXISTS` in the pre-goose inline schema, now part of the
+`00001_baseline.sql` migration (§1.8). A
 hand-authored edit and a judge finding are structurally identical rows — same
 table, same anchor columns, same replay — so without provenance recorded *in the
 row* the two are indistinguishable after the fact, and "judge precision"
@@ -2778,8 +2784,10 @@ finding will read as a fallback.
 **Helm.** Set `config.models` to the YAML above (as values). The chart renders
 it into the `<fullname>-models` ConfigMap, mounts it read-only at
 `/etc/earmark/models.yaml` on every pod that uses the common env/volumes, and
-sets `MODELS_FILE`; `config.models` is in the config checksum, so editing it
-rolls the pods. Empty (the default) renders nothing. `values.schema.json`
+sets `MODELS_FILE` — on both Deployments and the `evalBackfill` CronJob;
+`config.models` is in the config checksum, so editing it
+rolls the pods. Unset (the default) renders nothing, byte-identical to the chart
+without it. `values.schema.json`
 rejects unknown steps and fields.
 
 Validation is fail-closed like §2.14: an unreadable file, malformed YAML, an

@@ -1,51 +1,17 @@
 package db
 
-// Integration tests against a REAL Postgres + pgvector. Every test here is
-// named TestIntegration… and skips unless EARMARK_TEST_DATABASE_URL points at a
-// THROWAWAY database (they run migrations and write rows) — the CI job runs
-// them with `go test -run Integration ./...` against a pgvector service.
-//
-//	docker run -d --rm --name earmark-it -e POSTGRES_PASSWORD=pw -p 56842:5432 pgvector/pgvector:pg16
-//	EARMARK_TEST_DATABASE_URL='postgres://postgres:pw@localhost:56842/postgres?sslmode=disable' \
-//	  go test -run Integration ./internal/db/
+// Integration tests for the chunk prune against a REAL Postgres + pgvector.
+// Each runs in its own throwaway database (newTestDatabase); see
+// migrate_integration_test.go for how to run them and the shared helpers.
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
-	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/patch"
 )
-
-// integrationDB opens a migrated DB, creating the extensions first: the pool's
-// AfterConnect registers the pgvector types, which fails on a fresh database
-// before initialize() would have created the extension.
-func integrationDB(t *testing.T) *DB {
-	t.Helper()
-	url := os.Getenv("EARMARK_TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("EARMARK_TEST_DATABASE_URL not set")
-	}
-	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	if _, err := conn.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm`); err != nil {
-		t.Fatalf("create extensions: %v", err)
-	}
-	_ = conn.Close(ctx)
-	database, err := New(&config.Config{DatabaseURL: url})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(database.Close)
-	return database
-}
 
 // seedTranscript inserts a done job + transcript with unique checksum/path and
 // removes them (cascading to chunks) plus their findings on cleanup.
@@ -130,7 +96,7 @@ func readChunks(t *testing.T, database *DB, tID string) []chunkRow {
 // boundaries, keeps chunk ids, and retires (never deletes) the findings on the
 // pruned rows while leaving a rejected decision alone.
 func TestIntegrationInsertChunksPrune(t *testing.T) {
-	database := integrationDB(t)
+	database := integrationDB(t, newTestDatabase(t))
 	ctx := context.Background()
 	tID, path := seedTranscript(t, database)
 
@@ -189,7 +155,7 @@ func TestIntegrationInsertChunksPrune(t *testing.T) {
 // A prune must still retire such a finding on the tail (by chunk_index), and
 // accepting one must still flag its chunk for rebuild.
 func TestIntegrationPruneRetiresFindingsWithDanglingChunkID(t *testing.T) {
-	database := integrationDB(t)
+	database := integrationDB(t, newTestDatabase(t))
 	ctx := context.Background()
 	tID, path := seedTranscript(t, database)
 

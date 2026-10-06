@@ -289,3 +289,104 @@ func keys(m map[string]map[string]any) []string {
 	}
 	return out
 }
+
+// podSpecs returns every pod spec that renders earmark.commonEnv: both
+// Deployments and, when enabled, the evalBackfill CronJob.
+func podSpecs(t *testing.T, docs map[string]map[string]any) map[string]any {
+	t.Helper()
+	out := map[string]any{}
+	for k, doc := range docs {
+		switch {
+		case strings.HasPrefix(k, "Deployment/"):
+			out[k] = dig(t, doc, "spec", "template", "spec")
+		case strings.HasPrefix(k, "CronJob/"):
+			out[k] = cronPodSpec(t, doc)
+		}
+	}
+	return out
+}
+
+func envValue(t *testing.T, container any, name string) (string, bool) {
+	t.Helper()
+	env, _ := dig(t, container, "env").([]any)
+	for _, e := range env {
+		if m := e.(map[string]any); m["name"] == name {
+			v, _ := m["value"].(string)
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func hasNamed(t *testing.T, v any, name string) map[string]any {
+	t.Helper()
+	l, _ := v.([]any)
+	for _, e := range l {
+		if m := e.(map[string]any); m["name"] == name {
+			return m
+		}
+	}
+	return nil
+}
+
+// TestModelsFileOffByDefault: no config.models → no ConfigMap, no MODELS_FILE,
+// no mount anywhere (the pods run with an empty registry).
+func TestModelsFileOffByDefault(t *testing.T) {
+	docs := render(t, "evalBackfill.enabled=true")
+	assert.NotContains(t, keys(docs), "ConfigMap/earmark-models")
+	for k, spec := range podSpecs(t, docs) {
+		c := dig(t, spec, "containers", 0)
+		_, set := envValue(t, c, "MODELS_FILE")
+		assert.False(t, set, "%s sets MODELS_FILE without config.models", k)
+		assert.Nil(t, hasNamed(t, dig(t, spec, "volumes"), "models"), "%s mounts models without config.models", k)
+	}
+}
+
+// TestModelsFileWiredToEveryPod: with config.models set, every pod that gets
+// MODELS_FILE — the CronJob included, since it judges and so stamps propose
+// recipes — mounts the file it names. An env var without the mount fails
+// startup closed (CONTRACT §2.18).
+func TestModelsFileWiredToEveryPod(t *testing.T) {
+	docs := render(t,
+		"evalBackfill.enabled=true",
+		"config.models.steps.propose.expected_model=anthropic/claude-haiku-4-5-20251001",
+		"config.models.steps.propose.revision=r20251001",
+	)
+	cm, ok := docs["ConfigMap/earmark-models"]
+	require.True(t, ok, "models ConfigMap not rendered; got %v", keys(docs))
+	var file map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(dig(t, cm, "data", "models.yaml").(string)), &file))
+	assert.Equal(t, "anthropic/claude-haiku-4-5-20251001", dig(t, file, "steps", "propose", "expected_model"))
+
+	specs := podSpecs(t, docs)
+	require.Len(t, specs, 3, "want both Deployments and the CronJob; got %v", keys(docs))
+	for k, spec := range specs {
+		c := dig(t, spec, "containers", 0)
+		v, set := envValue(t, c, "MODELS_FILE")
+		require.True(t, set, "%s has no MODELS_FILE", k)
+		assert.Equal(t, "/etc/earmark/models.yaml", v, k)
+		m := hasNamed(t, dig(t, c, "volumeMounts"), "models")
+		require.NotNil(t, m, "%s sets MODELS_FILE but does not mount it", k)
+		assert.Equal(t, "/etc/earmark", m["mountPath"], k)
+		assert.Equal(t, true, m["readOnly"], k)
+		vol := hasNamed(t, dig(t, spec, "volumes"), "models")
+		require.NotNil(t, vol, "%s has no models volume", k)
+		assert.Equal(t, "earmark-models", dig(t, vol, "configMap", "name"), k)
+	}
+}
+
+func TestModelsSchemaRejectsBadValues(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	for _, set := range []string{
+		"config.models.steps.bogus.alias=x",
+		"config.models.steps.propose.unknown=x",
+		"config.models.other=x",
+	} {
+		t.Run(set, func(t *testing.T) {
+			out, err := exec.Command("helm", "template", "earmark", chartDir, "--set", set).CombinedOutput()
+			require.Error(t, err, "expected schema rejection, got:\n%s", out)
+		})
+	}
+}

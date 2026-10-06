@@ -106,6 +106,10 @@ spec:
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp
+                {{- /* The model registry IS mounted when config.models is set:
+                  commonEnv then sets MODELS_FILE, and this judge stamps propose
+                  recipes from it (CONTRACT §2.18). */}}
+                {{- with include "earmark.modelsVolumeMount" . }}{{ . | nindent 16 }}{{- end }}
 
           {{- with .Values.nodeSelector }}
           nodeSelector:
@@ -119,4 +123,5 @@ spec:
           volumes:
             - name: tmp
               emptyDir: {}
+            {{- with include "earmark.modelsVolume" . }}{{ . | nindent 12 }}{{- end }}
 {{- end }}

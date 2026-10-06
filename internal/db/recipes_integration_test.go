@@ -10,8 +10,6 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	pgxvector "github.com/pgvector/pgvector-go/pgx"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/openai"
@@ -230,33 +228,24 @@ func TestIntegrationLegacyBackfillWithoutRewrite(t *testing.T) {
 	}
 }
 
-// newIntegrationDB opens a *DB over a migrated database the way New does
-// (pgvector types registered), with an embeddings role bound to nomic.
-func newIntegrationDB(t *testing.T, dbURL string) *DB {
+// integrationDB opens a *DB over dbURL through New — the production path:
+// migrations run first on their own connection, so an EMPTY database needs no
+// pre-created extensions (the pool registers the pgvector types only on its
+// first connection). The embeddings role is bound to nomic-embed-text, so
+// chunks are stamped with a real embed recipe. The one constructor every
+// integration test in this package uses.
+func integrationDB(t *testing.T, dbURL string) *DB {
 	t.Helper()
-	if err := migrate(itCtx(t), dbURL, testLog()); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	poolCfg, err := pgxpool.ParseConfig(dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		return pgxvector.RegisterTypes(ctx, conn)
-	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	cfg := &config.Config{
+	d, err := New(&config.Config{
 		DatabaseURL: dbURL,
 		ChunkSize:   512,
 		AIEndpoints: []config.AIEndpoint{{ID: "e", Type: config.AIEndpointTypeEmbeddings, Model: "nomic-embed-text"}},
 		AIRoles:     &config.AIRoles{Embeddings: "e"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	d := &DB{pool: pool, cfg: cfg, log: testLog(), e: openai.NewEmbeddings(cfg)}
-	d.embedRecipe = d.EmbedRecipe()
+	t.Cleanup(d.Close)
 	return d
 }
 
@@ -289,7 +278,7 @@ func vec(v float32) []float32 {
 // human corrections, and silent for steps with no current recipe.
 func TestIntegrationStampingAndStaleWork(t *testing.T) {
 	ctx := context.Background()
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	if _, err := d.pool.Exec(ctx, `
 		INSERT INTO transcription_jobs (id, file_path, checksum, status)
 		VALUES ('00000000-0000-0000-0000-00000000000a', '/b/A/01.m4b', 'c1', 'done');
@@ -387,14 +376,25 @@ func TestIntegrationStampingAndStaleWork(t *testing.T) {
 	}
 
 	// Re-embedding restamps: ON CONFLICT updates recipe_id with the embedding.
+	// InsertChunks takes the transcript's COMPLETE chunk set (anything past it
+	// is pruned, CONTRACT §2.17), so a rebuild re-embeds both chunks — and both
+	// rows, kept by the upsert, now carry the new recipe.
 	d.embedRecipe = newEmbed
 	if err := d.InsertChunks(ctx, []Chunk{
 		{TranscriptID: tid, FilePath: "/b/A/01.m4b", ChunkIndex: 0, EndSec: 30, Text: "a", Embedding: vec(0.4)},
+		{TranscriptID: tid, FilePath: "/b/A/01.m4b", ChunkIndex: 1, StartSec: 30, EndSec: 60, Text: "b", Embedding: vec(0.5)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := staleRows(t, d); len(got) != 2 {
-		t.Errorf("after re-embedding one chunk, stale_work = %v, want 2 rows", got)
+	if got, want := staleRows(t, d), []string{"propose:transcript_findings:" + mustID(t, fallback)}; !slices.Equal(got, want) {
+		t.Errorf("after re-embedding the transcript, stale_work = %v, want %v (no chunk stale)", got, want)
+	}
+	if err := d.pool.QueryRow(ctx, `SELECT count(*) FROM transcript_chunks WHERE transcript_id = $1 AND recipe_id = $2`,
+		tid, mustID(t, newEmbed)).Scan(&stamped); err != nil {
+		t.Fatal(err)
+	}
+	if stamped != 2 {
+		t.Errorf("%d of 2 re-embedded chunks restamped with the new embed recipe", stamped)
 	}
 
 	// The current pointer moves only when the recipe does.
@@ -410,7 +410,7 @@ func TestIntegrationStampingAndStaleWork(t *testing.T) {
 // TestIntegrationRecipesAreImmutable: re-registering an ID never rewrites it.
 func TestIntegrationRecipesAreImmutable(t *testing.T) {
 	ctx := context.Background()
-	d := newIntegrationDB(t, newTestDatabase(t))
+	d := integrationDB(t, newTestDatabase(t))
 	r := d.EmbedRecipe()
 	id, err := d.RegisterRecipe(ctx, r)
 	if err != nil {
