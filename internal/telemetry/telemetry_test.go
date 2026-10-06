@@ -120,7 +120,7 @@ func TestSetup_UnreachableEndpointNeverBlocks(t *testing.T) {
 	addr := l.Addr().String()
 	_ = l.Close()
 
-	for _, proto := range []string{"grpc", "http/protobuf"} {
+	for _, proto := range []string{"", "http/protobuf"} {
 		t.Run(proto, func(t *testing.T) {
 			clearOTelEnv(t)
 			t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://"+addr)
@@ -205,6 +205,9 @@ func TestMetricsEndpointServesOTelAndLegacy(t *testing.T) {
 			t.Errorf("/metrics missing %q", w)
 		}
 	}
+	if strings.Contains(body, "target_info") {
+		t.Error("/metrics carries target_info; the exporter must run WithoutTargetInfo")
+	}
 	if strings.Contains(body, "otel_scope_") {
 		t.Error("/metrics carries otel_scope_* labels; the exporter must run WithoutScopeInfo")
 	}
@@ -277,5 +280,26 @@ func TestShutdownHonorsCtx(t *testing.T) {
 		if !honors && err == nil {
 			t.Error("abandoned refresh: want a context error from Shutdown")
 		}
+	}
+}
+
+// TestSetup_GRPCProtocolTurnsOTLPOff (review M7): only OTLP/HTTP ships. A
+// grpc protocol setting is refused per signal rather than sending HTTP to a
+// gRPC port on every export.
+func TestSetup_GRPCProtocolTurnsOTLPOff(t *testing.T) {
+	clearOTelEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf") // per-signal override wins
+	tel, err := telemetry.Setup(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(t, tel)
+	if tel.OTLPMetrics() {
+		t.Error("OTLP metrics on with protocol grpc")
+	}
+	if !tel.OTLPTraces() {
+		t.Error("OTLP traces off despite OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf")
 	}
 }

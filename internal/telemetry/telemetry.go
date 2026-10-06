@@ -12,7 +12,8 @@
 //	OTEL_RESOURCE_ATTRIBUTES        extra resource attributes
 //	OTEL_EXPORTER_OTLP_ENDPOINT     OTLP endpoint; unset → OTLP is off
 //	  (or OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT per signal)
-//	OTEL_EXPORTER_OTLP_PROTOCOL     grpc | http/protobuf (default http/protobuf)
+//	OTEL_EXPORTER_OTLP_PROTOCOL     http/protobuf only (the default); anything
+//	                                else turns that signal's OTLP export off
 //	OTEL_METRICS_EXPORTER           comma list of otlp, prometheus, none
 //	                                (default: prometheus, plus otlp when an endpoint is set)
 //	OTEL_TRACES_EXPORTER            otlp | none (default otlp when an endpoint is set)
@@ -39,9 +40,7 @@ import (
 	prombridge "go.opentelemetry.io/contrib/bridges/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
@@ -132,6 +131,9 @@ func Setup(ctx context.Context) (*Telemetry, error) {
 			// otel_scope_* labels on every series (cardinality rule, §2.16).
 			otelprom.WithTranslationStrategy(otlptranslator.UnderscoreEscapingWithSuffixes),
 			otelprom.WithoutScopeInfo(),
+			// No target_info series: the resource labels duplicate the
+			// scrape's job/instance and are not part of the §2.16 surface.
+			otelprom.WithoutTargetInfo(),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("prometheus exporter: %w", err)
@@ -141,7 +143,7 @@ func Setup(ctx context.Context) (*Telemetry, error) {
 	if metricExporters[exporterOTLP] {
 		if !endpointSet("METRICS") {
 			logger.Info("OTLP metrics not exported: no OTEL_EXPORTER_OTLP_ENDPOINT")
-		} else {
+		} else if protocolSupported("METRICS") {
 			exp, err := newMetricExporter(ctx)
 			if err != nil {
 				return nil, err
@@ -161,7 +163,7 @@ func Setup(ctx context.Context) (*Telemetry, error) {
 	if traceExporters[exporterOTLP] {
 		if !endpointSet("TRACES") {
 			logger.Info("OTLP traces not exported: no OTEL_EXPORTER_OTLP_ENDPOINT")
-		} else {
+		} else if protocolSupported("TRACES") {
 			exp, err := newTraceExporter(ctx)
 			if err != nil {
 				_ = t.mp.Shutdown(ctx)
@@ -396,34 +398,27 @@ func endpointSet(signal string) bool {
 		strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_"+signal+"_ENDPOINT")) != ""
 }
 
-// protocol resolves the OTLP protocol for signal: the per-signal variable, then
-// OTEL_EXPORTER_OTLP_PROTOCOL, then the spec default http/protobuf.
-func protocol(signal string) string {
+// protocolSupported reports whether the configured OTLP protocol for signal
+// (the per-signal variable, then OTEL_EXPORTER_OTLP_PROTOCOL) is http/protobuf,
+// the spec default and the only one earmark ships (OTLP/gRPC would add ~8 MB
+// of grpc to the binary; collectors such as Alloy take OTLP/HTTP on :4318).
+// Anything else is logged and that signal's OTLP export stays off — sending
+// HTTP to a gRPC port would fail on every export instead.
+func protocolSupported(signal string) bool {
 	p := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_" + signal + "_PROTOCOL"))
 	if p == "" {
 		p = strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"))
 	}
-	switch p {
-	case "", "http/protobuf":
-		return "http/protobuf"
-	case "grpc":
-		return "grpc"
-	default:
-		logger.Warn("unsupported OTLP protocol, using http/protobuf", "signal", signal, "protocol", p)
-		return "http/protobuf"
+	if p == "" || p == "http/protobuf" {
+		return true
 	}
+	logger.Warn("unsupported OTLP protocol; only http/protobuf is supported (use the collector's OTLP/HTTP port, e.g. :4318) — OTLP export off for this signal",
+		"signal", signal, "protocol", p)
+	return false
 }
 
 func newMetricExporter(ctx context.Context) (sdkmetric.Exporter, error) {
-	var (
-		exp sdkmetric.Exporter
-		err error
-	)
-	if protocol("METRICS") == "grpc" {
-		exp, err = otlpmetricgrpc.New(ctx)
-	} else {
-		exp, err = otlpmetrichttp.New(ctx)
-	}
+	exp, err := otlpmetrichttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("otlp metric exporter: %w", err)
 	}
@@ -431,15 +426,7 @@ func newMetricExporter(ctx context.Context) (sdkmetric.Exporter, error) {
 }
 
 func newTraceExporter(ctx context.Context) (sdktrace.SpanExporter, error) {
-	var (
-		exp sdktrace.SpanExporter
-		err error
-	)
-	if protocol("TRACES") == "grpc" {
-		exp, err = otlptracegrpc.New(ctx)
-	} else {
-		exp, err = otlptracehttp.New(ctx)
-	}
+	exp, err := otlptracehttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("otlp trace exporter: %w", err)
 	}
