@@ -3701,13 +3701,26 @@ func (db *DB) GetUnevaluatedJobTranscripts(ctx context.Context, after Transcript
 //     eval_skipped), so the event log is the only surviving record. The
 //     detail->'skipped' cast is guarded by jsonb_typeof so a non-numeric value
 //     can never fail the whole query.
-//  4. LEGACY: latched, but fewer chunks were judged than the transcript has
-//     stored (eval_chunks < count of transcript_chunks). The pre-fix CLI
-//     backfill aborted on the first client timeout and still latched with
+//  4. LEGACY: latched with eval_resolved_model IS NULL, but fewer chunks were
+//     judged than the transcript has stored (eval_chunks < count of
+//     transcript_chunks), and no chunk was added since the run's
+//     eval_started_at (eval_finished_at when unset). The pre-fix CLI backfill
+//     aborted on the first client timeout and still latched with
 //     eval_skipped = 0, the chunks judged so far, and no event — this is the
-//     only trace it leaves. (A transcript re-embedded with a different
-//     CHUNK_SIZE after a complete judge run also matches; re-judging it is
-//     harmless, findings are de-duplicated.)
+//     only trace it leaves. A NULL resolved model covers every pre-0a run plus
+//     post-0a runs whose endpoint reported no model (or the no-judge latch);
+//     post-0a runs latch only on full success, so they cannot have a short
+//     eval_chunks against the set they judged. The chunk-age guard matters
+//     because a later re-embed (ReembedJobs deletes, the worker re-inserts) or
+//     a re-chunk that adds rows changes the count without the judge having
+//     seen it; an in-place stale rebuild keeps created_at but not the count.
+//     (The gated pipeline judged before embedding, so its chunks are always
+//     newer than its run; its failures are 2-3's business.) eval_started_at is
+//     host time while created_at is the DB's now(), so clock skew matters only
+//     for chunks written within the skew of the run: a lagging host clock can
+//     only hide a match, a leading one can add a re-judge. Known gap: a legacy
+//     aborted run whose chunks were added to or replaced after it is
+//     undetectable here — the set it judged is gone from the count.
 //
 // A successful re-judge writes a new eval_started_at (after those events),
 // eval_skipped = 0, eval_chunks = every stored chunk, and clears eval_failed_at,
@@ -3735,9 +3748,15 @@ const evalErrorTranscriptsSQL = `
 		                            ELSE false END))
 		          AND pe.created_at >= COALESCE(rm.eval_started_at, '-infinity'::timestamptz)
 		      )
-		      OR COALESCE(rm.eval_chunks, 0) < (
-		        SELECT count(*) FROM transcript_chunks c WHERE c.transcript_id = t.id
-		      )
+		      OR (rm.eval_resolved_model IS NULL
+		          AND COALESCE(rm.eval_chunks, 0) < (
+		            SELECT count(*) FROM transcript_chunks c WHERE c.transcript_id = t.id
+		          )
+		          AND NOT EXISTS (
+		            SELECT 1 FROM transcript_chunks c
+		            WHERE c.transcript_id = t.id
+		              AND c.created_at > COALESCE(rm.eval_started_at, rm.eval_finished_at)
+		          ))
 		    ))
 		  )
 		  AND ` + transcriptKeysetPredicate + `

@@ -74,9 +74,10 @@ EVAL_IN_PIPELINE=false keeps the judge out of the embed path (CONTRACT ยง2.15, ย
 
 --backfill-eval-errors re-judges done transcripts whose judging failed: those
 with a recorded failure (run_metrics.eval_failed_at), and LEGACY ones the old
-pipeline latched as done despite a judge error (eval_skipped > 0, or an eval
-error event in pipeline_events). Findings already recorded for a transcript are
-not inserted twice.
+pipeline latched as done despite a judge error (eval_skipped > 0, an eval error
+event in pipeline_events, or a legacy run that judged fewer chunks than are
+stored, with no chunk added since the run). Findings already recorded for a
+transcript are not inserted twice.
 
 In both backfill modes eval_finished_at is written only when EVERY chunk was
 judged; otherwise the failure is recorded and the transcript stays eligible for
