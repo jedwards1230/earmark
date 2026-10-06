@@ -31,6 +31,14 @@ Schedule "{{ .Values.evalBackfill.schedule }}": earmark eval --backfill-unevalua
 kubectl get cronjob,jobs -n {{ .Release.Namespace }} -l app.kubernetes.io/component=eval-backfill
 # Run once now:
 kubectl create job -n {{ .Release.Namespace }} --from=cronjob/{{ include "earmark.evalBackfill.name" . }} {{ include "earmark.evalBackfill.name" . }}-manual
+{{- if .Values.config.evalInPipeline }}
+
+  ! WARNING: config.evalInPipeline is also true, so the ingest worker judges
+    inline AND this CronJob judges. They can judge the same transcript at once
+    (findings de-dupe and latching is idempotent, but judge calls are wasted).
+    Fine for a one-off catch-up of an old unevaluated backlog; for steady state
+    pick one: evalInPipeline: false (decoupled) or evalBackfill.enabled: false.
+{{- end }}
 {{- end }}
 
 ━━━ Prerequisites in namespace {{ .Release.Namespace }} ───────────────────────

@@ -164,7 +164,7 @@ func TestEvalBackfillOptionalFields(t *testing.T) {
 		"evalBackfill.ttlSecondsAfterFinished=null",
 		"evalBackfill.suspend=true",
 		"evalBackfill.concurrencyPolicy=Replace",
-		"evalBackfill.extraArgs[0]=--debug",
+		"evalBackfill.extraArgs[0]=--write=false",
 		"evalBackfill.extraEnv[0].name=EVAL_REASONING_EFFORT",
 		"evalBackfill.extraEnv[0].value=omit",
 	)
@@ -181,10 +181,10 @@ func TestEvalBackfillOptionalFields(t *testing.T) {
 	// limit 0 = no cap: the flag is omitted (the CLI's own "0 = all").
 	c := dig(t, cronPodSpec(t, cj), "containers", 0)
 	assert.Equal(t,
-		[]any{"eval", "--backfill-unevaluated", "--write", "--debug"},
+		[]any{"eval", "--backfill-unevaluated", "--write", "--write=false"},
 		dig(t, c, "args"))
 
-	// extraEnv lands after the shared env (last wins on duplicate names).
+	// extraEnv lands after the shared env.
 	env := dig(t, c, "env").([]any)
 	assert.Equal(t,
 		map[string]any{"name": "EVAL_REASONING_EFFORT", "value": "omit"},
@@ -207,6 +207,70 @@ func TestEvalBackfillSchemaRejectsBadValues(t *testing.T) {
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err, "expected schema rejection, got:\n%s", out)
 			assert.Contains(t, string(out), "evalBackfill")
+		})
+	}
+}
+
+func TestEvalBackfillExtraEnvCollisionFails(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	for _, name := range []string{"DATABASE_URL", "LOG_FORMAT", "AI_ROLES"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command("helm", "template", "earmark", chartDir,
+				"--set", "evalBackfill.enabled=true",
+				"--set", "evalBackfill.extraEnv[0].name="+name,
+				"--set", "evalBackfill.extraEnv[0].value=x",
+				// AI_ROLES is only in commonEnv when aiEndpoints/aiRoles are set.
+				"--set", "config.aiEndpoints[0].id=e",
+				"--set", "config.aiEndpoints[0].type=embeddings",
+				"--set", "config.aiEndpoints[0].backend=ollama",
+				"--set", "config.aiEndpoints[0].baseURL=http://o:11434/v1",
+				"--set", "config.aiEndpoints[0].model=m",
+				"--set", "config.aiRoles.embeddings=e")
+			out, err := cmd.CombinedOutput()
+			require.Error(t, err, "expected collision failure, got:\n%s", out)
+			assert.Contains(t, string(out), "evalBackfill.extraEnv sets \""+name+"\"")
+		})
+	}
+}
+
+// helmInstallNotes renders NOTES.txt via a client-side dry-run install.
+func helmInstallNotes(t *testing.T, sets ...string) string {
+	t.Helper()
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	args := []string{"install", "earmark", chartDir, "--namespace", "earmark", "--dry-run=client"}
+	for _, s := range sets {
+		args = append(args, "--set", s)
+	}
+	out, err := exec.Command("helm", args...).CombinedOutput()
+	require.NoError(t, err, "helm install --dry-run: %s", out)
+	return string(out)
+}
+
+func TestEvalBackfillInPipelineWarning(t *testing.T) {
+	const warn = "WARNING: config.evalInPipeline is also true"
+	cases := []struct {
+		name       string
+		inPipeline string
+		want       bool
+	}{
+		{"decoupled", "false", false},
+		{"both judge paths", "true", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := helmInstallNotes(t,
+				"evalBackfill.enabled=true",
+				"config.evalInPipeline="+tc.inPipeline)
+			assert.Contains(t, out, "Eval backfill CronJob")
+			if tc.want {
+				assert.Contains(t, out, warn)
+			} else {
+				assert.NotContains(t, out, warn)
+			}
 		})
 	}
 }

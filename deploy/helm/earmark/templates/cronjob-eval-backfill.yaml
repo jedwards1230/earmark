@@ -1,4 +1,19 @@
 {{- if .Values.evalBackfill.enabled }}
+{{- /*
+  extraEnv is additions only: a name that commonEnv already sets would leave a
+  duplicate env entry (API-server "hides previous definition" warnings, SSA /
+  ArgoCD diff churn on the `name` merge key) and silently fork the CronJob's
+  config from the Deployments'. Fail the render instead.
+*/}}
+{{- $common := dict }}
+{{- range (include "earmark.commonEnv" . | fromYamlArray) }}
+{{- $_ := set $common .name true }}
+{{- end }}
+{{- range .Values.evalBackfill.extraEnv }}
+{{- if hasKey $common .name }}
+{{- fail (printf "evalBackfill.extraEnv sets %q, which the chart's shared env (earmark.commonEnv) already sets. extraEnv is additions only — change %s through the chart's config/secrets values so the CronJob and the Deployments agree." .name .name) }}
+{{- end }}
+{{- end }}
 # Eval backfill CronJob — the decoupled eval judge (CONTRACT §2.15).
 #
 # Runs: earmark eval --backfill-unevaluated --write [--limit N]

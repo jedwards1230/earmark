@@ -1405,9 +1405,18 @@ Rendered workloads: Deployments `<release>-ingest` (`earmark monitor`) and
 The CronJob shares the Deployments' image, `earmark.commonEnv` env block (so it
 judges with the same `AI_ENDPOINTS`/`AI_ROLES` and gateway key), pod/container
 security contexts, `nodeSelector` and `tolerations`; it mounts no books volume and
-exposes no ports. `evalBackfill.extraEnv` appends judge-only env (e.g.
-`EVAL_REASONING_EFFORT=omit`) and `evalBackfill.extraArgs` extra CLI args. Defaults: schedule `17 * * * *`, `--limit 25` (`0` omits the flag
-= no cap), `concurrencyPolicy: Forbid`, `backoffLimit: 0`,
+exposes no ports. It gets the **whole** `commonEnv`, including env it never
+reads (`BOOKS_DIR`, `SCAN_INTERVAL`, `LIBRARY_COLLECTIONS`, `ASR_SERVERS`,
+`METADATA_PROVIDER`, `ABS_URL`/`ABS_LIBRARY_ID`) and the `ABS_TOKEN` secret ref
+(eval never calls Audiobookshelf). That is an accepted cost: one env block for
+every earmark pod is what keeps the judge config from drifting, and splitting
+`commonEnv` would reintroduce a second list to keep in step.
+`evalBackfill.extraEnv` appends judge-only env (e.g. `EVAL_REASONING_EFFORT=omit`)
+and is **additions only** — a name `commonEnv` already sets fails the render.
+`evalBackfill.extraArgs` appends extra `earmark eval` flags. Enabling the CronJob
+while `config.evalInPipeline: true` renders (a one-off backlog catch-up is
+legitimate) but `NOTES` warns that both paths will judge. Defaults: schedule
+`17 * * * *`, `--limit 25` (`0` omits the flag = no cap), `concurrencyPolicy: Forbid`, `backoffLimit: 0`,
 `activeDeadlineSeconds: 3000`, `startingDeadlineSeconds: 600`,
 `ttlSecondsAfterFinished: 86400`, history limits 3/3.
 

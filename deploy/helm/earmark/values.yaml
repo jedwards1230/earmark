@@ -223,11 +223,15 @@ evalBackfill:
   # the pass judges every unevaluated transcript) — size against the judge's
   # cost/throughput and activeDeadlineSeconds.
   limit: 25
-  # Extra args appended after the built-in ones (e.g. ["--debug"]). Do NOT pass
-  # --backfill-eval-errors here: it is mutually exclusive with
-  # --backfill-unevaluated.
+  # Extra `earmark eval` flags appended after the built-in ones — e.g.
+  # ["--write=false"] turns each run into a dry-run preview (the last --write
+  # wins). Do NOT pass --backfill-eval-errors here: it is mutually exclusive
+  # with --backfill-unevaluated.
   extraArgs: []
-  # Extra env vars (core/v1 EnvVar list) appended after the shared env — e.g.
+  # Extra env vars (core/v1 EnvVar list) appended after the shared env.
+  # ADDITIONS ONLY: a name already set by the shared env (DATABASE_URL,
+  # AI_ENDPOINTS, LOG_FORMAT, …) fails the render — change it via `config`
+  # instead, so the CronJob and the Deployments never disagree. E.g.
   # judge-only knobs the Deployments don't need in decoupled mode:
   #   - {name: EVAL_REASONING_EFFORT, value: omit}
   #   - {name: EVAL_CHAT_TEMPLATE_KWARGS, value: omit}
