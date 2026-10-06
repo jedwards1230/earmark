@@ -485,8 +485,8 @@ type backfillResult struct {
 // no stored chunks yet: under the gate the embed pass will insert chunks with the
 // deterministic UUIDv5 IDs, so judging regenerated chunks is safe; WITHOUT the
 // gate the embed worker assigns RANDOM chunk IDs at insert time, so findings
-// judged now would reference chunk IDs that will never exist (orphans — there
-// is no FK) while the latch would stop the job from ever being judged again.
+// judged now would reference chunk IDs that will never exist (orphans — chunk_id
+// has no FK) while the latch would stop the job from ever being judged again.
 // Such a transcript is skipped and left unlatched; the next backfill run judges
 // it once it has been embedded.
 func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, judge *evalpkg.Judge,

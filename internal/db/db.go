@@ -3120,14 +3120,13 @@ var trackDetailSQL = `
 // run_metrics, and its embedded chunk list. Returns pgx.ErrNoRows if no job has
 // that id, which the handler maps to a 404.
 //
-// KNOWN GAP (CONTRACT §2.17 reader audit). Its consumers — the web transcript
-// reader and the MCP get_transcript tool — are the one place a reader genuinely
-// wants CORRECTED text, but the segments returned here are transcripts.segments:
-// immutable ASR provenance that carries no corrections and must never be
-// rewritten. So the reader shows uncorrected ASR while search shows corrected
-// text. Closing the gap means projecting corrections onto segments at render
-// time (they have no chunk anchors today), which is deliberately out of scope —
-// mutating segments to fix it would destroy the provenance record.
+// The segments returned here are transcripts.segments: immutable ASR
+// provenance that carries no corrections and must never be rewritten (CONTRACT
+// §2.17 reader audit). A reader that wants CORRECTED text reads the chunk
+// projection instead — the MCP get_transcript tool does, through
+// GetCorrectedTranscriptPage. The web transcript reader still renders these
+// segments (KNOWN GAP): corrections are anchored to chunks, and projecting them
+// onto segment/word timing is a later task.
 func (db *DB) GetTrackDetail(ctx context.Context, jobID string) (*TrackDetail, error) {
 	return db.getTrackDetail(ctx, db.pool, jobID)
 }
@@ -4069,8 +4068,9 @@ func scanJobMatches(rows pgx.Rows) ([]JobMatch, error) {
 }
 
 // RequeueJobs re-runs the full pipeline for jobs whose file_path contains substr:
-// it deletes their transcripts (cascading to chunks) and resets the jobs to
-// 'pending' with attempts cleared. Returns the file paths that were reset.
+// it archives their findings as superseded, deletes their transcripts
+// (cascading to chunks) and resets the jobs to 'pending' with attempts cleared.
+// Returns the file paths that were reset.
 func (db *DB) RequeueJobs(ctx context.Context, substr string) ([]string, error) {
 	return db.requeue(ctx, requeueByPath, likePattern(substr))
 }
@@ -4101,19 +4101,20 @@ func (db *DB) RequeueByDir(ctx context.Context, dir string) ([]string, error) {
 	return db.requeue(ctx, requeueByDir, dir)
 }
 
-// requeuePlan is a pair of fully-formed, static SQL statements for one requeue
-// selector. The statements are package constants — nothing is concatenated at
-// runtime, so the only dynamic input is the bound $1 parameter (when present).
-type requeuePlan struct {
-	deleteTranscripts string // delete transcripts for the selected jobs (chunks cascade)
-	resetJobs         string // reset those jobs to pending; RETURNING id, file_path
+// requeueSelector is the one selector-specific statement of a requeue: reset
+// the selected jobs to pending, RETURNING (id, file_path). Every later step of
+// the transaction is keyed on the returned job ids, so the four entry points
+// (by path, failed, by id, by dir) cannot disagree about which transcripts they
+// archive and delete. The statements are package constants — nothing is
+// concatenated at runtime, so the only dynamic input is the bound $1 parameter
+// (when present).
+type requeueSelector struct {
+	resetJobs string
 }
 
 var (
 	// requeueByPath selects jobs by a case-insensitive file_path match ($1).
-	requeueByPath = requeuePlan{
-		deleteTranscripts: `DELETE FROM transcripts
-			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE file_path ILIKE $1)`,
+	requeueByPath = requeueSelector{
 		resetJobs: `UPDATE transcription_jobs
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
@@ -4121,9 +4122,7 @@ var (
 			RETURNING id, file_path`,
 	}
 	// requeueFailed selects every job in the 'failed' state (no parameters).
-	requeueFailed = requeuePlan{
-		deleteTranscripts: `DELETE FROM transcripts
-			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE status = 'failed')`,
+	requeueFailed = requeueSelector{
 		resetJobs: `UPDATE transcription_jobs
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
@@ -4131,9 +4130,7 @@ var (
 			RETURNING id, file_path`,
 	}
 	// requeueByID selects a single job by its UUID ($1, cast for safety).
-	requeueByID = requeuePlan{
-		deleteTranscripts: `DELETE FROM transcripts
-			WHERE job_id IN (SELECT id FROM transcription_jobs WHERE id = $1::uuid)`,
+	requeueByID = requeueSelector{
 		resetJobs: `UPDATE transcription_jobs
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
@@ -4142,11 +4139,7 @@ var (
 	}
 	// requeueByDir selects every track job in one book directory: an exact match
 	// on dirname(file_path) ($1). Used by the per-book "requeue book" action.
-	requeueByDir = requeuePlan{
-		deleteTranscripts: `DELETE FROM transcripts
-			WHERE job_id IN (
-				SELECT id FROM transcription_jobs
-				WHERE regexp_replace(file_path, '/[^/]+$', '') = $1)`,
+	requeueByDir = requeueSelector{
 		resetJobs: `UPDATE transcription_jobs
 			SET    status = 'pending', attempts = 0, error = NULL,
 			       claimed_by = NULL, claimed_at = NULL, updated_at = now()
@@ -4155,12 +4148,31 @@ var (
 	}
 )
 
+// requeueSupersedeFindingsSQL archives the findings of the transcripts a
+// requeue is about to delete (CONTRACT §1.4, §2.17): they move to
+// 'superseded' and are stamped superseded_at. Human decisions (accepted,
+// applied, rejected, reverted, and origin='human' corrections) are archived the
+// same way — never deleted. It must run BEFORE the delete: the foreign key's ON
+// DELETE SET NULL clears transcript_id, after which the findings can no longer
+// be found by transcript. $1 is the requeued job-id array; $2 the states that
+// may move to superseded, derived from patch.CanTransition.
+const requeueSupersedeFindingsSQL = `UPDATE transcript_findings
+	SET    patch_state = 'superseded', superseded_at = now()
+	WHERE  transcript_id IN (SELECT id FROM transcripts WHERE job_id = ANY($1))
+	  AND  patch_state = ANY($2)`
+
+// requeueDeleteTranscriptsSQL deletes the requeued jobs' transcripts. Chunks
+// cascade; findings keep their row and get transcript_id = NULL (ON DELETE SET
+// NULL). $1 is the requeued job-id array.
+const requeueDeleteTranscriptsSQL = `DELETE FROM transcripts WHERE job_id = ANY($1)`
+
 // requeueDeleteMetricsSQL drops the run_metrics rows for the requeued jobs in the
 // same transaction. run_metrics references transcription_jobs (not transcripts),
 // so deleting the transcript does NOT cascade to it — and requeue UPDATEs the job
 // row rather than deleting it, so the ON DELETE CASCADE never fires either. Left
 // untouched, the run_metrics row describes a now-deleted transcript (orphaned
-// telemetry that mis-reports the new run). $1 is the requeued job-id array.
+// telemetry that mis-reports the new run) and keeps its eval_finished_at latch,
+// so the new transcript would never be judged. $1 is the requeued job-id array.
 const requeueDeleteMetricsSQL = `DELETE FROM run_metrics WHERE job_id = ANY($1)`
 
 // txQuerier is the slice of pgx.Tx used by the requeue core. Both pgx.Tx and
@@ -4171,18 +4183,19 @@ type txQuerier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-// requeue runs a requeuePlan's statements in one transaction: delete the selected
-// transcripts (chunks cascade), reset the jobs to pending, and clear the now-stale
-// run_metrics rows for those jobs. args are the bound parameters for the plan's
-// $N placeholders (one for by-path/by-id/by-dir, none for failed).
-func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]string, error) {
+// requeue runs a requeue in one transaction: reset the selected jobs to pending,
+// archive their transcripts' findings as superseded, delete the transcripts
+// (chunks cascade), and clear the now-stale run_metrics rows. args are the bound
+// parameters for the selector's $N placeholders (one for by-path/by-id/by-dir,
+// none for failed).
+func (db *DB) requeue(ctx context.Context, sel requeueSelector, args ...any) ([]string, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin requeue tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	ids, paths, err := requeueTx(ctx, tx, plan, args...)
+	ids, paths, err := requeueTx(ctx, tx, sel, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -4208,15 +4221,15 @@ func (db *DB) requeue(ctx context.Context, plan requeuePlan, args ...any) ([]str
 }
 
 // requeueTx is the transaction-body core of requeue, split out so the
-// delete-transcripts → reset-jobs → clear-metrics sequence is testable against a
-// pgxmock transaction. It does NOT begin/commit — the caller owns the tx
-// lifecycle. Returns the reset jobs' ids and file paths (parallel slices).
-func requeueTx(ctx context.Context, tx txQuerier, plan requeuePlan, args ...any) (ids, paths []string, err error) {
-	if _, err := tx.Exec(ctx, plan.deleteTranscripts, args...); err != nil {
-		return nil, nil, fmt.Errorf("delete transcripts: %w", err)
-	}
-
-	rows, err := tx.Query(ctx, plan.resetJobs, args...)
+// reset-jobs → supersede-findings → delete-transcripts → clear-metrics sequence
+// is testable against a pgxmock transaction. It does NOT begin/commit — the
+// caller owns the tx lifecycle. Returns the reset jobs' ids and file paths
+// (parallel slices).
+//
+// Resetting first is safe: nothing outside the transaction sees the job as
+// pending until it commits, by which time its transcript is gone too.
+func requeueTx(ctx context.Context, tx txQuerier, sel requeueSelector, args ...any) (ids, paths []string, err error) {
+	rows, err := tx.Query(ctx, sel.resetJobs, args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reset jobs: %w", err)
 	}
@@ -4225,13 +4238,20 @@ func requeueTx(ctx context.Context, tx txQuerier, plan requeuePlan, args ...any)
 	if err != nil {
 		return nil, nil, err
 	}
+	if len(ids) == 0 {
+		return nil, nil, nil
+	}
 
+	if _, err := tx.Exec(ctx, requeueSupersedeFindingsSQL, ids, supersedeFromStates); err != nil {
+		return nil, nil, fmt.Errorf("supersede findings: %w", err)
+	}
+	if _, err := tx.Exec(ctx, requeueDeleteTranscriptsSQL, ids); err != nil {
+		return nil, nil, fmt.Errorf("delete transcripts: %w", err)
+	}
 	// Clear the orphaned run_metrics for the requeued jobs so the next run's
-	// telemetry starts clean. A no-op when nothing was reset.
-	if len(ids) > 0 {
-		if _, err := tx.Exec(ctx, requeueDeleteMetricsSQL, ids); err != nil {
-			return nil, nil, fmt.Errorf("delete run_metrics: %w", err)
-		}
+	// telemetry starts clean and its eval latch is clear.
+	if _, err := tx.Exec(ctx, requeueDeleteMetricsSQL, ids); err != nil {
+		return nil, nil, fmt.Errorf("delete run_metrics: %w", err)
 	}
 	return ids, paths, nil
 }

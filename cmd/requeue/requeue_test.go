@@ -117,3 +117,30 @@ func TestRun_NoMatches(t *testing.T) {
 		t.Errorf("want no-matches message, got:\n%s", out.String())
 	}
 }
+
+// TestRun_PreviewWarnsFindingsAreSuperseded: re-transcribing archives the old
+// transcript's findings, so the preview says so; --reembed keeps the
+// transcript and its findings, so it does not.
+func TestRun_PreviewWarnsFindingsAreSuperseded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		o    options
+		want bool
+	}{
+		{"re-transcribe", options{}, true},
+		{"failed", options{failed: true}, true},
+		{"reembed", options{reembed: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := []db.JobMatch{{ID: "1", FilePath: "/b/Dune.m4b", Status: "failed"}}
+			f := &fakeRequeuer{jobs: m, failed: m}
+			var out strings.Builder
+			if err := run(context.Background(), &out, f, "Dune", tc.o); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if got := strings.Contains(out.String(), "archived as superseded"); got != tc.want {
+				t.Errorf("superseded warning = %v, want %v:\n%s", got, tc.want, out.String())
+			}
+		})
+	}
+}

@@ -94,6 +94,11 @@ var appliedFromStates = append(patch.StatesAllowing(patch.StateApplied), patch.S
 // invalidated by a chunk rebuild).
 var staleFromStates = patch.StatesAllowing(patch.StateStale)
 
+// supersedeFromStates are the states an operator requeue archives from (see
+// requeueSupersedeFindingsSQL): every state but superseded itself, DERIVED from
+// patch.CanTransition like staleFromStates.
+var supersedeFromStates = patch.StatesAllowing(patch.StateSuperseded)
+
 // correctionOverlaySQL selects a transcript's replayable corrections.
 //
 // Read-only. Ordered by (chunk_index, anchor_offset NULLS LAST, id) so the

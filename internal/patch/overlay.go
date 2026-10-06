@@ -16,6 +16,11 @@ var ErrOverlappingPatches = errors.New("patches overlap in the same chunk")
 // Stale reasons. These strings are persisted verbatim into
 // transcript_findings.stale_reason, so they are part of the data contract:
 // change one and existing rows become unreadable.
+//
+// One more value can appear in the column without a constant here:
+// "superseded", written only by the Down of migration 00005, which maps the
+// superseded state (not a stale reason) back onto stale. Readers that label
+// stale reasons should show an unknown value verbatim rather than fail.
 const (
 	// StaleReasonChunkChanged — the chunk no longer hashes to what the judge
 	// reviewed (or the chunk it referenced no longer exists at all).
@@ -312,16 +317,25 @@ func AllStates() []string {
 		StateStale,
 		StateReverted,
 		StateUnanchorable,
+		StateSuperseded,
 	}
 }
 
-// IsMachineTransition reports whether a move belongs to the re-anchor pass
-// rather than a reviewer: into and out of unanchorable. The state machine
-// allows them, but a review surface must not offer them — "reconsider" on an
-// unanchorable finding would put a span with no anchor back in the review
-// queue, and only `earmark reanchor` knows whether it can be placed.
+// isState reports whether s is a known patch state.
+func isState(s string) bool { return slices.Contains(AllStates(), s) }
+
+// IsMachineTransition reports whether a move belongs to a maintenance pass
+// rather than a reviewer:
+//
+//   - into and out of unanchorable — the re-anchor pass. The state machine
+//     allows them, but a review surface must not offer them — "reconsider" on
+//     an unanchorable finding would put a span with no anchor back in the
+//     review queue, and only `earmark reanchor` knows whether it can be placed;
+//   - into superseded — an operator requeue, which archives every finding of
+//     the transcript it replaces in the same transaction that deletes it. A
+//     reviewer cannot supersede one finding of a transcript that still exists.
 func IsMachineTransition(from, to string) bool {
-	return from == StateUnanchorable || to == StateUnanchorable
+	return from == StateUnanchorable || to == StateUnanchorable || to == StateSuperseded
 }
 
 // StatesAllowing returns every state that may legally transition to `to`,

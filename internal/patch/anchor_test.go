@@ -128,6 +128,8 @@ func TestCanTransition(t *testing.T) {
 		{StateApplied, StateStale},
 		{StateProposed, StateUnanchorable},
 		{StateUnanchorable, StateProposed},
+		// a requeue archives a parked finding like any other
+		{StateUnanchorable, StateSuperseded},
 	}
 	for _, tc := range legal {
 		if !CanTransition(tc.from, tc.to) {
@@ -155,11 +157,40 @@ func TestCanTransition(t *testing.T) {
 		{StateRejected, StateUnanchorable},
 		{StateReverted, StateUnanchorable},
 		{StateStale, StateUnanchorable},
+		// superseded is terminal: a re-anchor never revives an archived finding.
+		{StateSuperseded, StateUnanchorable},
+		{StateSuperseded, StateProposed},
 	}
 	for _, tc := range illegal {
 		if CanTransition(tc.from, tc.to) {
 			t.Errorf("%s -> %s should be illegal", tc.from, tc.to)
 		}
+	}
+}
+
+// TestCanTransitionSuperseded pins the requeue archive state: every known state
+// (human decisions included) may be archived, and nothing leaves it — the
+// replacement transcript is judged fresh, so a superseded finding is never
+// resurrected or replayed.
+func TestCanTransitionSuperseded(t *testing.T) {
+	for _, from := range AllStates() {
+		want := from != StateSuperseded
+		if got := CanTransition(from, StateSuperseded); got != want {
+			t.Errorf("%s -> superseded = %v, want %v", from, got, want)
+		}
+		if CanTransition(StateSuperseded, from) {
+			t.Errorf("superseded -> %s should be illegal (terminal)", from)
+		}
+	}
+	if CanTransition("nonsense", StateSuperseded) {
+		t.Error("an unknown state must not be archivable")
+	}
+	if !slices.Contains(AllStates(), StateSuperseded) {
+		t.Error("AllStates must list superseded so the DB derives it")
+	}
+	// StatesAllowing is what requeue's UPDATE filters on: every state but itself.
+	if got, want := len(StatesAllowing(StateSuperseded)), len(AllStates())-1; got != want {
+		t.Errorf("StatesAllowing(superseded) has %d states, want %d", got, want)
 	}
 }
 
@@ -179,8 +210,10 @@ func TestUnanchorableIsNeverAppliable(t *testing.T) {
 			next = append(next, s)
 		}
 	}
-	if !slices.Equal(next, []string{StateProposed}) {
-		t.Errorf("unanchorable may move to %v, want only [proposed]", next)
+	// proposed (a re-anchor placed it) or superseded (a requeue archived its
+	// transcript) — never a reviewer's accept/apply.
+	if !slices.Equal(next, []string{StateProposed, StateSuperseded}) {
+		t.Errorf("unanchorable may move to %v, want only [proposed superseded]", next)
 	}
 }
 
@@ -194,6 +227,10 @@ func TestIsMachineTransition(t *testing.T) {
 		{StateProposed, StateAccepted, false},
 		{StateRejected, StateProposed, false},
 		{StateReverted, StateProposed, false},
+		// requeue's archive is never a reviewer's move, from any state
+		{StateProposed, StateSuperseded, true},
+		{StateAccepted, StateSuperseded, true},
+		{StateUnanchorable, StateSuperseded, true},
 	} {
 		if got := IsMachineTransition(tc.from, tc.to); got != tc.want {
 			t.Errorf("IsMachineTransition(%s, %s) = %v, want %v", tc.from, tc.to, got, tc.want)
@@ -209,5 +246,25 @@ func TestChunkHashIsStable(t *testing.T) {
 	}
 	if changed := ChunkHash(text + "!"); first == changed {
 		t.Error("hash does not distinguish different text")
+	}
+}
+
+// TestUnanchorableAndSupersededCompose pins how the two maintenance states
+// (re-anchor's unanchorable, requeue's superseded) meet: requeue archives a
+// parked finding, the re-anchor pass can never reach an archived one, and
+// neither state is ever retired to stale by a chunk rebuild.
+func TestUnanchorableAndSupersededCompose(t *testing.T) {
+	if !slices.Contains(StatesAllowing(StateSuperseded), StateUnanchorable) {
+		t.Errorf("StatesAllowing(superseded) = %v: requeue must archive unanchorable findings too",
+			StatesAllowing(StateSuperseded))
+	}
+	if got := StatesAllowing(StateUnanchorable); !slices.Equal(got, []string{StateProposed}) {
+		t.Errorf("StatesAllowing(unanchorable) = %v, want [proposed]", got)
+	}
+	if got := StatesAllowing(StateStale); slices.Contains(got, StateUnanchorable) || slices.Contains(got, StateSuperseded) {
+		t.Errorf("StatesAllowing(stale) = %v: neither unanchorable nor superseded may be retired by a rebuild", got)
+	}
+	if got := StatesAllowing(StateProposed); slices.Contains(got, StateSuperseded) {
+		t.Errorf("StatesAllowing(proposed) = %v includes superseded (terminal)", got)
 	}
 }

@@ -144,8 +144,12 @@ const maxCorrectionListLimit = 200
 //
 // It selects COALESCE(c.source_text, c.text): the PRISTINE chunk, the same text
 // the judge was shown and the same text replay resolves anchors against.
+//
+// transcript_id is NULL for a superseded finding whose transcript a requeue
+// replaced (ON DELETE SET NULL, CONTRACT §1.4); it reads as "" so the row still
+// lists — the audit view of what was proposed and decided on the old text.
 var listCorrectionsSQL = `
-	SELECT f.id, f.transcript_id, f.file_path,
+	SELECT f.id, COALESCE(f.transcript_id::text, '') AS transcript_id, f.file_path,
 	       regexp_replace(f.file_path, '/[^/]+$', '') AS book_dir,
 	       f.chunk_id, f.chunk_index, f.start_sec, f.end_sec,
 	       f.original_text, f.suggested_correction, f.issue_type, f.confidence,
