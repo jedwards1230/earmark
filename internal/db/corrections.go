@@ -445,9 +445,10 @@ func (db *DB) SetPatchState(ctx context.Context, id, from, to, decidedBy string)
 }
 
 func (db *DB) setPatchState(ctx context.Context, b txBeginner, id, from, to, decidedBy string) error {
-	// The re-anchor pass's own moves (proposed <-> unanchorable) are legal in
-	// the state machine but never a decision: only `earmark reanchor`, which
-	// knows whether the span can be placed, may make them.
+	// Maintenance moves are legal in the state machine but never a decision:
+	// proposed <-> unanchorable belongs to `earmark reanchor`, which knows
+	// whether the span can be placed, and any -> superseded to a requeue, which
+	// archives every finding of a transcript in the transaction that deletes it.
 	if !patch.CanTransition(from, to) || patch.IsMachineTransition(from, to) {
 		return fmt.Errorf("%w: %s -> %s (finding %s)", ErrIllegalTransition, from, to, id)
 	}

@@ -119,18 +119,28 @@ func TestIntegrationRequeueSupersedesFindings(t *testing.T) {
 			dbURL, d := migratedTestDB(t)
 			seedRequeueRows(t, dbURL)
 			conn := connect(t, dbURL)
+			// A finding the re-anchor pass parked (migration 4) is archived like
+			// any other; the reason column is legal only on unanchorable rows, so
+			// the supersede must clear it or the CHECK aborts the requeue.
+			if _, err := conn.Exec(ctx, `INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec,
+				original_text, issue_type, suggested_correction, confidence, model, origin, patch_state, unanchorable_reason)
+				VALUES ($1, '/b/Author/A/01.m4b', 0, 30, 'ganema', 'misheard_proper_noun', 'Ghanima', 0.9,
+				        'gemma3:12b', 'judge', 'unanchorable', 'anchor_ambiguous')`, rqTranscriptA); err != nil {
+				t.Fatal(err)
+			}
 
 			if err := requeue(ctx, d); err != nil {
 				t.Fatalf("requeue: %v", err)
 			}
 
-			if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings WHERE file_path LIKE '/b/Author/A/%'`); n != 7 {
-				t.Errorf("book A has %d findings after requeue, want all 7 kept", n)
+			if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings WHERE file_path LIKE '/b/Author/A/%'`); n != 8 {
+				t.Errorf("book A has %d findings after requeue, want all 8 kept", n)
 			}
 			if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
 				WHERE file_path LIKE '/b/Author/A/%'
-				  AND (patch_state <> 'superseded' OR superseded_at IS NULL OR transcript_id IS NOT NULL)`); n != 0 {
-				t.Errorf("%d book-A findings not archived (want superseded, stamped, transcript_id NULL)", n)
+				  AND (patch_state <> 'superseded' OR superseded_at IS NULL OR transcript_id IS NOT NULL
+				       OR unanchorable_reason IS NOT NULL)`); n != 0 {
+				t.Errorf("%d book-A findings not archived (want superseded, stamped, transcript_id NULL, no reason)", n)
 			}
 			if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
 				WHERE origin = 'human' AND patch_state = 'superseded'`); n != 1 {
@@ -182,8 +192,18 @@ func TestIntegrationRequeueSupersedesFindings(t *testing.T) {
 			if err != nil {
 				t.Fatalf("list superseded: %v", err)
 			}
-			if len(rows) != 7 {
-				t.Errorf("listed %d superseded findings, want 7", len(rows))
+			if len(rows) != 8 {
+				t.Errorf("listed %d superseded findings, want 8", len(rows))
+			}
+
+			// The re-anchor pass never sees an archived finding: superseded is
+			// out of scope and its transcript_id is NULL.
+			rep, err := d.Reanchor(ctx, ReanchorScope{}, true)
+			if err != nil {
+				t.Fatalf("reanchor after requeue: %v", err)
+			}
+			if sum := rep.Sum(); sum.Total != 1 {
+				t.Errorf("reanchor examined %d findings after requeue, want only book B's 1", sum.Total)
 			}
 		})
 	}
@@ -345,9 +365,10 @@ func TestIntegrationStaleWorkSkipsSuperseded(t *testing.T) {
 // TestIntegrationMigrationArchivesOrphans: migrating a database that already
 // holds orphaned findings (from requeues before the foreign key) archives them
 // as superseded with a NULL transcript_id and adds a VALIDATED foreign key. It
-// also rebuilds the patch_state CHECK from the list it finds — a state another
-// migration added (here simulated as 'unanchorable') survives — and its Down
-// reverts cleanly.
+// rebuilds the patch_state CHECK from the list it finds, so 00004's
+// 'unanchorable' survives; an orphan parked unanchorable by 00004's re-anchor
+// pass is archived too, its unanchorable_reason cleared (00004 allows the
+// reason only on unanchorable rows). Down 5 then Down 4 revert cleanly.
 func TestIntegrationMigrationArchivesOrphans(t *testing.T) {
 	ctx := context.Background()
 	dbURL := newTestDatabase(t)
@@ -370,13 +391,14 @@ func TestIntegrationMigrationArchivesOrphans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.UpTo(ctx, 3); err != nil {
-		t.Fatalf("up to 3: %v", err)
+	if _, err := provider.UpTo(ctx, 4); err != nil {
+		t.Fatalf("up to 4: %v", err)
 	}
-	// A sibling migration widens the CHECK before 00005 runs.
-	if _, err := conn.Exec(ctx, `ALTER TABLE transcript_findings DROP CONSTRAINT transcript_findings_patch_state_valid;
-		ALTER TABLE transcript_findings ADD CONSTRAINT transcript_findings_patch_state_valid
-		  CHECK (patch_state IN ('proposed','accepted','rejected','applied','stale','reverted','unanchorable'))`); err != nil {
+	// An orphan the re-anchor pass parked (possible before the FK existed).
+	if _, err := conn.Exec(ctx, `INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec,
+		original_text, issue_type, confidence, model, patch_state, unanchorable_reason)
+		VALUES ('00000000-0000-0000-0000-0000000000fe', '/b/gone-parked.m4b', 0, 1, 'y', 'other', 0.5, 'm',
+		        'unanchorable', 'anchor_ambiguous')`); err != nil {
 		t.Fatal(err)
 	}
 	if err := migrate(itCtx(t), dbURL, testLog()); err != nil {
@@ -384,8 +406,9 @@ func TestIntegrationMigrationArchivesOrphans(t *testing.T) {
 	}
 
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
-		WHERE file_path = '/b/gone.m4b' AND transcript_id IS NULL AND patch_state = 'superseded'`); n != 1 {
-		t.Error("orphaned finding was not archived as superseded with a NULL transcript_id")
+		WHERE file_path IN ('/b/gone.m4b', '/b/gone-parked.m4b')
+		  AND transcript_id IS NULL AND patch_state = 'superseded' AND unanchorable_reason IS NULL`); n != 2 {
+		t.Errorf("%d of 2 orphaned findings archived as superseded with a NULL transcript_id and no reason", n)
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
 		WHERE patch_state = 'proposed' AND transcript_id IS NOT NULL`); n != 5 {
@@ -399,35 +422,60 @@ func TestIntegrationMigrationArchivesOrphans(t *testing.T) {
 		WHERE conname = 'transcript_findings_null_transcript_superseded' AND convalidated`); n != 1 {
 		t.Error("null-transcript CHECK missing or not validated")
 	}
-	var def string
-	if err := conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint
-		WHERE conname = 'transcript_findings_patch_state_valid'`).Scan(&def); err != nil {
-		t.Fatal(err)
+	stateCheck := func() string {
+		t.Helper()
+		var def string
+		if err := conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint
+			WHERE conname = 'transcript_findings_patch_state_valid'`).Scan(&def); err != nil {
+			t.Fatal(err)
+		}
+		return def
 	}
+	def := stateCheck()
 	for _, s := range []string{"proposed", "accepted", "rejected", "applied", "stale", "reverted", "unanchorable", "superseded"} {
 		if !strings.Contains(def, "'"+s+"'") {
 			t.Errorf("patch_state CHECK lost %q: %s", s, def)
 		}
 	}
 
-	// Down: superseded → stale, CHECK without superseded, FK gone; the column
-	// stays nullable because the archived orphan has no transcript.
-	if _, err := provider.DownTo(ctx, 3); err != nil {
-		t.Fatalf("down to 3: %v", err)
+	// Down 5: superseded → stale, CHECK without superseded but still with
+	// 00004's unanchorable, FK gone; the column stays nullable because the
+	// archived orphans have no transcript.
+	if _, err := provider.DownTo(ctx, 4); err != nil {
+		t.Fatalf("down to 4: %v", err)
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
-		WHERE file_path = '/b/gone.m4b' AND patch_state = 'stale' AND stale_reason = 'superseded'`); n != 1 {
-		t.Error("Down did not map superseded to stale")
+		WHERE file_path IN ('/b/gone.m4b', '/b/gone-parked.m4b')
+		  AND patch_state = 'stale' AND stale_reason = 'superseded'`); n != 2 {
+		t.Errorf("Down mapped %d of 2 superseded findings to stale", n)
 	}
-	if err := conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint
-		WHERE conname = 'transcript_findings_patch_state_valid'`).Scan(&def); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(def, "superseded") || !strings.Contains(def, "unanchorable") {
-		t.Errorf("Down CHECK = %s", def)
+	if def := stateCheck(); strings.Contains(def, "superseded") || !strings.Contains(def, "'unanchorable'") {
+		t.Errorf("Down 5 CHECK = %s, want 00004's list (unanchorable, no superseded)", def)
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM pg_constraint WHERE conname IN
 		('transcript_findings_transcript_id_fkey', 'transcript_findings_null_transcript_superseded')`); n != 0 {
 		t.Error("Down kept the foreign key or the null-transcript CHECK")
+	}
+
+	// Down 4 on top: the pre-0b CHECK, and the re-anchor columns gone.
+	if _, err := provider.DownTo(ctx, 3); err != nil {
+		t.Fatalf("down to 3: %v", err)
+	}
+	if def := stateCheck(); strings.Contains(def, "unanchorable") || strings.Contains(def, "superseded") {
+		t.Errorf("Down 4 CHECK = %s, want the six pre-0b states", def)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM information_schema.columns
+		WHERE table_name = 'transcript_findings'
+		  AND column_name IN ('unanchorable_reason', 'reanchored_at', 'superseded_at')`); n != 0 {
+		t.Errorf("%d re-anchor/requeue columns survived Down to 3", n)
+	}
+	// And forward again: the full chain re-applies over the Down'd data.
+	// The rows Down left without a transcript are archived again.
+	if err := migrate(itCtx(t), dbURL, testLog()); err != nil {
+		t.Fatalf("re-migrate after down: %v", err)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
+		WHERE transcript_id IS NULL AND patch_state = 'superseded'`); n != 2 {
+		t.Errorf("re-migrate re-archived %d of 2 transcript-less findings", n)
 	}
 }

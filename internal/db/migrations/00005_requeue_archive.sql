@@ -47,9 +47,17 @@
 -- process retries the migration on its next start).
 --
 -- The patch_state CHECK is rebuilt from its CURRENT value list plus
--- 'superseded', rather than restated. Another migration in flight adds its own
--- state to the same constraint; restating the list here would silently drop
--- that state again, depending only on which file sorts last.
+-- 'superseded', rather than restated, so it keeps 'unanchorable' (added by
+-- 00004) and any state a later migration adds before this Down runs. After Up
+-- the list is proposed, accepted, rejected, applied, stale, reverted,
+-- unanchorable, superseded; Down removes only 'superseded', leaving 00004's
+-- list for 00004's own Down to narrow.
+--
+-- unanchorable (00004) and superseded compose: a requeue archives an
+-- unanchorable finding like any other, clearing unanchorable_reason (00004
+-- requires it set exactly when patch_state = 'unanchorable'); the orphan
+-- archive below does the same. Down maps superseded onto stale, which 00004's
+-- Down leaves alone, so Down 5 followed by Down 4 is coherent.
 
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
@@ -87,11 +95,15 @@ END $$;
 
 SELECT pg_temp.set_patch_states('superseded', NULL);
 
+-- A NULL transcript_id exists only on a database this migration was rolled back
+-- on (Down keeps the archived rows, as 'stale', with no transcript): they are
+-- archived again, or the CHECK below could not be added.
 UPDATE transcript_findings f
-   SET transcript_id = NULL,
-       patch_state   = 'superseded'
- WHERE f.transcript_id IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.id = f.transcript_id);
+   SET transcript_id       = NULL,
+       patch_state         = 'superseded',
+       unanchorable_reason = NULL
+ WHERE f.transcript_id IS NULL
+    OR NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.id = f.transcript_id);
 
 ALTER TABLE transcript_findings
     ADD CONSTRAINT transcript_findings_transcript_id_fkey

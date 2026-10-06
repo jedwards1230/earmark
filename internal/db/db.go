@@ -4183,9 +4183,13 @@ const requeueLockTranscriptsSQL = `SELECT 1 FROM transcripts WHERE job_id = ANY(
 // same way — never deleted. It must run BEFORE the delete: the foreign key's ON
 // DELETE SET NULL clears transcript_id, after which the findings can no longer
 // be found by transcript. $1 is the requeued job-id array; $2 the states that
-// may move to superseded, derived from patch.CanTransition.
+// may move to superseded, derived from patch.CanTransition — unanchorable
+// included: a parked finding describes the replaced text as much as any other.
+// Its unanchorable_reason is cleared because the database requires it to be
+// set exactly when patch_state = 'unanchorable'
+// (transcript_findings_unanchorable_reason_iff_state, migration 4).
 const requeueSupersedeFindingsSQL = `UPDATE transcript_findings
-	SET    patch_state = 'superseded', superseded_at = now()
+	SET    patch_state = 'superseded', superseded_at = now(), unanchorable_reason = NULL
 	WHERE  transcript_id IN (SELECT id FROM transcripts WHERE job_id = ANY($1))
 	  AND  patch_state = ANY($2)`
 
