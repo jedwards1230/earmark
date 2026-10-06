@@ -37,22 +37,25 @@ var opts options
 var ReanchorCmd = &cobra.Command{
 	Use:   "reanchor [flags]",
 	Short: "Re-anchor proposed findings to the current chunks (dry-run unless --yes)",
-	Long: `Re-chunking gives every chunk a new id, so findings recorded before it name
-text the projection no longer has; replayed as they are, they go stale, which
-is terminal. reanchor finds each proposed (or unanchorable) finding's span in
-the transcript's current pristine chunks — word-bounded, case-sensitive,
-named chunk first, then the chunks covering its audio window, then the whole
-transcript — and:
+	Long: `Re-chunking regenerates every chunk, so the same index can hold different
+text and findings recorded before it describe text the projection no longer
+has; replayed as they are, they go stale, which is terminal. reanchor finds
+each proposed (or unanchorable) finding's span in the transcript's current
+pristine chunks — word-bounded, case-sensitive — searching the named chunk if
+it is unchanged, otherwise every chunk covering the finding's judged audio
+window as one text (so a span straddling two chunks still counts), and:
 
-  one match       re-anchors it (chunk_id, chunk hash, rune offset, occurrence)
-  several matches marks it unanchorable (anchor_ambiguous) — never guessed
-  no match        marks it unanchorable (anchor_not_found)
+  one candidate   re-anchors it (chunk_id, chunk hash, rune offset, occurrence)
+  several         marks it unanchorable (anchor_ambiguous) — never guessed
+  none, or only a boundary-straddling one
+                  marks it unanchorable (anchor_not_found)
 
 unanchorable is not terminal: run reanchor again after the next re-chunk and
 anything it can now place returns to proposed. Findings a human has decided
 (accepted, applied, rejected, reverted) and stale ones are never touched.
 
-Without --yes nothing is written; the preview counts each outcome by model era.
+Without --yes no finding is written; the preview counts each outcome by model
+era. (Like every command it applies pending schema migrations on connect.)
 With --yes each batch of transcripts is one transaction that locks its findings
 FOR UPDATE SKIP LOCKED and its chunks FOR SHARE, so it cannot race a review
 decision or the worker's rebuild. Safe to re-run.

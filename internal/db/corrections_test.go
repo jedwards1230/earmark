@@ -518,6 +518,9 @@ func TestSetPatchState_RejectsIllegalTransitions(t *testing.T) {
 		{patch.StateStale, patch.StateProposed},
 		{patch.StateApplied, patch.StateAccepted},
 		{"nonsense", patch.StateAccepted},
+		// Legal in the state machine, but only the re-anchor pass makes them.
+		{patch.StateProposed, patch.StateUnanchorable},
+		{patch.StateUnanchorable, patch.StateProposed},
 	}
 	for _, tc := range illegal {
 		t.Run(tc.from+"->"+tc.to, func(t *testing.T) {

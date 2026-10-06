@@ -15,16 +15,18 @@ import (
 //
 // A finding's anchor (chunk_id, chunk_text_sha256, anchor_offset,
 // anchor_occurrence) names one revision of one chunk. Re-chunking regenerates
-// every chunk under a new id, so every finding recorded before it points at
-// text the projection no longer has, and the first rebuild that replays it
+// every chunk: the same index can now hold different text, under the same
+// deterministic id or a new one — the hash, not the id, proves an anchor
+// current. Every finding recorded before it points at text the projection no
+// longer has, and the first rebuild that replays it
 // retires it as stale — terminally. This pass finds each finding's span in the
 // transcript's CURRENT pristine chunks (patch.Reanchor) and records a fresh
 // anchor there, or parks the finding as `unanchorable` (non-terminal) when the
 // span is missing or ambiguous.
 //
 // It writes ONLY transcript_findings: anchor columns, the chunk it now names
-// (chunk_id, chunk_index and that chunk's start_sec/end_sec, read FROM the
-// chunk row), patch_state between proposed and unanchorable, and the
+// (chunk_id, chunk_index, read FROM the chunk row — the judged window
+// start_sec/end_sec is kept), patch_state between proposed and unanchorable, and the
 // reanchored_at/unanchorable_reason audit columns. It never touches chunk text,
 // embedding_stale or the transcripts table, and it never moves a finding a
 // human has decided: only proposed and unanchorable rows are in scope.
@@ -177,7 +179,11 @@ var reanchorChunksLockSQL = reanchorChunksSQL + `	FOR SHARE
 
 // reanchorWriteSQL records a fresh anchor.
 //
-// The chunk's identity and timing come FROM THE CHUNK ROW, and the statement
+// start_sec/end_sec are deliberately NOT rewritten: they are the audio window
+// of the chunk the judge saw, the evidence the next re-anchor (after the next
+// re-chunk) searches by. The chunk's own timing is one join away via chunk_id.
+//
+// The chunk's identity comes FROM THE CHUNK ROW, and the statement
 // re-checks the chunk's pristine-text hash in SQL: if the chunk was rebuilt
 // after it was read, zero rows match and the finding is left for the next run
 // rather than anchored to text nobody verified. `patch_state = $2` is the
@@ -186,8 +192,6 @@ var reanchorWriteSQL = `
 	UPDATE transcript_findings f
 	SET chunk_id            = c.id,
 	    chunk_index         = c.chunk_index,
-	    start_sec           = c.start_sec,
-	    end_sec             = c.end_sec,
 	    chunk_text_sha256   = $4,
 	    anchor_offset       = $5,
 	    anchor_occurrence   = $6,

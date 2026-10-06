@@ -440,7 +440,10 @@ func (db *DB) SetPatchState(ctx context.Context, id, from, to, decidedBy string)
 }
 
 func (db *DB) setPatchState(ctx context.Context, b txBeginner, id, from, to, decidedBy string) error {
-	if !patch.CanTransition(from, to) {
+	// The re-anchor pass's own moves (proposed <-> unanchorable) are legal in
+	// the state machine but never a decision: only `earmark reanchor`, which
+	// knows whether the span can be placed, may make them.
+	if !patch.CanTransition(from, to) || patch.IsMachineTransition(from, to) {
 		return fmt.Errorf("%w: %s -> %s (finding %s)", ErrIllegalTransition, from, to, id)
 	}
 

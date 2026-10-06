@@ -247,7 +247,7 @@ func (d demoDB) GetChunkForEdit(_ context.Context, chunkID string) (*db.ChunkTar
 // expected state. A demo that accepted anything would teach an agent the wrong
 // thing about the tool.
 func (d demoDB) SetPatchState(_ context.Context, id, from, to, decidedBy string) error {
-	if !patch.CanTransition(from, to) {
+	if !patch.CanTransition(from, to) || patch.IsMachineTransition(from, to) {
 		return fmt.Errorf("%w: %s -> %s (finding %s)", db.ErrIllegalTransition, from, to, id)
 	}
 	s := demoCorrections()

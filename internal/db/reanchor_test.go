@@ -92,7 +92,7 @@ func expectReanchorBatch(mock pgxmock.PgxPoolIface, lock bool) {
 
 	rows := pgxmock.NewRows(findingCols)
 	findingRow(rows, "f-unique", "gemma3:12b", patch.StateProposed, "ganema", 0, 0, 30, "")
-	findingRow(rows, "f-moved", "gemma3:12b", patch.StateProposed, "Chani", 0, 0, 30, "")
+	findingRow(rows, "f-moved", "gemma3:12b", patch.StateProposed, "Chani", 0, 0, 90, "")
 	findingRow(rows, "f-ambig", "gemma3:12b", patch.StateProposed, "the fox", 1, 30, 60, "")
 	findingRow(rows, "f-none", "qwen3.8", patch.StateProposed, "zzz", 0, 0, 30, "")
 	findingRow(rows, "f-parked", "qwen3.8", patch.StateUnanchorable, "zzz", 0, 0, 30, patch.UnanchorableNotFound)

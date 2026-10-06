@@ -1,8 +1,9 @@
 -- 00004_unanchorable.sql — the unanchorable patch state and re-anchor audit
 -- columns (CONTRACT §2.17 "Re-anchoring").
 --
--- Re-chunking gives every chunk a new id and shifts its boundaries, so a
--- finding recorded before it names a chunk that no longer exists. `earmark
+-- Re-chunking regenerates every chunk: the same index can hold different text
+-- (under the same deterministic id or a new one), so a finding recorded before
+-- it names text that no longer exists. `earmark
 -- reanchor` finds the span in the current pristine chunks and records a fresh
 -- anchor (chunk_id, chunk_index, chunk_text_sha256, anchor_offset,
 -- anchor_occurrence — the existing anchor columns). A finding it cannot place
@@ -19,6 +20,10 @@
 -- Readers that don't know the new state simply never ask for it.
 
 -- +goose Up
+-- The CHECK swap takes ACCESS EXCLUSIVE on transcript_findings (~7 ms on 33k
+-- rows). Fail fast rather than queue behind a long reader and stall every
+-- query that lines up behind this one; the next boot retries.
+SET LOCAL lock_timeout = '5s';
 ALTER TABLE transcript_findings
     ADD COLUMN unanchorable_reason TEXT,
     ADD COLUMN reanchored_at       TIMESTAMPTZ;
@@ -35,6 +40,7 @@ ALTER TABLE transcript_findings
         CHECK ((patch_state = 'unanchorable') = (unanchorable_reason IS NOT NULL));
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 -- An unanchorable finding goes back to the review queue it came from, so the
 -- narrower CHECK can be restored.
 UPDATE transcript_findings

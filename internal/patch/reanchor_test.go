@@ -73,12 +73,18 @@ func TestReanchor(t *testing.T) {
 			legacy("Stilgar", 2, 60, 90), OutcomeUnique, "c2", 0, 1},
 		{"moved: the audio window decides before the whole transcript",
 			legacy("Stilgar", 1, 30, 90), OutcomeMoved, "c2", 0, 1},
-		{"moved: anywhere in the transcript when the window has nothing",
-			legacy("Chani", 0, 0, 30), OutcomeMoved, "c4", 20, 1},
+		{"a match outside the judged window is a different place",
+			legacy("Chani", 0, 0, 30), OutcomeNone, "", 0, 0},
 		{"ambiguous in the named chunk is never guessed",
 			legacy("the fox", 1, 30, 60), OutcomeAmbiguous, "", 0, 2},
-		{"ambiguous across the transcript is never guessed",
-			legacy("Stilgar", 0, 0, 30), OutcomeAmbiguous, "", 0, 2},
+		{"matches only outside the window are not candidates",
+			legacy("Stilgar", 0, 0, 30), OutcomeNone, "", 0, 0},
+		{"named chunk gets no preference over another window chunk",
+			legacy("Stilgar", 2, 60, 150), OutcomeAmbiguous, "", 0, 2},
+		{"no window: named chunk, then the whole transcript",
+			legacy("Chani", 0, 0, 0), OutcomeMoved, "c4", 20, 1},
+		{"no window: ambiguous across the transcript",
+			legacy("Stilgar", 0, 0, 0), OutcomeAmbiguous, "", 0, 2},
 		{"ambiguous within the window", legacy("Stilgar", 3, 60, 150), OutcomeAmbiguous, "", 0, 2},
 		{"word boundary: substring of a word is none", legacy("gan", 0, 0, 30), OutcomeNone, "", 0, 0},
 		{"case: a case-changed span is none", legacy("Ganema", 0, 0, 30), OutcomeNone, "", 0, 0},
@@ -87,6 +93,10 @@ func TestReanchor(t *testing.T) {
 		{"named chunk index no longer exists", legacy("rock", 9, 60, 90), OutcomeMoved, "c2", 22, 1},
 		{"named chunk now covers other audio: its match is not the judged span",
 			legacy("Stilgar", 4, 60, 90), OutcomeMoved, "c2", 0, 1},
+		{"unchanged named chunk is the judged text: decisive despite window copies",
+			ReanchorFinding{OriginalText: "Stilgar", ChunkID: "old-id", ChunkIndex: idx(2), StartSec: 60, EndSec: 150,
+				ChunkHash: ChunkHash("Stilgar waited by the rock."), Offset: -1, Occurrence: -1},
+			OutcomeUnique, "c2", 0, 1},
 		{"unchanged named chunk: a misquoted span is not moved elsewhere",
 			ReanchorFinding{OriginalText: "Chani", ChunkID: "c2", ChunkIndex: idx(2), StartSec: 60, EndSec: 90,
 				ChunkHash: ChunkHash("Stilgar waited by the rock."), Offset: -1, Occurrence: -1},
@@ -121,6 +131,39 @@ func TestReanchor(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestReanchorWindowStraddle: the window's chunks are searched as one text
+// joined with " ", so an occurrence straddling a chunk boundary is a
+// candidate. Alone it cannot be anchored to one chunk (none); next to another
+// copy it makes the finding ambiguous instead of letting the copy win.
+func TestReanchorWindowStraddle(t *testing.T) {
+	chunks := []ReanchorChunk{
+		{ID: "c0", Index: 0, StartSec: 0, EndSec: 10, Text: "they met Duncan"},
+		{ID: "c1", Index: 1, StartSec: 10, EndSec: 20, Text: "Idaho at dawn."},
+		{ID: "c2", Index: 2, StartSec: 20, EndSec: 30, Text: "Later Duncan Idaho slept."},
+	}
+	cases := []struct {
+		name       string
+		f          ReanchorFinding
+		outcome    string
+		candidates int
+	}{
+		{"lone straddler is none", legacy("Duncan Idaho", 0, 5, 15), OutcomeNone, 1},
+		{"straddler plus a copy in a window chunk is ambiguous", legacy("Duncan Idaho", 0, 5, 25), OutcomeAmbiguous, 2},
+		{"a copy inside one chunk alone re-anchors", legacy("Duncan Idaho", 0, 22, 28), OutcomeMoved, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Reanchor(tc.f, chunks)
+			if got.Outcome != tc.outcome || got.Candidates != tc.candidates {
+				t.Fatalf("outcome %s (%d candidates), want %s (%d)", got.Outcome, got.Candidates, tc.outcome, tc.candidates)
+			}
+		})
+	}
+	if got := Reanchor(legacy("Duncan Idaho", 0, 22, 28), chunks); got.Chunk.ID != "c2" || got.Offset != 6 {
+		t.Errorf("anchored to %s@%d, want c2@6", got.Chunk.ID, got.Offset)
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 const (
 	raT1 = "00000000-0000-0000-0000-0000000000a1"
 	raT2 = "00000000-0000-0000-0000-0000000000b1"
+	raT3 = "00000000-0000-0000-0000-0000000000d1"
 
 	raC0 = "00000000-0000-0000-0000-0000000000c0"
 	raC1 = "00000000-0000-0000-0000-0000000000c1"
@@ -33,9 +34,9 @@ const (
 
 	fUnique       = "00000000-0000-0000-0000-0000000000f1"
 	fMovedWindow  = "00000000-0000-0000-0000-0000000000f2"
-	fMovedAnywhr  = "00000000-0000-0000-0000-0000000000f3"
+	fOutsideWinA  = "00000000-0000-0000-0000-0000000000f3"
 	fAmbigNamed   = "00000000-0000-0000-0000-0000000000f4"
-	fAmbigAnywhr  = "00000000-0000-0000-0000-0000000000f5"
+	fOutsideWinB  = "00000000-0000-0000-0000-0000000000f5"
 	fSubword      = "00000000-0000-0000-0000-0000000000f6"
 	fCase         = "00000000-0000-0000-0000-0000000000f7"
 	fPunct        = "00000000-0000-0000-0000-0000000000f8"
@@ -46,6 +47,10 @@ const (
 	fPending      = "00000000-0000-0000-0000-0000000000e4"
 	fMisquoted    = "00000000-0000-0000-0000-0000000000e5"
 	fOutOfWindow  = "00000000-0000-0000-0000-0000000000e6"
+	fWindowAmbig  = "00000000-0000-0000-0000-0000000000e7"
+	fWindowless   = "00000000-0000-0000-0000-0000000000e8"
+	fStraddle     = "00000000-0000-0000-0000-0000000000e9"
+	fDecoy        = "00000000-0000-0000-0000-0000000000ea"
 )
 
 // Pristine chunk text (source_text). Chunk 0's corrected surface (text)
@@ -91,9 +96,9 @@ func seedReanchor(t *testing.T, d *DB) {
 		  -- gemma era: dead chunk id, no hash/offset, timings of the OLD chunking
 		  ('`+fUnique+`',      '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'ganema',  'misheard_proper_noun', 'Ghanima', 0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
 		  ('`+fMovedWindow+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 1, 30, 90, 'Stilgar', 'misheard_proper_noun', 'Stilgar', 0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
-		  ('`+fMovedAnywhr+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'Chani',   'misheard_proper_noun', 'Chani',   0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
+		  ('`+fOutsideWinA+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'Chani',   'misheard_proper_noun', 'Chani',   0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
 		  ('`+fAmbigNamed+`',  '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 1, 30, 60, 'the fox', 'misheard_word',        'a fox',   0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
-		  ('`+fAmbigAnywhr+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'Stilgar', 'misheard_proper_noun', 'Stilgar', 0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
+		  ('`+fOutsideWinB+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'Stilgar', 'misheard_proper_noun', 'Stilgar', 0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
 		  ('`+fSubword+`',     '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'gan',     'misheard_word',        'gun',     0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
 		  ('`+fCase+`',        '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'Ganema',  'misheard_proper_noun', 'Ghanima', 0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
 		  ('`+fPunct+`',       '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0,  0, 30, 'sietch.', 'misheard_word',        'sietch!', 0.9, 'gemma3:12b', 'proposed', NULL, NULL, NULL),
@@ -112,6 +117,29 @@ func seedReanchor(t *testing.T, d *DB) {
 		  -- a human decision with a dead anchor: out of scope, never touched
 		  ('`+fAccepted+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0, 0, 30, 'ganema', 'misheard_proper_noun', 'Ghanima', 0.9,
 		   'gemma3:12b', 'accepted', NULL, NULL, NULL);
+		-- transcript 3: "Duncan Idaho" straddles the chunk 0/1 boundary inside
+		-- the judged window; a decoy copy sits in chunk 2.
+		INSERT INTO transcription_jobs (id, file_path, checksum, status) VALUES
+		  ('00000000-0000-0000-0000-00000000000d', '/b/Dune/03 God Emperor.m4b', 'c3', 'done');
+		INSERT INTO transcripts (id, job_id, file_path, checksum, language, duration_seconds,
+		                         segments, raw_text, model_name) VALUES
+		  ('`+raT3+`', '00000000-0000-0000-0000-00000000000d', '/b/Dune/03 God Emperor.m4b',
+		   'c3', 'en', 30, '[]', 'x', 'parakeet');
+		INSERT INTO transcript_chunks (transcript_id, file_path, chunk_index, start_sec, end_sec,
+		                               text, source_text, embedding) VALUES
+		  ('`+raT3+`', '/b/Dune/03 God Emperor.m4b', 0,  0, 10, 'they met Duncan', 'they met Duncan', array_fill(0.1, ARRAY[768])::vector),
+		  ('`+raT3+`', '/b/Dune/03 God Emperor.m4b', 1, 10, 20, 'Idaho at dawn.', 'Idaho at dawn.', array_fill(0.1, ARRAY[768])::vector),
+		  ('`+raT3+`', '/b/Dune/03 God Emperor.m4b', 2, 20, 30, 'Later Duncan Idaho slept.', 'Later Duncan Idaho slept.', array_fill(0.1, ARRAY[768])::vector);
+		INSERT INTO transcript_findings (id, transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
+		       original_text, issue_type, suggested_correction, confidence, model) VALUES
+		  -- judged occurrence straddles 0/1: no single chunk can hold it
+		  ('`+fStraddle+`', '`+raT3+`', '/b/Dune/03 God Emperor.m4b', '`+deadChunk+`', 0, 5, 15, 'Duncan Idaho', 'misheard_proper_noun', 'Duncan', 0.9, 'gemma3:12b'),
+		  -- window reaches chunk 2's copy too: straddler + copy = two candidates
+		  ('`+fDecoy+`',    '`+raT3+`', '/b/Dune/03 God Emperor.m4b', '`+deadChunk+`', 0, 5, 25, 'Duncan Idaho', 'misheard_proper_noun', 'Duncan', 0.9, 'gemma3:12b'),
+		  -- transcript 1: the named chunk 2 has one copy, chunk 4 (same window) another
+		  ('`+fWindowAmbig+`', '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 2, 60, 150, 'Stilgar', 'misheard_proper_noun', 'Stilgar', 0.9, 'gemma3:12b'),
+		  -- no usable window: named chunk, then the whole transcript
+		  ('`+fWindowless+`',  '`+raT1+`', '/b/Dune/02 Children of Dune.m4b', '`+deadChunk+`', 0, 0, 0, 'Chani', 'misheard_proper_noun', 'Chani', 0.9, 'gemma3:12b');
 		-- parked by an earlier run, placeable now
 		INSERT INTO transcript_findings (id, transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
 		       original_text, issue_type, suggested_correction, confidence, model, patch_state, unanchorable_reason)
@@ -185,9 +213,11 @@ func TestIntegrationReanchor(t *testing.T) {
 
 	wantFirst := map[string]ReanchorTally{
 		// unique: ganema, "sietch." · moved: Stilgar (window), Stilgar (named
-		// index now out of window), Chani (anywhere)
-		// ambiguous: "the fox" (named), Stilgar (anywhere) · none: gan, Ganema, zzz
-		"gemma3:12b":                          tally(11, 0, 2, 3, 2, 3, 1),
+		// index now out of window), Chani (no window → whole transcript)
+		// ambiguous: "the fox" (named), Stilgar (two window chunks), Duncan
+		// Idaho (straddler + decoy) · none: gan, Ganema, zzz, Chani and
+		// Stilgar (copies only outside the window), Duncan Idaho (lone straddler)
+		"gemma3:12b":                          tally(15, 0, 2, 3, 3, 6, 1),
 		"anthropic/claude-haiku-4-5-20251001": tally(2, 1, 0, 0, 0, 1, 0),
 		"qwen3.8":                             tally(1, 0, 1, 0, 0, 0, 0),
 	}
@@ -212,13 +242,15 @@ func TestIntegrationReanchor(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 	}
 	requireTallies(t, "apply", rep, wantFirst)
-	if rep.Reanchored != 6 || rep.MarkedUnanchorable != 6 || rep.Conflicts != 0 {
-		t.Errorf("apply wrote reanchored=%d unanchorable=%d conflicts=%d, want 6/6/0",
+	if rep.Reanchored != 6 || rep.MarkedUnanchorable != 10 || rep.Conflicts != 0 {
+		t.Errorf("apply wrote reanchored=%d unanchorable=%d conflicts=%d, want 6/10/0",
 			rep.Reanchored, rep.MarkedUnanchorable, rep.Conflicts)
 	}
 
 	// Every re-anchored row now carries an anchor Locate resolves to its span,
-	// against the chunk's PRISTINE text, with the chunk's own identity/timing.
+	// against the chunk's PRISTINE text, with the chunk's own identity — and
+	// still its JUDGED audio window (start/end are the old chunk's, never
+	// rewritten: the next re-anchor searches by them).
 	for id, want := range map[string]struct {
 		chunk, span string
 		idx         int
@@ -226,9 +258,9 @@ func TestIntegrationReanchor(t *testing.T) {
 	}{
 		fUnique:       {raC0, "ganema", 0, 0, 30},
 		fPunct:        {raC0, "sietch.", 0, 0, 30},
-		fMovedWindow:  {raC2, "Stilgar", 2, 60, 90},
+		fMovedWindow:  {raC2, "Stilgar", 2, 30, 90},
 		fOutOfWindow:  {raC2, "Stilgar", 2, 60, 90},
-		fMovedAnywhr:  {raC4, "Chani", 4, 120, 150},
+		fWindowless:   {raC4, "Chani", 4, 0, 0},
 		fUnanchorable: {raC4, "Chani", 4, 120, 150},
 	} {
 		a := readAnchor(t, d, id)
@@ -249,8 +281,11 @@ func TestIntegrationReanchor(t *testing.T) {
 		}
 	}
 	for id, reason := range map[string]string{
-		fAmbigNamed: patch.UnanchorableAmbiguous, fAmbigAnywhr: patch.UnanchorableAmbiguous,
-		fSubword: patch.UnanchorableNotFound, fCase: patch.UnanchorableNotFound, fGone: patch.UnanchorableNotFound,
+		fAmbigNamed: patch.UnanchorableAmbiguous, fWindowAmbig: patch.UnanchorableAmbiguous,
+		fDecoy:       patch.UnanchorableAmbiguous,
+		fOutsideWinA: patch.UnanchorableNotFound, fOutsideWinB: patch.UnanchorableNotFound,
+		fStraddle: patch.UnanchorableNotFound,
+		fSubword:  patch.UnanchorableNotFound, fCase: patch.UnanchorableNotFound, fGone: patch.UnanchorableNotFound,
 	} {
 		a := readAnchor(t, d, id)
 		if a.State != patch.StateUnanchorable || a.Reason != reason || !a.Reanchored {
@@ -281,7 +316,7 @@ func TestIntegrationReanchor(t *testing.T) {
 		t.Errorf("re-run wrote: %+v", rep)
 	}
 	requireTallies(t, "re-run", rep, map[string]ReanchorTally{
-		"gemma3:12b":                          tally(11, 5, 0, 0, 2, 3, 1),
+		"gemma3:12b":                          tally(15, 5, 0, 0, 3, 6, 1),
 		"anthropic/claude-haiku-4-5-20251001": tally(2, 1, 0, 0, 0, 1, 0),
 		"qwen3.8":                             tally(1, 1, 0, 0, 0, 0, 0),
 	})
@@ -341,8 +376,8 @@ func TestIntegrationReanchorSkipsLockedFindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply with a locked row: %v", err)
 	}
-	if got := rep.ByModel["gemma3:12b"].Total; got != 10 {
-		t.Errorf("gemma findings examined = %d, want 10 (the locked one skipped)", got)
+	if got := rep.ByModel["gemma3:12b"].Total; got != 14 {
+		t.Errorf("gemma findings examined = %d, want 14 (the locked one skipped)", got)
 	}
 	if a := readAnchor(t, d, fUnique); a.Reanchored || a.ChunkID != deadChunk {
 		t.Errorf("locked finding was written: %+v", a)
@@ -441,5 +476,47 @@ func requireTallies(t *testing.T, label string, rep ReanchorReport, want map[str
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("%s tallies:\n got %+v\nwant %+v", label, got, want)
+	}
+}
+
+// TestIntegrationReanchorWriteRefusesRebuiltChunk pins the anchor write's
+// in-SQL hash check: an anchor computed against a chunk that is rebuilt before
+// the write lands matches zero rows (a conflict), and the finding is left for
+// the next run rather than anchored to text nobody verified.
+func TestIntegrationReanchorWriteRefusesRebuiltChunk(t *testing.T) {
+	d := newIntegrationDB(t, newTestDatabase(t))
+	seedReanchor(t, d)
+	ctx := context.Background()
+
+	// The anchor as the pass would compute it from the text it read…
+	f := patch.ReanchorFinding{OriginalText: "ganema", ChunkID: deadChunk, ChunkIndex: &[]int{0}[0],
+		StartSec: 0, EndSec: 30, Offset: -1, Occurrence: -1}
+	res := patch.Reanchor(f, []patch.ReanchorChunk{{ID: raC0, Index: 0, StartSec: 0, EndSec: 30, Text: raPristine[raC0]}})
+	if res.Outcome != patch.OutcomeUnique {
+		t.Fatalf("precondition: %+v", res)
+	}
+	// …then the worker rebuilds the chunk before the write.
+	if _, err := d.pool.Exec(ctx, `UPDATE transcript_chunks SET source_text = source_text || ' More.' WHERE id = $1`, raC0); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rep := ReanchorReport{ByModel: map[string]*ReanchorTally{}}
+	row := reanchorRow{ID: fUnique, TranscriptID: raT1, Model: "gemma3:12b", State: patch.StateProposed, Finding: f}
+	if err := writeReanchor(ctx, tx, &rep, row, res); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Conflicts != 1 || rep.Reanchored != 0 {
+		t.Errorf("write against a rebuilt chunk: conflicts=%d reanchored=%d, want 1/0", rep.Conflicts, rep.Reanchored)
+	}
+	if a := readAnchor(t, d, fUnique); a.Reanchored || a.ChunkID != deadChunk || a.Sha != "" {
+		t.Errorf("finding was anchored to text nobody verified: %+v", a)
 	}
 }
