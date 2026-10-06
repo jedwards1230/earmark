@@ -93,6 +93,7 @@ CREATE TABLE transcripts (
     raw_text            TEXT        NOT NULL,   -- full transcript concatenated, for FTS
     model_name          TEXT        NOT NULL,   -- ASR model used, e.g. "nvidia/parakeet-tdt-0.6b-v3"
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    recipe_id           TEXT        REFERENCES recipes (recipe_id),  -- asr recipe (§1.9); NULL = unstamped
 
     CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
 );
@@ -966,6 +967,157 @@ performed the startup walk, so it waits for the first tick.
 > anything been transcribed lately", and pairing it with queue-non-empty +
 > not-paused still misfires under `run_limit=0` or the analyze phase.
 
+### 1.8 Schema migrations (goose)
+
+The schema is owned by [goose](https://github.com/pressly/goose) running the
+numbered migrations embedded from `internal/db/migrations/`. Every earmark
+process (`db.New` → `initialize()`) migrates to the latest version on startup;
+there is no other schema code. The version is recorded in `goose_db_version`.
+
+| Version | File | What |
+|---|---|---|
+| 1 | `00001_baseline.sql` | The schema as of v0.40.2 — the DDL the pre-goose `initialize()` ran inline on every boot, copied verbatim. |
+| 2 | `00002_recipes.sql` | `recipes` + nullable `recipe_id` on `transcripts`, `transcript_findings`, `transcript_chunks`; legacy backfill (§1.9). |
+| 3 | `00003_stale_work.sql` | `current_recipes` + the `stale_work` view (§1.9). |
+
+**Rules.** Schema changes are new numbered files; a migration that has shipped
+is never edited. Migrations stay additive unless a change says otherwise, and
+every table a migration adds is also dropped by `DEBUG_DB_RESET` (`resetSQL`,
+pinned by `TestIntegrationResetRebuildsFreshSchema`).
+
+**The baseline (version 1) adopts the existing database without touching it.**
+It is a Go migration with three outcomes, decided inside goose's transaction
+and under the schema lock:
+
+| Database | Detected by | Action |
+|---|---|---|
+| empty | no `transcription_jobs` | execute the baseline |
+| built by the old inline code | `transcription_jobs` exists and every baseline object is present | record version 1, execute **nothing** |
+| built by an *older* inline earmark | `transcription_jobs` exists, some baseline object missing | execute the baseline — it is idempotent (`IF NOT EXISTS` / guarded `DO` blocks), so this finishes the job exactly as booting the newer inline code would have |
+
+"Every baseline object" is an inventory parsed from the baseline file itself
+(tables, `ADD COLUMN` columns, indexes, named constraints, functions,
+triggers). The integration suite proves a database built by the frozen pre-goose
+DDL (`internal/db/testdata/legacy_initialize.sql`) and one built by the baseline
+are catalog-identical, and that migrating the former runs no DDL except goose's
+version table (recorded by an event trigger).
+
+**Serialization (binding for new processes).** `earmark-ingest` and
+`earmark-mcp` migrate concurrently on every rollout, and concurrent DDL
+deadlocks (observed 2026-08-14 during `CREATE FUNCTION`, "while updating tuple
+in relation `pg_proc`", and 2026-08-19 during `DROP TRIGGER`). Migration is
+therefore serialized by an advisory lock:
+
+- **Same key everywhere:** `0x4541524D5343484D` ("EARM","SCHM") — the key the
+  pre-goose `initialize()` used with `pg_advisory_xact_lock`. Session and
+  transaction advisory locks share one lock space, so an old pod and a new pod
+  rolling together still serialize.
+- **It waits:** `pg_advisory_lock`, never a try-lock. The loser blocks, then
+  finds nothing pending.
+- **It covers everything goose does,** including creating `goose_db_version`.
+  goose's own `WithSessionLocker` does not (its `Up` runs `HasPending`, which
+  creates the version table, before the locker) — so earmark takes the lock
+  itself and gives goose no locker.
+- **It cannot leak.** Goose commits each migration separately, so the lock
+  must be session-scoped to span the run — and a session lock left on a pooled
+  connection would block every later migration forever. It is therefore taken
+  on a dedicated `database/sql` handle (`application_name=earmark-migrate`,
+  `MaxIdleConns(0)`, closed before `migrate()` returns), never the service's
+  `pgxpool`, and released explicitly on a detached context; even a failed
+  unlock is released when the session ends.
+
+`internal/db/schema_lock_test.go` pins these at the source level; the Postgres
+integration tests (CI job "Integration (Postgres)", `EARMARK_TEST_DATABASE_URL`)
+prove that concurrent migrators serialize, that `migrate` waits on a held lock
+and creates nothing before it, and that no lock or session survives it.
+
+**If you add a process that touches this database, it must migrate through
+`db.New` (and so take the same lock) or reintroduce the deadlock.**
+
+### 1.9 Provenance recipes — `recipes`, `current_recipes`, `stale_work`
+
+A **recipe** is an immutable, content-addressed record of exactly how an output
+row was made. Output rows carry the `recipe_id` of the step that produced them,
+so three questions are queries: what made this text, what is out of date, and
+(later) is the new model better.
+
+```sql
+CREATE TABLE recipes (
+    recipe_id      TEXT        NOT NULL PRIMARY KEY,  -- lowercase hex sha256 of the canonical JSON below
+    step           TEXT        NOT NULL,              -- asr | propose | decide | propagate | scan | format | embed
+    step_version   INTEGER     NOT NULL,              -- bumped when earmark's logic for the step changes output; 0 = legacy
+    code_version   TEXT        NOT NULL,              -- earmark "<tag>+<commit>" (runner tag for asr); 'legacy-unknown'
+    model_alias    TEXT,                              -- what was asked for (the model id / LiteLLM alias sent)
+    model_resolved TEXT,                              -- what answered (the response "model" field)
+    model_revision TEXT,                              -- HF commit / .nemo sha256 / Ollama digest / provider snapshot
+    prompt_version TEXT,                              -- e.g. "judge@v1"
+    prompt_sha256  TEXT,                              -- hash of the exact prompt template bytes
+    params         JSONB       NOT NULL DEFAULT '{}', -- temperature, thresholds, chunk size, dimensions, prefixes…
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+| Row | Column | Recipe of | Written by |
+|---|---|---|---|
+| `transcripts` | `recipe_id` | `asr` | the ASR runner — **not yet**: NULL for new transcripts until the runner stamps its recipe (.nemo sha, runner tag, dtype, window/overlap) in PR 0b-4 |
+| `transcript_findings` | `recipe_id` | `propose` (the judge) | `InsertFindings`; NULL for `origin='human'` rows |
+| `transcript_chunks` | `recipe_id` | `embed` (chunking + embedding) | `InsertChunks`, on insert and re-embed |
+
+All three are nullable FKs to `recipes`. NULL means "unstamped".
+
+**Canonical form / ID.** `recipe_id` = lowercase hex SHA-256 of these exact
+bytes — keys in this order, no whitespace, empty strings as `null`, `params`
+canonicalized (object keys sorted, no whitespace, no HTML escaping, `{}` when
+empty):
+
+```json
+{"step":"propose","step_version":1,"code_version":"v0.41.0+abc1234","model_alias":"earmark-judge","model_resolved":"anthropic/claude-haiku-4-5-20251001","model_revision":null,"prompt_version":"judge@v1","prompt_sha256":"00ff","params":{"a<b":"x&y","min_confidence":0.6,"temperature":0}}
+```
+
+→ `51274b9640f28301dccaf6fc52f6f9c60c83984ee21f62c00840c1e4007dcff1`
+(`internal/recipe` `TestCanonicalVector`). Any writer outside Go (the runner)
+MUST reproduce these bytes, and registers its recipe with
+`INSERT … ON CONFLICT (recipe_id) DO NOTHING` before referencing it. Recipes are
+never updated or deleted.
+
+**What answered.** The judge records the model the chat response reports
+serving the request, not just the one it asked for. A LiteLLM fallback answer
+therefore has a different recipe, which `InsertFindings` registers on the fly
+in the same transaction. Embeddings responses are not read for a model yet: the
+embed recipe's `model_resolved` is the registry's expected model, else the
+alias.
+
+**Current steps.** `propose`: `step_version` 1, prompt `judge@v1` + sha256 of
+(system prompt, user template, response JSON schema), params `temperature`,
+`min_confidence`, `max_findings_per_chunk`. `embed`: `step_version` 1, params
+`chunk_size`, `dimensions`, `document_prefix`. Both take `expected_model` /
+`revision` from the model registry (§2.18).
+
+**Legacy rows.** Migration 2 gives every pre-existing row one recipe per
+`(step, model)` with `step_version` 0 and `code_version` `legacy-unknown`,
+told apart only by model name — no prompt, revision or runner hash was ever
+recorded, so none is invented: `asr` per `transcripts.model_name`; `propose`
+per `(model, resolved_model)` of judge findings; `embed` per
+`run_metrics.embed_model` of the chunk's job. Where every row of a table maps
+to one legacy recipe, the column is stamped through a constant default that
+Postgres keeps as the column's missing value and the default is then dropped —
+no rewrite, no `UPDATE` (at production size: 0.9 s, versus 91 s re-inserting
+every chunk into the HNSW index).
+
+**Current recipes and `stale_work`.** `current_recipes(step PK, recipe_id,
+updated_at)` holds the recipe each step would use now; the ingest process
+(`earmark monitor`) upserts the `embed` and (when an eval endpoint is
+configured) `propose` rows at startup — one writer, so an ad-hoc `earmark eval`
+with other settings stamps its own findings without redefining "current".
+The `stale_work` view lists `(step, source_table, row_id, recipe_id,
+current_recipe_id)` for every output row whose recipe is not equivalent to its
+step's current recipe. Equivalence compares `step_version`, the three model
+fields, prompt version and hash, and `params` — **not** `code_version`, so a
+release that changes nothing does not mark the library stale; a logic change
+bumps `step_version`. Unstamped rows are stale whenever their step has a
+current recipe; a step with no current recipe (asr, today) reports nothing;
+human corrections are never listed. Metrics over it arrive in PR 0b-4.
+
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
@@ -1218,6 +1370,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `EMBEDDINGS_MODEL` | no | **Deprecated** — `nomic-embed-text`. See `EMBEDDINGS_BASE_URL` above and §2.14. |
 | `AI_ENDPOINTS` | no | JSON array of AI endpoint descriptors (the AI endpoint registry, §2.14). When set, `AI_ROLES` is required and the `EMBEDDINGS_*` vars are ignored. **Malformed value is fatal** (fail-closed). Empty → the `EMBEDDINGS_*` legacy path applies. |
 | `AI_ROLES` | no | JSON object binding role names (`embeddings`, `eval`) to endpoint IDs (§2.14). Required when `AI_ENDPOINTS` is set. |
+| `MODELS_FILE` | no | Path to the model registry YAML (§2.18): per step, the expected answering model, revision pin and prompt version stamped into provenance recipes (§1.9). Unset → no pins. Unreadable / malformed / unknown step or field / an `alias` contradicting `AI_ENDPOINTS` is **fatal** (fail-closed). |
 | `BOOKS_DIR` | no | `/books` (read-only NFS mount inside container) |
 | `MCP_HTTP_ADDR` | no | `:8081` |
 | `INGEST_HTTP_ADDR` | no | `:8082`. The `earmark monitor` (ingest) process serves a minimal HTTP listener here for `/healthz` (liveness) and `/metrics` (Prometheus, §2.16). The mcp pod uses `MCP_HTTP_ADDR` for its surface; this is the ingest pod's only HTTP port. Chosen to avoid colliding with `:8081`. |
@@ -1856,6 +2009,13 @@ comma-joined in first-seen order, if a router switched models mid-run). Both are
 NULL when the endpoint omits the field. In-pipeline and standalone eval events
 carry it as `detail.resolved_model`.
 
+Each finding also carries `recipe_id` (§1.9): the judge's `propose` recipe —
+requested model, the model that answered, prompt version `judge@v1` and the
+hash of every prompt part sent, and the confidence floor / per-chunk cap — so
+a fallback answer is a different, re-runnable recipe. Bump `judgePromptVersion`
+(`internal/eval/prompt.go`) whenever the prompt or response schema changes;
+`TestJudgePromptVersionPinned` fails until you do.
+
 #### `transcript_findings` table
 
 ```sql
@@ -1874,9 +2034,10 @@ CREATE TABLE transcript_findings (
     model                TEXT        NOT NULL,    -- judge model id REQUESTED (attribution)
     resolved_model       TEXT,                    -- model the endpoint reported serving it (NULL = not reported)
     transcription_run_id UUID,                    -- transcription_jobs.id — per-backend/run attribution
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    recipe_id            TEXT REFERENCES recipes (recipe_id)  -- propose recipe that made it (§1.9); NULL for origin='human'
 );
--- indexes: file_path, transcript_id, transcription_run_id, issue_type
+-- indexes: file_path, transcript_id, transcription_run_id, issue_type, recipe_id
 ```
 
 `issue_type` is a closed vocabulary the judge prompt advertises; an unknown value
@@ -2121,8 +2282,6 @@ histogram are incremented at the Go-emitted pipeline event sites.
 
 Standard `go_*` and `process_*` collectors are also registered for baseline
 observability. Both pods also serve `/healthz` (liveness, always-200).
-
----
 
 ### 2.17 Reviewable Patches (human-gated apply)
 
@@ -2523,33 +2682,58 @@ surface. An anchor taken from corrected text would record a fingerprint the
 projection's input (the pristine regenerated chunk) can never match, so the
 correction would be born `stale` before a reviewer ever saw it.
 
+### 2.18 Model Registry (`MODELS_FILE`)
+
+One registry maps each pipeline step to the model expected behind it. It
+annotates the AI endpoint registry (§2.14) rather than duplicating it: *where*
+to send a request and *which model id or LiteLLM alias to ask for* still come
+from `AI_ENDPOINTS` + `AI_ROLES`. The registry adds what those cannot say, and
+those values go into the step's recipe (§1.9). Upgrading a model is a one-line
+change here.
+
+```yaml
+steps:
+  propose:                       # the eval judge — AI_ROLES.eval (or EVAL_CHAT_MODEL)
+    alias: earmark-judge         # optional assertion: must equal the model that endpoint requests
+    expected_model: anthropic/claude-haiku-4-5-20251001   # what should ANSWER → recipe model_resolved
+    revision: "20251001"         # weights pin → recipe model_revision
+    prompt_version: judge@v1     # optional: logged as a warning if the build runs another
+  embed:                         # AI_ROLES.embeddings
+    expected_model: nomic-embed-text
+    revision: sha256:0a109f422b47
+  asr:                           # recorded for the runner's recipe (PR 0b-4); unused by Go today
+    expected_model: nvidia/parakeet-tdt-1.1b
+```
+
+| Key | Meaning |
+|---|---|
+| `steps.<step>` | one of `asr`, `propose`, `decide`, `propagate`, `scan`, `format`, `embed` |
+| `alias` | optional; must equal the configured endpoint's `model` for the step's role (`propose`→`eval`, `embed`→`embeddings`) |
+| `expected_model` | the model the endpoint should report serving; the current recipe's `model_resolved`. Unset → the requested model |
+| `revision` | HF commit / `.nemo` sha256 / Ollama digest / provider snapshot |
+| `prompt_version` | the prompt version this deployment expects; the code's own version is authoritative, a mismatch is logged |
+
+Because `expected_model` becomes the current recipe's `model_resolved`, a
+response served by any other model (a LiteLLM fallback, or an alias silently
+re-pointed) stamps a different recipe and shows up in `stale_work`. Behind an
+alias, set `expected_model` to the id the endpoint actually reports, or every
+finding will read as a fallback.
+
+Validation is fail-closed like §2.14: an unreadable file, malformed YAML, an
+unknown step or field, or an `alias` that contradicts the endpoint registry
+stops startup. Unset → an empty registry: recipes are still stamped, with the
+requested model as the expected one and no revision.
+
+---
+
 ## 3. SCHEMA — pgvector chunks table
 
 The Go service reads completed transcripts, chunks them, and embeds each chunk.
 Chunks are stored alongside the transcripts in the same database.
 
-> **Schema init is serialized by an advisory lock (binding for new processes).**
-> Every earmark process runs the same idempotent schema-init transaction on
-> startup — today that is `earmark-ingest` and `earmark-mcp`, which Kubernetes
-> rolls together, so they execute the identical DDL block concurrently.
-> Concurrent DDL **deadlocks**: observed in production 2026-08-14 (during
-> `CREATE FUNCTION`, "while updating tuple in relation `pg_proc`") and again
-> 2026-08-19 (during `DROP TRIGGER`). The loser crashed and recovered on
-> restart, so the symptom was a crash-loop on deploy rather than data loss —
-> survivable only because every statement is `IF NOT EXISTS`-guarded.
->
-> `initialize()` therefore takes `pg_advisory_xact_lock` as the **first**
-> statement in its transaction, before any DDL. The second process waits
-> instead of racing. The lock is transaction-scoped, so COMMIT, ROLLBACK, or a
-> process crash all release it — there is no unlock path to forget.
->
-> **If you add a third process that touches this database, it must run the same
-> schema-init (and therefore take the same lock) or reintroduce the deadlock.**
-> Two constraints are load-bearing and are covered by tests in
-> `internal/db/schema_lock_test.go`: the key must be the same constant in every
-> process, and the lock must stay `pg_advisory_xact_lock` — the session-scoped
-> `pg_advisory_lock` would survive COMMIT on a *pooled* connection and block
-> every later initialization permanently.
+> **Schema changes go through goose migrations (§1.8)**, which every earmark
+> process runs on startup under a waiting, non-leaking advisory lock. The DDL
+> below is the resulting shape, not something any process executes directly.
 
 ```sql
 CREATE TABLE transcript_chunks (
@@ -2565,6 +2749,7 @@ CREATE TABLE transcript_chunks (
     embedding    VECTOR(768) NOT NULL,   -- nomic-embed-text dimension, MUST match EMBEDDINGS_MODEL
     embedding_stale BOOLEAN  NOT NULL DEFAULT false,  -- set on accept/revert, cleared on rebuild (§2.17)
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    recipe_id    TEXT        REFERENCES recipes (recipe_id),  -- embed recipe (§1.9); restamped on re-embed
 
     CONSTRAINT transcript_chunks_transcript_chunk_unique UNIQUE (transcript_id, chunk_index)
 );
@@ -2594,6 +2779,9 @@ Any change to:
 - The embedding model or vector dimension in section 2.3
 - The capability enum or the `caps_*` JSON shapes in section 2.13
 - The `AI_ENDPOINTS` / `AI_ROLES` JSON shapes or role names in section 2.14
+- The recipe canonical form, `recipe_id` derivation, or step names in section 1.9
+- The `MODELS_FILE` shape in section 2.18
+- A shipped migration in `internal/db/migrations/` (never edited — add a new one, §1.8)
 
 ...requires updating this file **before** writing implementation code. All
 three components (this Go service, the ASR runner, the deployment manifests)

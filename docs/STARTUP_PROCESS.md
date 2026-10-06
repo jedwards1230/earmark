@@ -12,19 +12,26 @@ Runs the file watcher and embed worker together.
 
 `config.LoadConfig()` reads all env vars. `DATABASE_URL` is required; startup fails immediately if it is absent. Optional vars (`BOOKS_DIR`, `EMBEDDINGS_BASE_URL`, `EMBEDDINGS_MODEL`, `CHUNK_SIZE`, `STALE_JOB_TIMEOUT`, etc.) fall back to documented defaults.
 
-### 2. DB connection and schema init
+### 2. DB connection and schema migrations
 
-Opens a `pgxpool.Pool` to the CNPG read-write endpoint (`earmark-pg-rw.earmark:5432`). On first connect, a schema-init transaction runs:
+Opens a `pgxpool.Pool` to the CNPG read-write endpoint (`earmark-pg-rw.earmark:5432`), then
+brings the schema to the latest version with the embedded goose migrations
+(`internal/db/migrations/`, CONTRACT §1.8):
 
-- `CREATE EXTENSION IF NOT EXISTS vector` and `pg_trgm`
-- `CREATE TABLE IF NOT EXISTS transcription_jobs` (with status check constraint, unique indexes, `updated_at` trigger)
-- `CREATE TABLE IF NOT EXISTS transcripts` (with trgm GIN index on `raw_text`)
-- `CREATE TABLE IF NOT EXISTS transcript_chunks` (`VECTOR(768)`, HNSW index)
-- `CREATE TABLE IF NOT EXISTS run_metrics` (additive telemetry; never blocks the pipeline)
-- `CREATE TABLE IF NOT EXISTS book_metadata` (additive enrichment)
-- `CREATE TABLE IF NOT EXISTS runner_control` + `INSERT … ON CONFLICT DO NOTHING` to seed the singleton pause/run-limit row
+- a dedicated, non-pooled connection takes the schema advisory lock (`pg_advisory_lock`,
+  waits — `earmark-mcp` migrating at the same moment simply queues behind it);
+- goose applies whatever is pending: on an empty database, version 1 creates the baseline
+  schema (extensions, `transcription_jobs`, `transcripts`, `transcript_chunks`,
+  `run_metrics`, `book_metadata`, `runner_control` + its singleton row,
+  `transcript_findings`, `pipeline_events`, functions and triggers); on a database the
+  pre-goose code built it is only recorded; versions 2–3 add provenance recipes;
+- the lock is released and the connection closed before anything else starts.
 
-Schema init is idempotent — safe on every restart.
+With nothing pending this is a few catalog reads — safe on every restart.
+
+Then the ingest process registers the **current recipes** (CONTRACT §1.9): the embed
+recipe and, when an eval chat endpoint is configured, the judge's propose recipe
+(`current_recipes`, read by the `stale_work` view). Best-effort: a failure is logged.
 
 ### 3. Monitor goroutine
 
@@ -86,7 +93,8 @@ Same `config.LoadConfig()`. `DATABASE_URL` is required.
 
 ### 2. DB connection
 
-Same `pgxpool.Pool` open; same idempotent schema init (safe to run on both pods).
+Same `pgxpool.Pool` open; same locked goose migration (safe to run on both pods — the
+second waits for the first, then finds nothing pending).
 
 ### 3. HTTP server
 
