@@ -1925,11 +1925,24 @@ good. Counting successes guarantees progress — each run latches N more or
 exhausts the selection. The selection is walked in keyset pages of 32 so memory
 stays bounded, and the cursor moves past every row it visits, so no row is
 selected twice within a run and the run ends at the end of the selection.
-Because failures no longer count toward `--limit`, a limited run stops with an
-error after **5 consecutive transcripts fail on every chunk** (the
-judge-outage signature; one bad chunk among several never trips it), so an
-outage cannot turn a bounded run into a sweep of the whole selection. Without
-`--limit` there is no breaker. After the command completes, `embedded ⟹ eval'd`
+`--limit` is the progress target; **`--max-attempts N` is the spend cap**: it
+counts every transcript the judge was actually called for, latched or not, and
+stops the run when reached. It defaults to **3 × `--limit`** when `--limit` is
+set, and is unbounded only when `--limit` is 0 too (an explicit `--max-attempts`
+caps an unlimited run). Without it a judge that fails *some* chunk of every
+transcript (rate limiting, a flaky endpoint) or a systematic write failure after
+judging would leave every transcript unlatched and turn `--limit 25` into a paid
+sweep of the whole selection. A dry run counts attempts the same way (its judge
+calls cost the same). A `--limit` run also stops early, with an error, after
+**5 consecutive transcripts fail on every chunk** — the fast exit for a dead
+endpoint. **Exit status:** a backfill that judged at least one transcript but
+latched none (`failed > 0`, `latched == 0`) exits **non-zero**, so a dead API
+key or endpoint fails the scheduled Job instead of hiding behind exit 0; a run
+that latched anything, or only skipped rows, exits 0. **Run
+`earmark prune-chunks --yes` before any `--backfill-*`** on a corpus that may
+carry orphan chunk tails (§2.17): the backfill judges stored rows, so a finding
+judged against an orphan tail that a prune later deletes is anchored to a chunk
+that no longer exists. After the command completes, `embedded ⟹ eval'd`
 holds for the existing corpus (minus any transcripts the judge failed on, which
 remain selectable).
 
@@ -2224,6 +2237,20 @@ correction ends up either applied or explicitly retired; none is silently lost.
 Accepting or reverting a finding sets `transcript_chunks.embedding_stale = true`
 for that one chunk, in the same transaction as the decision.
 
+**How a finding names its chunk.** Every statement that resolves a finding's
+chunk — this invalidation, the prune below, and the reviewer worklist
+(`listCorrectionsSQL`) — addresses it by `(transcript_id, chunk_index)` whenever
+the finding recorded a `chunk_index`, and by `chunk_id` only when it did not.
+`chunk_index` is what the replay is keyed by, so every other statement must
+resolve the same row. `chunk_id` is not reliable alone: on 2026-10-06, 25,442
+of 32,337 live findings carried a deterministic UUIDv5 `chunk_id` while the row
+at their index had a random id from the ungated embed path, so a
+`chunk_id`-first lookup flagged nothing on accept and showed reviewers an empty
+chunk. Where both resolve to a row they resolve to the same one (verified live:
+0 findings whose `chunk_id` names a row at a different index), so index-first
+addressing is a strict superset; the arms are mutually exclusive, so a finding
+never matches two chunks.
+
 **The rebuild trigger.** The embed worker runs a **rebuild pass** each cycle over
 transcripts with at least one flagged chunk, and puts them back through the
 normal regenerate → replay → embed path (`GetTranscriptsWithStaleChunks` →
@@ -2255,14 +2282,24 @@ boundaries without changing its index; the existing row `id` is kept, since
 findings reference it. Nothing has a foreign key to `transcript_chunks`
 (`transcript_findings.chunk_id` is a bare UUID, §2.15), so the delete can never
 fail or cascade. Findings are **never deleted**: in the same statement, the
-findings anchored to a pruned row (by `chunk_id`, or by `chunk_index` for rows
-without one) that may legally become `stale` — `proposed`, `accepted`, `applied`
-— move to `stale` with `stale_reason = chunk_changed`, which is exactly what
+findings addressed to the tail — `chunk_index >=` the new count, or (only for a
+finding with no `chunk_index`) a `chunk_id` naming a pruned row — that may
+legally become `stale` — `proposed`, `accepted`, `applied` — move to `stale`
+with `stale_reason = chunk_changed`, which is exactly what
 the replay already does to an accepted/applied correction whose chunk index no
 longer exists. `decided_at`/`decided_by` are untouched, and `rejected`/`reverted`
 decisions keep their state. Without that retire, accepting a `proposed` finding
 on a pruned chunk would flag no chunk for rebuild and leave it `accepted` and
 invisible forever. An empty chunk set never prunes.
+
+**Lock order.** `SetPatchState` locks the finding and then its chunk. The
+prune transaction (both `InsertChunks` and the standalone `prune-chunks`) takes
+the same order: before touching any chunk row it row-locks the findings it may
+retire (`SELECT … FOR UPDATE OF f` over the transcript's findings at
+`chunk_index >= keep`), then upserts and prunes. An accept racing a rebuild
+therefore waits rather than deadlocks: if the accept committed first, the prune
+retires it (its state guard re-checks); if the prune locked first, the accept
+then finds the finding `stale` and gets `ErrPatchStateConflict`.
 
 Rows pruned **before** this fix are cleaned up by `earmark prune-chunks`
 (dry-run unless `--yes`). It re-chunks every chunked transcript with the

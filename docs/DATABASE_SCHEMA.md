@@ -157,7 +157,8 @@ once the rebuilt chunk is inserted. The upsert refreshes every derived column
 (text, `source_text`, embedding, `file_path`, `start_sec`, `end_sec`, `speaker`)
 but keeps the row `id`, and the same transaction deletes the rows at
 `chunk_index >=` the new chunk count, retiring (never deleting) the findings
-anchored to them. See CONTRACT §2.17.
+addressed to them — findings resolve their chunk by `(transcript_id,
+chunk_index)`, by `chunk_id` only when they have no index. See CONTRACT §2.17.
 
 **Timestamps are TRACK-relative**: `start_sec`/`end_sec` are copied from the
 parent transcript's segment boundaries, so they are offsets into the chunk's own

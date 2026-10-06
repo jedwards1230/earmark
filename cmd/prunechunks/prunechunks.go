@@ -18,7 +18,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
@@ -62,9 +64,13 @@ text hash, with the stored rows:
   short    fewer rows than the re-chunk                    NOT pruned
 
 Only "orphans" transcripts are ever touched. Pruning deletes the tail chunk
-rows and moves the findings anchored to them (proposed/accepted/applied) to
-patch_state 'stale' (reason chunk_changed) — findings are never deleted, and
-rejected/reverted decisions are left as they are.
+rows and moves the findings addressed to them (chunk_index >= the kept count;
+proposed/accepted/applied) to patch_state 'stale' (reason chunk_changed) —
+findings are never deleted, and rejected/reverted decisions are left as they
+are. Each transcript is pruned in its own transaction.
+
+Run it BEFORE any 'earmark eval --backfill-*': the backfill judges stored rows,
+including an orphan tail.
 
 Run it with the deployment's own environment (CHUNK_SIZE in particular): a
 different chunk size classifies every transcript as drift and prunes nothing.
@@ -91,7 +97,11 @@ func runPrune(_ *cobra.Command, _ []string) {
 	}
 	defer database.Close()
 
-	if err := run(context.Background(), os.Stdout, database, cfg.ChunkSize, opts); err != nil {
+	// Ctrl-C / SIGTERM stops the walk between transcripts. Each prune is its
+	// own transaction, so an interrupted run leaves no half-pruned transcript.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Stdout, database, cfg.ChunkSize, opts); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
