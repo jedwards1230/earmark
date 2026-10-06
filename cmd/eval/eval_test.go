@@ -646,8 +646,10 @@ func TestRunBackfill_PagesAndLimit(t *testing.T) {
 		if len(fdb.evalMetrics) != 3 {
 			t.Errorf("latched %d transcripts, want --limit 3", len(fdb.evalMetrics))
 		}
-		if fmt.Sprint(fdb.pageLimits) != "[2 1]" {
-			t.Errorf("page limits = %v, want [2 1]", fdb.pageLimits)
+		// Full pages: skipped/failed rows don't count toward --limit, so the
+		// remaining limit can't size the page. The run stops mid-page.
+		if fmt.Sprint(fdb.pageLimits) != "[2 2]" {
+			t.Errorf("page limits = %v, want [2 2]", fdb.pageLimits)
 		}
 	})
 }
@@ -713,5 +715,153 @@ func TestRunBackfill_UngatedSkipsNotYetEmbedded(t *testing.T) {
 	}
 	if len(fdb.evalMetrics) != 1 || fdb.evalMetrics[0].Failed() {
 		t.Errorf("gated: want the transcript latched, got %+v", fdb.evalMetrics)
+	}
+}
+
+// poisonChat fails every call whose prompt contains needle and answers an
+// empty findings list otherwise — a transcript that always fails to judge.
+type poisonChat struct{ needle string }
+
+func (c poisonChat) Complete(_ context.Context, _, user string) (string, error) {
+	if strings.Contains(user, c.needle) {
+		return "", errors.New("poisoned chunk")
+	}
+	return `{"findings":[]}`, nil
+}
+func (poisonChat) Model() string { return "fake-backfill-judge" }
+
+// stalledHead builds the selection that stalled every --limit run: a head of
+// rows that can never latch (empty raw text, not embedded yet under the
+// ungated config, a transcript whose judge call always fails) followed by
+// judgeable ones.
+func stalledHead() *fakeBackfillDB {
+	embedded := func(id string) []db.EvalChunk {
+		return []db.EvalChunk{{ChunkID: "c-" + id, TranscriptID: id, FilePath: "/b/" + id + ".m4b", Text: "text of " + id}}
+	}
+	fdb := &fakeBackfillDB{stored: map[string][]db.EvalChunk{}}
+	for _, id := range []string{"t-empty", "t-unembedded", "t-poison", "t-ok1", "t-ok2", "t-ok3"} {
+		tr := &db.Transcript{ID: id, JobID: "j-" + id, FilePath: "/b/" + id + ".m4b", RawText: "x"}
+		switch id {
+		case "t-empty":
+			tr.RawText = ""
+		case "t-unembedded":
+			// no stored chunks + ungated config → skipped as not embedded
+		default:
+			fdb.stored[id] = embedded(id)
+		}
+		fdb.transcripts = append(fdb.transcripts, tr)
+	}
+	return fdb
+}
+
+// TestRunBackfill_LimitCountsOnlySuccesses is the stall regression: --limit
+// used to count every visited row, so a head of rows that never latch used up
+// the limit on every run and the backfill made no progress. The limit must
+// count only transcripts judged successfully; skipped/failed rows are visited
+// once (keyset cursor) and passed over.
+func TestRunBackfill_LimitCountsOnlySuccesses(t *testing.T) {
+	cfg := &config.Config{ChunkSize: 32} // ungated: t-unembedded is skipped
+	judge := evalpkg.NewJudge(poisonChat{needle: "text of t-poison"})
+
+	t.Run("write", func(t *testing.T) {
+		fdb := stalledHead()
+		var out strings.Builder
+		if err := runBackfill(context.Background(), &out, fdb, judge, cfg,
+			backfillOptions{write: true, limit: 2, pageSize: 2}); err != nil {
+			t.Fatalf("runBackfill: %v", err)
+		}
+		var latched, failedJobs []string
+		for _, m := range fdb.evalMetrics {
+			if m.Failed() {
+				failedJobs = append(failedJobs, m.JobID)
+			} else {
+				latched = append(latched, m.JobID)
+			}
+		}
+		if fmt.Sprint(latched) != "[j-t-ok1 j-t-ok2]" {
+			t.Errorf("latched %v, want the 2 judgeable transcripts past the stuck head", latched)
+		}
+		if fmt.Sprint(failedJobs) != "[j-t-poison]" {
+			t.Errorf("failure records %v, want exactly one for t-poison (visited once)", failedJobs)
+		}
+		// Stops at the limit: t-ok3 is never judged.
+		if strings.Contains(out.String(), "t-ok3") {
+			t.Errorf("run went past --limit:\n%s", out.String())
+		}
+		if !strings.Contains(out.String(), "Stopped at --limit 2") {
+			t.Errorf("report should say the limit stopped the run:\n%s", out.String())
+		}
+	})
+
+	t.Run("dry run counts would-latch", func(t *testing.T) {
+		fdb := stalledHead()
+		var out strings.Builder
+		if err := runBackfill(context.Background(), &out, fdb, judge, cfg,
+			backfillOptions{limit: 1, pageSize: 2}); err != nil {
+			t.Fatalf("runBackfill: %v", err)
+		}
+		s := out.String()
+		if !strings.Contains(s, "t-ok1.m4b") || strings.Contains(s, "t-ok2") {
+			t.Errorf("dry run with --limit 1 must preview exactly the first judgeable transcript:\n%s", s)
+		}
+		if len(fdb.evalMetrics) != 0 || len(fdb.findings) != 0 {
+			t.Errorf("dry run wrote: metrics=%d findings=%d", len(fdb.evalMetrics), len(fdb.findings))
+		}
+	})
+}
+
+// TestRunBackfill_LimitTerminatesWhenExhausted: when nothing in the selection
+// can latch, a --limit run still ends — at the end of the selection, each row
+// visited once — instead of re-selecting the same head.
+func TestRunBackfill_LimitTerminatesWhenExhausted(t *testing.T) {
+	fdb := stalledHead()
+	fdb.transcripts = fdb.transcripts[:3] // only the never-latching head
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb,
+		evalpkg.NewJudge(poisonChat{needle: "text of t-poison"}), &config.Config{ChunkSize: 32},
+		backfillOptions{write: true, limit: 5, pageSize: 2}); err != nil {
+		t.Fatalf("runBackfill: %v", err)
+	}
+	if fmt.Sprint(fdb.pageLimits) != "[2 2]" {
+		t.Errorf("page requests = %v, want [2 2] (a full page, then the short last page)", fdb.pageLimits)
+	}
+	if len(fdb.evalMetrics) != 1 || !fdb.evalMetrics[0].Failed() {
+		t.Errorf("want only t-poison's failure record, got %+v", fdb.evalMetrics)
+	}
+	if !strings.Contains(out.String(), "3 done transcript(s) with eval_finished_at IS NULL visited") {
+		t.Errorf("each row must be visited exactly once:\n%s", out.String())
+	}
+}
+
+// TestRunBackfill_OutageStopsLimitedRun: --limit no longer counts failures, so
+// a judge outage must not turn a bounded run into a sweep of the whole
+// selection. After maxConsecutiveJudgeOutages transcripts fail on EVERY chunk
+// the run stops with an error.
+func TestRunBackfill_OutageStopsLimitedRun(t *testing.T) {
+	fdb := &fakeBackfillDB{stored: map[string][]db.EvalChunk{}}
+	for i := range maxConsecutiveJudgeOutages + 3 {
+		id := fmt.Sprintf("t%d", i)
+		fdb.transcripts = append(fdb.transcripts, &db.Transcript{ID: id, JobID: "j" + id, FilePath: "/b/" + id + ".m4b", RawText: "x"})
+		fdb.stored[id] = []db.EvalChunk{{ChunkID: "c" + id, TranscriptID: id, Text: "text " + id}}
+	}
+	var out strings.Builder
+	err := runBackfill(context.Background(), &out, fdb, evalpkg.NewJudge(errBackfillChat{}),
+		&config.Config{ChunkSize: 32}, backfillOptions{write: true, limit: 2, pageSize: 4})
+	if err == nil || !strings.Contains(err.Error(), "judge outage") {
+		t.Fatalf("want judge outage error, got %v", err)
+	}
+	if len(fdb.evalMetrics) != maxConsecutiveJudgeOutages {
+		t.Errorf("judged %d transcripts, want to stop after %d consecutive outages", len(fdb.evalMetrics), maxConsecutiveJudgeOutages)
+	}
+
+	// Without --limit the operator asked for the whole selection: no breaker.
+	fdb.evalMetrics = nil
+	fdb.pageLimits = nil
+	if err := runBackfill(context.Background(), &out, fdb, evalpkg.NewJudge(errBackfillChat{}),
+		&config.Config{ChunkSize: 32}, backfillOptions{write: true, pageSize: 4}); err != nil {
+		t.Fatalf("unlimited run: %v", err)
+	}
+	if len(fdb.evalMetrics) != len(fdb.transcripts) {
+		t.Errorf("unlimited run judged %d of %d", len(fdb.evalMetrics), len(fdb.transcripts))
 	}
 }
