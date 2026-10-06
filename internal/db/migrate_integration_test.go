@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/url"
 	"os"
 	"slices"
@@ -26,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/log"
 )
 
@@ -441,6 +443,9 @@ func TestIntegrationMigrateConcurrent(t *testing.T) {
 // transaction — migrate must WAIT, must not create anything (not even goose's
 // version table), and must finish once the lock is released.
 func TestIntegrationMigrateWaitsForLock(t *testing.T) {
+	// Far shorter than the hold below: the ADVISORY wait must not be subject to
+	// lock_timeout, or the second pod would fail instead of queueing.
+	shortenLockTimeout(t, 200*time.Millisecond)
 	dbURL := newTestDatabase(t)
 	ctx := context.Background()
 	holder := connect(t, dbURL)
@@ -484,6 +489,56 @@ func TestIntegrationMigrateWaitsForLock(t *testing.T) {
 	}
 }
 
+// shortenLockTimeout sets migrateLockTimeout for one test.
+func shortenLockTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := migrateLockTimeout
+	migrateLockTimeout = d
+	t.Cleanup(func() { migrateLockTimeout = prev })
+}
+
+// TestIntegrationMigrateLockTimeout: a migration whose DDL is queued behind a
+// long-running reader (the old pod mid-search) fails fast with lock_timeout
+// instead of waiting indefinitely — and rolls back cleanly, so a later start
+// applies it.
+func TestIntegrationMigrateLockTimeout(t *testing.T) {
+	shortenLockTimeout(t, 500*time.Millisecond)
+	dbURL := newTestDatabase(t)
+	if err := migrateTo(itCtx(t), dbURL, testLog(), 1); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	reader := connect(t, dbURL)
+	tx, err := reader.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE transcript_chunks IN ACCESS SHARE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err = migrate(itCtx(t), dbURL, testLog())
+	if err == nil || !strings.Contains(err.Error(), "55P03") {
+		t.Fatalf("migrate behind a reader = %v, want a lock_timeout (55P03) failure", err)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Errorf("lock_timeout failure took %s", took)
+	}
+	if v := gooseVersion(t, dbURL); v != 1 {
+		t.Errorf("goose version after the failed migration = %d, want 1 (rolled back)", v)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(itCtx(t), dbURL, testLog()); err != nil {
+		t.Fatalf("migrate after the reader finished: %v", err)
+	}
+	requireNoMigrationSession(t, dbURL)
+}
+
 // TestIntegrationMigrateReleasesLock guards the leak: when migrate returns, the
 // session lock is gone and so is the dedicated connection that held it — so
 // nothing pooled can ever inherit it.
@@ -498,8 +553,10 @@ func TestIntegrationMigrateReleasesLock(t *testing.T) {
 	}
 
 	// And a cancelled context while WAITING for the lock leaves nothing behind.
+	// The holder's own acquire is bounded too: if migrate leaked the lock, this
+	// fails within itCtx instead of hanging the suite.
 	holder := connect(t, dbURL)
-	if _, err := holder.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaInitLockKey); err != nil {
+	if _, err := holder.Exec(itCtx(t), `SELECT pg_advisory_lock($1)`, schemaInitLockKey); err != nil {
 		t.Fatal(err)
 	}
 	cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
@@ -511,6 +568,36 @@ func TestIntegrationMigrateReleasesLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireNoMigrationSession(t, dbURL)
+}
+
+// TestIntegrationInitializeHasDeadline: startup migrations are bounded even
+// when the caller's context is not (db.New passes context.Background). Stuck
+// behind a schema lock that never comes free, initialize must fail with an
+// error inside migrateDeadline rather than block until a probe kills the pod.
+func TestIntegrationInitializeHasDeadline(t *testing.T) {
+	prev := migrateDeadline
+	migrateDeadline = 500 * time.Millisecond
+	t.Cleanup(func() { migrateDeadline = prev })
+	dbURL := newTestDatabase(t)
+	holder := connect(t, dbURL)
+	if _, err := holder.Exec(itCtx(t), `SELECT pg_advisory_lock($1)`, schemaInitLockKey); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = holder.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, schemaInitLockKey)
+	})
+
+	d := &DB{cfg: &config.Config{DatabaseURL: dbURL}, log: testLog()}
+	done := make(chan error, 1)
+	go func() { done <- d.initialize(context.Background()) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("initialize behind a held schema lock = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("initialize is still waiting 15 s later: no migration deadline")
+	}
 }
 
 func requireNoMigrationSession(t *testing.T, dbURL string) {

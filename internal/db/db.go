@@ -253,7 +253,13 @@ func (db *DB) Ping(ctx context.Context) error {
 // dedicated connection. See migrate for the locking design and
 // baselineMigration for how a pre-goose database is adopted without re-running
 // its DDL.
+//
+// The whole run is bounded by migrateDeadline (CONTRACT §1.8): a migration that
+// cannot finish fails startup with an error instead of hanging until the
+// liveness probe kills the pod mid-transaction.
 func (db *DB) initialize(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, migrateDeadline)
+	defer cancel()
 	return migrate(ctx, db.cfg.DatabaseURL, db.log)
 }
 

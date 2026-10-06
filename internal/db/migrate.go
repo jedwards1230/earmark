@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -36,6 +37,28 @@ var migrationFiles embed.FS
 // registered as a Go migration (see baselineMigration) because it needs a
 // decision no SQL file can make.
 const baselineFileName = "00001_baseline.sql"
+
+// Migration deadlines (CONTRACT §1.8).
+//
+// migrateLockTimeout bounds how long any single statement of a migration waits
+// for a TABLE lock (Postgres lock_timeout, on goose's connection). An ALTER
+// queued behind a long reader — e.g. the old pod still serving a search —
+// otherwise sits in the lock queue holding up every later reader too, and a
+// pod killed by its liveness probe mid-wait rolls back and retries forever.
+// With the timeout the migration fails fast with SQLSTATE 55P03, the
+// transaction rolls back cleanly, and the next start retries.
+//
+// The ADVISORY lock wait is deliberately exempt (lock_timeout 0 on the lock
+// connection): waiting for the other earmark pod to finish its migration is
+// the design, not a stall. migrateDeadline (initialize) bounds the whole run,
+// that wait included. It sits just under the ingest pod's liveness budget
+// (10 s + 3 × 30 s), so a migration that cannot finish fails startup with an
+// error in the log instead of an unexplained SIGKILL mid-transaction. Package
+// vars so tests can shorten them.
+var (
+	migrateLockTimeout = 30 * time.Second
+	migrateDeadline    = 90 * time.Second
+)
 
 // migrateAppName tags the dedicated migration connection in pg_stat_activity, so
 // a lingering session (which would mean a leaked lock) is identifiable — and so
@@ -111,6 +134,7 @@ func migrateTo(ctx context.Context, databaseURL string, logger log.Logger, targe
 		return fmt.Errorf("parse database URL for migrations: %w", err)
 	}
 	connCfg.RuntimeParams["application_name"] = migrateAppName
+	connCfg.RuntimeParams["lock_timeout"] = fmt.Sprintf("%dms", migrateLockTimeout.Milliseconds())
 
 	// A dedicated handle, NOT the service pool: the session lock must never be parked on
 	// a connection something else will borrow. MaxIdleConns(0) closes every
@@ -128,6 +152,10 @@ func migrateTo(ctx context.Context, databaseURL string, logger log.Logger, targe
 	}
 	defer func() { _ = lockConn.Close() }()
 
+	// The advisory wait is exempt from lock_timeout (see migrateLockTimeout).
+	if _, err := lockConn.ExecContext(ctx, `SET lock_timeout = 0`); err != nil {
+		return fmt.Errorf("prepare schema-lock connection: %w", err)
+	}
 	// FIRST, before goose touches the database at all.
 	if _, err := lockConn.ExecContext(ctx, schemaLockSQL, schemaInitLockKey); err != nil {
 		return fmt.Errorf("acquire schema advisory lock: %w", err)
