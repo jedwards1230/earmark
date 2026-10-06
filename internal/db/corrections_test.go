@@ -31,6 +31,14 @@ var correctionSQL = map[string]string{
 	"chunkTargetSQL":            chunkTargetSQL,
 	"insertManualCorrectionSQL": insertManualCorrectionSQL,
 	"markChunkStaleByIDSQL":     markChunkStaleByIDSQL,
+	// The re-anchor pass (reanchor.go) writes transcript_findings too.
+	"reanchorTranscriptsSQL":  reanchorTranscriptsSQL,
+	"reanchorFindingsSQL":     reanchorFindingsSQL,
+	"reanchorFindingsLockSQL": reanchorFindingsLockSQL,
+	"reanchorChunksSQL":       reanchorChunksSQL,
+	"reanchorChunksLockSQL":   reanchorChunksLockSQL,
+	"reanchorWriteSQL":        reanchorWriteSQL,
+	"markUnanchorableSQL":     markUnanchorableSQL,
 }
 
 // TestCorrectionSQL_NeverTouchesTranscriptProvenance is the hard invariant of
@@ -99,6 +107,14 @@ func TestOverlayStateSetsDeriveFromTheStateMachine(t *testing.T) {
 			t.Errorf("overlayStates contains %q — only accepted/applied corrections may be replayed", s)
 		}
 	}
+	// unanchorable has no anchor: it must never be replayed or retired by a rebuild.
+	for _, set := range [][]string{overlayStates, staleFromStates} {
+		for _, st := range set {
+			if st == patch.StateUnanchorable {
+				t.Errorf("unanchorable is in %v — the overlay must ignore it", set)
+			}
+		}
+	}
 	if len(overlayStates) != 2 {
 		t.Errorf("overlayStates must be exactly {accepted, applied}, got %v", overlayStates)
 	}
@@ -113,7 +129,7 @@ func TestOverlayStateSetsDeriveFromTheStateMachine(t *testing.T) {
 			t.Errorf("appliedFromStates allows %q -> applied, which CanTransition forbids", s)
 		}
 	}
-	for _, s := range []string{patch.StateProposed, patch.StateRejected, patch.StateStale, patch.StateReverted} {
+	for _, s := range []string{patch.StateProposed, patch.StateRejected, patch.StateStale, patch.StateReverted, patch.StateUnanchorable} {
 		for _, allowed := range appliedFromStates {
 			if s == allowed {
 				t.Errorf("%q must not be promotable straight to applied — that skips the human gate", s)
@@ -502,6 +518,9 @@ func TestSetPatchState_RejectsIllegalTransitions(t *testing.T) {
 		{patch.StateStale, patch.StateProposed},
 		{patch.StateApplied, patch.StateAccepted},
 		{"nonsense", patch.StateAccepted},
+		// Legal in the state machine, but only the re-anchor pass makes them.
+		{patch.StateProposed, patch.StateUnanchorable},
+		{patch.StateUnanchorable, patch.StateProposed},
 	}
 	for _, tc := range illegal {
 		t.Run(tc.from+"->"+tc.to, func(t *testing.T) {

@@ -133,7 +133,7 @@ func getChunkContextSchema() *jsonschema.Schema {
 func listCorrectionsSchema() *jsonschema.Schema {
 	return objectSchema(nil, map[string]*jsonschema.Schema{
 		"state": stringProp("Patch state(s) to list, comma-separated: proposed, accepted, applied, " +
-			"rejected, reverted, stale — or \"all\" for every state. Default: proposed (the undecided queue)."),
+			"rejected, reverted, stale, unanchorable — or \"all\" for every state. Default: proposed (the undecided queue)."),
 		"book": stringProp("A book title or directory substring to scope to (e.g. \"Project Hail Mary\"). " +
 			"Resolved the same way the search tools resolve it. Ignored when `path` is given."),
 		"path": stringProp("An exact book directory or track file path to scope to. Matches that path and " +
