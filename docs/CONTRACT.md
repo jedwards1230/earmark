@@ -1915,8 +1915,21 @@ gets the `eval_failed_*` record and is picked up again by the next run. It is
 safe over live embedded data: it only INSERTs findings and UPSERTs the eval
 slice — it does NOT touch `transcript_chunks` or `transcripts`. Run with
 `--write` to persist; omit for a dry-run preview. `--limit N` caps the
-transcripts judged per run (0 = all); the selection is walked in keyset pages of
-32 so memory stays bounded. After the command completes, `embedded ⟹ eval'd`
+transcripts judged **successfully** per run — latched, or in a dry run, that
+would latch (0 = all). Transcripts skipped without a judge call (empty raw text,
+not embedded yet under an ungated deployment, a read error) and transcripts
+whose judging failed do **not** count: neither ever leaves the selection, and
+keyset order puts them first on every run, so counting them let a head of
+never-latching rows use up the limit on every run and stall the backfill for
+good. Counting successes guarantees progress — each run latches N more or
+exhausts the selection. The selection is walked in keyset pages of 32 so memory
+stays bounded, and the cursor moves past every row it visits, so no row is
+selected twice within a run and the run ends at the end of the selection.
+Because failures no longer count toward `--limit`, a limited run stops with an
+error after **5 consecutive transcripts fail on every chunk** (the
+judge-outage signature; one bad chunk among several never trips it), so an
+outage cannot turn a bounded run into a sweep of the whole selection. Without
+`--limit` there is no breaker. After the command completes, `embedded ⟹ eval'd`
 holds for the existing corpus (minus any transcripts the judge failed on, which
 remain selectable).
 
@@ -1944,7 +1957,9 @@ A job is selected when any of these holds:
    chunk-age guard exists because chunks added after the run — a re-embed
    (`requeue --reembed` deletes, the worker re-inserts) or a re-chunk that adds
    rows — change the count without the judge having seen them. An in-place
-   stale rebuild keeps `created_at` and also keeps the count. `eval_started_at`
+   stale rebuild keeps `created_at`; it keeps the count too unless the re-chunk
+   yields fewer chunks, in which case the tail is pruned (§2.17) and the count
+   drops — which can only hide a match, never add a re-judge. `eval_started_at`
    is host time and `created_at` is the database's `now()`, so clock skew
    matters only for chunks written within the skew of the run (a lagging host
    clock hides a match; a leading one can add a re-judge). **Known gap:** a
@@ -2227,6 +2242,35 @@ A failed embed or insert means the projection was never written, so recording
 corrections as applied — or retiring one to the terminal `stale` state — would
 describe something that never happened. Same rule the in-pipeline findings
 already follow.
+
+**Re-chunking into fewer chunks: the tail is pruned.** `InsertChunks` upserts on
+`(transcript_id, chunk_index)` and, in the **same transaction**, deletes the
+transcript's rows at `chunk_index >=` the new chunk count. Without the prune, a
+rebuild whose re-chunk yields fewer chunks (a `CHUNK_SIZE` or chunker change
+since the first embed) would leave the old tail behind — stale text that still
+matches searches and still carries findings. The upsert also refreshes the
+position columns (`file_path`, `start_sec`, `end_sec`, `speaker`) on conflict,
+not just `text`/`source_text`/`embedding`, because a re-chunk can move a chunk's
+boundaries without changing its index; the existing row `id` is kept, since
+findings reference it. Nothing has a foreign key to `transcript_chunks`
+(`transcript_findings.chunk_id` is a bare UUID, §2.15), so the delete can never
+fail or cascade. Findings are **never deleted**: in the same statement, the
+findings anchored to a pruned row (by `chunk_id`, or by `chunk_index` for rows
+without one) that may legally become `stale` — `proposed`, `accepted`, `applied`
+— move to `stale` with `stale_reason = chunk_changed`, which is exactly what
+the replay already does to an accepted/applied correction whose chunk index no
+longer exists. `decided_at`/`decided_by` are untouched, and `rejected`/`reverted`
+decisions keep their state. Without that retire, accepting a `proposed` finding
+on a pruned chunk would flag no chunk for rebuild and leave it `accepted` and
+invisible forever. An empty chunk set never prunes.
+
+Rows pruned **before** this fix are cleaned up by `earmark prune-chunks`
+(dry-run unless `--yes`). It re-chunks every chunked transcript with the
+deployment's `CHUNK_SIZE`, compares pristine-text hashes, and prunes only the
+clean-rebuild signature: rows `0..n-1` all match the re-chunk and rows `>= n`
+exist. A transcript whose head differs was embedded under another chunking —
+its extra rows are real coverage — and is reported as `drift` (fix with
+`requeue --reembed`), never pruned.
 
 **The watermark.** `InsertChunks` deliberately does **not** clear
 `embedding_stale`. An unconditional clear there is a lost update: a human accept
