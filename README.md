@@ -79,7 +79,8 @@ This renders the full status dashboard against synthetic data — no Postgres, n
 | `earmark list` | List content from the database |
 | `earmark search <query>` | Semantic search from the CLI (`--text` for keyword, `--limit`, `--precision`) |
 | `earmark requeue [book]` | Re-transcribe, retry failed, or re-embed (`--reembed`, `--failed`; dry-run unless `--yes`) |
-| `earmark eval [book]` | Read-only LLM judge — flags suspected transcript errors (dry-run unless `--write`). `--backfill-unevaluated` judges every transcript not yet judged (the judging pass when `EVAL_IN_PIPELINE=false`); `--backfill-eval-errors` re-judges transcripts whose judging failed; `--limit N` caps either |
+| `earmark eval [book]` | Read-only LLM judge — flags suspected transcript errors (dry-run unless `--write`). `--backfill-unevaluated` judges every transcript not yet judged (the judging pass when `EVAL_IN_PIPELINE=false`); `--backfill-eval-errors` re-judges transcripts whose judging failed; `--limit N` caps the transcripts judged successfully (skipped/failed ones don't count); `--max-attempts N` caps judge calls (default 3×`--limit`); exits non-zero when it judged but latched nothing. Run `prune-chunks --yes` before a backfill |
+| `earmark prune-chunks` | Delete orphan chunk rows a re-chunk into fewer chunks left behind (CONTRACT §2.17; dry-run unless `--yes`) |
 | `earmark batch` | Two-phase pipeline coordinator that time-shares a GPU with other tenants |
 | `earmark backfill-metadata` | Re-derive book metadata for existing jobs without re-transcribing |
 | `earmark version` | Version, commit, build time |

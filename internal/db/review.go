@@ -135,9 +135,9 @@ const maxCorrectionListLimit = 200
 // text, no transcript writes) without a live database.
 //
 // The LEFT JOIN mirrors markChunkStaleForFindingSQL's addressing exactly: by
-// chunk_id when the finding recorded one, else by (transcript_id, chunk_index)
-// for findings written before chunk_id was populated. The two arms are mutually
-// exclusive (the second requires chunk_id IS NULL), so a finding can never
+// (transcript_id, chunk_index) when the finding recorded an index, else by
+// chunk_id (findingChunkAddressDoc in db.go). The two arms are mutually
+// exclusive (the second requires chunk_index IS NULL), so a finding can never
 // match two chunks and fan out into duplicate rows. LEFT, not INNER, so a
 // finding whose chunk is gone still appears — it is exactly the row a reviewer
 // needs to see, with an empty chunk text saying why it cannot be replayed.
@@ -155,10 +155,10 @@ var listCorrectionsSQL = `
 	       COALESCE(c.source_text, c.text, '') AS chunk_text
 	FROM transcript_findings f
 	LEFT JOIN transcript_chunks c
-	       ON c.id = f.chunk_id
-	       OR (f.chunk_id IS NULL
+	       ON (f.chunk_index IS NOT NULL
 	           AND c.transcript_id = f.transcript_id
 	           AND c.chunk_index = f.chunk_index)
+	       OR (f.chunk_index IS NULL AND c.id = f.chunk_id)
 	WHERE ($1::uuid IS NULL OR f.id = $1::uuid)
 	  AND ($2::text IS NULL OR f.file_path = $2 OR f.file_path LIKE $3 ESCAPE '\')
 	  AND ($4::text[] IS NULL OR f.patch_state = ANY($4))

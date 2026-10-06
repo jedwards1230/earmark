@@ -139,8 +139,10 @@ func (r *Resolver) match(dir string) (compiled, bool) {
 	return compiled{}, false
 }
 
-// asinIDPattern is the catalogue-id alternation shared by the extract and strip
-// regexes so the two can never drift apart. It accepts, inside square brackets:
+// ASINIDPattern is the catalogue-id alternation shared by the extract and strip
+// regexes (and by metaprovider's chapter-title cleaner) so they can never drift
+// apart. It is an unanchored, ungrouped, upper-case regexp alternation; callers
+// supply the brackets/grouping. It accepts, inside square brackets:
 //
 //   - an Audible ASIN: "B0" + 8 alphanumerics ("B08GB58KD5");
 //   - an ISBN-10 whose check digit is X: 9 digits + "X" ("059341635X") — Audible
@@ -151,13 +153,13 @@ func (r *Resolver) match(dir string) (compiled, bool) {
 // It is always anchored by the surrounding brackets, so an arbitrary 10-letter
 // word ("[Remastered]", "[Unabridged]") never matches: the only letters allowed
 // are the fixed "B0" prefix and a single trailing X after exactly nine digits.
-const asinIDPattern = `B0[0-9A-Z]{8}|[0-9]{9}X|[0-9]{6,}`
+const ASINIDPattern = `B0[0-9A-Z]{8}|[0-9]{9}X|[0-9]{6,}`
 
 // asinBracket matches a bracketed catalogue id embedded in a directory/title,
 // e.g. "[B08GB58KD5]" (Audible ASIN), "[059341635X]" (ISBN-10 with an X check
 // digit) or a bracketed all-digit id "[1984832069]". The captured group is the
 // id itself, without the brackets. Matched against UPPER-cased input.
-var asinBracket = regexp.MustCompile(`\[(` + asinIDPattern + `)\]`)
+var asinBracket = regexp.MustCompile(`\[(` + ASINIDPattern + `)\]`)
 
 // ExtractASIN returns the bracketed catalogue id (ASIN, ISBN-10 with an X check
 // digit, or numeric id) embedded in a book directory or title, e.g.
@@ -183,7 +185,7 @@ func StripASIN(title string) string {
 
 // asinBracketAnyCase is the case-insensitive variant used for stripping (the
 // title text we strip from is not upper-cased first, unlike ExtractASIN).
-var asinBracketAnyCase = regexp.MustCompile(`(?i)\s*\[(?:` + asinIDPattern + `)\]`)
+var asinBracketAnyCase = regexp.MustCompile(`(?i)\s*\[(?:` + ASINIDPattern + `)\]`)
 
 // trailingTrack strips a trailing track/part/chapter/disc marker and its number
 // (e.g. " - Track 202", " Part 1", " - 01", " CD2") so a per-track filename

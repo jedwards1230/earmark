@@ -53,6 +53,7 @@ MCP_TRANSPORT=http ./earmark mcp  # HTTP transport on :8081
 ./earmark requeue "Project Hail Mary" --yes    # re-transcribe (drops transcript+chunks, job→pending)
 ./earmark requeue --failed --yes               # retry all failed jobs
 ./earmark requeue --reembed "" --yes           # re-embed only (drop chunks; e.g. after model/chunk change)
+./earmark prune-chunks [--yes]                 # delete orphan chunk tails left by a re-chunk (CONTRACT §2.17); run before eval --backfill-*
 
 # Batched two-phase pipeline coordinator (GPU time-sharing; CONTRACT §1.4):
 ./earmark batch                                # batches of 10 until queue drains

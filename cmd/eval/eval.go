@@ -43,7 +43,8 @@ type runner interface {
 
 type options struct {
 	sample              int  // judge a random sample of N chunks library-wide (instead of a book)
-	limit               int  // cap chunks evaluated for a book / transcripts for a backfill (0 → default/all)
+	limit               int  // cap chunks evaluated for a book / transcripts latched by a backfill (0 → default/all)
+	maxAttempts         int  // backfill spend cap: transcripts judged, latched or not (0 → 3×limit, unbounded without --limit)
 	write               bool // persist findings; without it the command is a dry-run preview
 	backfillUnevaluated bool // judge ALL done transcripts with eval_finished_at IS NULL
 	backfillEvalErrors  bool // re-judge done transcripts whose judging failed
@@ -81,7 +82,17 @@ transcript are not inserted twice.
 
 In both backfill modes eval_finished_at is written only when EVERY chunk was
 judged; otherwise the failure is recorded and the transcript stays eligible for
-the next run. --limit N caps how many transcripts one run judges (0 = all).
+the next run. --limit N caps how many transcripts one run judges SUCCESSFULLY
+(0 = all): skipped transcripts (empty text, not embedded yet) and failed ones do
+not count, so a head of rows that never latch cannot stall every run.
+--max-attempts N caps judge SPEND: every transcript the judge is called for,
+latched or not (default 3×--limit; unbounded only when --limit is 0 too). A
+--limit run also stops after 5 transcripts in a row fail on every chunk (judge
+outage). A backfill that judged something but latched nothing exits non-zero,
+so a dead endpoint or API key fails a scheduled Job instead of exiting 0.
+
+Run 'earmark prune-chunks --yes' before a --backfill-* run: findings judged
+against an orphan chunk tail that a later prune deletes are not retired.
 
 Examples:
   earmark eval "Project Hail Mary"              # preview findings for one book
@@ -97,7 +108,9 @@ Examples:
 
 func init() {
 	EvalCmd.Flags().IntVar(&opts.sample, "sample", 0, "judge a random sample of N chunks library-wide")
-	EvalCmd.Flags().IntVar(&opts.limit, "limit", 0, "max chunks to evaluate for a book (0 = default); with --backfill-*, max transcripts to judge (0 = all)")
+	EvalCmd.Flags().IntVar(&opts.limit, "limit", 0, "max chunks to evaluate for a book (0 = default); with --backfill-*, max transcripts judged successfully (0 = all)")
+	EvalCmd.Flags().IntVar(&opts.maxAttempts, "max-attempts", 0,
+		"with --backfill-*, max transcripts the judge is called for, latched or not (0 = 3×--limit; unbounded only without --limit)")
 	EvalCmd.Flags().BoolVar(&opts.write, "write", false, "persist findings (otherwise dry-run preview)")
 	EvalCmd.Flags().BoolVar(&opts.write, "yes", false, "alias for --write")
 	EvalCmd.Flags().BoolVar(&opts.backfillUnevaluated, "backfill-unevaluated", false,
@@ -142,7 +155,11 @@ func runEval(cmd *cobra.Command, args []string) {
 		if opts.backfillEvalErrors {
 			mode = backfillEvalErrors
 		}
-		bo := backfillOptions{mode: mode, write: opts.write, limit: opts.limit}
+		if opts.maxAttempts < 0 || opts.limit < 0 {
+			fmt.Println("Error: --limit and --max-attempts must be >= 0")
+			os.Exit(1)
+		}
+		bo := backfillOptions{mode: mode, write: opts.write, limit: opts.limit, maxAttempts: opts.maxAttempts}
 		if err := runBackfill(context.Background(), os.Stdout, database, judge, cfg, bo); err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
@@ -191,8 +208,11 @@ const (
 type backfillOptions struct {
 	mode  backfillMode
 	write bool
-	// limit caps the transcripts judged in this run; 0 = all.
+	// limit is the progress target: transcripts judged successfully; 0 = all.
 	limit int
+	// maxAttempts caps the transcripts the judge is called for (latched or
+	// not); 0 → 3×limit when limit > 0, unbounded when limit is 0.
+	maxAttempts int
 	// pageSize is the keyset page size (rows loaded per query); 0 → default.
 	pageSize int
 }
@@ -251,6 +271,36 @@ func (d *dbRunner) Run(ctx context.Context, o evalpkg.RunOptions) ([]db.Finding,
 // loaded per selection query — mirroring EMBED_BATCH_SIZE's OOM guard.
 const defaultBackfillPageSize = 32
 
+// maxConsecutiveJudgeOutages is how many transcripts IN A ROW may fail on every
+// chunk before a --limit run gives up. A transcript whose chunks ALL fail is
+// the outage signature; one bad chunk among several (a poisoned transcript)
+// is not, and never trips it. It is the fast exit for a dead endpoint; the
+// spend cap that holds against EVERY failure mode is --max-attempts.
+const maxConsecutiveJudgeOutages = 5
+
+// defaultAttemptsPerLimit sizes the default --max-attempts: 3×--limit.
+const defaultAttemptsPerLimit = 3
+
+// effectiveMaxAttempts resolves --max-attempts: an explicit positive value
+// wins; otherwise 3×limit when --limit is set, and unbounded (0) only when
+// --limit is 0 too.
+func effectiveMaxAttempts(limit, maxAttempts int) int {
+	if maxAttempts > 0 {
+		return maxAttempts
+	}
+	if limit > 0 {
+		return defaultAttemptsPerLimit * limit
+	}
+	return 0
+}
+
+// backfillTally accumulates one run's outcome for the summary.
+type backfillTally struct {
+	seen, attempts, latched, failed, notEmbedded, skipped int
+	totalChunks, totalFindings, totalSkipped, totalDupes  int
+	limitReached, attemptsReached                         bool
+}
+
 // runBackfill judges every transcript the selected mode returns, walking the
 // selection in keyset pages so memory stays bounded (and a dry run, whose rows
 // never drop out of the selection, still terminates). For each transcript it:
@@ -265,6 +315,31 @@ const defaultBackfillPageSize = 32
 //  4. Writes eval_finished_at ONLY if every chunk was judged and the findings
 //     were stored; otherwise records the failure (eval_failed_at /
 //     eval_failed_chunks / eval_error) so the next run picks it up again.
+//
+// Two bounds, two jobs:
+//
+//   - --limit (o.limit) is the PROGRESS target: transcripts judged
+//     SUCCESSFULLY — latched, or in a dry run, that would latch. Skipped
+//     transcripts (empty raw text, not embedded yet, a read error) and failed
+//     ones do not count. A latched transcript leaves both selections for good,
+//     so a --limit N run either latches N more or exhausts the candidate set.
+//     Counting attempts instead lets a head of permanently failing or
+//     unjudgeable rows — they never leave the selection, and keyset order puts
+//     them first every run — use up the limit on every run and stall the
+//     backfill forever.
+//   - --max-attempts (o.maxAttempts, default 3×--limit) is the SPEND cap:
+//     every transcript the judge was actually called for, latched or not.
+//     Without it a flaky judge that fails some chunk of every transcript, or a
+//     systematic write failure after judging, would turn --limit 25 into a
+//     paid sweep of the whole selection.
+//
+// The cursor advances past EVERY row it visits, whatever its outcome, so
+// within one run no row is selected twice and the run ends when a short page
+// shows the selection is exhausted.
+//
+// The run returns an error — a non-zero exit, so a scheduled Job FAILS — when
+// it judged something but latched nothing (failed > 0, latched == 0): a dead
+// API key or endpoint must not hide behind exit 0.
 //
 // In dry-run mode (write=false) it prints what it would record but writes
 // nothing. A cancelled context stops the sweep without recording anything for
@@ -286,18 +361,17 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 	if chunkSize <= 0 {
 		chunkSize = 512
 	}
+	maxAttempts := effectiveMaxAttempts(o.limit, o.maxAttempts)
 
-	var seen, latched, failed, notEmbedded, totalChunks, totalFindings, totalSkipped, totalDupes int
+	var tl backfillTally
+	var outageRun int
 	var cursor db.TranscriptCursor
+walk:
 	for {
-		want := pageSize
-		if o.limit > 0 && o.limit-seen < want {
-			want = o.limit - seen
-		}
-		if want <= 0 {
-			break
-		}
-		page, err := selectPage(ctx, cursor, want)
+		// Always load a full page: rows that are skipped or fail do not count
+		// toward --limit, so the remaining limit says nothing about how many
+		// rows this run still has to visit.
+		page, err := selectPage(ctx, cursor, pageSize)
 		if err != nil {
 			return fmt.Errorf("query backfill transcripts: %w", err)
 		}
@@ -305,46 +379,90 @@ func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *eval
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			seen++
-			cursor = db.CursorAfter(t)
+			tl.seen++
+			cursor = db.CursorAfter(t) // advance past every row, whatever its outcome
 			res, err := backfillOne(ctx, p, bdb, judge, chunkSize, cfg.EvalGatesEmbed, t, o.write)
 			if err != nil {
 				return err
 			}
-			totalChunks += res.stats.ChunksEvaluated
-			totalSkipped += res.stats.ChunksSkipped
-			totalFindings += res.newFindings
-			totalDupes += res.dupes
+			if res.judged {
+				tl.attempts++
+			}
+			tl.totalChunks += res.stats.ChunksEvaluated
+			tl.totalSkipped += res.stats.ChunksSkipped
+			tl.totalFindings += res.newFindings
+			tl.totalDupes += res.dupes
 			switch {
 			case res.latched:
-				latched++
+				tl.latched++
 			case res.failed:
-				failed++
+				tl.failed++
 			case res.notEmbedded:
-				notEmbedded++
+				tl.notEmbedded++
+			default:
+				tl.skipped++
+			}
+
+			if res.stats.ChunksEvaluated == 0 && res.stats.ChunksSkipped > 0 {
+				outageRun++
+			} else if res.stats.ChunksEvaluated > 0 {
+				outageRun = 0
+			}
+			if o.limit > 0 && outageRun >= maxConsecutiveJudgeOutages {
+				p("\nStopping: the judge failed every chunk of %d transcripts in a row (endpoint down?) — last error: %s\n",
+					outageRun, res.stats.FirstError)
+				printBackfillSummary(p, what, o, maxAttempts, tl)
+				return fmt.Errorf("judge outage: %d consecutive transcripts failed on every chunk", outageRun)
+			}
+
+			if o.limit > 0 && tl.latched >= o.limit {
+				tl.limitReached = true
+				break walk
+			}
+			if maxAttempts > 0 && tl.attempts >= maxAttempts {
+				tl.attemptsReached = true
+				break walk
 			}
 		}
-		if len(page) < want {
+		if len(page) < pageSize {
 			break // selection exhausted
 		}
 	}
 
-	if seen == 0 {
+	if tl.seen == 0 {
 		p("No %s — nothing to backfill.\n", what)
 		return nil
 	}
-	p("\nBackfill: %d %s selected.\n", seen, what)
-	if notEmbedded > 0 {
-		p("%d transcript(s) skipped: not embedded yet (EVAL_GATES_EMBED=false assigns chunk IDs at embed time); re-run after the embed worker catches up.\n", notEmbedded)
+	printBackfillSummary(p, what, o, maxAttempts, tl)
+	if tl.failed > 0 && tl.latched == 0 {
+		return fmt.Errorf("no transcript latched: %d judged transcript(s) failed (judge endpoint, API key, or writes broken?)", tl.failed)
+	}
+	return nil
+}
+
+// printBackfillSummary prints the end-of-run report. In a dry run "latched"
+// counts the transcripts that WOULD latch.
+func printBackfillSummary(p func(string, ...any), what string, o backfillOptions, maxAttempts int, tl backfillTally) {
+	p("\nBackfill: %d %s visited, %d judged.\n", tl.seen, what, tl.attempts)
+	if tl.limitReached {
+		p("Stopped at --limit %d (counts transcripts judged successfully; skipped and failed ones do not count).\n", o.limit)
+	}
+	if tl.attemptsReached {
+		p("Stopped at --max-attempts %d (every transcript the judge was called for, latched or not).\n", maxAttempts)
+	}
+	if tl.notEmbedded > 0 {
+		p("%d transcript(s) skipped: not embedded yet (EVAL_GATES_EMBED=false assigns chunk IDs at embed time); re-run after the embed worker catches up.\n", tl.notEmbedded)
+	}
+	if tl.skipped > 0 {
+		p("%d transcript(s) skipped without a judge call (empty raw text, no chunks, or a read error) — left unlatched.\n", tl.skipped)
 	}
 	if !o.write {
-		p("(dry-run) pass --write to record %d new finding(s) across %d transcript(s) (%d chunk(s) would be skipped by judge errors).\n",
-			totalFindings, seen, totalSkipped)
-		return nil
+		p("(dry-run) pass --write to record %d new finding(s); %d transcript(s) would latch, %d would stay unlatched (%d chunk(s) would be skipped by judge errors).\n",
+			tl.totalFindings, tl.latched, tl.failed, tl.totalSkipped)
+		return
 	}
 	p("Backfill complete: %d chunk(s) evaluated, %d new finding(s) recorded (%d already present), %d chunk(s) skipped; %d transcript(s) latched, %d left unlatched for retry.\n",
-		totalChunks, totalFindings, totalDupes, totalSkipped, latched, failed)
-	return nil
+		tl.totalChunks, tl.totalFindings, tl.totalDupes, tl.totalSkipped, tl.latched, tl.failed)
 }
 
 // backfillResult is one transcript's backfill outcome.
@@ -352,9 +470,12 @@ type backfillResult struct {
 	stats       evalpkg.RunStats
 	newFindings int  // findings not already recorded for the transcript
 	dupes       int  // findings skipped because they were already recorded
-	latched     bool // eval_finished_at written
-	failed      bool // failure recorded (left unlatched)
+	judged      bool // the judge was called (counts toward --max-attempts)
+	latched     bool // eval_finished_at written (dry run: would be written)
+	failed      bool // judged but not latched: failure recorded, or a write failed
 	notEmbedded bool // skipped: ungated and no stored chunks yet
+	// None of the three set: skipped without a judge call (empty raw text, no
+	// chunks produced, or a read error).
 }
 
 // backfillOne judges one transcript and (under write) records its outcome.
@@ -414,6 +535,7 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	started := time.Now()
 	findings, stats, jerr := evalpkg.RunOnChunks(ctx, judge, nil, evalChunks, false)
 	finished := time.Now()
+	res.judged = true
 	res.stats = stats
 	if jerr != nil {
 		// RunOnChunks only errors when ctx was cancelled: stop, record nothing.
@@ -426,6 +548,7 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 		existing, kerr := bdb.GetFindingKeys(ctx, t.ID)
 		if kerr != nil {
 			p("  warn %s: read existing findings failed (%v); skipping (will retry next backfill)\n", name, kerr)
+			res.failed = true // judged, but nothing recorded
 			return res, nil
 		}
 		fresh = make([]db.Finding, 0, len(findings))
@@ -439,9 +562,13 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	res.dupes = len(findings) - len(fresh)
 
 	if !write {
+		// A dry run reports would-latch / would-fail through the same flags,
+		// so --limit bounds a preview exactly as it bounds the real run.
 		state := "would latch"
+		res.latched = true
 		if !stats.Complete() {
 			state = fmt.Sprintf("would stay unlatched: %d chunk(s) failed: %s", stats.ChunksSkipped, stats.FirstError)
+			res.latched, res.failed = false, true
 		}
 		p("  [dry-run] %s: %d/%d chunks judged, %d new finding(s) (%d already recorded) — %s\n",
 			name, stats.ChunksEvaluated, len(evalChunks), len(fresh), res.dupes, state)
@@ -486,6 +613,7 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	}
 	if merr := bdb.UpsertEvalMetrics(ctx, m); merr != nil {
 		p("  warn %s: eval run_metrics write failed (%v); transcript will be re-judged on next backfill\n", name, merr)
+		res.failed = true // judged, but the latch was not written
 		return res, nil
 	}
 	if m.Failed() {

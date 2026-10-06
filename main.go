@@ -11,6 +11,7 @@ import (
 	"github.com/jedwards1230/earmark/cmd/list"
 	"github.com/jedwards1230/earmark/cmd/mcp"
 	"github.com/jedwards1230/earmark/cmd/monitor"
+	"github.com/jedwards1230/earmark/cmd/prunechunks"
 	"github.com/jedwards1230/earmark/cmd/requeue"
 	"github.com/jedwards1230/earmark/cmd/search"
 	"github.com/jedwards1230/earmark/cmd/serve"
@@ -28,6 +29,7 @@ func main() {
 	rootCmd.AddCommand(search.SearchCmd)
 	rootCmd.AddCommand(requeue.RequeueCmd)
 	rootCmd.AddCommand(eval.EvalCmd)
+	rootCmd.AddCommand(prunechunks.PruneChunksCmd)
 	rootCmd.AddCommand(batch.BatchCmd)
 	rootCmd.AddCommand(backfill.BackfillCmd)
 	rootCmd.AddCommand(mcp.MCPCmd)

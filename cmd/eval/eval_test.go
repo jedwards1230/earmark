@@ -195,6 +195,7 @@ type fakeBackfillDB struct {
 	evalMetrics    []db.EvalMetrics
 	findingsErr    error
 	metricsErr     error
+	keysErr        error
 	transcriptErr  error
 	pageLimits     []int // limit passed on each selection call
 }
@@ -228,6 +229,9 @@ func (f *fakeBackfillDB) GetEvalErrorTranscripts(_ context.Context, after db.Tra
 }
 
 func (f *fakeBackfillDB) GetFindingKeys(_ context.Context, transcriptID string) (map[db.FindingKey]bool, error) {
+	if f.keysErr != nil {
+		return nil, f.keysErr
+	}
 	return f.existing[transcriptID], nil
 }
 
@@ -510,9 +514,8 @@ func TestRunBackfill_JudgeErrorDoesNotLatch(t *testing.T) {
 	}}}
 	judge := evalpkg.NewJudge(errBackfillChat{})
 	var out strings.Builder
-	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32, EvalGatesEmbed: true}, backfillOptions{write: true}); err != nil {
-		t.Fatalf("runBackfill: %v", err)
-	}
+	// Judged but nothing latched → non-zero exit (a dead endpoint must fail the Job).
+	wantNoLatchErr(t, runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 32, EvalGatesEmbed: true}, backfillOptions{write: true}))
 	if len(fdb.evalMetrics) != 1 {
 		t.Fatalf("want exactly one outcome record (the failure), got %d", len(fdb.evalMetrics))
 	}
@@ -553,9 +556,7 @@ func TestRunBackfill_PartialFailureRecordsFailure(t *testing.T) {
 		resp:  `{"findings":[{"original_text":"spice","issue_type":"misheard_word","suggested_correction":"spies","confidence":0.9}]}`,
 	})
 	var out strings.Builder
-	if err := runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 8, EvalGatesEmbed: true}, backfillOptions{write: true}); err != nil {
-		t.Fatalf("runBackfill: %v", err)
-	}
+	wantNoLatchErr(t, runBackfill(context.Background(), &out, fdb, judge, &config.Config{ChunkSize: 8, EvalGatesEmbed: true}, backfillOptions{write: true}))
 	if len(fdb.evalMetrics) != 1 {
 		t.Fatalf("want 1 outcome record, got %d", len(fdb.evalMetrics))
 	}
@@ -646,8 +647,10 @@ func TestRunBackfill_PagesAndLimit(t *testing.T) {
 		if len(fdb.evalMetrics) != 3 {
 			t.Errorf("latched %d transcripts, want --limit 3", len(fdb.evalMetrics))
 		}
-		if fmt.Sprint(fdb.pageLimits) != "[2 1]" {
-			t.Errorf("page limits = %v, want [2 1]", fdb.pageLimits)
+		// Full pages: skipped/failed rows don't count toward --limit, so the
+		// remaining limit can't size the page. The run stops mid-page.
+		if fmt.Sprint(fdb.pageLimits) != "[2 2]" {
+			t.Errorf("page limits = %v, want [2 2]", fdb.pageLimits)
 		}
 	})
 }
@@ -713,5 +716,274 @@ func TestRunBackfill_UngatedSkipsNotYetEmbedded(t *testing.T) {
 	}
 	if len(fdb.evalMetrics) != 1 || fdb.evalMetrics[0].Failed() {
 		t.Errorf("gated: want the transcript latched, got %+v", fdb.evalMetrics)
+	}
+}
+
+// poisonChat fails every call whose prompt contains needle and answers an
+// empty findings list otherwise — a transcript that always fails to judge.
+type poisonChat struct{ needle string }
+
+func (c poisonChat) Complete(_ context.Context, _, user string) (string, error) {
+	if strings.Contains(user, c.needle) {
+		return "", errors.New("poisoned chunk")
+	}
+	return `{"findings":[]}`, nil
+}
+func (poisonChat) Model() string { return "fake-backfill-judge" }
+
+// stalledHead builds the selection that stalled every --limit run: a head of
+// rows that can never latch (empty raw text, not embedded yet under the
+// ungated config, a transcript whose judge call always fails) followed by
+// judgeable ones.
+func stalledHead() *fakeBackfillDB {
+	embedded := func(id string) []db.EvalChunk {
+		return []db.EvalChunk{{ChunkID: "c-" + id, TranscriptID: id, FilePath: "/b/" + id + ".m4b", Text: "text of " + id}}
+	}
+	fdb := &fakeBackfillDB{stored: map[string][]db.EvalChunk{}}
+	for _, id := range []string{"t-empty", "t-unembedded", "t-poison", "t-ok1", "t-ok2", "t-ok3"} {
+		tr := &db.Transcript{ID: id, JobID: "j-" + id, FilePath: "/b/" + id + ".m4b", RawText: "x"}
+		switch id {
+		case "t-empty":
+			tr.RawText = ""
+		case "t-unembedded":
+			// no stored chunks + ungated config → skipped as not embedded
+		default:
+			fdb.stored[id] = embedded(id)
+		}
+		fdb.transcripts = append(fdb.transcripts, tr)
+	}
+	return fdb
+}
+
+// TestRunBackfill_LimitCountsOnlySuccesses is the stall regression: --limit
+// used to count every visited row, so a head of rows that never latch used up
+// the limit on every run and the backfill made no progress. The limit must
+// count only transcripts judged successfully; skipped/failed rows are visited
+// once (keyset cursor) and passed over.
+func TestRunBackfill_LimitCountsOnlySuccesses(t *testing.T) {
+	cfg := &config.Config{ChunkSize: 32} // ungated: t-unembedded is skipped
+	judge := evalpkg.NewJudge(poisonChat{needle: "text of t-poison"})
+
+	t.Run("write", func(t *testing.T) {
+		fdb := stalledHead()
+		var out strings.Builder
+		if err := runBackfill(context.Background(), &out, fdb, judge, cfg,
+			backfillOptions{write: true, limit: 2, pageSize: 2}); err != nil {
+			t.Fatalf("runBackfill: %v", err)
+		}
+		var latched, failedJobs []string
+		for _, m := range fdb.evalMetrics {
+			if m.Failed() {
+				failedJobs = append(failedJobs, m.JobID)
+			} else {
+				latched = append(latched, m.JobID)
+			}
+		}
+		if fmt.Sprint(latched) != "[j-t-ok1 j-t-ok2]" {
+			t.Errorf("latched %v, want the 2 judgeable transcripts past the stuck head", latched)
+		}
+		if fmt.Sprint(failedJobs) != "[j-t-poison]" {
+			t.Errorf("failure records %v, want exactly one for t-poison (visited once)", failedJobs)
+		}
+		// Stops at the limit: t-ok3 is never judged.
+		if strings.Contains(out.String(), "t-ok3") {
+			t.Errorf("run went past --limit:\n%s", out.String())
+		}
+		if !strings.Contains(out.String(), "Stopped at --limit 2") {
+			t.Errorf("report should say the limit stopped the run:\n%s", out.String())
+		}
+	})
+
+	t.Run("dry run counts would-latch", func(t *testing.T) {
+		fdb := stalledHead()
+		var out strings.Builder
+		if err := runBackfill(context.Background(), &out, fdb, judge, cfg,
+			backfillOptions{limit: 1, pageSize: 2}); err != nil {
+			t.Fatalf("runBackfill: %v", err)
+		}
+		s := out.String()
+		if !strings.Contains(s, "t-ok1.m4b") || strings.Contains(s, "t-ok2") {
+			t.Errorf("dry run with --limit 1 must preview exactly the first judgeable transcript:\n%s", s)
+		}
+		if len(fdb.evalMetrics) != 0 || len(fdb.findings) != 0 {
+			t.Errorf("dry run wrote: metrics=%d findings=%d", len(fdb.evalMetrics), len(fdb.findings))
+		}
+	})
+}
+
+// TestRunBackfill_LimitTerminatesWhenExhausted: when nothing in the selection
+// can latch, a --limit run still ends — at the end of the selection, each row
+// visited once — instead of re-selecting the same head.
+func TestRunBackfill_LimitTerminatesWhenExhausted(t *testing.T) {
+	fdb := stalledHead()
+	fdb.transcripts = fdb.transcripts[:3] // only the never-latching head
+	var out strings.Builder
+	wantNoLatchErr(t, runBackfill(context.Background(), &out, fdb,
+		evalpkg.NewJudge(poisonChat{needle: "text of t-poison"}), &config.Config{ChunkSize: 32},
+		backfillOptions{write: true, limit: 5, pageSize: 2}))
+	if fmt.Sprint(fdb.pageLimits) != "[2 2]" {
+		t.Errorf("page requests = %v, want [2 2] (a full page, then the short last page)", fdb.pageLimits)
+	}
+	if len(fdb.evalMetrics) != 1 || !fdb.evalMetrics[0].Failed() {
+		t.Errorf("want only t-poison's failure record, got %+v", fdb.evalMetrics)
+	}
+	if !strings.Contains(out.String(), "3 done transcript(s) with eval_finished_at IS NULL visited") {
+		t.Errorf("each row must be visited exactly once:\n%s", out.String())
+	}
+}
+
+// TestRunBackfill_OutageStopsLimitedRun: --limit no longer counts failures, so
+// a judge outage must not turn a bounded run into a sweep of the whole
+// selection. After maxConsecutiveJudgeOutages transcripts fail on EVERY chunk
+// the run stops with an error.
+func TestRunBackfill_OutageStopsLimitedRun(t *testing.T) {
+	fdb := &fakeBackfillDB{stored: map[string][]db.EvalChunk{}}
+	for i := range maxConsecutiveJudgeOutages + 3 {
+		id := fmt.Sprintf("t%d", i)
+		fdb.transcripts = append(fdb.transcripts, &db.Transcript{ID: id, JobID: "j" + id, FilePath: "/b/" + id + ".m4b", RawText: "x"})
+		fdb.stored[id] = []db.EvalChunk{{ChunkID: "c" + id, TranscriptID: id, Text: "text " + id}}
+	}
+	var out strings.Builder
+	err := runBackfill(context.Background(), &out, fdb, evalpkg.NewJudge(errBackfillChat{}),
+		&config.Config{ChunkSize: 32}, backfillOptions{write: true, limit: 2, pageSize: 4})
+	if err == nil || !strings.Contains(err.Error(), "judge outage") {
+		t.Fatalf("want judge outage error, got %v", err)
+	}
+	if len(fdb.evalMetrics) != maxConsecutiveJudgeOutages {
+		t.Errorf("judged %d transcripts, want to stop after %d consecutive outages", len(fdb.evalMetrics), maxConsecutiveJudgeOutages)
+	}
+
+	// Without --limit the operator asked for the whole selection: no breaker.
+	fdb.evalMetrics = nil
+	fdb.pageLimits = nil
+	wantNoLatchErr(t, runBackfill(context.Background(), &out, fdb, evalpkg.NewJudge(errBackfillChat{}),
+		&config.Config{ChunkSize: 32}, backfillOptions{write: true, pageSize: 4}))
+	if len(fdb.evalMetrics) != len(fdb.transcripts) {
+		t.Errorf("unlimited run judged %d of %d", len(fdb.evalMetrics), len(fdb.transcripts))
+	}
+}
+
+// wantNoLatchErr asserts the run failed because it judged but latched nothing.
+func wantNoLatchErr(t *testing.T, err error) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "no transcript latched") {
+		t.Fatalf("want a non-zero exit (no transcript latched), got %v", err)
+	}
+}
+
+// partialChat fails every call whose prompt contains "FAIL" and answers resp
+// otherwise, so one transcript can be judged with a chunk failing.
+type partialChat struct{ resp string }
+
+func (c partialChat) Complete(_ context.Context, _, user string) (string, error) {
+	if strings.Contains(user, "FAIL") {
+		return "", errors.New("rate limited")
+	}
+	return c.resp, nil
+}
+func (partialChat) Model() string { return "fake-backfill-judge" }
+
+// TestRunBackfill_MaxAttemptsCapsSpend (M2): a flaky judge that fails SOME
+// chunk of every transcript leaves each one unlatched and never trips the
+// all-chunks outage breaker. --limit counts only successes, so the spend cap
+// must come from --max-attempts: every transcript the judge was called for.
+func TestRunBackfill_MaxAttemptsCapsSpend(t *testing.T) {
+	mk := func() *fakeBackfillDB {
+		fdb := &fakeBackfillDB{stored: map[string][]db.EvalChunk{}}
+		for i := range 20 {
+			id := fmt.Sprintf("t%02d", i)
+			fdb.transcripts = append(fdb.transcripts, &db.Transcript{ID: id, JobID: "j" + id, FilePath: "/b/" + id + ".m4b", RawText: "x"})
+			fdb.stored[id] = []db.EvalChunk{
+				{ChunkID: "a" + id, TranscriptID: id, ChunkIndex: 0, Text: "fine " + id},
+				{ChunkID: "b" + id, TranscriptID: id, ChunkIndex: 1, Text: "FAIL " + id},
+			}
+		}
+		return fdb
+	}
+	judge := evalpkg.NewJudge(partialChat{resp: `{"findings":[]}`})
+	cfg := &config.Config{ChunkSize: 32}
+
+	tests := []struct {
+		name        string
+		o           backfillOptions
+		wantJudged  int
+		wantCapLine string
+	}{
+		{"default is 3x limit", backfillOptions{write: true, limit: 2, pageSize: 8}, 6, "Stopped at --max-attempts 6"},
+		{"explicit cap", backfillOptions{write: true, limit: 2, maxAttempts: 4, pageSize: 8}, 4, "Stopped at --max-attempts 4"},
+		{"dry run is capped too", backfillOptions{limit: 1, pageSize: 8}, 3, "Stopped at --max-attempts 3"},
+		{"explicit cap without limit", backfillOptions{write: true, maxAttempts: 5, pageSize: 8}, 5, "Stopped at --max-attempts 5"},
+		{"no limit, no cap: whole selection", backfillOptions{write: true, pageSize: 8}, 20, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fdb := mk()
+			var out strings.Builder
+			// Nothing latches, so every variant also exits non-zero.
+			wantNoLatchErr(t, runBackfill(context.Background(), &out, fdb, judge, cfg, tc.o))
+			judged := strings.Count(out.String(), "chunks judged")
+			if tc.o.write {
+				judged = len(fdb.evalMetrics)
+			}
+			if judged != tc.wantJudged {
+				t.Errorf("judge called for %d transcripts, want %d:\n%s", judged, tc.wantJudged, out.String())
+			}
+			if tc.wantCapLine != "" && !strings.Contains(out.String(), tc.wantCapLine) {
+				t.Errorf("report missing %q:\n%s", tc.wantCapLine, out.String())
+			}
+		})
+	}
+}
+
+// TestRunBackfill_ExitZeroWhenSomethingLatched: the non-zero exit is only for
+// "judged, latched nothing"; a run that latched at least one transcript, or
+// judged nothing at all (only skips), exits 0 even with failures alongside.
+func TestRunBackfill_ExitZeroWhenSomethingLatched(t *testing.T) {
+	cfg := &config.Config{ChunkSize: 32}
+	fdb := stalledHead() // t-poison fails, t-ok* latch
+	var out strings.Builder
+	if err := runBackfill(context.Background(), &out, fdb, evalpkg.NewJudge(poisonChat{needle: "text of t-poison"}), cfg,
+		backfillOptions{write: true, pageSize: 8}); err != nil {
+		t.Fatalf("latched some → exit 0, got %v", err)
+	}
+	fdb = stalledHead()
+	fdb.transcripts = fdb.transcripts[:2] // only skips: empty text + not embedded
+	if err := runBackfill(context.Background(), &out, fdb, evalpkg.NewJudge(poisonChat{needle: "never"}), cfg,
+		backfillOptions{write: true, pageSize: 8}); err != nil {
+		t.Fatalf("only skips → exit 0, got %v", err)
+	}
+}
+
+// TestRunBackfill_WriteFailuresAfterJudgingAreFailures (m3): a transcript the
+// judge WAS called for but whose outcome could not be recorded — reading the
+// existing findings failed, or the run_metrics write failed — is a failure,
+// not a skip: it counts toward the non-zero exit and is reported as unlatched.
+func TestRunBackfill_WriteFailuresAfterJudgingAreFailures(t *testing.T) {
+	finding := `{"findings":[{"original_text":"text","issue_type":"misheard_word","suggested_correction":"test","confidence":0.9}]}`
+	tests := []struct {
+		name   string
+		inject func(*fakeBackfillDB)
+		want   string
+	}{
+		{"finding keys read fails", func(f *fakeBackfillDB) { f.keysErr = errors.New("keys down") }, "read existing findings failed"},
+		{"metrics write fails", func(f *fakeBackfillDB) { f.metricsErr = errors.New("metrics down") }, "eval run_metrics write failed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fdb := stalledHead()
+			fdb.transcripts = fdb.transcripts[3:4] // t-ok1 only: judgeable
+			tc.inject(fdb)
+			var out strings.Builder
+			wantNoLatchErr(t, runBackfill(context.Background(), &out, fdb,
+				evalpkg.NewJudge(fakeBackfillChat{resp: finding}), &config.Config{ChunkSize: 32},
+				backfillOptions{write: true, pageSize: 8}))
+			s := out.String()
+			if !strings.Contains(s, tc.want) || !strings.Contains(s, "0 transcript(s) latched, 1 left unlatched") {
+				t.Errorf("want the failure reported as unlatched:\n%s", s)
+			}
+			if strings.Contains(s, "skipped without a judge call") {
+				t.Errorf("a judged transcript must not be reported as skipped:\n%s", s)
+			}
+		})
 	}
 }
