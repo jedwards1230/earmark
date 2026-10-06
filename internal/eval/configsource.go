@@ -42,6 +42,13 @@ func NewJudgeForConfig(chat ChatClient, cfg *config.Config) *Judge {
 	j := NewJudge(chat)
 	pin := cfg.ModelPin(recipe.StepPropose)
 	j.SetModelPin(ModelPin{ExpectedModel: pin.ExpectedModel, Revision: pin.Revision})
+	if pin.ExpectedModel == "" {
+		// Not knowable at startup whether the endpoint reports the alias
+		// verbatim (Ollama does) or a provider id (LiteLLM usually does); the
+		// judge warns once on the first mismatching response.
+		j.logger.Info("no MODELS_FILE expected_model pin for the judge; the current propose recipe expects the endpoint to report the requested model id",
+			"requested", chat.Model())
+	}
 	if pin.PromptVersion != "" && pin.PromptVersion != judgePromptVersion {
 		j.logger.Warn("MODELS_FILE pins a different judge prompt version than this build runs",
 			"pinned", pin.PromptVersion, "running", judgePromptVersion)

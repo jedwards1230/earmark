@@ -1,12 +1,15 @@
 package eval
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
@@ -146,4 +149,50 @@ func mustRecipeID(t *testing.T, r recipe.Recipe) string {
 		t.Fatal(err)
 	}
 	return id
+}
+
+func TestServedUnexpectedModel(t *testing.T) {
+	tests := []struct {
+		expected, reported string
+		want               bool
+	}{
+		{"earmark-judge", "", false},
+		{"earmark-judge", "earmark-judge", false},
+		{"earmark-judge", "anthropic/claude-haiku-4-5-20251001", true}, // alias reported as provider id, unpinned
+		{"anthropic/claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5-20251001", false},
+		{"anthropic/claude-haiku-4-5-20251001", "gemini/gemini-2.5-flash", true}, // fallback
+	}
+	for _, tt := range tests {
+		if got := servedUnexpectedModel(tt.expected, tt.reported); got != tt.want {
+			t.Errorf("servedUnexpectedModel(%q, %q) = %v, want %v", tt.expected, tt.reported, got, tt.want)
+		}
+	}
+}
+
+// TestJudgeWarnsOnceOnUnexpectedModel: unpinned behind an alias that the
+// endpoint reports as a provider id, every finding would be stamped with a
+// non-current recipe (stale_work). The judge must say so — once, not per chunk.
+func TestJudgeWarnsOnceOnUnexpectedModel(t *testing.T) {
+	for _, tt := range []struct {
+		name, reported string
+		wantWarns      int
+	}{
+		{"reports the alias", "earmark-judge", 0},
+		{"reports a provider id", "anthropic/claude-haiku-4-5-20251001", 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			chat := &reportingChat{fakeChat: fakeChat{resp: `{"findings":[]}`, model: "earmark-judge"}, resolved: tt.reported}
+			j := NewJudge(chat)
+			var buf bytes.Buffer
+			j.logger = log.Logger{Logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+			for range 3 {
+				if _, err := j.JudgeChunk(context.Background(), sampleChunk()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := strings.Count(buf.String(), "level=WARN"); got != tt.wantWarns {
+				t.Errorf("warnings over 3 chunks = %d, want %d:\n%s", got, tt.wantWarns, buf.String())
+			}
+		})
+	}
 }

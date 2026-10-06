@@ -24,6 +24,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
@@ -136,6 +137,8 @@ type Judge struct {
 	minConf float64
 	// pin is the model registry's entry for the propose step (CONTRACT §2.18).
 	pin ModelPin
+	// resolvedWarn fires the not-the-expected-model warning once per judge.
+	resolvedWarn sync.Once
 }
 
 // ModelPin is the model registry's pin for the judge: the model expected to
@@ -237,6 +240,16 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		j.logger.Debug("judge request served by a different model id",
 			"chunk_id", c.ChunkID, "requested", j.chat.Model(), "resolved", resolved)
 	}
+	if expected := j.Recipe().ModelResolved; servedUnexpectedModel(expected, resolved) {
+		j.resolvedWarn.Do(func() {
+			j.logger.Warn("the eval endpoint reported a different model than the propose recipe expects; "+
+				"findings it answers are stamped with a non-current recipe and listed in stale_work. "+
+				"If this is the normal answer for the alias (e.g. LiteLLM reporting the provider id), "+
+				"pin steps.propose.expected_model in MODELS_FILE (CONTRACT §2.18); if it is a fallback, this is expected",
+				"requested", j.chat.Model(), "expected", expected, "reported", resolved,
+				"expected_model_pinned", j.pin.ExpectedModel != "")
+		})
+	}
 
 	parsed, perr := parseFindings(raw)
 	if perr != nil {
@@ -332,6 +345,13 @@ func (j *Judge) capFindings(c db.EvalChunk, parsed []parsedFinding) []parsedFind
 	j.logger.Debug("capping over-flagged chunk findings",
 		"chunk_id", c.ChunkID, "kept", j.maxPerChunk, "dropped", dropped, "cap", j.maxPerChunk)
 	return parsed[:j.maxPerChunk]
+}
+
+// servedUnexpectedModel reports whether a response came from a model other
+// than the one the current recipe expects. An endpoint that reports nothing is
+// not a mismatch (the finding keeps the expected model).
+func servedUnexpectedModel(expected, reported string) bool {
+	return reported != "" && reported != expected
 }
 
 // optionalStr maps an empty string to nil (NULL), else a pointer to the value.
