@@ -1614,7 +1614,7 @@ def _mark_done(
                 + (
                     result.get("embedded_asin"),
                     _ASR_MODEL_SHA256,
-                    RUNNER_VERSION,
+                    _provenance_runner_version(),
                     json.dumps(_asr_params(), sort_keys=True),
                 ),
             )
@@ -1945,6 +1945,18 @@ def _model_sha256(model_id: str) -> str | None:
         return None
     log.info("ASR model %s: %s sha256=%s", model_id, path.name, digest)
     return digest
+
+
+def _provenance_runner_version() -> str | None:
+    """
+    The runner version recorded as the asr recipe's code_version, or None when
+    the runner cannot tell its own version ("unknown"): earmark never stamps a
+    recipe it would have to invent (CONTRACT §1.9), so such rows stay unstamped.
+    """
+    v = RUNNER_VERSION.strip()
+    if not v or v == "unknown":
+        return None
+    return v
 
 
 def _asr_params() -> dict[str, Any]:
@@ -3374,6 +3386,11 @@ class NeMoParakeetProvider(ASRProvider):
         # transcript records exactly which weights produced it.
         global _ASR_MODEL_SHA256
         _ASR_MODEL_SHA256 = _model_sha256(ASR_MODEL_ID)
+        if _provenance_runner_version() is None:
+            log.warning(
+                "runner version unknown (no VERSION file / RUNNER_VERSION): "
+                "transcripts will not be stamped with an asr recipe"
+            )
 
         log.info("Models loaded successfully")
         self._asr_model = asr_model

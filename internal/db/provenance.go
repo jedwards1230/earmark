@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -53,43 +54,101 @@ type StampedTranscript struct {
 	EmbeddedASIN string
 }
 
-// selectUnstampedASRSQL selects transcripts a provenance-aware runner wrote
-// that have no recipe yet (served by transcripts_asr_unstamped_idx). It reads
-// only the small provenance columns — never segments or raw_text.
+// selectUnstampedASRSQL selects one keyset page of transcripts a
+// provenance-aware runner wrote that have no recipe yet (served by
+// transcripts_asr_unstamped_idx), after the cursor (created_at, id). A runner
+// version of "unknown" (a runner that cannot tell its own version) is never
+// selected: a recipe with that code_version would invent provenance (CONTRACT
+// §1.9). It reads only the small provenance columns — never segments or
+// raw_text.
 const selectUnstampedASRSQL = `
-	SELECT id::text, file_path, model_name, coalesce(asr_model_sha256, ''),
+	SELECT id::text, created_at, file_path, model_name, coalesce(asr_model_sha256, ''),
 	       asr_runner_version, coalesce(asr_params::text, ''), coalesce(embedded_asin, '')
 	  FROM transcripts
 	 WHERE recipe_id IS NULL AND asr_runner_version IS NOT NULL
-	 ORDER BY created_at
-	 LIMIT $1`
+	   AND asr_runner_version NOT IN ('', 'unknown')
+	   AND (created_at, id) > ($1, $2::uuid)
+	 ORDER BY created_at, id
+	 LIMIT $3`
 
 // stampASRSQL stamps one transcript; guarded so a row stamped meanwhile (a
 // second ingest process) is never overwritten.
 const stampASRSQL = `UPDATE transcripts SET recipe_id = $1 WHERE id = $2 AND recipe_id IS NULL`
 
-// StampASRRecipes stamps up to limit unstamped transcripts with the asr recipe
-// built from their runner-reported provenance, registering each recipe in the
-// same transaction. It returns the rows it stamped. A row whose provenance
-// cannot form a valid recipe (malformed asr_params) is skipped and reported in
-// the error, after the others are committed.
-func (db *DB) StampASRRecipes(ctx context.Context, limit int) ([]StampedTranscript, error) {
-	if limit <= 0 {
-		limit = 100
+// StampASRRecipes stamps every unstamped transcript a provenance-aware runner
+// wrote with the asr recipe built from its runner-reported provenance. It
+// walks the selection in keyset pages of pageSize (bounded memory), and stamps
+// each row in its own transaction (register the recipe, set recipe_id), so a
+// row that cannot be stamped — malformed asr_params, an invalid recipe — is
+// skipped and reported in the returned error without blocking the rows behind
+// it or being retried ahead of them. Rows whose runner version is unknown are
+// not selected at all. It returns the rows it stamped.
+func (db *DB) StampASRRecipes(ctx context.Context, pageSize int) ([]StampedTranscript, error) {
+	if pageSize <= 0 {
+		pageSize = 100
 	}
-	rows, err := db.pool.Query(ctx, selectUnstampedASRSQL, limit)
+	// The model registry's asr pin (MODELS_FILE, CONTRACT §2.18) is what the
+	// runner is expected to run; a runner reporting something else still gets
+	// an honest recipe, and the mismatch is logged.
+	pin := db.cfg.ModelPin(recipe.StepASR)
+
+	var (
+		stamped []StampedTranscript
+		errs    []error
+		afterAt = time.Time{}
+		afterID = "00000000-0000-0000-0000-000000000000"
+	)
+	for {
+		page, err := db.unstampedASRPage(ctx, afterAt, afterID, pageSize)
+		if err != nil {
+			return stamped, errors.Join(append(errs, err)...)
+		}
+		for _, p := range page {
+			afterAt, afterID = p.createdAt, p.ID
+			if p.paramsErr != nil {
+				errs = append(errs, p.paramsErr)
+				continue
+			}
+			modelDiffers := pin.ExpectedModel != "" && pin.ExpectedModel != p.prov.ModelName
+			revisionDiffers := pin.Revision != "" && p.prov.ModelSHA256 != "" && pin.Revision != p.prov.ModelSHA256
+			if modelDiffers || revisionDiffers {
+				db.log.Warn("runner reported an ASR model other than the registry pin",
+					"transcript_id", p.ID, "model", p.prov.ModelName, "sha256", p.prov.ModelSHA256,
+					"expected_model", pin.ExpectedModel, "expected_revision", pin.Revision)
+			}
+			id, ok, err := db.stampOneASR(ctx, p.ID, p.prov)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("transcript %s: %w", p.ID, err))
+				continue
+			}
+			if ok {
+				p.RecipeID = id
+				stamped = append(stamped, p.StampedTranscript)
+			}
+		}
+		if len(page) < pageSize {
+			return stamped, errors.Join(errs...)
+		}
+	}
+}
+
+// unstampedRow is one row of selectUnstampedASRSQL.
+type unstampedRow struct {
+	StampedTranscript
+	createdAt time.Time
+	prov      ASRProvenance
+	paramsErr error
+}
+
+func (db *DB) unstampedASRPage(ctx context.Context, afterAt time.Time, afterID string, limit int) ([]unstampedRow, error) {
+	rows, err := db.pool.Query(ctx, selectUnstampedASRSQL, afterAt, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("select unstamped transcripts: %w", err)
 	}
-	type pending struct {
-		StampedTranscript
-		prov      ASRProvenance
-		paramsErr error
-	}
-	todo, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (pending, error) {
-		var p pending
+	page, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (unstampedRow, error) {
+		var p unstampedRow
 		var params string
-		if err := r.Scan(&p.ID, &p.FilePath, &p.prov.ModelName, &p.prov.ModelSHA256,
+		if err := r.Scan(&p.ID, &p.createdAt, &p.FilePath, &p.prov.ModelName, &p.prov.ModelSHA256,
 			&p.prov.RunnerVersion, &params, &p.EmbeddedASIN); err != nil {
 			return p, err
 		}
@@ -103,54 +162,29 @@ func (db *DB) StampASRRecipes(ctx context.Context, limit int) ([]StampedTranscri
 	if err != nil {
 		return nil, fmt.Errorf("scan unstamped transcripts: %w", err)
 	}
-	if len(todo) == 0 {
-		return nil, nil
-	}
+	return page, nil
+}
 
+// stampOneASR registers the recipe and stamps one transcript in a transaction.
+// ok is false when the row was stamped meanwhile by another process.
+func (db *DB) stampOneASR(ctx context.Context, transcriptID string, prov ASRProvenance) (string, bool, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin asr stamp tx: %w", err)
+		return "", false, fmt.Errorf("begin asr stamp tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-
-	// The model registry's asr pin (MODELS_FILE, CONTRACT §2.18) is what the
-	// runner is expected to run; a runner reporting something else still gets
-	// an honest recipe, and the mismatch is logged.
-	pin := db.cfg.ModelPin(recipe.StepASR)
-
-	var stamped []StampedTranscript
-	var firstErr error
-	for _, p := range todo {
-		if p.paramsErr != nil {
-			if firstErr == nil {
-				firstErr = p.paramsErr
-			}
-			continue
-		}
-		modelDiffers := pin.ExpectedModel != "" && pin.ExpectedModel != p.prov.ModelName
-		revisionDiffers := pin.Revision != "" && p.prov.ModelSHA256 != "" && pin.Revision != p.prov.ModelSHA256
-		if modelDiffers || revisionDiffers {
-			db.log.Warn("runner reported an ASR model other than the registry pin",
-				"transcript_id", p.ID, "model", p.prov.ModelName, "sha256", p.prov.ModelSHA256,
-				"expected_model", pin.ExpectedModel, "expected_revision", pin.Revision)
-		}
-		id, err := registerRecipe(ctx, tx, ASRRecipe(p.prov))
-		if err != nil {
-			return nil, fmt.Errorf("transcript %s: %w", p.ID, err)
-		}
-		tag, err := tx.Exec(ctx, stampASRSQL, id, p.ID)
-		if err != nil {
-			return nil, fmt.Errorf("stamp transcript %s: %w", p.ID, err)
-		}
-		if tag.RowsAffected() == 1 {
-			p.RecipeID = id
-			stamped = append(stamped, p.StampedTranscript)
-		}
+	id, err := registerRecipe(ctx, tx, ASRRecipe(prov))
+	if err != nil {
+		return "", false, err
+	}
+	tag, err := tx.Exec(ctx, stampASRSQL, id, transcriptID)
+	if err != nil {
+		return "", false, fmt.Errorf("stamp: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit asr stamps: %w", err)
+		return "", false, fmt.Errorf("commit asr stamp: %w", err)
 	}
-	return stamped, firstErr
+	return id, tag.RowsAffected() == 1, nil
 }
 
 // EmbeddedASIN returns the ASIN tag the runner read from filePath's audio

@@ -3729,3 +3729,16 @@ class ProvenanceMarkDoneTests(unittest.TestCase):
         sql, params = [(s, p) for s, p in conn.executed if "INSERT INTO transcripts" in s][0]
         self.assertNotIn("asr_model_sha256", sql)
         self.assertEqual(len(params), 9)
+
+
+class ProvenanceRunnerVersionTests(unittest.TestCase):
+    """An unknown runner version is written as NULL, never as "unknown"."""
+
+    def test_unknown_is_none(self) -> None:
+        for v in ("unknown", "", "  "):
+            with mock.patch.object(runner, "RUNNER_VERSION", v):
+                self.assertIsNone(runner._provenance_runner_version(), repr(v))
+
+    def test_known_passes_through(self) -> None:
+        with mock.patch.object(runner, "RUNNER_VERSION", "v0.41.0"):
+            self.assertEqual(runner._provenance_runner_version(), "v0.41.0")

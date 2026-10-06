@@ -246,3 +246,47 @@ func TestIntegrationIdentityTransitions(t *testing.T) {
 		t.Errorf("after exact again: asin=%s status=%s source=%s", str(r.asin), str(r.status), str(r.source))
 	}
 }
+
+// TestIntegrationStampASRPagesPastBadRows (review M5): more malformed rows
+// than one page, all older than a good row, never block it; a runner version
+// of "unknown" is never stamped.
+func TestIntegrationStampASRPagesPastBadRows(t *testing.T) {
+	ctx := context.Background()
+	d := newIntegrationDB(t, newTestDatabase(t))
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO transcription_jobs (id, file_path, checksum, status)
+		SELECT ('00000000-0000-0000-0000-0000000001' || lpad(g::text, 2, '0'))::uuid,
+		       '/b/Bad/' || g || '.m4b', 'c' || g, 'done' FROM generate_series(1, 7) g;
+		INSERT INTO transcripts (id, job_id, file_path, checksum, language, duration_seconds,
+		                         segments, raw_text, model_name, asr_runner_version, asr_params, created_at)
+		SELECT gen_random_uuid(), id, file_path, checksum, 'en', 1, '[]', 'x', 'm', 'v1', '[1]',
+		       now() - interval '1 hour'
+		  FROM transcription_jobs;
+		INSERT INTO transcription_jobs (id, file_path, checksum, status) VALUES
+		  ('00000000-0000-0000-0000-0000000002aa', '/b/Good/01.m4b', 'g', 'done'),
+		  ('00000000-0000-0000-0000-0000000002bb', '/b/Unknown/01.m4b', 'u', 'done');
+		INSERT INTO transcripts (id, job_id, file_path, checksum, language, duration_seconds,
+		                         segments, raw_text, model_name, asr_runner_version, asr_params) VALUES
+		  ('00000000-0000-0000-0000-0000000003aa', '00000000-0000-0000-0000-0000000002aa',
+		   '/b/Good/01.m4b', 'g', 'en', 1, '[]', 'x', 'm', 'v1', '{}'),
+		  ('00000000-0000-0000-0000-0000000003bb', '00000000-0000-0000-0000-0000000002bb',
+		   '/b/Unknown/01.m4b', 'u', 'en', 1, '[]', 'x', 'm', 'unknown', '{}');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	stamped, err := d.StampASRRecipes(ctx, 3) // 7 bad rows = more than two pages
+	if err == nil {
+		t.Error("want the malformed rows reported")
+	}
+	if len(stamped) != 1 || stamped[0].ID != "00000000-0000-0000-0000-0000000003aa" {
+		t.Fatalf("stamped = %+v, want only the good row", stamped)
+	}
+	var unknown *string
+	if err := d.pool.QueryRow(ctx, `SELECT recipe_id FROM transcripts
+		WHERE id = '00000000-0000-0000-0000-0000000003bb'`).Scan(&unknown); err != nil {
+		t.Fatal(err)
+	}
+	if unknown != nil {
+		t.Errorf("runner version \"unknown\" was stamped with %s", *unknown)
+	}
+}
