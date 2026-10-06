@@ -585,6 +585,11 @@ runner) and is transactional:
   next poll (it selects transcripts with no chunks). Use after an embedding
   model or `CHUNK_SIZE` change — no re-transcription.
 
+Both modes regenerate chunks under **new ids** (and a `CHUNK_SIZE` change also
+moves their boundaries), which orphans every finding's anchor. Run
+`earmark reanchor` once the worker has rebuilt the chunks (§2.17
+"Re-anchoring"); until it runs, replaying an old finding retires it as `stale`.
+
 ### 1.5 Per-run observability — `run_metrics` table
 
 One row per job capturing telemetry across the whole run (probe → transcribe →
@@ -979,6 +984,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 1 | `00001_baseline.sql` | The schema as of v0.40.2 — the DDL the pre-goose `initialize()` ran inline on every boot, copied verbatim. |
 | 2 | `00002_recipes.sql` | `recipes` + nullable `recipe_id` on `transcripts`, `transcript_findings`, `transcript_chunks`; legacy backfill (§1.9). |
 | 3 | `00003_stale_work.sql` | `current_recipes` + the `stale_work` view (§1.9). |
+| 4 | `00004_unanchorable.sql` | The `unanchorable` patch state, `unanchorable_reason` and `reanchored_at` on `transcript_findings` (§2.17 "Re-anchoring"). |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. Migrations stay additive unless a change says otherwise, and
@@ -1265,7 +1271,7 @@ per chunk) that always carries its own `words[]`. The search tools +
 | `get_transcript` | Read a track's full transcript as timestamped **segments** (paginated — `raw_text` can be 600k+ chars). Multi-track book → returns a track chooser to pick a `trackID`. Per-word timestamps are **hidden by default**; `includeWordTimestamps=true` adds each segment's `words[]` (word/start/end, plus score/speaker when present) for "exactly when was X said" queries. | `book?` or `trackID?` (one required), `offset?` (0), `limit?` (50 segments), `includeWordTimestamps?` (false) |
 | `get_chunk_context` | Surrounding **chunks** around a chunk. `chunkID` is the **UUID** in a search hit's `ID` field. | `chunkID` (required, the search-hit UUID), `contextWindow?` (**default 1** → ~3 chunks; clamped to 0–50 to bound the response size) |
 | `list_transcript_corrections` | Read-only review **worklist** (§2.17): each row is a finding with pristine chunk context, an anchor-resolution status, and its legal next actions (`allowedActions`). Defaults to the undecided (`proposed`) queue. | `state?` (comma-separated patch states, or `all`/`any`; default `proposed`), `book?`, `path?`, `id?` (a single finding), `min_confidence?` (0), `limit?` (20, capped 200), `offset?` (0) |
-| `decide_transcript_correction` | **Writes.** Accept / reject / revert / reconsider one finding — drives `db.SetPatchState`, validated against `patch.CanTransition` and compare-and-swapped on the expected current state. Accept/revert flag the chunk `embedding_stale`; reject changes no text. | `id` (required), `action` (required: `accept`\|`reject`\|`revert`\|`reconsider`), `decided_by?` (default `"agent"`, stored `mcp:`-prefixed), `expected_state?` (optional CAS guard) |
+| `decide_transcript_correction` | **Writes.** Accept / reject / revert / reconsider one finding — drives `db.SetPatchState`, validated against `patch.CanTransition` and compare-and-swapped on the expected current state. Accept/revert flag the chunk `embedding_stale`; reject changes no text. An `unanchorable` finding offers no action (only `earmark reanchor` moves it, §2.17). | `id` (required), `action` (required: `accept`\|`reject`\|`revert`\|`reconsider`), `decided_by?` (default `"agent"`, stored `mcp:`-prefixed), `expected_state?` (optional CAS guard) |
 | `create_transcript_correction` | **Writes.** The direct-edit escape hatch: records a correction no model proposed, after passing the same gates an accepted judge patch passes (anchor resolution, chunk-hash verification, overlap refusal). Writes no transcript text; flags the chunk `embedding_stale`. | `chunk_id` (required), `original_text` (required, verbatim span), `correction` (required, non-empty), `occurrence?`, `offset?` (hint only — the stored anchor is always the resolved position), `issue_type?` (default `other`), `decided_by?` (default `"agent"`), `expected_chunk_sha256?`, `dry_run?` (default `false`) |
 
 **Structured output**: every tool advertises an `outputSchema` and returns
@@ -2361,8 +2367,10 @@ centralised in `patch.CanTransition` so the DB layer and the UI cannot disagree:
 proposed ──accept──> accepted ──apply──> applied ──revert──> reverted
     │                    │                   │                   │
     └──reject──> rejected┘                   │                   └──> proposed
-                    │                        │
-                    └──> proposed            └──> stale
+    │               │                        │
+    │               └──> proposed            └──> stale
+    │
+    └──reanchor──> unanchorable ──reanchor──> proposed
 ```
 
 - **proposed** — the judge's output. Existing rows migrate here by default.
@@ -2377,6 +2385,15 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
   its anchor no longer resolves), so it describes text that no longer exists.
   **Terminal**: re-run the judge rather than resurrecting it. Stale findings stay
   visible; they are never deleted.
+- **unanchorable** — `earmark reanchor` could not place the finding's span in
+  the transcript's current chunks: it is in none of them (`anchor_not_found`)
+  or in more than one candidate place (`anchor_ambiguous`), recorded in
+  `unanchorable_reason`. **Not terminal**, unlike `stale`: a later re-anchor
+  (after another re-chunk) that places the span returns it to `proposed`. It is
+  never in the overlay, and its only legal move is back to `proposed` — it can
+  never be accepted or applied. Both moves belong to the re-anchor pass, not to
+  a reviewer: `patch.IsMachineTransition` marks them, and the review tool
+  (`decide_transcript_correction`) offers no action on an unanchorable finding.
 
 `proposed → applied` is deliberately **illegal**. Reaching `applied` requires
 passing through `accepted`, which is the human gate; skipping it would be an
@@ -2413,6 +2430,93 @@ rebuild starts from the pristine `source_text` and replays the whole overlay, so
 replaying an already-applied correction reproduces the same bytes instead of
 compounding. (Replaying onto already-corrected text — which the projection never
 does — is separately refused by the hash check.)
+
+#### Re-anchoring (`earmark reanchor`)
+
+> Added 2026-10 (v2 phase 0b). Migration 4.
+
+An anchor names one revision of one chunk, and re-chunking (`requeue
+--reembed`, a `CHUNK_SIZE` change, a re-transcription) regenerates every chunk
+under a new id. Every finding recorded before it then names a chunk that no
+longer exists, and the first rebuild that replays it retires it as `stale` —
+terminally. Measured 2026-10-06: 25,442 of the 25,452 gemma3:12b-era findings
+named a `chunk_id` with no `transcript_chunks` row, and only 5,551 of them had
+their span (as a substring) in the chunk at their `chunk_index`.
+
+`earmark reanchor [--book S] [--limit N] [--batch N] [--yes]` re-anchors the
+backlog. It reads `proposed` and `unanchorable` findings only — a finding a
+human has decided (`accepted`, `applied`, `rejected`, `reverted`) or a `stale`
+one is never touched — and classifies each with `patch.Reanchor` against the
+transcript's current **pristine** chunks (`COALESCE(source_text, text)`):
+
+| Outcome | Meaning | Write (`--yes`) |
+|---|---|---|
+| `already` | the existing anchor resolves: same `chunk_id`, hash matches, `Locate` places the span | none |
+| `unique` | exactly one match in the chunk the finding names (same `chunk_index`) | fresh anchor |
+| `moved` | no match there; exactly one in the chunks covering the finding's audio window, or failing that in the whole transcript | fresh anchor, on that chunk |
+| `ambiguous` | two or more candidates at the deciding tier | `unanchorable`, `anchor_ambiguous` |
+| `none` | the span is in none of the transcript's chunks | `unanchorable`, `anchor_not_found` |
+| `pending` | the transcript has no chunks right now (mid re-embed) | none — "no text yet" is not "span gone" |
+
+**The match.** Case-sensitive (replay splices the exact span, so a case-folded
+anchor would only go stale later) and **word-bounded**: an edge of the span
+that is a word character (Unicode letter, digit, `_`) must not continue a word
+in the chunk — `ganema` does not match inside `proganema` — while a
+punctuation edge needs no boundary. Overlapping matches count (`ha ha` occurs
+twice in `ha ha ha`): two placements are an ambiguity either way.
+
+**The tiers**, most specific first; the first tier with any match decides, and
+is never second-guessed by a wider one:
+
+1. the chunk at the finding's `chunk_index` — but only while it is still the
+   text the judge saw: its pristine text still has the recorded hash, or it
+   still overlaps the finding's `[start_sec, end_sec)` window. After a re-chunk
+   the same index can name different audio, and a match there is the same
+   words somewhere else;
+2. the other chunks overlapping that window. Audio time does not move when the
+   text is re-chunked, and the window is the chunk the judge was shown, so the
+   true occurrence is always among these chunks — one match here is that
+   occurrence;
+3. every chunk of the transcript.
+
+Tiers 2 and 3 are skipped when the named chunk is unchanged (hash match): its
+text did not move, so a span missing from it was misquoted by the judge, and
+the same words elsewhere are a different place.
+
+**A fresh anchor** is `chunk_id`, `chunk_index`, `start_sec`/`end_sec` (all read
+FROM the chunk row), `chunk_text_sha256` = `patch.ChunkHash` of the pristine
+text, `anchor_offset` = the rune offset of the match, and `anchor_occurrence` =
+its index among the **plain-substring** occurrences — `Locate`'s numbering, so
+the existing offset → occurrence ladder lands on exactly this span even when
+the word-bounded match is not the first raw substring hit. `reanchored_at` is
+stamped; `unanchorable_reason` is cleared. An `unanchorable` row keeps its
+original anchor columns (the only record of where the judge saw it) and is only
+rewritten when its reason changes or it can now be placed.
+
+**Concurrency.** Dry-run (the default) reads without locks and writes nothing.
+`--yes` walks transcripts in keyset batches (`--batch`, default 25 — the batch
+bounds both lock time and the chunk text held in memory), one transaction per
+batch: findings are read `FOR UPDATE SKIP LOCKED` (a finding a reviewer is
+deciding right now is skipped and picked up next run), then the batch's chunks
+`FOR SHARE` (the worker's rebuild upsert waits for the batch instead of changing
+the text mid-write; taken after the finding locks, in chunk order, so the two
+cannot deadlock). Both writes are compare-and-swaps on the state the row was
+read in, and the anchor write re-checks the chunk's pristine hash in SQL, so a
+row decided or rebuilt between read and write matches nothing and is reported
+as skipped. Every state change is checked against `patch.CanTransition` first.
+The pass never stamps `decided_at`/`decided_by` (it is not a review), never
+flags `embedding_stale` (a `proposed` finding is not in the overlay) and never
+writes chunk text or `transcripts`.
+
+**Idempotent.** A re-anchored finding reads as `already` on the next run; an
+unanchorable one with an unchanged reason is left alone. Re-run after every
+re-chunk.
+
+**Measuring it without the data.** `internal/db/testdata/reanchor_survival.sql`
+is a server-side mirror of the classifier that returns only counts per
+`(model, outcome)` — run it bounded (a transcript-id bucket per statement, with
+`SET statement_timeout`) rather than pulling chunk text out of Postgres.
+`TestIntegrationReanchorSurvivalSQLMatchesGo` pins it to the Go matcher.
 
 #### Applying: the replayable correction overlay
 

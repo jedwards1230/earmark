@@ -15,6 +15,7 @@ version is in `goose_db_version`.
 | 1 | `00001_baseline.sql` | everything below as of v0.40.2 (the former inline `initialize()` DDL). On a database the old code built it is only *recorded*, never executed. |
 | 2 | `00002_recipes.sql` | `recipes`; `recipe_id` on `transcripts`, `transcript_findings`, `transcript_chunks`; legacy backfill |
 | 3 | `00003_stale_work.sql` | `current_recipes`; the `stale_work` view |
+| 4 | `00004_unanchorable.sql` | `unanchorable` patch state; `unanchorable_reason`, `reanchored_at` on `transcript_findings` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -352,7 +353,7 @@ the transcript, so findings are attributable per ASR backend/run.
 
 Additive columns from the reviewable-patch migration are omitted above for
 brevity: `patch_state` (the `proposed → accepted → applied → reverted` /
-`rejected` / `stale` machine), the anchor trio (`anchor_offset`,
+`rejected` / `stale` / `unanchorable` machine), the anchor trio (`anchor_offset`,
 `anchor_occurrence`, `chunk_text_sha256`), `decided_at`/`decided_by`,
 `applied_at`/`applied_before_text`/`applied_after_text` (**span**-level, not
 whole-chunk), and `stale_reason`. This table is the authoritative home of a
@@ -360,6 +361,21 @@ human-accepted correction — `transcript_chunks` only ever carries a replayed
 copy. CONTRACT §2.17 is the reference. Also omitted: `origin` (`judge` |
 `human`), `resolved_model` (the model that answered), and `recipe_id`
 (migration 2; the judge's `propose` recipe, NULL for `origin='human'`).
+
+Migration 4 adds the re-anchor pass's columns (`earmark reanchor`, CONTRACT
+§2.17 "Re-anchoring"):
+
+```sql
+unanchorable_reason TEXT,         -- 'anchor_not_found' | 'anchor_ambiguous'; set iff patch_state = 'unanchorable'
+reanchored_at       TIMESTAMPTZ,  -- last time earmark reanchor wrote this row's anchor or state; NULL = never
+-- CHECK patch_state IN (proposed, accepted, rejected, applied, stale, reverted, unanchorable)
+-- CHECK (patch_state = 'unanchorable') = (unanchorable_reason IS NOT NULL)
+```
+
+A re-anchor rewrites the existing anchor columns in place — `chunk_id`,
+`chunk_index`, `start_sec`/`end_sec` (from the chunk row), `chunk_text_sha256`,
+`anchor_offset`, `anchor_occurrence` — and never touches a finding outside
+`proposed`/`unanchorable`. An `unanchorable` row keeps its original anchor.
 
 ### 8. `recipes` — Provenance (CONTRACT §1.9)
 

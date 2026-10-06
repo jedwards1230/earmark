@@ -126,7 +126,7 @@ the undecided (`proposed`) queue.
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `state` | `proposed` | comma-separated patch states (`proposed`, `accepted`, `applied`, `rejected`, `reverted`, `stale`), or `all`/`any` for every state |
+| `state` | `proposed` | comma-separated patch states (`proposed`, `accepted`, `applied`, `rejected`, `reverted`, `stale`, `unanchorable`), or `all`/`any` for every state |
 | `book` | — | resolved the same way the search tools resolve it; ignored when `path` is given |
 | `path` | — | exact book directory or track file path; matches that path and anything beneath it |
 | `id` | — | a single finding UUID — overrides the other filters in practice |
@@ -145,7 +145,7 @@ before any SQL runs and guards the `UPDATE` on the expected current state
 | Param | Default | Notes |
 |-------|---------|-------|
 | `id` | required | the finding UUID (`id` field from `list_transcript_corrections`) |
-| `action` | required | `accept` \| `reject` \| `revert` \| `reconsider` — legal actions depend on the current state (each row's `allowedActions`) |
+| `action` | required | `accept` \| `reject` \| `revert` \| `reconsider` — legal actions depend on the current state (each row's `allowedActions`). An `unanchorable` finding has none: only `earmark reanchor` returns it to `proposed` |
 | `decided_by` | `"agent"` | audit attribution; always stored with an `mcp:` prefix |
 | `expected_state` | — | optional compare-and-swap: the call fails if the finding has moved since you read it |
 
