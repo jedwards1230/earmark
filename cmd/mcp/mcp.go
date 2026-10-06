@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -67,12 +68,8 @@ func runMCP(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// stdio carries JSON-RPC on stdout: every structured log line goes to
-	// stderr instead (internal/log defaults to stdout). Set before anything
-	// logs — config and the DB connect already do.
-	if t := os.Getenv("MCP_TRANSPORT"); t == "" || t == "stdio" {
-		elog.SetOutput(os.Stderr)
-	}
+	// Set before anything logs — config and the DB connect already do.
+	configureLogOutput(os.Getenv("MCP_TRANSPORT"), os.Stderr)
 
 	// Load configuration
 	cfg, err := config.LoadConfig()
@@ -151,5 +148,14 @@ func runMCP(cmd *cobra.Command, args []string) {
 	}
 	if err != nil {
 		log.Fatalf("Failed to start MCP service: %v", err)
+	}
+}
+
+// configureLogOutput sends every internal/log line to stderr when the MCP
+// transport is stdio (the default, transport ""), because stdout carries the
+// JSON-RPC stream there; internal/log otherwise writes to stdout.
+func configureLogOutput(transport string, stderr io.Writer) {
+	if transport == "" || transport == "stdio" {
+		elog.SetOutput(stderr)
 	}
 }
