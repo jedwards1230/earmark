@@ -172,6 +172,9 @@ func TestAllowedActions_DerivedFromState(t *testing.T) {
 	assert.Equal(t, []string{"accept", "reject"}, allowedActions(patch.StateProposed))
 	assert.Equal(t, []string{"revert"}, allowedActions(patch.StateApplied))
 	assert.Empty(t, allowedActions(patch.StateStale))
+	// unanchorable -> proposed is legal for `earmark reanchor`, but it is not a
+	// review action: an unanchorable finding offers none.
+	assert.Empty(t, allowedActions(patch.StateUnanchorable))
 }
 
 // ─── decide_transcript_correction ─────────────────────────────────────────
@@ -254,6 +257,30 @@ func TestHandleDecideCorrection_IllegalActionRefusedBeforeWrite(t *testing.T) {
 	assert.Contains(t, text, "accept, reject")
 	mockDB.AssertNotCalled(t, "SetPatchState", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	mockDB.AssertExpectations(t)
+}
+
+// TestHandleDecideCorrection_UnanchorableRefusedBeforeWrite: "reconsider" on an
+// unanchorable finding would put a span with no anchor back in the review
+// queue. The state machine allows unanchorable -> proposed for the re-anchor
+// pass only, so the review tool refuses it without touching the database.
+func TestHandleDecideCorrection_UnanchorableRefusedBeforeWrite(t *testing.T) {
+	for _, action := range []string{"reconsider", "accept", "reject"} {
+		t.Run(action, func(t *testing.T) {
+			mockDB := &MockDBInterface{}
+			mockCurrentCorrection(mockDB, "f1", patch.StateUnanchorable)
+
+			h := NewToolHandlers(mockDB, nil)
+			res, err := h.handleDecideCorrection(context.Background(), req("decide_transcript_correction", map[string]interface{}{
+				"id": "f1", "action": action,
+			}))
+			require.NoError(t, err)
+			require.True(t, res.IsError)
+			text := res.Content[0].(*mcp.TextContent).Text
+			assert.Contains(t, text, "Cannot "+action+" correction f1")
+			assert.Contains(t, text, "earmark reanchor")
+			mockDB.AssertNotCalled(t, "SetPatchState", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
 }
 
 // TestHandleDecideCorrection_ExpectedStateMismatchRefusedBeforeWrite asserts a

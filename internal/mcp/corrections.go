@@ -286,7 +286,7 @@ func (h *ToolHandlers) handleDecideCorrection(ctx context.Context, req *mcp.Call
 		from = want
 	}
 
-	if !patch.CanTransition(from, to) {
+	if !reviewable(from, to) {
 		return errorResult(fmt.Sprintf(
 			"Cannot %s correction %s from state %q. Legal actions here: %s",
 			action, id, from, describeActions(allowedActions(from)))), nil
@@ -580,16 +580,24 @@ func excerptContext(text string) CorrectionContext {
 func allowedActions(from string) []string {
 	out := make([]string, 0, len(reviewActionOrder))
 	for _, a := range reviewActionOrder {
-		if patch.CanTransition(from, reviewActions[a]) {
+		if reviewable(from, reviewActions[a]) {
 			out = append(out, a)
 		}
 	}
 	return out
 }
 
+// reviewable reports whether a reviewer may move a finding from one state to
+// another: legal in the state machine AND not one of the re-anchor pass's own
+// moves (patch.IsMachineTransition). An unanchorable finding therefore offers
+// no review actions — only `earmark reanchor` can return it to proposed.
+func reviewable(from, to string) bool {
+	return patch.CanTransition(from, to) && !patch.IsMachineTransition(from, to)
+}
+
 func describeActions(actions []string) string {
 	if len(actions) == 0 {
-		return "none (terminal state)"
+		return "none (terminal, or awaiting `earmark reanchor`)"
 	}
 	return strings.Join(actions, ", ")
 }

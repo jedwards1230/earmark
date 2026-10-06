@@ -2,6 +2,7 @@ package patch
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -125,6 +126,8 @@ func TestCanTransition(t *testing.T) {
 		{StateReverted, StateProposed},
 		{StateProposed, StateStale},
 		{StateApplied, StateStale},
+		{StateProposed, StateUnanchorable},
+		{StateUnanchorable, StateProposed},
 	}
 	for _, tc := range legal {
 		if !CanTransition(tc.from, tc.to) {
@@ -141,10 +144,59 @@ func TestCanTransition(t *testing.T) {
 		{StateStale, StateApplied},
 		{StateApplied, StateAccepted},
 		{"nonsense", StateApplied},
+		// unanchorable has no anchor to apply: it can only go back to proposed.
+		{StateUnanchorable, StateAccepted},
+		{StateUnanchorable, StateApplied},
+		{StateUnanchorable, StateStale},
+		{StateUnanchorable, StateRejected},
+		// Only the review queue is re-anchored; a human decision is never parked.
+		{StateAccepted, StateUnanchorable},
+		{StateApplied, StateUnanchorable},
+		{StateRejected, StateUnanchorable},
+		{StateReverted, StateUnanchorable},
+		{StateStale, StateUnanchorable},
 	}
 	for _, tc := range illegal {
 		if CanTransition(tc.from, tc.to) {
 			t.Errorf("%s -> %s should be illegal", tc.from, tc.to)
+		}
+	}
+}
+
+// TestUnanchorableIsNeverAppliable walks every path: no sequence of legal
+// transitions from unanchorable reaches applied without passing through
+// proposed and then a human accept.
+func TestUnanchorableIsNeverAppliable(t *testing.T) {
+	if got := StatesAllowing(StateApplied); slices.Contains(got, StateUnanchorable) {
+		t.Errorf("StatesAllowing(applied) = %v includes unanchorable", got)
+	}
+	if got := StatesAllowing(StateAccepted); slices.Contains(got, StateUnanchorable) {
+		t.Errorf("StatesAllowing(accepted) = %v includes unanchorable", got)
+	}
+	var next []string
+	for _, s := range AllStates() {
+		if CanTransition(StateUnanchorable, s) {
+			next = append(next, s)
+		}
+	}
+	if !slices.Equal(next, []string{StateProposed}) {
+		t.Errorf("unanchorable may move to %v, want only [proposed]", next)
+	}
+}
+
+func TestIsMachineTransition(t *testing.T) {
+	for _, tc := range []struct {
+		from, to string
+		want     bool
+	}{
+		{StateProposed, StateUnanchorable, true},
+		{StateUnanchorable, StateProposed, true},
+		{StateProposed, StateAccepted, false},
+		{StateRejected, StateProposed, false},
+		{StateReverted, StateProposed, false},
+	} {
+		if got := IsMachineTransition(tc.from, tc.to); got != tc.want {
+			t.Errorf("IsMachineTransition(%s, %s) = %v, want %v", tc.from, tc.to, got, tc.want)
 		}
 	}
 }

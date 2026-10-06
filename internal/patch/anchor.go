@@ -14,6 +14,12 @@
 // own package (rather than in internal/eval) is what keeps the §2.15 guarantee
 // mechanically true instead of merely intended — internal/eval still contains
 // no UPDATE against transcript text, and its SQL guard test still passes.
+//
+// The one machine-driven move into or out of the review queue is re-anchoring
+// (reanchor.go, `earmark reanchor`): it rewrites a proposed finding's anchor
+// and parks one it cannot place as unanchorable. It changes no text and can
+// never bring a finding closer to applied — unanchorable's only exit is back
+// to proposed, where the human accept is still required.
 package patch
 
 import (
@@ -28,6 +34,7 @@ import (
 //	proposed -> accepted -> applied -> reverted
 //	proposed -> rejected
 //	(any)    -> stale        (the underlying chunk changed underneath us)
+//	proposed <-> unanchorable (earmark reanchor could not place the span)
 const (
 	StateProposed = "proposed"
 	StateAccepted = "accepted"
@@ -35,6 +42,12 @@ const (
 	StateApplied  = "applied"
 	StateStale    = "stale"
 	StateReverted = "reverted"
+	// StateUnanchorable — `earmark reanchor` could not place the finding's span
+	// in the transcript's current chunks (not found, or ambiguous). Unlike
+	// stale it is NOT terminal: a later re-anchor (after another re-chunk) may
+	// place it and return it to proposed. It is never in the overlay and can
+	// never be accepted or applied — there is no text to apply it to.
+	StateUnanchorable = "unanchorable"
 )
 
 var (
@@ -175,7 +188,7 @@ func occurrences(runes, target []rune) []int {
 func CanTransition(from, to string) bool {
 	switch from {
 	case StateProposed:
-		return to == StateAccepted || to == StateRejected || to == StateStale
+		return to == StateAccepted || to == StateRejected || to == StateStale || to == StateUnanchorable
 	case StateAccepted:
 		return to == StateApplied || to == StateRejected || to == StateStale
 	case StateApplied:
@@ -188,6 +201,10 @@ func CanTransition(from, to string) bool {
 	case StateStale:
 		// Terminal: the text it described is gone. Re-run the judge instead.
 		return false
+	case StateUnanchorable:
+		// Only back to proposed, and only by a re-anchor that placed the span.
+		// Never to accepted/applied: there is no anchor to apply it at.
+		return to == StateProposed
 	default:
 		return false
 	}

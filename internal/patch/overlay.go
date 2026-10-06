@@ -311,7 +311,17 @@ func AllStates() []string {
 		StateApplied,
 		StateStale,
 		StateReverted,
+		StateUnanchorable,
 	}
+}
+
+// IsMachineTransition reports whether a move belongs to the re-anchor pass
+// rather than a reviewer: into and out of unanchorable. The state machine
+// allows them, but a review surface must not offer them — "reconsider" on an
+// unanchorable finding would put a span with no anchor back in the review
+// queue, and only `earmark reanchor` knows whether it can be placed.
+func IsMachineTransition(from, to string) bool {
+	return from == StateUnanchorable || to == StateUnanchorable
 }
 
 // StatesAllowing returns every state that may legally transition to `to`,
