@@ -104,7 +104,9 @@ func (c *Config) loadModelRegistry() error {
 		c.Models = &ModelRegistry{}
 		return nil
 	}
-	raw, err := os.ReadFile(path) // #nosec G304 -- operator-supplied config path
+	// The path is the operator's own MODELS_FILE setting, read once at startup —
+	// the same trust level as every other env var; there is no untrusted input.
+	raw, err := os.ReadFile(path) // #nosec G304 G703 -- operator-supplied config path
 	if err != nil {
 		return fmt.Errorf("MODELS_FILE: %w", err)
 	}
