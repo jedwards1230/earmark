@@ -88,6 +88,15 @@ type DBInterface interface {
 	// GetServerObservation returns observed runner activity (live claims + per-host
 	// run_metrics) the Servers page merges with the configured ASR_SERVERS list.
 	GetServerObservation(ctx context.Context) (*db.ServerObservation, error)
+	// ─── Models page (CONTRACT §2.14) ───────────────────────────────────────
+	// Read-only aggregates the Models page caches for 30 s (modelsSnapshotCache):
+	// current recipe per step, stale_work counts per step, what answered each
+	// role, judge findings by answering model, and transcript provenance groups.
+	ListCurrentRecipes(ctx context.Context) ([]db.CurrentRecipe, error)
+	StaleItemCounts(ctx context.Context) (map[string]int64, error)
+	GetModelActivity(ctx context.Context) (db.ModelActivity, error)
+	FindingsByModel(ctx context.Context) ([]db.FindingsModelCount, error)
+	ASRProvenanceGroups(ctx context.Context, limit int) ([]db.ASRProvenanceGroup, error)
 	// GetFindingsSummary returns the read-only eval-layer findings rollup
 	// (totals, confidence buckets, issue-type tally, per-book) for the /findings
 	// dashboard page (CONTRACT §2.15).

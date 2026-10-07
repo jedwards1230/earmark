@@ -340,35 +340,6 @@ func TestBuildCapBadges(t *testing.T) {
 	}
 }
 
-// TestGroupByFamily checks first-seen-order bucketing, the trailing unknown
-// bucket, and the multiFamily toggle (≤1 family → flat render).
-func TestGroupByFamily(t *testing.T) {
-	views := []serverView{
-		{Name: "a", Family: asr.FamilyNeMoParakeet, FamilyKnown: true},
-		{Name: "b", Family: asr.FamilyWhisper},
-		{Name: "c", Family: asr.FamilyNeMoParakeet, FamilyKnown: true}, // joins a's group
-		{Name: "d"}, // no family → unknown bucket
-	}
-	groups := groupByFamily(views)
-	if len(groups) != 3 {
-		t.Fatalf("want 3 groups (parakeet, whisper, unknown), got %d: %+v", len(groups), groups)
-	}
-	if groups[0].Family != asr.FamilyNeMoParakeet || len(groups[0].Servers) != 2 || !groups[0].Known {
-		t.Errorf("group[0] wrong: %+v", groups[0])
-	}
-	if groups[2].Family != "" || groups[2].Label != "unknown" {
-		t.Errorf("group[2] should be the unknown bucket: %+v", groups[2])
-	}
-	if !multiFamily(groups) {
-		t.Errorf("3 families → multiFamily true")
-	}
-	// Single family → flat render.
-	single := groupByFamily([]serverView{{Name: "x", Family: asr.FamilyWhisper}})
-	if multiFamily(single) {
-		t.Errorf("one family → multiFamily false")
-	}
-}
-
 func TestArbiterRawToStatus(t *testing.T) {
 	used, total := 7338, 32607
 	raw := arbiterRaw{
@@ -402,3 +373,41 @@ func TestArbiterRawToStatus(t *testing.T) {
 }
 
 func boolPtrT(b bool) *bool { return &b }
+
+// TestBuildServerViews_HistoryWindow: an unconfigured host seen only in
+// run_metrics history appears only if it transcribed within
+// runnerHistoryWindow; a configured server always appears, however old its
+// history; an unconfigured live runner always appears.
+func TestBuildServerViews_HistoryWindow(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { t := now.Add(-d); return &t }
+	obs := &db.ServerObservation{
+		LiveRunners: []db.LiveRunner{{ClaimedBy: "runner-live-x", LastHeartbeat: now.Add(-5 * time.Second)}},
+		Hosts: []db.HostMetrics{
+			{Host: "recent", JobsDone: 3, LastFinished: at(29 * 24 * time.Hour)},
+			{Host: "retired", JobsDone: 4123, LastFinished: at(105 * 24 * time.Hour)},
+			{Host: "never-finished", JobsDone: 1},
+			{Host: "configured-old", JobsDone: 9, LastFinished: at(200 * 24 * time.Hour)},
+		},
+	}
+	configured := []config.ASRServer{{Name: "configured-old", Host: "configured-old"}}
+	views := buildServerViews(configured, obs, nil, now, 30*time.Minute)
+	names := map[string]serverView{}
+	for _, v := range views {
+		names[v.Name] = v
+	}
+	if _, ok := names["recent"]; !ok {
+		t.Errorf("host within the window must show: %v", names)
+	}
+	for _, gone := range []string{"retired", "never-finished"} {
+		if _, ok := names[gone]; ok {
+			t.Errorf("%s is outside runnerHistoryWindow and must be hidden", gone)
+		}
+	}
+	if v, ok := names["configured-old"]; !ok || v.JobsDone != 9 {
+		t.Errorf("configured server must always show with its history: %+v", v)
+	}
+	if _, ok := names["runner-live-x"]; !ok {
+		t.Errorf("an unconfigured live runner must always show")
+	}
+}

@@ -2381,30 +2381,38 @@ func (db *DB) GetServerObservation(ctx context.Context) (*ServerObservation, err
 		return nil, fmt.Errorf("rows error (live runners): %w", err)
 	}
 
-	// Per-host metrics: latest non-null model/compute mode (by run recency),
-	// jobs transcribed, last completion, mean transcription wall-clock, plus the
-	// most-recent non-null ASR backend descriptor (family/runtime/applied caps/
-	// skipped reasons/mean confidence — CONTRACT §1.5 / §2.13). The caps_* JSONB
-	// columns use the same "latest non-null" recency pick as model/compute so a
-	// run that didn't report them never blanks an earlier run that did.
+	// Per-host metrics: latest non-null model/compute mode (by TRANSCRIPTION
+	// recency), jobs transcribed, last completion, mean transcription
+	// wall-clock, plus the most-recent non-null ASR backend descriptor
+	// (family/runtime/applied caps/skipped reasons/mean confidence — CONTRACT
+	// §1.5 / §2.13). The caps_* JSONB columns use the same "latest non-null"
+	// recency pick as model/compute so a run that didn't report them never
+	// blanks an earlier run that did.
+	//
+	// Recency is transcribe_finished_at, never updated_at: the eval and embed
+	// stages upsert their own run_metrics columns and bump updated_at on rows a
+	// host transcribed months ago, which would make a retired host look fresh.
+	// The query is unbounded on purpose — a configured server keeps its full
+	// history; the dashboard hides stale UNconfigured hosts (runnerHistoryWindow,
+	// internal/mcp).
 	hostRows, err := db.pool.Query(ctx, `
 		SELECT runner_host,
-		       (ARRAY_AGG(asr_model    ORDER BY updated_at DESC) FILTER (WHERE asr_model    IS NOT NULL))[1] AS asr_model,
-		       (ARRAY_AGG(compute_type ORDER BY updated_at DESC) FILTER (WHERE compute_type IS NOT NULL))[1] AS compute_type,
+		       (ARRAY_AGG(asr_model    ORDER BY transcribe_finished_at DESC NULLS LAST, updated_at DESC) FILTER (WHERE asr_model    IS NOT NULL))[1] AS asr_model,
+		       (ARRAY_AGG(compute_type ORDER BY transcribe_finished_at DESC NULLS LAST, updated_at DESC) FILTER (WHERE compute_type IS NOT NULL))[1] AS compute_type,
 		       COUNT(*) AS jobs_done,
 		       MAX(transcribe_finished_at) AS last_finished,
 		       AVG(EXTRACT(EPOCH FROM (transcribe_finished_at - transcribe_started_at)))
 		         FILTER (WHERE transcribe_started_at IS NOT NULL
 		                   AND transcribe_finished_at IS NOT NULL) AS avg_proc,
-		       (ARRAY_AGG(asr_family  ORDER BY updated_at DESC) FILTER (WHERE asr_family  IS NOT NULL))[1] AS asr_family,
-		       (ARRAY_AGG(asr_runtime ORDER BY updated_at DESC) FILTER (WHERE asr_runtime IS NOT NULL))[1] AS asr_runtime,
-		       (ARRAY_AGG(caps_applied        ORDER BY updated_at DESC) FILTER (WHERE caps_applied        IS NOT NULL))[1] AS caps_applied,
-		       (ARRAY_AGG(caps_skipped_reason ORDER BY updated_at DESC) FILTER (WHERE caps_skipped_reason IS NOT NULL))[1] AS caps_skipped_reason,
-		       (ARRAY_AGG(mean_word_confidence ORDER BY updated_at DESC) FILTER (WHERE mean_word_confidence IS NOT NULL))[1] AS mean_word_confidence
+		       (ARRAY_AGG(asr_family  ORDER BY transcribe_finished_at DESC NULLS LAST, updated_at DESC) FILTER (WHERE asr_family  IS NOT NULL))[1] AS asr_family,
+		       (ARRAY_AGG(asr_runtime ORDER BY transcribe_finished_at DESC NULLS LAST, updated_at DESC) FILTER (WHERE asr_runtime IS NOT NULL))[1] AS asr_runtime,
+		       (ARRAY_AGG(caps_applied        ORDER BY transcribe_finished_at DESC NULLS LAST, updated_at DESC) FILTER (WHERE caps_applied        IS NOT NULL))[1] AS caps_applied,
+		       (ARRAY_AGG(caps_skipped_reason ORDER BY transcribe_finished_at DESC NULLS LAST, updated_at DESC) FILTER (WHERE caps_skipped_reason IS NOT NULL))[1] AS caps_skipped_reason,
+		       (ARRAY_AGG(mean_word_confidence ORDER BY transcribe_finished_at DESC NULLS LAST, updated_at DESC) FILTER (WHERE mean_word_confidence IS NOT NULL))[1] AS mean_word_confidence
 		FROM run_metrics
 		WHERE runner_host IS NOT NULL AND runner_host <> ''
 		GROUP BY runner_host
-		ORDER BY last_finished DESC NULLS LAST
+		ORDER BY last_finished DESC NULLS LAST, runner_host
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("host metrics query: %w", err)

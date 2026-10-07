@@ -1129,6 +1129,10 @@ type pageShell struct {
 	// PhaseReason is a one-line plain-language reason string for the title tooltip.
 	PhaseIcon   template.HTML
 	PhaseReason string
+
+	// ControlEnabled is set by pages whose static shell carries a token-gated
+	// form (the Models page's runner update): false hides the form.
+	ControlEnabled bool
 }
 
 // activityTrack is a condensed per-track row for the book-grouped activity feed

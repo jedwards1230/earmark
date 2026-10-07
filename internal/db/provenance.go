@@ -208,20 +208,27 @@ func (db *DB) EmbeddedASIN(ctx context.Context, filePath string) (string, error)
 }
 
 // CurrentRecipe is one current_recipes row with the fields earmark_recipe_info
-// labels carry.
+// labels carry, plus the recipe detail the Models page shows.
 type CurrentRecipe struct {
 	Step          string
 	RecipeID      string
 	Model         string // model_resolved, else model_alias
 	Revision      string
 	PromptVersion string
+	StepVersion   int
+	ModelAlias    string
+	ModelResolved string
+	PromptSHA     string
+	UpdatedAt     time.Time // current_recipes.updated_at: when the step last moved
 }
 
 // ListCurrentRecipes returns the current recipe of every step that has one.
 func (db *DB) ListCurrentRecipes(ctx context.Context) ([]CurrentRecipe, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT cr.step, cr.recipe_id, coalesce(r.model_resolved, r.model_alias, ''),
-		       coalesce(r.model_revision, ''), coalesce(r.prompt_version, '')
+		       coalesce(r.model_revision, ''), coalesce(r.prompt_version, ''),
+		       r.step_version, coalesce(r.model_alias, ''), coalesce(r.model_resolved, ''),
+		       coalesce(r.prompt_sha256, ''), cr.updated_at
 		  FROM current_recipes cr
 		  JOIN recipes r ON r.recipe_id = cr.recipe_id
 		 ORDER BY cr.step`)
@@ -230,7 +237,8 @@ func (db *DB) ListCurrentRecipes(ctx context.Context) ([]CurrentRecipe, error) {
 	}
 	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (CurrentRecipe, error) {
 		var c CurrentRecipe
-		err := r.Scan(&c.Step, &c.RecipeID, &c.Model, &c.Revision, &c.PromptVersion)
+		err := r.Scan(&c.Step, &c.RecipeID, &c.Model, &c.Revision, &c.PromptVersion,
+			&c.StepVersion, &c.ModelAlias, &c.ModelResolved, &c.PromptSHA, &c.UpdatedAt)
 		return c, err
 	})
 	if err != nil {

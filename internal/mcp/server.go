@@ -50,7 +50,7 @@ type MCPServer struct {
 	// gpuArbiterUrl (TTL-cached). Swapped for a static fake in the demo.
 	prober gpuProber
 
-	// cfg is retained so the Models/Services page can read the AI endpoint
+	// cfg is retained so the Models page can read the AI endpoint
 	// registry (CONTRACT §2.14). Read-only after construction.
 	cfg *config.Config
 
@@ -68,6 +68,16 @@ type MCPServer struct {
 	// live signal the lifecycle view can surface honestly.
 	evalInPipeline bool
 
+	// models holds the Models page's two DB snapshot caches (aggregates 30 s,
+	// stale counts 5 min), served stale-while-revalidate; the page and GET
+	// /api/v1/status roles[] read the same snapshots.
+	models modelsCaches
+
+	// gatewayProber reads LiteLLM readiness + the virtual key's own /key/info
+	// for gateway endpoints (60 s, stale-while-revalidate). Swapped for a static
+	// fake in the demo.
+	gatewayProber gatewayProber
+
 	// metrics is the Prometheus registry mounted at /metrics (CONTRACT §2.16).
 	// nil in the demo (no DB-backed scrape source).
 	metrics *metrics.Registry
@@ -83,6 +93,12 @@ type evalState struct {
 	configured bool
 	run        evalRunFunc
 	inFlight   atomic.Bool
+	// model / source / host describe what resolved, for the Models page's
+	// Judge card: the requested model id, judgeSourceRegistry or
+	// judgeSourceEnv, and host[:port] of the endpoint (when reported).
+	model  string
+	source string
+	host   string
 }
 
 // evalRunFunc runs the judge over the selected chunks and persists findings.
@@ -326,9 +342,11 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		// 5s TTL coalesces the /servers + /api/v1/status probes within one refresh.
 		prober: newHTTPGPUProber(2*time.Second, 5*time.Second),
 		// AI endpoint /models probe: same timeout/TTL budget as the gpu-arbiter
-		// prober so a slow upstream can't stall the Models/Services page.
+		// prober so a slow upstream can't stall the Models page.
 		endpointProber: newHTTPEndpointProber(2*time.Second, 5*time.Second),
+		gatewayProber:  newHTTPGatewayProber(2*time.Second, gatewayProbeTTL),
 	}
+	s.models = newModelsCaches(database, logger.Warn)
 	s.initEval(cfg)
 	// Prometheus metrics (CONTRACT §2.16): the scrape-time collector reads the DB
 	// for current-state gauges. s.db satisfies metrics.StatsSource.
@@ -351,6 +369,19 @@ func (s *MCPServer) initEval(cfg *config.Config) {
 	judge := eval.NewJudgeForConfig(chat, cfg)
 	db := s.db
 	s.eval.configured = true
+	s.eval.model = chat.Model()
+	s.eval.source = judgeSourceEnv
+	if _, ok := evalEndpoint(cfg); ok {
+		s.eval.source = judgeSourceRegistry
+	}
+	if er, ok := chat.(eval.EndpointReporter); ok {
+		if ep := er.Endpoint(); ep.Host != "" {
+			s.eval.host = ep.Host
+			if ep.Port != 0 {
+				s.eval.host = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+			}
+		}
+	}
 	s.eval.run = func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {
 		_, stats, err := eval.Run(ctx, db, judge, db, opts)
 		return stats, err
@@ -383,14 +414,15 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //
 // Routes:
 //
-//	GET  /                     — home: the Library page (full HTML shell)
+//	GET  /                     — home: the Pipeline ops page (full HTML shell)
+//	GET  /library              — Library page (shell)
 //	GET  /pipeline             — Pipeline ops page (status fragment + folded-in Failed view)
 //	GET  /track                — per-track detail page (shell)
 //	GET  /track/data           — per-track detail fragment (header + reader + chunks)
 //	GET  /status/data          — htmx-refreshed fragment (counts + recent jobs + controls)
 //	GET  /failed/data          — failed-jobs fragment (no standalone page; rendered inside /pipeline)
-//	GET  /servers              — transcription-servers page (shell)
-//	GET  /servers/data         — servers fragment (status + models/modes)
+//	GET  /servers              — Models page (shell)
+//	GET  /servers/data         — Models fragment (role board + recipes + runners + endpoints)
 //	GET  /static/htmx.min.js   — vendored htmx library
 //	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
 //	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)

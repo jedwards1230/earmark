@@ -166,6 +166,26 @@ func (m *MockDBInterface) GetServerObservation(context.Context) (*db.ServerObser
 	return &db.ServerObservation{}, nil
 }
 
+func (m *MockDBInterface) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) {
+	return nil, nil
+}
+
+func (m *MockDBInterface) StaleItemCounts(context.Context) (map[string]int64, error) {
+	return map[string]int64{}, nil
+}
+
+func (m *MockDBInterface) GetModelActivity(context.Context) (db.ModelActivity, error) {
+	return db.ModelActivity{}, nil
+}
+
+func (m *MockDBInterface) FindingsByModel(context.Context) ([]db.FindingsModelCount, error) {
+	return nil, nil
+}
+
+func (m *MockDBInterface) ASRProvenanceGroups(context.Context, int) ([]db.ASRProvenanceGroup, error) {
+	return nil, nil
+}
+
 func (m *MockDBInterface) GetFindingsSummary(context.Context) (*db.FindingsSummary, error) {
 	return &db.FindingsSummary{}, nil
 }

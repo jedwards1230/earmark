@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>earmark — {{.Title}}</title>
+<link rel="icon" href="data:,">
 <script src="/static/htmx.min.js"></script>
 <style>
   :root {
@@ -93,7 +94,7 @@
       --red:    #dc2626;
       --blue:   #1d4ed8;
       --purple: #7c3aed;
-      --amber:  #b45309;
+      --amber:  #92400e;   /* ≥4.5:1 on the light amber badge tint (#b45309 was 4.45:1) */
 
       --accent: #2563eb;   /* white label = 5.2:1 */
       --focus:  #1d4ed8;
@@ -309,7 +310,7 @@
   .rb-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
   .rb-value { font-size: var(--fs-sm); font-weight: 600; }
   .rb-form { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-  .rb-form input[type=number] {
+  .rb-form input[type=number], .rb-form input[type=text] {
     width: 80px; min-height: 40px; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; font: inherit; font-size: var(--fs-sm);
   }
@@ -353,7 +354,7 @@
   td { padding: 12px 14px; border-bottom: 1px solid var(--border); }
   tr:last-child td { border-bottom: none; }
   /* row banding so dense tables de-fuse (1.4.x readability) */
-  tbody tr:nth-child(even) td { background: var(--row-band); }
+  tbody tr:nth-child(even) > td, tbody tr:nth-child(even) > th { background: var(--row-band); }
   /* clickable rows: legacy <tr class=clickable> AND the new whole-row <a> pattern */
   tbody tr.clickable:hover td { background: var(--row-hover); cursor: pointer; }
   tbody tr.row-link:hover td { background: var(--row-hover); }
@@ -546,7 +547,7 @@
   .seg.seg-active { background: var(--tint-blue); border-left: 3px solid var(--blue); padding-left: 8px; border-radius: 4px; }
   .load-more { margin-top: 10px; }
 
-  /* ── servers page ──────────────────────────────────────────────── */
+  /* ── models page (/servers) ──────────────────────────────────────────────── */
   .server-card { border-left: 3px solid var(--border); }
   .server-card.state-running { border-left-color: var(--green); }
   .server-card.state-busy    { border-left-color: var(--amber); }
@@ -568,7 +569,7 @@
   .badge.role-primary  { background: var(--badge-green); color: var(--green); }
   .badge.role-fallback { background: var(--tint-blue); color: var(--blue); }
   .badge.unconfigured  { background: var(--badge-amber); color: var(--amber); }
-  /* AI endpoint type badges (Models/Services page) */
+  /* AI endpoint type badges (Models page) */
   .badge.role-embeddings { background: var(--tint-blue); color: var(--blue); }
   .badge.role-chat       { background: var(--badge-purple); color: var(--purple); }
   .server-note { color: var(--text-2); font-size: var(--fs-sm); line-height: 1.5; margin-top: 12px; max-width: 760px; }
@@ -576,10 +577,34 @@
   .about-page { margin-top: 14px; margin-bottom: 8px; }
   .about-page > summary { cursor: pointer; color: var(--text-2); font-size: var(--fs-sm); list-style: revert; min-height: 28px; }
   .about-page > summary:hover { color: var(--text); }
-  /* per-family grouping header inside the Models & modes table */
-  .family-row td { background: var(--surface2); padding: 6px 12px; }
-  .family-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; color: var(--purple); font-weight: 600; }
+  /* canonical runtime id in the runner models table */
   .family-known { color: var(--purple); }
+  /* role board: configured → answered → healthy → last run → stale */
+  .role-kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 10px; margin: 10px 0 0; font-size: var(--fs-sm); }
+  .role-kv dt { color: var(--muted); }
+  .role-kv dd { margin: 0; min-width: 0; }
+  .step-chip { font-family: var(--font-mono); font-size: var(--fs-xs); padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-2); }
+  .badge.gateway { background: var(--badge-purple); color: var(--purple); }
+  .match-ok { color: var(--green); }
+  .server-sub.err, .updated .err { color: var(--red); }
+  .badge.mismatch { background: var(--badge-amber); color: var(--amber); font-weight: 600; }
+  /* Models page: wider role cards so model ids don't wrap mid-token */
+  .role-panels { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .role-card .server-head { flex-wrap: nowrap; }
+  .role-card .step-chip { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .role-kv .mono { overflow-wrap: anywhere; }
+  .role-kv a { display: inline-block; min-height: 24px; line-height: 24px; }
+  h2.section-title { font-weight: inherit; margin-top: 0; }
+  caption.caption-prose { text-transform: none; letter-spacing: 0; font-size: var(--fs-sm); }
+  /* contain absolutely-positioned .sr-only text inside scrolling tables, so it
+     can't widen the page (it would otherwise escape the overflow clip) */
+  .table-wrap { position: relative; }
+  /* row headers (th scope=row, for screen readers) read as ordinary cells */
+  .table-wrap tbody th[scope=row] { text-transform: none; letter-spacing: normal; font-size: inherit; color: var(--text); font-weight: 500; text-align: left; }
+  /* runner-version form in the static Models shell */
+  .runner-update-form { margin-left: 0; flex-wrap: wrap; max-width: 640px; }
+  .runner-update-form form { margin-left: 0; flex: 1 1 30ch; flex-wrap: wrap; }
+  .runner-update-form input[type=text] { flex: 1 1 14ch; min-width: 0; width: auto; }
   /* capability strip: applied (green), declined/absent (amber, ✗ + reason tooltip) */
   .cap-strip { display: inline-flex; gap: 4px; flex-wrap: wrap; }
   .cap-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: var(--fs-xs); font-weight: 600; font-family: inherit; white-space: nowrap; }
@@ -634,7 +659,7 @@
   <nav class="nav">
     <a href="/" class="{{if eq .Nav "pipeline"}}active{{end}}">Pipeline</a>
     <a href="/library" class="{{if eq .Nav "library"}}active{{end}}">Library</a>
-    <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Models/Services</a>
+    <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Models</a>
     <a href="/findings" class="{{if eq .Nav "findings"}}active{{end}}">Findings</a>
   </nav>
   {{if .PhaseKnown}}

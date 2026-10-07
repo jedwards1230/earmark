@@ -9,19 +9,20 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 )
 
-// ─── AI Endpoints section (Models/Services page) ────────────────────────────────
+// ─── AI endpoints table (Models page) ──────────────────────────────────────────
 //
-// The Models/Services page lists the AI endpoint registry (CONTRACT §2.14)
-// alongside the ASR runners: one card per configured endpoint with its type,
-// backend, model, baseURL host, options, the role it serves (if any), and a
-// liveness probe. Observability only — no job routing. The baseURL is shown
-// HOST-ONLY (no scheme/path) so the card stays compact and the page never
+// The Models page lists the AI endpoint registry (CONTRACT §2.14) as a table:
+// one row per configured endpoint with its role, type, gateway, backend, model,
+// baseURL host, liveness, and options. Liveness is a GET /models probe ONLY —
+// role health on the cards above folds in call outcomes. Observability only, no
+// job routing. The baseURL is shown HOST-ONLY (no scheme/path) so the page never
 // surfaces a full internal URL the way the JSON API does.
 
 // endpointStateMeta maps a probe state to its display label + dot color,
 // mirroring the serverState convention used by the ASR cards.
 type endpointStateMeta struct {
 	Label string // READY / MODEL NOT LOADED / OFFLINE / UNKNOWN
+	Glyph string // ✓ / ▲ / ✗ / ? — paired with the word, never color alone
 	Class string
 	Dot   string // green / amber / grey
 	Sub   string
@@ -30,14 +31,14 @@ type endpointStateMeta struct {
 func endpointStateMetaFor(p endpointProbe) endpointStateMeta {
 	switch {
 	case !p.Probed:
-		return endpointStateMeta{Label: "UNKNOWN", Class: "state-unknown", Dot: "grey", Sub: "not probed yet"}
+		return endpointStateMeta{Label: "UNKNOWN", Glyph: "?", Class: "state-unknown", Dot: "grey", Sub: "not probed yet"}
 	case p.State == epStateReady:
-		return endpointStateMeta{Label: "READY", Class: "state-running", Dot: "green", Sub: "reachable — model available"}
+		return endpointStateMeta{Label: "READY", Glyph: "✓", Class: "state-running", Dot: "green", Sub: "reachable — model available"}
 	case p.State == epStateModelMissing:
-		return endpointStateMeta{Label: "MODEL NOT LOADED", Class: "state-busy", Dot: "amber",
+		return endpointStateMeta{Label: "MODEL NOT LOADED", Glyph: "▲", Class: "state-busy", Dot: "amber",
 			Sub: "reachable, but the configured model is not in /models"}
 	default: // offline
-		return endpointStateMeta{Label: "OFFLINE", Class: "state-offline", Dot: "grey",
+		return endpointStateMeta{Label: "OFFLINE", Glyph: "✗", Class: "state-offline", Dot: "grey",
 			Sub: "endpoint unreachable (GET /models failed)"}
 	}
 }
@@ -59,6 +60,14 @@ type endpointView struct {
 	HostOnly string // host[:port] for the card (no scheme/path)
 	Role     string // "embeddings" | "eval" | "" (unbound)
 	Options  []optionKV
+	// Gateway is the routing gateway ("litellm", or a declared value), "" for a
+	// direct endpoint; GatewayInferred marks a host-name guess rather than an
+	// AI_ENDPOINTS declaration (display only).
+	Gateway         string
+	GatewayInferred bool
+	// FromEnv marks the synthetic EVAL_CHAT_* row: a judge configured outside
+	// the registry, never probed (its key is not held by the registry).
+	FromEnv bool
 
 	State  endpointStateMeta
 	Probed bool
@@ -106,18 +115,27 @@ func buildEndpointViews(cfg *config.Config, probes map[string]endpointProbe) []e
 	for _, ep := range cfg.AIEndpoints {
 		probe := probes[ep.ID] // zero value → Probed:false → UNKNOWN
 		meta := endpointStateMetaFor(probe)
+		gw, inferred := gatewayFor(ep.Gateway, ep.BaseURL)
+		if gw == "litellm" && probe.Probed && probe.State == epStateModelMissing {
+			// LiteLLM's /v1/models lists only the virtual key's allowed models,
+			// so "missing" means "not on earmark's key allowlist": calls 403.
+			meta.Label = "NOT ALLOWED"
+			meta.Sub = "not on earmark's LiteLLM key allowlist (403 on call)"
+		}
 		v := endpointView{
-			ID:         ep.ID,
-			Type:       string(ep.Type),
-			Backend:    string(ep.Backend),
-			Model:      ep.Model,
-			BaseURL:    ep.BaseURL,
-			HostOnly:   hostOnly(ep.BaseURL),
-			Role:       cfg.RoleForEndpoint(ep.ID),
-			Options:    sortedOptions(ep.Options),
-			State:      meta,
-			Probed:     probe.Probed,
-			StateToken: string(probeStateToken(probe)),
+			Gateway:         gw,
+			GatewayInferred: inferred,
+			ID:              ep.ID,
+			Type:            string(ep.Type),
+			Backend:         string(ep.Backend),
+			Model:           ep.Model,
+			BaseURL:         ep.BaseURL,
+			HostOnly:        hostOnly(ep.BaseURL),
+			Role:            cfg.RoleForEndpoint(ep.ID),
+			Options:         sortedOptions(ep.Options),
+			State:           meta,
+			Probed:          probe.Probed,
+			StateToken:      string(probeStateToken(probe)),
 		}
 		views = append(views, v)
 	}
@@ -150,19 +168,10 @@ func (s *MCPServer) probeEndpoints(ctx context.Context) map[string]endpointProbe
 	return out
 }
 
-// RoleNote renders the assigned-role suffix on a card ("role: embeddings
-// (assigned)"), or "" when the endpoint is unbound. Exported because
-// html/template only invokes exported methods — an unexported method name is
-// treated as a (missing) field lookup and errors at execute time.
-func (v endpointView) RoleNote() string {
-	if v.Role == "" {
-		return ""
-	}
-	return "role: " + v.Role + " (assigned)"
-}
-
 // OptionsLine renders the options as "k=v k=v …" for the card, or "" when none.
-// Exported for the same reason as RoleNote (template method dispatch).
+// Exported because html/template only invokes exported methods — an
+// unexported method name is treated as a (missing) field lookup and errors at
+// execute time.
 func (v endpointView) OptionsLine() string {
 	if len(v.Options) == 0 {
 		return ""
@@ -172,4 +181,29 @@ func (v endpointView) OptionsLine() string {
 		parts = append(parts, o.Key+"="+o.Value)
 	}
 	return strings.Join(parts, " ")
+}
+
+// GatewayLabel renders the Gateway cell: "LiteLLM", a declared value verbatim,
+// or "direct". Exported for template method dispatch.
+func (v endpointView) GatewayLabel() string {
+	if v.Gateway == "" {
+		return "direct"
+	}
+	return gatewayLabel(v.Gateway)
+}
+
+// envJudgeView is the synthetic endpoint-table row for a judge configured from
+// EVAL_CHAT_* rather than AI_ENDPOINTS. It is never probed: probing would mean
+// holding the API key outside the registry.
+func envJudgeView(j judgeConfig) *endpointView {
+	if !j.Configured || j.Source != judgeSourceEnv {
+		return nil
+	}
+	gw, inferred := gatewayFor("", j.Host)
+	return &endpointView{
+		ID: "EVAL_CHAT_*", Type: "chat", Backend: "env", Model: j.Model, HostOnly: j.Host,
+		Role: "eval", Gateway: gw, GatewayInferred: inferred, FromEnv: true,
+		State:      endpointStateMeta{Label: "NOT PROBED", Glyph: "?", Class: "state-unknown", Dot: "grey", Sub: "from env, not in AI_ENDPOINTS"},
+		StateToken: string(epStateUnknown),
+	}
 }

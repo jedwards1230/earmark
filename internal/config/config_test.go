@@ -372,6 +372,24 @@ func TestLoadConfig_AIEndpointsValid(t *testing.T) {
 	assert.Equal(t, "", cfg.RoleForEndpoint("unbound"))
 }
 
+// TestLoadConfig_AIEndpointsGateway: the optional gateway field is normalized
+// (trimmed, lower-cased) and absent stays empty — it is display/API only.
+func TestLoadConfig_AIEndpointsGateway(t *testing.T) {
+	clearContractEnvVars(t)
+	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+	t.Setenv("AI_ENDPOINTS", `[
+		{"id":"litellm-embed","type":"embeddings","backend":"openai-compat","baseURL":"http://gw:4000/v1","model":"nomic-embed-text","gateway":" LiteLLM "},
+		{"id":"direct","type":"chat","backend":"ollama","baseURL":"http://ollama:11434/v1","model":"qwen3.8"}
+	]`)
+	t.Setenv("AI_ROLES", `{"embeddings":"litellm-embed"}`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.AIEndpoints, 2)
+	assert.Equal(t, "litellm", cfg.AIEndpoints[0].Gateway)
+	assert.Equal(t, "", cfg.AIEndpoints[1].Gateway)
+}
+
 func TestLoadConfig_AIEndpoints_AIRolesRequired(t *testing.T) {
 	clearContractEnvVars(t)
 	t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")

@@ -113,6 +113,11 @@ type AIEndpoint struct {
 	// APIKey is the token resolved from APIKeyEnv by parseAIEndpoints. It is
 	// never serialized (json:"-"), so marshalling an endpoint cannot leak it.
 	APIKey string `json:"-"`
+	// Gateway optionally names the routing gateway the endpoint sits behind
+	// (e.g. "litellm"), lower-cased and trimmed by parseAIEndpoints. Display
+	// and API only — no code path routes or behaves differently on it. The
+	// Models page infers "litellm" from the host name when it is absent.
+	Gateway string `json:"gateway,omitempty"`
 }
 
 // AIRoles binds function names to endpoint IDs. The "embeddings" role is
@@ -226,6 +231,13 @@ func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
 				return nil, fmt.Errorf("%s (%q): %w", where, ep.ID, err)
 			}
 			eps[i].APIKey = key
+		}
+		eps[i].Gateway = strings.ToLower(strings.TrimSpace(ep.Gateway))
+		if eps[i].Gateway != "" && ep.Backend == AIBackendOllama {
+			// Not fatal: gateway is display-only. But an Ollama endpoint is
+			// normally reached directly, so this is most likely a copy-paste slip.
+			logger.Warn("AI_ENDPOINTS entry declares a gateway on an ollama backend; gateway is display-only",
+				"id", ep.ID, "gateway", eps[i].Gateway)
 		}
 	}
 	return eps, nil
