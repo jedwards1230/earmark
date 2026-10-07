@@ -231,6 +231,8 @@ func (p *httpGatewayProber) getJSON(ctx context.Context, url, bearer string, out
 	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxGatewayBody)
 	if resp.StatusCode != http.StatusOK || out == nil {
+		// Drain error ignored on purpose: this is a best-effort drain for
+		// connection reuse, and probe failures are encoded in the status.
 		_, _ = io.Copy(io.Discard, body)
 		return resp.StatusCode, nil
 	}

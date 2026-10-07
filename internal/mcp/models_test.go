@@ -18,10 +18,6 @@ import (
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
-var testNow = time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
-
-func boolp(b bool) *bool { return &b }
-
 func ago(d time.Duration) time.Time { return testNow.Add(-d) }
 
 // TestJudgeHealthPrecedence covers every row of the Judge precedence table

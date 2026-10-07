@@ -187,17 +187,6 @@ func TestRefreshCache_SingleFlight(t *testing.T) {
 	assert.EqualValues(t, 1, g.calls.Load())
 }
 
-// waitIdle blocks until no refresh is in flight (background refreshes make
-// "after this get, the value is updated" asynchronous).
-func (c *refreshCache[T]) waitIdle() {
-	c.mu.Lock()
-	refreshing, done := c.refreshing, c.done
-	c.mu.Unlock()
-	if refreshing {
-		<-done
-	}
-}
-
 // TestRefreshCache_LoadPanicIsRecovered: a panicking load becomes lastErr,
 // clears refreshing and closes done (no waiter hangs), and the process lives.
 func TestRefreshCache_LoadPanicIsRecovered(t *testing.T) {
