@@ -92,7 +92,7 @@ config:
 
   # asrServers declares the transcription servers (ASR runners) for this
   # deployment, serialized to the ASR_SERVERS env var (JSON) and shown on the
-  # Servers dashboard page. Lets a configured-but-idle fallback appear, not just
+  # Models dashboard page. Lets a configured-but-idle fallback appear, not just
   # servers already observed. Empty → the page lists only observed runners.
   # Read-only: this does NOT route work — the runner claims jobs itself.
   # Each entry: {name, host?, model?, role?, match?, gpuArbiterUrl?,
@@ -150,7 +150,9 @@ config:
   # Behind LiteLLM (with secrets.aiApiKey.itemPath set):
   #     - {id: litellm-embed, type: embeddings, backend: openai-compat,
   #        baseURL: "http://litellm:4000/v1", model: nomic-embed-text,
-  #        apiKeyEnv: LITELLM_API_KEY}
+  #        apiKeyEnv: LITELLM_API_KEY, gateway: litellm}
+  # gateway is optional and display/API only (the Models page's "via LiteLLM"
+  # badge); without it the page infers LiteLLM from the host name.
   aiEndpoints: []
   aiRoles: {}
 

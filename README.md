@@ -140,7 +140,7 @@ reversible. Full parameter documentation is in
 | Path | What it is |
 |------|-----------|
 | `/mcp` | MCP streamable-HTTP endpoint |
-| `/` | htmx status dashboard — pipeline, library, per-book/track, servers, findings |
+| `/` | htmx status dashboard — pipeline, library, per-book/track, models, findings |
 | `/api/v1/status` | JSON pipeline status (read-only, unauthenticated) |
 | `/api/v1/pipeline/pause`, `/api/v1/pipeline/run` | Pause/resume and run-N-then-pause. `PUT`/`POST`/`DELETE` require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed with `503` when it is unset |
 | `/api/v1/openapi.yaml` | OpenAPI 3.1 contract for the JSON control API, embedded in the binary (read-only, unauthenticated) |
@@ -172,7 +172,7 @@ The ones you are most likely to set:
 | `INGEST_HTTP_ADDR` | `:8082` | Bind address for the ingest pod's health/metrics listener |
 | `METADATA_PROVIDER` | `path` | `path`, `abs` (Audiobookshelf — needs `ABS_URL` + `ABS_TOKEN`), or `chain:abs,path` |
 | `LIBRARY_COLLECTIONS` | — | JSON describing each library root's directory layout, so author/title labels come from config rather than a hardcoded path shape |
-| `ASR_SERVERS` | — | JSON describing the transcription hosts, for the Servers dashboard page. Read-only — it does not route work |
+| `ASR_SERVERS` | — | JSON describing the transcription hosts, for the Models page. Read-only — it does not route work |
 | `EVAL_IN_PIPELINE` | `false` | Run the eval judge inline before embedding. Leave `false` to keep embedding independent of the judge and run `earmark eval --backfill-unevaluated --write` as its own pass |
 | `EVAL_REASONING_EFFORT` / `EVAL_CHAT_TEMPLATE_KWARGS` | `auto` | Thinking-suppression fields sent to the judge: on for local models, omitted when the model id contains `anthropic/` (a LiteLLM alias that hides the provider needs `omit`); `omit` or an explicit value overrides |
 | `CONTROL_API_TOKEN` | — | Bearer token for the mutating control API; unset means those endpoints fail closed |

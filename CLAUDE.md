@@ -111,16 +111,22 @@ heartbeat), `failed` (failures incl. a long multi-line error), `multibackend`
 `batch-analyze` (`earmark batch` Phase B: phase=analyze, run_limit=0, tracks held
 pending for the next batch while eval runs on the GPU — the "ANALYZING" state
 line and the "held for the batch analyze phase" run budget),
-or `idle` (fully done, GPU util 0 but ~29 GB VRAM still occupied — the
+`idle` (fully done, GPU util 0 but ~29 GB VRAM still occupied — the
 "Idle — safe to walk away · models resident" answer to "why is VRAM held while
-idle"). To see the connection-lost banner, open the page then stop the server —
-htmx flags the data stale instead of freezing silently.
+idle"), or `snapshot-error` (the Models page's aggregate queries fail — "counts
+unavailable" with a 200). On the Models page (`/servers`) the scenarios cover
+every role state: `active` HEALTHY, `failed` Judge FAILING, `stale` DEGRADED,
+`idle` IDLE, `winddown` Judge/Embeddings DOWN, `empty` NOT CONFIGURED (fixtures
+in `internal/mcp/demo_models.go`). To see the connection-lost banner, open the
+page then stop the server — htmx flags the data stale instead of freezing
+silently.
 
 ```bash
 # Smoke-test the rendered HTML without a browser (server must be running):
 curl -sf http://localhost:9876/             # full dashboard page
 curl -sf http://localhost:9876/status/data  # htmx auto-refresh fragment
-curl -sf http://localhost:9876/servers      # Models/Services page
+curl -sf http://localhost:9876/servers      # Models page (role board)
+curl -sf http://localhost:9876/servers/data # Models fragment
 ```
 
 Then verify with the **Playwright MCP** server (declared in both `.mcp.json` and
@@ -129,9 +135,9 @@ Then verify with the **Playwright MCP** server (declared in both `.mcp.json` and
 - `browser_navigate` to `http://localhost:9876/` and the feature pages
   (`/servers`, plus `?scenario=...` via `DEMO_SCENARIO` restarts), then
   `browser_snapshot` / `browser_take_screenshot` for **light and dark** mode.
-- Toggle dark mode with the page's theme control, or
-  `document.documentElement.setAttribute('data-theme', 'dark')` via
-  `browser_evaluate`.
+- Toggle dark mode with `browser_emulate_media` (`colorScheme: 'dark'` /
+  `'light'`). The page follows `prefers-color-scheme` only — there is no
+  `data-theme` attribute or theme control.
 - Drive the htmx refresh by waiting, or fetch the fragment directly at
   `http://localhost:9876/status/data`.
 - Save screenshots under `.playwright-mcp/` (gitignored) so they are not
@@ -152,7 +158,7 @@ Optional (with defaults): `BOOKS_DIR`, `EMBEDDINGS_BASE_URL`, `EMBEDDINGS_MODEL`
 `EMBED_BATCH_SIZE`, `DEBUG`.
 
 Optional (no default): `ASR_SERVERS` — JSON array declaring the transcription
-servers for the **Models/Services** dashboard page (`/servers`). Read-only/observability
+servers for the **Models** dashboard page (`/servers`). Read-only/observability
 only; does not route work. See `docs/CONTRACT.md §2.4`.
 
 Optional (no default): `AI_ENDPOINTS` + `AI_ROLES` — the AI endpoint registry
@@ -172,7 +178,7 @@ Debug-only (both must be set):
 | `internal/db` | pgxpool-based DB handle; schema init; job queue; search; chunks |
 | `internal/worker` | Polls completed transcripts, chunks via segments, embeds, stores |
 | `internal/monitor` | Walks BOOKS_DIR, inserts pending jobs (dedup by SHA-256) |
-| `internal/mcp` | MCP server (8 tools: 6 read-only, 2 correction-review writes), status dashboard, control API, `/servers` Models/Services page. See [`internal/mcp/README.md`](internal/mcp/README.md) and [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for full details. |
+| `internal/mcp` | MCP server (8 tools: 6 read-only, 2 correction-review writes), status dashboard, control API, `/servers` Models page (role board). See [`internal/mcp/README.md`](internal/mcp/README.md) and [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for full details. |
 | `internal/chunker` | Token-based text splitter |
 | `internal/openai` | OpenAI-compatible embeddings client; resolves its endpoint through the AI registry's `embeddings` role (CONTRACT §2.14) |
 | `internal/asr` | ASR backend capability vocabulary (CONTRACT §2.13): closed capability enum + `ParseCapabilities` (drops unknown keys), recommended `family`/`runtime` ids + `KnownFamily`/`KnownRuntime` label helpers. Pure leaf package (no DB/HTTP deps). |
