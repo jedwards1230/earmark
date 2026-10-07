@@ -354,7 +354,7 @@
   td { padding: 12px 14px; border-bottom: 1px solid var(--border); }
   tr:last-child td { border-bottom: none; }
   /* row banding so dense tables de-fuse (1.4.x readability) */
-  tbody tr:nth-child(even) td, tbody tr:nth-child(even) th[scope=row] { background: var(--row-band); }
+  tbody tr:nth-child(even) > td, tbody tr:nth-child(even) > th { background: var(--row-band); }
   /* clickable rows: legacy <tr class=clickable> AND the new whole-row <a> pattern */
   tbody tr.clickable:hover td { background: var(--row-hover); cursor: pointer; }
   tbody tr.row-link:hover td { background: var(--row-hover); }
@@ -603,6 +603,7 @@
   .table-wrap tbody th[scope=row] { text-transform: none; letter-spacing: normal; font-size: inherit; color: var(--text); font-weight: 500; text-align: left; }
   /* runner-version form in the static Models shell */
   .runner-update-form { margin-left: 0; flex-wrap: wrap; max-width: 640px; }
+  .runner-update-form form { margin-left: 0; flex: 1 1 30ch; flex-wrap: wrap; }
   .runner-update-form input[type=text] { flex: 1 1 14ch; min-width: 0; width: auto; }
   /* capability strip: applied (green), declined/absent (amber, ✗ + reason tooltip) */
   .cap-strip { display: inline-flex; gap: 4px; flex-wrap: wrap; }

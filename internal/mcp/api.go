@@ -161,7 +161,10 @@ type apiGateway struct {
 	RPMLimit      *int64   `json:"rpmLimit"`
 	TPMLimit      *int64   `json:"tpmLimit"`
 	AllowedModels []string `json:"allowedModels"`
-	KeyInfoError  string   `json:"keyInfoError,omitempty"`
+	// TeamKey is true for a team-scoped key; with an empty allowedModels it
+	// inherits the team's models (not readable with earmark's key).
+	TeamKey      bool   `json:"teamKey"`
+	KeyInfoError string `json:"keyInfoError,omitempty"`
 }
 
 // apiGatewaysFrom maps the probed gateways to the API shape.
@@ -185,6 +188,7 @@ func apiGatewaysFrom(sts []gatewayStatus, targets []gatewayTarget) []apiGateway 
 			g.Spend, g.MaxBudget, g.BudgetResetAt = &spend, k.MaxBudget, k.BudgetResetAt
 			g.RPMLimit, g.TPMLimit = k.RPMLimit, k.TPMLimit
 			g.AllowedModels = append([]string{}, k.Models...)
+			g.TeamKey = k.TeamID != ""
 		}
 		out = append(out, g)
 	}

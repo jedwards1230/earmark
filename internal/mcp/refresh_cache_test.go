@@ -83,7 +83,9 @@ func TestRefreshCache_KeepLastGoodAndRetryAfter(t *testing.T) {
 	e, err := c.get(ctx)
 	require.Error(t, err)
 	assert.Same(t, good, e, "keep the last good value on error")
-	assert.EqualValues(t, 1, logged.Load(), "log once per failed refresh, not per poll")
+	// onError runs just after done closes, so wait for it rather than racing.
+	assert.Eventually(t, func() bool { return logged.Load() == 1 }, 2*time.Second, time.Millisecond,
+		"log once per failed refresh, not per poll")
 
 	clock = clock.Add(5 * time.Second) // within retry window: no new load
 	_, _ = c.get(ctx)
@@ -183,4 +185,79 @@ func TestRefreshCache_SingleFlight(t *testing.T) {
 	close(g.release)
 	wg.Wait()
 	assert.EqualValues(t, 1, g.calls.Load())
+}
+
+// waitIdle blocks until no refresh is in flight (background refreshes make
+// "after this get, the value is updated" asynchronous).
+func (c *refreshCache[T]) waitIdle() {
+	c.mu.Lock()
+	refreshing, done := c.refreshing, c.done
+	c.mu.Unlock()
+	if refreshing {
+		<-done
+	}
+}
+
+// TestRefreshCache_LoadPanicIsRecovered: a panicking load becomes lastErr,
+// clears refreshing and closes done (no waiter hangs), and the process lives.
+func TestRefreshCache_LoadPanicIsRecovered(t *testing.T) {
+	clock := testNow
+	calls := 0
+	c := newRefreshCache(30*time.Second, time.Second, func(context.Context) (int, error) {
+		calls++
+		if calls == 2 {
+			panic("boom")
+		}
+		return calls, nil
+	})
+	c.now = func() time.Time { return clock }
+	logged := make(chan error, 1)
+	c.onError = func(err error, _ bool) { logged <- err } // runs after done closes
+
+	first, err := c.get(context.Background())
+	require.NoError(t, err)
+
+	clock = clock.Add(time.Minute)
+	_, _ = c.get(context.Background()) // background refresh panics
+	c.waitIdle()
+	e, err := c.get(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refresh panicked: boom")
+	assert.Same(t, first, e, "last good value kept")
+	select {
+	case lerr := <-logged:
+		assert.Contains(t, lerr.Error(), "boom")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the panic was never reported to onError")
+	}
+	c.mu.Lock()
+	assert.False(t, c.refreshing, "refreshing must be cleared after a panic")
+	c.mu.Unlock()
+
+	// A panicking FIRST load must not leave waiters hanging either.
+	p := newRefreshCache(30*time.Second, time.Second, func(context.Context) (int, error) { panic("first") })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	e2, err := p.get(ctx)
+	assert.Nil(t, e2)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, context.DeadlineExceeded, "the waiter was released by done, not by its timeout")
+}
+
+// TestRefreshCache_FirstFailureRetriesSooner: with no value yet, a failed load
+// is retried after firstRetryAfter, not a full TTL.
+func TestRefreshCache_FirstFailureRetriesSooner(t *testing.T) {
+	clock := testNow
+	f := &fakeLoader{}
+	f.fail.Store(true)
+	c := newRefreshCache(5*time.Minute, time.Second, f.load)
+	c.firstRetryAfter = 30 * time.Second
+	c.now = func() time.Time { return clock }
+	_, _ = c.get(context.Background())
+	clock = clock.Add(31 * time.Second)
+	f.fail.Store(false)
+	e, err := c.get(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	assert.EqualValues(t, 2, f.calls.Load())
 }

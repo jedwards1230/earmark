@@ -43,13 +43,20 @@ import (
 // the background (refreshCache), so a slow gateway never delays a poll.
 const gatewayProbeTTL = 60 * time.Second
 
+// gatewayFirstWait bounds how long one page render waits for gateways whose
+// status has never loaded (shared across all gateways in that render).
+const gatewayFirstWait = 1500 * time.Millisecond
+
 // maxGatewayBody caps each gateway response read.
 const maxGatewayBody = 64 << 10 // 64 KB
 
 // gatewayKeyInfo is the subset of LiteLLM's /key/info "info" object earmark
 // reads. Deliberately excludes "token"/"key" and every other field.
 type gatewayKeyInfo struct {
-	KeyAlias       string   `json:"key_alias"`
+	KeyAlias string `json:"key_alias"`
+	// TeamID marks a team key: an empty Models list then means "the team's
+	// models", which this key cannot read — not "all models".
+	TeamID         string   `json:"team_id"`
 	Models         []string `json:"models"`
 	Spend          float64  `json:"spend"`
 	MaxBudget      *float64 `json:"max_budget"`
@@ -97,10 +104,19 @@ type gatewayProber interface {
 }
 
 // gatewayBase strips a trailing "/v1" (and slashes) from an endpoint baseURL.
+// It parses the URL so a query or fragment can't defeat the strip and a path
+// prefix is kept ("http://h/litellm/v1" → "http://h/litellm"); an unparseable
+// value is returned trimmed (fetch then rejects it as not http(s)).
 func gatewayBase(baseURL string) string {
-	b := strings.TrimRight(baseURL, "/")
-	b = strings.TrimSuffix(b, "/v1")
-	return strings.TrimRight(b, "/")
+	u, err := neturl.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return strings.TrimRight(baseURL, "/")
+	}
+	u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
+	p := strings.TrimRight(u.Path, "/")
+	p = strings.TrimSuffix(p, "/v1")
+	u.Path, u.RawPath = strings.TrimRight(p, "/"), ""
+	return u.String()
 }
 
 // httpGatewayProber implements gatewayProber over HTTP with a per-(base, key)
@@ -116,6 +132,10 @@ type httpGatewayProber struct {
 
 func newHTTPGatewayProber(timeout, ttl time.Duration) *httpGatewayProber {
 	return &httpGatewayProber{
+		// The default transport honours HTTPS_PROXY/HTTP_PROXY, so in a pod with a
+		// proxy configured the bearer travels via that proxy, exactly like the
+		// embed and judge clients' calls to the same gateway. NO_PROXY the gateway
+		// host if that is not wanted.
 		client: &http.Client{
 			Timeout: timeout,
 			// No redirects: a compromised gateway must not bounce the bearer
@@ -139,8 +159,9 @@ func (p *httpGatewayProber) Probe(ctx context.Context, baseURL, apiKey string) g
 	p.mu.Lock()
 	c, ok := p.caches[key]
 	if !ok {
-		// Two requests per refresh, each bounded by the client timeout.
-		c = newRefreshCache(p.ttl, 2*p.client.Timeout+time.Second, func(ctx context.Context) (gatewayStatus, error) {
+		// Up to three sequential requests per refresh (readiness, the liveliness
+		// fallback, key info), each bounded by the client timeout, plus slack.
+		c = newRefreshCache(p.ttl, 3*p.client.Timeout+time.Second, func(ctx context.Context) (gatewayStatus, error) {
 			return p.fetch(ctx, base, apiKey), nil
 		})
 		c.now = p.now
@@ -260,10 +281,15 @@ func (s *MCPServer) probeGateways(ctx context.Context) ([]gatewayStatus, []gatew
 	if len(targets) == 0 {
 		return nil, nil, nil
 	}
+	// Bound the FIRST load of every gateway together: after it, probes are
+	// served from cache instantly; a slow first load shows "not probed yet"
+	// and lands on a later poll instead of holding up the page.
+	gctx, cancel := context.WithTimeout(ctx, gatewayFirstWait)
+	defer cancel()
 	statuses := make([]gatewayStatus, 0, len(targets))
 	byEndpoint := map[string]gatewayStatus{}
 	for _, t := range targets {
-		st := s.gatewayProber.Probe(ctx, t.Base, t.APIKey)
+		st := s.gatewayProber.Probe(gctx, t.Base, t.APIKey)
 		statuses = append(statuses, st)
 		for _, ep := range t.Endpoints {
 			byEndpoint[ep.ID] = st
@@ -293,6 +319,7 @@ type gatewayView struct {
 	SpendText   string // "$12.25 · no budget set" / "$12.25 of $50.00 budget, resets in 12d"
 	LimitsText  string // "rpm 60 · tpm 100,000" or ""
 	AllowAll    bool
+	TeamModels  bool // team key with no own list: inherits the team's models (unreadable)
 	RoleModels  []gatewayRoleModel
 }
 
@@ -322,7 +349,8 @@ func buildGatewayViews(sts []gatewayStatus, targets []gatewayTarget, roles []rol
 			}
 		}
 		if st.KeyInfoOK {
-			v.AllowAll = len(st.Key.Models) == 0
+			v.TeamModels = len(st.Key.Models) == 0 && st.Key.TeamID != ""
+			v.AllowAll = len(st.Key.Models) == 0 && !v.TeamModels
 			for _, m := range st.Key.Models {
 				if m == "*" || m == "all-proxy-models" {
 					v.AllowAll = true

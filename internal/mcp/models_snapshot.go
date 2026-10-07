@@ -87,6 +87,9 @@ func newModelsCaches(d DBInterface, logWarn func(msg string, args ...any)) model
 		stale: newRefreshCache(staleSnapshotTTL, staleSnapshotTimeout,
 			func(ctx context.Context) (staleSnapshot, error) { return loadStaleSnapshot(ctx, d) }),
 	}
+	// A failed FIRST stale count retries after the aggregates' TTL rather than
+	// leaving the counts "unavailable" for the full 5 min.
+	c.stale.firstRetryAfter = modelsSnapshotTTL
 	if logWarn != nil {
 		c.models.onError = func(err error, haveLast bool) {
 			logWarn("models: snapshot refresh failed; serving last good counts", "error", err, "have_last_good", haveLast)

@@ -496,12 +496,15 @@ var serversPage = mustPage(`{{define "content"}}
 <section class="section" aria-labelledby="runner-update-title">
   <h2 class="section-title" id="runner-update-title">Update ASR runner</h2>
   {{if .ControlEnabled}}
-  <form class="rb-form runner-update-form" hx-post="/actions/runner-update" hx-target="#models-region" hx-swap="innerHTML">
-    <label for="runner-version" class="time-muted">version</label>
-    <input id="runner-version" type="text" name="version" placeholder="vX.Y.Z" autocomplete="off" spellcheck="false" />
-    <button class="btn btn-primary" type="submit">Update runner</button>
-    <button class="btn" type="button" hx-post="/actions/runner-update?version=" hx-target="#models-region" hx-swap="innerHTML" title="cancel or acknowledge the requested update">Clear request</button>
-  </form>
+  <div class="rb-form runner-update-form">
+    <form class="rb-form" hx-post="/actions/runner-update" hx-target="#models-region" hx-swap="innerHTML">
+      <label for="runner-version" class="time-muted">version</label>
+      <input id="runner-version" type="text" name="version" placeholder="vX.Y.Z" autocomplete="off" spellcheck="false" required />
+      <button class="btn btn-primary" type="submit">Update runner</button>
+    </form>
+    <!-- Outside the form on purpose: clearing must never carry the typed version. -->
+    <button class="btn" type="button" hx-post="/actions/runner-update" hx-vals='{"version": ""}' hx-target="#models-region" hx-swap="innerHTML" title="cancel or acknowledge the requested update">Clear request</button>
+  </div>
   <p class="server-note">Requests the runner self-update to a release tag; the runner performs the swap. Current and requested versions are shown under ASR runners above.</p>
   {{else}}<p class="server-note">Set <code>CONTROL_API_TOKEN</code> to enable runner updates.</p>{{end}}
 </section>
@@ -673,7 +676,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
         <dt>key</dt><dd><span class="mono">{{or .Key.KeyAlias "(no alias)"}}</span> · {{.KeyState}}{{with .ExpiresText}} · {{.}}{{end}}</dd>
         <dt>spend</dt><dd>{{.SpendText}}</dd>
         {{with .LimitsText}}<dt>limits</dt><dd>{{.}}</dd>{{end}}
-        <dt>allowed</dt><dd>{{if .AllowAll}}all models{{else}}{{range $i, $m := .Key.Models}}{{if $i}}, {{end}}<span class="mono">{{$m}}</span>{{end}}{{end}}</dd>
+        <dt>allowed</dt><dd>{{if .TeamModels}}<span class="time-muted">the team's models (not readable by earmark's key)</span>{{else if .AllowAll}}all models{{else}}{{range $i, $m := .Key.Models}}{{if $i}}, {{end}}<span class="mono">{{$m}}</span>{{end}}{{end}}</dd>
         {{else}}
         <dt>key</dt><dd class="time-muted">{{.KeyInfoErr}}</dd>
         {{end}}
@@ -959,7 +962,8 @@ func (s *MCPServer) modelRoles(ctx context.Context, stats *db.QueueStats, runner
 	ev := s.models.read(ctx, staleFirstWait)
 	phase, err := s.db.GetPipelinePhase(ctx)
 	if err != nil {
-		phase = "" // unknown: the ASR card then treats a stopped runner as unintended
+		s.logger.Warn("models: GetPipelinePhase error; ASR card treats a stopped runner as unintended", "error", err)
+		phase = ""
 	}
 	roles := buildRoleCards(roleInputs{
 		Phase:        phase,
@@ -1025,7 +1029,7 @@ func (s *MCPServer) handleRunnerUpdate(w http.ResponseWriter, r *http.Request) {
 		writeActionError(w, "control token not configured — update disabled")
 		return
 	}
-	version := strings.TrimSpace(r.URL.Query().Get("version"))
+	version := strings.TrimSpace(runnerUpdateVersion(r))
 	if version == "" {
 		if err := s.db.ClearRunnerUpdate(r.Context(), "dashboard"); err != nil {
 			s.logger.Error("runner-update clear error", "error", err)
@@ -1042,6 +1046,17 @@ func (s *MCPServer) handleRunnerUpdate(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("runner update requested via dashboard", "version", version)
 	}
 	s.handleServersData(w, r)
+}
+
+// runnerUpdateVersion reads the requested version: the form body first (htmx
+// hx-post sends the form's fields in the body), then the query string (the
+// legacy ?version= form, still accepted). An absent or empty value means
+// "clear the request".
+func runnerUpdateVersion(r *http.Request) string {
+	if v := r.PostFormValue("version"); v != "" {
+		return v
+	}
+	return r.URL.Query().Get("version")
 }
 
 // probeServers polls gpu-arbiter for every configured server that declares a

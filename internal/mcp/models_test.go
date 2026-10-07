@@ -633,3 +633,94 @@ func (s *slowStaleDB) StaleItemCounts(ctx context.Context) (map[string]int64, er
 		return nil, ctx.Err()
 	}
 }
+
+// TestRunnerUpdateAction covers the htmx runner-update action: hx-post sends
+// the form fields in the BODY (the bug was reading only the query string, so
+// "Update runner" cleared the request instead of setting it).
+func TestRunnerUpdateAction(t *testing.T) {
+	post := func(mock *SimpleMockDB, token, body, query string, htmx bool) *httptest.ResponseRecorder {
+		t.Helper()
+		srv := NewMCPServer(mock, &config.Config{ControlAPIToken: token})
+		req := httptest.NewRequest(http.MethodPost, "/actions/runner-update"+query, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		if htmx {
+			req.Header.Set("HX-Request", "true")
+		}
+		w := httptest.NewRecorder()
+		srv.buildMux().ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("form body sets the version", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		w := post(m, "tok", "version=+v9.9.9+", "", true)
+		require.Equal(t, http.StatusOK, w.Code)
+		assert.True(t, m.desiredVersionSet)
+		assert.Equal(t, "v9.9.9", m.desiredVersionSetTo)
+		assert.False(t, m.runnerUpdateCleared)
+	})
+	t.Run("clear (hx-vals empty version) clears", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		w := post(m, "tok", "version=", "", true)
+		require.Equal(t, http.StatusOK, w.Code)
+		assert.True(t, m.runnerUpdateCleared)
+		assert.False(t, m.desiredVersionSet)
+	})
+	t.Run("query string still works", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		post(m, "tok", "", "?version=v1.2.3", true)
+		assert.Equal(t, "v1.2.3", m.desiredVersionSetTo)
+	})
+	t.Run("form body wins over query", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		post(m, "tok", "version=v2.0.0", "?version=v1.0.0", true)
+		assert.Equal(t, "v2.0.0", m.desiredVersionSetTo)
+	})
+	t.Run("not htmx is forbidden", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		w := post(m, "tok", "version=v9.9.9", "", false)
+		assert.Equal(t, http.StatusForbidden, w.Code)
+		assert.False(t, m.desiredVersionSet)
+	})
+	t.Run("no control token fails closed", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		w := post(m, "", "version=v9.9.9", "", true)
+		assert.Contains(t, w.Body.String(), "control token not configured")
+		assert.False(t, m.desiredVersionSet)
+	})
+}
+
+// TestRunnerUpdateClearIsOutsideTheForm: the Clear control must not submit the
+// typed version, so it lives outside the form and sends an explicit empty one.
+func TestRunnerUpdateClearIsOutsideTheForm(t *testing.T) {
+	srv := newDemoServer(":0", "active")
+	w := httptest.NewRecorder()
+	srv.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers", nil))
+	out := w.Body.String()
+	formStart := strings.Index(out, `<form class="rb-form" hx-post="/actions/runner-update"`)
+	formEnd := strings.Index(out[formStart:], "</form>") + formStart
+	clear := strings.Index(out, `hx-vals='{"version": ""}'`)
+	require.Positive(t, formStart)
+	require.Positive(t, clear)
+	assert.Greater(t, clear, formEnd, "Clear must be outside the form")
+}
+
+// TestRunnerUpdateDemoRoundTrip: through the demo, a set version shows up in
+// the re-rendered fragment and a clear removes it.
+func TestRunnerUpdateDemoRoundTrip(t *testing.T) {
+	srv := newDemoServer(":0", "idle") // idle has no fixture request
+	h := srv.buildMux()
+	do := func(body string) string {
+		req := httptest.NewRequest(http.MethodPost, "/actions/runner-update", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("HX-Request", "true")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+		return w.Body.String()
+	}
+	assert.Contains(t, do("version=v9.9.9"), "requested <code>v9.9.9</code>")
+	assert.NotContains(t, do("version="), "requested <code>")
+}

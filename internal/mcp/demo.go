@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/asr"
@@ -51,6 +52,9 @@ type demoDB struct {
 	scenario string
 	paused   *bool // heap-backed so value-receiver SetPaused can mutate it
 	runLimit *int  // bounded-run counter for the control API (nil = unlimited)
+	// runnerUpd holds runner-update intent set through the dashboard/API
+	// (nil = writes are no-ops, the scenario fixture always applies).
+	runnerUpd *demoRunnerUpdate
 }
 
 func (demoDB) Ping(context.Context) error { return nil }
@@ -560,8 +564,42 @@ func (d demoDB) SetRunLimit(context.Context, *int, string) error { return nil }
 
 // Runner self-update is a no-op in the demo (value receiver); the fixture renders
 // a representative skew state via GetServiceStatus instead.
-func (d demoDB) SetDesiredRunnerVersion(context.Context, string, string) error { return nil }
-func (d demoDB) ClearRunnerUpdate(context.Context, string) error               { return nil }
+// SetDesiredRunnerVersion / ClearRunnerUpdate record the operator's intent in
+// memory (when the demo wired runnerUpd), so the runner-update form is
+// exercisable end to end: the next fragment shows the requested version.
+func (d demoDB) SetDesiredRunnerVersion(_ context.Context, version, _ string) error {
+	if d.runnerUpd != nil {
+		d.runnerUpd.set(&version)
+	}
+	return nil
+}
+
+func (d demoDB) ClearRunnerUpdate(context.Context, string) error {
+	if d.runnerUpd != nil {
+		d.runnerUpd.set(nil)
+	}
+	return nil
+}
+
+// demoRunnerUpdate is the demo's in-memory runner_control update intent.
+// touched=false → the scenario's fixture applies; desired=nil → cleared.
+type demoRunnerUpdate struct {
+	mu      sync.Mutex
+	touched bool
+	desired *string
+}
+
+func (u *demoRunnerUpdate) set(v *string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.touched, u.desired = true, v
+}
+
+func (u *demoRunnerUpdate) get() (touched bool, desired *string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.touched, u.desired
+}
 
 // GetPipelinePhase reports a per-scenario coordinator phase so the read-only
 // phase badge renders a representative state with no database: the live "active"
@@ -756,6 +794,15 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 		st := "requested"
 		q.DesiredRunnerVersion = &dv
 		q.RunnerUpdateState = &st
+	}
+	if d.runnerUpd != nil {
+		if touched, desired := d.runnerUpd.get(); touched {
+			q.DesiredRunnerVersion, q.RunnerUpdateState = nil, nil
+			if desired != nil {
+				dv, st := *desired, "requested"
+				q.DesiredRunnerVersion, q.RunnerUpdateState = &dv, &st
+			}
+		}
 	}
 	return q, nil
 }
@@ -1246,7 +1293,7 @@ func newDemoServer(addr, scenario string) *MCPServer {
 		Models:          models,
 		EvalInPipeline:  evalInPipeline,
 	}
-	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
+	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool), runnerUpd: &demoRunnerUpdate{}}, cfg)
 	// Swap the real HTTP probers for the static demo ones so the readiness states
 	// render without any network call.
 	srv.prober = demoGPUProber{scenario: scenario}

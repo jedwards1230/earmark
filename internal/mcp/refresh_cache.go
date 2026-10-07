@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -30,8 +31,12 @@ type refreshCache[T any] struct {
 	ttl        time.Duration
 	timeout    time.Duration
 	retryAfter time.Duration
-	now        func() time.Time
-	onError    func(err error, haveLastGood bool) // called once per failed refresh; may be nil
+	// firstRetryAfter replaces retryAfter while no value has ever loaded, so a
+	// long-TTL cache (stale counts, 5 min) recovers quickly from a failed
+	// first load instead of showing "unavailable" for a full TTL.
+	firstRetryAfter time.Duration
+	now             func() time.Time
+	onError         func(err error, haveLastGood bool) // called once per failed refresh; may be nil
 
 	mu         sync.Mutex
 	last       *cached[T] // last good value; nil until the first success
@@ -48,7 +53,7 @@ type cached[T any] struct {
 }
 
 func newRefreshCache[T any](ttl, timeout time.Duration, load func(context.Context) (T, error)) *refreshCache[T] {
-	return &refreshCache[T]{load: load, ttl: ttl, timeout: timeout, retryAfter: ttl, now: time.Now}
+	return &refreshCache[T]{load: load, ttl: ttl, timeout: timeout, retryAfter: ttl, firstRetryAfter: ttl, now: time.Now}
 }
 
 // get returns the cached entry (nil when none has ever loaded) and the error of
@@ -96,13 +101,17 @@ func (c *refreshCache[T]) startLocked() {
 func (c *refreshCache[T]) refresh(done chan struct{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
-	v, err := c.load(ctx)
+	v, err := c.safeLoad(ctx)
 
 	c.mu.Lock()
 	now := c.now()
 	if err != nil {
 		c.lastErr = err
-		c.retryAt = now.Add(c.retryAfter)
+		wait := c.retryAfter
+		if c.last == nil {
+			wait = c.firstRetryAfter
+		}
+		c.retryAt = now.Add(wait)
 	} else {
 		c.last = &cached[T]{Val: v, At: now}
 		c.lastErr = nil
@@ -118,13 +127,14 @@ func (c *refreshCache[T]) refresh(done chan struct{}) {
 	}
 }
 
-// waitIdle blocks until no refresh is in flight. Test helper: background
-// refreshes make "after this get, the value is updated" asynchronous.
-func (c *refreshCache[T]) waitIdle() {
-	c.mu.Lock()
-	refreshing, done := c.refreshing, c.done
-	c.mu.Unlock()
-	if refreshing {
-		<-done
-	}
+// safeLoad runs the load, converting a panic into an error. The load runs on
+// a background goroutine, outside net/http's per-request recover, so an
+// unrecovered panic here would take the whole process down.
+func (c *refreshCache[T]) safeLoad(ctx context.Context) (v T, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("refresh panicked: %v", p)
+		}
+	}()
+	return c.load(ctx)
 }

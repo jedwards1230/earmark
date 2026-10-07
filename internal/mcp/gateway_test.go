@@ -27,11 +27,17 @@ type fakeLiteLLM struct {
 	hits        atomic.Int32
 	keyHits     atomic.Int32
 	sawQuery    atomic.Bool
+	nonGET      atomic.Bool
+	prefix      string // path prefix the gateway is mounted under ("" = root)
 }
 
 func (f *fakeLiteLLM) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.hits.Add(1)
+		if r.Method != http.MethodGet {
+			f.nonGET.Store(true)
+		}
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, f.prefix)
 		switch r.URL.Path {
 		case "/health/readiness":
 			w.WriteHeader(f.readiness)
@@ -84,6 +90,7 @@ func TestHTTPGatewayProber_ReadsOwnKeyInfo(t *testing.T) {
 	require.NotNil(t, st.Key.MaxBudget)
 	require.NotNil(t, st.Key.RPMLimit)
 	assert.False(t, f.sawQuery.Load(), "/key/info is called WITHOUT a key= query (the caller's own key)")
+	assert.False(t, f.nonGET.Load(), "every gateway request is a GET")
 
 	// No key material anywhere in what the prober returns or the API emits.
 	raw, _ := json.Marshal(st)
@@ -202,4 +209,101 @@ func TestBuildGatewayViews(t *testing.T) {
 
 	down := buildGatewayViews([]gatewayStatus{{Probed: true, Host: "gw:4000"}}, nil, nil, testNow)
 	assert.Equal(t, "✗ DOWN", down[0].StateLabel)
+}
+
+// TestReconcileAllowlist: the /v1/models probe is authoritative; the
+// allowlist parse alone never asserts "every call 403s".
+func TestReconcileAllowlist(t *testing.T) {
+	gw := func(models []string, team string) gatewayStatus {
+		return gatewayStatus{KeyInfoOK: true, Key: gatewayKeyInfo{Models: models, TeamID: team}}
+	}
+	tests := []struct {
+		name      string
+		gw        gatewayStatus
+		requested string
+		probe     string
+		want      *bool
+	}{
+		{"listed and probe agrees", gw([]string{"earmark-judge"}, ""), "earmark-judge", "ready", boolp(true)},
+		{"not listed, probe agrees", gw([]string{"nomic-embed-text"}, ""), "earmark-judge", "model_not_loaded", boolp(false)},
+		{"access group: allowlist misses, probe lists it", gw([]string{"judge-models"}, ""), "earmark-judge", "ready", boolp(true)},
+		{"access group, probe offline → unknown", gw([]string{"judge-models"}, ""), "earmark-judge", "offline", nil},
+		{"no probe → unknown, not deny", gw([]string{"nomic-embed-text"}, ""), "earmark-judge", "", nil},
+		{"empty list on a personal key = all", gw(nil, ""), "x", "ready", boolp(true)},
+		{"empty list on a team key = unknown", gw(nil, "team-1"), "x", "ready", nil},
+		{"team key with its own list still checks", gw([]string{"a"}, "team-1"), "b", "model_not_loaded", boolp(false)},
+		{"empty requested model = unknown", gw([]string{"a"}, ""), "", "model_not_loaded", nil},
+		{"key info unreadable = unknown", gatewayStatus{KeyInfoErr: "HTTP 403"}, "a", "model_not_loaded", nil},
+		{"all-team-models = unknown", gw([]string{"all-team-models"}, "t"), "a", "model_not_loaded", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reconcileAllowlist(tc.gw, tc.requested, tc.probe)
+			if tc.want == nil {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, *tc.want, *got)
+		})
+	}
+}
+
+func TestBuildGatewayViews_TeamKey(t *testing.T) {
+	st := gatewayStatus{Probed: true, Reachable: true, KeyInfoOK: true, Key: gatewayKeyInfo{TeamID: "t1"}}
+	v := buildGatewayViews([]gatewayStatus{st}, nil, nil, testNow)
+	assert.True(t, v[0].TeamModels)
+	assert.False(t, v[0].AllowAll, "a team key's empty list is not 'all models'")
+}
+
+func TestGatewayBase(t *testing.T) {
+	tests := map[string]string{
+		"http://h:4000/v1":           "http://h:4000",
+		"http://h:4000/v1/":          "http://h:4000",
+		"http://h:4000":              "http://h:4000",
+		"http://h/litellm/v1":        "http://h/litellm",
+		"https://h/litellm/v1?x=1#f": "https://h/litellm",
+		"http://h:4000/v1beta":       "http://h:4000/v1beta",
+	}
+	for in, want := range tests {
+		assert.Equal(t, want, gatewayBase(in), in)
+	}
+}
+
+// TestHTTPGatewayProber_PathPrefixedBase: a gateway mounted under a path
+// prefix is probed under that prefix.
+func TestHTTPGatewayProber_PathPrefixedBase(t *testing.T) {
+	f := &fakeLiteLLM{readiness: 200, keyInfoCode: 200, prefix: "/litellm"}
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if !strings.HasPrefix(r.URL.Path, "/litellm/") {
+			http.NotFound(w, r)
+			return
+		}
+		f.handler().ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	st := newHTTPGatewayProber(2*time.Second, time.Hour).Probe(context.Background(), srv.URL+"/litellm/v1", testVirtualKey)
+	assert.True(t, st.Reachable)
+	assert.True(t, st.KeyInfoOK, st.KeyInfoErr)
+	assert.Contains(t, paths, "/litellm/key/info")
+}
+
+// TestProbeGateways_FirstLoadIsBounded: a gateway that never answers holds a
+// page render for at most gatewayFirstWait, then reports "not probed yet".
+func TestProbeGateways_FirstLoadIsBounded(t *testing.T) {
+	block := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-block }))
+	defer slow.Close()
+	defer close(block)
+	srv := NewMCPServer(&SimpleMockDB{}, &config.Config{AIEndpoints: []config.AIEndpoint{
+		{ID: "gw", Type: config.AIEndpointTypeChat, BaseURL: slow.URL + "/v1", Model: "m", Gateway: "litellm", APIKey: "k"},
+	}})
+	srv.gatewayProber = newHTTPGatewayProber(10*time.Second, time.Hour)
+	start := time.Now()
+	sts, _, _ := srv.probeGateways(context.Background())
+	assert.Less(t, time.Since(start), gatewayFirstWait+time.Second)
+	require.Len(t, sts, 1)
+	assert.False(t, sts[0].Probed, "still loading → not probed yet")
 }

@@ -280,21 +280,56 @@ func applyStale(c *roleCard, stale *staleSnapshot, pending bool) {
 }
 
 // applyAllowlist checks the role's requested model against the LiteLLM key
-// allowlist of the gateway its endpoint sits behind (when readable).
-func applyAllowlist(c *roleCard, gws map[string]gatewayStatus) {
+// allowlist of the gateway its endpoint sits behind (when readable), and
+// reconciles that verdict with the endpoint's own /v1/models probe, which is
+// authoritative: LiteLLM's /v1/models lists exactly what the key may call.
+//
+//   - probe "ready" (the key lists the model) → allowed, whatever the
+//     allowlist parse said (it may name access groups earmark can't expand).
+//   - probe "model_not_loaded" (the key does not list it) → the allowlist's
+//     deny stands.
+//   - probe offline / not run → a deny is NOT asserted (unknown): without the
+//     probe a non-matching entry may be an access group, and "every call
+//     403s" is too strong a claim to make on a guess. An offline endpoint is
+//     already DOWN.
+//
+// A team key with an empty model list inherits the team's models, which
+// earmark's key cannot read → unknown. An empty requested model → unknown.
+func applyAllowlist(c *roleCard, gws map[string]gatewayStatus, probe string) {
 	gw, ok := gws[c.EndpointID]
 	if !ok {
 		return
 	}
 	c.GatewayHost = gw.Host
-	if gw.KeyInfoOK {
-		c.ModelAllowed = modelAllowed(gw.Key.Models, c.Requested)
-	}
+	c.ModelAllowed = reconcileAllowlist(gw, c.Requested, probe)
 	if c.ModelAllowed != nil {
 		c.AllowState = "denied"
 		if *c.ModelAllowed {
 			c.AllowState = "allowed"
 		}
+	}
+}
+
+// reconcileAllowlist is the pure verdict behind applyAllowlist.
+func reconcileAllowlist(gw gatewayStatus, requested, probe string) *bool {
+	if !gw.KeyInfoOK || strings.TrimSpace(requested) == "" {
+		return nil
+	}
+	if gw.Key.TeamID != "" && len(gw.Key.Models) == 0 {
+		return nil // inherits the team's models: not readable with earmark's key
+	}
+	v := modelAllowed(gw.Key.Models, requested)
+	if v == nil || *v {
+		return v
+	}
+	switch probe {
+	case string(epStateReady):
+		yes := true
+		return &yes // the key lists it; the non-match was an access group
+	case string(epStateModelMissing):
+		return v // both say no
+	default:
+		return nil
 	}
 }
 
@@ -347,7 +382,7 @@ func buildJudgeCard(c *roleCard, in roleInputs) {
 	if in.Stats != nil {
 		c.CoverageDone, c.CoverageTotal = in.Stats.EvalCoverageDone, in.Stats.Done
 	}
-	applyAllowlist(c, in.Gateways)
+	applyAllowlist(c, in.Gateways, probe)
 	c.Health = judgeHealth(*c, probe, host, in.Stats != nil, in.Now)
 	finishAllowlist(c)
 }
@@ -410,7 +445,7 @@ func buildEmbedCard(c *roleCard, in roleInputs) {
 		c.Answered = in.Snap.Activity.EmbedLastModel
 		c.AnsweredMatch = answeredMatch(c.Answered, c.CompareTarget(), hasRuns)
 	}
-	applyAllowlist(c, in.Gateways)
+	applyAllowlist(c, in.Gateways, probe)
 	c.Health = embedHealth(*c, probe, host, in.Stats != nil, in.Now)
 	finishAllowlist(c)
 }

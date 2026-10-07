@@ -440,6 +440,9 @@ components:
           type:
             - number
             - "null"
+        teamKey:
+          description: True for a team-scoped key. With an empty `allowedModels` it inherits the team's models, which earmark's key cannot read, so roles behind it report `modelAllowed` null.
+          type: boolean
         tpmLimit:
           type:
             - integer
@@ -456,6 +459,7 @@ components:
         - rpmLimit
         - tpmLimit
         - allowedModels
+        - teamKey
       type: object
     PauseRequest:
       additionalProperties: false
@@ -633,7 +637,7 @@ components:
             - "null"
         modelAllowed:
           description: |
-            Whether `requested` is on the LiteLLM virtual key's allowlist (wildcard-aware). `false` means every call 403s and the role is `degraded`. `null` when the endpoint is not behind LiteLLM or the key info is not readable.
+            Whether `requested` is on the LiteLLM virtual key's allowlist (wildcard-aware), reconciled with the endpoint's `/v1/models` probe, which wins: `true` whenever the probe lists the model; `false` only when the allowlist excludes it AND the probe does not list it (every call 403s; the role is `degraded`). `null` when not behind LiteLLM, key info is unreadable, the probe did not run, the requested model is empty, or a team key inherits its team's models.
           type:
             - boolean
             - "null"
