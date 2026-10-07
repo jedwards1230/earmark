@@ -1193,7 +1193,7 @@ func renumber(p string, n int) string {
 // StartDemoDashboard starts the HTTP transport (status dashboard + /mcp +
 // /health + /readyz) backed by synthetic data, with no database connection.
 // Intended for local UI iteration and AI-agent visual verification only.
-// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend|winddown|idle|batch-analyze|snapshot-error
+// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend|winddown|idle|batch-analyze|snapshot-error|gateway-allowlist|gateway-keyinfo
 // to render a state.
 func StartDemoDashboard(addr string) error {
 	if addr == "" {
@@ -1251,6 +1251,7 @@ func newDemoServer(addr, scenario string) *MCPServer {
 	// render without any network call.
 	srv.prober = demoGPUProber{scenario: scenario}
 	srv.endpointProber = demoEndpointProber{scenario: scenario}
+	srv.gatewayProber = demoGatewayProber{scenario: scenario}
 	// Swap the live chat client for a static fake judge so clicking "run eval"
 	// exercises the trigger + async indicator with no network call. Only when
 	// the scenario configured an eval endpoint in the first place.

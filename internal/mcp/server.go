@@ -68,9 +68,15 @@ type MCPServer struct {
 	// live signal the lifecycle view can surface honestly.
 	evalInPipeline bool
 
-	// models caches the Models page's DB aggregates for modelsSnapshotTTL; the
-	// page and GET /api/v1/status roles[] read the same snapshot.
-	models *modelsSnapshotCache
+	// models holds the Models page's two DB snapshot caches (aggregates 30 s,
+	// stale counts 5 min), served stale-while-revalidate; the page and GET
+	// /api/v1/status roles[] read the same snapshots.
+	models modelsCaches
+
+	// gatewayProber reads LiteLLM readiness + the virtual key's own /key/info
+	// for gateway endpoints (60 s, stale-while-revalidate). Swapped for a static
+	// fake in the demo.
+	gatewayProber gatewayProber
 
 	// metrics is the Prometheus registry mounted at /metrics (CONTRACT §2.16).
 	// nil in the demo (no DB-backed scrape source).
@@ -338,8 +344,9 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 		// AI endpoint /models probe: same timeout/TTL budget as the gpu-arbiter
 		// prober so a slow upstream can't stall the Models page.
 		endpointProber: newHTTPEndpointProber(2*time.Second, 5*time.Second),
-		models:         newModelsSnapshotCache(modelsSnapshotTTL),
+		gatewayProber:  newHTTPGatewayProber(2*time.Second, gatewayProbeTTL),
 	}
+	s.models = newModelsCaches(database, logger.Warn)
 	s.initEval(cfg)
 	// Prometheus metrics (CONTRACT §2.16): the scrape-time collector reads the DB
 	// for current-state gauges. s.db satisfies metrics.StatsSource.

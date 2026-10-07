@@ -116,6 +116,12 @@ func buildEndpointViews(cfg *config.Config, probes map[string]endpointProbe) []e
 		probe := probes[ep.ID] // zero value → Probed:false → UNKNOWN
 		meta := endpointStateMetaFor(probe)
 		gw, inferred := gatewayFor(ep.Gateway, ep.BaseURL)
+		if gw == "litellm" && probe.Probed && probe.State == epStateModelMissing {
+			// LiteLLM's /v1/models lists only the virtual key's allowed models,
+			// so "missing" means "not on earmark's key allowlist": calls 403.
+			meta.Label = "NOT ALLOWED"
+			meta.Sub = "not on earmark's LiteLLM key allowlist (403 on call)"
+		}
 		v := endpointView{
 			Gateway:         gw,
 			GatewayInferred: inferred,

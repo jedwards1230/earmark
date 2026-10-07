@@ -25,6 +25,13 @@ import (
 //	multibackend           — two runner builds and two .nemo shas plus legacy
 //	snapshot-error         — the aggregate snapshot fails: "counts unavailable",
 //	                         the fragment still renders 200
+//	gateway-allowlist      — the judge's model is missing from earmark's LiteLLM
+//	                         key allowlist → Judge DEGRADED ("every call 403s")
+//	gateway-keyinfo        — /key/info is not readable by earmark's key (403):
+//	                         the gateway card degrades, roles are unaffected
+//
+// The LiteLLM gateway is READY with key "earmark" ($12.25, no budget) in every
+// scenario except winddown (gateway down); idle sets a budget and limits.
 
 // demoScenarioSnapshotError is the scenario whose aggregate queries fail.
 const demoScenarioSnapshotError = "snapshot-error"
@@ -74,17 +81,59 @@ var demoModelRegistry = &config.ModelRegistry{Steps: map[string]config.ModelPin{
 	recipe.StepEmbed:   {ExpectedModel: demoEmbedModel},
 }}
 
+// Demo scenarios specific to the LiteLLM gateway.
+const (
+	demoScenarioGatewayAllowlist = "gateway-allowlist"
+	demoScenarioGatewayKeyInfo   = "gateway-keyinfo"
+)
+
 // demoEndpointProber is a static endpointProber: the direct desktop-2 Ollama is
 // offline; in winddown the LiteLLM gateway is offline too (Judge + Embeddings
-// DOWN). Everything else is ready.
+// DOWN); in gateway-allowlist the gateway's /v1/models omits the judge alias
+// (LiteLLM lists only the key's allowed models). Everything else is ready.
 type demoEndpointProber struct{ scenario string }
 
-func (p demoEndpointProber) Probe(_ context.Context, baseURL, _, _ string) endpointProbe {
+func (p demoEndpointProber) Probe(_ context.Context, baseURL, model, _ string) endpointProbe {
 	if strings.Contains(baseURL, "desktop-2") ||
 		(p.scenario == "winddown" && strings.Contains(baseURL, "llm-gateway")) {
 		return endpointProbe{Probed: true, State: epStateOffline}
 	}
+	if p.scenario == demoScenarioGatewayAllowlist && model == demoJudgeAlias {
+		return endpointProbe{Probed: true, State: epStateModelMissing}
+	}
 	return endpointProbe{Probed: true, State: epStateReady}
+}
+
+// demoGatewayProber is a static gatewayProber (no network): LiteLLM readiness
+// plus earmark's own /key/info, varied by scenario.
+type demoGatewayProber struct{ scenario string }
+
+func (p demoGatewayProber) Probe(_ context.Context, baseURL, _ string) gatewayStatus {
+	base := gatewayBase(baseURL)
+	st := gatewayStatus{Probed: true, Base: base, Host: hostOnly(base)}
+	if p.scenario == "winddown" {
+		st.KeyInfoErr = "key info unreachable"
+		return st
+	}
+	st.Reachable, st.Health, st.DB, st.Version = true, "healthy", "connected", "1.102.1"
+	if p.scenario == demoScenarioGatewayKeyInfo {
+		st.KeyInfoErr = "key info not readable by earmark's key (HTTP 403)"
+		return st
+	}
+	models := []string{demoEmbedModel, demoJudgeAlias, "ollama/qwen3.8:latest"}
+	if p.scenario == demoScenarioGatewayAllowlist {
+		models = []string{demoEmbedModel, "ollama/qwen3.8:latest"}
+	}
+	blocked := false
+	k := gatewayKeyInfo{KeyAlias: "earmark", Models: models, Spend: 12.25, Status: "active", Blocked: &blocked}
+	if p.scenario == "idle" {
+		budget, rpm, tpm := 50.0, int64(60), int64(100_000)
+		k.MaxBudget, k.BudgetDuration, k.RPMLimit, k.TPMLimit = &budget, "30d", &rpm, &tpm
+		k.BudgetResetAt = time.Now().Add(12 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		k.Expires = time.Now().Add(200 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	}
+	st.KeyInfoOK, st.Key = true, k
+	return st
 }
 
 // demoRecipeID is a deterministic 64-hex recipe id for a step.

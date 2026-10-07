@@ -2,103 +2,137 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
 )
 
-// modelsSnapshotTTL is how long the Models page reuses its DB aggregates. The
-// fragment polls every 5 s; the aggregates (stale_work counts, findings
-// GROUP BY, provenance groups) recompute at most every 30 s regardless of how
-// many viewers or API callers there are.
-const modelsSnapshotTTL = 30 * time.Second
-
-// modelsSnapshotTimeout bounds one refresh (five queries, sequential).
-const modelsSnapshotTimeout = 3 * time.Second
+// The Models page reads two independently cached DB snapshots, both served
+// stale-while-revalidate by refreshCache (so a poll never waits on a refresh
+// once a value exists):
+//
+//   - modelsSnapshot — role activity, current recipes, judge findings, ASR
+//     provenance. Cheap (a few ms each); refreshed every 30 s, 3 s timeout.
+//   - staleSnapshot — per-step stale_work counts. The view seq-scans chunks
+//     and findings (EXPLAIN ANALYZE ≈ 1.6 s on production), so it gets its own
+//     5 min TTL and 30 s timeout — the same budget as the ingest pod's
+//     earmark_stale_items refresh. A slow or failed stale count never marks the
+//     other sections unavailable.
+const (
+	modelsSnapshotTTL     = 30 * time.Second
+	modelsSnapshotTimeout = 3 * time.Second
+	staleSnapshotTTL      = 5 * time.Minute
+	staleSnapshotTimeout  = 30 * time.Second
+)
 
 // asrProvenanceGroupLimit is how many runner-build groups the page shows.
 const asrProvenanceGroupLimit = 8
 
-// modelsSnapshot is the cached DB evidence behind the Models page and the
+// modelsSnapshot is the cheap DB evidence behind the Models page and the
 // roles[] array of GET /api/v1/status.
 type modelsSnapshot struct {
-	At        time.Time
 	Activity  db.ModelActivity
 	Recipes   []db.CurrentRecipe
-	Stale     map[string]int64 // step → count; a missing key = not tracked
 	Findings  []db.FindingsModelCount
 	ASRGroups []db.ASRProvenanceGroup
 }
 
-// modelsSnapshotCache holds the last GOOD snapshot. Holding mu across the
-// refresh is deliberate: it is the single-flight (concurrent pollers wait for
-// one refresh rather than each issuing it), and a refresh takes tens of ms.
-type modelsSnapshotCache struct {
-	mu      sync.Mutex
-	last    *modelsSnapshot // last good snapshot; kept when a refresh fails
-	lastErr error           // error of the most recent refresh (nil after a success)
-	retryAt time.Time       // after a failure, no new attempt before this
-	ttl     time.Duration
-	now     func() time.Time
+// staleSnapshot is the per-step stale_work count map; a missing step key means
+// the step has no current recipe (not tracked).
+type staleSnapshot struct {
+	Counts map[string]int64
 }
 
-func newModelsSnapshotCache(ttl time.Duration) *modelsSnapshotCache {
-	return &modelsSnapshotCache{ttl: ttl, now: time.Now}
-}
-
-// get returns the cached snapshot, refreshing it when older than the TTL. On a
-// refresh error it returns the last good snapshot (nil if there never was one)
-// together with the error, and waits a full TTL before retrying so a broken DB
-// is not hammered every 5 s per viewer.
-func (c *modelsSnapshotCache) get(ctx context.Context, d DBInterface) (*modelsSnapshot, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.now()
-	if c.lastErr != nil {
-		if now.Before(c.retryAt) {
-			return c.last, c.lastErr
-		}
-	} else if c.last != nil && now.Sub(c.last.At) < c.ttl {
-		return c.last, nil
-	}
-
-	// Detach from the request's cancellation: a viewer closing the tab must not
-	// turn into a recorded failure that blocks every other viewer for a TTL.
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), modelsSnapshotTimeout)
-	defer cancel()
-	snap, err := loadModelsSnapshot(rctx, d)
-	if err != nil {
-		c.lastErr = err
-		c.retryAt = now.Add(c.ttl)
-		return c.last, err
-	}
-	snap.At = now
-	c.last, c.lastErr = snap, nil
-	return snap, nil
-}
-
-// loadModelsSnapshot runs the five aggregate queries sequentially.
-func loadModelsSnapshot(ctx context.Context, d DBInterface) (*modelsSnapshot, error) {
+// loadModelsSnapshot runs the four cheap aggregate queries sequentially.
+func loadModelsSnapshot(ctx context.Context, d DBInterface) (modelsSnapshot, error) {
 	var (
 		s   modelsSnapshot
 		err error
 	)
 	if s.Activity, err = d.GetModelActivity(ctx); err != nil {
-		return nil, fmt.Errorf("models snapshot: %w", err)
+		return modelsSnapshot{}, fmt.Errorf("models snapshot: %w", err)
 	}
 	if s.Recipes, err = d.ListCurrentRecipes(ctx); err != nil {
-		return nil, fmt.Errorf("models snapshot: %w", err)
-	}
-	if s.Stale, err = d.StaleItemCounts(ctx); err != nil {
-		return nil, fmt.Errorf("models snapshot: %w", err)
+		return modelsSnapshot{}, fmt.Errorf("models snapshot: %w", err)
 	}
 	if s.Findings, err = d.FindingsByModel(ctx); err != nil {
-		return nil, fmt.Errorf("models snapshot: %w", err)
+		return modelsSnapshot{}, fmt.Errorf("models snapshot: %w", err)
 	}
 	if s.ASRGroups, err = d.ASRProvenanceGroups(ctx, asrProvenanceGroupLimit); err != nil {
-		return nil, fmt.Errorf("models snapshot: %w", err)
+		return modelsSnapshot{}, fmt.Errorf("models snapshot: %w", err)
 	}
-	return &s, nil
+	return s, nil
+}
+
+func loadStaleSnapshot(ctx context.Context, d DBInterface) (staleSnapshot, error) {
+	m, err := d.StaleItemCounts(ctx)
+	if err != nil {
+		return staleSnapshot{}, fmt.Errorf("stale counts: %w", err)
+	}
+	return staleSnapshot{Counts: m}, nil
+}
+
+// modelsCaches holds the page's two snapshot caches.
+type modelsCaches struct {
+	models *refreshCache[modelsSnapshot]
+	stale  *refreshCache[staleSnapshot]
+}
+
+func newModelsCaches(d DBInterface, logWarn func(msg string, args ...any)) modelsCaches {
+	c := modelsCaches{
+		models: newRefreshCache(modelsSnapshotTTL, modelsSnapshotTimeout,
+			func(ctx context.Context) (modelsSnapshot, error) { return loadModelsSnapshot(ctx, d) }),
+		stale: newRefreshCache(staleSnapshotTTL, staleSnapshotTimeout,
+			func(ctx context.Context) (staleSnapshot, error) { return loadStaleSnapshot(ctx, d) }),
+	}
+	if logWarn != nil {
+		c.models.onError = func(err error, haveLast bool) {
+			logWarn("models: snapshot refresh failed; serving last good counts", "error", err, "have_last_good", haveLast)
+		}
+		c.stale.onError = func(err error, haveLast bool) {
+			logWarn("models: stale-count refresh failed; serving last good counts", "error", err, "have_last_good", haveLast)
+		}
+	}
+	return c
+}
+
+// modelsEvidence is one read of both snapshots, as the builders consume it.
+// Snap/Stale are nil when that snapshot has never loaded; the *Err fields
+// carry the most recent refresh error (the last good value is still served).
+// StalePending is true while the stale counts' first load is still running.
+type modelsEvidence struct {
+	Snap         *modelsSnapshot
+	SnapAt       time.Time
+	SnapErr      error
+	Stale        *staleSnapshot
+	StaleAt      time.Time
+	StaleErr     error
+	StalePending bool
+}
+
+// read returns both snapshots. After their first loads both are served from
+// cache without waiting. The aggregates' first load waits up to its own 3 s
+// timeout (bounded by ctx); the stale counts' first load (a full-library scan)
+// is waited for at most staleWait, then reported as pending while it finishes
+// in the background.
+func (c modelsCaches) read(ctx context.Context, staleWait time.Duration) modelsEvidence {
+	var e modelsEvidence
+	m, err := c.models.get(ctx)
+	e.SnapErr = err
+	if m != nil {
+		e.Snap, e.SnapAt = &m.Val, m.At
+	}
+	sctx, cancel := context.WithTimeout(ctx, staleWait)
+	s, err := c.stale.get(sctx)
+	if s == nil && errors.Is(err, context.DeadlineExceeded) && sctx.Err() != nil && ctx.Err() == nil {
+		e.StalePending, err = true, nil // still counting in the background; not a failure
+	}
+	cancel()
+	e.StaleErr = err
+	if s != nil {
+		e.Stale, e.StaleAt = &s.Val, s.At
+	}
+	return e
 }

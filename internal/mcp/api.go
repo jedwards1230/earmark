@@ -78,6 +78,11 @@ type apiStatus struct {
 	// folded from liveness AND call outcomes, what was requested vs pinned vs
 	// answered, and the step's stale count. Always five entries.
 	Roles []apiRole `json:"roles"`
+	// Gateways is every distinct LiteLLM gateway the AI registry routes
+	// through, read with earmark's own virtual key: readiness, key alias,
+	// status, spend/budget, limits, and the key's allowed models. Empty when
+	// no endpoint is behind LiteLLM.
+	Gateways []apiGateway `json:"gateways"`
 	// Pipeline is the derived 3-stage lifecycle view (CONTRACT §2.12). It
 	// summarises transcribe / eval / embed progress and the GPU commitment so an
 	// agent can read one self-describing object rather than piecing it together
@@ -109,7 +114,10 @@ type apiEndpoint struct {
 // builder as the Models page's role cards (buildRoleCards), so the two cannot
 // disagree. state is "healthy" | "idle" | "degraded" | "failing" | "down" |
 // "not_configured" | "unknown". Timestamps are RFC 3339; null = never or
-// unknown (countsAsOf null = the DB snapshot has never loaded).
+// unknown. countsAsOf dates the 30 s aggregate snapshot (answered, judge
+// lastOkAt/lastFailedAt/lastError/failingNow, ASR lastOkAt); staleAsOf dates
+// the separate 5 min stale-count snapshot. Embeddings' lastOkAt comes from the
+// live queue stats, not a snapshot.
 type apiRole struct {
 	Role            string  `json:"role"`
 	Step            string  `json:"step"`
@@ -123,19 +131,74 @@ type apiRole struct {
 	Expected        string  `json:"expected,omitempty"`
 	Answered        string  `json:"answered,omitempty"`
 	AnsweredMatch   string  `json:"answeredMatch,omitempty"`
+	ModelAllowed    *bool   `json:"modelAllowed"`
 	LastOKAt        *string `json:"lastOkAt"`
 	LastFailedAt    *string `json:"lastFailedAt"`
 	LastError       *string `json:"lastError"`
-	FailingNow      int     `json:"failingNow"`
+	FailingNow      *int    `json:"failingNow"`
 	Stale           *int64  `json:"stale"`
 	CountsAsOf      *string `json:"countsAsOf"`
+	CountsError     bool    `json:"countsError"`
+	StaleAsOf       *string `json:"staleAsOf"`
+}
+
+// apiGateway is one LiteLLM gateway as seen through earmark's virtual key
+// (CONTRACT §2.14). It never carries key material.
+type apiGateway struct {
+	BaseHost      string   `json:"baseHost"`
+	Endpoints     []string `json:"endpoints"`
+	Ready         bool     `json:"ready"`
+	Health        string   `json:"health,omitempty"`
+	DB            string   `json:"db,omitempty"`
+	Version       string   `json:"version,omitempty"`
+	KeyAlias      string   `json:"keyAlias,omitempty"`
+	KeyStatus     string   `json:"keyStatus,omitempty"`
+	KeyBlocked    bool     `json:"keyBlocked"`
+	KeyExpires    string   `json:"keyExpires,omitempty"`
+	Spend         *float64 `json:"spend"`
+	MaxBudget     *float64 `json:"maxBudget"`
+	BudgetResetAt string   `json:"budgetResetAt,omitempty"`
+	RPMLimit      *int64   `json:"rpmLimit"`
+	TPMLimit      *int64   `json:"tpmLimit"`
+	AllowedModels []string `json:"allowedModels"`
+	KeyInfoError  string   `json:"keyInfoError,omitempty"`
+}
+
+// apiGatewaysFrom maps the probed gateways to the API shape.
+func apiGatewaysFrom(sts []gatewayStatus, targets []gatewayTarget) []apiGateway {
+	out := make([]apiGateway, 0, len(sts))
+	for i, st := range sts {
+		g := apiGateway{
+			BaseHost: st.Host, Ready: st.Reachable, Health: st.Health, DB: st.DB, Version: st.Version,
+			KeyInfoError: st.KeyInfoErr,
+		}
+		if i < len(targets) {
+			for _, ep := range targets[i].Endpoints {
+				g.Endpoints = append(g.Endpoints, ep.ID)
+			}
+		}
+		if st.KeyInfoOK {
+			k := st.Key
+			spend := k.Spend
+			g.KeyAlias, g.KeyStatus, g.KeyExpires = k.KeyAlias, k.Status, k.Expires
+			g.KeyBlocked = k.Blocked != nil && *k.Blocked
+			g.Spend, g.MaxBudget, g.BudgetResetAt = &spend, k.MaxBudget, k.BudgetResetAt
+			g.RPMLimit, g.TPMLimit = k.RPMLimit, k.TPMLimit
+			g.AllowedModels = append([]string{}, k.Models...)
+		}
+		out = append(out, g)
+	}
+	return out
 }
 
 // apiRolesFrom maps the role cards to the API shape.
-func apiRolesFrom(cards []roleCard, snap *modelsSnapshot) []apiRole {
-	var asOf *string
-	if snap != nil {
-		asOf = rfc3339Ptr(snap.At)
+func apiRolesFrom(cards []roleCard, ev modelsEvidence) []apiRole {
+	var asOf, staleAsOf *string
+	if ev.Snap != nil {
+		asOf = rfc3339Ptr(ev.SnapAt)
+	}
+	if ev.Stale != nil {
+		staleAsOf = rfc3339Ptr(ev.StaleAt)
 	}
 	out := make([]apiRole, 0, len(cards))
 	for _, c := range cards {
@@ -144,9 +207,13 @@ func apiRolesFrom(cards []roleCard, snap *modelsSnapshot) []apiRole {
 			Configured: c.Configured, Endpoint: c.EndpointID,
 			Gateway: c.Gateway, GatewayInferred: c.GatewayInferred,
 			Requested: c.Requested, Expected: c.Expected,
-			Answered: c.Answered, AnsweredMatch: c.AnsweredMatch,
+			Answered: c.Answered, AnsweredMatch: c.AnsweredMatch, ModelAllowed: c.ModelAllowed,
 			LastOKAt: rfc3339Ptr(c.LastOK), LastFailedAt: rfc3339Ptr(c.LastFail),
-			FailingNow: c.FailingNow, Stale: c.Stale, CountsAsOf: asOf,
+			Stale: c.Stale, CountsAsOf: asOf, CountsError: ev.SnapErr != nil, StaleAsOf: staleAsOf,
+		}
+		if c.Key == "judge" && c.CountsKnown {
+			n := c.FailingNow
+			r.FailingNow = &n
 		}
 		if c.LastError != "" {
 			e := truncateRunes(c.LastError, maxAPIErrorLen)
@@ -471,8 +538,10 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Role board (CONTRACT §2.14): the same builder and 30 s snapshot as the
 	// Models page. A snapshot error degrades counts to null, never the response.
-	roles, snap, _ := s.modelRoles(r.Context(), stats, runners, runnersKnown, eps, now)
-	out.Roles = apiRolesFrom(roles, snap)
+	gws, targets, gwByEndpoint := s.probeGateways(r.Context())
+	out.Gateways = apiGatewaysFrom(gws, targets)
+	roles, ev := s.modelRoles(r.Context(), stats, runners, runnersKnown, eps, gwByEndpoint, now)
+	out.Roles = apiRolesFrom(roles, ev)
 
 	writeJSON(w, http.StatusOK, out)
 }

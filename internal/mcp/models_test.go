@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +19,8 @@ import (
 )
 
 var testNow = time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+
+func boolp(b bool) *bool { return &b }
 
 func ago(d time.Duration) time.Time { return testNow.Add(-d) }
 
@@ -43,10 +44,14 @@ func TestJudgeHealthPrecedence(t *testing.T) {
 	}{
 		{"not configured", with(func(c *roleCard) { c.Configured = false }), "ready", true, roleNotConfigured, "judging is off"},
 		{"probe offline beats a recent failure", with(func(c *roleCard) { c.LastFail = ago(time.Minute) }), "offline", true, roleDown, "gateway unreachable"},
+		{"offline beats not-allowed", with(func(c *roleCard) { c.ModelAllowed = boolp(false) }), "offline", true, roleDown, "gateway unreachable"},
+		{"not on key allowlist beats a failure", with(func(c *roleCard) { c.ModelAllowed, c.LastFail = boolp(false), ago(time.Minute) }), "model_not_loaded", true, roleDegraded, "earmark-judge is not on earmark's LiteLLM key allowlist — every call 403s"},
+		{"allowed is no signal", with(func(c *roleCard) { c.ModelAllowed = boolp(true) }), "ready", true, roleHealthy, "judged"},
+		{"model missing behind litellm", with(func(c *roleCard) { c.Gateway = "litellm" }), "model_not_loaded", true, roleDegraded, "not on earmark's LiteLLM key allowlist (403 on call)"},
 		{"last fail after last ok", with(func(c *roleCard) { c.LastFail = ago(time.Minute) }), "ready", true, roleFailing, "last attempt failed 1m ago"},
 		{"failure but never succeeded", with(func(c *roleCard) { c.LastOK, c.LastFail = time.Time{}, ago(time.Minute) }), "", true, roleFailing, "last attempt failed"},
 		{"old failure, newer success", with(func(c *roleCard) { c.LastFail = ago(time.Hour) }), "ready", true, roleHealthy, "judged 10m ago"},
-		{"model not loaded", base, "model_not_loaded", true, roleDegraded, "gateway does not list earmark-judge"},
+		{"model not loaded", base, "model_not_loaded", true, roleDegraded, "endpoint does not list earmark-judge"},
 		{"answered by the fallback", with(func(c *roleCard) { c.Answered, c.AnsweredMatch = "qwen3.8", matchMismatch }), "ready", true, roleDegraded, "answered by qwen3.8, expected haiku"},
 		{"counts unavailable", with(func(c *roleCard) { c.CountsKnown = false }), "ready", true, roleUnknown, "counts query failed"},
 		{"stats unavailable", base, "ready", false, roleUnknown, "counts query failed"},
@@ -83,6 +88,7 @@ func TestEmbedHealthPrecedence(t *testing.T) {
 	}{
 		{"not configured", with(func(c *roleCard) { c.Configured = false }), "", true, roleNotConfigured, "no embeddings endpoint"},
 		{"offline", base, "offline", true, roleDown, "endpoint unreachable"},
+		{"not on key allowlist", with(func(c *roleCard) { c.ModelAllowed = boolp(false) }), "ready", true, roleDegraded, "every call 403s"},
 		{"model not loaded", base, "model_not_loaded", true, roleDegraded, "does not list nomic-embed-text"},
 		{"embed model differs", with(func(c *roleCard) { c.Answered, c.AnsweredMatch = "mxbai", matchMismatch }), "ready", true, roleDegraded, "embedded by mxbai"},
 		{"unreported model is not a mismatch", with(func(c *roleCard) { c.Answered, c.AnsweredMatch = "", matchUnreported }), "ready", true, roleHealthy, "3 waiting"},
@@ -121,15 +127,24 @@ func TestASRHealthPrecedence(t *testing.T) {
 		{"none", nil, roleNotConfigured, "no ASR_SERVERS"},
 		{"only not-seen", []serverView{sv("a", "not_seen", false, "")}, roleUnknown, "no runner activity"},
 	}
+	// A free GPU whose asr-runner is stopped needs the operator even with an
+	// empty queue: DEGRADED, not IDLE (M3).
+	stopped := asrHealth([]serverView{sv("a", "busy", true, "available"), sv("b", "busy", true, "gaming")}, 0, true, "")
+	assert.Equal(t, roleDegraded, stopped.Token)
+	assert.Contains(t, stopped.Sub, "asr-runner stopped on a")
+	// …unless `earmark batch` parked it on purpose for the analyze phase.
+	parked := asrHealth([]serverView{sv("a", "busy", true, "available")}, 78, true, db.PhaseAnalyze)
+	assert.Equal(t, roleIdle, parked.Token)
+	assert.Contains(t, parked.Sub, "parked on a for the batch analyze phase")
 	// Held GPUs with nothing queued are not degrading anything: IDLE.
-	h := asrHealth([]serverView{sv("a", "busy", true, "gaming")}, 0, true)
+	h := asrHealth([]serverView{sv("a", "busy", true, "gaming")}, 0, true, "")
 	assert.Equal(t, roleIdle, h.Token)
 	assert.Contains(t, h.Sub, "nothing queued")
 	// Unknown queue depth: stay conservative (DEGRADED).
-	assert.Equal(t, roleDegraded, asrHealth([]serverView{sv("a", "busy", true, "gaming")}, 0, false).Token)
+	assert.Equal(t, roleDegraded, asrHealth([]serverView{sv("a", "busy", true, "gaming")}, 0, false, "").Token)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h := asrHealth(tc.servers, 5, true)
+			h := asrHealth(tc.servers, 5, true, "")
 			assert.Equal(t, tc.wantToken, h.Token)
 			assert.Contains(t, h.Sub, tc.wantSub)
 		})
@@ -161,6 +176,45 @@ func TestModelsMatch(t *testing.T) {
 	assert.False(t, modelLoaded(map[string]bool{"other": true}, "nomic-embed-text"))
 }
 
+func TestSameModel(t *testing.T) {
+	assert.True(t, sameModel("Qwen3.8", "qwen3.8:latest"))
+	assert.True(t, sameModel("anthropic/claude-haiku", "anthropic/claude-haiku"))
+	assert.False(t, sameModel("qwen3.8", "qwen3.8:14b"), "a bare pin must not match an arbitrary tag")
+	assert.False(t, sameModel("", ""))
+}
+
+func TestModelAllowed(t *testing.T) {
+	tr, fa := true, false
+	tests := []struct {
+		name    string
+		allowed []string
+		model   string
+		want    *bool
+	}{
+		{"empty list allows all", nil, "anything", &tr},
+		{"exact", []string{"nomic-embed-text", "earmark-judge"}, "earmark-judge", &tr},
+		{"case and :latest", []string{"ollama/qwen3.8:latest"}, "OLLAMA/qwen3.8", &tr},
+		{"missing", []string{"nomic-embed-text"}, "earmark-judge", &fa},
+		{"provider wildcard", []string{"anthropic/*"}, "anthropic/claude-haiku-4-5", &tr},
+		{"wildcard other provider", []string{"anthropic/*"}, "openai/gpt-5", &fa},
+		{"star", []string{"*"}, "x", &tr},
+		{"all-proxy-models", []string{"all-proxy-models"}, "x", &tr},
+		{"all-team-models is unknowable", []string{"all-team-models"}, "x", nil},
+		{"tag mismatch", []string{"qwen3.8:14b"}, "qwen3.8", &fa},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := modelAllowed(tc.allowed, tc.model)
+			if tc.want == nil {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, *tc.want, *got)
+		})
+	}
+}
+
 func TestAnsweredMatch(t *testing.T) {
 	assert.Equal(t, matchNone, answeredMatch("", "x", false))
 	assert.Equal(t, matchUnreported, answeredMatch("", "x", true))
@@ -189,97 +243,6 @@ func TestGatewayFor(t *testing.T) {
 	}
 }
 
-// modelsCountingDB counts snapshot refreshes and can be made to fail.
-type modelsCountingDB struct {
-	SimpleMockDB
-	mu    sync.Mutex
-	calls int
-	fail  bool
-}
-
-func (m *modelsCountingDB) GetModelActivity(context.Context) (db.ModelActivity, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.calls++
-	if m.fail {
-		return db.ModelActivity{}, errors.New("db down")
-	}
-	return db.ModelActivity{EvalLastModel: "haiku"}, nil
-}
-
-func TestModelsSnapshotCache(t *testing.T) {
-	clock := testNow
-	c := newModelsSnapshotCache(30 * time.Second)
-	c.now = func() time.Time { return clock }
-	d := &modelsCountingDB{}
-	ctx := context.Background()
-
-	s1, err := c.get(ctx, d)
-	require.NoError(t, err)
-	require.NotNil(t, s1)
-	assert.Equal(t, testNow, s1.At)
-	assert.Equal(t, 1, d.calls)
-
-	clock = clock.Add(10 * time.Second) // within TTL → cached
-	s2, err := c.get(ctx, d)
-	require.NoError(t, err)
-	assert.Same(t, s1, s2)
-	assert.Equal(t, 1, d.calls)
-
-	clock = clock.Add(25 * time.Second) // past TTL → refresh
-	_, err = c.get(ctx, d)
-	require.NoError(t, err)
-	assert.Equal(t, 2, d.calls)
-	good := c.last
-
-	// A failed refresh keeps the last good snapshot and reports the error.
-	d.fail = true
-	clock = clock.Add(31 * time.Second)
-	s3, err := c.get(ctx, d)
-	require.Error(t, err)
-	assert.Same(t, good, s3, "keep-last-good on error")
-	assert.Equal(t, 3, d.calls)
-
-	// Retry-after: no new attempt within a TTL of the failure.
-	clock = clock.Add(5 * time.Second)
-	s4, err := c.get(ctx, d)
-	require.Error(t, err)
-	assert.Same(t, good, s4)
-	assert.Equal(t, 3, d.calls, "a broken DB must not be re-queried on every poll")
-
-	// After the retry window, a recovered DB refreshes and clears the error.
-	d.fail = false
-	clock = clock.Add(30 * time.Second)
-	s5, err := c.get(ctx, d)
-	require.NoError(t, err)
-	assert.NotSame(t, good, s5)
-	assert.Equal(t, 4, d.calls)
-}
-
-func TestModelsSnapshotCache_NeverGood(t *testing.T) {
-	c := newModelsSnapshotCache(30 * time.Second)
-	c.now = func() time.Time { return testNow }
-	snap, err := c.get(context.Background(), &modelsCountingDB{fail: true})
-	require.Error(t, err)
-	assert.Nil(t, snap)
-}
-
-// A cancelled request context must not poison the cache for other viewers.
-func TestModelsSnapshotCache_DetachedFromRequestCancel(t *testing.T) {
-	c := newModelsSnapshotCache(30 * time.Second)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	snap, err := c.get(ctx, &ctxCheckingDB{})
-	require.NoError(t, err)
-	require.NotNil(t, snap)
-}
-
-type ctxCheckingDB struct{ SimpleMockDB }
-
-func (ctxCheckingDB) GetModelActivity(ctx context.Context) (db.ModelActivity, error) {
-	return db.ModelActivity{}, ctx.Err()
-}
-
 func TestBuildRecipeRows(t *testing.T) {
 	cfg := &config.Config{Models: &config.ModelRegistry{Steps: map[string]config.ModelPin{
 		recipe.StepPropose: {ExpectedModel: "haiku"},
@@ -290,9 +253,14 @@ func TestBuildRecipeRows(t *testing.T) {
 			{Step: recipe.StepPropose, RecipeID: strings.Repeat("a", 64), ModelAlias: "earmark-judge", ModelResolved: "haiku"},
 			{Step: recipe.StepEmbed, RecipeID: strings.Repeat("b", 64), ModelAlias: "nomic"},
 		},
-		Stale: map[string]int64{recipe.StepPropose: 5, recipe.StepEmbed: 0},
 	}
-	rows := buildRecipeRows(cfg, snap)
+	stale := &staleSnapshot{Counts: map[string]int64{recipe.StepPropose: 5, recipe.StepEmbed: 0}}
+	// Stale counts unavailable: recipe columns still render, counts are unknown.
+	for _, r := range buildRecipeRows(cfg, snap, nil) {
+		assert.False(t, r.StaleKnown, r.Step)
+		assert.Nil(t, r.Stale, r.Step)
+	}
+	rows := buildRecipeRows(cfg, snap, stale)
 	require.Len(t, rows, len(recipe.Steps))
 	byStep := map[string]recipeRow{}
 	for _, r := range rows {
@@ -305,6 +273,7 @@ func TestBuildRecipeRows(t *testing.T) {
 	assert.Equal(t, matchOK, p.PinMatch)
 	require.NotNil(t, p.Stale)
 	assert.Equal(t, int64(5), *p.Stale)
+	assert.True(t, p.StaleKnown)
 	assert.Equal(t, "only by re-judging", p.ConvergeNote)
 
 	e := byStep[recipe.StepEmbed]
@@ -383,12 +352,17 @@ func TestServersDataScenarios(t *testing.T) {
 			wantContains: []string{"✓ HEALTHY", "transcribing on gpu-1", "via LiteLLM", "also:", "qwen3.8</span> ×3",
 				"32,337", "39,644", "counts as of", "id=\"recipe-propose\"", "href=\"#recipe-propose\"",
 				"runner version", "not reported (pre-provenance runner)", "AI endpoints (3)", "unbound", "direct",
-				"✗ OFFLINE", "29,001", "3,336", "decided by humans", "hx-target=\"#models-region\""},
-			wantAbsent: []string{"counts unavailable", "FAILING", "about-page", "Family", "Size"},
+				"✗ OFFLINE", "29,001", "3,336", "decided by humans", "· counts as of", "· stale counts as of",
+				"1 transcript currently failing", "<dt>last error</dt>",
+				"LiteLLM gateway", "proxy healthy · db connected", "v1.102.1", "$12.25 · no budget set", "✓ allowed",
+				`<th scope="row" class="mono">propose</th>`, `<h2 class="section-title"`},
+			wantAbsent: []string{"counts unavailable", "FAILING", "about-page", "Family", "Size", "<form",
+				"1 transcripts", `<div class="server-sub err" title="chat completion`, "gpu-retired", "NOT ALLOWED"},
 		},
 		{
-			scenario:     "failed",
-			wantContains: []string{"✗ FAILING", "invalid LiteLLM virtual key", "12 transcripts currently failing", "see error below"},
+			scenario: "failed",
+			wantContains: []string{"✗ FAILING", "invalid LiteLLM virtual key", "12 transcripts currently failing", "see error below",
+				`<div class="server-sub err" title="401 Unauthorized`},
 		},
 		{
 			scenario: "stale",
@@ -396,18 +370,20 @@ func TestServersDataScenarios(t *testing.T) {
 				"embedded by mxbai-embed-large", "holds a claim with a stale heartbeat", "33,870"},
 		},
 		{
-			scenario:     "idle",
-			wantContains: []string{"● IDLE", "every transcript judged", "nothing waiting to embed"},
-			wantAbsent:   []string{"FAILING", "DEGRADED"},
+			scenario: "idle",
+			wantContains: []string{"● IDLE", "every transcript judged", "nothing waiting to embed",
+				"asr-runner stopped on gpu-1", "$12.25 of $50.00 budget, resets in", "rpm 60 · tpm 100,000", "expires in"},
+			wantAbsent: []string{"FAILING"},
 		},
 		{
-			scenario:     "winddown",
-			wantContains: []string{"✗ DOWN", "gateway unreachable (GET /models failed) — llm-gateway.demo:4000", "endpoint unreachable"},
+			scenario: "winddown",
+			wantContains: []string{"✗ DOWN", "gateway unreachable (GET /models failed) — llm-gateway.demo:4000", "endpoint unreachable",
+				"readiness and liveliness probes failed", "key info unreachable"},
 		},
 		{
 			scenario:     "empty",
 			wantContains: []string{"no ASR_SERVERS", "judging is off", "no judge findings yet", "no transcripts yet", "_legacy", "Current recipes are registered by"},
-			wantAbsent:   []string{"HEALTHY", "via LiteLLM"},
+			wantAbsent:   []string{"HEALTHY", "via LiteLLM", "LiteLLM gateway"},
 			wantCount:    map[string]int{"○ NOT CONFIGURED": 4},
 		},
 		{
@@ -416,12 +392,26 @@ func TestServersDataScenarios(t *testing.T) {
 		},
 		{
 			scenario:     "batch-analyze",
-			wantContains: []string{"✓ HEALTHY", "32,337"},
+			wantContains: []string{"✓ HEALTHY", "32,337", "asr-runner parked on gpu-1 for the batch analyze phase"},
 		},
 		{
-			scenario:     demoScenarioSnapshotError,
-			wantContains: []string{"counts unavailable", "counts unavailable — see server logs", "call outcomes unavailable", "? UNKNOWN"},
-			wantAbsent:   []string{"counts as of", "32,337"},
+			scenario: demoScenarioSnapshotError,
+			// Only the aggregate snapshot fails: the separately cached stale counts
+			// still render.
+			wantContains: []string{"counts unavailable", "counts unavailable — see server logs", "call outcomes unavailable", "? UNKNOWN",
+				"· stale counts as of", "32,337 rows"},
+			wantAbsent: []string{"· counts as of", "stale counts unavailable"},
+		},
+		{
+			scenario: demoScenarioGatewayAllowlist,
+			wantContains: []string{"▲ DEGRADED", "earmark-judge is not on earmark&#39;s LiteLLM key allowlist — every call 403s",
+				"✗ NOT ALLOWED", "is not on the key allowlist — calls 403", "▲ NOT ALLOWED",
+				`title="not on earmark&#39;s LiteLLM key allowlist (403 on call)"`},
+		},
+		{
+			scenario:     demoScenarioGatewayKeyInfo,
+			wantContains: []string{"key info not readable by earmark&#39;s key (HTTP 403)", "✓ HEALTHY", "? not checked"},
+			wantAbsent:   []string{"NOT ALLOWED", "$12.25"},
 		},
 	}
 	for _, tc := range tests {
@@ -444,8 +434,10 @@ func TestServersDataScenarios(t *testing.T) {
 	}
 }
 
-// TestServersPageShell: the About text and the focus-pause trigger live in the
-// static shell, not the polled fragment.
+// TestServersPageShell: the About text and the runner-update form live in the
+// static shell, not the polled fragment, so a poll can neither collapse About
+// nor wipe what the operator is typing (the vendored htmx 4 ignores a trigger
+// filter on "every", so pausing the poll is not an option).
 func TestServersPageShell(t *testing.T) {
 	srv := newDemoServer(":0", "active")
 	w := httptest.NewRecorder()
@@ -453,10 +445,42 @@ func TestServersPageShell(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	out := w.Body.String()
 	assert.Contains(t, out, `id="models-region"`)
-	assert.Contains(t, out, `every 5s [!document.querySelector('#models-region form:focus-within')]`)
+	assert.Contains(t, out, `hx-trigger="load, every 5s"`)
+	assert.NotContains(t, out, "focus-within")
 	assert.Contains(t, out, `class="about-page"`)
 	assert.Contains(t, out, "no per-backfill-run marker")
 	assert.Contains(t, out, ">Models</a>")
+	// The form: token-gated, posts into the region, placeholder only (no value).
+	assert.Contains(t, out, `id="runner-version"`)
+	assert.Contains(t, out, `placeholder="vX.Y.Z"`)
+	assert.Contains(t, out, `hx-post="/actions/runner-update" hx-target="#models-region"`)
+	assert.NotContains(t, out, `name="version" value=`)
+
+	noToken := NewMCPServer(&SimpleMockDB{}, &config.Config{})
+	w = httptest.NewRecorder()
+	noToken.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers", nil))
+	assert.NotContains(t, w.Body.String(), `id="runner-version"`)
+	assert.Contains(t, w.Body.String(), "Set <code>CONTROL_API_TOKEN</code> to enable runner updates")
+}
+
+// TestServersData_StaleCountFailureIsIsolated: a failing stale count marks only
+// the stale numbers unavailable; recipes, activity and findings still render.
+func TestServersData_StaleCountFailureIsIsolated(t *testing.T) {
+	srv := NewMCPServer(&staleErrDB{}, &config.Config{})
+	w := httptest.NewRecorder()
+	srv.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers/data", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	out := w.Body.String()
+	assert.Contains(t, out, "stale counts unavailable")
+	assert.Contains(t, out, "· counts as of")
+	assert.Contains(t, out, `id="recipe-propose"`, "the recipes table still renders")
+	assert.NotContains(t, out, "counts unavailable — see server logs")
+}
+
+type staleErrDB struct{ SimpleMockDB }
+
+func (*staleErrDB) StaleItemCounts(context.Context) (map[string]int64, error) {
+	return nil, errors.New("statement timeout")
 }
 
 // TestServersData_ObservationErrorIs500 keeps the existing contract: only a
@@ -523,7 +547,23 @@ func TestAPIStatusRolesArray(t *testing.T) {
 	assert.Equal(t, "earmark-judge", j.Requested)
 	assert.Equal(t, "anthropic/claude-haiku-4-5-20251001", j.Expected)
 	assert.Equal(t, matchOK, j.AnsweredMatch)
-	assert.Equal(t, 12, j.FailingNow)
+	require.NotNil(t, j.FailingNow)
+	assert.Equal(t, 12, *j.FailingNow)
+	assert.False(t, j.CountsError)
+	require.NotNil(t, j.StaleAsOf)
+	require.NotNil(t, j.ModelAllowed)
+	assert.True(t, *j.ModelAllowed)
+	require.Len(t, got.Gateways, 1)
+	g := got.Gateways[0]
+	assert.Equal(t, "llm-gateway.demo:4000", g.BaseHost)
+	assert.True(t, g.Ready)
+	assert.Equal(t, "earmark", g.KeyAlias)
+	assert.Equal(t, []string{"litellm-embed", "litellm-judge"}, g.Endpoints)
+	require.NotNil(t, g.Spend)
+	assert.InDelta(t, 12.25, *g.Spend, 0.001)
+	assert.Nil(t, g.MaxBudget)
+	assert.Contains(t, g.AllowedModels, "earmark-judge")
+	assert.Nil(t, got.Roles[2].FailingNow, "failingNow is judge-only")
 	require.NotNil(t, j.LastError)
 	assert.Contains(t, *j.LastError, "invalid LiteLLM virtual key")
 	require.NotNil(t, j.LastOKAt)
@@ -548,6 +588,48 @@ func TestAPIStatusRolesArray(t *testing.T) {
 	se := get(demoScenarioSnapshotError)
 	require.Len(t, se.Roles, 5)
 	assert.Nil(t, se.Roles[1].CountsAsOf)
-	assert.Nil(t, se.Roles[1].Stale)
+	assert.True(t, se.Roles[1].CountsError)
+	assert.Nil(t, se.Roles[1].FailingNow, "unknown, not 0")
 	assert.Equal(t, roleUnknown, se.Roles[1].State)
+	require.NotNil(t, se.Roles[1].Stale, "stale counts are cached separately and still load")
+
+	al := get(demoScenarioGatewayAllowlist)
+	require.NotNil(t, al.Roles[1].ModelAllowed)
+	assert.False(t, *al.Roles[1].ModelAllowed)
+	assert.Equal(t, roleDegraded, al.Roles[1].State)
+}
+
+// TestModelsCaches_StalePending: a slow first stale count renders as pending
+// (not an error) and does not hold up the cheap aggregates.
+func TestModelsCaches_StalePending(t *testing.T) {
+	d := &slowStaleDB{release: make(chan struct{})}
+	c := newModelsCaches(d, nil)
+	start := time.Now()
+	ev := c.read(context.Background(), 50*time.Millisecond)
+	assert.Less(t, time.Since(start), time.Second, "the page must not wait on the stale scan")
+	assert.NotNil(t, ev.Snap, "aggregates loaded independently")
+	assert.Nil(t, ev.Stale)
+	assert.True(t, ev.StalePending)
+	assert.NoError(t, ev.StaleErr)
+
+	close(d.release)
+	c.stale.waitIdle()
+	ev = c.read(context.Background(), 50*time.Millisecond)
+	require.NotNil(t, ev.Stale)
+	assert.False(t, ev.StalePending)
+	assert.Equal(t, int64(7), ev.Stale.Counts["embed"])
+}
+
+type slowStaleDB struct {
+	SimpleMockDB
+	release chan struct{}
+}
+
+func (s *slowStaleDB) StaleItemCounts(ctx context.Context) (map[string]int64, error) {
+	select {
+	case <-s.release:
+		return map[string]int64{"embed": 7}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

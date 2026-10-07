@@ -3,6 +3,7 @@ package mcp
 import (
 	"cmp"
 	"fmt"
+	"html/template"
 	"sort"
 	"strings"
 	"time"
@@ -118,12 +119,6 @@ func roleTitleForStep(step string) string {
 	return ""
 }
 
-// modelCount is one other model that answered the judge recently.
-type modelCount struct {
-	Model string
-	Count int
-}
-
 // roleCard is one card on the role board (and one roles[] API entry).
 type roleCard struct {
 	Key, Title, Step string
@@ -140,8 +135,8 @@ type roleCard struct {
 	Expected         string
 	ExpectedRevision string
 	Answered         string
-	AnsweredMatch    string       // match|mismatch|unreported|none|unchecked
-	AlsoAnswered     []modelCount // judge only: other models in the last 7 days, max 3
+	AnsweredMatch    string          // match|mismatch|unreported|none|unchecked
+	AlsoAnswered     []db.ModelCount // judge only: other models in the last 7 days, max 3
 	ASRRunnerVersion string
 	ASRModelSHA      string
 	LastOK, LastFail time.Time // zero = never / unknown
@@ -153,9 +148,24 @@ type roleCard struct {
 	Backlog          int // embeddings
 	HumanDecided     *int
 	// Stale is the step's stale_work count; nil when not tracked (no current
-	// recipe) or unavailable (CountsKnown false).
+	// recipe) or unavailable. StaleKnown says the stale snapshot has loaded
+	// (it is cached separately, 5 min); StalePending says its first load is
+	// still running.
 	Stale        *int64
 	StaleTracked bool
+	StaleKnown   bool
+	StalePending bool
+	// ModelAllowed is whether the requested model is on the LiteLLM virtual
+	// key's allowlist (GET /key/info); nil when the endpoint is not behind a
+	// readable LiteLLM key. A false here means every call 403s.
+	ModelAllowed *bool
+	// GatewayHost is the LiteLLM gateway host the allowlist came from.
+	GatewayHost string
+	// AllowState is ModelAllowed for templates: "allowed", "denied", or "".
+	// AllowlistWarn adds a red warning line when the role is NOT allowed and
+	// its health sub-line says something else (e.g. DOWN outranks it).
+	AllowState    string
+	AllowlistWarn bool
 	// CountsKnown is false when no snapshot has ever loaded: answered/last
 	// ok/stale render "—" instead of a misleading "never".
 	CountsKnown bool
@@ -211,11 +221,20 @@ type roleInputs struct {
 	Servers    []serverView
 	Endpoints  []endpointView
 	Stats      *db.QueueStats
-	Snap       *modelsSnapshot
-	Now        time.Time
+	Snap       *modelsSnapshot // nil = never loaded
+	Stale      *staleSnapshot  // nil = never loaded (cached separately)
+	// StalePending is true while the stale snapshot's first load is running.
+	StalePending bool
+	// Gateways maps an AI_ENDPOINTS id to the LiteLLM gateway status probed
+	// with that endpoint's key (absent = not behind LiteLLM / not probed).
+	Gateways map[string]gatewayStatus
+	Now      time.Time
 	// ServersKnown is false when the runner observation read failed; the ASR
 	// card is then UNKNOWN rather than a misleading NOT CONFIGURED.
 	ServersKnown bool
+	// Phase is the coordinator's pipeline phase ("" when unknown). In the
+	// batch analyze phase the asr-runner is parked on purpose.
+	Phase string
 }
 
 // buildRoleCards builds the five role cards in their fixed order.
@@ -223,7 +242,7 @@ func buildRoleCards(in roleInputs) []roleCard {
 	cards := make([]roleCard, 0, len(roleDefs))
 	for _, d := range roleDefs {
 		c := roleCard{Key: d.Key, Title: d.Title, Step: d.Step, CountsKnown: in.Snap != nil, StatsKnown: in.Stats != nil}
-		applyStale(&c, in.Snap)
+		applyStale(&c, in.Stale, in.StalePending)
 		switch d.Key {
 		case "asr":
 			c.HasModel, c.LastKnown = true, in.Snap != nil
@@ -246,15 +265,48 @@ func buildRoleCards(in roleInputs) []roleCard {
 	return cards
 }
 
-// applyStale sets the card's stale count from the snapshot: tracked only when
-// the step has a current recipe (StaleItemCounts reports exactly those steps).
-func applyStale(c *roleCard, snap *modelsSnapshot) {
-	if snap == nil {
+// applyStale sets the card's stale count from the stale snapshot: tracked only
+// when the step has a current recipe (StaleItemCounts reports exactly those
+// steps).
+func applyStale(c *roleCard, stale *staleSnapshot, pending bool) {
+	c.StalePending = pending && stale == nil
+	if stale == nil {
 		return
 	}
-	if n, ok := snap.Stale[c.Step]; ok {
+	c.StaleKnown = true
+	if n, ok := stale.Counts[c.Step]; ok {
 		c.Stale, c.StaleTracked = &n, true
 	}
+}
+
+// applyAllowlist checks the role's requested model against the LiteLLM key
+// allowlist of the gateway its endpoint sits behind (when readable).
+func applyAllowlist(c *roleCard, gws map[string]gatewayStatus) {
+	gw, ok := gws[c.EndpointID]
+	if !ok {
+		return
+	}
+	c.GatewayHost = gw.Host
+	if gw.KeyInfoOK {
+		c.ModelAllowed = modelAllowed(gw.Key.Models, c.Requested)
+	}
+	if c.ModelAllowed != nil {
+		c.AllowState = "denied"
+		if *c.ModelAllowed {
+			c.AllowState = "allowed"
+		}
+	}
+}
+
+// finishAllowlist sets the warning flag once health is known.
+func finishAllowlist(c *roleCard) {
+	c.AllowlistWarn = c.AllowState == "denied" && c.Health.Sub != notAllowedSub(c.Requested)
+}
+
+// notAllowedSub is the shared wording for a model missing from the key
+// allowlist — the misconfiguration that 403'd every judge call on 2026-10-05.
+func notAllowedSub(model string) string {
+	return model + " is not on earmark's LiteLLM key allowlist — every call 403s"
 }
 
 func buildJudgeCard(c *roleCard, in roleInputs) {
@@ -288,14 +340,16 @@ func buildJudgeCard(c *roleCard, in roleInputs) {
 				break
 			}
 			if !strings.EqualFold(m.Model, c.Answered) {
-				c.AlsoAnswered = append(c.AlsoAnswered, modelCount{Model: m.Model, Count: m.Count})
+				c.AlsoAnswered = append(c.AlsoAnswered, m)
 			}
 		}
 	}
 	if in.Stats != nil {
 		c.CoverageDone, c.CoverageTotal = in.Stats.EvalCoverageDone, in.Stats.Done
 	}
+	applyAllowlist(c, in.Gateways)
 	c.Health = judgeHealth(*c, probe, host, in.Stats != nil, in.Now)
+	finishAllowlist(c)
 }
 
 // judgeHealth is the Judge precedence table (first match wins). probe is the
@@ -307,10 +361,12 @@ func judgeHealth(c roleCard, probe, host string, statsKnown bool, now time.Time)
 		return health(roleNotConfigured, "no AI_ROLES.eval binding and no EVAL_CHAT_* — judging is off")
 	case probe == string(epStateOffline):
 		return health(roleDown, "gateway unreachable (GET /models failed) — "+orDash(host))
+	case c.ModelAllowed != nil && !*c.ModelAllowed:
+		return health(roleDegraded, notAllowedSub(c.Requested))
 	case c.CountsKnown && !c.LastFail.IsZero() && c.LastFail.After(c.LastOK):
 		return health(roleFailing, "last attempt failed "+humanizeSince(now.Sub(c.LastFail))+" — see error below")
 	case probe == string(epStateModelMissing):
-		return health(roleDegraded, "gateway does not list "+c.Requested)
+		return health(roleDegraded, modelMissingSub(c))
 	case c.CountsKnown && c.AnsweredMatch == matchMismatch:
 		return health(roleDegraded, fmt.Sprintf("answered by %s, expected %s — new findings are stamped stale (fallback route?)",
 			c.Answered, c.CompareTarget()))
@@ -354,7 +410,19 @@ func buildEmbedCard(c *roleCard, in roleInputs) {
 		c.Answered = in.Snap.Activity.EmbedLastModel
 		c.AnsweredMatch = answeredMatch(c.Answered, c.CompareTarget(), hasRuns)
 	}
+	applyAllowlist(c, in.Gateways)
 	c.Health = embedHealth(*c, probe, host, in.Stats != nil, in.Now)
+	finishAllowlist(c)
+}
+
+// modelMissingSub words a model_not_loaded probe. Behind LiteLLM, /v1/models
+// lists only the virtual key's allowed models, so a missing model is an
+// allowlist problem (calls 403), not an unloaded model.
+func modelMissingSub(c roleCard) string {
+	if c.Gateway == "litellm" {
+		return c.Requested + " is not on earmark's LiteLLM key allowlist (403 on call)"
+	}
+	return "endpoint does not list " + c.Requested
 }
 
 // embedHealth is the Embeddings precedence table (first match wins).
@@ -364,8 +432,10 @@ func embedHealth(c roleCard, probe, host string, statsKnown bool, now time.Time)
 		return health(roleNotConfigured, "no embeddings endpoint — set AI_ENDPOINTS + AI_ROLES.embeddings")
 	case probe == string(epStateOffline):
 		return health(roleDown, "endpoint unreachable (GET /models failed) — "+orDash(host))
+	case c.ModelAllowed != nil && !*c.ModelAllowed:
+		return health(roleDegraded, notAllowedSub(c.Requested))
 	case probe == string(epStateModelMissing):
-		return health(roleDegraded, "endpoint does not list "+c.Requested)
+		return health(roleDegraded, modelMissingSub(c))
 	case c.CountsKnown && c.AnsweredMatch == matchMismatch:
 		return health(roleDegraded, fmt.Sprintf("embedded by %s, expected %s — new chunks are stamped stale",
 			c.Answered, c.CompareTarget()))
@@ -405,7 +475,7 @@ func buildASRCard(c *roleCard, in roleInputs) {
 	if pendingKnown {
 		pending = in.Stats.Pending
 	}
-	c.Health = asrHealth(in.Servers, pending, pendingKnown)
+	c.Health = asrHealth(in.Servers, pending, pendingKnown, in.Phase)
 }
 
 // primaryASRModel is the model the primary ASR_SERVERS entry expects (else the
@@ -426,7 +496,7 @@ func primaryASRModel(servers []config.ASRServer) string {
 
 // asrHealth aggregates the runner cards' states (first match wins). pending is
 // the queue depth: GPUs held by games only degrade the role when work waits.
-func asrHealth(servers []serverView, pending int, pendingKnown bool) roleHealth {
+func asrHealth(servers []serverView, pending int, pendingKnown bool, phase string) roleHealth {
 	first := func(token string) *serverView {
 		for i := range servers {
 			if servers[i].State.Token == token {
@@ -445,7 +515,7 @@ func asrHealth(servers []serverView, pending int, pendingKnown bool) roleHealth 
 		return health(roleHealthy, "ready on "+v.Name)
 	}
 	probed, busy, offline := 0, 0, 0
-	var busyView *serverView
+	var heldView, stoppedView *serverView
 	for i := range servers {
 		if !servers[i].Probed {
 			continue
@@ -454,17 +524,29 @@ func asrHealth(servers []serverView, pending int, pendingKnown bool) roleHealth 
 		switch servers[i].State.Token {
 		case "busy":
 			busy++
-			if busyView == nil {
-				busyView = &servers[i]
+			if servers[i].GPUState == "available" {
+				if stoppedView == nil {
+					stoppedView = &servers[i]
+				}
+			} else if heldView == nil {
+				heldView = &servers[i]
 			}
 		case "offline":
 			offline++
 		}
 	}
-	// No probed server is usable and at least one is held: degraded, not down —
-	// the GPU comes back when the game exits.
 	if probed > 0 && busy > 0 && busy+offline == probed {
-		held := busyView.Name + ": " + gpuHeldWording(busyView.GPUState)
+		// No probed server can transcribe now. A free GPU whose asr-runner is
+		// stopped needs the operator regardless of the queue; GPUs held by games
+		// only degrade the role while work waits (they come back by themselves).
+		if stoppedView != nil && phase == db.PhaseAnalyze {
+			// `earmark batch` parks the runner so the judge can use the GPU.
+			return health(roleIdle, "asr-runner parked on "+stoppedView.Name+" for the batch analyze phase")
+		}
+		if stoppedView != nil {
+			return health(roleDegraded, "asr-runner stopped on "+stoppedView.Name+" — start it before queueing work")
+		}
+		held := heldView.Name + ": " + gpuHeldWording(heldView.GPUState)
 		if pendingKnown && pending == 0 {
 			return health(roleIdle, "nothing queued; "+held)
 		}
@@ -488,8 +570,6 @@ func gpuHeldWording(state string) string {
 		return "GPU held by a game (gaming)"
 	case "evicting":
 		return "evicting other GPU work"
-	case "available":
-		return "GPU free but asr-runner stopped"
 	default:
 		return "GPU busy"
 	}
@@ -504,7 +584,7 @@ func answeredMatch(answered, expected string, hasRuns bool) string {
 		return matchNone
 	case expected == "":
 		return matchUnchecked
-	case modelsMatch(answered, expected):
+	case sameModel(answered, expected):
 		return matchOK
 	default:
 		return matchMismatch
@@ -543,7 +623,8 @@ type recipeRow struct {
 	Since                 time.Time
 	Pin                   string // expected model; "" unpinned
 	PinMatch              string // match|mismatch|unpinned ("" with no current recipe)
-	Stale                 *int64 // nil = not tracked
+	Stale                 *int64 // nil = not tracked (or unknown: StaleKnown false)
+	StaleKnown            bool
 	ConvergeNote          string
 	NoneNote              string // why there is no current recipe
 }
@@ -555,8 +636,10 @@ var convergeNotes = map[string]string{
 }
 
 // buildRecipeRows lists every recipe step in canonical order. snap must be
-// non-nil (the caller renders "counts unavailable" otherwise).
-func buildRecipeRows(cfg *config.Config, snap *modelsSnapshot) []recipeRow {
+// non-nil (the caller renders "counts unavailable" otherwise); stale may be nil
+// (its counts then render as unknown, independently of the recipe columns).
+// cfg may be nil: ModelPin is nil-safe.
+func buildRecipeRows(cfg *config.Config, snap *modelsSnapshot, stale *staleSnapshot) []recipeRow {
 	byStep := map[string]db.CurrentRecipe{}
 	for _, r := range snap.Recipes {
 		byStep[r.Step] = r
@@ -572,7 +655,7 @@ func buildRecipeRows(cfg *config.Config, snap *modelsSnapshot) []recipeRow {
 			switch {
 			case row.Pin == "":
 				row.PinMatch = "unpinned"
-			case modelsMatch(row.Model, row.Pin):
+			case sameModel(row.Model, row.Pin):
 				row.PinMatch = matchOK
 			default:
 				row.PinMatch = matchMismatch
@@ -582,7 +665,12 @@ func buildRecipeRows(cfg *config.Config, snap *modelsSnapshot) []recipeRow {
 		} else {
 			row.NoneNote = "no current recipe"
 		}
-		if n, ok := snap.Stale[step]; ok {
+		if stale == nil {
+			rows = append(rows, row)
+			continue
+		}
+		row.StaleKnown = true
+		if n, ok := stale.Counts[step]; ok {
 			row.Stale = &n
 			if n > 0 {
 				row.ConvergeNote = convergeNotes[step]
@@ -682,6 +770,48 @@ func modelsMatch(a, b string) bool {
 		strings.HasPrefix(b, a+":")
 }
 
+// sameModel is the strict comparison for "did the expected model answer":
+// case-insensitive, and Ollama's implicit `:latest` equals the bare name, but
+// a bare pin does NOT match an arbitrary tag (`qwen3.8` ≠ `qwen3.8:14b`) —
+// unlike modelsMatch, which is the lenient /models presence check.
+func sameModel(a, b string) bool {
+	a, b = strings.ToLower(strings.TrimSpace(a)), strings.ToLower(strings.TrimSpace(b))
+	if a == "" || b == "" {
+		return false
+	}
+	return strings.TrimSuffix(a, ":latest") == strings.TrimSuffix(b, ":latest")
+}
+
+// modelAllowed reports whether model is on a LiteLLM key allowlist: an empty
+// list or "*" / "all-proxy-models" allows everything; "provider/*" (any
+// trailing "*") is a prefix wildcard; otherwise sameModel. nil when the list
+// uses a scope earmark cannot resolve from its own key ("all-team-models").
+func modelAllowed(allowed []string, model string) *bool {
+	yes, no := true, false
+	if len(allowed) == 0 {
+		return &yes
+	}
+	m := strings.ToLower(strings.TrimSpace(model))
+	unknown := false
+	for _, a := range allowed {
+		a = strings.ToLower(strings.TrimSpace(a))
+		switch {
+		case a == "*" || a == "all-proxy-models":
+			return &yes
+		case a == "all-team-models":
+			unknown = true
+		case strings.HasSuffix(a, "*") && strings.HasPrefix(m, strings.TrimSuffix(a, "*")):
+			return &yes
+		case sameModel(a, m):
+			return &yes
+		}
+	}
+	if unknown {
+		return nil
+	}
+	return &no
+}
+
 // gatewayFor resolves the gateway an endpoint sits behind: the declared
 // AI_ENDPOINTS gateway when set, else "litellm" inferred from a host name
 // containing "litellm" or "llm-gateway". Display only.
@@ -754,4 +884,19 @@ func orDash(s string) string {
 		return "—"
 	}
 	return s
+}
+
+// modelsFuncs are the Models fragment's extra template helpers.
+var modelsFuncs = template.FuncMap{
+	// plural picks the singular or plural noun for n.
+	"plural": func(n int, one, many string) string {
+		if n == 1 {
+			return one
+		}
+		return many
+	},
+	// runnerRow pairs a runner view with the table's column toggles.
+	"runnerRow": func(v serverView, showRuntime, showCaps bool) runnerTableRow {
+		return runnerTableRow{V: v, ShowRuntime: showRuntime, ShowCaps: showCaps}
+	},
 }

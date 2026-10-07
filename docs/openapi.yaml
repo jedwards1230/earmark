@@ -383,6 +383,80 @@ components:
       required:
         - error
       type: object
+    Gateway:
+      description: |
+        One LiteLLM gateway as seen through earmark's OWN virtual key (CONTRACT §2.14): readiness from `/health/readiness` (fallback `/health/liveliness`) and the caller's own `/key/info`. earmark never uses the master key, never calls a model for this, and never returns key material. Key fields are absent/null when `keyInfoError` is set.
+      properties:
+        allowedModels:
+          description: |
+            The key's model allowlist. An empty list means every model is allowed; entries may be wildcards (`anthropic/*`) or `all-proxy-models`. `null` when key info could not be read.
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        baseHost:
+          description: Gateway host[:port] (the endpoint baseURL without a trailing `/v1`).
+          type: string
+        budgetResetAt:
+          type: string
+        db:
+          type: string
+        endpoints:
+          description: AI_ENDPOINTS ids routed through this gateway with this key.
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        health:
+          description: Readiness `status` (e.g. `healthy`), or `alive` when only liveliness answered.
+          type: string
+        keyAlias:
+          type: string
+        keyBlocked:
+          type: boolean
+        keyExpires:
+          type: string
+        keyInfoError:
+          description: |
+            Why the key info is missing, e.g. "key info not readable by earmark's key (HTTP 403)" or "no API key configured for this endpoint (apiKeyEnv)". Never contains key material.
+          type: string
+        keyStatus:
+          type: string
+        maxBudget:
+          type:
+            - number
+            - "null"
+        ready:
+          description: True when readiness (or the liveliness fallback) returned 200.
+          type: boolean
+        rpmLimit:
+          type:
+            - integer
+            - "null"
+        spend:
+          description: Spend in USD tracked against this key.
+          type:
+            - number
+            - "null"
+        tpmLimit:
+          type:
+            - integer
+            - "null"
+        version:
+          type: string
+      required:
+        - baseHost
+        - endpoints
+        - ready
+        - keyBlocked
+        - spend
+        - maxBudget
+        - rpmLimit
+        - tpmLimit
+        - allowedModels
+      type: object
     PauseRequest:
       additionalProperties: false
       properties:
@@ -517,10 +591,13 @@ components:
           type: boolean
         countsAsOf:
           description: |
-            When the 30 s DB snapshot behind answered/lastOkAt/lastFailedAt/stale was taken. `null` when it has never loaded (those fields are then unknown, not "never").
+            When the 30 s aggregate snapshot behind `answered`, the judge's `lastOkAt`/`lastFailedAt`/`lastError`/`failingNow` and the ASR `lastOkAt` was taken. `null` when it has never loaded (those fields are then unknown, not "never"). The embeddings `lastOkAt` comes from live queue stats and `stale` from a separate snapshot (`staleAsOf`).
           type:
             - string
             - "null"
+        countsError:
+          description: True when the most recent aggregate-snapshot refresh failed; the last good snapshot (if any, see `countsAsOf`) is still served.
+          type: boolean
         endpoint:
           description: AI_ENDPOINTS id serving the role, or `EVAL_CHAT_*` for an env-configured judge. Omitted for ASR and unconfigured roles.
           type: string
@@ -528,8 +605,10 @@ components:
           description: MODELS_FILE `expected_model` pin for the role's step. Omitted when unpinned.
           type: string
         failingNow:
-          description: Judge only — transcripts whose latest judge attempt failed (a later success clears it). Not an attempt count.
-          type: integer
+          description: Judge only — transcripts whose latest judge attempt failed (a later success clears it). Not an attempt count. `null` for other roles and when counts are unavailable.
+          type:
+            - integer
+            - "null"
         gateway:
           description: Gateway of the serving endpoint (see `Endpoint.gateway`).
           type: string
@@ -552,6 +631,12 @@ components:
           type:
             - string
             - "null"
+        modelAllowed:
+          description: |
+            Whether `requested` is on the LiteLLM virtual key's allowlist (wildcard-aware). `false` means every call 403s and the role is `degraded`. `null` when the endpoint is not behind LiteLLM or the key info is not readable.
+          type:
+            - boolean
+            - "null"
         reason:
           description: One-sentence human explanation of `state`.
           type: string
@@ -568,9 +653,14 @@ components:
           type: string
         stale:
           description: |
-            stale_work rows for the role's step (CONTRACT §1.9). `null` when the step has no current recipe (not tracked) or counts are unavailable.
+            stale_work rows for the role's step (CONTRACT §1.9), from the separate 5 min snapshot (`staleAsOf`). `null` when the step has no current recipe (not tracked) or the stale counts are unavailable or still loading.
           type:
             - integer
+            - "null"
+        staleAsOf:
+          description: When the stale-count snapshot (cached 5 min; a full-library scan) was taken. `null` until it first loads.
+          type:
+            - string
             - "null"
         state:
           enum:
@@ -591,12 +681,15 @@ components:
         - state
         - reason
         - configured
+        - modelAllowed
         - lastOkAt
         - lastFailedAt
         - lastError
         - failingNow
         - stale
         - countsAsOf
+        - countsError
+        - staleAsOf
       type: object
     RunRequest:
       additionalProperties: false
@@ -755,6 +848,14 @@ components:
             - type: "null"
         failed:
           type: integer
+        gateways:
+          description: |
+            Every distinct LiteLLM gateway (declared or inferred) the AI registry routes through, read with earmark's own virtual key. Empty when no endpoint is behind LiteLLM.
+          items:
+            $ref: '#/components/schemas/Gateway'
+          type:
+            - array
+            - "null"
         lastHeartbeat:
           description: UTC RFC 3339 heartbeat timestamp. Omitted when never seen.
           format: date-time
@@ -824,5 +925,6 @@ components:
         - servers
         - endpoints
         - roles
+        - gateways
         - pipeline
       type: object
