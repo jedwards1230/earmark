@@ -331,6 +331,13 @@ components:
           description: |
             LAN-internal, non-secret base address — included deliberately so an operator can debug connectivity from the status payload.
           type: string
+        gateway:
+          description: |
+            Routing gateway the endpoint sits behind: the declared AI_ENDPOINTS `gateway` (lower-cased), or `litellm` inferred from a host name containing `litellm`/`llm-gateway`. Omitted for a direct endpoint. Display only.
+          type: string
+        gatewayInferred:
+          description: True when `gateway` was inferred from the host name rather than declared.
+          type: boolean
         id:
           type: string
         model:
@@ -348,7 +355,7 @@ components:
           type: string
         state:
           description: |
-            Probe result. `unknown` means not probed (no prober wired), which is distinct from `offline`.
+            Probe result — liveness only (GET /models), not call success; see `roles[].state` for call outcomes. `unknown` means not probed (no prober wired), which is distinct from `offline`.
           enum:
             - ready
             - model_not_loaded
@@ -486,6 +493,110 @@ components:
         - evaldOnly
         - embeddedReady
         - failed
+      type: object
+    Role:
+      description: |
+        One pipeline role from the Models page role board (CONTRACT §2.14). Health folds endpoint liveness AND call outcomes from run_metrics, so it answers "is this role working" where `endpoints[].state` only answers "is the endpoint up".
+      properties:
+        answered:
+          description: |
+            The model that actually answered most recently (judge `eval_resolved_model`, embeddings `embed_model`, ASR the newest transcript's `model_name`). Omitted when nothing has answered.
+          type: string
+        answeredMatch:
+          description: |
+            `answered` compared with `expected` (else `requested`), case-insensitive and tolerant of Ollama `:latest`/`:tag` suffixes. Omitted when counts are unavailable.
+          enum:
+            - match
+            - mismatch
+            - unreported
+            - none
+            - unchecked
+          type: string
+        configured:
+          description: True when the role has a binding (ASR_SERVERS, AI_ROLES, or EVAL_CHAT_*).
+          type: boolean
+        countsAsOf:
+          description: |
+            When the 30 s DB snapshot behind answered/lastOkAt/lastFailedAt/stale was taken. `null` when it has never loaded (those fields are then unknown, not "never").
+          type:
+            - string
+            - "null"
+        endpoint:
+          description: AI_ENDPOINTS id serving the role, or `EVAL_CHAT_*` for an env-configured judge. Omitted for ASR and unconfigured roles.
+          type: string
+        expected:
+          description: MODELS_FILE `expected_model` pin for the role's step. Omitted when unpinned.
+          type: string
+        failingNow:
+          description: Judge only — transcripts whose latest judge attempt failed (a later success clears it). Not an attempt count.
+          type: integer
+        gateway:
+          description: Gateway of the serving endpoint (see `Endpoint.gateway`).
+          type: string
+        gatewayInferred:
+          description: True when `gateway` was inferred from the host name.
+          type: boolean
+        lastError:
+          description: Judge only — the newest still-failing attempt's error, truncated to 300 characters.
+          type:
+            - string
+            - "null"
+        lastFailedAt:
+          description: Judge only — newest still-failing attempt (`max(run_metrics.eval_failed_at)`).
+          type:
+            - string
+            - "null"
+        lastOkAt:
+          description: |
+            Newest success: judge `max(eval_finished_at)` from ANY source (backfill CronJob, in-pipeline, dashboard — no per-backfill-run marker exists), embeddings the newest chunk, ASR the newest transcript.
+          type:
+            - string
+            - "null"
+        reason:
+          description: One-sentence human explanation of `state`.
+          type: string
+        requested:
+          description: The model id earmark sends (or ASR_SERVERS expects).
+          type: string
+        role:
+          enum:
+            - asr
+            - judge
+            - embeddings
+            - decide
+            - format
+          type: string
+        stale:
+          description: |
+            stale_work rows for the role's step (CONTRACT §1.9). `null` when the step has no current recipe (not tracked) or counts are unavailable.
+          type:
+            - integer
+            - "null"
+        state:
+          enum:
+            - healthy
+            - idle
+            - degraded
+            - failing
+            - down
+            - not_configured
+            - unknown
+          type: string
+        step:
+          description: Recipe step the role runs (`asr`, `propose`, `embed`, `decide`, `format`).
+          type: string
+      required:
+        - role
+        - step
+        - state
+        - reason
+        - configured
+        - lastOkAt
+        - lastFailedAt
+        - lastError
+        - failingNow
+        - stale
+        - countsAsOf
       type: object
     RunRequest:
       additionalProperties: false
@@ -657,6 +768,14 @@ components:
           oneOf:
             - $ref: '#/components/schemas/PipelineLifecycle'
             - type: "null"
+        roles:
+          description: |
+            The Models page role board (CONTRACT §2.14): always five entries — asr, judge, embeddings, decide, format — built by the same code as the page.
+          items:
+            $ref: '#/components/schemas/Role'
+          type:
+            - array
+            - "null"
         runLimit:
           description: Remaining claims in a bounded run; `null` means unlimited.
           type:
@@ -704,5 +823,6 @@ components:
         - eta
         - servers
         - endpoints
+        - roles
         - pipeline
       type: object

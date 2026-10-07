@@ -130,26 +130,13 @@ func (p *httpEndpointProber) Probe(ctx context.Context, baseURL, model, apiKey s
 }
 
 // modelLoaded reports whether the configured model appears in the endpoint's
-// reported model set, tolerating ollama's `:tag` suffix. Ollama lists a model as
-// `nomic-embed-text:latest` while the config often names it bare
-// (`nomic-embed-text`), so an exact-match-only check spuriously reports
-// model_not_loaded for a working endpoint. We match when, after stripping a
-// trailing `:latest` from both sides, the configured model equals a returned id
-// OR a returned id is the configured model carrying any tag (`model:<tag>`), and
-// vice versa (configured `model:latest` vs returned bare `model`). The map keys
-// are already lower-cased by fetch(); we lower-case the input to match.
+// reported model set, tolerating ollama's `:tag` suffix via modelsMatch. Ollama
+// lists a model as `nomic-embed-text:latest` while the config often names it
+// bare (`nomic-embed-text`), so an exact-match-only check would spuriously
+// report model_not_loaded for a working endpoint.
 func modelLoaded(models map[string]bool, model string) bool {
-	want := strings.ToLower(model)
-	wantBase := strings.TrimSuffix(want, ":latest")
 	for id := range models {
-		idBase := strings.TrimSuffix(id, ":latest")
-		// Exact, or either side is the other carrying a `:tag` suffix. Comparing
-		// the `:latest`-stripped bases also covers configured-bare vs returned
-		// `:latest` (and the reverse).
-		if want == id ||
-			wantBase == idBase ||
-			strings.HasPrefix(id, want+":") ||
-			strings.HasPrefix(want, id+":") {
+		if modelsMatch(id, model) {
 			return true
 		}
 	}

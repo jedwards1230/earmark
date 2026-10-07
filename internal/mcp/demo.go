@@ -43,6 +43,10 @@ func doneRatio(b db.BookSummary) float64 {
 //	batch-analyze    — `earmark batch` Phase B: phase=analyze, run_limit=0,
 //	                   tracks held pending for the next batch, eval on the GPU
 //	                   → "ANALYZING" state line + "held" run budget
+//	snapshot-error   — like active, but the Models page's aggregate snapshot
+//	                   fails → "counts unavailable" (the fragment stays 200)
+//
+// The Models page role-board fixtures per scenario live in demo_models.go.
 type demoDB struct {
 	scenario string
 	paused   *bool // heap-backed so value-receiver SetPaused can mutate it
@@ -174,42 +178,16 @@ var demoMultibackendServers = []config.ASRServer{
 
 // demoServersFor returns the ASR_SERVERS registry for a scenario: the
 // multibackend scenario uses the three-family set (no gpu-arbiter probes — the
-// story there is families/caps, not readiness); every other scenario uses the
-// single-family readiness set.
+// story there is families/caps, not readiness); empty declares none (fresh
+// install); every other scenario uses the single-family readiness set.
 func demoServersFor(scenario string) []config.ASRServer {
-	if scenario == "multibackend" {
+	switch scenario {
+	case "multibackend":
 		return demoMultibackendServers
+	case "empty":
+		return nil // fresh install: no ASR_SERVERS → the ASR role is NOT CONFIGURED
 	}
 	return demoASRServers
-}
-
-// demoAIEndpoints is the synthetic AI endpoint registry for the demo: an
-// embeddings endpoint (Ollama, bound to the embeddings role, ready) and a chat
-// endpoint (vLLM, bound to eval, offline) so the Models/Services page shows both
-// types, the role badge, options, and two health states. baseURLs are generic
-// placeholders only (per the shareable-repo rule); the demo swaps in a static
-// prober (demoEndpointProber) keyed by a sentinel in the URL, so no network call
-// is made.
-var demoAIEndpoints = []config.AIEndpoint{
-	{ID: "embed-1", Type: config.AIEndpointTypeEmbeddings, Backend: config.AIBackendOllama,
-		BaseURL: "http://ollama.example.com:11434/v1", Model: "nomic-embed-text"},
-	{ID: "eval-1", Type: config.AIEndpointTypeChat, Backend: config.AIBackendVLLM,
-		BaseURL: "http://vllm.example.com:8000/v1", Model: "Qwen2.5-7B-Instruct",
-		Options: map[string]string{"temperature": "0", "max_tokens": "256"}},
-}
-
-var demoAIRoles = &config.AIRoles{Embeddings: "embed-1", Eval: "eval-1"}
-
-// demoEndpointProber is a static endpointProber for the demo: the embeddings
-// endpoint is ready, the eval (chat) endpoint is offline, routed by a substring
-// of the base URL so the page renders both states with no network call.
-type demoEndpointProber struct{}
-
-func (demoEndpointProber) Probe(_ context.Context, baseURL, _, _ string) endpointProbe {
-	if strings.Contains(baseURL, "vllm") {
-		return endpointProbe{Probed: true, State: epStateOffline}
-	}
-	return endpointProbe{Probed: true, State: epStateReady}
 }
 
 // demoGPUProber is a static gpuProber for the demo, routing by a sentinel in the
@@ -1210,7 +1188,7 @@ func renumber(p string, n int) string {
 // StartDemoDashboard starts the HTTP transport (status dashboard + /mcp +
 // /health + /readyz) backed by synthetic data, with no database connection.
 // Intended for local UI iteration and AI-agent visual verification only.
-// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend|winddown|idle|batch-analyze
+// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend|winddown|idle|batch-analyze|snapshot-error
 // to render a state.
 func StartDemoDashboard(addr string) error {
 	if addr == "" {
@@ -1220,15 +1198,28 @@ func StartDemoDashboard(addr string) error {
 	if scenario == "" {
 		scenario = "active"
 	}
-	// The "empty" scenario models a fresh install: no eval role bound, so the
-	// /findings page shows the honest "Eval endpoint not configured" state and
-	// the per-book "run eval" button is hidden. Every other scenario keeps the
-	// eval role bound so the trigger surface renders.
-	aiRoles := demoAIRoles
+	srv := newDemoServer(addr, scenario)
+	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",
+		"address", addr, "scenario", scenario)
+	return srv.StartHTTP(addr)
+}
+
+// newDemoServer builds the demo MCPServer for a scenario: synthetic config,
+// demoDB, and static probers. Shared by StartDemoDashboard and the handler
+// tests so both render exactly the same fixture.
+func newDemoServer(addr, scenario string) *MCPServer {
+	// The "empty" scenario models a fresh install: no ASR_SERVERS, only the
+	// synthesized _legacy embeddings endpoint, no eval role bound — so the
+	// /findings page shows the honest "Eval endpoint not configured" state, the
+	// per-book "run eval" button is hidden, and the Models page shows NOT
+	// CONFIGURED roles. Every other scenario binds the LiteLLM judge.
+	endpoints, aiRoles, models := demoAIEndpoints, demoAIRoles, demoModelRegistry
 	// #nosec G101 - demo fixture string, not a real credential
 	demoEvalToken := "demo-eval-token"
 	if scenario == "empty" {
-		aiRoles = &config.AIRoles{Embeddings: "embed-1"} // no Eval binding
+		endpoints = demoLegacyEndpoints
+		aiRoles = &config.AIRoles{Embeddings: "_legacy"} // no Eval binding
+		models = nil
 		demoEvalToken = ""
 	}
 	// The active scenario enables EVAL_IN_PIPELINE so the lifecycle strip shows a
@@ -1245,23 +1236,21 @@ func StartDemoDashboard(addr string) error {
 		// (unless the operator set their own) so the buttons are clickable.
 		ControlAPIToken: cmp.Or(os.Getenv("CONTROL_API_TOKEN"), demoEvalToken),
 		ASRServers:      demoServersFor(scenario),
-		AIEndpoints:     demoAIEndpoints,
+		AIEndpoints:     endpoints,
 		AIRoles:         aiRoles,
+		Models:          models,
 		EvalInPipeline:  evalInPipeline,
 	}
 	srv := NewMCPServer(demoDB{scenario: scenario, paused: new(bool)}, cfg)
 	// Swap the real HTTP probers for the static demo ones so the readiness states
 	// render without any network call.
 	srv.prober = demoGPUProber{scenario: scenario}
-	srv.endpointProber = demoEndpointProber{}
+	srv.endpointProber = demoEndpointProber{scenario: scenario}
 	// Swap the live chat client for a static fake judge so clicking "run eval"
-	// exercises the trigger + async indicator with no network call (the demo
-	// vLLM endpoint is intentionally offline). Only when the scenario configured
-	// an eval endpoint in the first place.
+	// exercises the trigger + async indicator with no network call. Only when
+	// the scenario configured an eval endpoint in the first place.
 	if srv.eval.configured {
 		srv.eval.run = demoEvalRun(srv.db)
 	}
-	srv.logger.Info("Starting DEMO dashboard (synthetic data, no database)",
-		"address", addr, "scenario", scenario)
-	return srv.StartHTTP(addr)
+	return srv
 }

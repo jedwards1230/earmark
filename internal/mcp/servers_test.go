@@ -340,35 +340,6 @@ func TestBuildCapBadges(t *testing.T) {
 	}
 }
 
-// TestGroupByFamily checks first-seen-order bucketing, the trailing unknown
-// bucket, and the multiFamily toggle (≤1 family → flat render).
-func TestGroupByFamily(t *testing.T) {
-	views := []serverView{
-		{Name: "a", Family: asr.FamilyNeMoParakeet, FamilyKnown: true},
-		{Name: "b", Family: asr.FamilyWhisper},
-		{Name: "c", Family: asr.FamilyNeMoParakeet, FamilyKnown: true}, // joins a's group
-		{Name: "d"}, // no family → unknown bucket
-	}
-	groups := groupByFamily(views)
-	if len(groups) != 3 {
-		t.Fatalf("want 3 groups (parakeet, whisper, unknown), got %d: %+v", len(groups), groups)
-	}
-	if groups[0].Family != asr.FamilyNeMoParakeet || len(groups[0].Servers) != 2 || !groups[0].Known {
-		t.Errorf("group[0] wrong: %+v", groups[0])
-	}
-	if groups[2].Family != "" || groups[2].Label != "unknown" {
-		t.Errorf("group[2] should be the unknown bucket: %+v", groups[2])
-	}
-	if !multiFamily(groups) {
-		t.Errorf("3 families → multiFamily true")
-	}
-	// Single family → flat render.
-	single := groupByFamily([]serverView{{Name: "x", Family: asr.FamilyWhisper}})
-	if multiFamily(single) {
-		t.Errorf("one family → multiFamily false")
-	}
-}
-
 func TestArbiterRawToStatus(t *testing.T) {
 	used, total := 7338, 32607
 	raw := arbiterRaw{

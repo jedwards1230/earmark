@@ -71,7 +71,13 @@ type apiStatus struct {
 	Servers []apiServer `json:"servers"`
 	// Endpoints is the AI endpoint registry (CONTRACT §2.14) with health probes.
 	// Always non-empty (at least the embeddings endpoint after config load).
+	// Their state is liveness only (GET /models) — see Roles for call outcomes.
 	Endpoints []apiEndpoint `json:"endpoints"`
+	// Roles is the Models page's role board (CONTRACT §2.14): one entry per
+	// pipeline role (asr, judge, embeddings, decide, format) with its health
+	// folded from liveness AND call outcomes, what was requested vs pinned vs
+	// answered, and the step's stale count. Always five entries.
+	Roles []apiRole `json:"roles"`
 	// Pipeline is the derived 3-stage lifecycle view (CONTRACT §2.12). It
 	// summarises transcribe / eval / embed progress and the GPU commitment so an
 	// agent can read one self-describing object rather than piecing it together
@@ -93,6 +99,71 @@ type apiEndpoint struct {
 	Role    string            `json:"role,omitempty"`
 	State   string            `json:"state"`
 	Probed  bool              `json:"probed"`
+	// Gateway is the declared AI_ENDPOINTS gateway, or "litellm" inferred from
+	// the host name (GatewayInferred). Omitted for a direct endpoint.
+	Gateway         string `json:"gateway,omitempty"`
+	GatewayInferred bool   `json:"gatewayInferred,omitempty"`
+}
+
+// apiRole is one pipeline role in GET /api/v1/status roles[] — the same
+// builder as the Models page's role cards (buildRoleCards), so the two cannot
+// disagree. state is "healthy" | "idle" | "degraded" | "failing" | "down" |
+// "not_configured" | "unknown". Timestamps are RFC 3339; null = never or
+// unknown (countsAsOf null = the DB snapshot has never loaded).
+type apiRole struct {
+	Role            string  `json:"role"`
+	Step            string  `json:"step"`
+	State           string  `json:"state"`
+	Reason          string  `json:"reason"`
+	Configured      bool    `json:"configured"`
+	Endpoint        string  `json:"endpoint,omitempty"`
+	Gateway         string  `json:"gateway,omitempty"`
+	GatewayInferred bool    `json:"gatewayInferred,omitempty"`
+	Requested       string  `json:"requested,omitempty"`
+	Expected        string  `json:"expected,omitempty"`
+	Answered        string  `json:"answered,omitempty"`
+	AnsweredMatch   string  `json:"answeredMatch,omitempty"`
+	LastOKAt        *string `json:"lastOkAt"`
+	LastFailedAt    *string `json:"lastFailedAt"`
+	LastError       *string `json:"lastError"`
+	FailingNow      int     `json:"failingNow"`
+	Stale           *int64  `json:"stale"`
+	CountsAsOf      *string `json:"countsAsOf"`
+}
+
+// apiRolesFrom maps the role cards to the API shape.
+func apiRolesFrom(cards []roleCard, snap *modelsSnapshot) []apiRole {
+	var asOf *string
+	if snap != nil {
+		asOf = rfc3339Ptr(snap.At)
+	}
+	out := make([]apiRole, 0, len(cards))
+	for _, c := range cards {
+		r := apiRole{
+			Role: c.Key, Step: c.Step, State: c.Health.Token, Reason: c.Health.Sub,
+			Configured: c.Configured, Endpoint: c.EndpointID,
+			Gateway: c.Gateway, GatewayInferred: c.GatewayInferred,
+			Requested: c.Requested, Expected: c.Expected,
+			Answered: c.Answered, AnsweredMatch: c.AnsweredMatch,
+			LastOKAt: rfc3339Ptr(c.LastOK), LastFailedAt: rfc3339Ptr(c.LastFail),
+			FailingNow: c.FailingNow, Stale: c.Stale, CountsAsOf: asOf,
+		}
+		if c.LastError != "" {
+			e := truncateRunes(c.LastError, maxAPIErrorLen)
+			r.LastError = &e
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// rfc3339Ptr formats t as RFC 3339 UTC, nil for the zero time.
+func rfc3339Ptr(t time.Time) *string {
+	if t.IsZero() {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339)
+	return &s
 }
 
 // apiServer is the JSON shape of one transcription server in GET /api/v1/status.
@@ -341,10 +412,14 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Servers view is supplementary: a query error here logs but does not fail the
 	// whole status response (the counts above are the primary payload).
+	now := time.Now()
+	var runners []serverView
+	runnersKnown := false
 	if obs, err := s.db.GetServerObservation(r.Context()); err != nil {
 		s.logger.Error("api status servers error", "error", err)
 	} else {
-		for _, v := range buildServerViews(s.asrServers, obs, s.probeServers(r.Context()), time.Now(), s.runnerStaleAfter) {
+		runners, runnersKnown = buildServerViews(s.asrServers, obs, s.probeServers(r.Context()), now, s.runnerStaleAfter), true
+		for _, v := range runners {
 			out.Servers = append(out.Servers, apiServer{
 				Name:               v.Name,
 				Host:               v.Host,
@@ -377,19 +452,27 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 			optsByID[ep.ID] = ep.Options
 		}
 	}
-	for _, v := range buildEndpointViews(s.cfg, s.probeEndpoints(r.Context())) {
+	eps := buildEndpointViews(s.cfg, s.probeEndpoints(r.Context()))
+	for _, v := range eps {
 		out.Endpoints = append(out.Endpoints, apiEndpoint{
-			ID:      v.ID,
-			Type:    v.Type,
-			Backend: v.Backend,
-			BaseURL: v.BaseURL,
-			Model:   v.Model,
-			Options: optsByID[v.ID],
-			Role:    v.Role,
-			State:   v.StateToken,
-			Probed:  v.Probed,
+			ID:              v.ID,
+			Type:            v.Type,
+			Backend:         v.Backend,
+			BaseURL:         v.BaseURL,
+			Model:           v.Model,
+			Options:         optsByID[v.ID],
+			Role:            v.Role,
+			State:           v.StateToken,
+			Probed:          v.Probed,
+			Gateway:         v.Gateway,
+			GatewayInferred: v.GatewayInferred,
 		})
 	}
+
+	// Role board (CONTRACT §2.14): the same builder and 30 s snapshot as the
+	// Models page. A snapshot error degrades counts to null, never the response.
+	roles, snap, _ := s.modelRoles(r.Context(), stats, runners, runnersKnown, eps, now)
+	out.Roles = apiRolesFrom(roles, snap)
 
 	writeJSON(w, http.StatusOK, out)
 }

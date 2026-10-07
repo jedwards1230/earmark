@@ -184,6 +184,26 @@ func (m *SimpleMockDB) GetServerObservation(_ context.Context) (*db.ServerObserv
 	return &db.ServerObservation{}, nil
 }
 
+func (m *SimpleMockDB) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) {
+	return nil, nil
+}
+
+func (m *SimpleMockDB) StaleItemCounts(context.Context) (map[string]int64, error) {
+	return map[string]int64{}, nil
+}
+
+func (m *SimpleMockDB) GetModelActivity(context.Context) (db.ModelActivity, error) {
+	return db.ModelActivity{}, nil
+}
+
+func (m *SimpleMockDB) FindingsByModel(context.Context) ([]db.FindingsModelCount, error) {
+	return nil, nil
+}
+
+func (m *SimpleMockDB) ASRProvenanceGroups(context.Context, int) ([]db.ASRProvenanceGroup, error) {
+	return nil, nil
+}
+
 func (m *SimpleMockDB) GetFindingsSummary(_ context.Context) (*db.FindingsSummary, error) {
 	return &db.FindingsSummary{}, nil
 }

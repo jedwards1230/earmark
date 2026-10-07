@@ -546,7 +546,7 @@
   .seg.seg-active { background: var(--tint-blue); border-left: 3px solid var(--blue); padding-left: 8px; border-radius: 4px; }
   .load-more { margin-top: 10px; }
 
-  /* ── servers page ──────────────────────────────────────────────── */
+  /* ── models page (/servers) ──────────────────────────────────────────────── */
   .server-card { border-left: 3px solid var(--border); }
   .server-card.state-running { border-left-color: var(--green); }
   .server-card.state-busy    { border-left-color: var(--amber); }
@@ -568,7 +568,7 @@
   .badge.role-primary  { background: var(--badge-green); color: var(--green); }
   .badge.role-fallback { background: var(--tint-blue); color: var(--blue); }
   .badge.unconfigured  { background: var(--badge-amber); color: var(--amber); }
-  /* AI endpoint type badges (Models/Services page) */
+  /* AI endpoint type badges (Models page) */
   .badge.role-embeddings { background: var(--tint-blue); color: var(--blue); }
   .badge.role-chat       { background: var(--badge-purple); color: var(--purple); }
   .server-note { color: var(--text-2); font-size: var(--fs-sm); line-height: 1.5; margin-top: 12px; max-width: 760px; }
@@ -576,10 +576,16 @@
   .about-page { margin-top: 14px; margin-bottom: 8px; }
   .about-page > summary { cursor: pointer; color: var(--text-2); font-size: var(--fs-sm); list-style: revert; min-height: 28px; }
   .about-page > summary:hover { color: var(--text); }
-  /* per-family grouping header inside the Models & modes table */
-  .family-row td { background: var(--surface2); padding: 6px 12px; }
-  .family-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; color: var(--purple); font-weight: 600; }
+  /* canonical runtime id in the runner models table */
   .family-known { color: var(--purple); }
+  /* role board: configured → answered → healthy → last run → stale */
+  .role-kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 10px; margin: 10px 0 0; font-size: var(--fs-sm); }
+  .role-kv dt { color: var(--muted); }
+  .role-kv dd { margin: 0; min-width: 0; word-break: break-word; }
+  .step-chip { font-family: var(--font-mono); font-size: var(--fs-xs); padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-2); }
+  .badge.gateway { background: var(--badge-purple); color: var(--purple); }
+  .match-ok { color: var(--green); }
+  .server-sub.err, .updated .err { color: var(--red); }
   /* capability strip: applied (green), declined/absent (amber, ✗ + reason tooltip) */
   .cap-strip { display: inline-flex; gap: 4px; flex-wrap: wrap; }
   .cap-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: var(--fs-xs); font-weight: 600; font-family: inherit; white-space: nowrap; }
@@ -634,7 +640,7 @@
   <nav class="nav">
     <a href="/" class="{{if eq .Nav "pipeline"}}active{{end}}">Pipeline</a>
     <a href="/library" class="{{if eq .Nav "library"}}active{{end}}">Library</a>
-    <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Models/Services</a>
+    <a href="/servers" class="{{if eq .Nav "servers"}}active{{end}}">Models</a>
     <a href="/findings" class="{{if eq .Nav "findings"}}active{{end}}">Findings</a>
   </nav>
   {{if .PhaseKnown}}
