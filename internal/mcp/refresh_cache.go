@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -133,7 +134,7 @@ func (c *refreshCache[T]) refresh(done chan struct{}) {
 func (c *refreshCache[T]) safeLoad(ctx context.Context) (v T, err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf("refresh panicked: %v", p)
+			err = fmt.Errorf("refresh panicked: %v\n%s", p, debug.Stack())
 		}
 	}()
 	return c.load(ctx)

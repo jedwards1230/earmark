@@ -1048,13 +1048,18 @@ func (s *MCPServer) handleRunnerUpdate(w http.ResponseWriter, r *http.Request) {
 	s.handleServersData(w, r)
 }
 
-// runnerUpdateVersion reads the requested version: the form body first (htmx
-// hx-post sends the form's fields in the body), then the query string (the
-// legacy ?version= form, still accepted). An absent or empty value means
-// "clear the request".
+// runnerUpdateVersion reads the requested version. A `version` field in the
+// form body wins whenever it is PRESENT — even empty, which is an explicit
+// clear (the Clear control posts version="") — so a stray ?version= in the URL
+// can never turn a clear into a set. Only when the body carries no version
+// field does the legacy query string apply. Empty means "clear the request".
 func runnerUpdateVersion(r *http.Request) string {
-	if v := r.PostFormValue("version"); v != "" {
-		return v
+	_ = r.ParseForm() // a malformed body leaves PostForm empty → query fallback
+	if vs, ok := r.PostForm["version"]; ok {
+		if len(vs) == 0 {
+			return ""
+		}
+		return vs[0]
 	}
 	return r.URL.Query().Get("version")
 }

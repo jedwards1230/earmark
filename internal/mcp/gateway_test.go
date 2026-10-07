@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -274,9 +275,14 @@ func TestGatewayBase(t *testing.T) {
 // prefix is probed under that prefix.
 func TestHTTPGatewayProber_PathPrefixedBase(t *testing.T) {
 	f := &fakeLiteLLM{readiness: 200, keyInfoCode: 200, prefix: "/litellm"}
-	var paths []string
+	var (
+		mu    sync.Mutex
+		paths []string
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		paths = append(paths, r.URL.Path)
+		mu.Unlock()
 		if !strings.HasPrefix(r.URL.Path, "/litellm/") {
 			http.NotFound(w, r)
 			return
@@ -287,6 +293,8 @@ func TestHTTPGatewayProber_PathPrefixedBase(t *testing.T) {
 	st := newHTTPGatewayProber(2*time.Second, time.Hour).Probe(context.Background(), srv.URL+"/litellm/v1", testVirtualKey)
 	assert.True(t, st.Reachable)
 	assert.True(t, st.KeyInfoOK, st.KeyInfoErr)
+	mu.Lock()
+	defer mu.Unlock()
 	assert.Contains(t, paths, "/litellm/key/info")
 }
 

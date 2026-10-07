@@ -223,6 +223,8 @@ func TestRefreshCache_LoadPanicIsRecovered(t *testing.T) {
 	e, err := c.get(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refresh panicked: boom")
+	assert.Contains(t, err.Error(), "goroutine ", "the stack trace is kept with the error")
+	assert.Contains(t, err.Error(), "safeLoad")
 	assert.Same(t, first, e, "last good value kept")
 	select {
 	case lerr := <-logged:

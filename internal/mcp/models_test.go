@@ -673,6 +673,17 @@ func TestRunnerUpdateAction(t *testing.T) {
 		post(m, "tok", "", "?version=v1.2.3", true)
 		assert.Equal(t, "v1.2.3", m.desiredVersionSetTo)
 	})
+	t.Run("an empty body field is an explicit clear, query ignored", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		post(m, "tok", "version=", "?version=v1.0.0", true)
+		assert.True(t, m.runnerUpdateCleared)
+		assert.False(t, m.desiredVersionSet, "a present-but-empty body field must not fall back to ?version=")
+	})
+	t.Run("body without a version field falls back to query", func(t *testing.T) {
+		m := &SimpleMockDB{}
+		post(m, "tok", "other=x", "?version=v1.0.0", true)
+		assert.Equal(t, "v1.0.0", m.desiredVersionSetTo)
+	})
 	t.Run("form body wins over query", func(t *testing.T) {
 		m := &SimpleMockDB{}
 		post(m, "tok", "version=v2.0.0", "?version=v1.0.0", true)
@@ -700,9 +711,11 @@ func TestRunnerUpdateClearIsOutsideTheForm(t *testing.T) {
 	srv.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers", nil))
 	out := w.Body.String()
 	formStart := strings.Index(out, `<form class="rb-form" hx-post="/actions/runner-update"`)
-	formEnd := strings.Index(out[formStart:], "</form>") + formStart
+	require.Positive(t, formStart, "runner-update form not found")
+	formLen := strings.Index(out[formStart:], "</form>")
+	require.Positive(t, formLen, "runner-update form not closed")
+	formEnd := formStart + formLen
 	clear := strings.Index(out, `hx-vals='{"version": ""}'`)
-	require.Positive(t, formStart)
 	require.Positive(t, clear)
 	assert.Greater(t, clear, formEnd, "Clear must be outside the form")
 }
