@@ -242,6 +242,9 @@ func TestErrorClass(t *testing.T) {
 		{&StatusError{Code: 503, Body: "secret"}, "503"},
 		{fmt.Errorf("judge chunk x: %w", &StatusError{Code: 429}), "429"},
 		{ErrThinkingOnlyResponse, "thinking_only"},
+		{fmt.Errorf("judge chunk x: %w", ErrEmptyResponse), "empty"},
+		{fmt.Errorf("%w (finish_reason=%q)", ErrTruncatedResponse, "length"), "truncated"},
+		{fmt.Errorf("%w (finish_reason=%q)", ErrRefusalResponse, "content_filter"), "refusal"},
 		{fmt.Errorf("chat request: %w", context.DeadlineExceeded), "timeout"},
 		{context.Canceled, "canceled"},
 		{errors.New("unmarshal chat response: the text"), "_OTHER"},
@@ -264,8 +267,8 @@ func TestSameModel(t *testing.T) {
 		{"qwen3.8", "anthropic/claude-haiku-4-5-20251001", false},
 		{"claude-haiku-4-5", "claude-haiku-4-5-20251001", false},
 	} {
-		if got := sameModel(tc.a, tc.b); got != tc.want {
-			t.Errorf("sameModel(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		if got := SameModel(tc.a, tc.b); got != tc.want {
+			t.Errorf("SameModel(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
 		}
 	}
 }
