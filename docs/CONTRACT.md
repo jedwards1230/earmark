@@ -1336,7 +1336,8 @@ none of those rows was made by the current configuration. Chunks converge as
 the worker re-embeds; findings only by re-judging.
 
 The Models page (§2.14) shows `current_recipes` and per-step `stale_work`
-counts (cached 30 s), and `GET /api/v1/status` `roles[].stale` (§2.12) carries
+counts (the stale counts cached 5 min — the view scans every chunk and
+finding, ≈1.6 s on production), and `GET /api/v1/status` `roles[].stale` (§2.12) carries
 the same count per role.
 
 **Pin `expected_model` behind an alias.** The current propose recipe expects
@@ -1978,19 +1979,43 @@ ready` and `roles[judge].state = failing`.
   "expected": "anthropic/claude-haiku-4-5-20251001", // MODELS_FILE pin; omitted when unpinned
   "answered": "qwen3.8",        // what actually answered most recently
   "answeredMatch": "mismatch",  // match | mismatch | unreported | none | unchecked
+  "modelAllowed": true,         // requested model on the LiteLLM key allowlist; null = not behind a readable LiteLLM key
   "lastOkAt": "2026-10-06T00:12:00Z",   // null = never / unknown
   "lastFailedAt": null,
   "lastError": null,            // judge only; truncated to 300 chars
-  "failingNow": 0,              // judge only; transcripts whose LATEST attempt failed
-  "stale": 32337,               // stale_work rows for the step; null = not tracked / unavailable
-  "countsAsOf": "2026-10-06T00:13:30Z"  // the 30 s snapshot; null = never loaded
+  "failingNow": 0,              // judge only (null otherwise / when counts unavailable); transcripts whose LATEST attempt failed
+  "stale": 32337,               // stale_work rows for the step; null = not tracked / unavailable / still counting
+  "countsAsOf": "2026-10-06T00:13:30Z", // the 30 s aggregate snapshot; null = never loaded
+  "countsError": false,         // the latest aggregate refresh failed (last good still served)
+  "staleAsOf": "2026-10-06T00:10:02Z"   // the separate 5 min stale-count snapshot; null = not loaded yet
 }
 ```
 
-The DB-derived fields (`answered`, `lastOkAt`, `lastFailedAt`, `lastError`,
-`failingNow`, `stale`) come from a snapshot cached for 30 s. A failed refresh
-keeps the last good snapshot; with none, those fields are `null` and the
-judge's `state` is `unknown` — the response itself never fails on it.
+The DB-derived fields come from two caches served stale-while-revalidate (a
+request never waits on a refresh once a value exists): `answered`, the judge's
+`lastOkAt`/`lastFailedAt`/`lastError`/`failingNow` and the ASR `lastOkAt` from
+the 30 s aggregate snapshot (`countsAsOf`); `stale` from the 5 min stale-count
+snapshot (`staleAsOf`). Embeddings' `lastOkAt` comes from the live queue stats.
+A failed refresh keeps the last good snapshot (`countsError: true`); with none,
+those fields are `null` and the judge's `state` is `unknown` — the response
+itself never fails on it, and a slow or failed stale count never affects the
+other fields.
+
+**`gateways[]` array** — one entry per distinct LiteLLM gateway (and virtual
+key) the AI registry routes through (§2.14 "LiteLLM gateway"); empty when none.
+Never carries key material:
+
+```jsonc
+{
+  "baseHost": "llm-gateway:4000", "endpoints": ["litellm-embed", "litellm-judge"],
+  "ready": true, "health": "healthy", "db": "connected", "version": "1.102.1",
+  "keyAlias": "earmark", "keyStatus": "active", "keyBlocked": false, "keyExpires": "",
+  "spend": 12.25, "maxBudget": null, "budgetResetAt": "",
+  "rpmLimit": null, "tpmLimit": null,
+  "allowedModels": ["anthropic/claude-haiku-4-5-20251001", "nomic-embed-text"], // [] = all models
+  "keyInfoError": ""            // e.g. "key info not readable by earmark's key (HTTP 403)"; key fields then null/absent
+}
+```
 
 **Auth**: mutating endpoints require `Authorization: Bearer <CONTROL_API_TOKEN>`
 (constant-time compared). When `CONTROL_API_TOKEN` is unset they **fail closed**
@@ -2048,7 +2073,7 @@ LAN-only; only reachable under the HTTP transport.
 | `GET /library/data` | Library fragment. Query: `status`, `q`, `sort` (`recent`\|`title`\|`progress`\|`findings`), `findings` (`1` → only books with recorded findings), `offset`. Sort + has-findings filter are applied **all-in-Go** over the full filtered set. |
 | `GET /status/data` | Status fragment (htmx-refreshed every 3 s): counts, pipeline state, read-only phase badge, and the token-gated pause + run-budget controls. |
 | `GET /failed/data` | Failed-jobs fragment. **No standalone `/failed` page** — it renders inside `/pipeline`. |
-| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the role board, recipes & stale work, ASR runners, AI endpoints, judge output. The fragment polls every 5 s (paused while a form inside it has focus); its DB aggregates are cached 30 s. Only a runner-observation read failure returns 5xx; a failed aggregate snapshot still renders `200` with "counts unavailable". |
+| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the role board, recipes & stale work, ASR runners, AI endpoints, judge output. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s and stale counts 5 min, both served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
 | `GET /findings` · `/findings/data` | Findings page + fragment (§2.15). |
 | `GET /book` · `/book/data` | Per-book detail page + fragment. |
 | `GET /track?id=…[&t=<startSec>]` | Per-track detail page. The optional **`t`** (seconds) is the finding "Where" deep-jump: the reader preloads pages `[0 .. the page containing the segment spanning t]`, marks that segment active, and scrolls to it. |
@@ -2235,7 +2260,7 @@ TTL-cached so both render paths share one upstream call. State tokens:
 | Condition | Page label | API `state` |
 |---|---|---|
 | 200 OK + model present (or empty model list) | `✓ READY` (green) | `ready` |
-| 200 OK but configured model not in `/models` | `▲ MODEL NOT LOADED` (amber) | `model_not_loaded` |
+| 200 OK but configured model not in `/models` | `▲ MODEL NOT LOADED` (amber); behind LiteLLM `▲ NOT ALLOWED` — LiteLLM's `/v1/models` lists only the virtual key's allowed models, so the model is off earmark's key allowlist (403 on call) | `model_not_loaded` |
 | non-200 / timeout / unreachable | `✗ OFFLINE` (grey) | `offline` |
 | not probed yet | `? UNKNOWN` (grey) | `unknown` |
 
@@ -2272,26 +2297,40 @@ bottom:
    |---|---|---|
    | `healthy` | ✓ HEALTHY | working; the answering model is the expected one |
    | `idle` | ● IDLE | configured and reachable, nothing to do, no recent failure |
-   | `degraded` | ▲ DEGRADED | works but something is off: a different model answered, the model is not loaded, GPUs held by games while jobs wait, or no success for a while with work waiting |
+   | `degraded` | ▲ DEGRADED | works but something is off: the model is not on the LiteLLM key allowlist (calls 403), a different model answered, the model is not loaded, the asr-runner is stopped on a free GPU, GPUs held by games while jobs wait, or no success for a while with work waiting |
    | `failing` | ✗ FAILING | attempts are failing (judge: newest failure after newest success), or an ASR claim is stalled |
    | `down` | ✗ DOWN | configured but unreachable (red — a configured role that cannot be reached is an alarm, unlike the neutral grey `OFFLINE` of an endpoint row) |
    | `not_configured` | ○ NOT CONFIGURED | no binding |
    | `unknown` | ? UNKNOWN | evidence unavailable (the counts snapshot or runner read failed) |
 
-   Precedence, first match wins. **Judge:** not configured → probe offline
-   (`down`) → last fail after last ok (`failing`) → model not loaded →
-   answered ≠ expected → counts unavailable (`unknown`) → transcripts unjudged
-   and no success in 3 h (3× the hourly backfill; `degraded`) → nothing
-   unjudged (`idle`) → `healthy`. **Embeddings:** not configured → offline →
-   model not loaded → `embed_model` ≠ expected → backlog with nothing embedded
-   in 1 h (`degraded`) → no backlog (`idle`) → `healthy`. **ASR** (from the
-   runner states): any transcribing (`healthy`) → any stalled (`failing`) → any
-   ready (`healthy`) → every probed server busy/offline with one held by a game
-   (`degraded` while jobs are pending, `idle` when nothing is queued) → every
-   probed server offline (`down`) → any idle → no servers (`not_configured`) →
-   `unknown`. Model ids compare case-insensitively and tolerate Ollama
-   `:latest`/`:tag` suffixes; when unpinned, the answer is compared with the
-   requested id.
+   Precedence, first match wins.
+   - **Judge:** not configured → probe offline (`down`) → requested model not
+     on the LiteLLM key allowlist (`degraded`, "every call 403s") → last fail
+     after last ok (`failing`) → model not loaded (behind LiteLLM: "not on
+     earmark's LiteLLM key allowlist (403 on call)") → answered ≠ expected →
+     counts or queue stats unavailable (`unknown`) → transcripts unjudged and
+     no success yet, or none in 3 h (3× the hourly backfill; `degraded`) →
+     nothing unjudged (`idle`; "nothing to judge yet" on an empty library) →
+     `healthy`.
+   - **Embeddings:** not configured → offline (`down`) → not on the key
+     allowlist → model not loaded → `embed_model` ≠ expected (`degraded`) →
+     queue stats unavailable (`unknown`) → backlog with nothing ever embedded,
+     or nothing embedded in 1 h (`degraded`) → no backlog (`idle`) → `healthy`.
+   - **ASR** (from the runner states; `unknown` when the runner observation
+     read failed): any transcribing (`healthy`) → any stalled (`failing`) → any
+     ready (`healthy`) → no probed server usable, one of them a free GPU with
+     the asr-runner stopped (`degraded`, regardless of the queue — `idle` in the
+     `earmark batch` analyze phase, which parks the runner on purpose) → no probed
+     server usable, one held by a game or evicting (`degraded` while jobs are
+     pending, `idle` when nothing is queued) → every probed server offline
+     (`down`) → any idle → no servers (`not_configured`) → `unknown`.
+
+   "answered ≠ expected" compares case-insensitively and treats Ollama's
+   implicit `:latest` as the bare name, but a bare pin does not match an
+   arbitrary tag (`qwen3.8` ≠ `qwen3.8:14b`); when unpinned, the answer is
+   compared with the requested id. A failing judge shows its last error in red
+   under the state; otherwise the last error is a muted "last error" row with
+   its time.
 
    *last ok* on the Judge card is `max(run_metrics.eval_finished_at)`: the
    newest judge success **from any source** (the hourly backfill CronJob,
@@ -2301,24 +2340,65 @@ bottom:
 2. **Recipes & stale work** — every recipe step: current recipe (id, model,
    prompt, since), its pin, and its `stale_work` count (§1.9). Steps with no
    current recipe show *not tracked*. Only counts are read — never rows.
-3. **ASR runners** — the runner cards (state table above, §2.4), the runner
-   version panel (§2.12 self-update; the form pauses polling while focused), a
-   model/runtime/caps table, and transcript provenance grouped by
+3. **ASR runners** — the runner cards (state table above, §2.4; unconfigured
+   history-only hosts only within 30 days), a read-only runner version panel
+   (running / requested / state, §2.12 self-update — the update form itself is
+   in the static shell below the region), a model/runtime/caps table (Runtime
+   and Caps columns hidden while no runner reports them), and transcript
+   provenance grouped by
    (model, runner version, `.nemo` sha256), newest first, at most 8 groups;
    transcripts from a runner that reported no provenance form one *not
    reported* group.
-4. **AI endpoints** — the registry as a table: id, role, type, gateway
+4. **LiteLLM gateway** — one card per distinct LiteLLM gateway and key (see
+   below): readiness, key alias/status/expiry, spend and budget, rpm/tpm
+   limits, the allowed models, and each role's model marked ✓ allowed / ✗ NOT
+   ALLOWED.
+5. **AI endpoints** — the registry as a table: id, role, type, gateway
    (declared, *inferred*, or *direct*), backend, host, model, liveness,
    options. An env-configured judge appears as an unprobed `EVAL_CHAT_*` row.
-5. **Judge output** — judge findings by `coalesce(resolved_model, model)`:
+6. **Judge output** — judge findings by `coalesce(resolved_model, model)`:
    proposed, unanchorable, decided (accepted + rejected + applied + reverted),
    superseded / other (superseded + the patch state `stale`), total.
 
-The aggregates behind roles, recipes, provenance and judge output are read in
-one snapshot cached for 30 s (shared with `GET /api/v1/status` `roles[]`), so
-their cost does not scale with viewers; the header shows how old it is. A
-failed refresh keeps the last good snapshot and is not retried for 30 s; with
-no good snapshot the page shows "counts unavailable" and still returns `200`.
+**Caching.** The page and `GET /api/v1/status` read the same caches, all served
+stale-while-revalidate: a value past its TTL is returned immediately and one
+background refresh starts (single-flight); only the very first load waits, and
+that wait is bounded by the request. A failed refresh keeps the last good value,
+logs once, and is not retried for one TTL.
+
+| Data | TTL | Refresh timeout | Header stamp |
+|---|---|---|---|
+| Aggregates: model activity, current recipes, judge findings, ASR provenance | 30 s | 3 s | "counts as of" |
+| Per-step `stale_work` counts (a full scan of chunks + findings, ≈1.6 s at production size) | 5 min | 30 s | "stale counts as of"; "loading…" for at most 1.5 s on the first load, then shown when ready |
+| LiteLLM gateway readiness + key info | 60 s | 2 s per request | — |
+
+A slow or failed stale count marks only the stale numbers unavailable; with no
+good aggregate snapshot the page shows "counts unavailable" for the sections it
+backs and still returns `200`.
+
+#### LiteLLM gateway
+
+For every distinct LiteLLM gateway the registry routes through (`gateway:
+litellm`, declared or inferred from the host), earmark reads — with **each
+endpoint's own virtual key** (`apiKeyEnv`), never the master key, and never a
+model call:
+
+- `GET <base>/health/readiness` (fallback `GET <base>/health/liveliness`):
+  proxy health and DB connection. No key needed.
+- `GET <base>/key/info` with `Authorization: Bearer <virtual key>` and **no**
+  query parameter: LiteLLM returns the caller's own key — `key_alias`,
+  `models` (the allowlist; empty = all models; `provider/*` wildcards and
+  `all-proxy-models` honored), `spend`, `max_budget`, `budget_duration`,
+  `budget_reset_at`, `expires`, `blocked`, `status`, `tpm_limit`, `rpm_limit`.
+  Only those fields are decoded; the hashed token and every other field are
+  ignored, so no key material is rendered, logged, or returned.
+
+`<base>` is the endpoint `baseURL` without a trailing `/v1`. Requests use a 2 s
+timeout, no redirects, http/https only, and a 64 KB body cap. A 401/403 from
+`/key/info` degrades the gateway card ("key info not readable by earmark's
+key"); roles are then not checked against the allowlist (`modelAllowed:
+null`). An `allowedModels` entry `all-team-models` cannot be resolved from the
+key alone, so roles behind it are reported as unknown rather than allowed.
 
 ---
 
