@@ -2382,7 +2382,9 @@ bottom:
 
 Each table's description is a paragraph above its scroll container (not a
 `<caption>`, which would scroll out of view on a phone) and labels the table
-via `aria-labelledby`. Times are relative, with the absolute UTC time on hover.
+via `aria-labelledby`. Times are relative, with the absolute UTC time on hover —
+except the header's "updated HH:MM:SS UTC" render clock, which stays absolute
+because it is the one value that visibly freezes when polling stops.
 
 **Caching.** The page and `GET /api/v1/status` read the same caches, all served
 stale-while-revalidate: a value past its TTL is returned immediately and one

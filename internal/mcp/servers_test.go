@@ -464,7 +464,7 @@ func TestBuildServerViews_StateGlyph(t *testing.T) {
 	if len(views) != 2 {
 		t.Fatalf("want 2 views, got %d", len(views))
 	}
-	for _, tc := range []struct{ glyph, label, token string }{{"○", "IDLE", "idle"}, {"?", "NOT SEEN", "not_seen"}} {
+	for _, tc := range []struct{ glyph, label, token string }{{"●", "IDLE", "idle"}, {"?", "NOT SEEN", "not_seen"}} {
 		var v *serverView
 		for i := range views {
 			if views[i].State.Label == tc.label {

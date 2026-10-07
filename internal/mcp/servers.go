@@ -447,7 +447,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 		if host.LastFinished != nil {
 			sub = "idle — last active " + humanizeSince(now.Sub(*host.LastFinished))
 		}
-		v.State = serverState{Label: "IDLE", Glyph: "○", Class: "state-idle", Dot: "blue", Sub: sub}
+		v.State = serverState{Label: "IDLE", Glyph: "●", Class: "state-idle", Dot: "blue", Sub: sub}
 	default:
 		v.State = serverState{Label: "NOT SEEN", Glyph: "?", Class: "state-unknown", Dot: "grey",
 			Sub: "configured — no activity observed yet"}
@@ -517,9 +517,9 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 // ─── Templates ────────────────────────────────────────────────────────────────
 
 // serversPage is the static Models shell. Only #models-region is polled; the
-// About text lives here, outside the swap, so it does not collapse every 5 s.
-// Polling pauses while a form inside the region has focus, so the runner-version
-// input is not wiped mid-typing.
+// About text and the runner-update form live here, OUTSIDE the region, so a
+// poll can neither collapse About nor wipe a version the operator is typing.
+// The form follows the region directly, under its last section (ASR runners).
 var serversPage = mustPage(`{{define "content"}}
 <p class="subtitle">Each pipeline role: what is configured, what actually answered, whether it is healthy, and how much output predates the current recipe.</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
@@ -558,7 +558,7 @@ var serversPage = mustPage(`{{define "content"}}
 {{end}}`)
 
 var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).Funcs(modelsFuncs).Parse(`
-<div class="updated">updated <span title="{{.RenderedAt}}">just now</span>{{if .CountsErr}} · <span class="err">counts unavailable{{if .CountsAge}} (last good <span title="{{.CountsAt}}">{{.CountsAge}}</span>){{end}}</span>{{else if .CountsAge}} · counts as of <span title="{{.CountsAt}}">{{.CountsAge}}</span>{{end}}{{if .StaleErr}} · <span class="err">stale counts unavailable{{if .StaleAge}} (last good <span title="{{.StaleAt}}">{{.StaleAge}}</span>){{end}}</span>{{else if .StaleAge}} · stale counts as of <span title="{{.StaleAt}}">{{.StaleAge}}</span>{{else if .StalePending}} · stale counts loading…{{end}}</div>
+<div class="updated">updated {{.RenderedAt}}{{if .CountsErr}} · <span class="err">counts unavailable{{if .CountsAge}} (last good <span title="{{.CountsAt}}">{{.CountsAge}}</span>){{end}}</span>{{else if .CountsAge}} · counts as of <span title="{{.CountsAt}}">{{.CountsAge}}</span>{{end}}{{if .StaleErr}} · <span class="err">stale counts unavailable{{if .StaleAge}} (last good <span title="{{.StaleAt}}">{{.StaleAge}}</span>){{end}}</span>{{else if .StaleAge}} · stale counts as of <span title="{{.StaleAt}}">{{.StaleAge}}</span>{{else if .StalePending}} · stale counts loading…{{end}}</div>
 
 <section class="section" aria-labelledby="roles-title">
   <h2 class="section-title" id="roles-title">Roles</h2>
@@ -810,7 +810,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
     {{if eq .Key "embeddings"}}<dt>backlog</dt><dd>{{if .StatsKnown}}{{commafy .Backlog}} {{plural .Backlog "transcript" "transcripts"}} awaiting embedding{{else}}—{{end}}</dd>{{end}}
   {{end}}
     {{if .HumanDecided}}<dt>decided by humans</dt><dd>{{commafyPtr .HumanDecided}}</dd>{{end}}
-    <dt>stale</dt><dd>{{if not .StaleKnown}}{{if .StalePending}}<span class="time-muted">counting…</span>{{else}}—{{end}}{{else if .StaleTracked}}<a href="#recipe-{{.Step}}">{{commafy64Ptr .Stale}} rows</a>{{else}}<span class="time-muted">not tracked</span>{{end}}</dd>
+    <dt>stale</dt><dd>{{if not .StaleKnown}}{{if .StalePending}}<span class="time-muted">counting…</span>{{else}}—{{end}}{{else if .StaleTracked}}{{if .CountsKnown}}<a href="#recipe-{{.Step}}">{{commafy64Ptr .Stale}} rows</a>{{else}}{{commafy64Ptr .Stale}} rows{{end}}{{else}}<span class="time-muted">not tracked</span>{{end}}</dd>
   </dl>
 </div>
 {{end}}
@@ -864,8 +864,9 @@ type endpointTableRow struct {
 
 // modelsData backs the Models fragment (/servers/data).
 type modelsData struct {
-	// RenderedAt / CountsAt / StaleAt are absolute UTC stamps for the header's
-	// title tooltips; the visible text is relative.
+	// RenderedAt is the render clock ("15:04:05 UTC"), shown as-is: it is the
+	// one header value that visibly freezes when polling stops. CountsAt /
+	// StaleAt are absolute UTC stamps for the relative ages' title tooltips.
 	RenderedAt string
 	// CountsAge is how old the cached aggregate snapshot is ("12s ago"); ""
 	// when none ever loaded. CountsErr is true when the latest refresh failed —
@@ -954,7 +955,7 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 	roles, ev := s.modelRoles(ctx, stats, runners, true, eps, gwByEndpoint, now)
 
 	data := modelsData{
-		RenderedAt:   absTime(now),
+		RenderedAt:   now.UTC().Format("15:04:05 UTC"),
 		CountsErr:    ev.SnapErr != nil,
 		CountsKnown:  ev.Snap != nil,
 		StaleErr:     ev.StaleErr != nil,

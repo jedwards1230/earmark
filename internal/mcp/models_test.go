@@ -420,7 +420,8 @@ func TestServersDataScenarios(t *testing.T) {
 			// still render.
 			wantContains: []string{"counts unavailable", "counts unavailable — see server logs", "call outcomes unavailable", "? UNKNOWN",
 				"· stale counts as of", "32,337 rows"},
-			wantAbsent: []string{"· counts as of", "stale counts unavailable"},
+			// no recipes table to link to: the stale count is plain text
+			wantAbsent: []string{"· counts as of", "stale counts unavailable", `href="#recipe-`},
 		},
 		{
 			scenario: demoScenarioGatewayAllowlist,
@@ -483,6 +484,33 @@ func TestServersPageShell(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "Set <code>CONTROL_API_TOKEN</code> to enable runner updates")
 }
 
+// TestRunnerUpdateFormOutsidePolledRegion: the runner-update form must never be
+// in the polled fragment (a 5 s swap would wipe the typed version); on the full
+// page it follows #models-region's closing tag.
+func TestRunnerUpdateFormOutsidePolledRegion(t *testing.T) {
+	srv := newDemoServer(":0", "active")
+	h := srv.buildMux()
+	get := func(path string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		require.Equal(t, http.StatusOK, w.Code, path)
+		return w.Body.String()
+	}
+	frag := get("/servers/data")
+	assert.NotContains(t, frag, `id="runner-version"`)
+	assert.NotContains(t, frag, "<form")
+
+	page := get("/servers")
+	region := strings.Index(page, `<div id="models-region"`)
+	require.Positive(t, region)
+	regionEnd := strings.Index(page[region:], "</div>")
+	require.Positive(t, regionEnd)
+	form := strings.Index(page, `id="runner-version"`)
+	require.Positive(t, form)
+	assert.Greater(t, form, region+regionEnd, "the form follows the closed polled region")
+}
+
 // TestServersData_StaleCountFailureIsIsolated: a failing stale count marks only
 // the stale numbers unavailable; recipes, activity and findings still render.
 func TestServersData_StaleCountFailureIsIsolated(t *testing.T) {
@@ -493,11 +521,18 @@ func TestServersData_StaleCountFailureIsIsolated(t *testing.T) {
 	out := w.Body.String()
 	assert.Contains(t, out, "stale counts unavailable")
 	assert.Contains(t, out, "· counts as of")
-	assert.Contains(t, out, "Not tracked: asr", "the recipes section still renders")
+	assert.Contains(t, out, `id="recipe-propose"`, "the recipes table still renders")
+	assert.Regexp(t, `id="recipe-propose">\s*<th scope="row" class="mono">propose</th>\s*<td>Judge</td>\s*<td class="num"><span class="time-muted">—</span></td>`, out,
+		"the stale cell is unknown (—), not a count")
+	assert.Contains(t, out, "Not tracked: asr")
 	assert.NotContains(t, out, "counts unavailable — see server logs")
 }
 
 type staleErrDB struct{ SimpleMockDB }
+
+func (*staleErrDB) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) {
+	return []db.CurrentRecipe{{Step: recipe.StepPropose, RecipeID: strings.Repeat("a", 64), ModelAlias: "earmark-judge", UpdatedAt: testNow}}, nil
+}
 
 func (*staleErrDB) StaleItemCounts(context.Context) (map[string]int64, error) {
 	return nil, errors.New("statement timeout")

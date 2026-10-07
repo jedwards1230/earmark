@@ -96,7 +96,7 @@ func TestBuildEndpointViews_NilCfg(t *testing.T) {
 // endpoint that HAS a gateway, role and options exercises that dispatch path.
 func TestServersFragmentRendersEndpointMethods(t *testing.T) {
 	data := modelsData{
-		RenderedAt:  "2026-01-01 00:00:00 UTC",
+		RenderedAt:  "00:00:00 UTC",
 		ShowOptions: true,
 		Endpoints: []endpointView{{
 			ID:      "litellm-judge",
