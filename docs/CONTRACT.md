@@ -1979,7 +1979,7 @@ ready` and `roles[judge].state = failing`.
   "expected": "anthropic/claude-haiku-4-5-20251001", // MODELS_FILE pin; omitted when unpinned
   "answered": "qwen3.8",        // what actually answered most recently
   "answeredMatch": "mismatch",  // match | mismatch | unreported | none | unchecked
-  "modelAllowed": true,         // requested model on the LiteLLM key allowlist; null = not behind a readable LiteLLM key
+  "modelAllowed": true,         // on the LiteLLM key allowlist, reconciled with /v1/models (see §2.14); null = unknown
   "lastOkAt": "2026-10-06T00:12:00Z",   // null = never / unknown
   "lastFailedAt": null,
   "lastError": null,            // judge only; truncated to 300 chars
@@ -2054,7 +2054,7 @@ unchanged.):
 | `POST` | `/actions/book-requeue?dir=…` | htmx | re-transcribe one book |
 | `POST` | `/actions/pause` / `/actions/resume` | htmx + token | toggle the runner pause flag (Pipeline page) |
 | `POST` | `/actions/run` (form/query `n≥1`) | htmx + token | arm a bounded run of N claims then auto-pause — sets `run_limit=N` then unpauses (limit before unpause, mirroring `POST /api/v1/pipeline/run`) |
-| `POST` | `/actions/runner-update` (form/query `version`) | htmx + token | request the runner self-update to `version` (or clear when empty); writes `desired_runner_version` + `'requested'` and re-renders the `/servers` (Models) fragment (the runner version panel) |
+| `POST` | `/actions/runner-update` (form body `version`, else query `?version=`) | htmx + token | request the runner self-update to `version` (or clear when empty); writes `desired_runner_version` + `'requested'` and re-renders the `/servers` (Models) fragment (the runner version panel) |
 | `POST` | `/actions/run-clear` | htmx + token | clear the bounded run (`run_limit→NULL`) without touching the pause flag |
 | `POST` | `/actions/eval?dir=…` | htmx + token | run the LLM judge over one book (async, §2.15) |
 | `POST` | `/actions/eval-sample?n=N` | htmx + token | run the LLM judge over an N-chunk sample (async, §2.15) |
@@ -2343,7 +2343,9 @@ bottom:
 3. **ASR runners** — the runner cards (state table above, §2.4; unconfigured
    history-only hosts only within 30 days), a read-only runner version panel
    (running / requested / state, §2.12 self-update — the update form itself is
-   in the static shell below the region), a model/runtime/caps table (Runtime
+   in the static shell below the region; it posts `version` in the form body,
+   and its separate "Clear request" control posts an explicit empty `version`,
+   never the typed text), a model/runtime/caps table (Runtime
    and Caps columns hidden while no runner reports them), and transcript
    provenance grouped by
    (model, runner version, `.nemo` sha256), newest first, at most 8 groups;
@@ -2364,13 +2366,15 @@ bottom:
 stale-while-revalidate: a value past its TTL is returned immediately and one
 background refresh starts (single-flight); only the very first load waits, and
 that wait is bounded by the request. A failed refresh keeps the last good value,
-logs once, and is not retried for one TTL.
+logs once, and is not retried for one TTL (a failed *first* stale-count load
+retries after 30 s). A panic inside a background load is recovered and recorded
+as that refresh's error.
 
 | Data | TTL | Refresh timeout | Header stamp |
 |---|---|---|---|
 | Aggregates: model activity, current recipes, judge findings, ASR provenance | 30 s | 3 s | "counts as of" |
 | Per-step `stale_work` counts (a full scan of chunks + findings, ≈1.6 s at production size) | 5 min | 30 s | "stale counts as of"; "loading…" for at most 1.5 s on the first load, then shown when ready |
-| LiteLLM gateway readiness + key info | 60 s | 2 s per request | — |
+| LiteLLM gateway readiness + key info | 60 s | 2 s per request (≤ 3 requests) | — |
 
 A slow or failed stale count marks only the stale numbers unavailable; with no
 good aggregate snapshot the page shows "counts unavailable" for the sections it
@@ -2397,8 +2401,22 @@ model call:
 timeout, no redirects, http/https only, and a 64 KB body cap. A 401/403 from
 `/key/info` degrades the gateway card ("key info not readable by earmark's
 key"); roles are then not checked against the allowlist (`modelAllowed:
-null`). An `allowedModels` entry `all-team-models` cannot be resolved from the
-key alone, so roles behind it are reported as unknown rather than allowed.
+null`).
+
+**Allowlist verdict.** The endpoint's own `GET /v1/models` probe is
+authoritative — behind LiteLLM it lists exactly what the virtual key may call —
+and the `/key/info` allowlist never overrides it:
+
+| Allowlist (wildcard-aware) | `/v1/models` probe | `modelAllowed` |
+|---|---|---|
+| allows | any | `true` |
+| does not match | lists the model (`ready`) | `true` — the entry was an access group earmark can't expand |
+| does not match | does not list it (`model_not_loaded`) | `false` → role `degraded`, "every call 403s" |
+| does not match | offline / not run | `null` — no deny without the probe |
+| team key with an empty list (inherits the team's models), `all-team-models`, empty requested model, unreadable key info | — | `null` |
+
+The first load of a gateway's status is waited for at most 1.5 s per render
+(shared across gateways); after that it is served from cache.
 
 ---
 
