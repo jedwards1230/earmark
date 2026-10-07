@@ -315,3 +315,37 @@ func TestProbeGateways_FirstLoadIsBounded(t *testing.T) {
 	require.Len(t, sts, 1)
 	assert.False(t, sts[0].Probed, "still loading → not probed yet")
 }
+
+// TestBuildGatewayViews_RoleModelsShownOnlyWhenNotAllAllowed: the per-role
+// rows on the gateway card only repeat "allowed" when every role is allowed,
+// so they show only when one is denied or could not be checked. "used by"
+// names roles by title, and an unbound endpoint by its id.
+func TestBuildGatewayViews_RoleModelsShownOnlyWhenNotAllAllowed(t *testing.T) {
+	st := gatewayStatus{Probed: true, Reachable: true, KeyInfoOK: true}
+	targets := []gatewayTarget{{Endpoints: []config.AIEndpoint{{ID: "embed-ep"}, {ID: "judge-ep"}, {ID: "spare-ep"}}}}
+	tests := []struct {
+		name        string
+		judgeAllow  string
+		wantShow    bool
+		wantJudgeMk string
+	}{
+		{"all allowed → hidden", "allowed", false, "✓ allowed"},
+		{"one denied → shown", "denied", true, "✗ NOT ALLOWED"},
+		{"one unchecked → shown", "", true, "? not checked"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			roles := []roleCard{
+				{Title: "Embeddings", EndpointID: "embed-ep", Requested: "nomic", AllowState: "allowed"},
+				{Title: "Judge", EndpointID: "judge-ep", Requested: "earmark-judge", AllowState: tc.judgeAllow},
+			}
+			v := buildGatewayViews([]gatewayStatus{st}, targets, roles, testNow)
+			require.Len(t, v, 1)
+			assert.Equal(t, tc.wantShow, v[0].ShowRoleModels)
+			assert.Equal(t, []string{"Embeddings", "Judge", "spare-ep"}, v[0].UsedBy)
+			require.Len(t, v[0].RoleModels, 2)
+			assert.Equal(t, "Judge", v[0].RoleModels[1].Role)
+			assert.Equal(t, tc.wantJudgeMk, v[0].RoleModels[1].Mark)
+		})
+	}
+}

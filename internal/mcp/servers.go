@@ -32,6 +32,7 @@ import (
 // serverState is the derived liveness of one server, with its CSS/dot classes.
 type serverState struct {
 	Label string // TRANSCRIBING / READY / BUSY / STALLED / OFFLINE / IDLE / NOT SEEN
+	Glyph string // ✓ ▲ ✗ ○ ? — paired with the word so state is never color alone
 	Class string // state-running / state-busy / state-stalled / state-offline / state-idle / state-unknown
 	Dot   string // green / amber / red / grey / blue
 	Sub   string // human one-liner
@@ -62,6 +63,9 @@ type serverView struct {
 	JobsDone    int    // run_metrics rows attributed to this server
 	AvgProc     string // humanized mean wall-clock, or "—"
 	LastActive  string // rel time of last completion, or "—"
+	// LastActiveAt is the absolute last completion (zero when unknown), for the
+	// "last active" cell's title.
+	LastActiveAt time.Time
 
 	// Backend descriptor (CONTRACT §2.13). Family/Runtime resolve observed >
 	// configured, same precedence as Model. *Source records which won so the
@@ -131,6 +135,39 @@ func (v serverView) capsSkippedReasons() map[string]string {
 		}
 	}
 	return m
+}
+
+// AppliedCaps is the capability strip trimmed to what the backend supports
+// (applied/advertised); the full list, declined ones included, is CapsTitle.
+func (v serverView) AppliedCaps() []capBadge {
+	var out []capBadge
+	for _, b := range v.Caps {
+		if b.Applied {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// CapsTitle renders every known capability for the Caps cell's tooltip:
+// "words ✓ · bias ✗ (reason) · …", prefixed with where the data came from.
+func (v serverView) CapsTitle() string {
+	src := "applied by the most recent run"
+	if v.CapsSource == "configured" {
+		src = "declared in ASR_SERVERS (no run has reported applied caps yet)"
+	}
+	parts := make([]string, 0, len(v.Caps))
+	for _, b := range v.Caps {
+		p := b.Label + " ✓"
+		if !b.Applied {
+			p = b.Label + " ✗"
+			if b.Reason != "" {
+				p += " (" + b.Reason + ")"
+			}
+		}
+		parts = append(parts, p)
+	}
+	return src + ": " + strings.Join(parts, " · ")
 }
 
 // capStripOrder fixes the badge order so two backends are visually comparable
@@ -392,27 +429,27 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 		if f := path.Base(live.CurrentFile); f != "" && f != "." && f != "/" {
 			sub = "transcribing " + f
 		}
-		v.State = serverState{Label: "TRANSCRIBING", Class: "state-running", Dot: "green", Sub: sub}
+		v.State = serverState{Label: "TRANSCRIBING", Glyph: "✓", Class: "state-running", Dot: "green", Sub: sub}
 	case live != nil:
-		v.State = serverState{Label: "STALLED", Class: "state-stalled", Dot: "red",
+		v.State = serverState{Label: "STALLED", Glyph: "✗", Class: "state-stalled", Dot: "red",
 			Sub: "claim heartbeat stale (" + humanizeSince(now.Sub(live.LastHeartbeat)) + ") — runner may have crashed"}
 	case probe != nil && !probe.Reachable:
-		v.State = serverState{Label: "OFFLINE", Class: "state-offline", Dot: "grey",
+		v.State = serverState{Label: "OFFLINE", Glyph: "✗", Class: "state-offline", Dot: "grey",
 			Sub: "host unreachable (gpu-arbiter not responding)"}
 	case probe != nil && probe.ready():
-		v.State = serverState{Label: "READY", Class: "state-running", Dot: "green",
+		v.State = serverState{Label: "READY", Glyph: "✓", Class: "state-running", Dot: "green",
 			Sub: "connected — GPU available" + vramSuffix(probe)}
 	case probe != nil:
-		v.State = serverState{Label: "BUSY", Class: "state-busy", Dot: "amber",
+		v.State = serverState{Label: "BUSY", Glyph: "▲", Class: "state-busy", Dot: "amber",
 			Sub: busySubtext(probe)}
 	case host != nil && host.JobsDone > 0:
 		sub := "idle — no live claim"
 		if host.LastFinished != nil {
 			sub = "idle — last active " + humanizeSince(now.Sub(*host.LastFinished))
 		}
-		v.State = serverState{Label: "IDLE", Class: "state-idle", Dot: "blue", Sub: sub}
+		v.State = serverState{Label: "IDLE", Glyph: "○", Class: "state-idle", Dot: "blue", Sub: sub}
 	default:
-		v.State = serverState{Label: "NOT SEEN", Class: "state-unknown", Dot: "grey",
+		v.State = serverState{Label: "NOT SEEN", Glyph: "?", Class: "state-unknown", Dot: "grey",
 			Sub: "configured — no activity observed yet"}
 	}
 	v.State.Token = strings.ReplaceAll(strings.ToLower(v.State.Label), " ", "_")
@@ -465,6 +502,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 		}
 		if host.LastFinished != nil {
 			v.LastActive = humanizeSince(now.Sub(*host.LastFinished))
+			v.LastActiveAt = *host.LastFinished
 		}
 	}
 	if v.AvgProc == "" {
@@ -483,7 +521,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 // Polling pauses while a form inside the region has focus, so the runner-version
 // input is not wiped mid-typing.
 var serversPage = mustPage(`{{define "content"}}
-<p class="subtitle">Each pipeline role: what is configured, what actually answered, whether it is healthy, and how much output predates the current recipe. Auto-refreshes every 5&thinsp;s; counts every 30&thinsp;s; stale counts every 5&thinsp;min.</p>
+<p class="subtitle">Each pipeline role: what is configured, what actually answered, whether it is healthy, and how much output predates the current recipe.</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 <div id="models-region"
      hx-get="/servers/data" hx-trigger="load, every 5s" hx-swap="innerHTML"
@@ -510,150 +548,60 @@ var serversPage = mustPage(`{{define "content"}}
 </section>
 <details class="about-page">
   <summary>About this page</summary>
-  <p class="server-note"><strong>Roles.</strong> One card per pipeline role. <em>requested</em> is the model id earmark sends; <em>pinned</em> is the <code>MODELS_FILE</code> expectation; <em>answered</em> is what the endpoint reported serving the call. A different answer (≠ expected) usually means a gateway fallback, and its output is stamped with a different recipe — i.e. stale. Role health folds in call outcomes, so a gateway that lists the model but fails every call shows <em>FAILING</em> here while its endpoint row still reads <em>READY</em>.</p>
+  <p class="server-note"><strong>Roles.</strong> One card per configured pipeline role; roles with no binding are listed on one line under the cards. <em>requested</em> is the model id earmark sends; <em>pinned</em> (shown only when set) is the <code>MODELS_FILE</code> expectation; <em>answered</em> is what the endpoint reported serving the call. A different answer (≠ expected) usually means a gateway fallback, and its output is stamped with a different recipe — i.e. stale. Role health folds in call outcomes, so a gateway that lists the model but fails every call shows <em>FAILING</em> here while its endpoint row still reads <em>lists model</em>. <em>HEALTHY · idle</em> is a working role with nothing to do.</p>
   <p class="server-note"><em>last ok</em> on the Judge card is the newest judge success from any source (the hourly backfill CronJob, in-pipeline judging, the dashboard). earmark records no per-backfill-run marker.</p>
-  <p class="server-note"><strong>Recipes &amp; stale work.</strong> A recipe is everything that determined a step's output (code, model, prompt). Stale rows were made under any recipe other than the current one; legacy rows from before provenance count as stale by design and converge as the work is redone. Recipes and activity are cached for 30&thinsp;s; stale counts scan the whole library, so they are cached for 5&thinsp;min.</p>
-  <p class="server-note"><strong>ASR runners.</strong> The model table prefers <em>observed</em> values (what a run reported in <code>run_metrics</code>) over the <em>configured</em> <code>ASR_SERVERS</code> expectation, marked <em>(expected)</em> until a run reports. A runner host that is not in <code>ASR_SERVERS</code> appears only while it holds a claim or transcribed in the last 30 days. Servers with a <code>gpuArbiterUrl</code> show live readiness from gpu-arbiter: <em>ready</em>, <em>busy</em> (GPU held by a game, or free with the asr-runner stopped), or <em>offline</em>; others fall back to <em>idle</em>/<em>not&nbsp;seen</em> inferred from job history. The runner claims jobs itself — nothing here routes work.</p>
-  <p class="server-note"><strong>LiteLLM gateway.</strong> For endpoints behind LiteLLM, earmark reads the proxy's readiness and its own virtual key's <code>/key/info</code> (alias, allowed models, spend, budget, limits) with that key — never the master key, and never a model call. A role whose model is not on the key's allowlist is DEGRADED: every call to it 403s.</p>
-  <p class="server-note"><strong>AI endpoints.</strong> The <code>AI_ENDPOINTS</code> registry (<code>AI_ROLES</code> binds each to a role). Liveness is a <code>GET /models</code> probe only: <em>ready</em>, <em>model not loaded</em> (behind LiteLLM: not on the key allowlist), or <em>offline</em>. <em>Gateway</em> is the declared <code>gateway</code> field, or LiteLLM inferred from the host name. The legacy <code>EMBEDDINGS_BASE_URL</code>/<code>EMBEDDINGS_MODEL</code> vars appear as a synthesized <code>_legacy</code> endpoint; a judge configured from <code>EVAL_CHAT_*</code> appears as an unprobed <code>EVAL_CHAT_*</code> row.</p>
+  <p class="server-note"><strong>Recipes &amp; stale work.</strong> A recipe is everything that determined a step's output (code, model, prompt). Stale rows were made under any recipe other than the current one; legacy rows from before provenance count as stale by design and converge as the work is redone. Only steps with a current recipe are tracked; the rest are listed on one <em>Not tracked</em> line. Recipes and activity are cached for 30&thinsp;s; stale counts scan the whole library, so they are cached for 5&thinsp;min. The page itself refreshes every 5&thinsp;s.</p>
+  <p class="server-note"><strong>LiteLLM gateway.</strong> For endpoints behind LiteLLM, earmark reads the proxy's readiness and its own virtual key's <code>/key/info</code> (alias, allowed models, spend, budget, limits) with that key — never the master key, and never a model call. A role whose model is not on the key's allowlist is DEGRADED: every call to it 403s; each role's model is listed on the gateway card only when one is not allowed (or cannot be checked).</p>
+  <p class="server-note"><strong>AI endpoints.</strong> The <code>AI_ENDPOINTS</code> registry (<code>AI_ROLES</code> binds each to a role). Liveness is a <code>GET /models</code> probe only: <em>lists model</em>, <em>model not listed</em> (behind LiteLLM: <em>not allowed</em> — not on the key allowlist), or <em>unreachable</em>. <em>Gateway</em> is the declared <code>gateway</code> field, or LiteLLM inferred from the host name. The legacy <code>EMBEDDINGS_BASE_URL</code>/<code>EMBEDDINGS_MODEL</code> vars appear as a synthesized <code>_legacy</code> endpoint; a judge configured from <code>EVAL_CHAT_*</code> appears as an unprobed <code>EVAL_CHAT_*</code> row.</p>
+  <p class="server-note"><strong>ASR runners.</strong> The model table prefers <em>observed</em> values (what a run reported in <code>run_metrics</code>) over the <em>configured</em> <code>ASR_SERVERS</code> expectation, marked <em>(expected)</em> until a run reports. <em>Caps</em> lists the capabilities a backend supports; hover for the full list, declined ones and why. A runner host that is not in <code>ASR_SERVERS</code> appears only while it holds a claim or transcribed in the last 30 days. Servers with a <code>gpuArbiterUrl</code> show live readiness from gpu-arbiter: <em>ready</em>, <em>busy</em> (GPU held by a game, or free with the asr-runner stopped), or <em>offline</em>; others fall back to <em>idle</em>/<em>not&nbsp;seen</em> inferred from job history. The runner claims jobs itself — nothing here routes work.</p>
 </details>
 {{end}}`)
 
 var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).Funcs(modelsFuncs).Parse(`
-<div class="updated">updated {{.RenderedAt}}{{if .CountsErr}} · <span class="err">counts unavailable{{if .CountsAge}} (last good {{.CountsAge}}){{end}}</span>{{else if .CountsAge}} · counts as of {{.CountsAge}}{{end}}{{if .StaleErr}} · <span class="err">stale counts unavailable{{if .StaleAge}} (last good {{.StaleAge}}){{end}}</span>{{else if .StaleAge}} · stale counts as of {{.StaleAge}}{{else if .StalePending}} · stale counts loading…{{end}}</div>
+<div class="updated">updated <span title="{{.RenderedAt}}">just now</span>{{if .CountsErr}} · <span class="err">counts unavailable{{if .CountsAge}} (last good <span title="{{.CountsAt}}">{{.CountsAge}}</span>){{end}}</span>{{else if .CountsAge}} · counts as of <span title="{{.CountsAt}}">{{.CountsAge}}</span>{{end}}{{if .StaleErr}} · <span class="err">stale counts unavailable{{if .StaleAge}} (last good <span title="{{.StaleAt}}">{{.StaleAge}}</span>){{end}}</span>{{else if .StaleAge}} · stale counts as of <span title="{{.StaleAt}}">{{.StaleAge}}</span>{{else if .StalePending}} · stale counts loading…{{end}}</div>
 
 <section class="section" aria-labelledby="roles-title">
   <h2 class="section-title" id="roles-title">Roles</h2>
-  <div class="panels role-panels">
-  {{range .Roles}}{{template "roleCard" .}}{{end}}
-  </div>
+  {{with .RoleCards}}<div class="panels role-panels">
+  {{range .}}{{template "roleCard" .}}{{end}}
+  </div>{{end}}
+  {{with .UnconfiguredRoles}}<p class="server-note roles-unconfigured">○ Not configured: {{range $i, $r := .}}{{if $i}}, {{end}}{{$r.Title}}{{if $r.HasModel}} <span class="time-muted">({{$r.Health.Sub}})</span>{{else if $r.HumanDecided}} <span class="time-muted">(decided by humans {{commafyPtr $r.HumanDecided}})</span>{{end}}{{end}}</p>{{end}}
 </section>
 
 <section class="section" aria-labelledby="recipes-title">
   <h2 class="section-title" id="recipes-title">Recipes &amp; stale work</h2>
-  {{if .CountsKnown}}
+  {{if not .CountsKnown}}<p class="lib-empty">counts unavailable — see server logs</p>
+  {{else}}
+  {{if .Recipes}}
+  <p class="server-note table-lead" id="recipes-note">Current recipe per tracked step and the output rows made under any other recipe. Legacy rows (pre-provenance) count as stale by design and converge as work is redone.</p>
   <div class="table-wrap">
-  <table class="recipes-table">
-    <caption class="caption-prose">Current recipe per step and output rows made under any other recipe. Legacy rows (pre-provenance) count as stale by design and converge as work is redone.{{if .NoRecipes}} Current recipes are registered by <code>earmark monitor</code> at startup.{{end}}</caption>
+  <table class="recipes-table" aria-labelledby="recipes-note">
     <thead><tr>
       <th scope="col">Step</th>
       <th scope="col">Role</th>
       <th scope="col" class="num">Stale rows</th>
       <th scope="col">Current recipe</th>
       <th scope="col">Model</th>
-      <th scope="col">Prompt</th>
-      <th scope="col">Since</th>
-      <th scope="col" title="the current recipe's model vs the MODELS_FILE expected_model pin">Pin</th>
+      <th scope="col" class="hide-sm">Prompt</th>
+      <th scope="col" class="hide-sm">Since</th>
     </tr></thead>
     <tbody>
     {{range .Recipes}}
     <tr id="recipe-{{.Step}}">
       <th scope="row" class="mono">{{.Step}}</th>
       <td>{{if .RoleTitle}}{{.RoleTitle}}{{else}}<span class="time-muted">—</span>{{end}}</td>
-      <td class="num">{{if not .StaleKnown}}<span class="time-muted">{{if $.StalePending}}counting…{{else}}—{{end}}</span>{{else if .Stale}}<strong>{{commafy64Ptr .Stale}}</strong>{{with .ConvergeNote}}<div class="time-muted">{{.}}</div>{{end}}{{else}}<span class="time-muted">not tracked</span>{{end}}</td>
-      {{if .Current}}
+      <td class="num">{{if not .StaleKnown}}<span class="time-muted">{{if $.StalePending}}counting…{{else}}—{{end}}</span>{{else if .Stale}}<strong{{with .ConvergeNote}} title="converges {{.}}"{{end}}>{{commafy64Ptr .Stale}}</strong>{{with .ConvergeNote}}<span class="sr-only"> — converges {{.}}</span>{{end}}{{else}}<span class="time-muted">—</span>{{end}}</td>
       <td class="mono" title="{{.RecipeID}}">{{.RecipeShort}}</td>
       <td class="mono">{{or .Model "—"}}</td>
-      <td>{{or .PromptVersion "—"}}</td>
-      <td class="time-muted" title="{{formatTime .Since}}">{{relTime .Since}}</td>
-      {{else}}
-      <td colspan="4" class="time-muted"><em>{{.NoneNote}}</em></td>
-      {{end}}
-      <td>{{if .Pin}}<span class="mono">{{.Pin}}</span>{{if eq .PinMatch "match"}} <span class="match-ok" title="current recipe matches the pin">✓<span class="sr-only"> recipe matches pin</span></span>{{else if eq .PinMatch "mismatch"}} <span class="badge mismatch" title="the current recipe's model differs from the pin">≠<span class="sr-only"> recipe differs from pin</span></span>{{end}}{{else if .Current}}<span class="time-muted">unpinned</span>{{else}}<span class="time-muted">—</span>{{end}}</td>
+      <td class="hide-sm">{{or .PromptVersion "—"}}</td>
+      <td class="time-muted hide-sm" title="{{formatTime .Since}}">{{relTime .Since}}</td>
     </tr>
     {{end}}
     </tbody>
   </table>
   </div>
-  {{else}}<p class="lib-empty">counts unavailable — see server logs</p>{{end}}
-</section>
-
-<section class="section" aria-labelledby="runners-title">
-  <h2 class="section-title" id="runners-title">ASR runners ({{len .Runners}})</h2>
-  {{if or .Runners .RunnerUpdate}}
-  <div class="panels">
-  {{range .Runners}}
-    <div class="panel server-card {{.State.Class}}">
-      <div class="server-head">
-        <span class="server-name"><span class="dot {{.State.Dot}}"></span>{{.Name}}</span>
-        {{if .Role}}<span class="badge role-{{.Role}}">{{.Role}}</span>{{end}}
-        {{if not .Configured}}<span class="badge unconfigured" title="observed in the data but not in ASR_SERVERS">unconfigured</span>{{end}}
-      </div>
-      <div class="server-state {{.State.Class}}">{{.State.Label}}</div>
-      <div class="server-sub">{{.State.Sub}}</div>
-      {{if and .Host (ne .Host .Name)}}<div class="server-host">{{.Host}}</div>{{end}}
-    </div>
-  {{end}}
-  {{with .RunnerUpdate}}
-    <div class="panel server-card">
-      <div class="server-head">
-        <span class="server-name">runner version</span>
-        {{if .Available}}<span class="badge unconfigured" title="a different version is requested">update {{if eq .State "updating"}}in progress{{else if eq .State "failed"}}failed{{else}}requested{{end}}</span>{{end}}
-      </div>
-      <div class="server-sub">running <code>{{if .Running}}{{.Running}}{{else}}unknown{{end}}</code></div>
-      {{if .Desired}}<div class="server-sub">requested <code>{{.Desired}}</code>{{if .State}} · {{.State}}{{end}}</div>{{end}}
-      {{if .Error}}<div class="server-sub err">{{.Error}}</div>{{end}}
-    </div>
-  {{end}}
-  </div>
-  {{else}}
-  <p class="lib-empty">No ASR runners configured or observed yet. Set <code>ASR_SERVERS</code> to declare your transcription servers, or wait for a runner to claim its first job.</p>
-  {{end}}
-
-  {{if .Runners}}
-  <div class="table-wrap">
-  <table>
-    <caption class="caption-prose">Model, runtime, and capabilities per runner — observed values win over configured</caption>
-    <thead><tr>
-      <th scope="col">Server</th>
-      <th scope="col">Model</th>
-      {{if .ShowRuntime}}<th scope="col" title="runtime — observed from run_metrics, else the configured expectation">Runtime</th>{{end}}
-      {{if .ShowCaps}}<th scope="col" title="capabilities this backend applied (observed) or declares (configured); ✗ = requested-but-declined or absent, hover for why">Caps</th>{{end}}
-      <th scope="col" title="compute precision the runner reported">Mode</th>
-      <th scope="col" class="num" title="mean per-word confidence the model reported (blank when it emits no scores)">Conf</th>
-      <th scope="col" class="num" title="transcripts this server has produced">Jobs</th>
-      <th scope="col" class="num" title="mean transcription wall-clock">Avg proc</th>
-      <th scope="col" title="last finished transcription">Last active</th>
-    </tr></thead>
-    <tbody>
-    {{range .Runners}}{{template "serverModesRow" (runnerRow . $.ShowRuntime $.ShowCaps)}}{{end}}
-    </tbody>
-  </table>
-  </div>
-  {{end}}
-
-  {{if not .CountsKnown}}<p class="lib-empty">transcript provenance: counts unavailable — see server logs</p>
-  {{else if not .ASRGroups}}<p class="lib-empty">transcript provenance: no transcripts yet</p>
-  {{else}}
-  <div class="table-wrap">
-  <table>
-    <caption class="caption-prose">Which runner build and model file produced transcripts, newest first.</caption>
-    <thead><tr>
-      <th scope="col">Model</th>
-      <th scope="col">Runner</th>
-      <th scope="col">.nemo sha256</th>
-      <th scope="col" class="num">Transcripts</th>
-      <th scope="col">First</th>
-      <th scope="col">Last</th>
-    </tr></thead>
-    <tbody>
-    {{range .ASRGroups}}
-    <tr>
-      <th scope="row" class="mono">{{.Model}}</th>
-      {{if .Reported}}
-      <td class="mono">{{.RunnerVersion}}</td>
-      <td class="mono"{{if .SHA}} title="{{.SHA}}"{{end}}>{{or .SHAShort "—"}}</td>
-      {{else}}
-      <td colspan="2" class="time-muted"><em>not reported (pre-provenance runner)</em></td>
-      {{end}}
-      <td class="num">{{commafy .Count}}</td>
-      <td class="time-muted" title="{{formatTime .First}}">{{relTime .First}}</td>
-      <td class="time-muted" title="{{formatTime .Last}}">{{relTime .Last}}</td>
-    </tr>
-    {{end}}
-    </tbody>
-  </table>
-  </div>
+  {{else}}<p class="lib-empty">No current recipes yet. Current recipes are registered by <code>earmark monitor</code> at startup.</p>{{end}}
+  {{with .UntrackedSteps}}<p class="server-note time-muted">Not tracked: {{range $i, $s := .}}{{if $i}}, {{end}}{{$s}}{{end}}</p>{{end}}
   {{end}}
 </section>
 
@@ -671,7 +619,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
       <div class="server-sub">{{.Sub}}</div>
       {{range .Warnings}}<div class="server-sub err">{{.}}</div>{{end}}
       <dl class="role-kv">
-        <dt>used by</dt><dd class="mono">{{range $i, $e := .EndpointIDs}}{{if $i}}, {{end}}{{$e}}{{end}}</dd>
+        <dt>used by</dt><dd>{{range $i, $e := .UsedBy}}{{if $i}}, {{end}}{{$e}}{{end}}</dd>
         {{if .KeyInfoOK}}
         <dt>key</dt><dd><span class="mono">{{or .Key.KeyAlias "(no alias)"}}</span> · {{.KeyState}}{{with .ExpiresText}} · {{.}}{{end}}</dd>
         <dt>spend</dt><dd>{{.SpendText}}</dd>
@@ -680,7 +628,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
         {{else}}
         <dt>key</dt><dd class="time-muted">{{.KeyInfoErr}}</dd>
         {{end}}
-        {{range .RoleModels}}<dt>{{.Role}}</dt><dd><span class="mono">{{.Model}}</span> <span class="{{.Class}}">{{.Mark}}</span></dd>{{end}}
+        {{if .ShowRoleModels}}{{range .RoleModels}}<dt>{{.Role}}</dt><dd><span class="mono">{{.Model}}</span> <span class="{{.Class}}">{{.Mark}}</span></dd>{{end}}{{end}}
       </dl>
     </div>
   {{end}}
@@ -691,23 +639,22 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
 <section class="section" aria-labelledby="endpoints-title">
   <h2 class="section-title" id="endpoints-title">AI endpoints ({{.EndpointCount}})</h2>
   {{if or .Endpoints .EvalEnvRow}}
+  <p class="server-note table-lead" id="endpoints-note">The AI_ENDPOINTS registry. Liveness here is GET /models only; role health above includes call outcomes.</p>
   <div class="table-wrap">
-  <table>
-    <caption class="caption-prose">The AI_ENDPOINTS registry. Health here is liveness only (GET /models); role health above includes call outcomes.</caption>
+  <table aria-labelledby="endpoints-note">
     <thead><tr>
       <th scope="col">ID</th>
       <th scope="col">Role</th>
       <th scope="col">Type</th>
       <th scope="col">Gateway</th>
-      <th scope="col">Backend</th>
       <th scope="col">Host</th>
       <th scope="col">Model</th>
       <th scope="col" title="GET /models only — not call success">Liveness</th>
-      <th scope="col">Options</th>
+      {{if .ShowOptions}}<th scope="col">Options</th>{{end}}
     </tr></thead>
     <tbody>
-    {{range .Endpoints}}{{template "endpointRow" .}}{{end}}
-    {{with .EvalEnvRow}}{{template "endpointRow" .}}{{end}}
+    {{range .Endpoints}}{{template "endpointRow" (endpointRow . $.ShowOptions)}}{{end}}
+    {{with .EvalEnvRow}}{{template "endpointRow" (endpointRow . $.ShowOptions)}}{{end}}
     </tbody>
   </table>
   </div>
@@ -719,9 +666,9 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   {{if not .CountsKnown}}<p class="lib-empty">counts unavailable — see server logs</p>
   {{else if not .JudgeOutput}}<p class="lib-empty">no judge findings yet</p>
   {{else}}
+  <p class="server-note table-lead" id="judge-output-note">Judge findings by the model that answered.</p>
   <div class="table-wrap">
-  <table>
-    <caption class="caption-prose">Judge findings by the model that answered (superseded findings excluded from "open").</caption>
+  <table aria-labelledby="judge-output-note">
     <thead><tr>
       <th scope="col">Answered by</th>
       <th scope="col" class="num">Proposed</th>
@@ -757,66 +704,145 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   {{end}}
 </section>
 
+<section class="section" aria-labelledby="runners-title">
+  <h2 class="section-title" id="runners-title">ASR runners ({{len .Runners}})</h2>
+  {{if .Runners}}
+  <div class="panels">
+  {{range .Runners}}
+    <div class="panel server-card {{.State.Class}}">
+      <div class="server-head">
+        <span class="server-name"><span class="dot {{.State.Dot}}"></span>{{.Name}}</span>
+        {{if .Role}}<span class="badge role-{{.Role}}">{{.Role}}</span>{{end}}
+        {{if not .Configured}}<span class="badge unconfigured" title="observed in the data but not in ASR_SERVERS">unconfigured</span>{{end}}
+      </div>
+      <div class="server-state {{.State.Class}}">{{.State.Glyph}} {{.State.Label}}</div>
+      <div class="server-sub">{{.State.Sub}}</div>
+      {{if and .Host (ne .Host .Name)}}<div class="server-host">{{.Host}}</div>{{end}}
+    </div>
+  {{end}}
+  </div>
+  {{else}}
+  <p class="lib-empty">No ASR runners configured or observed yet. Set <code>ASR_SERVERS</code> to declare your transcription servers, or wait for a runner to claim its first job.</p>
+  {{end}}
+  {{with .RunnerUpdate}}
+  <div class="server-sub runner-version">runner version: running <code>{{if .Running}}{{.Running}}{{else}}unknown{{end}}</code>{{if .Desired}} · requested <code>{{.Desired}}</code>{{if and .State (not .Available)}} · {{.State}}{{end}}{{end}}{{if .Available}} <span class="badge mismatch" title="a different version is requested">update {{if eq .State "updating"}}in progress{{else if eq .State "failed"}}failed{{else}}requested{{end}}</span>{{end}}</div>
+  {{with .Error}}<div class="server-sub err mono err-clamp" title="{{.}}">{{.}}</div>{{end}}
+  {{end}}
+
+  {{if .Runners}}
+  <p class="server-note table-lead" id="runners-note">Model, runtime, and capabilities per runner — observed values win over configured.</p>
+  <div class="table-wrap">
+  <table aria-labelledby="runners-note">
+    <thead><tr>
+      <th scope="col">Server</th>
+      <th scope="col">Model</th>
+      {{if .ShowRuntime}}<th scope="col" title="runtime — observed from run_metrics, else the configured expectation">Runtime</th>{{end}}
+      {{if .ShowCaps}}<th scope="col" title="capabilities this backend applied (observed) or declares (configured); hover for the full list">Caps</th>{{end}}
+      <th scope="col" title="compute precision the runner reported">Precision</th>
+      <th scope="col" class="num" title="mean per-word confidence the model reported (blank when it emits no scores)">Conf</th>
+      <th scope="col" class="num" title="transcripts this server has produced">Jobs</th>
+      <th scope="col" class="num" title="mean transcription wall-clock per job">Avg / job</th>
+      <th scope="col" title="last finished transcription">Last active</th>
+    </tr></thead>
+    <tbody>
+    {{range .Runners}}{{template "serverModesRow" (runnerRow . $.ShowRuntime $.ShowCaps)}}{{end}}
+    </tbody>
+  </table>
+  </div>
+  {{end}}
+
+  {{if not .CountsKnown}}<p class="lib-empty">transcript provenance: counts unavailable — see server logs</p>
+  {{else if not .ASRGroups}}<p class="lib-empty">transcript provenance: no transcripts yet</p>
+  {{else}}
+  <p class="server-note table-lead" id="provenance-note">Which runner build and model file produced transcripts, newest first.</p>
+  <div class="table-wrap">
+  <table aria-labelledby="provenance-note">
+    <thead><tr>
+      <th scope="col">Model</th>
+      <th scope="col">Runner</th>
+      <th scope="col">.nemo sha256</th>
+      <th scope="col" class="num">Transcripts</th>
+      <th scope="col">First</th>
+      <th scope="col">Last</th>
+    </tr></thead>
+    <tbody>
+    {{range .ASRGroups}}
+    <tr>
+      <th scope="row" class="mono">{{.Model}}</th>
+      {{if .Reported}}
+      <td class="mono">{{.RunnerVersion}}</td>
+      <td class="mono"{{if .SHA}} title="{{.SHA}}"{{end}}>{{or .SHAShort "—"}}</td>
+      {{else}}
+      <td colspan="2" class="time-muted"><em>not reported (pre-provenance runner)</em></td>
+      {{end}}
+      <td class="num">{{commafy .Count}}</td>
+      <td class="time-muted" title="{{formatTime .First}}">{{relTime .First}}</td>
+      <td class="time-muted" title="{{formatTime .Last}}">{{relTime .Last}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+  {{end}}
+</section>
+
 {{define "roleCard"}}
 <div class="panel server-card role-card {{.Health.Class}}" id="role-{{.Key}}">
   <div class="server-head">
     <span class="server-name"><span class="dot {{.Health.Dot}}"></span>{{.Title}}</span>
+    {{if .Gateway}}<span class="badge gateway"{{if .GatewayInferred}} title="inferred from the host name; set gateway in AI_ENDPOINTS to confirm"{{end}}>via {{.GatewayLabel}}{{if .GatewayInferred}} (inferred){{end}}</span>{{end}}
     <span class="step-chip" title="recipe step">{{.Step}}</span>
   </div>
-  <div class="server-state {{.Health.Class}}">{{.Health.Glyph}} {{.Health.Label}}{{if .Gateway}} <span class="badge gateway"{{if .GatewayInferred}} title="inferred from the host name; set gateway in AI_ENDPOINTS to confirm"{{end}}>via {{.GatewayLabel}}{{if .GatewayInferred}} (inferred){{end}}</span>{{end}}</div>
+  <div class="server-state {{.Health.Class}}">{{.Health.Glyph}} {{.Health.Label}}</div>
   <div class="server-sub">{{.Health.Sub}}</div>
   {{if .AllowlistWarn}}<div class="server-sub err">✗ {{.Requested}} is not on earmark's LiteLLM key allowlist — every call 403s</div>{{end}}
-  {{if and .LastErrorShort (eq .Health.Token "failing")}}<div class="server-sub err" title="{{.LastError}}">{{.LastErrorShort}}</div>{{end}}
+  {{if and .LastErrorShort (eq .Health.Token "failing")}}<div class="server-sub err mono err-clamp" title="{{.LastError}}">{{.LastErrorShort}}</div>{{end}}
   <dl class="role-kv">
   {{if .HasModel}}
     <dt>requested</dt><dd>{{if .Requested}}<span class="mono">{{.Requested}}</span>{{if .EndpointID}} <span class="time-muted">@ {{.EndpointID}}</span>{{end}}{{else}}—{{end}}</dd>
-    {{if .AllowState}}<dt>key allowlist</dt><dd>{{if eq .AllowState "allowed"}}<span class="match-ok">✓ allowed</span>{{else}}<span class="badge mismatch">✗ NOT ALLOWED</span>{{end}} <span class="time-muted">· {{.GatewayHost}}</span></dd>{{end}}
-    <dt>pinned</dt><dd>{{if .Expected}}<span class="mono">{{.Expected}}</span>{{with .ExpectedRevisionShort}} <span class="time-muted">· rev {{.}}</span>{{end}}{{if eq .Key "asr"}} <span class="time-muted">· recorded only</span>{{end}}{{else}}<span class="time-muted">unpinned{{if eq .Key "asr"}} · recorded only{{else}} (expects the requested id){{end}}</span>{{end}}</dd>
+    {{if .Expected}}<dt>pinned</dt><dd><span class="mono">{{.Expected}}</span>{{with .ExpectedRevisionShort}} <span class="time-muted">· rev {{.}}</span>{{end}}{{if eq .Key "asr"}} <span class="time-muted">· recorded only</span>{{end}}</dd>{{end}}
     <dt>answered</dt><dd>{{template "roleAnswered" .}}</dd>
     {{if .AlsoAnswered}}<dt><span class="sr-only">also answered</span></dt><dd class="time-muted">also: {{range $i, $m := .AlsoAnswered}}{{if $i}}, {{end}}<span class="mono">{{$m.Model}}</span> ×{{commafy $m.Count}}{{end}} (7d)</dd>{{end}}
-    <dt>last ok</dt><dd>{{if not .LastKnown}}—{{else if .LastOK.IsZero}}<span class="time-muted">never</span>{{else}}<span title="{{formatTime .LastOK}}">{{relTime .LastOK}}</span>{{end}}{{if eq .Key "judge"}} · last fail {{if not .LastKnown}}—{{else if .LastFail.IsZero}}<span class="time-muted">never</span>{{else}}<span title="{{formatTime .LastFail}}">{{relTime .LastFail}}</span>{{end}}{{end}}</dd>
+    <dt>last ok</dt><dd>{{if not .LastKnown}}—{{else if .LastOK.IsZero}}<span class="time-muted">never</span>{{else}}<span title="{{formatTime .LastOK}}">{{relTime .LastOK}}</span>{{end}}{{if and (eq .Key "judge") .LastKnown}} · {{if .LastFail.IsZero}}<span class="time-muted">no failures</span>{{else}}last fail <span title="{{formatTime .LastFail}}">{{relTime .LastFail}}</span>{{end}}{{end}}</dd>
     {{if and .LastErrorShort (ne .Health.Token "failing")}}<dt>last error</dt><dd class="time-muted" title="{{.LastError}}">{{if not .LastFail.IsZero}}{{relTime .LastFail}}: {{end}}{{.LastErrorShort}}</dd>{{end}}
     {{if .FailingNow}}<dt>failing</dt><dd>{{commafy .FailingNow}} {{plural .FailingNow "transcript" "transcripts"}} currently failing</dd>{{end}}
     {{if eq .Key "judge"}}<dt>coverage</dt><dd>{{if .StatsKnown}}{{commafy .CoverageDone}} / {{commafy .CoverageTotal}} {{plural .CoverageTotal "transcript" "transcripts"}} judged{{else}}—{{end}}</dd>{{end}}
     {{if eq .Key "embeddings"}}<dt>backlog</dt><dd>{{if .StatsKnown}}{{commafy .Backlog}} {{plural .Backlog "transcript" "transcripts"}} awaiting embedding{{else}}—{{end}}</dd>{{end}}
   {{end}}
     {{if .HumanDecided}}<dt>decided by humans</dt><dd>{{commafyPtr .HumanDecided}}</dd>{{end}}
-    <dt>stale</dt><dd>{{if not .StaleKnown}}{{if .StalePending}}<span class="time-muted">counting…</span>{{else}}—{{end}}{{else if .StaleTracked}}<a href="#recipe-{{.Step}}">{{commafy64Ptr .Stale}} rows</a>{{else}}<span class="time-muted">not tracked — no current recipe</span>{{end}}</dd>
+    <dt>stale</dt><dd>{{if not .StaleKnown}}{{if .StalePending}}<span class="time-muted">counting…</span>{{else}}—{{end}}{{else if .StaleTracked}}<a href="#recipe-{{.Step}}">{{commafy64Ptr .Stale}} rows</a>{{else}}<span class="time-muted">not tracked</span>{{end}}</dd>
   </dl>
 </div>
 {{end}}
 
-{{define "roleAnswered"}}{{if not .CountsKnown}}—{{else if eq .AnsweredMatch "none"}}<span class="time-muted">no runs yet</span>{{else if eq .AnsweredMatch "unreported"}}<span class="time-muted">not reported by endpoint</span>{{else}}<span class="mono">{{.Answered}}</span>{{if eq .Key "asr"}} · {{if .ASRRunnerVersion}}runner <span class="mono">{{.ASRRunnerVersion}}</span>{{if .ASRModelSHA}} · .nemo <span class="mono" title="{{.ASRModelSHA}}">{{.ASRModelSHAShort}}</span>{{end}}{{else}}<span class="time-muted">runner did not report provenance</span>{{end}}{{end}}{{if eq .AnsweredMatch "match"}} <span class="match-ok">✓ matches {{if .Expected}}pin{{else}}request{{end}}</span>{{else if eq .AnsweredMatch "mismatch"}} <span class="badge mismatch">≠ expected {{.CompareTarget}}</span>{{end}}{{end}}{{end}}
+{{define "roleAnswered"}}{{if not .CountsKnown}}—{{else if eq .AnsweredMatch "none"}}<span class="time-muted">no runs yet</span>{{else if eq .AnsweredMatch "unreported"}}<span class="time-muted">not reported by endpoint</span>{{else}}<span class="mono">{{.Answered}}</span>{{if and (eq .Key "asr") .ASRRunnerVersion}} · runner <span class="mono">{{.ASRRunnerVersion}}</span>{{if .ASRModelSHA}} · .nemo <span class="mono" title="{{.ASRModelSHA}}">{{.ASRModelSHAShort}}</span>{{end}}{{end}}{{if eq .AnsweredMatch "match"}} <span class="match-ok">✓ matches {{if .Expected}}pin{{else}}request{{end}}</span>{{else if eq .AnsweredMatch "mismatch"}} <span class="badge mismatch">≠ expected {{.CompareTarget}}</span>{{end}}{{end}}{{end}}
 
 {{define "endpointRow"}}
 <tr>
-  <th scope="row" class="mono">{{.ID}}</th>
-  <td>{{if .Role}}<span class="badge role-primary" title="bound to the {{.Role}} role">{{.Role}}</span>{{else}}<span class="time-muted">unbound</span>{{end}}</td>
-  <td><span class="badge role-{{.Type}}">{{.Type}}</span></td>
-  <td>{{if .Gateway}}<strong>{{.GatewayLabel}}</strong>{{if .GatewayInferred}} <span class="time-muted" title="inferred from the host name; set gateway in AI_ENDPOINTS to confirm">(inferred)</span>{{end}}{{else}}<span class="time-muted">direct</span>{{end}}</td>
-  <td class="time-muted">{{.Backend}}</td>
-  <td class="mono">{{or .HostOnly "—"}}</td>
-  <td class="mono">{{.Model}}</td>
-  <td><span class="server-state {{.State.Class}}" title="{{.State.Sub}}">{{.State.Glyph}} {{.State.Label}}</span></td>
-  <td class="time-muted">{{if .FromEnv}}<em>from env, not in AI_ENDPOINTS</em>{{else}}{{.OptionsLine}}{{end}}</td>
+  <th scope="row" class="mono">{{.V.ID}}</th>
+  <td>{{if .V.Role}}<span title="role token: {{.V.Role}}">{{.V.RoleTitle}}</span>{{else}}<span class="time-muted">unbound</span>{{end}}</td>
+  <td><span class="badge role-{{.V.Type}}">{{.V.Type}}</span></td>
+  <td>{{if .V.Gateway}}<strong>{{.V.GatewayLabel}}</strong>{{if .V.GatewayInferred}} <span class="time-muted" title="inferred from the host name; set gateway in AI_ENDPOINTS to confirm">(inferred)</span>{{end}}{{else}}<span class="time-muted">direct</span>{{end}}</td>
+  <td class="mono">{{or .V.HostOnly "—"}}</td>
+  <td class="mono">{{.V.Model}}</td>
+  <td><span class="server-state {{.V.State.Class}}" title="{{.V.State.Sub}}">{{.V.State.Glyph}} {{.V.State.Label}}</span></td>
+  {{if .ShowOptions}}<td class="time-muted">{{if .V.FromEnv}}<em>from env, not in AI_ENDPOINTS</em>{{else}}{{.V.OptionsLine}}{{end}}</td>{{end}}
 </tr>
 {{end}}
 
 {{define "serverModesRow"}}
 <tr>
   <th scope="row">{{.V.Name}}{{if .V.Role}} <span class="time-muted">({{.V.Role}})</span>{{end}}</th>
-  <td>{{if .V.Model}}{{.V.Model}}{{if eq .V.ModelSource "configured"}} <span class="time-muted" title="expected from ASR_SERVERS; no run has reported a model yet">(expected)</span>{{end}}{{else}}<span class="time-muted">—</span>{{end}}</td>
+  <td class="mono">{{if .V.Model}}{{.V.Model}}{{if eq .V.ModelSource "configured"}} <span class="time-muted" title="expected from ASR_SERVERS; no run has reported a model yet">(expected)</span>{{end}}{{else}}<span class="time-muted">—</span>{{end}}</td>
   {{if .ShowRuntime}}<td class="time-muted">{{if .V.Runtime}}<span{{if .V.RuntimeKnown}} class="family-known"{{end}}>{{.V.Runtime}}</span>{{if eq .V.RuntimeSource "configured"}} <span class="time-muted" title="expected from ASR_SERVERS; no run has reported a runtime yet">(expected)</span>{{end}}{{else}}<span title="no runtime observed or configured">unknown</span>{{end}}</td>{{end}}
   {{if .ShowCaps}}<td>
-    {{if .V.Caps}}<span class="cap-strip" title="{{if eq .V.CapsSource "configured"}}declared in ASR_SERVERS (no run has reported applied caps yet){{else}}applied by the most recent run{{end}}">
-      {{range .V.Caps}}<span class="cap-badge {{if .Applied}}cap-on{{else}}cap-off{{end}}"{{if and (not .Applied) .Reason}} title="{{.Key}}: {{.Reason}}"{{end}}>{{.Label}}{{if not .Applied}}✗{{end}}</span>{{end}}
-    </span>{{else}}<span class="time-muted" title="no capabilities observed or configured">unknown</span>{{end}}
+    {{if .V.Caps}}<span class="cap-strip" title="{{.V.CapsTitle}}">{{range .V.AppliedCaps}}<span class="cap-badge cap-on">{{.Label}}</span>{{else}}<span class="time-muted">none</span>{{end}}</span>{{else}}<span class="time-muted" title="no capabilities observed or configured">unknown</span>{{end}}
   </td>{{end}}
   <td class="time-muted">{{if .V.ComputeMode}}{{.V.ComputeMode}}{{else}}—{{end}}</td>
   <td class="time-muted">{{confPct .V.MeanConfidence}}</td>
   <td class="time-muted">{{commafy .V.JobsDone}}</td>
   <td class="time-muted">{{.V.AvgProc}}</td>
-  <td class="time-muted">{{.V.LastActive}}</td>
+  <td class="time-muted"{{if not .V.LastActiveAt.IsZero}} title="{{formatTime .V.LastActiveAt}}"{{end}}>{{.V.LastActive}}</td>
 </tr>
 {{end}}
 `))
@@ -829,26 +855,42 @@ type runnerTableRow struct {
 	ShowCaps    bool
 }
 
+// endpointTableRow is one endpoints-table row plus the Options column toggle
+// (hidden when no row has options to show).
+type endpointTableRow struct {
+	V           endpointView
+	ShowOptions bool
+}
+
 // modelsData backs the Models fragment (/servers/data).
 type modelsData struct {
+	// RenderedAt / CountsAt / StaleAt are absolute UTC stamps for the header's
+	// title tooltips; the visible text is relative.
 	RenderedAt string
 	// CountsAge is how old the cached aggregate snapshot is ("12s ago"); ""
 	// when none ever loaded. CountsErr is true when the latest refresh failed —
 	// the page then shows the last good snapshot (if any) and says so.
 	CountsAge   string
+	CountsAt    string
 	CountsErr   bool
 	CountsKnown bool
 	// StaleAge / StaleErr / StalePending are the same for the separately
 	// cached (5 min) stale_work counts.
 	StaleAge     string
+	StaleAt      string
 	StaleErr     bool
 	StalePending bool
-	Roles        []roleCard
-	Recipes      []recipeRow
-	NoRecipes    bool // no step has a current recipe (fresh DB / monitor not started)
-	Runners      []serverView
-	ShowRuntime  bool
-	ShowCaps     bool
+	// RoleCards are the roles rendered as cards; UnconfiguredRoles (state
+	// not_configured) collapse into one muted line under them.
+	RoleCards         []roleCard
+	UnconfiguredRoles []roleCard
+	// Recipes are the tracked steps; UntrackedSteps label the rest for the
+	// one-line "Not tracked:" note.
+	Recipes        []recipeRow
+	UntrackedSteps []string
+	Runners        []serverView
+	ShowRuntime    bool
+	ShowCaps       bool
 	// RunnerUpdate is the read-only version-skew state (CONTRACT §2.12), nil
 	// when the runner has never reported a version. The update form itself is
 	// in the static shell so a poll never wipes what the operator is typing.
@@ -856,6 +898,7 @@ type modelsData struct {
 	Gateways     []gatewayView
 	Endpoints    []endpointView
 	EvalEnvRow   *endpointView // non-nil when the judge comes from EVAL_CHAT_*
+	ShowOptions  bool          // any endpoint row has options (or the env-row note)
 	ASRGroups    []asrProvenanceRow
 	JudgeOutput  []findingsModelRow
 	JudgeTotals  *findingsModelRow
@@ -911,26 +954,35 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 	roles, ev := s.modelRoles(ctx, stats, runners, true, eps, gwByEndpoint, now)
 
 	data := modelsData{
-		RenderedAt:   now.UTC().Format("15:04:05 UTC"),
+		RenderedAt:   absTime(now),
 		CountsErr:    ev.SnapErr != nil,
 		CountsKnown:  ev.Snap != nil,
 		StaleErr:     ev.StaleErr != nil,
 		StalePending: ev.StalePending,
-		Roles:        roles,
 		Runners:      runners,
 		RunnerUpdate: runnerUpdateView(stats),
 		Gateways:     buildGatewayViews(gws, targets, roles, now),
 		Endpoints:    eps,
 		EvalEnvRow:   envJudgeView(s.judgeConfig()),
 	}
+	for _, c := range roles {
+		if c.Health.Token == roleNotConfigured {
+			data.UnconfiguredRoles = append(data.UnconfiguredRoles, c)
+		} else {
+			data.RoleCards = append(data.RoleCards, c)
+		}
+	}
 	for _, v := range runners {
 		data.ShowRuntime = data.ShowRuntime || v.Runtime != ""
 		data.ShowCaps = data.ShowCaps || len(v.Caps) > 0
 	}
+	data.ShowOptions = data.EvalEnvRow != nil
+	for _, e := range eps {
+		data.ShowOptions = data.ShowOptions || len(e.Options) > 0
+	}
 	if ev.Snap != nil {
-		data.CountsAge = humanizeSince(now.Sub(ev.SnapAt))
-		data.Recipes = buildRecipeRows(s.cfg, ev.Snap, ev.Stale)
-		data.NoRecipes = len(ev.Snap.Recipes) == 0
+		data.CountsAge, data.CountsAt = humanizeSince(now.Sub(ev.SnapAt)), absTime(ev.SnapAt)
+		data.Recipes, data.UntrackedSteps = buildRecipeRows(ev.Snap, ev.Stale)
 		data.ASRGroups = buildASRRows(ev.Snap.ASRGroups)
 		rows, totals := buildFindingsRows(ev.Snap.Findings)
 		data.JudgeOutput = rows
@@ -939,7 +991,7 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if ev.Stale != nil {
-		data.StaleAge = humanizeSince(now.Sub(ev.StaleAt))
+		data.StaleAge, data.StaleAt = humanizeSince(now.Sub(ev.StaleAt)), absTime(ev.StaleAt)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -947,6 +999,9 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("models fragment render error", "error", err)
 	}
 }
+
+// absTime is the absolute UTC stamp shown in a relative time's title tooltip.
+func absTime(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05 UTC") }
 
 // staleFirstWait bounds how long a poll waits for the stale counts' very
 // first load (a full-library scan) before rendering "counting…"; the load

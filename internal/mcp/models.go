@@ -16,13 +16,14 @@ import (
 // ─── Models page: the role board (CONTRACT §2.14) ─────────────────────────────
 //
 // The page answers "is each pipeline role being done, by what, and is its
-// output current?" — one card per role (ASR, Judge, Embeddings, Decide,
-// Format), then the supporting detail: recipes + stale counts, ASR runners,
-// the AI endpoint registry, and judge output by answering model.
+// output current?" — one card per configured role (ASR, Judge, Embeddings,
+// Decide, Format; not-configured roles collapse to one line), then the
+// supporting detail: recipes + stale counts, the LiteLLM gateway, the AI
+// endpoint registry, judge output by answering model, and the ASR runners.
 //
 // Endpoint liveness (GET /models) is NOT call success: a gateway that lists the
-// alias but 401s every chat call is READY in the endpoint table and FAILING on
-// the Judge card. Role health therefore folds in call outcomes from run_metrics.
+// alias but 401s every chat call "lists model" in the endpoint table and is
+// FAILING on the Judge card. Role health therefore folds in call outcomes from run_metrics.
 //
 // Every builder here is pure (takes now and the cached snapshot, does no I/O),
 // so the page and GET /api/v1/status share one source and cannot disagree.
@@ -69,15 +70,18 @@ const (
 type roleHealth struct {
 	Token string // healthy|idle|degraded|failing|down|not_configured|unknown
 	Label string // HEALTHY …
-	Glyph string // ✓ ● ▲ ✗ ○ ?
-	Class string // state-running|state-idle|state-busy|state-stalled|state-unknown
-	Dot   string // green|blue|amber|red|grey
+	Glyph string // ✓ ▲ ✗ ○ ?
+	Class string // state-running|state-busy|state-stalled|state-unknown
+	Dot   string // green|amber|red|grey
 	Sub   string // one-sentence reason
 }
 
+// roleHealthMeta is each token's display. idle is healthy with nothing to do:
+// it gets the same green ✓ as healthy so a working-but-quiet role never reads
+// as not-OK; its API token stays "idle".
 var roleHealthMeta = map[string]roleHealth{
 	roleHealthy:       {Token: roleHealthy, Label: "HEALTHY", Glyph: "✓", Class: "state-running", Dot: "green"},
-	roleIdle:          {Token: roleIdle, Label: "IDLE", Glyph: "●", Class: "state-idle", Dot: "blue"},
+	roleIdle:          {Token: roleIdle, Label: "HEALTHY · idle", Glyph: "✓", Class: "state-running", Dot: "green"},
 	roleDegraded:      {Token: roleDegraded, Label: "DEGRADED", Glyph: "▲", Class: "state-busy", Dot: "amber"},
 	roleFailing:       {Token: roleFailing, Label: "FAILING", Glyph: "✗", Class: "state-stalled", Dot: "red"},
 	roleDown:          {Token: roleDown, Label: "DOWN", Glyph: "✗", Class: "state-stalled", Dot: "red"},
@@ -648,20 +652,17 @@ func isDecidedState(s string) bool {
 
 // ─── Recipes & stale work ─────────────────────────────────────────────────────
 
-// recipeRow is one step in the Recipes & stale work table.
+// recipeRow is one tracked step (a step with a current recipe) in the Recipes
+// & stale work table.
 type recipeRow struct {
 	Step, RoleTitle       string
-	Current               bool
 	RecipeID, RecipeShort string
 	Model, PromptVersion  string
 	StepVersion           int
 	Since                 time.Time
-	Pin                   string // expected model; "" unpinned
-	PinMatch              string // match|mismatch|unpinned ("" with no current recipe)
-	Stale                 *int64 // nil = not tracked (or unknown: StaleKnown false)
+	Stale                 *int64 // nil = unknown (StaleKnown false) or not counted
 	StaleKnown            bool
 	ConvergeNote          string
-	NoneNote              string // why there is no current recipe
 }
 
 // convergeNotes says how each step's stale rows get redone.
@@ -670,50 +671,49 @@ var convergeNotes = map[string]string{
 	recipe.StepPropose: "only by re-judging",
 }
 
-// buildRecipeRows lists every recipe step in canonical order. snap must be
+// untrackedNotes qualifies an untracked step in the "Not tracked:" line.
+var untrackedNotes = map[string]string{
+	recipe.StepASR: "provenance per transcript",
+}
+
+// buildRecipeRows splits the recipe steps, in canonical order, into the
+// tracked rows (a current recipe exists, so stale work is counted) and the
+// untracked step labels for the one-line "Not tracked:" note. snap must be
 // non-nil (the caller renders "counts unavailable" otherwise); stale may be nil
 // (its counts then render as unknown, independently of the recipe columns).
-// cfg may be nil: ModelPin is nil-safe.
-func buildRecipeRows(cfg *config.Config, snap *modelsSnapshot, stale *staleSnapshot) []recipeRow {
+func buildRecipeRows(snap *modelsSnapshot, stale *staleSnapshot) (rows []recipeRow, untracked []string) {
 	byStep := map[string]db.CurrentRecipe{}
 	for _, r := range snap.Recipes {
 		byStep[r.Step] = r
 	}
-	rows := make([]recipeRow, 0, len(recipe.Steps))
 	for _, step := range recipe.Steps {
-		row := recipeRow{Step: step, RoleTitle: roleTitleForStep(step), Pin: cfg.ModelPin(step).ExpectedModel}
-		if r, ok := byStep[step]; ok {
-			row.Current = true
-			row.RecipeID, row.RecipeShort = r.RecipeID, shortID(r.RecipeID)
-			row.Model = cmp.Or(r.ModelResolved, r.ModelAlias)
-			row.PromptVersion, row.StepVersion, row.Since = r.PromptVersion, r.StepVersion, r.UpdatedAt
-			switch {
-			case row.Pin == "":
-				row.PinMatch = "unpinned"
-			case sameModel(row.Model, row.Pin):
-				row.PinMatch = matchOK
-			default:
-				row.PinMatch = matchMismatch
+		r, ok := byStep[step]
+		if !ok {
+			label := step
+			if n := untrackedNotes[step]; n != "" {
+				label += " (" + n + ")"
 			}
-		} else if step == recipe.StepASR {
-			row.NoneNote = "none — the runner reports provenance per transcript; staleness not tracked"
-		} else {
-			row.NoneNote = "no current recipe"
-		}
-		if stale == nil {
-			rows = append(rows, row)
+			untracked = append(untracked, label)
 			continue
 		}
-		row.StaleKnown = true
-		if n, ok := stale.Counts[step]; ok {
-			row.Stale = &n
-			if n > 0 {
-				row.ConvergeNote = convergeNotes[step]
+		row := recipeRow{
+			Step: step, RoleTitle: roleTitleForStep(step),
+			RecipeID: r.RecipeID, RecipeShort: shortID(r.RecipeID),
+			Model:         cmp.Or(r.ModelResolved, r.ModelAlias),
+			PromptVersion: r.PromptVersion, StepVersion: r.StepVersion, Since: r.UpdatedAt,
+		}
+		if stale != nil {
+			row.StaleKnown = true
+			if n, ok := stale.Counts[step]; ok {
+				row.Stale = &n
+				if n > 0 {
+					row.ConvergeNote = convergeNotes[step]
+				}
 			}
 		}
 		rows = append(rows, row)
 	}
-	return rows
+	return rows, untracked
 }
 
 // ─── Judge output ─────────────────────────────────────────────────────────────
@@ -933,5 +933,9 @@ var modelsFuncs = template.FuncMap{
 	// runnerRow pairs a runner view with the table's column toggles.
 	"runnerRow": func(v serverView, showRuntime, showCaps bool) runnerTableRow {
 		return runnerTableRow{V: v, ShowRuntime: showRuntime, ShowCaps: showCaps}
+	},
+	// endpointRow pairs an endpoint view with the Options column toggle.
+	"endpointRow": func(v endpointView, showOptions bool) endpointTableRow {
+		return endpointTableRow{V: v, ShowOptions: showOptions}
 	},
 }

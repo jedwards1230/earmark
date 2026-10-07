@@ -66,20 +66,20 @@ func TestBuildEndpointViews(t *testing.T) {
 	assert.Equal(t, "embeddings", emb.Type)
 	assert.Equal(t, "ollama:11434", emb.HostOnly)
 	assert.Equal(t, "embeddings", emb.Role)
-	assert.Equal(t, "READY", emb.State.Label)
+	assert.Equal(t, "lists model", emb.State.Label)
 	assert.Equal(t, "ready", emb.StateToken)
 	assert.True(t, emb.Probed)
 
 	ev := views[1]
 	assert.Equal(t, "eval", ev.Role)
-	assert.Equal(t, "MODEL NOT LOADED", ev.State.Label)
+	assert.Equal(t, "model not listed", ev.State.Label)
 	assert.Equal(t, "model_not_loaded", ev.StateToken)
 	assert.Equal(t, "temperature=0", ev.OptionsLine())
 	assert.Equal(t, "direct", ev.GatewayLabel())
 
 	sp := views[2]
 	assert.Equal(t, "", sp.Role) // unbound
-	assert.Equal(t, "UNKNOWN", sp.State.Label)
+	assert.Equal(t, "unknown", sp.State.Label)
 	assert.Equal(t, "unknown", sp.StateToken)
 	assert.False(t, sp.Probed)
 }
@@ -96,7 +96,8 @@ func TestBuildEndpointViews_NilCfg(t *testing.T) {
 // endpoint that HAS a gateway, role and options exercises that dispatch path.
 func TestServersFragmentRendersEndpointMethods(t *testing.T) {
 	data := modelsData{
-		RenderedAt: "00:00:00 UTC",
+		RenderedAt:  "2026-01-01 00:00:00 UTC",
+		ShowOptions: true,
 		Endpoints: []endpointView{{
 			ID:      "litellm-judge",
 			Type:    "chat",
@@ -105,7 +106,7 @@ func TestServersFragmentRendersEndpointMethods(t *testing.T) {
 			Role:    "eval",
 			Gateway: "litellm",
 			Options: []optionKV{{Key: "temperature", Value: "0"}},
-			State:   endpointStateMeta{Label: "READY", Glyph: "✓", Class: "state-running", Dot: "green"},
+			State:   endpointStateMeta{Label: "lists model", Glyph: "✓", Class: "state-running", Dot: "green"},
 		}},
 		EvalEnvRow: envJudgeView(judgeConfig{Configured: true, Source: judgeSourceEnv, Model: "qwen3.8", Host: "litellm.lan:4000"}),
 	}
@@ -115,7 +116,9 @@ func TestServersFragmentRendersEndpointMethods(t *testing.T) {
 	out := buf.String()
 	assert.Contains(t, out, "LiteLLM")
 	assert.Contains(t, out, "temperature=0")
-	assert.Contains(t, out, "✓ READY")
+	assert.Contains(t, out, "✓ lists model")
+	assert.Contains(t, out, `<span title="role token: eval">Judge</span>`, "the endpoint role reads as the role card's title")
+	assert.NotContains(t, out, "openai-compat", "the Backend column is gone")
 	assert.Contains(t, out, "AI endpoints (2)")
 	assert.Contains(t, out, "EVAL_CHAT_*")
 	assert.Contains(t, out, "from env, not in AI_ENDPOINTS")
@@ -294,4 +297,10 @@ func TestAPIStatusEndpointsArray(t *testing.T) {
 	assert.Equal(t, "eval", e1.Role)
 	assert.Equal(t, "offline", e1.State)
 	assert.Equal(t, map[string]string{"temperature": "0", "max_tokens": "256"}, e1.Options)
+}
+
+func TestEndpointViewRoleTitle(t *testing.T) {
+	for role, want := range map[string]string{"eval": "Judge", "embeddings": "Embeddings", "": "", "other": "other"} {
+		assert.Equal(t, want, endpointView{Role: role}.RoleTitle(), role)
+	}
 }

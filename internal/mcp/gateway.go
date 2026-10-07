@@ -311,7 +311,9 @@ type gatewayRoleModel struct {
 // gatewayView is one LiteLLM gateway card on the Models page.
 type gatewayView struct {
 	gatewayStatus
-	EndpointIDs []string
+	// UsedBy names what sits behind the gateway: role titles for bound
+	// endpoints, the endpoint id for an unbound one.
+	UsedBy      []string
 	StateLabel  string // "✓ READY" / "✗ DOWN" / "? NOT PROBED"
 	Class, Dot  string
 	Sub         string
@@ -323,6 +325,9 @@ type gatewayView struct {
 	AllowAll    bool
 	TeamModels  bool // team key with no own list: inherits the team's models (unreadable)
 	RoleModels  []gatewayRoleModel
+	// ShowRoleModels is false when every role model is allowed: the rows then
+	// repeat what "allowed" already says, so the card omits them.
+	ShowRoleModels bool
 }
 
 // buildGatewayViews renders the probed gateways, checking each role whose
@@ -334,8 +339,8 @@ func buildGatewayViews(sts []gatewayStatus, targets []gatewayTarget, roles []rol
 		ids := map[string]bool{}
 		if i < len(targets) {
 			for _, ep := range targets[i].Endpoints {
-				v.EndpointIDs = append(v.EndpointIDs, ep.ID)
 				ids[ep.ID] = true
+				v.UsedBy = append(v.UsedBy, usedByLabel(ep.ID, roles))
 			}
 		}
 		switch {
@@ -376,7 +381,7 @@ func buildGatewayViews(sts []gatewayStatus, targets []gatewayTarget, roles []rol
 			if !ids[r.EndpointID] {
 				continue
 			}
-			rm := gatewayRoleModel{Role: strings.ToLower(r.Title), Model: r.Requested, Mark: "? not checked", Class: "time-muted"}
+			rm := gatewayRoleModel{Role: r.Title, Model: r.Requested, Mark: "? not checked", Class: "time-muted"}
 			switch r.AllowState {
 			case "allowed":
 				rm.Mark, rm.Class = "✓ allowed", "match-ok"
@@ -385,6 +390,7 @@ func buildGatewayViews(sts []gatewayStatus, targets []gatewayTarget, roles []rol
 				v.Warnings = append(v.Warnings, r.Requested+" ("+rm.Role+") is not on the key allowlist — calls 403")
 			}
 			v.RoleModels = append(v.RoleModels, rm)
+			v.ShowRoleModels = v.ShowRoleModels || r.AllowState != "allowed"
 		}
 		if len(v.Warnings) > 0 && v.Class == "state-running" {
 			v.Class, v.Dot = "state-busy", "amber"
@@ -392,6 +398,17 @@ func buildGatewayViews(sts []gatewayStatus, targets []gatewayTarget, roles []rol
 		out = append(out, v)
 	}
 	return out
+}
+
+// usedByLabel names an endpoint behind a gateway by the role it serves (role
+// title), else by its id.
+func usedByLabel(id string, roles []roleCard) string {
+	for _, r := range roles {
+		if r.EndpointID == id {
+			return r.Title
+		}
+	}
+	return id
 }
 
 // parseLiteLLMTime parses LiteLLM's timestamps, which come with or without a
