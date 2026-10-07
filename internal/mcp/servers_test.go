@@ -373,3 +373,41 @@ func TestArbiterRawToStatus(t *testing.T) {
 }
 
 func boolPtrT(b bool) *bool { return &b }
+
+// TestBuildServerViews_HistoryWindow: an unconfigured host seen only in
+// run_metrics history appears only if it transcribed within
+// runnerHistoryWindow; a configured server always appears, however old its
+// history; an unconfigured live runner always appears.
+func TestBuildServerViews_HistoryWindow(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { t := now.Add(-d); return &t }
+	obs := &db.ServerObservation{
+		LiveRunners: []db.LiveRunner{{ClaimedBy: "runner-live-x", LastHeartbeat: now.Add(-5 * time.Second)}},
+		Hosts: []db.HostMetrics{
+			{Host: "recent", JobsDone: 3, LastFinished: at(29 * 24 * time.Hour)},
+			{Host: "retired", JobsDone: 4123, LastFinished: at(105 * 24 * time.Hour)},
+			{Host: "never-finished", JobsDone: 1},
+			{Host: "configured-old", JobsDone: 9, LastFinished: at(200 * 24 * time.Hour)},
+		},
+	}
+	configured := []config.ASRServer{{Name: "configured-old", Host: "configured-old"}}
+	views := buildServerViews(configured, obs, nil, now, 30*time.Minute)
+	names := map[string]serverView{}
+	for _, v := range views {
+		names[v.Name] = v
+	}
+	if _, ok := names["recent"]; !ok {
+		t.Errorf("host within the window must show: %v", names)
+	}
+	for _, gone := range []string{"retired", "never-finished"} {
+		if _, ok := names[gone]; ok {
+			t.Errorf("%s is outside runnerHistoryWindow and must be hidden", gone)
+		}
+	}
+	if v, ok := names["configured-old"]; !ok || v.JobsDone != 9 {
+		t.Errorf("configured server must always show with its history: %+v", v)
+	}
+	if _, ok := names["runner-live-x"]; !ok {
+		t.Errorf("an unconfigured live runner must always show")
+	}
+}

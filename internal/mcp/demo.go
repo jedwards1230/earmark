@@ -349,9 +349,14 @@ func (d demoDB) GetServerObservation(context.Context) (*db.ServerObservation, er
 				{Host: "gpu-2", ASRModel: &parakeet, ComputeType: &f16, JobsDone: 24,
 					LastFinished: tp(now.Add(-6 * time.Hour)), AvgProcessingSeconds: fp(902.0)},
 				// Unconfigured host: not in demoASRServers; whisper-large-v3 has no
-				// param-size token, so the Size column shows an em dash.
+				// param-size token (API modelSize is empty).
 				{Host: "gpu-9", ASRModel: &whisper, ComputeType: sp(int8), JobsDone: 5,
 					LastFinished: tp(now.Add(-48 * time.Hour)), AvgProcessingSeconds: fp(1840.0)},
+				// Retired unconfigured host: thousands of old rows, last transcription
+				// months ago (the eval backfill still touches its run_metrics rows).
+				// Outside runnerHistoryWindow, so the Models page must NOT show it.
+				{Host: "gpu-retired", ASRModel: &parakeet, ComputeType: &bf16, JobsDone: 4123,
+					LastFinished: tp(now.Add(-105 * 24 * time.Hour)), AvgProcessingSeconds: fp(495.0)},
 			},
 		}, nil
 	}

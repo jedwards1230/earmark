@@ -1679,7 +1679,12 @@ A fresh DB claim still wins (`TRANSCRIBING`); without a `gpuArbiterUrl` the stat
 falls back to history inference (`idle`/`not_seen`). The Models dashboard page
 (ASR runners section) and the `servers` array in `GET /api/v1/status` merge the configured list with
 observed activity; an observed runner with no matching entry is still shown,
-marked *unconfigured*. Example:
+marked *unconfigured* — **if** it holds a live claim or finished a transcription
+within the last 30 days (`runnerHistoryWindow`). A retired host that only
+appears in old `run_metrics` history is hidden; configured servers always show.
+Host recency is `run_metrics.transcribe_finished_at` (also the "last active"
+value and the source of a host's latest model/mode), never `updated_at`, which
+the eval and embed stages bump on old rows. Example:
 
 ```json
 [{"name":"gpu-1","host":"gpu-1","model":"nvidia/parakeet-tdt-0.6b-v3","role":"primary","gpuArbiterUrl":"http://gpu-1:48750/status"},

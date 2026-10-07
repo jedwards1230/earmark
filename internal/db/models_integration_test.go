@@ -7,6 +7,7 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
@@ -181,5 +182,52 @@ func TestIntegrationListCurrentRecipesDetail(t *testing.T) {
 		c.ModelResolved != "anthropic/claude-haiku" || c.Model != "anthropic/claude-haiku" ||
 		c.PromptVersion != "judge@v1" || c.PromptSHA != "abc" || c.UpdatedAt.IsZero() {
 		t.Errorf("current recipe = %+v", c)
+	}
+}
+
+// TestIntegrationServerObservationRecency: a retired host whose run_metrics
+// rows were touched recently (the eval backfill bumps updated_at) must still
+// report its LAST TRANSCRIPTION as LastFinished, sort after a host that
+// actually transcribed recently, and pick its model by transcription recency.
+func TestIntegrationServerObservationRecency(t *testing.T) {
+	ctx := context.Background()
+	d := integrationDB(t, newTestDatabase(t))
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO transcription_jobs (id, file_path, checksum, status) VALUES
+		  ('00000000-0000-0000-0000-0000000000e1', '/b/Old/01.m4b', 'e1', 'done'),
+		  ('00000000-0000-0000-0000-0000000000e2', '/b/Old/02.m4b', 'e2', 'done'),
+		  ('00000000-0000-0000-0000-0000000000e3', '/b/New/01.m4b', 'e3', 'done');
+		-- retired-host: transcribed 100 and 105 days ago; the NEWER transcription
+		-- used model-new, but the OLDER row was just re-touched by eval (updated_at now).
+		INSERT INTO run_metrics (job_id, runner_host, asr_model, transcribe_started_at,
+		                         transcribe_finished_at, updated_at) VALUES
+		  ('00000000-0000-0000-0000-0000000000e1', 'retired-host', 'model-old',
+		   now() - interval '105 days 1 hour', now() - interval '105 days', now()),
+		  ('00000000-0000-0000-0000-0000000000e2', 'retired-host', 'model-new',
+		   now() - interval '100 days 1 hour', now() - interval '100 days', now() - interval '100 days'),
+		  ('00000000-0000-0000-0000-0000000000e3', 'live-host', 'parakeet',
+		   now() - interval '2 hours', now() - interval '1 hour', now() - interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	obs, err := d.GetServerObservation(ctx)
+	if err != nil {
+		t.Fatalf("GetServerObservation: %v", err)
+	}
+	if len(obs.Hosts) != 2 {
+		t.Fatalf("hosts = %+v", obs.Hosts)
+	}
+	if obs.Hosts[0].Host != "live-host" {
+		t.Errorf("hosts must be ordered by last transcription, got %s first", obs.Hosts[0].Host)
+	}
+	old := obs.Hosts[1]
+	if old.LastFinished == nil || time.Since(*old.LastFinished) < 99*24*time.Hour {
+		t.Errorf("retired-host LastFinished = %v, want ~100 days ago (not the fresh updated_at)", old.LastFinished)
+	}
+	if old.ASRModel == nil || *old.ASRModel != "model-new" {
+		t.Errorf("retired-host model = %v, want model-new (latest TRANSCRIPTION, not latest updated_at)", old.ASRModel)
+	}
+	if old.JobsDone != 2 {
+		t.Errorf("JobsDone = %d", old.JobsDone)
 	}
 }

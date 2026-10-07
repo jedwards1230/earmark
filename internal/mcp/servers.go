@@ -190,6 +190,14 @@ func modelSize(model string) string {
 	return m[1] + "B"
 }
 
+// runnerHistoryWindow bounds which UNconfigured runner hosts appear from
+// run_metrics history alone: only those that finished a transcription within
+// the window. A host retired months ago (whose rows the eval backfill still
+// touches) otherwise lingers as an "unconfigured" card forever. Configured
+// ASR_SERVERS entries always show, and an unconfigured runner holding a live
+// claim always shows — the window only filters history-only hosts.
+const runnerHistoryWindow = 30 * 24 * time.Hour
+
 // buildServerViews merges the configured ASR_SERVERS list with observed runner
 // activity into the Servers-page model. It is pure (deterministic given now) so
 // the state logic is unit-testable without a DB or HTTP server.
@@ -282,12 +290,16 @@ func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, 
 		views = append(views, v)
 	}
 
-	// Unconfigured hosts with only historical metrics (no live claim).
+	// Unconfigured hosts with only historical metrics (no live claim), when they
+	// transcribed within runnerHistoryWindow.
 	for i, h := range obs.Hosts {
 		if hostUsed[i] {
 			continue
 		}
 		hostUsed[i] = true
+		if !recentlyTranscribed(h, now) {
+			continue
+		}
 		h := h
 		v := serverView{Name: h.Host, Configured: false}
 		applyObserved(&v, nil, &h, nil, h.JobsDone, config.ASRServer{}, now, staleAfter)
@@ -295,6 +307,12 @@ func buildServerViews(configured []config.ASRServer, obs *db.ServerObservation, 
 	}
 
 	return views
+}
+
+// recentlyTranscribed reports whether a host finished a transcription within
+// runnerHistoryWindow of now. A host with no finished transcription is not.
+func recentlyTranscribed(h db.HostMetrics, now time.Time) bool {
+	return h.LastFinished != nil && now.Sub(*h.LastFinished) <= runnerHistoryWindow
 }
 
 // probeFor returns the probe result for a server name, or nil when none ran.
