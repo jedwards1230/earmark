@@ -12,15 +12,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeLoader counts loads, can fail, and can block until released.
+// fakeLoader counts loads, can fail, can block until released, and can
+// signal when a load starts.
 type fakeLoader struct {
 	calls   atomic.Int32
 	fail    atomic.Bool
 	release chan struct{} // nil = return immediately
+	started chan struct{} // nil = no signal; else one send per load (keep it buffered)
 }
 
 func (f *fakeLoader) load(ctx context.Context) (int, error) {
 	n := f.calls.Add(1)
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
 	if f.release != nil {
 		select {
 		case <-f.release:
@@ -149,12 +154,13 @@ func TestRefreshCache_SingleFlight(t *testing.T) {
 	first, err := c.get(context.Background())
 	require.NoError(t, err)
 
-	f.release = make(chan struct{}) // the next load blocks until released
+	const n = 50
+	f.release = make(chan struct{})    // the next load blocks until released
+	f.started = make(chan struct{}, n) // room for every caller, so a wrong extra load never blocks
 	mu.Lock()
 	clock = clock.Add(time.Minute)
 	mu.Unlock()
 
-	const n = 50
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
@@ -165,9 +171,18 @@ func TestRefreshCache_SingleFlight(t *testing.T) {
 		}()
 	}
 	wg.Wait() // returns while the refresh is still blocked: nobody waited
-	assert.EqualValues(t, 2, f.calls.Load(), "exactly one refresh for %d concurrent callers", n)
+
+	// The callers returned before the background refresh necessarily reached
+	// load, so wait for it to start rather than reading the counter now.
+	select {
+	case <-f.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no background refresh started")
+	}
 	close(f.release)
 	c.waitIdle()
+	assert.EqualValues(t, 2, f.calls.Load(), "exactly one refresh for %d concurrent callers", n)
+	assert.Empty(t, f.started, "a second refresh started")
 
 	// Concurrent FIRST loads also share one load.
 	g := &fakeLoader{release: make(chan struct{})}
