@@ -325,3 +325,23 @@ func TestClientFromConfig(t *testing.T) {
 		t.Errorf("pinned model refused: ok=%v err=%v", ok, err)
 	}
 }
+
+type failingSegments struct{ *fakeRunStore }
+
+func (failingSegments) GetTranscriptSegments(context.Context, []string) (map[string][]db.Segment, error) {
+	return nil, errors.New("boom")
+}
+
+// A store error stops the run, names the load that failed, and no model
+// call is made.
+func TestDryRunStoreError(t *testing.T) {
+	asker := runAsker()
+	_, err := DryRun(context.Background(), failingSegments{runFixture()}, asker,
+		RunOptions{Scope: db.DecideScope{Sample: 5, Seed: "s"}, Concurrency: 1, Params: DefaultShouldApplyParams()})
+	if err == nil || !strings.Contains(err.Error(), "load segments of 2 transcripts: boom") {
+		t.Errorf("err = %v", err)
+	}
+	if asker.calls != 0 {
+		t.Errorf("%d calls after a store error", asker.calls)
+	}
+}

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"slices"
 	"sort"
 	"sync"
 
@@ -139,14 +138,16 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		batch := tids[start:min(start+db.MaxDecideTranscriptBatch, len(tids))]
 		segs, err := store.GetTranscriptSegments(ctx, batch)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("load segments of %d transcripts: %w", len(batch), err)
 		}
 		var keys []db.ChunkKey
+		keySet := map[db.ChunkKey]bool{}
 		dirSet := map[string]bool{}
 		for _, t := range batch {
 			for _, f := range byTranscript[t] {
 				k := db.ChunkKey{TranscriptID: f.TranscriptID, ChunkIndex: f.ChunkIndex}
-				if !slices.Contains(keys, k) {
+				if !keySet[k] {
+					keySet[k] = true
 					keys = append(keys, k)
 				}
 				dirSet[filepath.Dir(f.FilePath)] = true
@@ -156,7 +157,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		for k0 := 0; k0 < len(keys); k0 += db.MaxDecideChunkBatch {
 			part, err := store.DecideChunks(ctx, keys[k0:min(k0+db.MaxDecideChunkBatch, len(keys))])
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("load chunks %d-%d of %d: %w", k0, min(k0+db.MaxDecideChunkBatch, len(keys)), len(keys), err)
 			}
 			for k, c := range part {
 				chunks[k] = c
@@ -171,7 +172,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		for d0 := 0; d0 < len(dirs); d0 += db.MaxDecideBookBatch {
 			part, err := store.GetBookRecords(ctx, dirs[d0:min(d0+db.MaxDecideBookBatch, len(dirs))])
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("load catalogue records of %d books: %w", len(dirs), err)
 			}
 			for k, r := range part {
 				records[k] = r
