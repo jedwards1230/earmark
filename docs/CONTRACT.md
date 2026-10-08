@@ -1127,6 +1127,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 4 | `00004_unanchorable.sql` | The `unanchorable` patch state, `unanchorable_reason` and `reanchored_at` on `transcript_findings` (§2.17 "Re-anchoring"). |
 | 5 | `00005_requeue_archive.sql` | Requeue archives findings (§1.4 "Operator requeue"): `patch_state` gains `superseded`, `superseded_at` column, `transcript_findings.transcript_id` becomes nullable with a foreign key to `transcripts(id) ON DELETE SET NULL` and a CHECK that only superseded findings may have no transcript; existing orphans are archived as `superseded` first; `stale_work` skips superseded findings. Not purely additive — see §1.4. |
 | 6 | `00006_asr_provenance_identity.sql` | Runner-reported provenance + `embedded_asin` on `transcripts`; `asin_source` / `identity_status` on `book_metadata` (§1.2, §1.6, §1.9). |
+| 7 | `00007_fn_calls.sql` | `fn_calls` — the pure-function call log and cache, with the partial unique cache index `fn_calls_cache_key_idx` and `fn_calls_recipe_id_idx` (§1.9 "Pure-function calls"). New table only. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1149,7 +1150,7 @@ nothing — so the reset now drops **every** earmark object and
 `goose_db_version`, then migrates from version 1. That includes
 `transcript_findings` (**human corrections too**, `origin='human'`),
 `book_metadata`, `run_metrics`, `pipeline_events`, `recipes` /
-`current_recipes`, and `runner_control` — the runner comes back **unpaused**
+`current_recipes`, `fn_calls`, and `runner_control` — the runner comes back **unpaused**
 with no `run_limit`.
 
 **Deadlines.** A migration must not outlive the pod's patience:
@@ -1350,6 +1351,55 @@ recipe and listed as stale. The judge logs a warning on the first response
 from a model other than the expected one (that is only knowable once the
 endpoint answers), and an info line at startup when no pin is set.
 
+
+#### Pure-function calls — `fn_calls`
+
+Every call a pure function (`internal/fn`) makes to a decision model — today
+TypeSafe System One (`jev-*`) — is one row. The log doubles as the cache.
+
+```sql
+CREATE TABLE fn_calls (
+    id             BIGSERIAL     PRIMARY KEY,
+    fn             TEXT          NOT NULL,              -- the function, e.g. "should_apply"
+    prompt_version TEXT          NOT NULL,
+    prompt_sha256  TEXT          NOT NULL,
+    model_alias    TEXT          NOT NULL,              -- the pinned model id asked for, e.g. "jev-1.13.0"
+    model_resolved TEXT,                                -- the reply's "model"; NULL when no reply
+    model_revision TEXT,
+    recipe_id      TEXT          REFERENCES recipes (recipe_id),
+    input_sha256   TEXT          NOT NULL CHECK (input_sha256 ~ '^[0-9a-f]{64}$'), -- sha256 of the canonical input JSON
+    input          JSONB         NOT NULL,
+    output         JSONB,                               -- NULL on error
+    error_class    TEXT,                                -- NULL on success
+    latency_ms     INTEGER,
+    input_tokens   INTEGER,
+    output_tokens  INTEGER,
+    cost_usd       NUMERIC(14,8),
+    cache_hit      BOOLEAN       NOT NULL DEFAULT false,
+    cached_from    BIGINT        REFERENCES fn_calls (id), -- the row a cache hit was served from
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX fn_calls_cache_key_idx ON fn_calls (fn, prompt_sha256, model_alias, input_sha256)
+    WHERE error_class IS NULL AND NOT cache_hit;
+CREATE INDEX fn_calls_recipe_id_idx ON fn_calls (recipe_id, created_at);
+```
+
+- **Cache.** The partial unique index admits one successful, non-cached row
+  per `(fn, prompt_sha256, model_alias, input_sha256)`; that row is the cache
+  entry. Writers insert with `ON CONFLICT … DO NOTHING` (`db.InsertFnCall`), so
+  an input is never paid for twice and log rows are never updated.
+- **Serving** (`db.LookupFnCache`) returns that row only when its
+  `model_resolved` equals the expected model (the registry's
+  `expected_model`, else the alias): a reply from any other model is stored but
+  never served. A fallback reply is logged with `error_class =
+  'model_fallback'`, which also keeps it out of the cache slot.
+- **A served call is still logged**, as its own row with `cache_hit = true`
+  and `cached_from` set, so the table counts every call.
+- **Errors** are logged with `error_class` and no output; they are never
+  served.
+- `recipe_id` is the call's recipe, registered (insert-if-absent) before the
+  row is written. No prompt or completion text is stored outside `input` /
+  `output`.
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
