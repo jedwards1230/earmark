@@ -89,3 +89,65 @@ func threeDigitWords(n uint64) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// NumberReadings returns the common spoken readings of a run of ASCII digits,
+// cardinal first, without duplicates:
+//
+//   - cardinal — NumberWords ("240" → "two hundred forty");
+//   - paired, for 3- and 4-digit runs without a leading zero — the way
+//     prices, times, room numbers and years are said: "240" → "two forty",
+//     "205" → "two oh five", "1984" → "nineteen eighty four", "2005" →
+//     "twenty oh five", "1900" → "nineteen hundred". A round thousand
+//     ("2000") has no paired form; its cardinal is how it is said;
+//   - digit by digit, for runs of two or more digits — "240" → "two four
+//     zero".
+//
+// Non-digit input returns nil.
+func NumberReadings(digits string) []string {
+	cardinal := NumberWords(digits)
+	if cardinal == "" {
+		return nil
+	}
+	out := []string{cardinal}
+	add := func(r string) {
+		for _, have := range out {
+			if have == r {
+				return
+			}
+		}
+		out = append(out, r)
+	}
+	if p := pairedWords(digits); p != "" {
+		add(p)
+	}
+	if len(digits) > 1 {
+		words := make([]string, 0, len(digits))
+		for i := 0; i < len(digits); i++ {
+			words = append(words, smallNumbers[digits[i]-'0'])
+		}
+		add(strings.Join(words, " "))
+	}
+	return out
+}
+
+// pairedWords is the paired reading of a 3- or 4-digit run, or "" when it has
+// none. The run is split into a head (all but the last two digits) and a
+// two-digit tail: "1984" → "19" + "84", "240" → "2" + "40".
+func pairedWords(digits string) string {
+	if (len(digits) != 3 && len(digits) != 4) || digits[0] == '0' {
+		return ""
+	}
+	head, tail := digits[:len(digits)-2], digits[len(digits)-2:]
+	headWords := NumberWords(head)
+	switch {
+	case tail == "00":
+		if len(head) == 2 && head[1] == '0' {
+			return "" // "2000": "twenty hundred" is not how it is said
+		}
+		return headWords + " hundred"
+	case tail[0] == '0':
+		return headWords + " oh " + smallNumbers[tail[1]-'0']
+	default:
+		return headWords + " " + NumberWords(tail)
+	}
+}

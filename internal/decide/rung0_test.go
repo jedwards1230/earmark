@@ -46,11 +46,10 @@ func TestCheck(t *testing.T) {
 		{"prompt: their → there", cand("a", IssueHomophone, "over their by the door", "their", "there", 0.9), true, ""},
 		{"prompt: thegreycourses → thegreatcourses", cand("a", IssueMisheardWord, "from thegreycourses plus", "thegreycourses", "thegreatcourses", 0.9), true, ""},
 		{"prompt: Limpel Ziv → Lempel-Ziv", cand("a", IssueMisheardWord, "limpel ziv coding", "limpel ziv", "Lempel-Ziv", 0.9), true, ""},
-		// KNOWN GAP, kept as a test so a fix is a conscious change: the prompt's
-		// number_artifact example scores 0.444. "240" spells out as "two hundred
-		// forty" (THNTRTFRT) while "too forty" is TFRT — the spoken "two forty"
-		// reading of a numeral is not modelled.
-		{"prompt: too forty → 240 (known gap)", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "240", 0.9), false, ReasonNotSoundAlike},
+		// "240" is scored by its best spoken reading, "two forty" (TFRT).
+		{"prompt: too forty → 240", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "240", 0.9), true, ""},
+		{"number: nineteen eighty four → 1984", cand("a", IssueNumberArtifact, "in nineteen eighty four we", "nineteen eighty four", "1984", 0.9), true, ""},
+		{"number: unrelated value", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "17", 0.9), false, ReasonNotSoundAlike},
 
 		// Target exists.
 		{"chunk changed", func() Candidate {
@@ -146,6 +145,13 @@ func TestCheckEvidenceCarriesScoreAndCodes(t *testing.T) {
 		if !strings.Contains(v.Evidence, want) {
 			t.Errorf("evidence %q lacks %q", v.Evidence, want)
 		}
+	}
+}
+
+func TestCheckEvidenceNamesTheWinningReading(t *testing.T) {
+	v := Check(cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "240", 0.9), DefaultParams())
+	if !strings.Contains(v.Evidence, `"240" read as "two forty" (best of 3 readings)`) {
+		t.Errorf("evidence %q does not name the winning reading", v.Evidence)
 	}
 }
 

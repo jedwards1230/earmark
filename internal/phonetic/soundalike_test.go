@@ -2,6 +2,8 @@ package phonetic
 
 import (
 	"math"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -72,7 +74,7 @@ func TestSoundAlike(t *testing.T) {
 		{"their", "there", 1, true},                        // 0R/TR
 		{"thegreycourses", "thegreatcourses", 0.875, true}, // 0KRKRSS vs 0KRTKRSS
 		{"Limpel Ziv", "Lempel-Ziv", 1, true},              // LMPLSF
-		{"too forty", "240", 4.0 / 9, false},               // TFRT vs THNTRTFRT: known gap
+		{"too forty", "240", 1, true},                      // TFRT: "240" read as "two forty"
 		{"240", "two hundred forty", 1, true},              // same normalized text
 		{"neumann", "newman", 1, true},                     // NMN
 		{"cat", "dog", 0, false},                           // KT vs TK
@@ -88,14 +90,19 @@ func TestSoundAlike(t *testing.T) {
 		{"Case", "case", 1, true},                          // identical once normalized
 		{"tic tac toe", "tic-tac-toe", 1, true},            // identical once normalized
 		{"seventeen", "seventy", 0.8, true},                // SFNTN vs SFNT
-		{"nineteen eighty four", "1984", 0.4375, false},    // cardinal reading only
-		{"Schwarzenegger", "shwartseneger", 0.875, true},   // XFRTSNKR vs XRTSNKR
-		{"the cat", "a dog", 1.0 / 3, false},               // 0KT/TKT vs ATK
-		{"Wasserman", "Vasserman", 1, true},                // alternate pairing AFSRMN
-		{"Jose", "Hosay", 1, true},                         // H vs H
-		{"Smith", "Schmidt", 1, true},                      // SM0/XMT alternate pairing
-		{"Arecibo", "auto sebo", 0.75, true},               // order does not matter
-		{"place names", "placenes", 5.0 / 6, true},         // order does not matter
+		{"nineteen eighty four", "1984", 1, true},          // paired (year) reading
+		{"two oh five", "205", 1, true},                    // paired reading with "oh"
+		{"twenty oh five", "2005", 1, true},
+		{"nineteen hundred", "1900", 1, true},
+		{"two four zero", "240", 1, true},                // digit by digit
+		{"1,984", "nineteen eighty four", 0.4375, false}, // grouped: cardinal only
+		{"Schwarzenegger", "shwartseneger", 0.875, true}, // XFRTSNKR vs XRTSNKR
+		{"the cat", "a dog", 1.0 / 3, false},             // 0KT/TKT vs ATK
+		{"Wasserman", "Vasserman", 1, true},              // alternate pairing AFSRMN
+		{"Jose", "Hosay", 1, true},                       // H vs H
+		{"Smith", "Schmidt", 1, true},                    // SM0/XMT alternate pairing
+		{"Arecibo", "auto sebo", 0.75, true},             // order does not matter
+		{"place names", "placenes", 5.0 / 6, true},       // order does not matter
 		{"supercalifragilistic", "super cali fragilistic", 1, true},
 	}
 	for _, tc := range tests {
@@ -106,6 +113,84 @@ func TestSoundAlike(t *testing.T) {
 				tc.a, tc.b, ok, score, m.A.Codes.Primary, m.A.Codes.Alternate,
 				m.B.Codes.Primary, m.B.Codes.Alternate, tc.pass, tc.score)
 		}
+	}
+}
+
+func TestNumberReadings(t *testing.T) {
+	tests := map[string][]string{
+		"7":     {"seven"},
+		"42":    {"forty two", "four two"},
+		"240":   {"two hundred forty", "two forty", "two four zero"},
+		"205":   {"two hundred five", "two oh five", "two zero five"},
+		"200":   {"two hundred", "two zero zero"},
+		"1984":  {"one thousand nine hundred eighty four", "nineteen eighty four", "one nine eight four"},
+		"2005":  {"two thousand five", "twenty oh five", "two zero zero five"},
+		"1900":  {"one thousand nine hundred", "nineteen hundred", "one nine zero zero"},
+		"2000":  {"two thousand", "two zero zero zero"},
+		"1010":  {"one thousand ten", "ten ten", "one zero one zero"},
+		"007":   {"zero zero seven"},
+		"12345": {"twelve thousand three hundred forty five", "one two three four five"},
+		"":      nil,
+		"x":     nil,
+	}
+	for in, want := range tests {
+		if got := NumberReadings(in); !slices.Equal(got, want) {
+			t.Errorf("NumberReadings(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestReadings(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"auto sebo", []string{"auto sebo"}},
+		{"", []string{""}},
+		{"Route 66!", []string{"route sixty six", "route six six"}},
+		{"about 240 miles", []string{"about two hundred forty miles", "about two forty miles", "about two four zero miles"}},
+		{"1,984", []string{"one thousand nine hundred eighty four"}},
+		// 2 × 3 = 6 combinations: within the cap, cardinal-first, first
+		// numeral varying fastest.
+		{"42 240", []string{
+			"forty two two hundred forty", "four two two hundred forty",
+			"forty two two forty", "four two two forty",
+			"forty two two four zero", "four two two four zero",
+		}},
+	}
+	for _, tc := range tests {
+		if got := Readings(tc.in); !slices.Equal(got, tc.want) {
+			t.Errorf("Readings(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestReadingsCap(t *testing.T) {
+	// 3 × 3 = 9 > MaxReadings: every numeral falls back to its cardinal.
+	got := Readings("240 1984")
+	want := []string{"two hundred forty one thousand nine hundred eighty four"}
+	if !slices.Equal(got, want) {
+		t.Errorf("Readings over the cap = %q, want %q", got, want)
+	}
+	// Many numerals stay bounded.
+	if n := len(Readings(strings.Repeat("12 ", 200))); n != 1 {
+		t.Errorf("200 numerals gave %d readings, want 1", n)
+	}
+	for _, s := range []string{"1 2 3", "12 34 56", "10 20", "240"} {
+		if n := len(Readings(s)); n < 1 || n > MaxReadings {
+			t.Errorf("Readings(%q) has %d readings", s, n)
+		}
+	}
+}
+
+func TestCompareReportsWinningReading(t *testing.T) {
+	m := Compare("too forty", "240")
+	if m.B.Reading != "two forty" || m.B.Readings != 3 || m.A.Reading != "too forty" || m.A.Readings != 1 {
+		t.Errorf("Compare reported A %+v B %+v", m.A, m.B)
+	}
+	m = Compare("1984", "nineteen eighty four")
+	if m.A.Reading != "nineteen eighty four" || m.Score != 1 {
+		t.Errorf("Compare reported A %+v score %v", m.A, m.Score)
 	}
 }
 
@@ -124,6 +209,8 @@ func FuzzSoundAlikeSymmetric(f *testing.F) {
 		{"french", "French"}, {"", ""}, {"", "a"}, {"h", "w"}, {"1,000,000", "a million"},
 		{"Çedilla", "Ñandu"}, {"straße", "strasse"}, {"İstanbul", "istanbul"},
 		{"san jose", "SAN JOSE"}, {"99999999999999999999", "x"},
+		{"too forty", "240"}, {"1984 and 2005", "nineteen eighty four and twenty oh five"},
+		{"1 2 3 4 5 6 7 8 9", "123456789"},
 	} {
 		f.Add(s[0], s[1])
 	}

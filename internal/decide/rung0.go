@@ -208,9 +208,9 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 	}
 	a, b := strings.Join(ow, " "), strings.Join(rw, " ")
 	m := phonetic.Compare(a, b)
-	ev := fmt.Sprintf("soundalike %.3f (threshold %.2f): %q [%s/%s] vs %q [%s/%s]",
-		m.Score, threshold, a, m.A.Codes.Primary, m.A.Codes.Alternate, b, m.B.Codes.Primary, m.B.Codes.Alternate)
-	if ok, _ := phonetic.SoundAlike(a, b, threshold); !ok {
+	ev := fmt.Sprintf("soundalike %.3f (threshold %.2f): %s vs %s",
+		m.Score, threshold, describe(a, m.A), describe(b, m.B))
+	if !m.Passes(threshold) {
 		return Verdict{Reason: ReasonNotSoundAlike, Span: span, Evidence: ev}
 	}
 	return Verdict{Pass: true, Span: span, Evidence: ev}
@@ -367,6 +367,15 @@ func Dedupe(cands []Candidate, verdicts []Verdict, existing []patch.Patch) []Ver
 				cands[winner].FindingID, cands[winner].Confidence, out[winner].Span.Start, out[winner].Span.End)}
 	}
 	return out
+}
+
+// describe renders one side of a phonetic comparison for evidence: the text,
+// the reading that won when the text had several (numerals), and its codes.
+func describe(text string, p phonetic.Phrase) string {
+	if p.Readings > 1 {
+		return fmt.Sprintf("%q read as %q (best of %d readings) [%s/%s]", text, p.Reading, p.Readings, p.Codes.Primary, p.Codes.Alternate)
+	}
+	return fmt.Sprintf("%q [%s/%s]", text, p.Codes.Primary, p.Codes.Alternate)
 }
 
 func firstOverlap(s patch.Span, applied []patch.AppliedPatch, self string) (patch.AppliedPatch, bool) {
