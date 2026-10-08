@@ -459,3 +459,162 @@ func transcriptPatchSetAt(ctx context.Context, q rowQuerier, transcriptID string
 	}
 	return out, nil
 }
+
+// ApplyResult reports one ApplyDecisions write. Every finding id given lands
+// in exactly one list, each sorted.
+type ApplyResult struct {
+	Accepted []string // apply: proposed → accepted
+	Rejected []string // reject: proposed → rejected
+	Held     []string // hold: recorded, left proposed
+	Skipped  []string // not written: locked by someone else, no longer proposed, or its chunk changed
+}
+
+// applyDecisionsLockSQL locks the findings first (the repo-wide order:
+// findings, then chunks) in id order, SKIP LOCKED: a finding a reviewer, a
+// reanchor run or another decide shard holds right now is skipped and
+// re-decided next run, never waited on. Only proposed findings are decided.
+var applyDecisionsLockSQL = `
+	SELECT id::text FROM transcript_findings
+	 WHERE id = ANY($1) AND patch_state = 'proposed'
+	 ORDER BY id
+	   FOR UPDATE SKIP LOCKED
+`
+
+// applyDecisionsChunksSQL reads, FOR SHARE, the pristine-text hash of each
+// locked finding's chunk (addressed like markChunkStaleForFindingSQL), so a
+// rebuild cannot change the text between this check and the commit. Chunks
+// are locked in chunk-id order, after every finding lock.
+var applyDecisionsChunksSQL = `
+	SELECT f.id::text,
+	       encode(sha256(convert_to(COALESCE(c.source_text, c.text), 'UTF8')), 'hex')
+	  FROM transcript_findings f
+	  JOIN transcript_chunks c
+	    ON (f.chunk_index IS NOT NULL AND c.transcript_id = f.transcript_id AND c.chunk_index = f.chunk_index)
+	    OR (f.chunk_index IS NULL AND c.id = f.chunk_id)
+	 WHERE f.id = ANY($1)
+	 ORDER BY c.id
+	   FOR SHARE OF c
+`
+
+// ApplyDecisions is the decide step's write (CONTRACT §2.17 "Automated
+// decisions"): in one short transaction it locks the decided findings then
+// their chunks, drops any finding that is locked elsewhere, no longer
+// proposed, or whose chunk no longer hashes to the event's ChunkTextSHA256
+// (the decider saw other text), then records the remaining decision events
+// and moves apply → accepted and reject → rejected as "jev:<recipeID>". Holds
+// are recorded and stay proposed. Model calls belong before this call, never
+// inside it.
+//
+// Every event must belong to recipeID, the recipe must be registered, and a
+// finding may appear once.
+func (db *DB) ApplyDecisions(ctx context.Context, recipeID string, evs []DecisionEvent) (ApplyResult, error) {
+	return applyDecisions(ctx, db.pool, recipeID, evs)
+}
+
+func applyDecisions(ctx context.Context, b txBeginner, recipeID string, evs []DecisionEvent) (ApplyResult, error) {
+	if !sha256HexRe.MatchString(recipeID) {
+		return ApplyResult{}, fmt.Errorf("apply decisions: recipe_id %q is not lowercase hex sha256", recipeID)
+	}
+	ids := make([]string, 0, len(evs))
+	seen := make(map[string]bool, len(evs))
+	for _, e := range evs {
+		if err := e.validate(); err != nil {
+			return ApplyResult{}, err
+		}
+		if e.RecipeID != recipeID {
+			return ApplyResult{}, fmt.Errorf("apply decisions: event for %s is by recipe %s, not %s", e.FindingID, e.RecipeID, recipeID)
+		}
+		if seen[e.FindingID] {
+			return ApplyResult{}, fmt.Errorf("apply decisions: finding %s decided twice", e.FindingID)
+		}
+		seen[e.FindingID] = true
+		ids = append(ids, e.FindingID)
+	}
+	if len(ids) == 0 {
+		return ApplyResult{}, nil
+	}
+	slices.Sort(ids)
+
+	tx, err := b.Begin(ctx)
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("begin apply-decisions tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, applyDecisionsLockSQL, ids)
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("lock decided findings: %w", err)
+	}
+	locked, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("lock decided findings: %w", err)
+	}
+	rows, err = tx.Query(ctx, applyDecisionsChunksSQL, locked)
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("lock decided chunks: %w", err)
+	}
+	chunkSHA := make(map[string]string, len(locked))
+	var fid, sha string
+	if _, err := pgx.ForEachRow(rows, []any{&fid, &sha}, func() error {
+		chunkSHA[fid] = sha
+		return nil
+	}); err != nil {
+		return ApplyResult{}, fmt.Errorf("lock decided chunks: %w", err)
+	}
+
+	var (
+		res     ApplyResult
+		write   []DecisionEvent
+		isReady = make(map[string]bool, len(locked))
+	)
+	for _, id := range locked {
+		isReady[id] = true
+	}
+	for _, e := range evs {
+		cur, hasChunk := chunkSHA[e.FindingID]
+		// A decision about text the chunk no longer holds is not written; an
+		// event that names no hash still needs the chunk to exist.
+		if !isReady[e.FindingID] || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) {
+			res.Skipped = append(res.Skipped, e.FindingID)
+			continue
+		}
+		write = append(write, e)
+		switch e.Outcome {
+		case OutcomeApply:
+			res.Accepted = append(res.Accepted, e.FindingID)
+		case OutcomeReject:
+			res.Rejected = append(res.Rejected, e.FindingID)
+		default:
+			res.Held = append(res.Held, e.FindingID)
+		}
+	}
+	if len(write) > 0 {
+		if _, err := InsertDecisionEvents(ctx, tx, write); err != nil {
+			return ApplyResult{}, err
+		}
+	}
+	decider := "jev:" + recipeID
+	for _, mv := range []struct {
+		to  string
+		ids []string
+	}{{patch.StateAccepted, res.Accepted}, {patch.StateRejected, res.Rejected}} {
+		if len(mv.ids) == 0 {
+			continue
+		}
+		br, err := setPatchStateBulkTx(ctx, tx, patch.StateProposed, mv.to, decider, mv.ids)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		// The findings are locked and were proposed, so nothing can be skipped.
+		if len(br.Skipped) > 0 {
+			return ApplyResult{}, fmt.Errorf("apply decisions: %d locked finding(s) did not move to %s", len(br.Skipped), mv.to)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ApplyResult{}, fmt.Errorf("commit apply decisions: %w", err)
+	}
+	for _, l := range [][]string{res.Accepted, res.Rejected, res.Held, res.Skipped} {
+		slices.Sort(l)
+	}
+	return res, nil
+}

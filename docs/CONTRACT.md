@@ -3181,8 +3181,14 @@ Every verdict, including a **hold** (the finding stays `proposed`), is a
 (`apply`/`hold`/`reject`), the reason, the model probability `p`, the evidence
 class (`asin_verbatim`/`exact_repeat`/`none`), the `fn_calls` row that
 answered, and the chunk hash the decider saw. Model calls happen outside the
-write transaction; the write locks findings then chunks (the repo-wide order)
-and re-checks them before recording.
+write transaction. The write is `db.ApplyDecisions(recipe, events)`: one short
+transaction that locks the findings (id order, `SKIP LOCKED`, `proposed`
+only) then their chunks (`FOR SHARE`) — the repo-wide order — skips any
+finding locked elsewhere, no longer proposed, or whose chunk's pristine text no
+longer hashes to the event's `chunk_text_sha256`, then records the remaining
+decision events and moves `apply` → `accepted` and `reject` → `rejected` as
+`jev:<recipe_id>`. Skipped findings get no event and are decided again next
+run.
 
 #### Version history
 

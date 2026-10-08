@@ -46,6 +46,8 @@ var correctionSQL = map[string]string{
 	"revokeEventsSQL":         revokeEventsSQL,
 	"findingHistorySQL":       findingHistorySQL,
 	"patchSetAtSQL":           patchSetAtSQL,
+	"applyDecisionsLockSQL":   applyDecisionsLockSQL,
+	"applyDecisionsChunksSQL": applyDecisionsChunksSQL,
 }
 
 // TestCorrectionSQL_NeverTouchesTranscriptProvenance is the hard invariant of

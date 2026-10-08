@@ -263,3 +263,48 @@ func TestFindingEventSQL_AppendOnly(t *testing.T) {
 		t.Error("findingHistorySQL must be bounded")
 	}
 }
+
+// TestApplyDecisions_ValidatesBeforeTx: a malformed batch opens no
+// transaction.
+func TestApplyDecisions_ValidatesBeforeTx(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+	ok := DecisionEvent{FindingID: "a", RecipeID: testRecipe, Outcome: OutcomeApply, Reason: "r"}
+	other := ok
+	other.FindingID, other.RecipeID = "b", strings.Repeat("cd", 32)
+	cases := map[string]struct {
+		recipe string
+		evs    []DecisionEvent
+	}{
+		"bad recipe id": {"jev:" + testRecipe, []DecisionEvent{ok}},
+		"mixed recipes": {testRecipe, []DecisionEvent{ok, other}},
+		"duplicate":     {testRecipe, []DecisionEvent{ok, ok}},
+		"invalid event": {testRecipe, []DecisionEvent{{FindingID: "a", RecipeID: testRecipe, Outcome: "accept", Reason: "r"}}},
+	}
+	for name, tc := range cases {
+		if _, err := applyDecisions(context.Background(), mock, tc.recipe, tc.evs); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if res, err := applyDecisions(context.Background(), mock, testRecipe, nil); err != nil || len(res.Skipped) != 0 {
+		t.Errorf("empty batch = %+v, %v", res, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("validation must not touch the database: %v", err)
+	}
+}
+
+// TestApplyDecisionsSQL_LockOrder: findings SKIP LOCKED in id order, then
+// chunks FOR SHARE — the repo-wide findings → chunks order.
+func TestApplyDecisionsSQL_LockOrder(t *testing.T) {
+	if !strings.Contains(norm(applyDecisionsLockSQL), "patch_state = 'proposed' ORDER BY id FOR UPDATE SKIP LOCKED") {
+		t.Errorf("findings must be locked in id order, SKIP LOCKED, proposed only:\n%s", applyDecisionsLockSQL)
+	}
+	if !strings.Contains(norm(applyDecisionsChunksSQL), "ORDER BY c.id FOR SHARE OF c") ||
+		!strings.Contains(applyDecisionsChunksSQL, "COALESCE(c.source_text, c.text)") {
+		t.Errorf("chunks must be read pristine and locked FOR SHARE in order:\n%s", applyDecisionsChunksSQL)
+	}
+}

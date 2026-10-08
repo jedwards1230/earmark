@@ -456,3 +456,63 @@ func TestIntegrationFindingEventsBackfill(t *testing.T) {
 		t.Fatalf("re-migrate: %v", err)
 	}
 }
+
+// TestIntegrationApplyDecisions: one write records apply/hold/reject and
+// moves the states; a finding whose chunk changed, one no longer proposed and
+// one locked by another transaction are skipped with no event.
+func TestIntegrationApplyDecisions(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	ids := seedFindingEvents(t, conn, 6) // even ids on chunk 0, odd on chunk 1
+	recipe := strings.Repeat("5e", 32)
+	registerTestRecipe(t, conn, recipe, 1)
+	sha0 := patch.ChunkHash("ganema said")
+	sha1 := patch.ChunkHash("and left")
+
+	if err := d.SetPatchState(ctx, ids[4], patch.StateProposed, patch.StateRejected, "mcp:justin"); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := d.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, `SELECT 1 FROM transcript_findings WHERE id = $1 FOR UPDATE`, ids[5]); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := func(id, outcome, sha string) DecisionEvent {
+		return DecisionEvent{FindingID: id, RecipeID: recipe, Outcome: outcome, Reason: "test", ChunkTextSHA256: sha}
+	}
+	res, err := d.ApplyDecisions(ctx, recipe, []DecisionEvent{
+		ev(ids[0], OutcomeApply, sha0),
+		ev(ids[1], OutcomeHold, sha1),
+		ev(ids[2], OutcomeReject, ""),
+		ev(ids[3], OutcomeApply, sha0), // ids[3] is on chunk 1: the decider saw other text
+		ev(ids[4], OutcomeApply, sha0), // no longer proposed
+		ev(ids[5], OutcomeApply, sha1), // locked elsewhere
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Accepted) != 1 || res.Accepted[0] != ids[0] || len(res.Held) != 1 || res.Held[0] != ids[1] ||
+		len(res.Rejected) != 1 || res.Rejected[0] != ids[2] || len(res.Skipped) != 3 {
+		t.Fatalf("ApplyDecisions = %+v", res)
+	}
+	for id, want := range map[string]string{ids[0]: "accepted", ids[1]: "proposed", ids[2]: "rejected", ids[3]: "proposed", ids[4]: "rejected"} {
+		if got := findingState(t, d, id); got != want {
+			t.Errorf("%s is %s, want %s", id, got, want)
+		}
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'decision'`); n != 3 {
+		t.Errorf("%d decision events, want 3 (skipped findings record none)", n)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM finding_events
+		WHERE kind = 'transition' AND actor = $1 AND recipe_id = $2`, "jev:"+recipe, recipe); n != 2 {
+		t.Errorf("%d recipe transitions, want the accept and the reject", n)
+	}
+	if !chunkStale(t, conn, feChunk0) {
+		t.Error("the accepted finding's chunk must be flagged")
+	}
+}
