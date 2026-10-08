@@ -4378,6 +4378,7 @@ func scanIDPaths(rows pgx.Rows) (ids, paths []string, err error) {
 // TestResetRebuildsFreshSchema (integration) fails if one survives.
 var resetSQL = `
 	DROP VIEW     IF EXISTS stale_work;
+	DROP TABLE    IF EXISTS finding_events      CASCADE;
 	DROP TABLE    IF EXISTS fn_calls            CASCADE;
 	DROP TABLE    IF EXISTS current_recipes     CASCADE;
 	DROP TABLE    IF EXISTS transcript_findings CASCADE;
@@ -4391,6 +4392,8 @@ var resetSQL = `
 	DROP TABLE    IF EXISTS recipes             CASCADE;
 	DROP FUNCTION IF EXISTS transcription_jobs_set_updated_at()   CASCADE;
 	DROP FUNCTION IF EXISTS transcription_jobs_set_completed_at() CASCADE;
+	DROP FUNCTION IF EXISTS finding_events_record_transition()    CASCADE;
+	DROP FUNCTION IF EXISTS finding_events_append_only()          CASCADE;
 	DROP TABLE    IF EXISTS goose_db_version;
 `
 

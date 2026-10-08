@@ -9,8 +9,10 @@
 // cheap, an autonomous wrong correction would silently corrupt the corpus.
 //
 // This package does not relax that. The judge remains read-only; every write
-// here is gated on an explicit human decision recorded against a specific
-// finding. The model proposes, a person disposes. Keeping the apply path in its
+// here is gated on an explicit decision recorded against a specific finding —
+// by a person, or by a registered decide recipe (CONTRACT §2.17 "Automated
+// decisions"), every one logged in finding_events. The judge proposes, a
+// decider disposes, and proposed → applied stays illegal for both. Keeping the apply path in its
 // own package (rather than in internal/eval) is what keeps the §2.15 guarantee
 // mechanically true instead of merely intended — internal/eval still contains
 // no UPDATE against transcript text, and its SQL guard test still passes.
