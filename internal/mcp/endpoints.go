@@ -7,21 +7,23 @@ import (
 	"strings"
 
 	"github.com/jedwards1230/earmark/internal/config"
+	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
 // ─── AI endpoints table (Models page) ──────────────────────────────────────────
 //
 // The Models page lists the AI endpoint registry (CONTRACT §2.14) as a table:
-// one row per configured endpoint with its role, type, gateway, backend, model,
-// baseURL host, liveness, and options. Liveness is a GET /models probe ONLY —
+// one row per configured endpoint with its role, type, gateway, baseURL host,
+// model, liveness, and options (the backend stays in the JSON API only). Liveness is a GET /models probe ONLY —
 // role health on the cards above folds in call outcomes. Observability only, no
 // job routing. The baseURL is shown HOST-ONLY (no scheme/path) so the page never
 // surfaces a full internal URL the way the JSON API does.
 
-// endpointStateMeta maps a probe state to its display label + dot color,
-// mirroring the serverState convention used by the ASR cards.
+// endpointStateMeta maps a probe state to its display label + dot color. The
+// labels say what the GET /models probe saw ("lists model", not "READY"), so a
+// liveness result never reads as role health or runner readiness.
 type endpointStateMeta struct {
-	Label string // READY / MODEL NOT LOADED / OFFLINE / UNKNOWN
+	Label string // lists model / model not listed / unreachable / unknown
 	Glyph string // ✓ / ▲ / ✗ / ? — paired with the word, never color alone
 	Class string
 	Dot   string // green / amber / grey
@@ -31,14 +33,14 @@ type endpointStateMeta struct {
 func endpointStateMetaFor(p endpointProbe) endpointStateMeta {
 	switch {
 	case !p.Probed:
-		return endpointStateMeta{Label: "UNKNOWN", Glyph: "?", Class: "state-unknown", Dot: "grey", Sub: "not probed yet"}
+		return endpointStateMeta{Label: "unknown", Glyph: "?", Class: "state-unknown", Dot: "grey", Sub: "not probed yet"}
 	case p.State == epStateReady:
-		return endpointStateMeta{Label: "READY", Glyph: "✓", Class: "state-running", Dot: "green", Sub: "reachable — model available"}
+		return endpointStateMeta{Label: "lists model", Glyph: "✓", Class: "state-running", Dot: "green", Sub: "reachable — model available"}
 	case p.State == epStateModelMissing:
-		return endpointStateMeta{Label: "MODEL NOT LOADED", Glyph: "▲", Class: "state-busy", Dot: "amber",
+		return endpointStateMeta{Label: "model not listed", Glyph: "▲", Class: "state-busy", Dot: "amber",
 			Sub: "reachable, but the configured model is not in /models"}
 	default: // offline
-		return endpointStateMeta{Label: "OFFLINE", Glyph: "✗", Class: "state-offline", Dot: "grey",
+		return endpointStateMeta{Label: "unreachable", Glyph: "✗", Class: "state-offline", Dot: "grey",
 			Sub: "endpoint unreachable (GET /models failed)"}
 	}
 }
@@ -119,7 +121,7 @@ func buildEndpointViews(cfg *config.Config, probes map[string]endpointProbe) []e
 		if gw == "litellm" && probe.Probed && probe.State == epStateModelMissing {
 			// LiteLLM's /v1/models lists only the virtual key's allowed models,
 			// so "missing" means "not on earmark's key allowlist": calls 403.
-			meta.Label = "NOT ALLOWED"
+			meta.Label = "not allowed"
 			meta.Sub = "not on earmark's LiteLLM key allowlist (403 on call)"
 		}
 		v := endpointView{
@@ -192,6 +194,21 @@ func (v endpointView) GatewayLabel() string {
 	return gatewayLabel(v.Gateway)
 }
 
+// RoleTitle names the bound role the way the role cards do ("Judge" for the
+// eval role), "" when unbound. Exported for template method dispatch.
+func (v endpointView) RoleTitle() string {
+	switch v.Role {
+	case "":
+		return ""
+	case "eval":
+		return roleTitleForStep(recipe.StepPropose)
+	case "embeddings":
+		return roleTitleForStep(recipe.StepEmbed)
+	default:
+		return v.Role
+	}
+}
+
 // envJudgeView is the synthetic endpoint-table row for a judge configured from
 // EVAL_CHAT_* rather than AI_ENDPOINTS. It is never probed: probing would mean
 // holding the API key outside the registry.
@@ -203,7 +220,7 @@ func envJudgeView(j judgeConfig) *endpointView {
 	return &endpointView{
 		ID: "EVAL_CHAT_*", Type: "chat", Backend: "env", Model: j.Model, HostOnly: j.Host,
 		Role: "eval", Gateway: gw, GatewayInferred: inferred, FromEnv: true,
-		State:      endpointStateMeta{Label: "NOT PROBED", Glyph: "?", Class: "state-unknown", Dot: "grey", Sub: "from env, not in AI_ENDPOINTS"},
+		State:      endpointStateMeta{Label: "not probed", Glyph: "?", Class: "state-unknown", Dot: "grey", Sub: "from env, not in AI_ENDPOINTS"},
 		StateToken: string(epStateUnknown),
 	}
 }

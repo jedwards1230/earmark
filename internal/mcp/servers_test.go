@@ -411,3 +411,74 @@ func TestBuildServerViews_HistoryWindow(t *testing.T) {
 		t.Errorf("an unconfigured live runner must always show")
 	}
 }
+
+// TestServerViewCaps: the Caps cell shows only supported capabilities; the
+// tooltip carries the full list, declined ones with their reason.
+func TestServerViewCaps(t *testing.T) {
+	tests := []struct {
+		name      string
+		v         serverView
+		wantShown []string
+		wantTitle string
+	}{
+		{
+			name: "observed with a declined cap",
+			v: serverView{CapsSource: "observed", Caps: []capBadge{
+				{Key: "word_timestamps", Label: "words", Applied: true},
+				{Key: "context_biasing", Label: "bias", Applied: false, Reason: "timestamps break"},
+				{Key: "diarization", Label: "diar", Applied: false},
+			}},
+			wantShown: []string{"words"},
+			wantTitle: "applied by the most recent run: words ✓ · bias ✗ (timestamps break) · diar ✗",
+		},
+		{
+			name:      "configured, nothing supported",
+			v:         serverView{CapsSource: "configured", Caps: []capBadge{{Key: "diarization", Label: "diar"}}},
+			wantShown: nil,
+			wantTitle: "declared in ASR_SERVERS (no run has reported applied caps yet): diar ✗",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var shown []string
+			for _, b := range tc.v.AppliedCaps() {
+				shown = append(shown, b.Label)
+			}
+			if strings.Join(shown, ",") != strings.Join(tc.wantShown, ",") {
+				t.Errorf("AppliedCaps = %v, want %v", shown, tc.wantShown)
+			}
+			if got := tc.v.CapsTitle(); got != tc.wantTitle {
+				t.Errorf("CapsTitle = %q, want %q", got, tc.wantTitle)
+			}
+		})
+	}
+}
+
+// TestBuildServerViews_StateGlyph: every runner state pairs a glyph with its
+// word (state is never color alone) without changing the API token.
+func TestBuildServerViews_StateGlyph(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fin := now.Add(-time.Hour)
+	views := buildServerViews([]config.ASRServer{{Name: "gpu-1"}, {Name: "gpu-2"}},
+		&db.ServerObservation{Hosts: []db.HostMetrics{{Host: "gpu-1", JobsDone: 3, LastFinished: &fin}}}, nil, now, time.Minute)
+	if len(views) != 2 {
+		t.Fatalf("want 2 views, got %d", len(views))
+	}
+	for _, tc := range []struct{ glyph, label, token string }{{"●", "IDLE", "idle"}, {"?", "NOT SEEN", "not_seen"}} {
+		var v *serverView
+		for i := range views {
+			if views[i].State.Label == tc.label {
+				v = &views[i]
+			}
+		}
+		if v == nil {
+			t.Fatalf("no %s view", tc.label)
+		}
+		if v.State.Glyph != tc.glyph || v.State.Token != tc.token {
+			t.Errorf("%s: glyph %q token %q, want %q %q", tc.label, v.State.Glyph, v.State.Token, tc.glyph, tc.token)
+		}
+	}
+	if !views[0].LastActiveAt.Equal(fin) {
+		t.Errorf("LastActiveAt = %v, want %v", views[0].LastActiveAt, fin)
+	}
+}

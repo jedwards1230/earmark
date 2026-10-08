@@ -2054,7 +2054,7 @@ unchanged.):
 | `POST` | `/actions/book-requeue?dir=…` | htmx | re-transcribe one book |
 | `POST` | `/actions/pause` / `/actions/resume` | htmx + token | toggle the runner pause flag (Pipeline page) |
 | `POST` | `/actions/run` (form/query `n≥1`) | htmx + token | arm a bounded run of N claims then auto-pause — sets `run_limit=N` then unpauses (limit before unpause, mirroring `POST /api/v1/pipeline/run`) |
-| `POST` | `/actions/runner-update` (form body `version`, else query `?version=`) | htmx + token | request the runner self-update to `version` (or clear when empty); writes `desired_runner_version` + `'requested'` and re-renders the `/servers` (Models) fragment (the runner version panel) |
+| `POST` | `/actions/runner-update` (form body `version`, else query `?version=`) | htmx + token | request the runner self-update to `version` (or clear when empty); writes `desired_runner_version` + `'requested'` and re-renders the `/servers` (Models) fragment (the runner version line) |
 | `POST` | `/actions/run-clear` | htmx + token | clear the bounded run (`run_limit→NULL`) without touching the pause flag |
 | `POST` | `/actions/eval?dir=…` | htmx + token | run the LLM judge over one book (async, §2.15) |
 | `POST` | `/actions/eval-sample?n=N` | htmx + token | run the LLM judge over an N-chunk sample (async, §2.15) |
@@ -2073,7 +2073,7 @@ LAN-only; only reachable under the HTTP transport.
 | `GET /library/data` | Library fragment. Query: `status`, `q`, `sort` (`recent`\|`title`\|`progress`\|`findings`), `findings` (`1` → only books with recorded findings), `offset`. Sort + has-findings filter are applied **all-in-Go** over the full filtered set. |
 | `GET /status/data` | Status fragment (htmx-refreshed every 3 s): counts, pipeline state, read-only phase badge, and the token-gated pause + run-budget controls. |
 | `GET /failed/data` | Failed-jobs fragment. **No standalone `/failed` page** — it renders inside `/pipeline`. |
-| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the role board, recipes & stale work, ASR runners, AI endpoints, judge output. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s and stale counts 5 min, both served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
+| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the role board, recipes & stale work, LiteLLM gateway, AI endpoints, judge output, ASR runners. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s and stale counts 5 min, both served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
 | `GET /findings` · `/findings/data` | Findings page + fragment (§2.15). |
 | `GET /book` · `/book/data` | Per-book detail page + fragment. |
 | `GET /track?id=…[&t=<startSec>]` | Per-track detail page. The optional **`t`** (seconds) is the finding "Where" deep-jump: the reader preloads pages `[0 .. the page containing the segment spanning t]`, marks that segment active, and scrolls to it. |
@@ -2259,14 +2259,18 @@ TTL-cached so both render paths share one upstream call. State tokens:
 
 | Condition | Page label | API `state` |
 |---|---|---|
-| 200 OK + model present (or empty model list) | `✓ READY` (green) | `ready` |
-| 200 OK but configured model not in `/models` | `▲ MODEL NOT LOADED` (amber); behind LiteLLM `▲ NOT ALLOWED` — LiteLLM's `/v1/models` lists only the virtual key's allowed models, so the model is off earmark's key allowlist (403 on call) | `model_not_loaded` |
-| non-200 / timeout / unreachable | `✗ OFFLINE` (grey) | `offline` |
-| not probed yet | `? UNKNOWN` (grey) | `unknown` |
+| 200 OK + model present (or empty model list) | `✓ lists model` (green) | `ready` |
+| 200 OK but configured model not in `/models` | `▲ model not listed` (amber); behind LiteLLM `▲ not allowed` — LiteLLM's `/v1/models` lists only the virtual key's allowed models, so the model is off earmark's key allowlist (403 on call) | `model_not_loaded` |
+| non-200 / timeout / unreachable | `✗ unreachable` (grey) | `offline` |
+| not probed yet | `? unknown` (grey); an `EVAL_CHAT_*` row `? not probed` | `unknown` |
 
-**Liveness is not call success.** `READY` means the gateway lists the model,
+The page labels say what the probe saw rather than "READY", so endpoint
+liveness never reads as role health or runner readiness; the API tokens are
+unchanged.
+
+**Liveness is not call success.** `lists model` (`ready`) means the gateway lists the model,
 not that calls to it succeed: a judge that 401s on every chat call, or that
-LiteLLM silently routes to a fallback, is still `READY`. Role health (below)
+LiteLLM silently routes to a fallback, still `lists model`. Role health (below)
 folds in call outcomes.
 
 #### Models page (`/servers`)
@@ -2276,31 +2280,37 @@ Models/Services page — the URL stays `/servers`) is a **role board**:
 observability only, earmark does **not** route work between endpoints. Top to
 bottom:
 
-1. **Roles** — one card per pipeline role, in fixed order. Each card shows
-   *requested* (the model id earmark sends, `@ <endpoint id>`), *pinned*
-   (`MODELS_FILE` `expected_model` + revision, §2.18), *answered* (what the
-   endpoint reported serving the call) with `✓ matches pin` or `≠ expected
-   <x>`, last ok / last fail, and the step's stale count linking to its recipe
-   row.
+1. **Roles** — one card per configured pipeline role, in fixed order; roles
+   in state `not_configured` are not cards but one muted "○ Not configured:"
+   line under them (Decide with its human-decided count; ASR/Judge/Embeddings
+   with the reason). Each card shows *requested* (the model id earmark sends,
+   `@ <endpoint id>`), *pinned* (`MODELS_FILE` `expected_model` + revision,
+   §2.18; the row is omitted when unpinned), *answered* (what the endpoint
+   reported serving the call) with `✓ matches pin` or `≠ expected <x>`, last
+   ok / last fail ("no failures" when none), and the step's stale count
+   linking to its recipe row. A role behind a gateway carries a "via LiteLLM"
+   badge in its header. The LiteLLM key allowlist verdict is not a card row:
+   a denied model shows as the health line or, when another state outranks
+   it, a red "✗ <model> is not on earmark's LiteLLM key allowlist" line.
 
    | Role | Step | Configured from | Answered from |
    |---|---|---|---|
    | ASR | `asr` | `ASR_SERVERS` primary entry's `model` (else the first) | newest `transcripts` row: `model_name`, `asr_runner_version`, `asr_model_sha256` |
    | Judge | `propose` | `AI_ROLES.eval`, else `EVAL_CHAT_*` (shown as `@ EVAL_CHAT_*`, not probed) | newest `run_metrics.eval_resolved_model`; other models seen in 7 days listed as *also* |
    | Embeddings | `embed` | `AI_ROLES.embeddings` | newest `run_metrics.embed_model` |
-   | Decide | `decide` | none yet (`NOT CONFIGURED`; shows judge findings decided by humans) | — |
-   | Format | `format` | none yet (`NOT CONFIGURED`) | — |
+   | Decide | `decide` | none yet (`not_configured`; the strip shows judge findings decided by humans) | — |
+   | Format | `format` | none yet (`not_configured`) | — |
 
    Role health (`roles[].state` in the API) — a glyph always pairs with the word:
 
    | Token | Label | Meaning |
    |---|---|---|
    | `healthy` | ✓ HEALTHY | working; the answering model is the expected one |
-   | `idle` | ● IDLE | configured and reachable, nothing to do, no recent failure |
+   | `idle` | ✓ HEALTHY · idle (green, like `healthy`) | configured and reachable, nothing to do, no recent failure |
    | `degraded` | ▲ DEGRADED | works but something is off: the model is not on the LiteLLM key allowlist (calls 403), a different model answered, the model is not loaded, the asr-runner is stopped on a free GPU, GPUs held by games while jobs wait, or no success for a while with work waiting |
    | `failing` | ✗ FAILING | attempts are failing (judge: newest failure after newest success), or an ASR claim is stalled |
    | `down` | ✗ DOWN | configured but unreachable (red — a configured role that cannot be reached is an alarm, unlike the neutral grey `OFFLINE` of an endpoint row) |
-   | `not_configured` | ○ NOT CONFIGURED | no binding |
+   | `not_configured` | ○ Not configured (one line under the cards, not a card) | no binding |
    | `unknown` | ? UNKNOWN | evidence unavailable (the counts snapshot or runner read failed) |
 
    Precedence, first match wins.
@@ -2329,38 +2339,52 @@ bottom:
    implicit `:latest` as the bare name, but a bare pin does not match an
    arbitrary tag (`qwen3.8` ≠ `qwen3.8:14b`); when unpinned, the answer is
    compared with the requested id. A failing judge shows its last error in red
-   under the state; otherwise the last error is a muted "last error" row with
-   its time.
+   under the state (monospace, clamped to two lines; full text on hover);
+   otherwise the last error is a muted "last error" row with its time.
 
    *last ok* on the Judge card is `max(run_metrics.eval_finished_at)`: the
    newest judge success **from any source** (the hourly backfill CronJob,
    in-pipeline judging, the dashboard). earmark records no per-backfill-run
    marker. *failing* counts transcripts whose latest attempt failed (a success
    clears it), not attempts.
-2. **Recipes & stale work** — every recipe step: current recipe (id, model,
-   prompt, since), its pin, and its `stale_work` count (§1.9). Steps with no
-   current recipe show *not tracked*. Only counts are read — never rows.
-3. **ASR runners** — the runner cards (state table above, §2.4; unconfigured
-   history-only hosts only within 30 days), a read-only runner version panel
-   (running / requested / state, §2.12 self-update — the update form itself is
-   in the static shell below the region; it posts `version` in the form body,
-   and its separate "Clear request" control posts an explicit empty `version`,
-   never the typed text), a model/runtime/caps table (Runtime
-   and Caps columns hidden while no runner reports them), and transcript
-   provenance grouped by
-   (model, runner version, `.nemo` sha256), newest first, at most 8 groups;
-   transcripts from a runner that reported no provenance form one *not
-   reported* group.
-4. **LiteLLM gateway** — one card per distinct LiteLLM gateway and key (see
-   below): readiness, key alias/status/expiry, spend and budget, rpm/tpm
-   limits, the allowed models, and each role's model marked ✓ allowed / ✗ NOT
-   ALLOWED.
-5. **AI endpoints** — the registry as a table: id, role, type, gateway
-   (declared, *inferred*, or *direct*), backend, host, model, liveness,
-   options. An env-configured judge appears as an unprobed `EVAL_CHAT_*` row.
-6. **Judge output** — judge findings by `coalesce(resolved_model, model)`:
+2. **Recipes & stale work** — one row per *tracked* step (a step with a
+   current recipe): its current recipe (id, model, prompt, since — prompt and
+   since hidden on narrow screens) and its `stale_work` count (§1.9), with how
+   stale rows converge on hover. Every other step is named on one muted
+   "Not tracked:" line (`asr` noted as *provenance per transcript*). Only
+   counts are read — never rows.
+3. **LiteLLM gateway** — one card per distinct LiteLLM gateway and key (see
+   below): readiness, *used by* (role titles; an unbound endpoint by id), key
+   alias/status/expiry, spend and budget, rpm/tpm limits, the allowed models,
+   and — only when some role's model is not allowed or cannot be checked —
+   each role's model marked ✓ allowed / ✗ NOT ALLOWED / ? not checked.
+4. **AI endpoints** — the registry as a table: id, role (the role card's
+   title, e.g. *Judge* for `eval`), type, gateway (declared, *inferred*, or
+   *direct*), host, model, liveness, and options (column shown only when some
+   row has options). An env-configured judge appears as an unprobed
+   `EVAL_CHAT_*` row.
+5. **Judge output** — judge findings by `coalesce(resolved_model, model)`:
    proposed, unanchorable, decided (accepted + rejected + applied + reverted),
    superseded / other (superseded + the patch state `stale`), total.
+6. **ASR runners** — last, so the static update form in the shell follows it
+   directly. The runner cards (state table above, §2.4, each state paired
+   with a glyph; unconfigured history-only hosts only within 30 days), one
+   read-only runner version line (running / requested / state, §2.12
+   self-update — the update form itself is in the static shell below the
+   region; it posts `version` in the form body, and its separate "Clear
+   request" control posts an explicit empty `version`, never the typed text),
+   a model/runtime/caps table (Runtime and Caps columns hidden while no runner
+   reports them; Caps lists only supported capabilities, the full list with
+   declined ones and their reasons on hover), and transcript provenance
+   grouped by (model, runner version, `.nemo` sha256), newest first, at most 8
+   groups; transcripts from a runner that reported no provenance form one
+   *not reported* group.
+
+Each table's description is a paragraph above its scroll container (not a
+`<caption>`, which would scroll out of view on a phone) and labels the table
+via `aria-labelledby`. Times are relative, with the absolute UTC time on hover —
+except the header's "updated HH:MM:SS UTC" render clock, which stays absolute
+because it is the one value that visibly freezes when polling stops.
 
 **Caching.** The page and `GET /api/v1/status` read the same caches, all served
 stale-while-revalidate: a value past its TTL is returned immediately and one

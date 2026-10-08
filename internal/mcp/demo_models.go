@@ -19,9 +19,9 @@ import (
 //	failed                 — Judge FAILING (401 from LiteLLM, 12 failing)
 //	stale                  — Judge DEGRADED (qwen3.8 ≠ pin), Embeddings
 //	                         DEGRADED (embed_model differs), ASR FAILING (stalled)
-//	idle                   — Judge and Embeddings IDLE, stale counts 0
+//	idle                   — Judge and Embeddings HEALTHY · idle, stale counts 0
 //	winddown               — the LiteLLM gateway is offline → Judge + Embeddings DOWN
-//	empty                  — ASR/Judge/Decide/Format NOT CONFIGURED, no recipes
+//	empty                  — ASR/Judge/Decide/Format on the "Not configured" line, no recipes
 //	multibackend           — two runner builds and two .nemo shas plus legacy
 //	snapshot-error         — the aggregate snapshot fails: "counts unavailable",
 //	                         the fragment still renders 200

@@ -239,11 +239,10 @@ func TestGatewayFor(t *testing.T) {
 	}
 }
 
+// TestBuildRecipeRows: only steps with a current recipe become rows (their
+// stale work is counted); every other step is a label on the one-line
+// "Not tracked:" note, in canonical step order.
 func TestBuildRecipeRows(t *testing.T) {
-	cfg := &config.Config{Models: &config.ModelRegistry{Steps: map[string]config.ModelPin{
-		recipe.StepPropose: {ExpectedModel: "haiku"},
-		recipe.StepEmbed:   {ExpectedModel: "other"},
-	}}}
 	snap := &modelsSnapshot{
 		Recipes: []db.CurrentRecipe{
 			{Step: recipe.StepPropose, RecipeID: strings.Repeat("a", 64), ModelAlias: "earmark-judge", ModelResolved: "haiku"},
@@ -251,37 +250,44 @@ func TestBuildRecipeRows(t *testing.T) {
 		},
 	}
 	stale := &staleSnapshot{Counts: map[string]int64{recipe.StepPropose: 5, recipe.StepEmbed: 0}}
-	// Stale counts unavailable: recipe columns still render, counts are unknown.
-	for _, r := range buildRecipeRows(cfg, snap, nil) {
-		assert.False(t, r.StaleKnown, r.Step)
-		assert.Nil(t, r.Stale, r.Step)
-	}
-	rows := buildRecipeRows(cfg, snap, stale)
-	require.Len(t, rows, len(recipe.Steps))
-	byStep := map[string]recipeRow{}
-	for _, r := range rows {
-		byStep[r.Step] = r
-	}
-	p := byStep[recipe.StepPropose]
-	assert.True(t, p.Current)
-	assert.Equal(t, "aaaaaaaaaaaa", p.RecipeShort)
-	assert.Equal(t, "Judge", p.RoleTitle)
-	assert.Equal(t, matchOK, p.PinMatch)
-	require.NotNil(t, p.Stale)
-	assert.Equal(t, int64(5), *p.Stale)
-	assert.True(t, p.StaleKnown)
-	assert.Equal(t, "only by re-judging", p.ConvergeNote)
 
-	e := byStep[recipe.StepEmbed]
-	assert.Equal(t, "nomic", e.Model, "falls back to the alias when nothing resolved")
-	assert.Equal(t, matchMismatch, e.PinMatch)
-	assert.Empty(t, e.ConvergeNote, "no note when nothing is stale")
+	t.Run("stale counts unavailable", func(t *testing.T) {
+		rows, _ := buildRecipeRows(snap, nil)
+		require.Len(t, rows, 2, "recipe columns still render")
+		for _, r := range rows {
+			assert.False(t, r.StaleKnown, r.Step)
+			assert.Nil(t, r.Stale, r.Step)
+		}
+	})
 
-	a := byStep[recipe.StepASR]
-	assert.False(t, a.Current)
-	assert.Nil(t, a.Stale, "asr has no current recipe → not tracked")
-	assert.Contains(t, a.NoneNote, "staleness not tracked")
-	assert.Equal(t, "", byStep[recipe.StepScan].RoleTitle)
+	t.Run("tracked rows and untracked labels", func(t *testing.T) {
+		rows, untracked := buildRecipeRows(snap, stale)
+		steps := make([]string, 0, len(rows))
+		for _, r := range rows {
+			steps = append(steps, r.Step)
+		}
+		assert.Equal(t, []string{recipe.StepPropose, recipe.StepEmbed}, steps, "only tracked steps, canonical order")
+		assert.Equal(t, []string{"asr (provenance per transcript)", "decide", "propagate", "scan", "format"}, untracked)
+
+		p := rows[0]
+		assert.Equal(t, "aaaaaaaaaaaa", p.RecipeShort)
+		assert.Equal(t, "Judge", p.RoleTitle)
+		assert.Equal(t, "haiku", p.Model)
+		require.NotNil(t, p.Stale)
+		assert.Equal(t, int64(5), *p.Stale)
+		assert.True(t, p.StaleKnown)
+		assert.Equal(t, "only by re-judging", p.ConvergeNote)
+
+		e := rows[1]
+		assert.Equal(t, "nomic", e.Model, "falls back to the alias when nothing resolved")
+		assert.Empty(t, e.ConvergeNote, "no note when nothing is stale")
+	})
+
+	t.Run("no current recipes", func(t *testing.T) {
+		rows, untracked := buildRecipeRows(&modelsSnapshot{}, stale)
+		assert.Empty(t, rows)
+		assert.Len(t, untracked, len(recipe.Steps))
+	})
 }
 
 func TestBuildFindingsRows(t *testing.T) {
@@ -347,18 +353,29 @@ func TestServersDataScenarios(t *testing.T) {
 			scenario: "active",
 			wantContains: []string{"✓ HEALTHY", "transcribing on gpu-1", "via LiteLLM", "also:", "qwen3.8</span> ×3",
 				"32,337", "39,644", "counts as of", "id=\"recipe-propose\"", "href=\"#recipe-propose\"",
-				"runner version", "not reported (pre-provenance runner)", "AI endpoints (3)", "unbound", "direct",
-				"✗ OFFLINE", "29,001", "3,336", "decided by humans", "· counts as of", "· stale counts as of",
-				"1 transcript currently failing", "<dt>last error</dt>",
-				"LiteLLM gateway", "proxy healthy · db connected", "v1.102.1", "$12.25 · no budget set", "✓ allowed",
-				`<th scope="row" class="mono">propose</th>`, `<h2 class="section-title"`},
+				"runner version: running", "not reported (pre-provenance runner)", "AI endpoints (3)", "unbound", "direct",
+				"✗ unreachable", "✓ lists model", `<span title="role token: eval">Judge</span>`,
+				"29,001", "3,336", "decided by humans", "· counts as of", "· stale counts as of",
+				"1 transcript currently failing", "<dt>last error</dt>", "· last fail",
+				"LiteLLM gateway", "proxy healthy · db connected", "v1.102.1", "$12.25 · no budget set",
+				"<dt>used by</dt><dd>Embeddings, Judge</dd>",
+				`<th scope="row" class="mono">propose</th>`, `<h2 class="section-title"`,
+				"○ Not configured: Decide", "Not tracked: asr (provenance per transcript), decide, propagate, scan, format",
+				`class="badge mismatch" title="a different version is requested">update requested`,
+				`title="converges only by re-judging"`, "Avg / job", "Precision", `aria-labelledby="recipes-note"`},
 			wantAbsent: []string{"counts unavailable", "FAILING", "about-page", "Family", "Size", "<form",
-				"1 transcripts", `<div class="server-sub err" title="chat completion`, "gpu-retired", "NOT ALLOWED"},
+				"1 transcripts", `<div class="server-sub err" title="chat completion`, "gpu-retired", "NOT ALLOWED",
+				// the gateway's role rows and the card's allowlist row only repeat "allowed"
+				"✓ allowed", "key allowlist</dt>",
+				"○ NOT CONFIGURED", `id="recipe-asr"`, `id="recipe-decide"`, "unpinned", "<caption", "Pin</th>",
+				"Backend</th>", "openai-compat", "runner did not report provenance", "last fail <span class=\"time-muted\">never",
+				`class="badge unconfigured" title="a different version`, "✓ READY</span>", "AVG PROC", "Mode</th>"},
+			wantCount: map[string]int{`class="panel server-card role-card`: 3},
 		},
 		{
 			scenario: "failed",
 			wantContains: []string{"✗ FAILING", "invalid LiteLLM virtual key", "12 transcripts currently failing", "see error below",
-				`<div class="server-sub err" title="401 Unauthorized`},
+				`<div class="server-sub err mono err-clamp" title="401 Unauthorized`},
 		},
 		{
 			scenario: "stale",
@@ -367,9 +384,12 @@ func TestServersDataScenarios(t *testing.T) {
 		},
 		{
 			scenario: "idle",
-			wantContains: []string{"● IDLE", "every transcript judged", "nothing waiting to embed",
-				"asr-runner stopped on gpu-1", "$12.25 of $50.00 budget, resets in", "rpm 60 · tpm 100,000", "expires in"},
-			wantAbsent: []string{"FAILING"},
+			wantContains: []string{"✓ HEALTHY · idle", "every transcript judged", "nothing waiting to embed",
+				`class="panel server-card role-card state-running" id="role-judge"`,
+				`class="panel server-card role-card state-running" id="role-embeddings"`,
+				"asr-runner stopped on gpu-1", "$12.25 of $50.00 budget, resets in", "rpm 60 · tpm 100,000", "expires in",
+				"· <span class=\"time-muted\">no failures</span>"},
+			wantAbsent: []string{"FAILING", "● IDLE", "state-idle\" id=\"role-", "last fail"},
 		},
 		{
 			scenario: "winddown",
@@ -377,10 +397,14 @@ func TestServersDataScenarios(t *testing.T) {
 				"readiness and liveliness probes failed", "key info unreachable"},
 		},
 		{
-			scenario:     "empty",
-			wantContains: []string{"no ASR_SERVERS", "judging is off", "no judge findings yet", "no transcripts yet", "_legacy", "Current recipes are registered by"},
-			wantAbsent:   []string{"HEALTHY", "via LiteLLM", "LiteLLM gateway"},
-			wantCount:    map[string]int{"○ NOT CONFIGURED": 4},
+			scenario: "empty",
+			wantContains: []string{"no ASR_SERVERS", "judging is off", "no judge findings yet", "no transcripts yet", "_legacy",
+				"No current recipes yet. Current recipes are registered by", "○ Not configured: ASR", ", Format</p>",
+				"Not tracked: asr (provenance per transcript), propose, decide, propagate, scan, format, embed"},
+			wantAbsent: []string{"via LiteLLM", "LiteLLM gateway", "○ NOT CONFIGURED", `class="recipes-table"`,
+				// no endpoint has options and the judge is not env-sourced
+				"Options</th>"},
+			wantCount: map[string]int{`class="panel server-card role-card`: 1, "○ Not configured:": 1},
 		},
 		{
 			scenario:     "multibackend",
@@ -396,17 +420,18 @@ func TestServersDataScenarios(t *testing.T) {
 			// still render.
 			wantContains: []string{"counts unavailable", "counts unavailable — see server logs", "call outcomes unavailable", "? UNKNOWN",
 				"· stale counts as of", "32,337 rows"},
-			wantAbsent: []string{"· counts as of", "stale counts unavailable"},
+			// no recipes table to link to: the stale count is plain text
+			wantAbsent: []string{"· counts as of", "stale counts unavailable", `href="#recipe-`},
 		},
 		{
 			scenario: demoScenarioGatewayAllowlist,
 			wantContains: []string{"▲ DEGRADED", "earmark-judge is not on earmark&#39;s LiteLLM key allowlist — every call 403s",
-				"✗ NOT ALLOWED", "is not on the key allowlist — calls 403", "▲ NOT ALLOWED",
+				"<dt>Judge</dt>", "✗ NOT ALLOWED", "earmark-judge (Judge) is not on the key allowlist — calls 403", "▲ not allowed",
 				`title="not on earmark&#39;s LiteLLM key allowlist (403 on call)"`},
 		},
 		{
 			scenario:     demoScenarioGatewayKeyInfo,
-			wantContains: []string{"key info not readable by earmark&#39;s key (HTTP 403)", "✓ HEALTHY", "? not checked"},
+			wantContains: []string{"key info not readable by earmark&#39;s key (HTTP 403)", "✓ HEALTHY", "<dt>Judge</dt>", "? not checked"},
 			wantAbsent:   []string{"NOT ALLOWED", "$12.25"},
 		},
 	}
@@ -459,6 +484,33 @@ func TestServersPageShell(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "Set <code>CONTROL_API_TOKEN</code> to enable runner updates")
 }
 
+// TestRunnerUpdateFormOutsidePolledRegion: the runner-update form must never be
+// in the polled fragment (a 5 s swap would wipe the typed version); on the full
+// page it follows #models-region's closing tag.
+func TestRunnerUpdateFormOutsidePolledRegion(t *testing.T) {
+	srv := newDemoServer(":0", "active")
+	h := srv.buildMux()
+	get := func(path string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		require.Equal(t, http.StatusOK, w.Code, path)
+		return w.Body.String()
+	}
+	frag := get("/servers/data")
+	assert.NotContains(t, frag, `id="runner-version"`)
+	assert.NotContains(t, frag, "<form")
+
+	page := get("/servers")
+	region := strings.Index(page, `<div id="models-region"`)
+	require.Positive(t, region)
+	regionEnd := strings.Index(page[region:], "</div>")
+	require.Positive(t, regionEnd)
+	form := strings.Index(page, `id="runner-version"`)
+	require.Positive(t, form)
+	assert.Greater(t, form, region+regionEnd, "the form follows the closed polled region")
+}
+
 // TestServersData_StaleCountFailureIsIsolated: a failing stale count marks only
 // the stale numbers unavailable; recipes, activity and findings still render.
 func TestServersData_StaleCountFailureIsIsolated(t *testing.T) {
@@ -470,10 +522,17 @@ func TestServersData_StaleCountFailureIsIsolated(t *testing.T) {
 	assert.Contains(t, out, "stale counts unavailable")
 	assert.Contains(t, out, "· counts as of")
 	assert.Contains(t, out, `id="recipe-propose"`, "the recipes table still renders")
+	assert.Regexp(t, `id="recipe-propose">\s*<th scope="row" class="mono">propose</th>\s*<td>Judge</td>\s*<td class="num"><span class="time-muted">—</span></td>`, out,
+		"the stale cell is unknown (—), not a count")
+	assert.Contains(t, out, "Not tracked: asr")
 	assert.NotContains(t, out, "counts unavailable — see server logs")
 }
 
 type staleErrDB struct{ SimpleMockDB }
+
+func (*staleErrDB) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) {
+	return []db.CurrentRecipe{{Step: recipe.StepPropose, RecipeID: strings.Repeat("a", 64), ModelAlias: "earmark-judge", UpdatedAt: testNow}}, nil
+}
 
 func (*staleErrDB) StaleItemCounts(context.Context) (map[string]int64, error) {
 	return nil, errors.New("statement timeout")
@@ -732,4 +791,93 @@ func TestRunnerUpdateDemoRoundTrip(t *testing.T) {
 	}
 	assert.Contains(t, do("version=v9.9.9"), "requested <code>v9.9.9</code>")
 	assert.NotContains(t, do("version="), "requested <code>")
+}
+
+// TestRoleHealthIdleRendersHealthy: an idle role keeps its "idle" API token
+// but gets the healthy treatment (green ✓), so a working-but-quiet role never
+// reads as not-OK next to a HEALTHY one.
+func TestRoleHealthIdleRendersHealthy(t *testing.T) {
+	idle, healthy := health(roleIdle, "nothing to do"), health(roleHealthy, "")
+	assert.Equal(t, roleIdle, idle.Token, "the API token is unchanged")
+	assert.Equal(t, "HEALTHY · idle", idle.Label)
+	assert.Equal(t, healthy.Glyph, idle.Glyph)
+	assert.Equal(t, healthy.Class, idle.Class)
+	assert.Equal(t, healthy.Dot, idle.Dot)
+}
+
+// TestServersFragmentRoleCards renders the fragment from crafted role cards:
+// not-configured roles collapse into the one-line strip, the card's
+// "key allowlist" row is gone, an unpinned role has no "pinned" row, and the
+// allowlist warning still renders when the model is denied but the health
+// line says something else.
+func TestServersFragmentRoleCards(t *testing.T) {
+	denied := roleCard{Key: "judge", Title: "Judge", Step: recipe.StepPropose, HasModel: true, Configured: true,
+		Requested: "earmark-judge", AllowState: "denied", AllowlistWarn: true,
+		Health: health(roleDown, "gateway unreachable")}
+	allowed := roleCard{Key: "embeddings", Title: "Embeddings", Step: recipe.StepEmbed, HasModel: true, Configured: true,
+		Requested: "nomic-embed-text", AllowState: "allowed", Health: health(roleIdle, "nothing waiting to embed")}
+	decided := 7
+	tests := []struct {
+		name         string
+		cards        []roleCard
+		unconfigured []roleCard
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:  "denied model warns without a key allowlist row",
+			cards: []roleCard{denied},
+			wantContains: []string{"✗ earmark-judge is not on earmark's LiteLLM key allowlist — every call 403s",
+				`id="role-judge"`},
+			wantAbsent: []string{"key allowlist</dt>", "NOT ALLOWED", "<dt>pinned</dt>", "Not configured"},
+		},
+		{
+			name:         "allowed model: no allowlist row, no warning",
+			cards:        []roleCard{allowed},
+			wantContains: []string{"✓ HEALTHY · idle"},
+			wantAbsent:   []string{"key allowlist", "✓ allowed", "every call 403s"},
+		},
+		{
+			name: "not-configured roles render in the strip, not as cards",
+			unconfigured: []roleCard{
+				{Key: "judge", Title: "Judge", HasModel: true, Health: health(roleNotConfigured, "judging is off")},
+				{Key: "decide", Title: "Decide", HumanDecided: &decided, Health: health(roleNotConfigured, "no model role for this step yet")},
+				{Key: "format", Title: "Format", Health: health(roleNotConfigured, "no model role for this step yet")},
+			},
+			wantContains: []string{`○ Not configured: Judge <span class="time-muted">(judging is off)</span>, Decide <span class="time-muted">(decided by humans 7)</span>, Format</p>`},
+			wantAbsent:   []string{"role-card", "NOT CONFIGURED", "no model role for this step yet", `class="panels role-panels"`},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf strings.Builder
+			require.NoError(t, serversFragmentTmpl.Execute(&buf, modelsData{RoleCards: tc.cards, UnconfiguredRoles: tc.unconfigured}))
+			out := buf.String()
+			for _, want := range tc.wantContains {
+				assert.Contains(t, out, want)
+			}
+			for _, absent := range tc.wantAbsent {
+				assert.NotContains(t, out, absent)
+			}
+		})
+	}
+}
+
+// TestServersFragmentSectionOrder: ASR runners is the last polled section, so
+// the static update form in the shell follows it directly.
+func TestServersFragmentSectionOrder(t *testing.T) {
+	srv := newDemoServer(":0", "active")
+	w := httptest.NewRecorder()
+	srv.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers/data", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	out := w.Body.String()
+	order := []string{`id="roles-title"`, `id="recipes-title"`, `id="gateway-title"`, `id="endpoints-title"`,
+		`id="judge-output-title"`, `id="runners-title"`}
+	last := -1
+	for _, id := range order {
+		i := strings.Index(out, id)
+		require.Positive(t, i, id)
+		assert.Greater(t, i, last, "%s is out of order", id)
+		last = i
+	}
 }

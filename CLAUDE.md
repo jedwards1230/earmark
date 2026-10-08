@@ -118,9 +118,9 @@ unavailable" with a 200), `gateway-allowlist` (the judge's model is off
 earmark's LiteLLM key allowlist — Judge DEGRADED, "every call 403s") or
 `gateway-keyinfo` (LiteLLM `/key/info` not readable by earmark's key). On the
 Models page (`/servers`) the scenarios cover every role state: `active`
-HEALTHY, `failed` Judge FAILING, `stale` DEGRADED, `idle` Judge/Embeddings IDLE
+HEALTHY, `failed` Judge FAILING, `stale` DEGRADED, `idle` Judge/Embeddings HEALTHY · idle
 (ASR DEGRADED: asr-runner stopped), `winddown` Judge/Embeddings and the LiteLLM
-gateway DOWN, `empty` NOT CONFIGURED (fixtures in
+gateway DOWN, `empty` the "○ Not configured" strip (fixtures in
 `internal/mcp/demo_models.go`). To see the connection-lost banner, open the
 page then stop the server — htmx flags the data stale instead of freezing
 silently.
