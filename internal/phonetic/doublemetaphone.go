@@ -162,7 +162,8 @@ type encoder struct {
 // cleanInput mirrors commons-codec: Java String.trim (strip runes <= ' ' at
 // both ends), then upper-case. Java's toUpperCase(Locale.ENGLISH) expands
 // 'ß' to "SS" where Go's ToUpper leaves it alone, so that one case is mapped
-// explicitly.
+// explicitly. Other one-to-many Java upper-casings (ligatures such as 'ﬁ' →
+// "FI") are not mapped; they stay single runes the encoder skips.
 func cleanInput(s string) []rune {
 	s = strings.TrimFunc(s, func(r rune) bool { return r <= ' ' })
 	if s == "" {

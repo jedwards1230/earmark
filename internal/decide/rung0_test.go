@@ -49,6 +49,11 @@ func TestCheck(t *testing.T) {
 		// "240" is scored by its best spoken reading, "two forty" (TFRT).
 		{"prompt: too forty → 240", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "240", 0.9), true, ""},
 		{"number: nineteen eighty four → 1984", cand("a", IssueNumberArtifact, "in nineteen eighty four we", "nineteen eighty four", "1984", 0.9), true, ""},
+		{"number: grouped thousands", cand("a", IssueNumberArtifact, "about one thousand miles", "one thousand", "1,000", 0.9), true, ""},
+		{"number: grouped tens of thousands", cand("a", IssueNumberArtifact, "some twenty five thousand people", "twenty five thousand", "25,000", 0.9), true, ""},
+		{"number: decimal", cand("a", IssueNumberArtifact, "about three point five liters", "three point five", "3.5", 0.9), true, ""},
+		{"number: two years", cand("a", IssueNumberArtifact, "from nineteen eighty four to nineteen ninety we", "nineteen eighty four to nineteen ninety", "1984 to 1990", 0.9), true, ""},
+		{"number: two paired readings", cand("a", IssueNumberArtifact, "at too forty at two oh five", "too forty at two oh five", "240 at 205", 0.9), true, ""},
 		{"number: unrelated value", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "17", 0.9), false, ReasonNotSoundAlike},
 
 		// Target exists.
@@ -91,7 +96,14 @@ func TestCheck(t *testing.T) {
 		{"other", cand("a", IssueOther, "over their by", "their", "there", 0.9), false, ReasonUnsupportedIssueType},
 		{"unknown type", cand("a", "run_on", "over their by", "their", "there", 0.9), false, ReasonUnsupportedIssueType},
 
+		// Spans must be word-bounded for every issue type.
+		{"mid-word: homophone inside therein", cand("a", IssueHomophone, "therein lies the rub", "there", "their", 0.9), false, ReasonNotWordBounded},
+		{"mid-word: insertion inside cathedral", cand("a", IssueDroppedWord, "near the cathedral", "the cat", "the big cat", 0.9), false, ReasonNotWordBounded},
+
 		// Substitutions that do not sound alike.
+		{"window too many words", cand("a", IssueMisheardWord, "x a b c d e f g h i y", "a b c d e f g h i", "j k l m n o p q r", 0.9), false, ReasonNotSoundAlike},
+		{"window too many runes", cand("a", IssueMisheardProperNoun, "x supercalifragilisticexpialidocioussupercalifragilisticexpialidociousandmoreandmore y",
+			"supercalifragilisticexpialidocioussupercalifragilisticexpialidociousandmoreandmore", "supercalifragilisticexpialidocioussupercalifragilisticexpialidociousandmoreandless", 0.9), false, ReasonNotSoundAlike},
 		{"not soundalike: proper noun", cand("a", IssueMisheardProperNoun, "the holevo bound", "holevo", "Shannon", 0.9), false, ReasonNotSoundAlike},
 		{"not soundalike: word", cand("a", IssueMisheardWord, "the cat sat", "cat", "dog", 0.9), false, ReasonNotSoundAlike},
 		{"not soundalike: pure deletion", cand("a", IssueMisheardWord, "a big red ball", "big red ball", "red ball", 0.9), false, ReasonNotSoundAlike},
@@ -106,7 +118,9 @@ func TestCheck(t *testing.T) {
 		{"repeat: replacement changes a word", cand("a", IssueRepeatedText, "the the cat sat", "the the cat", "the dog", 0.9), false, ReasonNotExactRepeat},
 		{"repeat: no repeat at all", cand("a", IssueRepeatedText, "a quick fox", "a quick fox", "a fox", 0.9), false, ReasonNotExactRepeat},
 		{"repeat: replacement longer", cand("a", IssueRepeatedText, "the cat", "the cat", "the the cat", 0.9), false, ReasonNotExactRepeat},
-		{"repeat: inside a longer word", cand("a", IssueRepeatedText, "bathe the cat", "the the", "the", 0.9), false, ReasonNotExactRepeat},
+		{"repeat: inside a longer word", cand("a", IssueRepeatedText, "bathe the cat", "the the", "the", 0.9), false, ReasonNotWordBounded},
+		{"repeat: across a sentence break", cand("a", IssueRepeatedText, "it was the end. the end came", "the end. the end", "the end", 0.9), false, ReasonNotExactRepeat},
+		{"repeat: comma inside the stutter is fine", cand("a", IssueRepeatedText, "well, well, well then", "well, well, well", "well", 0.9), true, ""},
 
 		// dropped_word.
 		{"insertion: one word", cand("a", IssueDroppedWord, "i went the store", "went the store", "went to the store", 0.9), true, ""},
@@ -152,6 +166,13 @@ func TestCheckEvidenceNamesTheWinningReading(t *testing.T) {
 	v := Check(cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "240", 0.9), DefaultParams())
 	if !strings.Contains(v.Evidence, `"240" read as "two forty" (best of 3 readings)`) {
 		t.Errorf("evidence %q does not name the winning reading", v.Evidence)
+	}
+}
+
+func TestCheckWindowLimitEvidence(t *testing.T) {
+	v := Check(cand("a", IssueMisheardWord, "x a b c d e f g h i y", "a b c d e f g h i", "j k l m n o p q r", 0.9), DefaultParams())
+	if !strings.Contains(v.Evidence, "too long to be a mishearing") {
+		t.Errorf("evidence %q does not say the window is too long", v.Evidence)
 	}
 }
 
@@ -254,6 +275,32 @@ func TestDedupe(t *testing.T) {
 			want:     []string{ReasonOverlapsOverlay, ""},
 		},
 		{
+			name:  "the candidate's own row does not hide another accepted row",
+			cands: []Candidate{at("x", 0.9, "holovo", "Holevo", IssueMisheardProperNoun)},
+			existing: []patch.Patch{
+				accepted("x", "holovo", "Holevo"),
+				accepted("y", "holovo bound", "Holevo bound"),
+			},
+			want: []string{ReasonOverlapsOverlay},
+		},
+		{
+			name:  "accepted rows that overlap each other still occupy their spans",
+			cands: []Candidate{at("a", 0.9, "holovo", "Holevo", IssueMisheardProperNoun)},
+			existing: []patch.Patch{
+				accepted("y", "holovo bound", "Holevo bound"),
+				accepted("z", "the holovo", "the Holevo"),
+			},
+			want: []string{ReasonOverlapsOverlay},
+		},
+		{
+			name:  "an empty-correction overlay row occupies no span",
+			cands: []Candidate{at("a", 0.9, "holovo", "Holevo", IssueMisheardProperNoun)},
+			existing: []patch.Patch{
+				accepted("y", "holovo bound", " "),
+			},
+			want: []string{""},
+		},
+		{
 			name:     "the candidate's own accepted row is not a conflict",
 			cands:    []Candidate{at("x", 0.9, "holovo", "Holevo", IssueMisheardProperNoun)},
 			existing: []patch.Patch{accepted("x", "holovo", "Holevo")},
@@ -336,6 +383,22 @@ func TestIssueTypesMatchEval(t *testing.T) {
 	}
 }
 
+func TestTokenSpans(t *testing.T) {
+	const s = "Don't, 1,000 o\u2019brien."
+	ts := tokenSpans(s)
+	var got []string
+	for _, tk := range ts {
+		got = append(got, string([]rune(s)[tk.start:tk.end]))
+	}
+	want := []string{"Don't", "1", "000", "o\u2019brien"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("token ranges cover %q, want %q", got, want)
+	}
+	if raw := rawText(s, ts[1:3]); raw != "1,000" {
+		t.Errorf("rawText = %q, want %q", raw, "1,000")
+	}
+}
+
 func TestTokens(t *testing.T) {
 	tests := map[string]string{
 		"Don't stop":         "dont|stop",
@@ -362,6 +425,9 @@ func FuzzCheck(f *testing.F) {
 	f.Add("at auto sebo today", "auto sebo", "Arecibo", IssueMisheardProperNoun)
 	f.Add("bathe the cat", "the the", "the", IssueRepeatedText)
 	f.Add("ü ü ü", "ü ü", "ü", IssueRepeatedText)
+	f.Add("about one thousand miles", "one thousand", "1,000", IssueNumberArtifact)
+	f.Add("therein lies", "there", "their", IssueHomophone)
+	f.Add("the end. the end", "the end. the end", "the end", IssueRepeatedText)
 	f.Fuzz(func(t *testing.T, chunk, original, replacement, issue string) {
 		c := cand("a", issue, chunk, original, replacement, 0.5)
 		v := Check(c, DefaultParams())

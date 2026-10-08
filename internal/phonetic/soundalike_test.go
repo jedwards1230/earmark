@@ -50,8 +50,12 @@ func TestNormalize(t *testing.T) {
 		"o’brien's":       "obriens",
 		"  \t\n":          "",
 		"two hundred 40":  "twohundredforty",
-		"3.5":             "threefive",
-		"9,99,999 (typo)": "ninehundredninetyninethousandninehundredninetyninetypo",
+		"3.5":             "threepointfive",
+		"1,2,3":           "onetwothree",
+		"1,0000":          "onezerozerozerozero",
+		"12,345.67":       "twelvethousandthreehundredfortyfivepointsixseven",
+		"1234,567":        "onethousandtwohundredthirtyfourfivehundredsixtyseven",
+		"9,99,999 (typo)": "nineninetyninethousandninehundredninetyninetypo",
 	}
 	for in, want := range tests {
 		if got := Normalize(in); got != want {
@@ -166,20 +170,43 @@ func TestReadings(t *testing.T) {
 }
 
 func TestReadingsCap(t *testing.T) {
-	// 3 × 3 = 9 > MaxReadings: every numeral falls back to its cardinal.
-	got := Readings("240 1984")
-	want := []string{"two hundred forty one thousand nine hundred eighty four"}
-	if !slices.Equal(got, want) {
-		t.Errorf("Readings over the cap = %q, want %q", got, want)
+	// Three numerals with three readings each: 27 = MaxReadings, all kept.
+	if n := len(Readings("240 205 1984")); n != 27 {
+		t.Errorf("three numerals gave %d readings, want 27", n)
 	}
-	// Many numerals stay bounded.
+	// A fourth numeral would make 81: it is pinned to its cardinal, the
+	// first three keep every combination.
+	got := Readings("240 205 1984 1990")
+	if len(got) != 27 {
+		t.Fatalf("four numerals gave %d readings, want 27", len(got))
+	}
+	for _, r := range got {
+		if !strings.HasSuffix(r, " one thousand nine hundred ninety") {
+			t.Errorf("fourth numeral not pinned to its cardinal: %q", r)
+		}
+	}
+	if !slices.Contains(got, "two forty two oh five nineteen eighty four one thousand nine hundred ninety") {
+		t.Errorf("earliest numerals lost a combination: %q", got)
+	}
+	// Input longer than MaxPhraseRunes gets the cardinal reading only.
 	if n := len(Readings(strings.Repeat("12 ", 200))); n != 1 {
 		t.Errorf("200 numerals gave %d readings, want 1", n)
 	}
-	for _, s := range []string{"1 2 3", "12 34 56", "10 20", "240"} {
+	for _, s := range []string{"1 2 3", "12 34 56", "10 20", "240", "1 22 333 4444 55555"} {
 		if n := len(Readings(s)); n < 1 || n > MaxReadings {
 			t.Errorf("Readings(%q) has %d readings", s, n)
 		}
+	}
+}
+
+func TestCompareBounds(t *testing.T) {
+	long := strings.Repeat("7", MaxPhraseRunes+1)
+	if m := Compare(long, long); m.Score != 0 {
+		t.Errorf("over-long input scored %v, want 0", m.Score)
+	}
+	// 50k digits must not take minutes.
+	if ok, _ := SoundAlike(strings.Repeat("9", 50000), strings.Repeat("8", 50000), DefaultSoundAlikeThreshold); ok {
+		t.Error("over-long input passed")
 	}
 }
 
@@ -211,6 +238,8 @@ func FuzzSoundAlikeSymmetric(f *testing.F) {
 		{"san jose", "SAN JOSE"}, {"99999999999999999999", "x"},
 		{"too forty", "240"}, {"1984 and 2005", "nineteen eighty four and twenty oh five"},
 		{"1 2 3 4 5 6 7 8 9", "123456789"},
+		{"1,000", "one thousand"}, {"3.5", "three point five"}, {"1,2,3", "1,234,567.89"},
+		{"240 205 1984 1990", "two forty two oh five nineteen eighty four nineteen ninety"},
 	} {
 		f.Add(s[0], s[1])
 	}

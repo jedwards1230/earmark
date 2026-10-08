@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/phonetic"
@@ -37,6 +38,10 @@ const (
 	// ReasonAnchorMissing — the anchor resolves to no span, or to several
 	// (patch.Locate refuses rather than guesses).
 	ReasonAnchorMissing = "anchor_missing"
+	// ReasonNotWordBounded — the anchor resolved, but the span starts or ends
+	// inside a word ("there" found in "therein"): editing it would rewrite
+	// part of a word the judge did not flag.
+	ReasonNotWordBounded = "not_word_bounded"
 	// ReasonEmptyCorrection — the replacement is empty or whitespace; applying
 	// it would silently delete text. Same rule as the overlay's
 	// patch.StaleReasonEmptyCorrection.
@@ -71,6 +76,14 @@ const (
 	MaxRepeatTokens = 6
 	// MaxInsertedTokens is the most words a dropped_word fix may insert.
 	MaxInsertedTokens = 2
+	// MaxSubstitutionTokens and MaxSubstitutionRunes bound each side of the
+	// differing window a substitution is scored on. A misheard word or name
+	// is a few words; a longer window is a rewrite, not a mishearing, and
+	// would also make the phonetic comparison expensive. Past either limit
+	// the candidate fails not_soundalike. MaxSubstitutionRunes equals
+	// phonetic.MaxPhraseRunes.
+	MaxSubstitutionTokens = 8
+	MaxSubstitutionRunes  = phonetic.MaxPhraseRunes
 )
 
 // Candidate is one proposed finding, with the pristine text of the chunk it
@@ -147,7 +160,8 @@ func Rung0(cands []Candidate, existing []patch.Patch, p Params) []Verdict {
 //     rows without a hash, a machine decision must not act on a revision it
 //     cannot verify), the
 //     anchor's text is the finding's original text and resolves to exactly
-//     one span (anchor_missing);
+//     one span (anchor_missing), and that span starts and ends on word
+//     boundaries in the chunk (not_word_bounded);
 //  2. the replacement is not empty (empty_correction);
 //  3. the edit changes more than case, punctuation, hyphens and spacing
 //     (cosmetic_only);
@@ -179,6 +193,9 @@ func Check(c Candidate, p Params) Verdict {
 		}
 		return fail(ReasonAnchorMissing, patch.Span{}, "anchor %s: %v", what, err)
 	}
+	if runes := []rune(c.ChunkText); !wordBoundary(runes, span.Start) || !wordBoundary(runes, span.End) {
+		return fail(ReasonNotWordBounded, span, "span %d-%d starts or ends inside a word in the chunk", span.Start, span.End)
+	}
 
 	if strings.TrimSpace(c.Replacement) == "" {
 		return fail(ReasonEmptyCorrection, span, "suggested correction is empty")
@@ -199,14 +216,27 @@ func Check(c Candidate, p Params) Verdict {
 	}
 }
 
-// checkSubstitution requires the differing token window to sound alike.
+// checkSubstitution requires the differing token window to sound alike. The
+// window is compared as the RAW text from the first differing word to the last
+// on each side, so a numeral keeps its punctuation ("1,000", "3.5") and is read
+// as one number rather than as separate digit groups.
 func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict {
-	o, r := tokens(c.Original), tokens(c.Replacement)
-	ow, rw := diffWindow(o, r)
+	o, r := tokenSpans(c.Original), tokenSpans(c.Replacement)
+	pre, suf := diffWindow(texts(o), texts(r))
+	ow, rw := o[pre:len(o)-suf], r[pre:len(r)-suf]
 	if len(ow) == 0 || len(rw) == 0 {
 		return fail(ReasonNotSoundAlike, span, "not a substitution: %q → %q only inserts or deletes words", c.Original, c.Replacement)
 	}
-	a, b := strings.Join(ow, " "), strings.Join(rw, " ")
+	a, b := rawText(c.Original, ow), rawText(c.Replacement, rw)
+	for _, side := range []struct {
+		text string
+		n    int
+	}{{a, len(ow)}, {b, len(rw)}} {
+		if side.n > MaxSubstitutionTokens || utf8.RuneCountInString(side.text) > MaxSubstitutionRunes {
+			return fail(ReasonNotSoundAlike, span, "substituted window %q is too long to be a mishearing (%d words; limits %d words, %d runes)",
+				side.text, side.n, MaxSubstitutionTokens, MaxSubstitutionRunes)
+		}
+	}
 	m := phonetic.Compare(a, b)
 	ev := fmt.Sprintf("soundalike %.3f (threshold %.2f): %s vs %s",
 		m.Score, threshold, describe(a, m.A), describe(b, m.B))
@@ -217,25 +247,34 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 }
 
 // checkRepeat requires the replacement to be the original with an exact
-// adjacent repeat collapsed — P + X×k + S → P + X + S for a unit X of 1 to
-// MaxRepeatTokens words and k >= 2 — and the located span to be
-// word-bounded in the chunk, so a repeat found inside a longer word
-// ("bathe the" containing "the the") is refused.
+// adjacent repeat collapsed: P + X×k + S → P + X + S, for a unit X of 1 to
+// MaxRepeatTokens words and k >= 2 adjacent copies, with any prefix P and
+// suffix S left unchanged.
+//
+// This is deliberately wider than the plan's literal "original is X repeated
+// and replacement == X": the judge prompt's own example, "the the cat" → "the
+// cat", carries context around the stutter (S = "cat"), and the literal rule
+// would reject it. The change is still exactly "remove duplicate copies".
+//
+// The repeat is checked on the located span's text in the chunk (Check has
+// already required it to be word-bounded, so "bathe the" does not contain
+// "the the"), and a collapse is refused when the removed text contains
+// sentence punctuation (. ? !): "the end. The end" is two sentences, not a
+// stutter.
 func checkRepeat(c Candidate, span patch.Span) Verdict {
-	runes := []rune(c.ChunkText)
-	if !wordBoundary(runes, span.Start) || !wordBoundary(runes, span.End) {
-		return fail(ReasonNotExactRepeat, span, "span %d-%d is not word-bounded in the chunk", span.Start, span.End)
-	}
-	o, r := tokens(string(runes[span.Start:span.End])), tokens(c.Replacement)
-	if unit, copies, ok := findCollapse(o, r); ok {
+	raw := string([]rune(c.ChunkText)[span.Start:span.End])
+	o, r := tokenSpans(raw), tokens(c.Replacement)
+	if unit, copies, ok := findCollapse(raw, o, r); ok {
 		return Verdict{Pass: true, Span: span, Evidence: fmt.Sprintf("exact repeat: %q ×%d → ×1", strings.Join(unit, " "), copies)}
 	}
 	return fail(ReasonNotExactRepeat, span, "%q → %q does not remove an adjacent repeat of 1-%d words", c.Original, c.Replacement, MaxRepeatTokens)
 }
 
-// findCollapse searches o for a run of k >= 2 adjacent copies of a unit whose
-// collapse to one copy yields exactly r.
-func findCollapse(o, r []string) (unit []string, copies int, ok bool) {
+// findCollapse searches o (tokens of raw) for a run of k >= 2 adjacent copies
+// of a unit whose collapse to one copy yields exactly r, and whose removed
+// region of raw has no sentence punctuation.
+func findCollapse(raw string, ot []token, r []string) (unit []string, copies int, ok bool) {
+	o := texts(ot)
 	removed := len(o) - len(r)
 	if removed <= 0 {
 		return nil, 0, false
@@ -250,7 +289,10 @@ func findCollapse(o, r []string) (unit []string, copies int, ok bool) {
 				continue
 			}
 			collapsed := slices.Concat(o[:i+size], o[i+k*size:])
-			if slices.Equal(collapsed, r) {
+			// The removed region runs from the end of the kept copy to the
+			// end of the last removed one.
+			gone := []rune(raw)[ot[i+size-1].end:ot[i+k*size-1].end]
+			if slices.Equal(collapsed, r) && !strings.ContainsAny(string(gone), ".?!") {
 				return o[i : i+size], k, true
 			}
 		}
@@ -305,11 +347,18 @@ func subsequenceExtras(sub, full []string) ([]string, bool) {
 // Only passing verdicts take part — a failed check has no trustworthy span.
 // In order:
 //
-//  1. A candidate whose span overlaps a correction that would actually replay
-//     onto its chunk text — patch.Replay(ChunkText, existing).Applied, the same
-//     test patch.PlanDirectEdit uses — fails overlaps_overlay. A correction
-//     with the candidate's own FindingID is ignored (re-deciding an accepted
-//     finding must not conflict with itself).
+//  1. A candidate whose span overlaps a span OCCUPIED by an existing
+//     accepted/applied correction fails overlaps_overlay. A correction
+//     occupies its span when it resolves on the candidate's chunk text: a
+//     non-empty correction, a matching (or legacy empty) chunk hash, and an
+//     anchor patch.Locate places. That is stricter than the corrections
+//     patch.Replay would apply: Replay quarantines two accepted corrections
+//     that overlap EACH OTHER, so neither appears in its Applied set, and
+//     using that set would let a new candidate over both through. Each
+//     candidate's set excludes its own FindingID (re-deciding an accepted
+//     finding must not conflict with itself) and is computed from that
+//     candidate's view, so the self-exclusion never hides a conflict between
+//     the candidate's row and another.
 //  2. The rest are ranked by Confidence descending, then FindingID ascending,
 //     and kept greedily: one that overlaps an already-kept candidate fails
 //     overlap_dup.
@@ -323,21 +372,21 @@ func Dedupe(cands []Candidate, verdicts []Verdict, existing []patch.Patch) []Ver
 	}
 	out := slices.Clone(verdicts)
 
-	overlays := make(map[string][]patch.AppliedPatch) // by chunk text
+	occupiedBy := make(map[string][]occupied) // by chunk text
 	var live []int
 	for i, v := range out {
 		if !v.Pass {
 			continue
 		}
 		c := cands[i]
-		applied, seen := overlays[c.ChunkText]
+		occ, seen := occupiedBy[c.ChunkText]
 		if !seen {
-			applied = patch.Replay(c.ChunkText, existing).Applied
-			overlays[c.ChunkText] = applied
+			occ = occupiedSpans(c.ChunkText, existing)
+			occupiedBy[c.ChunkText] = occ
 		}
-		if a, hit := firstOverlap(v.Span, applied, c.FindingID); hit {
+		if o, hit := firstOverlap(v.Span, occ, c.FindingID); hit {
 			out[i] = Verdict{Reason: ReasonOverlapsOverlay, Span: v.Span,
-				Evidence: fmt.Sprintf("overlaps correction %s at runes %d-%d", a.ID, a.Span.Start, a.Span.End)}
+				Evidence: fmt.Sprintf("overlaps correction %s at runes %d-%d", o.id, o.span.Start, o.span.End)}
 			continue
 		}
 		live = append(live, i)
@@ -378,13 +427,38 @@ func describe(text string, p phonetic.Phrase) string {
 	return fmt.Sprintf("%q [%s/%s]", text, p.Codes.Primary, p.Codes.Alternate)
 }
 
-func firstOverlap(s patch.Span, applied []patch.AppliedPatch, self string) (patch.AppliedPatch, bool) {
-	for _, a := range applied {
-		if a.ID != self && overlaps(s, a.Span) {
-			return a, true
+// occupied is the span an existing correction claims on a chunk text.
+type occupied struct {
+	id   string
+	span patch.Span
+}
+
+// occupiedSpans resolves every existing correction that is usable on text —
+// the checks of the overlay's resolvePatch (non-empty correction, hash match
+// or legacy empty hash, Locate) WITHOUT its overlap quarantine. See Dedupe.
+func occupiedSpans(text string, existing []patch.Patch) []occupied {
+	hash := patch.ChunkHash(text)
+	var out []occupied
+	for _, p := range existing {
+		if strings.TrimSpace(p.Correction) == "" || (p.ChunkHash != "" && p.ChunkHash != hash) {
+			continue
+		}
+		span, err := patch.Locate(text, p.Anchor)
+		if err != nil {
+			continue
+		}
+		out = append(out, occupied{id: p.ID, span: span})
+	}
+	return out
+}
+
+func firstOverlap(s patch.Span, occ []occupied, self string) (occupied, bool) {
+	for _, o := range occ {
+		if o.id != self && overlaps(s, o.span) {
+			return o, true
 		}
 	}
-	return patch.AppliedPatch{}, false
+	return occupied{}, false
 }
 
 // overlaps is the overlay's half-open interval test (see
@@ -407,43 +481,73 @@ func squash(s string) string {
 	return b.String()
 }
 
-// tokens splits s into lower-cased words of letters and digits. Apostrophes
-// are dropped inside a word; every other rune that is not a letter or digit
-// separates words.
-func tokens(s string) []string {
-	var out []string
+// token is one word of a string: its comparison text and its rune range in
+// the source.
+type token struct {
+	text       string
+	start, end int // rune indices into the source string
+}
+
+// tokenSpans splits s into lower-cased words of letters and digits, with
+// their rune ranges. Apostrophes are dropped inside a word (and stay inside
+// its range); every other rune that is not a letter or digit separates words.
+func tokenSpans(s string) []token {
+	var out []token
 	var cur strings.Builder
-	flush := func() {
+	start := -1
+	n := 0
+	flush := func(end int) {
 		if cur.Len() > 0 {
-			out = append(out, cur.String())
+			out = append(out, token{text: cur.String(), start: start, end: end})
 			cur.Reset()
 		}
+		start = -1
 	}
+	lastWord := 0 // rune index just past the last letter or digit
 	for _, r := range strings.ToLower(s) {
 		switch {
 		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			if start < 0 {
+				start = n
+			}
 			cur.WriteRune(r)
-		case r == '\'' || r == '’':
+			lastWord = n + 1
+		case r == '\'' || r == '\u2019':
 		default:
-			flush()
+			flush(lastWord)
 		}
+		n++
 	}
-	flush()
+	flush(lastWord)
 	return out
 }
 
-// diffWindow strips the common leading and trailing tokens and returns the
-// differing middles.
-func diffWindow(a, b []string) ([]string, []string) {
-	pre := 0
+// tokens is the comparison text of tokenSpans.
+func tokens(s string) []string { return texts(tokenSpans(s)) }
+
+func texts(ts []token) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = t.text
+	}
+	return out
+}
+
+// rawText is the source text covered by a run of tokens, first to last.
+func rawText(s string, ts []token) string {
+	return string([]rune(s)[ts[0].start:ts[len(ts)-1].end])
+}
+
+// diffWindow counts the common leading (pre) and trailing (suf) tokens; the
+// differing middles are a[pre:len(a)-suf] and b[pre:len(b)-suf].
+func diffWindow(a, b []string) (pre, suf int) {
 	for pre < len(a) && pre < len(b) && a[pre] == b[pre] {
 		pre++
 	}
-	suf := 0
 	for suf < len(a)-pre && suf < len(b)-pre && a[len(a)-1-suf] == b[len(b)-1-suf] {
 		suf++
 	}
-	return a[pre : len(a)-suf], b[pre : len(b)-suf]
+	return pre, suf
 }
 
 // wordBoundary reports whether rune index i sits between words: at either

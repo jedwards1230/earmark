@@ -3,6 +3,7 @@ package phonetic
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // DefaultSoundAlikeThreshold is the similarity at or above which two phrases
@@ -46,22 +47,41 @@ func SoundAlike(a, b string, threshold float64) (bool, float64) {
 // threshold and score > 0.
 func (m Match) Passes(threshold float64) bool { return m.Score >= threshold && m.Score > 0 }
 
+// MaxPhraseRunes caps the length of each side Compare will score. Longer
+// input scores 0 (fails closed) instead of paying for a quadratic edit
+// distance over an unbounded string. With MaxReadings readings per side the
+// worst case (adversarial strings of numerals) is a few hundred milliseconds;
+// ordinary phrases take microseconds. internal/decide caps its substitution
+// window at the same length and rejects longer windows with evidence.
+const MaxPhraseRunes = 80
+
 // Compare scores how alike two phrases sound.
 //
 // Each side is expanded into its spoken readings (Readings): lower-cased,
-// each digit run spelled out as words in every way it is commonly said
-// ("240" → "two hundred forty", "two forty", "two four zero"), everything but
-// letters dropped, spaces included — so splits and fusions ("auto sebo" vs
-// "arecibo", "placenes" vs "place names") compare as one word. Each reading
-// is encoded with Double Metaphone at unbounded length, and the score is the
-// best, over every pair of readings and the four {primary, alternate} code
-// pairings, of 1 − Levenshtein(codeA, codeB) / max(len(codeA), len(codeB)).
+// each numeral spelled out as words in every way it is commonly said
+// ("240" → "two hundred forty", "two forty", "two four zero"; "3.5" → "three
+// point five"), everything but letters dropped, spaces included — so splits
+// and fusions ("auto sebo" vs "arecibo", "placenes" vs "place names") compare
+// as one word. Each reading is encoded with Double Metaphone at unbounded
+// length, and the score is the best, over every pair of readings and the four
+// {primary, alternate} code pairings, of
+// 1 − Levenshtein(codeA, codeB) / max(len(codeA), len(codeB)).
 // Match reports the readings that produced the best score (the first such
 // pair, in reading order, when several tie).
 //
+// Because readings are encoded letters-only (that is what makes fusions
+// match), the Double Metaphone rules that look at a space — "VAN "/"VON "
+// germanic, "SAN " Spanish J, Mac " C"/" G"/" Q" — never fire through
+// Compare. That is deliberate; call DoubleMetaphone directly to get them.
+//
+// Cost is bounded: at most MaxPhraseRunes runes per side, at most
+// MaxReadings readings per side, so at most 4·MaxReadings² edit distances —
+// and pairs whose length difference alone rules out beating the current best
+// are skipped.
+//
 // Edge cases, all symmetric:
-//   - either side normalizes to nothing (empty, or only punctuation): 0 —
-//     there is nothing to compare, so the check fails closed;
+//   - either side normalizes to nothing (empty, or only punctuation), or is
+//     longer than MaxPhraseRunes: 0 — the check fails closed;
 //   - a reading of one side identical to a reading of the other: 1;
 //   - different text whose codes are all empty (letters Double Metaphone
 //     does not voice, such as "h" or "w" alone): 0, again failing closed —
@@ -69,6 +89,9 @@ func (m Match) Passes(threshold float64) bool { return m.Score >= threshold && m
 //   - one side's code empty, the other's not: 0 (the distance is the whole
 //     other code).
 func Compare(a, b string) Match {
+	if utf8.RuneCountInString(a) > MaxPhraseRunes || utf8.RuneCountInString(b) > MaxPhraseRunes {
+		return Match{}
+	}
 	as, bs := encodeReadings(a), encodeReadings(b)
 	m := Match{A: as[0], B: bs[0]}
 	if m.A.Normalized == "" || m.B.Normalized == "" {
@@ -81,10 +104,19 @@ func Compare(a, b string) Match {
 			}
 		}
 	}
+	// Each distinct pair of codes is scored once: readings often share codes
+	// (and primary often equals alternate). Iteration stays in reading order,
+	// so the reported pair is still the first best one.
+	scored := make(map[[2]string]bool)
 	for _, pa := range as {
 		for _, pb := range bs {
 			for _, ca := range []string{pa.Codes.Primary, pa.Codes.Alternate} {
 				for _, cb := range []string{pb.Codes.Primary, pb.Codes.Alternate} {
+					key := [2]string{ca, cb}
+					if scored[key] || similarityBound(ca, cb) <= m.Score {
+						continue
+					}
+					scored[key] = true
 					if s := codeSimilarity(ca, cb); s > m.Score {
 						m = Match{A: pa, B: pb, Score: s}
 					}
@@ -93,6 +125,21 @@ func Compare(a, b string) Match {
 		}
 	}
 	return m
+}
+
+// similarityBound is an upper bound on codeSimilarity: the edit distance is at
+// least the length difference.
+func similarityBound(a, b string) float64 {
+	la, lb := utf8.RuneCountInString(a), utf8.RuneCountInString(b)
+	longest := max(la, lb)
+	if longest == 0 {
+		return 0
+	}
+	diff := la - lb
+	if diff < 0 {
+		diff = -diff
+	}
+	return 1 - float64(diff)/float64(longest)
 }
 
 // encodeReadings encodes every reading of s. The result is never empty.
@@ -106,16 +153,26 @@ func encodeReadings(s string) []Phrase {
 	return out
 }
 
-// MaxReadings caps how many readings Readings returns for one string. Every
-// numeral multiplies the count, so past the cap each numeral falls back to its
-// cardinal reading alone and the string has exactly one reading.
-const MaxReadings = 8
+// MaxReadings caps how many readings Readings returns for one string: 27 is
+// every combination of three numerals with three readings each. Numerals are
+// expanded in order while the running product of reading counts stays within
+// the cap; every later numeral is pinned to its cardinal reading.
+const MaxReadings = 27
 
 // Readings returns the spoken readings of s: lower-case words separated by
-// single spaces, with each ASCII digit run replaced by one of its
-// NumberReadings. The first reading always uses every numeral's cardinal
-// form. When the combinations would exceed MaxReadings, only that first
-// reading is returned. Text without digits has exactly one reading.
+// single spaces, with each numeral replaced by one of its readings.
+//
+// A numeral is an ASCII digit run, optionally with thousands groups ("1,000"
+// — a comma counts as a separator only when it is followed by exactly three
+// digits, after a leading group of one to three, so "1,2,3" is three
+// numerals) and a decimal part ("3.5" → "three point five", the fraction read
+// digit by digit). A plain numeral reads as NumberReadings; a grouped one is
+// written as a quantity and reads as its cardinal only.
+//
+// The first reading always uses every numeral's cardinal form. At most
+// MaxReadings readings are returned (see MaxReadings for how numerals degrade
+// past it); input longer than MaxPhraseRunes gets the cardinal reading only.
+// Text without digits has exactly one reading.
 func Readings(s string) []string {
 	type part struct {
 		text string   // literal letters or a separator
@@ -123,31 +180,54 @@ func Readings(s string) []string {
 	}
 	var parts []part
 	runes := []rune(strings.ToLower(s))
+	cardinalOnly := len(runes) > MaxPhraseRunes
+	digitsAt := func(from, n int) bool {
+		if from+n > len(runes) {
+			return false
+		}
+		for _, r := range runes[from : from+n] {
+			if !isASCIIDigit(r) {
+				return false
+			}
+		}
+		return true
+	}
 	for i := 0; i < len(runes); {
 		r := runes[i]
 		switch {
 		case isASCIIDigit(r):
-			var digits []rune
-			grouped := false
-			for i < len(runes) {
-				if isASCIIDigit(runes[i]) {
-					digits = append(digits, runes[i])
-					i++
-					continue
-				}
-				// "1,000": a comma between digits is a thousands separator.
-				if runes[i] == ',' && i+1 < len(runes) && isASCIIDigit(runes[i+1]) {
-					grouped = true
-					i++
-					continue
-				}
-				break
+			j := i
+			for j < len(runes) && isASCIIDigit(runes[j]) {
+				j++
 			}
-			alts := []string{NumberWords(string(digits))}
-			if !grouped {
-				// A grouped number ("1,984") is written as a quantity; read it
-				// as one.
-				alts = NumberReadings(string(digits))
+			whole := string(runes[i:j])
+			grouped := false
+			if j-i <= 3 {
+				for j < len(runes) && runes[j] == ',' && digitsAt(j+1, 3) && !digitsAt(j+4, 1) {
+					whole += string(runes[j+1 : j+4])
+					j += 4
+					grouped = true
+				}
+			}
+			frac := ""
+			if j+1 < len(runes) && runes[j] == '.' && isASCIIDigit(runes[j+1]) {
+				k := j + 1
+				for k < len(runes) && isASCIIDigit(runes[k]) {
+					k++
+				}
+				frac = string(runes[j+1 : k])
+				j = k
+			}
+			i = j
+
+			alts := []string{NumberWords(whole)}
+			if !grouped && !cardinalOnly {
+				alts = NumberReadings(whole)
+			}
+			if frac != "" {
+				for n := range alts {
+					alts[n] += " point " + digitWords(frac)
+				}
 			}
 			parts = append(parts, part{text: " "}, part{alts: alts}, part{text: " "})
 		case unicode.IsLetter(r):
@@ -159,17 +239,18 @@ func Readings(s string) []string {
 		}
 	}
 
+	// Expand numerals in order while the product fits; pin the rest to the
+	// cardinal.
 	combos := 1
-	for _, p := range parts {
-		if len(p.alts) > 0 {
-			combos *= len(p.alts)
-			if combos > MaxReadings {
-				break
-			}
+	for n := range parts {
+		if len(parts[n].alts) == 0 {
+			continue
 		}
-	}
-	if combos > MaxReadings {
-		combos = 1
+		if combos*len(parts[n].alts) > MaxReadings {
+			parts[n].alts = parts[n].alts[:1]
+			continue
+		}
+		combos *= len(parts[n].alts)
 	}
 
 	out := make([]string, 0, combos)
@@ -182,12 +263,8 @@ func Readings(s string) []string {
 				b.WriteString(p.text)
 				continue
 			}
-			n := 1
-			if combos > 1 {
-				n = len(p.alts)
-			}
-			b.WriteString(p.alts[rest%n])
-			rest /= n
+			b.WriteString(p.alts[rest%len(p.alts)])
+			rest /= len(p.alts)
 		}
 		reading := strings.Join(strings.Fields(b.String()), " ")
 		if !seen[reading] {
@@ -199,9 +276,9 @@ func Readings(s string) []string {
 }
 
 // Normalize prepares text for phonetic encoding using the cardinal reading of
-// every numeral: lower-case, ASCII digit runs spelled out (NumberWords; a
-// comma between digits is read as a thousands separator), and every rune that
-// is not a letter removed — spaces too. It is lettersOnly(Readings(s)[0]).
+// every numeral (see Readings): lower-case, numerals spelled out, and every
+// rune that is not a letter removed — spaces too. It is
+// lettersOnly(Readings(s)[0]).
 func Normalize(s string) string { return lettersOnly(Readings(s)[0]) }
 
 // lettersOnly drops every rune that is not a letter.

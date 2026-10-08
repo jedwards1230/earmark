@@ -36,11 +36,7 @@ func NumberWords(digits string) string {
 		}
 	}
 	if (len(digits) > 1 && digits[0] == '0') || len(digits) > maxCardinalDigits {
-		words := make([]string, 0, len(digits))
-		for i := 0; i < len(digits); i++ {
-			words = append(words, smallNumbers[digits[i]-'0'])
-		}
-		return strings.Join(words, " ")
+		return digitWords(digits)
 	}
 	var n uint64
 	for i := 0; i < len(digits); i++ {
@@ -121,13 +117,18 @@ func NumberReadings(digits string) []string {
 		add(p)
 	}
 	if len(digits) > 1 {
-		words := make([]string, 0, len(digits))
-		for i := 0; i < len(digits); i++ {
-			words = append(words, smallNumbers[digits[i]-'0'])
-		}
-		add(strings.Join(words, " "))
+		add(digitWords(digits))
 	}
 	return out
+}
+
+// digitWords reads ASCII digits one by one: "240" → "two four zero".
+func digitWords(digits string) string {
+	words := make([]string, 0, len(digits))
+	for i := 0; i < len(digits); i++ {
+		words = append(words, smallNumbers[digits[i]-'0'])
+	}
+	return strings.Join(words, " ")
 }
 
 // pairedWords is the paired reading of a 3- or 4-digit run, or "" when it has
