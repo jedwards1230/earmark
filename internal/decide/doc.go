@@ -26,4 +26,9 @@
 // internal/fn, and maps the answer to apply, hold or reject (Decide). It fails
 // closed: any failure to get a usable answer is a retryable hold, never an
 // apply. Nothing here persists a decision or changes a finding's state.
+//
+// DryRun (`earmark decide`) runs the whole step over a deterministic sample
+// and builds a Report — outcomes, reasons, a p histogram, cost and a backlog
+// projection — and, in calibration mode, agreement with decisions people
+// already made. It writes only the decide recipe and the fn_calls log.
 package decide

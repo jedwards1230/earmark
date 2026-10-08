@@ -1,0 +1,42 @@
+decide calibration (human-decided findings) · recipe cdcdcdcdcdcd · model jev-1.13.0 · seed "cal"
+sampled 6 of 6 requested · scope 60
+
+outcomes: apply 2 · hold 1 · reject 2 · reanchor 1
+outcome   issue_type            evidence       count
+apply     misheard_proper_noun  asin_verbatim  2
+hold      misheard_word         none           1
+reject    misheard_word         none           2
+reanchor  misheard_word         none           1
+
+decision reasons: confident_with_evidence 2 · jev_reject 1 · no_evidence 1
+rung-0 rejects:   not_soundalike 1
+reanchor needed:  anchor_missing 1
+
+p histogram (answered 0):
+  [0.0,0.1)     0
+  [0.1,0.2)     0
+  [0.2,0.3)     0
+  [0.3,0.4)     0
+  [0.4,0.5)     0
+  [0.5,0.6)     0
+  [0.6,0.7)     0
+  [0.7,0.8)     0
+  [0.8,0.9)     0
+  [0.9,1.0]     0
+
+jev: asked 0 · answered 0 · unavailable 0 · cache hits 0
+tokens: 0 in · 0 out · cost $0.000000
+
+projection to the scope (60 findings): apply 20 · hold 10 · reject 20 · reanchor 10
+  ~0 model calls · cost unknown (no uncached call in the sample)
+
+calibration: 3 human-accepted · 3 human-rejected
+  human accepted → apply 1 · hold 0 · reject 1 · reanchor 1
+  human rejected → apply 1 · hold 1 · reject 1 · reanchor 0
+  apply precision 50.0% · apply recall 33.3% · reject precision 50.0% · hold rate 16.7%
+  phonetic_min_sim sweep (rung 0 re-run offline; no new model calls):
+    sim     pass(acc)  pass(rej)  unasked  apply  precision  reject   rej agree  hold
+    0.55            2          3        1      2      50.0%       1           1     1
+    0.67            1          3        0      2      50.0%       2           1     1
+
+(dry run) nothing decided: no finding_events, no state changes. Model answers are cached in fn_calls.

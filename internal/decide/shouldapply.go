@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/fn"
+	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/systemone"
 )
@@ -240,6 +242,18 @@ type Outcome struct {
 	// Model is the model that answered ("" when none did).
 	Model    string
 	CacheHit bool
+	// Asked is true when the model was asked (rung 0 passed), whether or not
+	// it answered usably.
+	Asked bool
+	// ErrorClass is the bounded failure class of a jev_unavailable hold
+	// (genai.ErrorClass, "model_fallback" or "invalid_reply"); "" otherwise.
+	ErrorClass string
+	// Latency, tokens and cost of the call. A cache hit makes no request:
+	// its tokens and cost are zero.
+	Latency      time.Duration
+	InputTokens  int
+	OutputTokens int
+	CostUSD      float64
 }
 
 // Evaluator runs should_apply.
@@ -294,19 +308,33 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) Outcome {
 	state := BuildState(c.IssueType, BuildContext(in.Segments, chunk, v.Span, c.Replacement),
 		Relevant(sentences, c.Original, c.Replacement))
 
-	unavailable := func() Outcome {
+	unavailable := func(class string) Outcome {
 		out.Decision, out.Reason, out.Retryable, out.P = DecisionHold, ReasonJevUnavailable, true, nil
+		out.ErrorClass = class
 		return out
 	}
+	out.Asked = true
 	res, meta, err := e.fn.Invoke(ctx, e.store, shouldApplyInput{State: state}, e.call(state))
 	out.FnCallID, out.CallRecipeID, out.CacheHit = meta.CallID, meta.RecipeID, meta.CacheHit
-	out.Model = res.Model
-	if err != nil || meta.Fallback {
-		return unavailable()
+	out.Model, out.Latency = res.Model, meta.Latency
+	if res.InputTokens != nil {
+		out.InputTokens = *res.InputTokens
+	}
+	if res.OutputTokens != nil {
+		out.OutputTokens = *res.OutputTokens
+	}
+	if res.CostUSD != nil {
+		out.CostUSD = *res.CostUSD
+	}
+	switch {
+	case err != nil:
+		return unavailable(genai.ErrorClass(err))
+	case meta.Fallback:
+		return unavailable(db.ErrorClassModelFallback)
 	}
 	p, err := decodeShouldApply(res.Output)
 	if err != nil {
-		return unavailable()
+		return unavailable(genai.ErrorClass(err))
 	}
 	out.P = &p
 	out.Decision, out.Reason = e.params.Decide(p, out.Evidence, c.IssueType)
