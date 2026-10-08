@@ -9,6 +9,7 @@ import (
 	neturl "net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -102,8 +103,11 @@ type AIEndpoint struct {
 	BaseURL string         `json:"baseURL"` // OpenAI-compatible base, no trailing slash
 	Model   string         `json:"model"`   // model id passed to the API
 	// Options are backend-specific key/value pairs (all strings on the wire).
-	// Known keys: temperature, max_tokens, top_p. Unknown keys are forwarded
-	// as-is so future backends don't require code changes.
+	// For a chat endpoint they are sent in the eval judge's request body:
+	// known keys temperature, max_tokens, top_p are validated here
+	// (validateChatOptions) and parsed by internal/eval; reserved request keys
+	// are rejected; unknown keys are forwarded so future backends don't
+	// require code changes (CONTRACT §2.14).
 	Options map[string]string `json:"options,omitempty"`
 	// APIKeyEnv names the environment variable holding this endpoint's bearer
 	// token (e.g. a LiteLLM virtual key). It is the variable NAME, not the
@@ -225,6 +229,11 @@ func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
 		if ep.Model == "" {
 			return nil, fmt.Errorf("%s (%q): model is required", where, ep.ID)
 		}
+		if ep.Type == AIEndpointTypeChat {
+			if err := validateChatOptions(ep.Options); err != nil {
+				return nil, fmt.Errorf("%s (%q): %w", where, ep.ID, err)
+			}
+		}
 		if ep.APIKeyEnv != "" {
 			key, err := resolveAPIKeyEnv(ep.APIKeyEnv)
 			if err != nil {
@@ -241,6 +250,42 @@ func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
 		}
 	}
 	return eps, nil
+}
+
+// reservedChatOptionKeys are chat request fields the eval judge sets itself;
+// an option may not override them (CONTRACT §2.14).
+var reservedChatOptionKeys = []string{
+	"model", "messages", "stream", "response_format", "reasoning_effort", "chat_template_kwargs",
+}
+
+// validateChatOptions rejects chat-endpoint options the judge would refuse at
+// construction: a non-numeric/negative temperature or top_p, a non-positive or
+// non-integer max_tokens, or a reserved request key. It runs at LoadConfig so
+// a bad option is fatal at startup (the §2.14 malformed-registry posture)
+// rather than silently disabling the judge — with EVAL_GATES_EMBED=true a
+// judge that fails to build would otherwise reach the gated worker as nil.
+// internal/eval.parseChatOptions is the parser that actually builds the
+// request; this is the same rule, inlined so config stays independent of eval
+// (as validateBaseURL is).
+func validateChatOptions(opts map[string]string) error {
+	for k, raw := range opts {
+		v := strings.TrimSpace(raw)
+		switch k {
+		case "temperature", "top_p":
+			if f, err := strconv.ParseFloat(v, 64); err != nil || f < 0 {
+				return fmt.Errorf("option %q must be a non-negative number, got %q", k, raw)
+			}
+		case "max_tokens":
+			if n, err := strconv.Atoi(v); err != nil || n <= 0 {
+				return fmt.Errorf("option %q must be a positive integer, got %q", k, raw)
+			}
+		default:
+			if slices.Contains(reservedChatOptionKeys, k) {
+				return fmt.Errorf("option %q is set by earmark and cannot be overridden", k)
+			}
+		}
+	}
+	return nil
 }
 
 // envNameRE matches a conventional environment variable name.

@@ -177,6 +177,19 @@ func TestSameModel(t *testing.T) {
 	assert.True(t, sameModel("anthropic/claude-haiku", "anthropic/claude-haiku"))
 	assert.False(t, sameModel("qwen3.8", "qwen3.8:14b"), "a bare pin must not match an arbitrary tag")
 	assert.False(t, sameModel("", ""))
+	// Provider-prefix-insensitive: LiteLLM answers the bare provider id.
+	assert.True(t, sameModel("claude-haiku-5-5", "anthropic/claude-haiku-5-5"))
+	assert.True(t, sameModel("Anthropic/Claude-Haiku-5-5", "claude-haiku-5-5"))
+	assert.True(t, sameModel("ollama/qwen3.8:latest", "qwen3.8"))
+	assert.False(t, sameModel("claude-haiku-5-5", "anthropic/claude-haiku-4-5-20251001"))
+	assert.False(t, sameModel("claude-haiku-5-5", "claude-haiku-5-5-20260101"), "a dated snapshot is a different model")
+}
+
+// The Judge's "answered ≠ expected" check reads LiteLLM's prefix-less answer
+// for an unpinned anthropic/… route as a match, not DEGRADED.
+func TestAnsweredMatch_ProviderPrefix(t *testing.T) {
+	assert.Equal(t, matchOK, answeredMatch("claude-haiku-5-5", "anthropic/claude-haiku-5-5", true))
+	assert.Equal(t, matchMismatch, answeredMatch("claude-haiku-4-5-20251001", "anthropic/claude-haiku-5-5", true))
 }
 
 func TestModelAllowed(t *testing.T) {
@@ -197,6 +210,10 @@ func TestModelAllowed(t *testing.T) {
 		{"all-proxy-models", []string{"all-proxy-models"}, "x", &tr},
 		{"all-team-models is unknowable", []string{"all-team-models"}, "x", nil},
 		{"tag mismatch", []string{"qwen3.8:14b"}, "qwen3.8", &fa},
+		// The allowlist stays prefix-SENSITIVE: LiteLLM matches the requested
+		// name, so a bare entry does not admit a provider-routed request.
+		{"provider prefix is significant", []string{"claude-haiku-5-5"}, "anthropic/claude-haiku-5-5", &fa},
+		{"empty model", []string{"x"}, "", &fa},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

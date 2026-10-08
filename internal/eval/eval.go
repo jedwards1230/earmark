@@ -111,6 +111,16 @@ type ModelReportingClient interface {
 	CompleteWithModel(ctx context.Context, system, user string) (Completion, error)
 }
 
+// TemperatureReporter is an optional ChatClient extension reporting the
+// sampling temperature the client actually sends: nil when it omits the field
+// (hosted routes by default — the provider's default applies). The judge's
+// recipe params and the gen_ai.request.temperature span attribute follow it.
+// openAIChatClient implements it; a ChatClient that doesn't is assumed to send
+// temperature 0 (the historical judge setting).
+type TemperatureReporter interface {
+	Temperature() *float64
+}
+
 // ChunkReader is the read-only slice of the DB the judge needs to fetch chunks.
 // Intentionally read-only — there is no transcript-mutating method here.
 type ChunkReader interface {
@@ -185,13 +195,38 @@ func (j *Judge) Recipe() recipe.Recipe {
 		ModelRevision: j.pin.Revision,
 		PromptVersion: judgePromptVersion,
 		PromptSHA256:  judgePromptSHA256(),
-		Params: map[string]any{
-			// openAIChatClient always sends temperature 0.
-			"temperature":            0,
-			"min_confidence":         j.minConf,
-			"max_findings_per_chunk": j.maxPerChunk,
-		},
+		Params:        j.recipeParams(),
 	}
+}
+
+// recipeParams are the propose recipe's output-shaping params. temperature is
+// recorded only when it is actually sent (sentTemperature): a hosted route
+// that omits it has no temperature param, which is a different recipe from
+// the historical temperature-0 one (CONTRACT §1.9 / §2.15). max_tokens is not
+// a param — it bounds the reply's length, and a reply that hits it is an error
+// (ErrTruncatedResponse), never a finding set.
+func (j *Judge) recipeParams() map[string]any {
+	params := map[string]any{
+		"min_confidence":         j.minConf,
+		"max_findings_per_chunk": j.maxPerChunk,
+	}
+	if t := j.sentTemperature(); t != nil {
+		params["temperature"] = *t
+	}
+	return params
+}
+
+// sentTemperature is the temperature the judge's chat client sends, nil when
+// omitted. A client that does not report it is assumed to send 0.
+func (j *Judge) sentTemperature() *float64 {
+	if j == nil || j.chat == nil {
+		return nil
+	}
+	if tr, ok := j.chat.(TemperatureReporter); ok {
+		return tr.Temperature()
+	}
+	zero := 0.0
+	return &zero
 }
 
 // recipeFor is the recipe that actually produced a reply: the current recipe
@@ -236,7 +271,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 	if er, ok := j.chat.(EndpointReporter); ok {
 		ep = er.Endpoint()
 	}
-	ctx, span := startChatSpan(ctx, j.chat.Model(), ep, chunkRef{transcriptID: c.TranscriptID, chunkID: c.ChunkID})
+	ctx, span := startChatSpan(ctx, j.chat.Model(), j.sentTemperature(), ep, chunkRef{transcriptID: c.TranscriptID, chunkID: c.ChunkID})
 	comp, err := j.complete(ctx, system, user)
 	resolved := comp.ResolvedModel
 	var recipeID string

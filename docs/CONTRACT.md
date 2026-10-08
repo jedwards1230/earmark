@@ -1290,8 +1290,10 @@ cannot know the runner's configuration before it reports, so asr rows are not
 yet reported stale.
 
 **Current steps.** `propose`: `step_version` 1, prompt `judge@v1` + sha256 of
-(system prompt, user template, response JSON schema), params `temperature`,
-`min_confidence`, `max_findings_per_chunk`. `embed`: `step_version` 1, params
+(system prompt, user template, response JSON schema), params `temperature`
+(**only when it is sent** — omitted for hosted routes unless configured, §2.15
+"Request parameters"), `min_confidence`, `max_findings_per_chunk`. `max_tokens`
+is deliberately not a param: a reply that hits it is an error, never findings. `embed`: `step_version` 1, params
 `chunk_size`, `dimensions`, `document_prefix`. Both take `expected_model` /
 `revision` from the model registry (§2.18).
 
@@ -2202,9 +2204,26 @@ this (LiteLLM, bare vLLM and any OpenAI-compatible server all declare
 fatal).
 
 All three backends speak the OpenAI-compatible REST API; `backend` selects the
-dashboard label only (no behavioral difference today). `options` keys are
-forwarded as-is — known keys are `temperature`, `max_tokens`, `top_p`; unknown
-keys are preserved so a future backend needs no code change.
+dashboard label only (no behavioral difference today). For the `eval` role's
+chat endpoint, `options` are sent in the `/chat/completions` request body:
+
+- **Known keys** are parsed: `temperature` and `top_p` as non-negative numbers,
+  `max_tokens` as a positive integer. An unparseable value on a `chat` entry
+  is a fatal `AI_ENDPOINTS` error at startup, like a malformed baseURL (fail
+  loud — never silently the backend default, and never a judge that silently
+  fails to build).
+- **`apiKey`** is the deprecated bearer-token fallback (below) and is never
+  forwarded.
+- **Reserved keys** earmark sets itself — `model`, `messages`, `stream`,
+  `response_format`, `reasoning_effort`, `chat_template_kwargs` — are rejected
+  the same way (the thinking controls have their own env vars, §2.15).
+- **Every other key is forwarded** so a future backend needs no code change.
+  Option values are strings on the wire, so a value that is a JSON number,
+  boolean, array or object is sent as that JSON value (`"top_k": "20"` → `20`,
+  `"stop": "[\"END\"]"` → `["END"]`); anything else is sent as the string.
+
+Defaults when unset and the temperature rule for hosted routes are in §2.15
+"Request parameters". The embeddings client does not read `options`.
 
 `apiKeyEnv` authenticates an endpoint behind a gateway that requires
 `Authorization: Bearer <key>` (e.g. a LiteLLM virtual key). It holds the **name**
@@ -2335,12 +2354,17 @@ bottom:
      pending, `idle` when nothing is queued) → every probed server offline
      (`down`) → any idle → no servers (`not_configured`) → `unknown`.
 
-   "answered ≠ expected" compares case-insensitively and treats Ollama's
-   implicit `:latest` as the bare name, but a bare pin does not match an
-   arbitrary tag (`qwen3.8` ≠ `qwen3.8:14b`); when unpinned, the answer is
-   compared with the requested id. A failing judge shows its last error in red
-   under the state (monospace, clamped to two lines; full text on hover);
-   otherwise the last error is a muted "last error" row with its time.
+   "answered ≠ expected" compares case-insensitively, ignores a router's
+   provider prefix (the same rule as `earmark_model_calls_total`'s `fallback`,
+   §2.16: LiteLLM answering `claude-haiku-5-5` for a requested
+   `anthropic/claude-haiku-5-5` is a match) and treats Ollama's implicit
+   `:latest` as the bare name, but a bare pin does not match an arbitrary tag
+   (`qwen3.8` ≠ `qwen3.8:14b`) or a dated snapshot; when unpinned, the answer
+   is compared with the requested id. The LiteLLM key-allowlist check stays
+   prefix-sensitive — LiteLLM matches the requested name exactly. A failing
+   judge shows its last error in red under the state (monospace, clamped to
+   two lines; full text on hover); otherwise the last error is a muted "last
+   error" row with its time.
 
    *last ok* on the Judge card is `max(run_metrics.eval_finished_at)`: the
    newest judge success **from any source** (the hourly backfill CronJob,
@@ -2506,9 +2530,50 @@ hides the provider (e.g. model `judge` mapped to Claude in the proxy config)
 cannot be detected from the id: set `EVAL_REASONING_EFFORT=omit` and
 `EVAL_CHAT_TEMPLATE_KWARGS=omit` for it. Either field can be
 forced per deployment: `omit` never sends it; any other value is sent verbatim
-(`EVAL_CHAT_TEMPLATE_KWARGS` must then be a JSON object). Everything else in the
-request is route-independent: `response_format` (JSON schema), `temperature: 0`,
-and the bearer token from the endpoint's `apiKeyEnv` (§2.14).
+(`EVAL_CHAT_TEMPLATE_KWARGS` must then be a JSON object). Route-independent:
+`response_format` (JSON schema) and the bearer token from the endpoint's
+`apiKeyEnv` (§2.14).
+
+**Request parameters.** From the eval endpoint's `options` (§2.14), with these
+defaults when a key is unset (the `EVAL_CHAT_*` fallback has no options, so it
+always gets the defaults):
+
+| Field | Default | Why |
+|---|---|---|
+| `max_tokens` | `8192` (`defaultJudgeMaxTokens`) | The reply itself is small, but on hosted reasoning models (Claude Haiku 5.5 thinks adaptively by default) the output budget is **shared with thinking** — a tight cap gets spent thinking and the answer is truncated. 8192 leaves room for that and is still a ceiling on a runaway generation. Ollama maps it onto `num_predict`. |
+| `temperature` | `0` for local models; **omitted** for hosted routes | Local judges need determinism (the same span should flag the same way run to run). Hosted routes (`isHostedRoute`: `anthropic/` anywhere in the model id) are sent no temperature, because newer Claude models reject any non-default sampling parameter (`temperature`/`top_p`/`top_k` → 400). An explicit `temperature` option is always sent, on any route. |
+| `top_p` | omitted | Sent only when configured. |
+
+The judge's `propose` recipe params (§1.9) and the span's
+`gen_ai.request.temperature` (§2.16) record the temperature **actually sent**,
+and omit it when none is. **Recipe consequence:** on a hosted route the recipe
+params lose `temperature` (previously always `0`), so the current `propose`
+recipe id changes and every prior propose finding from that route is listed in
+`stale_work`. That is intended to coincide with the judge model switch (a new
+model changes the recipe anyway); nothing re-judges automatically — findings
+converge only by re-judging (`earmark eval --backfill-*`). Local routes keep
+`temperature: 0` and so keep their recipe id.
+
+**Fail-closed replies.** A reply the judge cannot use is an **error**, never
+"no findings" — an empty answer read as zero findings is indistinguishable
+from a clean chunk, would latch the transcript as judged (§1.5), and would
+never be retried. The client checks the first choice's `finish_reason` and
+message, in this order:
+
+| Condition | Error | `error.type` |
+|---|---|---|
+| `finish_reason` `content_filter` or `refusal`, or a non-empty `message.refusal` | `ErrRefusalResponse` | `refusal` |
+| `finish_reason` `length` (hit `max_tokens`; any content is cut off) | `ErrTruncatedResponse` | `truncated` |
+| empty/whitespace content with non-empty `reasoning`/`reasoning_content` | `ErrThinkingOnlyResponse` | `thinking_only` |
+| empty/whitespace content otherwise (e.g. Haiku 5.5's empty thinking blocks → empty `reasoning_content`) | `ErrEmptyResponse` | `empty` |
+
+Each goes through the existing per-chunk failure path: the chunk is counted
+skipped (not evaluated), the run is not complete, and the transcript gets a
+failure record (`eval_failed_at`, `eval_error`) instead of `eval_finished_at`
+— so `earmark eval --backfill-eval-errors` re-judges it. The content is
+dropped; the reported model and usage are still recorded. (A reply that has
+content but is not valid findings JSON is still the advisory soft-fail of
+`JudgeChunk`; a reply cut off by `max_tokens` never reaches it.)
 
 **Resolved model.** The judge records the model the endpoint **reports** serving
 each request (the response's `model` field) next to the requested id, because a
@@ -2854,12 +2919,14 @@ OpenTelemetry GenAI semantic conventions, **pinned to semconv v1.40.0** (they
 are still "development"; earmark's own `earmark.*` attributes are
 authoritative): `gen_ai.operation.name=chat`, `gen_ai.provider.name` (the
 LiteLLM route prefix of the model id, e.g. `anthropic`, else
-`openai_compatible`), `gen_ai.request.model`, `gen_ai.request.temperature`,
+`openai_compatible`), `gen_ai.request.model`, `gen_ai.request.temperature`
+(only when the request sends one, §2.15),
 `gen_ai.response.model` (the resolved model), `gen_ai.usage.input_tokens` /
 `output_tokens` (from the response `usage`), `server.address` / `server.port`,
 on failure an error status whose description and `error.type` are a bounded
-class only — the HTTP status code (`422`), `timeout`, `canceled`,
-`thinking_only` or `_OTHER` — never the error text, because an upstream error
+class only — the HTTP status code (`422`), `timeout`, `canceled`, an
+unusable-reply class (`thinking_only`, `empty`, `truncated`, `refusal`; §2.15
+"Fail-closed replies") or `_OTHER` — never the error text, because an upstream error
 body can echo the request (no exception event is recorded; the full error
 still reaches the caller's logs), and `earmark.step`, `earmark.fn`,
 `earmark.recipe_id` (the recipe that stamped its findings), `earmark.transcript_id`,

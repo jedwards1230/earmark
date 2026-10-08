@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -59,6 +62,51 @@ func TestEvalTranscript_JudgeErrorDoesNotLatch(t *testing.T) {
 					"judge failed on every chunk → eval_finished_at must NOT be latched (got %v, chunks=%d skipped=%d)",
 					m.FinishedAt, m.Chunks, m.Skipped)
 			}
+		})
+	}
+}
+
+// endpointSource is a registry binding for eval.ResolveChatClient.
+type endpointSource struct{ ep eval.EvalEndpoint }
+
+func (s endpointSource) EvalEndpoint() (eval.EvalEndpoint, bool) { return s.ep, true }
+
+// TestEvalTranscript_UnusableReplyDoesNotLatch drives the REAL chat client
+// against an endpoint whose replies the judge cannot use (empty content,
+// truncation at max_tokens, a refusal). Each must fail closed: the transcript
+// gets a failure record, never eval_finished_at with zero findings — a latched
+// transcript is never re-judged, so that false negative would be permanent.
+func TestEvalTranscript_UnusableReplyDoesNotLatch(t *testing.T) {
+	for name, reply := range map[string]string{
+		"empty content":  `{"model":"claude-haiku-5-5","choices":[{"message":{"content":""},"finish_reason":"stop"}]}`,
+		"truncated":      `{"model":"claude-haiku-5-5","choices":[{"message":{"content":"{\"findings\":["},"finish_reason":"length"}]}`,
+		"content_filter": `{"model":"claude-haiku-5-5","choices":[{"message":{"content":""},"finish_reason":"content_filter"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, reply)
+			}))
+			defer srv.Close()
+			chat, err := eval.ResolveChatClient(endpointSource{ep: eval.EvalEndpoint{
+				BaseURL: srv.URL + "/v1", Model: "anthropic/claude-haiku-5-5",
+			}})
+			require.NoError(t, err)
+
+			fdb := &fakeDB{}
+			w := &Worker{
+				ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"),
+				judge: eval.NewJudge(chat), evalGatesEmbed: true,
+			}
+			tr := &db.Transcript{ID: "tid-unusable", JobID: "job-unusable", FilePath: "/b/a/t/ch.mp3", RawText: longTranscript}
+			require.NoError(t, w.evalTranscript(&config.Config{ChunkSize: 8, EvalGatesEmbed: true}, tr))
+
+			require.Len(t, fdb.evalMetrics, 1)
+			m := fdb.evalMetrics[0]
+			require.True(t, m.FinishedAt.IsZero(), "an unusable judge reply must NOT latch eval_finished_at")
+			require.True(t, m.Failed(), "it is recorded as a failure, retryable by --backfill-eval-errors")
+			require.Positive(t, m.FailedChunks)
+			require.Empty(t, fdb.findings)
 		})
 	}
 }

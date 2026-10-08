@@ -61,18 +61,21 @@ func countModelCall(ctx context.Context, model, outcome string) {
 		attribute.String("outcome", outcome)))
 }
 
-// startChatSpan opens the gen_ai client span for one judge call. Prompt and
-// completion content are never recorded.
-func startChatSpan(ctx context.Context, model string, ep Endpoint, c chunkRef) (context.Context, trace.Span) {
+// startChatSpan opens the gen_ai client span for one judge call. temperature
+// is what the client sends; nil (omitted from the request) omits the
+// gen_ai.request.temperature attribute. Prompt and completion content are
+// never recorded.
+func startChatSpan(ctx context.Context, model string, temperature *float64, ep Endpoint, c chunkRef) (context.Context, trace.Span) {
 	attrs := []attribute.KeyValue{
 		semconv.GenAIOperationNameChat,
 		semconv.GenAIRequestModel(model),
-		// openAIChatClient always sends temperature 0.
-		semconv.GenAIRequestTemperature(0),
 		attrStep.String("propose"),
 		attrFn.String(judgeFn),
 		attrTranscriptID.String(c.transcriptID),
 		attrChunkID.String(c.chunkID),
+	}
+	if temperature != nil {
+		attrs = append(attrs, semconv.GenAIRequestTemperature(*temperature))
 	}
 	if ep.Provider != "" {
 		attrs = append(attrs, semconv.GenAIProviderNameKey.String(ep.Provider))
@@ -110,7 +113,7 @@ func endChatSpan(ctx context.Context, span trace.Span, model, expected string, c
 	} else {
 		if comp.ResolvedModel != "" {
 			span.SetAttributes(semconv.GenAIResponseModel(comp.ResolvedModel))
-			if expected != "" && !sameModel(comp.ResolvedModel, expected) {
+			if expected != "" && !SameModel(comp.ResolvedModel, expected) {
 				outcome = outcomeFallback
 			}
 		}
@@ -127,8 +130,9 @@ func endChatSpan(ctx context.Context, span trace.Span, model, expected string, c
 }
 
 // errorClass reduces a chat error to a bounded, content-free label for
-// error.type: the HTTP status code ("422"), "timeout", "canceled",
-// "thinking_only", else semconv's "_OTHER".
+// error.type: the HTTP status code ("422"), "timeout", "canceled", one of the
+// unusable-reply classes ("thinking_only", "empty", "truncated", "refusal"),
+// else semconv's "_OTHER".
 func errorClass(err error) string {
 	var se *StatusError
 	var ne net.Error
@@ -137,6 +141,12 @@ func errorClass(err error) string {
 		return strconv.Itoa(se.Code)
 	case errors.Is(err, ErrThinkingOnlyResponse):
 		return "thinking_only"
+	case errors.Is(err, ErrEmptyResponse):
+		return "empty"
+	case errors.Is(err, ErrTruncatedResponse):
+		return "truncated"
+	case errors.Is(err, ErrRefusalResponse):
+		return "refusal"
 	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
 		return "timeout"
 	case errors.Is(err, context.Canceled):
@@ -146,11 +156,11 @@ func errorClass(err error) string {
 	}
 }
 
-// sameModel compares model ids ignoring a router's route prefix and case: a
+// SameModel compares model ids ignoring a router's route prefix and case: a
 // registry pin "anthropic/claude-haiku-4-5-20251001" and a LiteLLM response
 // reporting "claude-haiku-4-5-20251001" name the same model, so the call is
-// not a fallback.
-func sameModel(a, b string) bool {
+// not a fallback. Shared with the dashboard's Models page (internal/mcp).
+func SameModel(a, b string) bool {
 	last := func(s string) string {
 		s = strings.ToLower(strings.TrimSpace(s))
 		if i := strings.LastIndex(s, "/"); i >= 0 {

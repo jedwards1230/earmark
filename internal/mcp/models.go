@@ -10,6 +10,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
@@ -806,20 +807,24 @@ func modelsMatch(a, b string) bool {
 }
 
 // sameModel is the strict comparison for "did the expected model answer":
-// case-insensitive, and Ollama's implicit `:latest` equals the bare name, but
-// a bare pin does NOT match an arbitrary tag (`qwen3.8` ≠ `qwen3.8:14b`) —
-// unlike modelsMatch, which is the lenient /models presence check.
+// case-insensitive, a router's provider prefix is ignored (eval.SameModel:
+// LiteLLM answers `claude-haiku-5-5` for a requested
+// `anthropic/claude-haiku-5-5`), and Ollama's implicit `:latest` equals the
+// bare name, but a bare pin does NOT match an arbitrary tag (`qwen3.8` ≠
+// `qwen3.8:14b`) — unlike modelsMatch, which is the lenient /models presence
+// check.
 func sameModel(a, b string) bool {
 	a, b = strings.ToLower(strings.TrimSpace(a)), strings.ToLower(strings.TrimSpace(b))
 	if a == "" || b == "" {
 		return false
 	}
-	return strings.TrimSuffix(a, ":latest") == strings.TrimSuffix(b, ":latest")
+	return eval.SameModel(strings.TrimSuffix(a, ":latest"), strings.TrimSuffix(b, ":latest"))
 }
 
 // modelAllowed reports whether model is on a LiteLLM key allowlist: an empty
 // list or "*" / "all-proxy-models" allows everything; "provider/*" (any
-// trailing "*") is a prefix wildcard; otherwise sameModel. nil when the list
+// trailing "*") is a prefix wildcard; otherwise an exact (case- and
+// `:latest`-insensitive) match. nil when the list
 // uses a scope earmark cannot resolve from its own key ("all-team-models").
 func modelAllowed(allowed []string, model string) *bool {
 	yes, no := true, false
@@ -837,7 +842,9 @@ func modelAllowed(allowed []string, model string) *bool {
 			unknown = true
 		case strings.HasSuffix(a, "*") && strings.HasPrefix(m, strings.TrimSuffix(a, "*")):
 			return &yes
-		case sameModel(a, m):
+		case a != "" && strings.TrimSuffix(a, ":latest") == strings.TrimSuffix(m, ":latest"):
+			// Exact (modulo :latest), NOT sameModel: LiteLLM matches the
+			// requested name, provider prefix included.
 			return &yes
 		}
 	}

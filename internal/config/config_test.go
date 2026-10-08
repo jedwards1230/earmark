@@ -555,6 +555,38 @@ func TestParseAIEndpoints_APIKeyEnv(t *testing.T) {
 	}
 }
 
+// TestParseAIEndpoints_ChatOptions: a chat endpoint's options are validated at
+// load (fatal), so a bad value cannot silently disable the judge — with
+// EVAL_GATES_EMBED=true a nil judge would latch transcripts with zero findings.
+// Embeddings endpoints do not read options and are not checked.
+func TestParseAIEndpoints_ChatOptions(t *testing.T) {
+	entry := func(typ, opts string) string {
+		return `[{"id":"e","type":"` + typ + `","backend":"openai-compat","baseURL":"http://litellm:4000/v1","model":"m","options":` + opts + `}]`
+	}
+	cases := []struct {
+		name, typ, opts, wantErr string
+	}{
+		{name: "known keys valid", typ: "chat", opts: `{"temperature":"0.2","max_tokens":"8192","top_p":"1"}`},
+		{name: "unknown keys and apiKey pass", typ: "chat", opts: `{"top_k":"20","apiKey":"x","user":"earmark"}`},
+		{name: "bad temperature", typ: "chat", opts: `{"temperature":"warm"}`, wantErr: `option "temperature"`},
+		{name: "negative top_p", typ: "chat", opts: `{"top_p":"-0.1"}`, wantErr: `option "top_p"`},
+		{name: "zero max_tokens", typ: "chat", opts: `{"max_tokens":"0"}`, wantErr: `option "max_tokens"`},
+		{name: "reserved key", typ: "chat", opts: `{"response_format":"{}"}`, wantErr: "cannot be overridden"},
+		{name: "embeddings options unchecked", typ: "embeddings", opts: `{"max_tokens":"lots"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseAIEndpoints(entry(tc.typ, tc.opts))
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 // TestAIEndpoint_APIKeyNeverSerialized guards the json:"-" tag: the resolved
 // secret must not appear when an endpoint is marshalled, while the (non-secret)
 // variable name may.
