@@ -183,11 +183,15 @@ func TestMetricsEndpointServesOTelAndLegacy(t *testing.T) {
 	tel.StartStaleRefresh(time.Hour, time.Second, func(context.Context) (map[string]int64, error) {
 		return map[string]int64{"embed": 7}, nil
 	})
+	tel.StartQualityRefresh(time.Hour, time.Second, func(context.Context) ([]telemetry.QualityIndex, error) {
+		return []telemetry.QualityIndex{{Scope: "library", Recipe: "r1", Value: 0.75}}, nil
+	})
 
 	want := []string{
 		`earmark_build_info{commit="` + version.Commit + `",version="` + version.Version + `"} 1`,
 		`earmark_recipe_info{model="anthropic/claude-haiku-4-5-20251001",prompt_version="judge@v1",recipe="abc",revision="20251001",step="propose"} 1`,
 		`earmark_stale_items{step="embed"} 7`,
+		`earmark_quality_index{recipe="r1",scope="library"} 0.75`,
 		// legacy names unchanged
 		`earmark_jobs{status="pending"} 2`,
 		`earmark_jobs_failed_total 0`,
@@ -196,7 +200,8 @@ func TestMetricsEndpointServesOTelAndLegacy(t *testing.T) {
 	var body string
 	for {
 		body = scrape(t, reg)
-		if strings.Contains(body, `earmark_stale_items{step="embed"} 7`) || time.Now().After(deadline) {
+		if (strings.Contains(body, `earmark_stale_items{step="embed"} 7`) &&
+			strings.Contains(body, `earmark_quality_index{`)) || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond) // the stale refresh runs asynchronously
