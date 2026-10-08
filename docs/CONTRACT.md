@@ -3996,8 +3996,13 @@ satisfy `0 ≤ reject_p < apply_p ≤ 1` and `0 < phonetic_min_sim ≤ 1`.
 **Outcome** (what a decision record persists): finding id, decision, reason,
 retryable flag, `p` (absent when the model was not asked or gave no usable
 answer), evidence kind, the rung-0 verdict (reason, span, evidence text), the
-chunk hash decided on, the `fn_calls` row id, the recipe id, the answering
-model and whether the answer was a cache hit. Reason and evidence values are a
+chunk hash decided on, the `fn_calls` row id and the recipe that row was
+stamped with, the answering model and whether the answer was a cache hit. The
+decision itself is attributed to the evaluator's decide recipe
+(`decide.Evaluator.Recipe`: should_apply, the pinned model, these params) for
+every outcome, including rung-0 rejects and holds that made no call; its
+decision and evidence values are the `db.Outcome*`/`db.Evidence*` vocabulary
+`db.ApplyDecisions` records. Reason and evidence values are a
 data contract: new ones may be added, existing ones are never renamed.
 
 **Reads.** `db.GetTranscriptSegments` (at most 32 transcripts per call) and

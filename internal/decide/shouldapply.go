@@ -231,9 +231,12 @@ type Outcome struct {
 	ChunkHash string
 	// FnCallID is the fn_calls row of the model call (0 when not asked).
 	FnCallID int64
-	// RecipeID is the decide recipe of the model call ("" when not asked or
-	// the call failed before a reply).
-	RecipeID string
+	// CallRecipeID is the recipe the fn_calls row was stamped with — the
+	// answering model's ("" when not asked or no reply). The DECISION's
+	// recipe, the one a decision is attributed to (decided_by
+	// "jev:<recipe_id>"), is Evaluator.Recipe for every outcome, including
+	// rung-0 rejects and holds that made no call.
+	CallRecipeID string
 	// Model is the model that answered ("" when none did).
 	Model    string
 	CacheHit bool
@@ -259,6 +262,11 @@ func NewEvaluator(store fn.Store, asker Asker, p ShouldApplyParams) (*Evaluator,
 	}
 	return &Evaluator{fn: f, params: p, store: store, asker: asker}, nil
 }
+
+// Recipe is the decide recipe every outcome of this Evaluator is attributed
+// to: should_apply answered by the pinned model, with this Evaluator's params.
+// Register it (db.RegisterRecipe) before recording decisions.
+func (e *Evaluator) Recipe() recipe.Recipe { return e.fn.Recipe("") }
 
 // Evaluate decides one finding: rung 0 (in.Verdict, or Check), then text
 // evidence, then — only for a rung-0 pass — the should_apply model call, then
@@ -291,7 +299,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) Outcome {
 		return out
 	}
 	res, meta, err := e.fn.Invoke(ctx, e.store, shouldApplyInput{State: state}, e.call(state))
-	out.FnCallID, out.RecipeID, out.CacheHit = meta.CallID, meta.RecipeID, meta.CacheHit
+	out.FnCallID, out.CallRecipeID, out.CacheHit = meta.CallID, meta.RecipeID, meta.CacheHit
 	out.Model = res.Model
 	if err != nil || meta.Fallback {
 		return unavailable()

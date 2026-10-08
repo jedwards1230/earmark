@@ -240,7 +240,7 @@ func TestEvaluateEndToEnd(t *testing.T) {
 		in := radioInput(IssueMisheardProperNoun, "auto sebo", "Arecibo")
 		out := e.Evaluate(ctx, in)
 		if out.Decision != DecisionApply || out.Reason != ReasonConfident || out.Evidence != EvidenceASINVerbatim ||
-			out.P == nil || *out.P != 0.97 || out.Retryable || out.FnCallID == 0 || out.RecipeID == "" ||
+			out.P == nil || *out.P != 0.97 || out.Retryable || out.FnCallID == 0 || out.CallRecipeID == "" ||
 			out.ChunkHash != in.Candidate.ChunkHash || out.Model != "jev-1.13.0" || !out.Rung0.Pass {
 			t.Fatalf("outcome %+v", out)
 		}
@@ -366,5 +366,29 @@ func TestDecodeShouldApply(t *testing.T) {
 		if _, err := decodeShouldApply(json.RawMessage(raw)); (err == nil) != ok {
 			t.Errorf("%s: err=%v, want ok=%v", raw, err, ok)
 		}
+	}
+}
+
+// The decide outcome vocabulary is what db.ApplyDecisions validates.
+func TestOutcomeVocabularyMatchesDB(t *testing.T) {
+	for got, want := range map[string]string{
+		DecisionApply: db.OutcomeApply, DecisionHold: db.OutcomeHold, DecisionReject: db.OutcomeReject,
+		EvidenceASINVerbatim: db.EvidenceASINVerbatim, EvidenceExactRepeat: db.EvidenceExactRepeat, EvidenceNone: db.EvidenceNone,
+	} {
+		if got != want {
+			t.Errorf("decide %q != db %q", got, want)
+		}
+	}
+}
+
+func TestEvaluatorRecipe(t *testing.T) {
+	e, _ := newTestEvaluator(t, &fakeJev{reply: noul(0.5, "jev-1.13.0")})
+	r := e.Recipe()
+	if r.Step != recipe.StepDecide || r.ModelAlias != ShouldApplyModel || r.ModelResolved != ShouldApplyModel ||
+		r.PromptSHA256 != ShouldApplyPromptSHA256 || r.Params["fn"] != ShouldApplyName || r.Params["apply_p"] != 0.95 {
+		t.Errorf("recipe %+v", r)
+	}
+	if err := r.Validate(); err != nil {
+		t.Error(err)
 	}
 }
