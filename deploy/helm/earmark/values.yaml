@@ -137,7 +137,8 @@ config:
   # to register a chat endpoint for the eval layer.
   #
   # aiRoles is pass-through JSON → AI_ROLES, binding roles to endpoint ids:
-  # {embeddings: <id>, eval?: <id>}. aiRoles.embeddings is REQUIRED whenever
+  # {embeddings: <id>, eval?: <id>, decide?: <id>, scan?: <id>} (decide/scan
+  # must name a `systemone` endpoint, CONTRACT §2.14). aiRoles.embeddings is REQUIRED whenever
   # aiEndpoints is non-empty (the chart fails to render otherwise, mirroring the
   # app's fail-closed behavior); eval is optional (omit → no eval layer).
   # Example:

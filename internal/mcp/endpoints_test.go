@@ -304,3 +304,28 @@ func TestEndpointViewRoleTitle(t *testing.T) {
 		assert.Equal(t, want, endpointView{Role: role}.RoleTitle(), role)
 	}
 }
+
+// TestProbeEndpoints_SystemOne: a systemone endpoint is probed at
+// GET {base}/v1/models (the prober appends /models), and its role is titled.
+func TestProbeEndpoints_SystemOne(t *testing.T) {
+	cfg := &config.Config{
+		AIEndpoints: []config.AIEndpoint{
+			{ID: "embed-1", Type: config.AIEndpointTypeEmbeddings, Backend: config.AIBackendOllama,
+				BaseURL: "http://ollama:11434/v1", Model: "nomic-embed-text"},
+			{ID: "jev", Type: config.AIEndpointTypeSystemOne, Backend: config.AIBackendOpenAI,
+				BaseURL: "http://litellm:4000/typesafe/", Model: "jev-1.13.0"},
+		},
+		AIRoles: &config.AIRoles{Embeddings: "embed-1", Decide: "jev"},
+	}
+	srv := NewMCPServer(&SimpleMockDB{}, cfg)
+	srv.endpointProber = fakeEndpointProber{byURL: map[string]endpointProbe{
+		"http://ollama:11434/v1":          {Probed: true, State: epStateReady},
+		"http://litellm:4000/typesafe/v1": {Probed: true, State: epStateModelMissing},
+	}}
+	got := srv.probeEndpoints(context.Background())
+	assert.Equal(t, epStateReady, got["embed-1"].State)
+	assert.Equal(t, epStateModelMissing, got["jev"].State, "systemone probed at {base}/v1/models")
+
+	assert.Equal(t, "Decide", endpointView{Role: "decide"}.RoleTitle())
+	assert.Equal(t, "Scan", endpointView{Role: "scan"}.RoleTitle())
+}

@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jedwards1230/earmark/internal/genai"
 )
 
 // openAIChatClient is a minimal OpenAI-compatible /v1/chat/completions client.
@@ -503,11 +505,7 @@ type Completion struct {
 
 // Endpoint describes where a chat client sends requests, for telemetry
 // (gen_ai.provider.name, server.address, server.port).
-type Endpoint struct {
-	Provider string
-	Host     string
-	Port     int
-}
+type Endpoint = genai.Endpoint
 
 // EndpointReporter is an optional ChatClient extension describing its
 // endpoint. openAIChatClient implements it.
@@ -520,20 +518,8 @@ type EndpointReporter interface {
 // else "openai_compatible": the client speaks the OpenAI chat API, but the
 // server behind it (Ollama, vLLM, a LiteLLM alias) is not knowable from here.
 func (c *openAIChatClient) Endpoint() Endpoint {
-	e := Endpoint{Provider: "openai_compatible"}
-	if i := strings.Index(c.model, "/"); i > 0 {
-		e.Provider = strings.ToLower(c.model[:i])
-	}
-	if u, err := neturl.Parse(c.baseURL); err == nil {
-		e.Host = u.Hostname()
-		if p, err := strconv.Atoi(u.Port()); err == nil {
-			e.Port = p
-		} else if u.Scheme == "https" {
-			e.Port = 443
-		} else if u.Scheme == "http" {
-			e.Port = 80
-		}
-	}
+	e := Endpoint{Provider: genai.RouteProvider(c.model, "openai_compatible")}
+	e.Host, e.Port = genai.Server(c.baseURL)
 	return e
 }
 

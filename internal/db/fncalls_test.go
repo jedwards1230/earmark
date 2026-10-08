@@ -55,7 +55,7 @@ func TestLookupFnCacheSQL(t *testing.T) {
 		"WHERE fn = $1 AND prompt_sha256 = $2 AND model_alias = $3 AND input_sha256 = $4",
 		"error_class IS NULL AND NOT cache_hit",
 		"output IS NOT NULL",
-		"model_resolved = $5",
+		"lower(regexp_replace(btrim(model_resolved), '^.*/', '')) = $5",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("lookupFnCacheSQL is missing %q:\n%s", want, sql)
@@ -105,11 +105,12 @@ func TestLookupFnCache(t *testing.T) {
 	t.Run("expected model overrides the alias", func(t *testing.T) {
 		mock := newMockPool(t)
 		// A row answered by another model is filtered by the query ($5), so
-		// the expected model must be what is bound — not the alias.
+		// the expected model — bare, as genai.BareModel compares — is bound,
+		// not the alias.
 		mock.ExpectQuery("FROM fn_calls").
-			WithArgs(fnKey.Fn, fnKey.PromptSHA256, fnKey.ModelAlias, fnKey.InputSHA256, "typesafe/jev-1.13.0").
+			WithArgs(fnKey.Fn, fnKey.PromptSHA256, fnKey.ModelAlias, fnKey.InputSHA256, "jev-1.13.1").
 			WillReturnError(pgx.ErrNoRows)
-		got, ok, err := lookupFnCache(context.Background(), mock, fnKey, "typesafe/jev-1.13.0")
+		got, ok, err := lookupFnCache(context.Background(), mock, fnKey, "TypeSafe/JEV-1.13.1")
 		if err != nil || ok || got != nil {
 			t.Fatalf("miss = %v, %v, %v", got, ok, err)
 		}

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/jedwards1230/earmark/internal/genai"
 )
 
 // Pure-function call log and cache (CONTRACT §1.9 "fn_calls"). Every call an
@@ -78,8 +80,11 @@ func (k FnCacheKey) validate() error {
 }
 
 // lookupFnCacheSQL repeats the index predicate so the planner can use
-// fn_calls_cache_key_idx. model_resolved = $5 is the "store but never serve"
-// rule: a row answered by any model but the expected one is never returned.
+// fn_calls_cache_key_idx. The model_resolved test is the "store but never
+// serve" rule: a row answered by any model but the expected one is never
+// returned. It compares the bare model id (genai.BareModel: lower-cased, route
+// prefix dropped), the same comparison the writer used to call the reply a
+// fallback, so "typesafe/jev-1.13.0" serves for "jev-1.13.0".
 var lookupFnCacheSQL = `
 	SELECT id, fn, prompt_version, prompt_sha256, model_alias,
 	       COALESCE(model_resolved, ''), COALESCE(model_revision, ''), COALESCE(recipe_id, ''),
@@ -89,13 +94,13 @@ var lookupFnCacheSQL = `
 	 WHERE fn = $1 AND prompt_sha256 = $2 AND model_alias = $3 AND input_sha256 = $4
 	   AND error_class IS NULL AND NOT cache_hit
 	   AND output IS NOT NULL
-	   AND model_resolved = $5
+	   AND lower(regexp_replace(btrim(model_resolved), '^.*/', '')) = $5
 `
 
 // LookupFnCache returns the cached successful row for key, if any. A row is
-// served only when its model_resolved equals expectedModel (the alias when
-// expectedModel is empty): a reply from any other model is stored but never
-// served.
+// served only when its model_resolved is the same model as expectedModel (the
+// alias when expectedModel is empty; genai.SameModel): a reply from any other
+// model is stored but never served.
 func (db *DB) LookupFnCache(ctx context.Context, key FnCacheKey, expectedModel string) (*FnCall, bool, error) {
 	return lookupFnCache(ctx, db.pool, key, expectedModel)
 }
@@ -107,6 +112,7 @@ func lookupFnCache(ctx context.Context, q rowScanner, key FnCacheKey, expectedMo
 	if expectedModel == "" {
 		expectedModel = key.ModelAlias
 	}
+	expectedModel = genai.BareModel(expectedModel)
 	var (
 		c      FnCall
 		input  []byte

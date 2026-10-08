@@ -488,7 +488,7 @@ CREATE TABLE fn_calls (
 
 Inserts are `ON CONFLICT DO NOTHING` on the cache index; rows are never
 updated. A cached row is served only when `model_resolved` is the expected
-model. Cache hits are logged as their own rows (`cache_hit`, `cached_from`).
+model (case and route prefix ignored). Cache hits are logged as their own rows (`cache_hit`, `cached_from`).
 
 ## Relationships
 

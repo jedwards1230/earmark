@@ -142,7 +142,7 @@
             "required": ["id", "type", "backend", "baseURL", "model"],
             "properties": {
               "id":      { "type": "string", "minLength": 1 },
-              "type":    { "type": "string", "enum": ["embeddings", "chat"] },
+              "type":    { "type": "string", "enum": ["embeddings", "chat", "systemone"] },
               "backend": { "type": "string", "enum": ["ollama", "vllm", "openai-compat"] },
               "baseURL": { "type": "string", "minLength": 1 },
               "model":   { "type": "string", "minLength": 1 },
@@ -159,7 +159,9 @@
           "additionalProperties": false,
           "properties": {
             "embeddings": { "type": "string" },
-            "eval":       { "type": "string" }
+            "eval":       { "type": "string" },
+            "decide":     { "type": "string" },
+            "scan":       { "type": "string" }
           }
         },
         "models": {
@@ -177,7 +179,14 @@
                   "alias":          { "type": "string" },
                   "expected_model": { "type": "string" },
                   "revision":       { "type": "string" },
-                  "prompt_version": { "type": "string" }
+                  "prompt_version": { "type": "string" },
+                  "params": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "usd_per_mtok_in": { "type": "number", "minimum": 0 }
+                    }
+                  }
                 }
               }
             }
