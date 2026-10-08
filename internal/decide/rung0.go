@@ -219,8 +219,8 @@ func Check(c Candidate, p Params) Verdict {
 }
 
 // checkSubstitution requires the differing token window to sound alike. A
-// window that is numerals on both sides always fails (see allNumerals's use).
-// The
+// window whose two sides both contain numerals, with different written
+// values, fails unless it is a pure re-spelling (see the numeral check). The
 // window is compared as the RAW text from the first differing word to the last
 // on each side, so a numeral keeps its punctuation ("1,000", "3.5") and is read
 // as one number rather than as separate digit groups.
@@ -232,14 +232,6 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 		return fail(ReasonNotSoundAlike, span, "not a substitution: %q → %q only inserts or deletes words", c.Original, c.Replacement)
 	}
 	a, b := rawText(c.Original, ow), rawText(c.Replacement, rw)
-	if allNumerals(ow) && allNumerals(rw) {
-		// Both sides are written numerals, so the edit changes a value, not a
-		// spelling. Their spoken forms share most of their sounds ("one
-		// thousand five hundred" vs "... fifty", "two hundred forty" vs
-		// "... fifty"), so a phonetic score would pass wrong numbers; rung 0
-		// has no way to tell which value was spoken.
-		return fail(ReasonNotSoundAlike, span, "numeral-to-numeral change %q → %q: a value change cannot be checked phonetically", a, b)
-	}
 	for _, side := range []struct {
 		text string
 		n    int
@@ -251,6 +243,17 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 			return fail(ReasonNotSoundAlike, span, "substituted window %q is too long to be a mishearing (%d words; limits %d words, %d runes)",
 				side.text, side.n, MaxSubstitutionTokens, MaxSubstitutionRunes)
 		}
+	}
+	if na, nb := numerals(ow), numerals(rw); len(na) > 0 && len(nb) > 0 &&
+		!slices.Equal(na, nb) && !phonetic.SameReading(a, b) {
+		// Both sides write numerals and the written values differ, so the edit
+		// changes a value, not a spelling. Spoken numbers share most of their
+		// sounds ("one thousand five hundred" vs "... fifty", "two hundred
+		// forty" vs "... fifty"), so a phonetic score would pass wrong numbers;
+		// rung 0 has no way to tell which value was spoken. The one exception
+		// is a pure re-spelling that some reading of each side says
+		// identically ("10,000" → "10 thousand").
+		return fail(ReasonNotSoundAlike, span, "numeral change %q → %q: a value change cannot be checked phonetically", a, b)
 	}
 	m := phonetic.Compare(a, b)
 	ev := fmt.Sprintf("soundalike %.3f (threshold %.2f): %s vs %s",
@@ -275,7 +278,8 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 // already required it to be word-bounded, so "bathe the" does not contain
 // "the the"), and a collapse is refused when the removed text contains
 // sentence punctuation (hasSentenceBreak: . ? ! and other Sentence_Terminal
-// runes, ; and …): "the end. The end" is two sentences, not a stutter.
+// runes, ; and …) in the gaps between its words: "the end. The end" is two
+// sentences, not a stutter, while "3.5 3.5" is a stutter.
 func checkRepeat(c Candidate, span patch.Span) Verdict {
 	raw := string([]rune(c.ChunkText)[span.Start:span.End])
 	o, r := tokenSpans(raw), tokens(c.Replacement)
@@ -304,10 +308,7 @@ func findCollapse(raw string, ot []token, r []string) (unit []string, copies int
 				continue
 			}
 			collapsed := slices.Concat(o[:i+size], o[i+k*size:])
-			// The removed region runs from the end of the kept copy to the
-			// end of the last removed one.
-			gone := []rune(raw)[ot[i+size-1].end:ot[i+k*size-1].end]
-			if slices.Equal(collapsed, r) && !hasSentenceBreak(gone) {
+			if slices.Equal(collapsed, r) && !breakBetween(raw, ot[i+size-1:i+k*size]) {
 				return o[i : i+size], k, true
 			}
 		}
@@ -467,6 +468,19 @@ func occupiedSpans(text string, existing []patch.Patch) []occupied {
 	return out
 }
 
+// breakBetween reports whether any gap between consecutive tokens of ts (the
+// separators in raw, not the tokens themselves — "3.5" holds a point but no
+// break) contains a sentence break.
+func breakBetween(raw string, ts []token) bool {
+	runes := []rune(raw)
+	for t := 0; t+1 < len(ts); t++ {
+		if hasSentenceBreak(runes[ts[t].end:ts[t+1].start]) {
+			return true
+		}
+	}
+	return false
+}
+
 // hasSentenceBreak reports whether rs contains a sentence terminator
 // (unicode.Sentence_Terminal: . ? ! and their script variants), a
 // semicolon, or an ellipsis.
@@ -512,7 +526,8 @@ func squash(s string) string {
 // the source.
 type token struct {
 	text       string
-	start, end int // rune indices into the source string
+	start, end int  // rune indices into the source string
+	numeral    bool // scanned by phonetic.ScanNumeral
 }
 
 // tokenSpans splits s into lower-cased words with their rune ranges.
@@ -540,12 +555,12 @@ func tokenSpans(s string) []token {
 		r := unicode.ToLower(runes[n])
 		switch {
 		case start < 0 && r >= '0' && r <= '9':
-			num := phonetic.ScanNumeral(runes, n)
+			num, _ := phonetic.ScanNumeral(runes, n) // runes[n] is a digit
 			text := num.Whole
 			if num.Fraction != "" {
 				text += "." + num.Fraction
 			}
-			out = append(out, token{text: text, start: n, end: num.End})
+			out = append(out, token{text: text, start: n, end: num.End, numeral: true})
 			n = num.End
 			continue
 		case unicode.IsLetter(r) || unicode.IsDigit(r):
@@ -564,16 +579,16 @@ func tokenSpans(s string) []token {
 	return out
 }
 
-// allNumerals reports whether every token is a numeral (see tokenSpans).
-func allNumerals(ts []token) bool {
+// numerals returns the canonical text of every numeral token in ts, in order
+// (see tokenSpans: thousands separators dropped, decimal point kept).
+func numerals(ts []token) []string {
+	var out []string
 	for _, t := range ts {
-		for _, r := range t.text {
-			if (r < '0' || r > '9') && r != '.' {
-				return false
-			}
+		if t.numeral {
+			out = append(out, t.text)
 		}
 	}
-	return len(ts) > 0
+	return out
 }
 
 // tokens is the comparison text of tokenSpans.

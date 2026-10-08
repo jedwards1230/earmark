@@ -214,8 +214,39 @@ func TestScanNumeral(t *testing.T) {
 		{"7.", Numeral{Whole: "7", End: 1}},
 	}
 	for _, tc := range tests {
-		if got := ScanNumeral([]rune(tc.in), 0); got != tc.want {
-			t.Errorf("ScanNumeral(%q) = %+v, want %+v", tc.in, got, tc.want)
+		if got, ok := ScanNumeral([]rune(tc.in), 0); !ok || got != tc.want {
+			t.Errorf("ScanNumeral(%q) = %+v %v, want %+v true", tc.in, got, ok, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		in string
+		i  int
+	}{{"abc", 0}, {",000", 0}, {"", 0}, {"12", -1}, {"12", 2}, {".5", 0}} {
+		if got, ok := ScanNumeral([]rune(tc.in), tc.i); ok || got != (Numeral{}) {
+			t.Errorf("ScanNumeral(%q, %d) = %+v %v, want zero false", tc.in, tc.i, got, ok)
+		}
+	}
+}
+
+func TestSameReading(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"10,000", "10 thousand", true},
+		{"1984", "nineteen eighty four", true},
+		{"nineteen 84", "1984", true},
+		{"240 feat", "250 feet", false},
+		{"1,500", "1,550", false},
+		{"", "", false},
+		{"!!", "", false},
+	}
+	for _, tc := range tests {
+		if got := SameReading(tc.a, tc.b); got != tc.want {
+			t.Errorf("SameReading(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+		if got := SameReading(tc.b, tc.a); got != tc.want {
+			t.Errorf("SameReading(%q, %q) = %v, want %v (swapped)", tc.b, tc.a, got, tc.want)
 		}
 	}
 }

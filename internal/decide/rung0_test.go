@@ -57,6 +57,10 @@ func TestCheck(t *testing.T) {
 		{"number: decimal digits differ", cand("a", IssueNumberArtifact, "pi is 3.15 here", "3.15", "3.50", 0.9), false, ReasonNotSoundAlike},
 		{"number: grouped digits differ", cand("a", IssueNumberArtifact, "paid 1,500 dollars", "1,500", "1,550", 0.9), false, ReasonNotSoundAlike},
 		{"number: plain digits differ", cand("a", IssueNumberArtifact, "x 240 y", "240", "250", 0.9), false, ReasonNotSoundAlike},
+		{"number: value change beside a word", cand("a", IssueNumberArtifact, "about 240 feat high", "240 feat", "250 feet", 0.9), false, ReasonNotSoundAlike},
+		{"number: value change in a phrase", cand("a", IssueMisheardWord, "the 15 men left", "15 men", "50 man", 0.9), false, ReasonNotSoundAlike},
+		{"number: same value re-spelled with digits", cand("a", IssueNumberArtifact, "in nineteen 84 we", "nineteen 84", "1984", 0.9), true, ""},
+		{"number: same numeral, words around it changed", cand("a", IssueHomophone, "x the 240 feat y", "the 240 feat", "a 240 feet", 0.9), true, ""},
 		{"number: grouped vs words", cand("a", IssueNumberArtifact, "some 10,000 people", "10,000", "10 thousand", 0.9), true, ""},
 		{"number: nine spelled-out words", cand("a", IssueNumberArtifact, "exactly one million two hundred thousand three hundred forty five votes",
 			"one million two hundred thousand three hundred forty five", "1,200,345", 0.9), true, ""},
@@ -135,6 +139,8 @@ func TestCheck(t *testing.T) {
 		{"repeat: across a semicolon", cand("a", IssueRepeatedText, "it ended; ended there", "ended; ended", "ended", 0.9), false, ReasonNotExactRepeat},
 		{"repeat: across an ellipsis", cand("a", IssueRepeatedText, "so\u2026 so be it", "so\u2026 so", "so", 0.9), false, ReasonNotExactRepeat},
 		{"repeat: across a question mark", cand("a", IssueRepeatedText, "why? why not", "why? why", "why", 0.9), false, ReasonNotExactRepeat},
+		{"repeat: decimal numeral stutter", cand("a", IssueRepeatedText, "it was 3.5 3.5 liters", "3.5 3.5", "3.5", 0.9), true, ""},
+		{"repeat: decimal numeral across a full stop", cand("a", IssueRepeatedText, "it was 3.5. 3.5 then", "3.5. 3.5", "3.5", 0.9), false, ReasonNotExactRepeat},
 		{"repeat: comma inside the stutter is fine", cand("a", IssueRepeatedText, "well, well, well then", "well, well, well", "well", 0.9), true, ""},
 
 		// dropped_word.
@@ -456,6 +462,8 @@ func FuzzCheck(f *testing.F) {
 	f.Add("the end. the end", "the end. the end", "the end", IssueRepeatedText)
 	f.Add("paid 1,500 now", "1,500", "1,550", IssueNumberArtifact)
 	f.Add("i won't go", "won", "one", IssueHomophone)
+	f.Add("about 240 feat high", "240 feat", "250 feet", IssueNumberArtifact)
+	f.Add("it was 3.5 3.5 liters", "3.5 3.5", "3.5", IssueRepeatedText)
 	f.Fuzz(func(t *testing.T, chunk, original, replacement, issue string) {
 		c := cand("a", issue, chunk, original, replacement, 0.5)
 		v := Check(c, DefaultParams())

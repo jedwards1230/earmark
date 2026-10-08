@@ -127,6 +127,29 @@ func Compare(a, b string) Match {
 	return m
 }
 
+// SameReading reports whether some reading of a and some reading of b
+// normalize to the same letters — the two say the same thing aloud, e.g.
+// "10,000" and "10 thousand", or "1984" and "nineteen eighty four". Inputs
+// longer than MaxPhraseRunes, or that normalize to nothing, never match.
+func SameReading(a, b string) bool {
+	if utf8.RuneCountInString(a) > MaxPhraseRunes || utf8.RuneCountInString(b) > MaxPhraseRunes {
+		return false
+	}
+	as, bs := Readings(a), Readings(b)
+	for _, ra := range as {
+		na := lettersOnly(ra)
+		if na == "" {
+			continue
+		}
+		for _, rb := range bs {
+			if na == lettersOnly(rb) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // similarityBound is an upper bound on codeSimilarity: the edit distance is at
 // least the length difference.
 func similarityBound(a, b string) float64 {
@@ -185,7 +208,7 @@ func Readings(s string) []string {
 		r := runes[i]
 		switch {
 		case isASCIIDigit(r):
-			num := ScanNumeral(runes, i)
+			num, _ := ScanNumeral(runes, i) // r is a digit
 			i = num.End
 			whole, grouped, frac := num.Whole, num.Grouped, num.Fraction
 
@@ -285,8 +308,9 @@ type Numeral struct {
 	End int
 }
 
-// ScanNumeral reads the numeral starting at runes[i], which must be an ASCII
-// digit. The grammar, shared by Readings and internal/decide's tokenizer so
+// ScanNumeral reads the numeral starting at runes[i]. It reports false, with
+// a zero Numeral, when i is out of range or runes[i] is not an ASCII digit.
+// The grammar, shared by Readings and internal/decide's tokenizer so
 // the two always agree on what one number is:
 //
 //	numeral  = digits [ groups ] [ "." digits ]
@@ -296,7 +320,10 @@ type Numeral struct {
 // So "1,000", "12,345.67" and "3.5" are one numeral each, while "1,2,3",
 // "1,0000" and "1234,567" are not grouped (the comma ends the numeral). A
 // trailing "." not followed by a digit is not part of the numeral.
-func ScanNumeral(runes []rune, i int) Numeral {
+func ScanNumeral(runes []rune, i int) (Numeral, bool) {
+	if i < 0 || i >= len(runes) || !isASCIIDigit(runes[i]) {
+		return Numeral{}, false
+	}
 	digitsAt := func(from, n int) bool {
 		if from+n > len(runes) {
 			return false
@@ -329,7 +356,7 @@ func ScanNumeral(runes []rune, i int) Numeral {
 		j = k
 	}
 	n.End = j
-	return n
+	return n, true
 }
 
 // levenshtein is the classic two-row edit distance over runes.
