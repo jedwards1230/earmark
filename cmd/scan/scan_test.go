@@ -234,6 +234,36 @@ func TestRunWalksPagesAndHonoursLimit(t *testing.T) {
 	}
 }
 
+// TestRunRoutePrefixedReplyKeepsTheRecipe: a gateway that reports the model
+// with its route prefix ("typesafe/jev-1.13.0") answers under the run's own
+// recipe — no other_recipe, no MODELS_FILE pin needed.
+func TestRunRoutePrefixedReplyKeepsTheRecipe(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req systemone.Request
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_, _ = w.Write([]byte(strings.Replace(replyFor(req.State), `"model":"jev-1.13.0"`, `"model":"typesafe/jev-1.13.0"`, 1)))
+	}))
+	t.Cleanup(srv.Close)
+	store := &fakeStore{cands: cands("one", "two")}
+	var out strings.Builder
+	if err := run(context.Background(), &out, store, newScanner(t, srv.URL, store),
+		options{sample: 2, concurrency: 2, context: 2, yes: true, json: true}); err != nil {
+		t.Fatal(err)
+	}
+	var rep Report
+	if err := json.Unmarshal([]byte(out.String()), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.OtherRecipe != 0 || rep.Fallback != 0 || rep.Written != 2 {
+		t.Errorf("report = %+v", rep)
+	}
+	for _, s := range store.scans {
+		if s.RecipeID != rep.RecipeID {
+			t.Errorf("row recipe %s, want the run's %s", s.RecipeID, rep.RecipeID)
+		}
+	}
+}
+
 func TestRunReportsChangedChunks(t *testing.T) {
 	srv, _ := fakeSystemOne(t)
 	store := &fakeStore{cands: cands("x"), outcome: db.ChunkScanChanged}

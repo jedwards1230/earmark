@@ -112,10 +112,14 @@ func (f Fn) expected() string {
 }
 
 // Recipe is the recipe of a call answered by resolved ("" = the expected
-// model). The function name is a param, so two functions of one step never
-// share a recipe.
+// model). A resolved id that names the expected model with only a route
+// prefix or case added (genai.SameModel: "typesafe/JEV-1.13.0" for
+// "jev-1.13.0") is recorded as the expected model, so the same model always
+// has one recipe — the one current_recipes names — while fn_calls keeps the
+// reply's spelling. The function name is a param, so two functions of one
+// step never share a recipe.
 func (f Fn) Recipe(resolved string) recipe.Recipe {
-	if resolved == "" {
+	if resolved == "" || genai.SameModel(resolved, f.expected()) {
 		resolved = f.expected()
 	}
 	params := make(map[string]any, len(f.Params)+1)

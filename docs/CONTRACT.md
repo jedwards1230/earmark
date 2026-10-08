@@ -1429,7 +1429,11 @@ CREATE INDEX fn_calls_recipe_id_idx ON fn_calls (recipe_id, created_at);
   pinned alias as `model_alias`, the reply's model as `model_resolved`, the
   prompt version and hash, and the function's params plus `"fn": <name>` (so
   two functions of a step never share a recipe). A cache hit carries the
-  served row's recipe.
+  served row's recipe. A reply naming the expected model with only a route
+  prefix or other case (`typesafe/jev-1.13.0` for `jev-1.13.0`, the
+  `genai.SameModel` comparison serving uses) is recorded as the expected
+  model, so one model has one recipe — the current one; `fn_calls.model_resolved`
+  keeps the reply's spelling.
 - **Pinned models only.** A function refuses an alias that can move under the
   same name — `*-latest`, `*-preview`, `:latest`, or an id with no dotted
   version (`jev-latest` is refused, `jev-1.13.0` accepted); a `systemone`
@@ -1515,10 +1519,11 @@ CREATE INDEX chunk_scan_recipe_id_idx ON chunk_scan (recipe_id);
   substring.
 - **Recipe.** Registered once at startup (`recipes`, insert-if-absent); the
   current `scan` recipe is set only by `earmark monitor` (single writer). A
-  reply whose model id differs from the expected one in spelling only (e.g.
-  `typesafe/jev-1.13.0`) is not a fallback but stamps its own recipe; the run
-  reports these as *other recipe* — pin `MODELS_FILE`
-  `steps.scan.expected_model` (§2.18) to the reported id.
+  reply naming the model with a route prefix (`typesafe/jev-1.13.0`) answers
+  under the run's own recipe (§1.9 `fn_calls` "Recipe"); no `MODELS_FILE`
+  pin is needed for that. The run reports answers stamped with any other
+  recipe (a cache hit from a call made under other settings) as *other
+  recipe*.
 - **GPU gate.** None: System One is hosted, so `earmark scan` ignores
   `runner_control.phase`.
 - **Quality index.** `earmark_quality_index{scope,recipe}` (§2.16) is, per
@@ -3858,7 +3863,6 @@ steps:
       usd_per_mtok_in: 0.042     # cost estimate when the gateway reports none
   scan:                          # AI_ROLES.scan — `earmark scan` (§1.9 "Chunk scan")
     alias: jev-1.13.0
-    expected_model: jev-1.13.0   # the id the gateway reports; scan recipes key on it
 ```
 
 | Key | Meaning |

@@ -166,10 +166,10 @@ type Report struct {
 	Written int `json:"written"`
 	Exists  int `json:"exists"`
 	Changed int `json:"changed"`
-	// OtherRecipe counts usable answers whose recipe is not RecipeID: the
-	// reply named the model differently from the expected one (e.g. with a
-	// route prefix). They are written under their own recipe, which is not
-	// the current one — pin MODELS_FILE steps.scan.expected_model (§2.18).
+	// OtherRecipe counts usable answers whose recipe is not RecipeID (a
+	// cache hit served from a row an older, differently configured run wrote).
+	// A route prefix or case difference on the model id is not one: it maps
+	// to the expected model's recipe (fn.Recipe, genai.SameModel).
 	OtherRecipe int `json:"other_recipe"`
 
 	CostUSD     float64        `json:"cost_usd"`
@@ -360,8 +360,8 @@ func printReport(out io.Writer, rep *Report, asJSON bool) error {
 		p("errors:       %s\n", hist(rep.Errors, sortedKeys(rep.Errors)))
 	}
 	if rep.OtherRecipe > 0 {
-		p("WARNING: %d answers came back under another recipe than %s (the reply names the model differently);\n"+
-			"         pin MODELS_FILE steps.scan.expected_model to the reply's model (CONTRACT §2.18).\n",
+		p("WARNING: %d answers came back under another recipe than %s (served from a call made under\n"+
+			"         other settings); they are written under that recipe, which is not the current one.\n",
 			rep.OtherRecipe, short(rep.RecipeID))
 	}
 	if rep.DryRun {
