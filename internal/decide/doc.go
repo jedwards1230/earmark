@@ -1,8 +1,8 @@
 // Package decide is the decide step: it turns the judge's proposed findings
 // (CONTRACT §2.15) into decisions about which corrections to apply.
 //
-// This package currently holds rung 0 only — deterministic checks that need
-// no model call, run before anything is asked of a model:
+// Rung 0 is deterministic checks that need no model call, run before
+// anything is asked of a model:
 //
 //   - the finding still describes the chunk revision it was judged against,
 //     and its anchor resolves to exactly one span (patch.ChunkHash,
@@ -17,5 +17,13 @@
 //
 // A rung-0 failure is final for that finding under the current recipe. A
 // rung-0 pass is NOT a decision to apply — it only makes a finding eligible for
-// the later rungs. Everything here is pure: no database, no network, no clock.
+// the later rungs. Rung 0 is pure: no database, no network, no clock.
+//
+// should_apply (CONTRACT §2.19) is the next rung: Evaluator.Evaluate builds
+// the finding's context from its ASR segments (BuildContext), finds text
+// evidence in the book's catalogue record (RecordSentences, Relevant,
+// TextEvidence), asks the pinned decision model one question through
+// internal/fn, and maps the answer to apply, hold or reject (Decide). It fails
+// closed: any failure to get a usable answer is a retryable hold, never an
+// apply. Nothing here persists a decision or changes a finding's state.
 package decide

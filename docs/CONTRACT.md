@@ -3894,6 +3894,116 @@ unknown step or field, or an `alias` that contradicts the endpoint registry
 stops startup. Unset → an empty registry: recipes are still stamped, with the
 requested model as the expected one and no revision.
 
+### 2.19 Decide step — `should_apply`
+
+The decide step turns a **proposed** finding (§2.15) into a decision about
+its correction: `apply`, `hold` or `reject`. This section is the contract of
+the per-finding decision (`internal/decide`); persisting decisions and moving
+`patch_state` are separate (§2.17).
+
+**Pipeline, per finding** (`decide.Evaluator.Evaluate`): rung 0 → text
+evidence → the `should_apply` model call → the decision rule. It never returns
+an error: every failure after rung 0 is a retryable `hold`.
+
+1. **Rung 0** — the deterministic checks of `internal/decide/rung0.go`
+   (version `rung0@v1`): chunk hash and a unique, word-bounded anchor; not a
+   cosmetic-only edit; the issue type's edit shape (sound-alike substitution,
+   exact repeat removal, 1–2-word insertion); per-chunk dedupe against other
+   candidates and existing accepted/applied corrections. A failure is a
+   `reject` with the rung-0 reason (`chunk_changed`, `anchor_missing`,
+   `not_word_bounded`, `empty_correction`, `cosmetic_only`,
+   `unsupported_issue_type`, `not_soundalike`, `not_exact_repeat`,
+   `bad_insertion`, `overlap_dup`, `overlaps_overlay`) and **no model call**.
+2. **Context** — "sentence" means **ASR segment**: transcript text is
+   lowercase with no punctuation, and a chunk is whole segments joined by one
+   space. The segments starting at the chunk's `start_sec` are joined until
+   they cover the chunk; when that reproduces the pristine chunk text
+   (`COALESCE(source_text, text)`) exactly, the sentence is the segment(s)
+   holding the span, and BEFORE/AFTER are the neighbouring segments (which may
+   lie in the previous/next chunk — context only, never edited). Each is cut
+   to ±40 words around the span. Otherwise the context falls back to a
+   ±25-word window of the chunk with no BEFORE/AFTER.
+3. **Book reference** — the `book_metadata` row of the book directory. A book
+   with no ASIN (libro.fm, unmatched files, identity conflicts) has **no
+   reference**. Title, author, narrator, each series and each chapter title are
+   one sentence each; the description is stripped of HTML (block tags break
+   sentences, `script`/`style` content dropped, entities decoded) and split
+   into sentences. Only **relevant** sentences reach the model: those sharing a
+   non-stopword with the span or the replacement, or holding a word whose
+   Double Metaphone code matches a span word (or the span read as one word).
+   Sentences naming the replacement's new words come first; at most 6
+   sentences and 1,200 characters, long sentences clipped around the match.
+4. **Text evidence** (rule `d2a_new_tokens_verbatim@v1`):
+   - `exact_repeat` — a `repeated_text` finding that passed rung 0;
+   - `asin_verbatim` — the words the replacement introduces (its differing
+     window against the original) appear contiguously, word-bounded and
+     case-insensitively in one sentence of the book reference, **and**
+     include at least one non-stopword of ≥ 4 characters;
+   - `none` — anything else, including every finding of a book with no
+     reference.
+5. **Model call** — `fn` `should_apply`, step `decide`, prompt
+   `should_apply@v1`, model pinned to `jev-1.13.0`, through `internal/fn`
+   (logged and cached in `fn_calls`, §1.9) and the System One client (§2.14).
+   One `noul` question named `should_apply` with explicit `true`/`false`
+   criteria; its canonical JSON's sha256 is the prompt hash (pinned by a
+   golden test — changing the question text requires a new prompt version).
+   The state is a labelled text, byte-deterministic for the same inputs:
+
+   ```text
+   ISSUE TYPE:
+   misheard_proper_noun
+
+   ORIGINAL SENTENCE:
+   the dish at [[auto sebo]] picked
+
+   CORRECTED SENTENCE:
+   the dish at [[Arecibo]] picked
+
+   BEFORE:
+   …
+
+   AFTER:
+   …
+
+   BOOK REFERENCE:
+   - chapter: The Arecibo Message
+   ```
+
+   An empty block reads `(none)`. The `fn_calls` input is `{"state": …}`; the
+   output is `{"model", "answers"}` as returned.
+6. **Decision rule** — with `p` the `should_apply` `noul`:
+
+   | Condition | Decision | Reason |
+   |---|---|---|
+   | no usable answer: transport error, timeout, 4xx/5xx, a reply that fails strict decoding, an answer from a model other than `jev-1.13.0` (fallback), `p` NaN or outside [0, 1], a cancelled context | `hold` (retryable) | `jev_unavailable` |
+   | `p ≥ apply_p`, issue type `dropped_word` or `number_artifact` | `hold` | `issue_type_capped` |
+   | `p ≥ apply_p`, evidence `asin_verbatim` or `exact_repeat` | `apply` | `confident_with_evidence` |
+   | `p ≥ apply_p`, evidence `none` | `hold` | `no_evidence` |
+   | `reject_p < p < apply_p` | `hold` | `uncertain` |
+   | `p ≤ reject_p` | `reject` | `jev_reject` |
+
+   **Fail-closed rule:** nothing but a decoded, in-range answer from the pinned
+   model can produce `apply`. `dropped_word` and `number_artifact` can never be
+   applied by machine — their best outcome is `hold`.
+
+**Recipe params.** `apply_p` (0.95), `reject_p` (0.20), `phonetic_min_sim`
+(rung 0's sound-alike threshold, 0.67), `evidence_rule`, `rung0_version`, the
+context sizes (`context_words` 40, `fallback_words` 25) and the relevance caps
+(`max_relevant_sentences` 6, `max_relevant_runes` 1200) are all params of the
+decide recipe (§1.9), so changing any of them yields a new recipe. Params must
+satisfy `0 ≤ reject_p < apply_p ≤ 1` and `0 < phonetic_min_sim ≤ 1`.
+
+**Outcome** (what a decision record persists): finding id, decision, reason,
+retryable flag, `p` (absent when the model was not asked or gave no usable
+answer), evidence kind, the rung-0 verdict (reason, span, evidence text), the
+chunk hash decided on, the `fn_calls` row id, the recipe id, the answering
+model and whether the answer was a cache hit. Reason and evidence values are a
+data contract: new ones may be added, existing ones are never renamed.
+
+**Reads.** `db.GetTranscriptSegments` (at most 32 transcripts per call) and
+`db.GetBookRecords` (at most 256 book dirs per call) are read-only, batched and
+bounded; neither writes.
+
 ---
 
 ## 3. SCHEMA — pgvector chunks table
