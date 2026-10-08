@@ -1128,6 +1128,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 5 | `00005_requeue_archive.sql` | Requeue archives findings (§1.4 "Operator requeue"): `patch_state` gains `superseded`, `superseded_at` column, `transcript_findings.transcript_id` becomes nullable with a foreign key to `transcripts(id) ON DELETE SET NULL` and a CHECK that only superseded findings may have no transcript; existing orphans are archived as `superseded` first; `stale_work` skips superseded findings. Not purely additive — see §1.4. |
 | 6 | `00006_asr_provenance_identity.sql` | Runner-reported provenance + `embedded_asin` on `transcripts`; `asin_source` / `identity_status` on `book_metadata` (§1.2, §1.6, §1.9). |
 | 7 | `00007_fn_calls.sql` | `fn_calls` — the pure-function call log and cache, with the partial unique cache index `fn_calls_cache_key_idx` and `fn_calls_recipe_id_idx` (§1.9 "Pure-function calls"). New table only. |
+| 8 | `00008_finding_events.sql` | `finding_events` — the append-only finding version history (§2.17 "Version history"): transition triggers on `transcript_findings` (every `patch_state` change, and every insert not in `proposed`), an append-only guard, a backfill of one transition per already-decided finding, and the `decide` arm of `stale_work` (§1.9). No ALTER on `transcript_findings`; `CREATE TRIGGER` blocks its writers until the migration commits (`lock_timeout` 5s). |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1328,7 +1329,13 @@ release that changes nothing does not mark the library stale; a logic change
 bumps `step_version`. Unstamped rows are stale whenever their step has a
 current recipe; a step with no current recipe (asr, today) reports nothing;
 human corrections and `superseded` findings (archived by a requeue, §1.4 —
-not work to redo; filtered since migration 5) are never listed.
+not work to redo; filtered since migration 5) are never listed. Since
+migration 8 the view also has a **`decide`** arm (`source_table` =
+`transcript_findings`, `recipe_id` = the decider): a finding whose latest
+**unrevoked** `decision` event in `finding_events` (§2.17 "Version history")
+was made by a recipe not equivalent to the current `decide` recipe. Findings
+no recipe ever decided are not listed (they are undecided, not stale), nor
+are superseded ones.
 `earmark_stale_items{step}` (§2.16) counts it per step.
 
 **Expect a large `stale_work` right after the first deploy.** Every legacy row
@@ -2596,6 +2603,13 @@ The first load of a gateway's status is waited for at most 1.5 s per render
 > UNCHANGED and still binding — the judge writes nothing but findings. What
 > changed is that a *separate, human-gated* component may act on one. Read
 > §2.17 before touching either.
+>
+> **Amended (2026-10, decide step).** "Human-gated" now reads "gated on an
+> explicit, recorded decision": a registered decide recipe
+> (`decided_by='jev:<recipe_id>'`) may decide too, every such decision is
+> recorded in `finding_events`, and `proposed → applied` stays illegal (§2.17
+> "Automated decisions"). The judge is still read-only: proposing and deciding
+> are different steps, run by different code, under different recipes.
 
 The eval layer is a **read-only LLM-as-judge** (`internal/eval`, `earmark eval`)
 that READS transcript chunks and records **suspected** transcription errors as
@@ -3063,16 +3077,23 @@ answers are **never** recorded on spans, metrics or logs — only in the
 carries `trace_id` and `span_id`. In MCP stdio mode every log line goes to
 stderr (stdout carries JSON-RPC).
 
-### 2.17 Reviewable Patches (human-gated apply)
+### 2.17 Reviewable Patches (decision-gated apply)
 
 > Added 2026-08-18. This section is the counterpart to §2.15: it defines how a
 > finding stops being a note and becomes an edit. §2.15's read-only guarantee is
 > unchanged — everything here happens in `internal/patch`, never in
 > `internal/eval`.
+>
+> **Amended 2026-10 (migration 8).** The gate was "a human decision"; it is now
+> "an explicit, recorded decision" by a human **or** a registered decide
+> recipe — see "Automated decisions" and "Version history" below.
 
-A finding is a **proposed patch**. The judge proposes; a human disposes. No
-transcript text changes without an explicit, recorded human decision on a
-specific finding.
+A finding is a **proposed patch**. The judge proposes; a decider disposes. No
+transcript text changes without an **explicit, recorded decision on a specific
+finding**, made by a human (`mcp:`/dashboard attribution) or by a registered
+decide recipe (`decided_by='jev:<recipe_id>'`, recorded in `finding_events`).
+`proposed → applied` remains illegal: `applied` is reached only by a rebuild
+replaying an `accepted` finding.
 
 #### Lifecycle
 
@@ -3129,8 +3150,115 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
   with a NULL `transcript_id`).
 
 `proposed → applied` is deliberately **illegal**. Reaching `applied` requires
-passing through `accepted`, which is the human gate; skipping it would be an
-autonomous correction, which is exactly what §2.15 forbids.
+passing through `accepted`, which is the decision gate; skipping it would be an
+unrecorded correction, which is exactly what §2.15 forbids.
+
+#### Automated decisions (decide step)
+
+A registered `decide` recipe (§1.9) may accept, reject or hold findings in
+bulk. It is held to the same gate as a person, plus three guards of its own:
+
+- **Path.** `db.SetPatchStateBulk` (and its in-transaction twin) is the only
+  bulk writer. Before any SQL it requires the move to be legal in
+  `patch.CanTransition`, not a maintenance move (`patch.IsMachineTransition`),
+  and into `accepted`, `rejected`, `reverted` or `proposed` — **never
+  `applied`** — and `decided_by` to match `^(jev|revert:jev):[0-9a-f]{64}$`.
+  `revert:jev:<id>` is the undo of that recipe's decisions. Humans keep using
+  `SetPatchState`, one finding at a time.
+- **Attribution cannot be forged.** The MCP surface prefixes every attribution
+  with `mcp:` (`attributeDecision`), so no tool caller can pose as a recipe; the
+  transition the bulk write records names the recipe in `recipe_id`, a foreign
+  key to `recipes`, so a decision by an unregistered recipe fails.
+- **One guarded statement.** Candidates are locked in id order (concurrent bulk
+  writes cannot deadlock), each row moves only if it is still in the expected
+  state (rows that are not are returned as *skipped*, never clobbered),
+  `decided_at` is stamped with `clock_timestamp()` (the watermark
+  `ClearEmbeddingStale` compares against), and the chunks of accepted or
+  reverted findings are flagged `embedding_stale` — all in one transaction.
+
+Every verdict, including a **hold** (the finding stays `proposed`), is a
+`decision` event in `finding_events` carrying the outcome
+(`apply`/`hold`/`reject`), the reason, the model probability `p`, the evidence
+class (`asin_verbatim`/`exact_repeat`/`none`), the `fn_calls` row that
+answered, and the chunk hash the decider saw. Model calls happen outside the
+write transaction. The write is `db.ApplyDecisions(recipe, events)`: one short
+transaction that locks the findings (id order, `SKIP LOCKED`, `proposed`
+only) then their chunks (`FOR SHARE`) — the repo-wide order — skips any
+finding locked elsewhere, no longer proposed, or whose chunk's pristine text no
+longer hashes to the event's `chunk_text_sha256`, then records the remaining
+decision events and moves `apply` → `accepted` and `reject` → `rejected` as
+`jev:<recipe_id>`. Skipped findings get no event and are decided again next
+run.
+
+#### Version history
+
+The model is a version-controlled text: `source_text` (the pristine chunk text)
+is the **base**, each finding is an anchored **patch**, and the text a reader
+sees is the base with the accepted patches **replayed** (see "Applying" below).
+`finding_events` (migration 8) is the patch log — append-only, so history can
+be read but never rewritten:
+
+```sql
+CREATE TABLE finding_events (
+    id                BIGSERIAL   PRIMARY KEY,
+    finding_id        UUID        NOT NULL REFERENCES transcript_findings ON DELETE CASCADE,
+    transcript_id     UUID,                    -- plain column: history outlives a requeue's transcript delete
+    kind              TEXT        NOT NULL,    -- transition | decision | revoke
+    from_state        TEXT,                    -- transition: NULL for an insert
+    to_state          TEXT,                    -- transition
+    outcome           TEXT,                    -- decision: apply | hold | reject
+    reason            TEXT,
+    actor             TEXT        NOT NULL,    -- mcp:<who> | jev:<recipe> | revert:jev:<recipe> | cli:<who> | system
+    recipe_id         TEXT        REFERENCES recipes,
+    p                 FLOAT8,                  -- [0,1]
+    evidence          TEXT,                    -- asin_verbatim | exact_repeat | none
+    fn_call_id        BIGINT      REFERENCES fn_calls,
+    chunk_text_sha256 TEXT,
+    issue_type        TEXT,                    -- denormalized for reporting
+    revokes_event_id  BIGINT      REFERENCES finding_events,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+-- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at),
+--          UNIQUE (revokes_event_id) WHERE kind = 'revoke'
+```
+
+- **transition** — written by triggers on `transcript_findings`, never by
+  application code: one row for **every** `patch_state` change from any path
+  (a reviewer, the decide step, the rebuild's `applied`/`stale`, re-anchoring,
+  a requeue's `superseded`), and one for every finding inserted in a state
+  other than `proposed` (a human's direct correction). Attribution: when the
+  UPDATE stamped a decision (`decided_at` or `decided_by` changed) the actor is
+  `decided_by`; otherwise the transaction-local setting `earmark.actor`
+  (`db.SetEventContext`; `SetPatchState` sets it to the reviewer for a
+  reconsider), else `system`. `recipe_id` is the setting `earmark.recipe_id`
+  when set, else the recipe named by a `jev:`/`revert:jev:` actor.
+  `created_at` is when the transition ran (`clock_timestamp()`), not when its
+  transaction committed.
+- **decision** — a decide recipe's verdict (`db.InsertDecisionEvents`), see
+  above. `actor` is `jev:<recipe_id>`.
+- **revoke** — withdraws one decision (`revokes_event_id`;
+  `db.RevokeEvents` revokes every live decision of a recipe). A decision is
+  revoked at most once; undo appends, it never edits.
+
+Append-only is enforced by the database: `UPDATE` on `finding_events` raises,
+and so does `DELETE` unless it is the cascade from deleting the finding itself.
+Migration 8 backfilled one `transition` per finding that already had a
+`decided_at` (actor `decided_by`, else `unknown`; `to_state` its state at the
+migration; dated `decided_at`) — earlier history was never recorded.
+
+What the log answers:
+
+- **Blame** — `db.FindingHistory(finding)`: every state a patch passed through,
+  who moved it, every verdict a recipe gave on it and whether it was revoked.
+- **Point in time** — `db.TranscriptPatchSetAt(transcript, t)`: the findings
+  that were `accepted`/`applied` at `t` (each finding's latest transition at or
+  before `t`). Replayed onto the base, that is the transcript as it read then.
+- **Undo scopes** — a single finding (a reviewer's revert or reconsider), a
+  whole decide recipe (revoke its decisions and move its findings back with a
+  `revert:jev:<recipe_id>` decider: applied → reverted, accepted → rejected,
+  rejected → proposed), or everything since a time (the transitions after `t`).
+  The CLI for recipe and time undo is `earmark decide revert` (phase 1, PR6);
+  the schema and DB helpers above are what it is built on.
 
 #### Anchoring
 
@@ -3287,7 +3415,7 @@ regenerate from source  →  replay applied corrections  →  embed
 | Layer | Tables | Writer | Mutability |
 |---|---|---|---|
 | Source | `transcripts.segments`, `transcripts.raw_text` | ingest (the ASR runner), once | **immutable** |
-| Decisions | `transcript_findings` | human accept/reject | append-only; only `patch_state` transitions |
+| Decisions | `transcript_findings` (+ the `finding_events` log) | a reviewer, or a registered decide recipe | append-only; only `patch_state` transitions, each recorded in `finding_events` |
 | Projection | `transcript_chunks` + embeddings | the chunker | **disposable, rebuildable** |
 
 A correction lives in the *decisions* layer and is **replayed** onto the
@@ -3469,7 +3597,8 @@ swap: the next rebuild regenerates from source and replays an overlay that no
 longer contains the reverted correction, so the correction simply stops being
 applied. Reverting sets `embedding_stale` on the affected chunk (which the
 rebuild pass then picks up) and stamps `decided_at`/`decided_by` like any other
-human decision.
+decision. Every revert is also a `transition` in `finding_events` ("Version
+history"), so what was undone, by whom and when stays queryable.
 
 `applied_at` plus `applied_before_text` / `applied_after_text` remain an **audit
 trail** of what landed, with one **semantic narrowing**: they now hold the
@@ -3478,14 +3607,14 @@ whole chunk. Whole-chunk before/after became ill-defined once a chunk can carry
 several corrections — there is no single "before" that attributes a difference
 to one finding.
 
-`decided_at` / `decided_by` record who made a human decision — accept, reject,
-**or revert** — and `stale_reason` records why a correction was retired. The
+`decided_at` / `decided_by` record who made the latest decision — accept,
+reject, **or revert**, by a human or a decide recipe — and `stale_reason` records why a correction was retired. The
 machine transitions (`applied`, `stale`, written by the embed worker) never
 stamp them, so the record of who approved a correction is not overwritten by a
 rebuild.
 
 State transitions go through `patch.CanTransition` at the DB boundary: an
-illegal move (notably `proposed → applied`, which would skip the human gate) is
+illegal move (notably `proposed → applied`, which would skip the decision gate) is
 refused before any SQL runs, and the `UPDATE` is guarded on the expected current
 state so a concurrent decision cannot be clobbered.
 

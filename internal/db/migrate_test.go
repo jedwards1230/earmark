@@ -240,3 +240,88 @@ func TestFnCallsMigrationIsNewTableOnly(t *testing.T) {
 		t.Error("resetSQL must drop fn_calls (every migration-created table is reset)")
 	}
 }
+
+// TestFindingEventsMigration pins 00008: the transition triggers exist (every
+// patch_state change and every non-proposed insert is recorded), the log is
+// append-only with cascade the only delete, the backfill runs after the
+// trigger takes its lock, stale_work keeps 5's superseded filter and gains
+// the decide arm, and Down undoes it all.
+func TestFindingEventsMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00008_finding_events.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	for _, want := range []string{
+		"CREATE TABLE finding_events",
+		"REFERENCES transcript_findings (id) ON DELETE CASCADE",
+		"CHECK (kind IN ('transition', 'decision', 'revoke'))",
+		"CHECK (outcome IN ('apply', 'hold', 'reject'))",
+		"CHECK (p IS NULL OR p BETWEEN 0 AND 1)",
+		"CHECK (evidence IN ('asin_verbatim', 'exact_repeat', 'none'))",
+		"REFERENCES fn_calls (id)",
+		"REFERENCES finding_events (id)",
+		"DEFAULT clock_timestamp()",
+		"CREATE INDEX finding_events_finding_idx ON finding_events (finding_id, id DESC)",
+		"CREATE INDEX finding_events_recipe_idx ON finding_events (recipe_id, created_at)",
+		"CREATE INDEX finding_events_transcript_idx ON finding_events (transcript_id, created_at)",
+		"CREATE UNIQUE INDEX finding_events_revokes_idx ON finding_events (revokes_event_id) WHERE kind = 'revoke'",
+		// The transition trigger.
+		"AFTER UPDATE OF patch_state ON transcript_findings FOR EACH ROW WHEN (OLD.patch_state IS DISTINCT FROM NEW.patch_state)",
+		"AFTER INSERT ON transcript_findings FOR EACH ROW WHEN (NEW.patch_state <> 'proposed')",
+		"current_setting('earmark.actor', true)",
+		"current_setting('earmark.recipe_id', true)",
+		// Append-only.
+		"BEFORE UPDATE OR DELETE ON finding_events",
+		"pg_trigger_depth() > 1",
+		"RAISE EXCEPTION 'finding_events is append-only",
+		// stale_work keeps 5's filter and adds decide.
+		"AND f.patch_state <> 'superseded'",
+		"SELECT 'decide', 'transcript_findings'",
+		"JOIN cur ON cur.step = 'decide'",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("00008 Up is missing %q", want)
+		}
+	}
+	if got := strings.Count(up, "f.patch_state <> 'superseded'"); got != 2 {
+		t.Errorf("Up stale_work filters superseded in %d arms, want propose and decide", got)
+	}
+	lockAt := strings.Index(up, "SET LOCAL lock_timeout")
+	trigAt := strings.Index(up, "CREATE TRIGGER transcript_findings_record_transition")
+	fillAt := strings.LastIndex(up, "INSERT INTO finding_events") // the backfill; the first is the trigger body
+	if lockAt < 0 || trigAt < lockAt || fillAt < trigAt {
+		t.Error("Up must SET LOCAL lock_timeout, then create the trigger, then backfill")
+	}
+	if strings.Contains(strings.ToUpper(up), "ALTER TABLE TRANSCRIPT_FINDINGS") {
+		t.Error("00008 must not alter transcript_findings")
+	}
+	for _, want := range []string{
+		"SET LOCAL lock_timeout",
+		"DROP TRIGGER transcript_findings_record_insert ON transcript_findings",
+		"DROP TRIGGER transcript_findings_record_transition ON transcript_findings",
+		"DROP TABLE finding_events",
+		"DROP FUNCTION finding_events_append_only()",
+		"DROP FUNCTION finding_events_record_transition()",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("00008 Down is missing %q", want)
+		}
+	}
+	if strings.Contains(down, "'decide'") || !strings.Contains(down, "f.patch_state <> 'superseded'") {
+		t.Error("Down must restore 5's stale_work: superseded filter, no decide arm")
+	}
+	for _, want := range []string{
+		"DROP TABLE    IF EXISTS finding_events",
+		"DROP FUNCTION IF EXISTS finding_events_record_transition()",
+		"DROP FUNCTION IF EXISTS finding_events_append_only()",
+	} {
+		if !strings.Contains(resetSQL, want) {
+			t.Errorf("resetSQL is missing %q (every migration-created object is reset)", want)
+		}
+	}
+}

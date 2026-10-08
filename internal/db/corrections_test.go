@@ -39,6 +39,15 @@ var correctionSQL = map[string]string{
 	"reanchorChunksLockSQL":   reanchorChunksLockSQL,
 	"reanchorWriteSQL":        reanchorWriteSQL,
 	"markUnanchorableSQL":     markUnanchorableSQL,
+	// Version history (findingevents.go).
+	"setPatchStateBulkSQL":    setPatchStateBulkSQL,
+	"setEventContextSQL":      setEventContextSQL,
+	"insertDecisionEventsSQL": insertDecisionEventsSQL,
+	"revokeEventsSQL":         revokeEventsSQL,
+	"findingHistorySQL":       findingHistorySQL,
+	"patchSetAtSQL":           patchSetAtSQL,
+	"applyDecisionsLockSQL":   applyDecisionsLockSQL,
+	"applyDecisionsChunksSQL": applyDecisionsChunksSQL,
 }
 
 // TestCorrectionSQL_NeverTouchesTranscriptProvenance is the hard invariant of

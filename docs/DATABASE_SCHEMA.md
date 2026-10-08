@@ -19,6 +19,7 @@ version is in `goose_db_version`.
 | 5 | `00005_requeue_archive.sql` | `superseded` patch state + `superseded_at`; `transcript_findings.transcript_id` nullable, FK to `transcripts(id) ON DELETE SET NULL`, CHECK `transcript_id IS NOT NULL OR patch_state = 'superseded'`; existing orphans archived as `superseded` first; `stale_work` skips superseded findings |
 | 6 | `00006_asr_provenance_identity.sql` | runner-reported provenance on `transcripts` (`embedded_asin`, `asr_model_sha256`, `asr_runner_version`, `asr_params`) + partial index `transcripts_asr_unstamped_idx`; `book_metadata.asin_source` / `identity_status` |
 | 7 | `00007_fn_calls.sql` | `fn_calls` (pure-function call log + cache); partial unique `fn_calls_cache_key_idx`, `fn_calls_recipe_id_idx` |
+| 8 | `00008_finding_events.sql` | `finding_events` (append-only finding version history); transition triggers on `transcript_findings`; append-only guard; backfill of decided findings; `decide` arm of `stale_work` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -454,6 +455,9 @@ startup. Right after the first deploy every legacy row is stale (≈39,644 chunk
 ≈32,337 findings on production): none was made by the current configuration. `stale_work` lists every output row whose recipe differs from its
 step's current recipe in anything but `code_version` (unstamped rows count as
 stale; steps without a current recipe, human corrections and superseded findings never appear).
+Since migration 8 a `decide` arm lists findings whose latest unrevoked
+`finding_events` decision came from a recipe other than the current `decide`
+recipe.
 
 ### 10. `fn_calls` — Pure-function call log and cache (CONTRACT §1.9)
 
@@ -490,6 +494,40 @@ Inserts are `ON CONFLICT DO NOTHING` on the cache index; rows are never
 updated. A cached row is served only when `model_resolved` is the expected
 model (case and route prefix ignored). Cache hits are logged as their own rows (`cache_hit`, `cached_from`).
 
+### 11. `finding_events` — Finding version history (CONTRACT §2.17)
+
+Append-only log of every finding's history: `transition` rows (written by
+triggers on `transcript_findings` for every `patch_state` change and every
+insert not in `proposed`), `decision` rows (a decide recipe's apply / hold /
+reject verdict) and `revoke` rows (withdraw one decision).
+
+```sql
+CREATE TABLE finding_events (
+    id                BIGSERIAL   PRIMARY KEY,
+    finding_id        UUID        NOT NULL REFERENCES transcript_findings (id) ON DELETE CASCADE,
+    transcript_id     UUID,                   -- not a FK: survives a requeue
+    kind              TEXT        NOT NULL,   -- transition | decision | revoke
+    from_state        TEXT,
+    to_state          TEXT,
+    outcome           TEXT,                   -- apply | hold | reject
+    reason            TEXT,
+    actor             TEXT        NOT NULL,   -- decided_by, earmark.actor setting, or 'system'
+    recipe_id         TEXT        REFERENCES recipes (recipe_id),
+    p                 FLOAT8,                 -- [0,1]
+    evidence          TEXT,                   -- asin_verbatim | exact_repeat | none
+    fn_call_id        BIGINT      REFERENCES fn_calls (id),
+    chunk_text_sha256 TEXT,
+    issue_type        TEXT,
+    revokes_event_id  BIGINT      REFERENCES finding_events (id),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+-- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at)
+-- unique finding_events_revokes_idx: (revokes_event_id) WHERE kind = 'revoke'
+-- triggers: transcript_findings_record_transition (AFTER UPDATE OF patch_state),
+--           transcript_findings_record_insert (AFTER INSERT, non-proposed),
+--           finding_events_append_only (BEFORE UPDATE OR DELETE: raises unless cascade)
+```
+
 ## Relationships
 
 ```
@@ -498,6 +536,7 @@ transcription_jobs (1) ←── transcripts (1) ←── transcript_chunks (N)
 book_metadata      (key: book_dir — filepath.Dir of any file_path in the book)
 runner_control     (singleton, id=1)
 recipes (1) ←── transcripts / transcript_findings / transcript_chunks (N, via nullable recipe_id)
+transcript_findings (1) ←── finding_events (N, ON DELETE CASCADE)
         (1) ←── current_recipes (one per step)
         (1) ←── fn_calls (N, via nullable recipe_id)
 fn_calls (1) ←── fn_calls (N cache-hit rows, via cached_from)

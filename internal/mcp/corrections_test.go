@@ -538,3 +538,16 @@ func TestAttributeDecision(t *testing.T) {
 	got := attributeDecision(long)
 	assert.LessOrEqual(t, len([]rune(got)), maxDecidedByRunes)
 }
+
+// TestMCPCannotAttributeJev: the MCP surface prefixes every attribution with
+// "mcp:", so no caller can pose as a decide recipe — the bulk path accepts only
+// jev:<recipe_id> / revert:jev:<recipe_id> (CONTRACT §2.17 "Automated decisions").
+func TestMCPCannotAttributeJev(t *testing.T) {
+	recipe := strings.Repeat("0f", 32)
+	for _, raw := range []string{"jev:" + recipe, "revert:jev:" + recipe, " jev:" + recipe} {
+		got := attributeDecision(raw)
+		assert.True(t, strings.HasPrefix(got, "mcp:"), "attribution %q must be mcp-prefixed", got)
+		assert.False(t, db.ValidAutomatedDecider(got), "MCP attribution %q must not pass as an automated decider", got)
+	}
+	assert.True(t, db.ValidAutomatedDecider("jev:"+recipe), "sanity: the bare recipe decider is valid")
+}

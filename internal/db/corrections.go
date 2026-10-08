@@ -414,9 +414,10 @@ var markChunkStaleForFindingSQL = `
 	       OR (f.chunk_index IS NULL AND c.id = f.chunk_id))
 `
 
-// isHumanDecision reports whether a target state is reached by a person rather
-// than by the embed worker. Only these stamp decided_at/decided_by — and only
-// these are visible to ClearEmbeddingStale's watermark.
+// isHumanDecision reports whether a target state is reached by a decider (a
+// reviewer here; a decide recipe through SetPatchStateBulk) rather than by the
+// embed worker. Only these stamp decided_at/decided_by — and only these are
+// visible to ClearEmbeddingStale's watermark.
 func isHumanDecision(to string) bool {
 	switch to {
 	case patch.StateAccepted, patch.StateRejected, patch.StateReverted:
@@ -427,8 +428,10 @@ func isHumanDecision(to string) bool {
 }
 
 // SetPatchState moves one finding through the patch state machine. This is the
-// human gate (CONTRACT §2.17): the judge proposes, a person disposes, and no
-// text changes without an explicit recorded decision on a specific finding.
+// reviewer's gate (CONTRACT §2.17): the judge proposes, a decider disposes, and
+// no text changes without an explicit recorded decision on a specific finding.
+// A decide recipe uses SetPatchStateBulk instead; both are recorded in
+// finding_events by the patch_state trigger.
 //
 // The transition is validated against patch.CanTransition BEFORE any SQL runs,
 // so an illegal move (notably proposed → applied, which would skip the human
@@ -463,6 +466,13 @@ func (db *DB) setPatchState(ctx context.Context, b txBeginner, id, from, to, dec
 	if isHumanDecision(to) {
 		tag, err = tx.Exec(ctx, setPatchStateDecidedSQL, id, from, to, decidedBy)
 	} else {
+		// A reconsider stamps no decision, so the version-history trigger
+		// would attribute it to 'system'; name the reviewer instead.
+		if decidedBy != "" {
+			if err := SetEventContext(ctx, tx, EventContext{Actor: decidedBy}); err != nil {
+				return err
+			}
+		}
 		tag, err = tx.Exec(ctx, setPatchStateSQL, id, from, to)
 	}
 	if err != nil {
