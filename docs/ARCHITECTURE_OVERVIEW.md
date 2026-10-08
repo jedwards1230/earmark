@@ -79,7 +79,7 @@ Exposed to AI clients via mcp-proxy upstream key `"audiobooks"` at `http://earma
 
 ### AI endpoint registry (`internal/config`, CONTRACT §2.14)
 
-`AI_ENDPOINTS` + `AI_ROLES` declare named AI service endpoints (Ollama, vLLM, etc.) and bind them to roles (`embeddings`, `eval`). The embed worker resolves its Ollama endpoint through the `embeddings` role; the eval layer resolves its chat endpoint through the `eval` role. When `AI_ENDPOINTS` is unset the legacy `EMBEDDINGS_BASE_URL`/`EMBEDDINGS_MODEL` vars are synthesized into a `_legacy` endpoint. A malformed `AI_ENDPOINTS` is fatal (fail-closed).
+`AI_ENDPOINTS` + `AI_ROLES` declare named AI service endpoints (Ollama, vLLM, etc.) and bind them to roles (`embeddings`, `eval`, `decide`, `scan`). The embed worker resolves its Ollama endpoint through the `embeddings` role; the eval layer resolves its chat endpoint through the `eval` role; the optional `decide`/`scan` roles name `systemone` endpoints (TypeSafe System One, `internal/systemone`), whose calls go through the pure-function wrapper `internal/fn` and are logged and cached in `fn_calls` (CONTRACT §1.9). When `AI_ENDPOINTS` is unset the legacy `EMBEDDINGS_BASE_URL`/`EMBEDDINGS_MODEL` vars are synthesized into a `_legacy` endpoint. A malformed `AI_ENDPOINTS` is fatal (fail-closed).
 
 ### eval layer (`internal/eval`, CONTRACT §2.15)
 

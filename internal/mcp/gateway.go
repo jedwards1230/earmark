@@ -119,6 +119,15 @@ func gatewayBase(baseURL string) string {
 	return u.String()
 }
 
+// gatewayOrigin is a base URL's scheme://host[:port], with no path.
+func gatewayOrigin(baseURL string) string {
+	u, err := neturl.Parse(strings.TrimSpace(baseURL))
+	if err != nil || u.Host == "" {
+		return gatewayBase(baseURL)
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 // httpGatewayProber implements gatewayProber over HTTP with a per-(base, key)
 // stale-while-revalidate cache.
 type httpGatewayProber struct {
@@ -261,7 +270,14 @@ func gatewayTargets(cfg *config.Config) []gatewayTarget {
 		if gw, _ := gatewayFor(ep.Gateway, ep.BaseURL); gw != "litellm" {
 			continue
 		}
-		k := [2]string{gatewayBase(ep.BaseURL), ep.APIKey}
+		base := gatewayBase(ep.BaseURL)
+		if ep.Type == config.AIEndpointTypeSystemOne {
+			// A systemone base is a pass-through route ("…/typesafe") whose
+			// every path is forwarded upstream; the gateway's own API is at
+			// its origin.
+			base = gatewayOrigin(ep.BaseURL)
+		}
+		k := [2]string{base, ep.APIKey}
 		i, ok := idx[k]
 		if !ok {
 			out = append(out, gatewayTarget{Base: k[0], APIKey: ep.APIKey})

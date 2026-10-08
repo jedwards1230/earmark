@@ -4378,6 +4378,7 @@ func scanIDPaths(rows pgx.Rows) (ids, paths []string, err error) {
 // TestResetRebuildsFreshSchema (integration) fails if one survives.
 var resetSQL = `
 	DROP VIEW     IF EXISTS stale_work;
+	DROP TABLE    IF EXISTS fn_calls            CASCADE;
 	DROP TABLE    IF EXISTS current_recipes     CASCADE;
 	DROP TABLE    IF EXISTS transcript_findings CASCADE;
 	DROP TABLE    IF EXISTS transcript_chunks   CASCADE;

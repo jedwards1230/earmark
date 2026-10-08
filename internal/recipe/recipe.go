@@ -107,7 +107,7 @@ func (r Recipe) ParamsJSON() ([]byte, error) {
 	if len(r.Params) == 0 {
 		return []byte("{}"), nil
 	}
-	return marshalCanonical(r.Params)
+	return MarshalCanonical(r.Params)
 }
 
 // Canonical returns the bytes the ID hashes:
@@ -125,7 +125,7 @@ func (r Recipe) Canonical() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("recipe params: %w", err)
 	}
-	return marshalCanonical(canonical{
+	return MarshalCanonical(canonical{
 		Step:          r.Step,
 		StepVersion:   r.StepVersion,
 		CodeVersion:   nullable(r.CodeVersion),
@@ -159,9 +159,11 @@ func (r Recipe) Validate() error {
 	return nil
 }
 
-// marshalCanonical is json.Marshal without HTML escaping and without the
-// encoder's trailing newline. encoding/json already sorts map keys.
-func marshalCanonical(v any) ([]byte, error) {
+// MarshalCanonical is json.Marshal without HTML escaping and without the
+// encoder's trailing newline. encoding/json already sorts map keys; struct
+// fields keep their declaration order. It is the marshaller behind recipe IDs
+// and, via internal/fn, pure-function input hashes.
+func MarshalCanonical(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)

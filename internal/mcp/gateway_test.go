@@ -349,3 +349,18 @@ func TestBuildGatewayViews_RoleModelsShownOnlyWhenNotAllAllowed(t *testing.T) {
 		})
 	}
 }
+
+// TestGatewayTargets_SystemOne: a systemone base is a pass-through route
+// ("…/typesafe" forwards everything upstream), so its gateway is probed at
+// the origin and shares the target of the gateway's other endpoints.
+func TestGatewayTargets_SystemOne(t *testing.T) {
+	cfg := &config.Config{AIEndpoints: []config.AIEndpoint{
+		{ID: "embed", BaseURL: "http://litellm.lan:4000/v1", APIKey: "k1"},
+		{ID: "jev", Type: config.AIEndpointTypeSystemOne, BaseURL: "http://litellm.lan:4000/typesafe", APIKey: "k1"},
+	}}
+	ts := gatewayTargets(cfg)
+	require.Len(t, ts, 1)
+	assert.Equal(t, "http://litellm.lan:4000", ts[0].Base)
+	assert.Len(t, ts[0].Endpoints, 2)
+	assert.Equal(t, "https://h", gatewayOrigin("https://h/typesafe/"))
+}

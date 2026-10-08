@@ -363,7 +363,7 @@ components:
             - unknown
           type: string
         type:
-          description: Endpoint kind (e.g. `embeddings`, `chat`).
+          description: Endpoint kind (`embeddings`, `chat`, `systemone`).
           type: string
       required:
         - id

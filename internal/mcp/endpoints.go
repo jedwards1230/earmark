@@ -55,12 +55,12 @@ type optionKV struct {
 // with its health probe and resolved role.
 type endpointView struct {
 	ID       string
-	Type     string // "embeddings" | "chat"
+	Type     string // "embeddings" | "chat" | "systemone"
 	Backend  string // "ollama" | "vllm" | "openai-compat"
 	Model    string
 	BaseURL  string // full URL — JSON API only
 	HostOnly string // host[:port] for the card (no scheme/path)
-	Role     string // "embeddings" | "eval" | "" (unbound)
+	Role     string // "embeddings" | "eval" | "decide" | "scan" | "" (unbound)
 	Options  []optionKV
 	// Gateway is the routing gateway ("litellm", or a declared value), "" for a
 	// direct endpoint; GatewayInferred marks a host-name guess rather than an
@@ -162,12 +162,23 @@ func (s *MCPServer) probeEndpoints(ctx context.Context) map[string]endpointProbe
 	}
 	out := make(map[string]endpointProbe, len(s.cfg.AIEndpoints))
 	for _, ep := range s.cfg.AIEndpoints {
-		out[ep.ID] = s.endpointProber.Probe(ctx, ep.BaseURL, ep.Model, ep.APIKey)
+		out[ep.ID] = s.endpointProber.Probe(ctx, probeBase(ep), ep.Model, ep.APIKey)
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// probeBase is the base the /models probe is appended to: the OpenAI-style
+// base for embeddings and chat endpoints, and {base}/v1 for a systemone
+// endpoint, whose base is the route prefix the client appends /v1/… to
+// (GET {base}/v1/models, CONTRACT §2.14).
+func probeBase(ep config.AIEndpoint) string {
+	if ep.Type == config.AIEndpointTypeSystemOne {
+		return strings.TrimRight(ep.BaseURL, "/") + "/v1"
+	}
+	return ep.BaseURL
 }
 
 // OptionsLine renders the options as "k=v k=v …" for the card, or "" when none.
@@ -204,6 +215,10 @@ func (v endpointView) RoleTitle() string {
 		return roleTitleForStep(recipe.StepPropose)
 	case "embeddings":
 		return roleTitleForStep(recipe.StepEmbed)
+	case "decide":
+		return roleTitleForStep(recipe.StepDecide)
+	case "scan":
+		return "Scan"
 	default:
 		return v.Role
 	}

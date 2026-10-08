@@ -193,3 +193,50 @@ func TestRecipesMigrationLocksStampedTables(t *testing.T) {
 		}
 	}
 }
+
+// TestFnCallsMigrationIsNewTableOnly: 00007 creates fn_calls and touches no
+// existing table, so it takes no lock a running pod could be waiting behind.
+// The cache index's predicate is the one insertFnCallSQL's ON CONFLICT names —
+// Postgres infers a partial unique index only when the predicates match — and
+// Down drops everything Up creates.
+func TestFnCallsMigrationIsNewTableOnly(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00007_fn_calls.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := stripSQLComments(rawUp), stripSQLComments(rawDown)
+	for _, banned := range []string{"ALTER TABLE", "LOCK TABLE", "UPDATE ", "DELETE "} {
+		if strings.Contains(strings.ToUpper(up), banned) {
+			t.Errorf("00007 Up must only create fn_calls, found %q", banned)
+		}
+	}
+	for _, want := range []string{
+		"CREATE TABLE fn_calls",
+		"input_sha256 ~ '^[0-9a-f]{64}$'",
+		"REFERENCES recipes (recipe_id)",
+		"REFERENCES fn_calls (id)",
+		"CREATE UNIQUE INDEX fn_calls_cache_key_idx",
+		"ON fn_calls (fn, prompt_sha256, model_alias, input_sha256)",
+		"CREATE INDEX fn_calls_recipe_id_idx ON fn_calls (recipe_id, created_at)",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("00007 Up is missing %q", want)
+		}
+	}
+	const pred = "WHERE error_class IS NULL AND NOT cache_hit"
+	if !strings.Contains(norm(up), pred) || !strings.Contains(norm(insertFnCallSQL), pred) {
+		t.Errorf("cache index and insertFnCallSQL must share the predicate %q", pred)
+	}
+	for _, want := range []string{"DROP INDEX fn_calls_recipe_id_idx", "DROP INDEX fn_calls_cache_key_idx", "DROP TABLE fn_calls"} {
+		if !strings.Contains(down, want) {
+			t.Errorf("00007 Down is missing %q", want)
+		}
+	}
+	if !strings.Contains(resetSQL, "DROP TABLE    IF EXISTS fn_calls") {
+		t.Error("resetSQL must drop fn_calls (every migration-created table is reset)")
+	}
+}

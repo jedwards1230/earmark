@@ -36,6 +36,10 @@ import (
 //	    revision: sha256:0a109f422b47
 //	  asr:                           # recorded only; the ASR runner owns its recipe
 //	    expected_model: nvidia/parakeet-tdt-1.1b
+//	  decide:                        # AI_ROLES.decide (a systemone endpoint)
+//	    alias: jev-1.13.0
+//	    params:
+//	      usd_per_mtok_in: 0.042     # cost estimate when the gateway reports none
 //
 // Unset → no pins: recipes are still stamped, with the requested model as the
 // expected one and no revision. A file that is unreadable, malformed, names an
@@ -57,6 +61,35 @@ type ModelPin struct {
 	// PromptVersion, when set, is the prompt version this deployment expects
 	// the step to run; a mismatch with the code is logged at startup.
 	PromptVersion string `yaml:"prompt_version"`
+	// Params are step-specific settings. ParseModelRegistry accepts only
+	// known keys: usd_per_mtok_in (decide, scan), a non-negative number.
+	Params map[string]any `yaml:"params"`
+}
+
+// ParamUSDPerMTokIn is the per-million-input-token price used to estimate a
+// System One call's cost when the gateway reports none (CONTRACT §2.18).
+const ParamUSDPerMTokIn = "usd_per_mtok_in"
+
+// FloatParam returns a numeric param; ok=false when absent.
+func (p ModelPin) FloatParam(key string) (float64, bool) {
+	v, ok := p.Params[key]
+	if !ok {
+		return 0, false
+	}
+	f, ok := toFloat(v)
+	return f, ok
+}
+
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case float64:
+		return n, true
+	}
+	return 0, false
 }
 
 // ModelRegistry is the parsed MODELS_FILE.
@@ -68,6 +101,8 @@ type ModelRegistry struct {
 var stepRole = map[string]string{
 	recipe.StepPropose: roleEval,
 	recipe.StepEmbed:   roleEmbeddings,
+	recipe.StepDecide:  roleDecide,
+	recipe.StepScan:    roleScan,
 }
 
 // ParseModelRegistry decodes and validates a model registry document. Unknown
@@ -92,6 +127,19 @@ func ParseModelRegistry(r io.Reader) (*ModelRegistry, error) {
 		sort.Strings(unknown)
 		return nil, fmt.Errorf("model registry: unknown step(s) %s (known: %s)",
 			strings.Join(unknown, ", "), strings.Join(recipe.Steps, ", "))
+	}
+	for step, pin := range reg.Steps {
+		for k, v := range pin.Params {
+			if k != ParamUSDPerMTokIn {
+				// A misspelt key must not silently fall back to a default.
+				return nil, fmt.Errorf("model registry: steps.%s.params: unknown key %q (known: %s)",
+					step, k, ParamUSDPerMTokIn)
+			}
+			if f, ok := toFloat(v); !ok || f < 0 {
+				return nil, fmt.Errorf("model registry: steps.%s.params.%s must be a non-negative number, got %v",
+					step, k, v)
+			}
+		}
 	}
 	return &reg, nil
 }

@@ -75,13 +75,19 @@ type ASRServer struct {
 // vLLM on another) by changing config, not code. AIRoles binds a function name
 // (e.g. "embeddings") to an endpoint id.
 
-// AIEndpointType distinguishes an embeddings endpoint from a chat/generation
-// endpoint. Only these two values are valid; LoadConfig rejects others.
+// AIEndpointType distinguishes an embeddings endpoint, a chat/generation
+// endpoint and a TypeSafe System One decision endpoint. Only these values are
+// valid; LoadConfig rejects others.
 type AIEndpointType string
 
 const (
 	AIEndpointTypeEmbeddings AIEndpointType = "embeddings"
 	AIEndpointTypeChat       AIEndpointType = "chat"
+	// AIEndpointTypeSystemOne is a TypeSafe System One endpoint (internal/
+	// systemone): baseURL is the route prefix the client appends
+	// /v1/systemone and /v1/models to (e.g. a LiteLLM pass-through,
+	// "http://litellm:4000/typesafe"), and model must be a pinned version.
+	AIEndpointTypeSystemOne AIEndpointType = "systemone"
 )
 
 // AIBackend names the provider's wire protocol. All three speak the
@@ -98,7 +104,7 @@ const (
 // AIEndpoint is one entry in the AI_ENDPOINTS registry.
 type AIEndpoint struct {
 	ID      string         `json:"id"`      // unique within this deployment
-	Type    AIEndpointType `json:"type"`    // "embeddings" | "chat"
+	Type    AIEndpointType `json:"type"`    // "embeddings" | "chat" | "systemone"
 	Backend AIBackend      `json:"backend"` // "ollama" | "vllm" | "openai-compat"
 	BaseURL string         `json:"baseURL"` // OpenAI-compatible base, no trailing slash
 	Model   string         `json:"model"`   // model id passed to the API
@@ -125,15 +131,43 @@ type AIEndpoint struct {
 }
 
 // AIRoles binds function names to endpoint IDs. The "embeddings" role is
-// required when AI_ROLES is set; "eval" is optional (no eval layer when absent).
+// required when AI_ROLES is set; the others are optional (the function is
+// disabled when absent).
 type AIRoles struct {
-	Embeddings string `json:"embeddings"` // id of the embeddings endpoint (required)
-	Eval       string `json:"eval"`       // id of a chat endpoint for the eval layer; "" = disabled
+	Embeddings string `json:"embeddings"`       // id of the embeddings endpoint (required)
+	Eval       string `json:"eval"`             // id of a chat endpoint for the eval layer; "" = disabled
+	Decide     string `json:"decide,omitempty"` // id of a systemone endpoint for the decide step; "" = disabled
+	Scan       string `json:"scan,omitempty"`   // id of a systemone endpoint for the scan step; "" = disabled
 }
 
 // validAIType reports whether t is a recognized endpoint type.
 func validAIType(t AIEndpointType) bool {
-	return t == AIEndpointTypeEmbeddings || t == AIEndpointTypeChat
+	return t == AIEndpointTypeEmbeddings || t == AIEndpointTypeChat || t == AIEndpointTypeSystemOne
+}
+
+// unpinnedModelRE matches a moving model alias: "*-latest", "*-preview" and
+// ollama's ":latest" tag.
+var unpinnedModelRE = regexp.MustCompile(`(?i)(-latest|-preview|:latest)$`)
+
+// pinnedVersionRE requires a dotted version number somewhere in the id.
+var pinnedVersionRE = regexp.MustCompile(`\d+(\.\d+)+`)
+
+// PinnedModel rejects a model id that does not name one fixed version: a
+// moving alias ("jev-latest", "jev-preview", anything "*-latest"/"*-preview")
+// or an id without a dotted version ("jev"). Decisions are cached and replayed
+// against the model that made them (CONTRACT §1.9 "fn_calls"), so a model that
+// can change under the same name is refused (e.g. "jev-1.13.0" is accepted).
+func PinnedModel(model string) error {
+	m := strings.TrimSpace(model)
+	switch {
+	case m == "":
+		return fmt.Errorf("model is required")
+	case unpinnedModelRE.MatchString(m):
+		return fmt.Errorf("model %q is a moving alias; pin a version (e.g. jev-1.13.0)", model)
+	case !pinnedVersionRE.MatchString(m):
+		return fmt.Errorf("model %q names no version; pin one (e.g. jev-1.13.0)", model)
+	}
+	return nil
 }
 
 // validAIBackend reports whether b is a recognized backend adapter.
@@ -216,8 +250,8 @@ func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
 		}
 		seen[ep.ID] = true
 		if !validAIType(ep.Type) {
-			return nil, fmt.Errorf("%s (%q): invalid type %q (want %q or %q)",
-				where, ep.ID, ep.Type, AIEndpointTypeEmbeddings, AIEndpointTypeChat)
+			return nil, fmt.Errorf("%s (%q): invalid type %q (want %q, %q or %q)",
+				where, ep.ID, ep.Type, AIEndpointTypeEmbeddings, AIEndpointTypeChat, AIEndpointTypeSystemOne)
 		}
 		if !validAIBackend(ep.Backend) {
 			return nil, fmt.Errorf("%s (%q): invalid backend %q (want %q, %q, or %q)",
@@ -232,6 +266,16 @@ func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
 		if ep.Type == AIEndpointTypeChat {
 			if err := validateChatOptions(ep.Options); err != nil {
 				return nil, fmt.Errorf("%s (%q): %w", where, ep.ID, err)
+			}
+		}
+		if ep.Type == AIEndpointTypeSystemOne {
+			if err := PinnedModel(ep.Model); err != nil {
+				return nil, fmt.Errorf("%s (%q): %w", where, ep.ID, err)
+			}
+			if len(ep.Options) > 0 {
+				// The client sends only model/state/questions; an option would
+				// be silently ignored, so refuse it rather than mislead.
+				return nil, fmt.Errorf("%s (%q): a %q endpoint takes no options", where, ep.ID, AIEndpointTypeSystemOne)
 			}
 		}
 		if ep.APIKeyEnv != "" {
@@ -352,14 +396,23 @@ func validateAIRoles(roles *AIRoles, eps []AIEndpoint) error {
 		return fmt.Errorf("AI_ROLES.embeddings %q resolves to a %q endpoint, want %q",
 			roles.Embeddings, emb.Type, AIEndpointTypeEmbeddings)
 	}
-	if roles.Eval != "" {
-		ev, ok := byID[roles.Eval]
-		if !ok {
-			return fmt.Errorf("AI_ROLES.eval %q does not match any AI_ENDPOINTS id", roles.Eval)
+	for _, r := range []struct {
+		role, id string
+		want     AIEndpointType
+	}{
+		{roleEval, roles.Eval, AIEndpointTypeChat},
+		{roleDecide, roles.Decide, AIEndpointTypeSystemOne},
+		{roleScan, roles.Scan, AIEndpointTypeSystemOne},
+	} {
+		if r.id == "" {
+			continue
 		}
-		if ev.Type != AIEndpointTypeChat {
-			return fmt.Errorf("AI_ROLES.eval %q resolves to a %q endpoint, want %q",
-				roles.Eval, ev.Type, AIEndpointTypeChat)
+		ep, ok := byID[r.id]
+		if !ok {
+			return fmt.Errorf("AI_ROLES.%s %q does not match any AI_ENDPOINTS id", r.role, r.id)
+		}
+		if ep.Type != r.want {
+			return fmt.Errorf("AI_ROLES.%s %q resolves to a %q endpoint, want %q", r.role, r.id, ep.Type, r.want)
 		}
 	}
 	return nil
@@ -722,6 +775,18 @@ func (c *Config) EvalEndpoint() (AIEndpoint, bool) {
 	return c.endpointForRole(roleEval)
 }
 
+// DecideEndpoint returns the systemone endpoint bound to the "decide" role;
+// ok=false when unbound (the decide step is then disabled).
+func (c *Config) DecideEndpoint() (AIEndpoint, bool) {
+	return c.endpointForRole(roleDecide)
+}
+
+// ScanEndpoint returns the systemone endpoint bound to the "scan" role;
+// ok=false when unbound.
+func (c *Config) ScanEndpoint() (AIEndpoint, bool) {
+	return c.endpointForRole(roleScan)
+}
+
 // RoleForEndpoint returns the AI_ROLES key bound to an endpoint id, or "" when
 // the endpoint is registered but unbound. Used by the dashboard to label which
 // role an endpoint serves.
@@ -734,6 +799,10 @@ func (c *Config) RoleForEndpoint(id string) string {
 		return roleEmbeddings
 	case c.AIRoles.Eval:
 		return roleEval
+	case c.AIRoles.Decide:
+		return roleDecide
+	case c.AIRoles.Scan:
+		return roleScan
 	}
 	return ""
 }
@@ -741,6 +810,8 @@ func (c *Config) RoleForEndpoint(id string) string {
 const (
 	roleEmbeddings = "embeddings"
 	roleEval       = "eval"
+	roleDecide     = "decide"
+	roleScan       = "scan"
 )
 
 // endpointForRole resolves a role name to its bound endpoint.
@@ -754,6 +825,10 @@ func (c *Config) endpointForRole(role string) (AIEndpoint, bool) {
 		id = c.AIRoles.Embeddings
 	case roleEval:
 		id = c.AIRoles.Eval
+	case roleDecide:
+		id = c.AIRoles.Decide
+	case roleScan:
+		id = c.AIRoles.Scan
 	}
 	if id == "" {
 		return AIEndpoint{}, false

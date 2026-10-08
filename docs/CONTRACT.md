@@ -1127,6 +1127,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 4 | `00004_unanchorable.sql` | The `unanchorable` patch state, `unanchorable_reason` and `reanchored_at` on `transcript_findings` (§2.17 "Re-anchoring"). |
 | 5 | `00005_requeue_archive.sql` | Requeue archives findings (§1.4 "Operator requeue"): `patch_state` gains `superseded`, `superseded_at` column, `transcript_findings.transcript_id` becomes nullable with a foreign key to `transcripts(id) ON DELETE SET NULL` and a CHECK that only superseded findings may have no transcript; existing orphans are archived as `superseded` first; `stale_work` skips superseded findings. Not purely additive — see §1.4. |
 | 6 | `00006_asr_provenance_identity.sql` | Runner-reported provenance + `embedded_asin` on `transcripts`; `asin_source` / `identity_status` on `book_metadata` (§1.2, §1.6, §1.9). |
+| 7 | `00007_fn_calls.sql` | `fn_calls` — the pure-function call log and cache, with the partial unique cache index `fn_calls_cache_key_idx` and `fn_calls_recipe_id_idx` (§1.9 "Pure-function calls"). New table only. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1149,7 +1150,7 @@ nothing — so the reset now drops **every** earmark object and
 `goose_db_version`, then migrates from version 1. That includes
 `transcript_findings` (**human corrections too**, `origin='human'`),
 `book_metadata`, `run_metrics`, `pipeline_events`, `recipes` /
-`current_recipes`, and `runner_control` — the runner comes back **unpaused**
+`current_recipes`, `fn_calls`, and `runner_control` — the runner comes back **unpaused**
 with no `run_limit`.
 
 **Deadlines.** A migration must not outlive the pod's patience:
@@ -1350,6 +1351,73 @@ recipe and listed as stale. The judge logs a warning on the first response
 from a model other than the expected one (that is only knowable once the
 endpoint answers), and an info line at startup when no pin is set.
 
+
+#### Pure-function calls — `fn_calls`
+
+Every call a pure function (`internal/fn`) makes to a decision model — today
+TypeSafe System One (`jev-*`) — is one row. The log doubles as the cache.
+
+```sql
+CREATE TABLE fn_calls (
+    id             BIGSERIAL     PRIMARY KEY,
+    fn             TEXT          NOT NULL,              -- the function, e.g. "should_apply"
+    prompt_version TEXT          NOT NULL,
+    prompt_sha256  TEXT          NOT NULL,
+    model_alias    TEXT          NOT NULL,              -- the pinned model id asked for, e.g. "jev-1.13.0"
+    model_resolved TEXT,                                -- the reply's "model"; NULL when no reply
+    model_revision TEXT,
+    recipe_id      TEXT          REFERENCES recipes (recipe_id),
+    input_sha256   TEXT          NOT NULL CHECK (input_sha256 ~ '^[0-9a-f]{64}$'), -- sha256 of the canonical input JSON
+    input          JSONB         NOT NULL,
+    output         JSONB,                               -- NULL on error
+    error_class    TEXT,                                -- NULL on success
+    latency_ms     INTEGER,
+    input_tokens   INTEGER,
+    output_tokens  INTEGER,
+    cost_usd       NUMERIC(14,8),
+    cache_hit      BOOLEAN       NOT NULL DEFAULT false,
+    cached_from    BIGINT        REFERENCES fn_calls (id), -- the row a cache hit was served from
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX fn_calls_cache_key_idx ON fn_calls (fn, prompt_sha256, model_alias, input_sha256)
+    WHERE error_class IS NULL AND NOT cache_hit;
+CREATE INDEX fn_calls_recipe_id_idx ON fn_calls (recipe_id, created_at);
+```
+
+- **Cache.** The partial unique index admits one successful, non-cached row
+  per `(fn, prompt_sha256, model_alias, input_sha256)`; that row is the cache
+  entry. Writers insert with `ON CONFLICT … DO NOTHING` (`db.InsertFnCall`), so
+  an input is never paid for twice and log rows are never updated.
+- **Serving** (`db.LookupFnCache`) returns that row only when its
+  `model_resolved` is the expected model (the registry's `expected_model`,
+  else the alias), compared without case or a route prefix
+  (`typesafe/jev-1.13.0` = `jev-1.13.0`): a reply from any other model is
+  stored but never served. A fallback reply is logged with `error_class =
+  'model_fallback'` and its output kept, which also keeps it out of the cache
+  slot; the caller still receives it, flagged as a fallback.
+- **A served call is still logged**, as its own row with `cache_hit = true`
+  and `cached_from` set, so the table counts every call.
+- **Errors** are logged with `error_class` and no output; they are never
+  served. `error_class` is a bounded label: the HTTP status (`422`, `429`,
+  `503`…), `timeout`, `canceled`, `invalid_reply` (a 200 that does not answer
+  the request, §2.14 "System One"), `model_fallback`, or `_OTHER`.
+- **Input hash.** `input_sha256` is the lowercase hex sha256 of the input's
+  canonical JSON (`fn.CanonicalInput`): every object's keys sorted (struct
+  fields included), no whitespace, no HTML escaping, numbers as written —
+  `{"b":"x<y","a":1}` → `{"a":1,"b":"x<y"}` →
+  `7e897661c014a2799b01d100cf3db3088dbc1c2c0ba3c83a63dd58fd41634fcc`.
+- **Recipe.** A call's recipe is the function's step and `step_version`, the
+  pinned alias as `model_alias`, the reply's model as `model_resolved`, the
+  prompt version and hash, and the function's params plus `"fn": <name>` (so
+  two functions of a step never share a recipe). A cache hit carries the
+  served row's recipe.
+- **Pinned models only.** A function refuses an alias that can move under the
+  same name — `*-latest`, `*-preview`, `:latest`, or an id with no dotted
+  version (`jev-latest` is refused, `jev-1.13.0` accepted); a `systemone`
+  endpoint is refused at startup for the same reason (§2.14).
+- `recipe_id` is the call's recipe, registered (insert-if-absent) before the
+  row is written. No prompt or completion text is stored outside `input` /
+  `output`.
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
@@ -1619,7 +1687,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `EMBEDDINGS_BASE_URL` | no | **Deprecated** — `http://ollama:11434/v1`. Superseded by `AI_ENDPOINTS` (§2.14); still honored (synthesized into a `_legacy` embeddings endpoint) when `AI_ENDPOINTS` is unset. |
 | `EMBEDDINGS_MODEL` | no | **Deprecated** — `nomic-embed-text`. See `EMBEDDINGS_BASE_URL` above and §2.14. |
 | `AI_ENDPOINTS` | no | JSON array of AI endpoint descriptors (the AI endpoint registry, §2.14). When set, `AI_ROLES` is required and the `EMBEDDINGS_*` vars are ignored. **Malformed value is fatal** (fail-closed). Empty → the `EMBEDDINGS_*` legacy path applies. |
-| `AI_ROLES` | no | JSON object binding role names (`embeddings`, `eval`) to endpoint IDs (§2.14). Required when `AI_ENDPOINTS` is set. |
+| `AI_ROLES` | no | JSON object binding role names (`embeddings`, `eval`, `decide`, `scan`) to endpoint IDs (§2.14). Required when `AI_ENDPOINTS` is set. |
 | `MODELS_FILE` | no | Path to the model registry YAML (§2.18): per step, the expected answering model, revision pin and prompt version stamped into provenance recipes (§1.9). Unset → no pins. Unreadable / malformed / unknown step or field / an `alias` contradicting `AI_ENDPOINTS` is **fatal** (fail-closed). |
 | `BOOKS_DIR` | no | `/books` (read-only NFS mount inside container) |
 | `MCP_HTTP_ADDR` | no | `:8081` |
@@ -2183,7 +2251,7 @@ with no change.
 [
   {
     "id": "embed-1",                 // unique within this deployment (required)
-    "type": "embeddings",            // "embeddings" | "chat" (required)
+    "type": "embeddings",            // "embeddings" | "chat" | "systemone" (required)
     "backend": "ollama",             // "ollama" | "vllm" | "openai-compat" (required)
     "baseURL": "http://ollama:11434/v1", // OpenAI-compatible base (http/https, required)
     "model": "nomic-embed-text",     // model id passed to the API (required)
@@ -2238,16 +2306,61 @@ deployments are unchanged. For the eval judge, the resolved key takes precedence
 over the deprecated `options.apiKey` (still honored for back-compat; do not put
 real secrets there).
 
+#### `systemone` endpoints (TypeSafe System One)
+
+A `systemone` endpoint is a decision model ("Jev") reached through the
+LiteLLM pass-through, e.g.
+
+```jsonc
+{ "id": "jev", "type": "systemone", "backend": "openai-compat",
+  "baseURL": "http://litellm.llm-gateway.svc:4000/typesafe",
+  "model": "jev-1.13.0", "apiKeyEnv": "LITELLM_API_KEY" }
+```
+
+- `baseURL` is the route prefix: the client (`internal/systemone`) calls
+  `POST {baseURL}/v1/systemone` and `GET {baseURL}/v1/models`, with the
+  `apiKeyEnv` token as `Authorization: Bearer`. It never follows a redirect.
+- `model` MUST be a pinned version (`jev-1.13.0`); a moving alias
+  (`jev-latest`, `jev-preview`, any `*-latest`/`*-preview`/`:latest`) or an id
+  with no dotted version is a startup error. `options` are refused (the client
+  sends only `model`, `state`, `questions`).
+- **Request** `{"model", "state": <string>, "questions": {<name>: {"type",
+  "instructions", "criteria"}}}` — `model` always sent (omitting it is a 422);
+  every question needs `instructions`; `noul` criteria optional
+  (`{"true","false"}`), `choice` criteria 1–255 labels → descriptions, `score`
+  criteria a list of ≥ 2 levels. The client validates this before sending.
+- **Reply** `{"model", "answers": {<name>: {...}}, "usage": {"input_tokens",
+  "output_tokens"}}`; per type `noul` → `noul` ∈ [0,1]; `choice` → `choice`
+  (an asked label), `probabilities`, `confidence`; `score` → `score` ∈
+  [0, levels−1], `confidence`, `legend`, `probabilities`. Decoding is
+  **strict** — a missing answer, a type other than the one asked, a missing
+  required field, any probability/confidence outside [0,1] or a score outside
+  its levels is an error (`invalid_reply`), never a partial answer; answers
+  to unasked questions are dropped.
+- **Errors are typed**: 422 (not retryable), 429 (with `Retry-After`), 5xx,
+  other statuses, and timeouts (15 s default; the caller's deadline counts) —
+  429, 5xx and timeouts are retryable. Error values carry no request or
+  response body and never the key.
+- **Cost**: the `x-litellm-response-cost` header when present and a
+  non-negative number, else `input_tokens × usd_per_mtok_in / 1e6` (output is
+  not billed) with `usd_per_mtok_in` from `MODELS_FILE`
+  `steps.<step>.params` (§2.18), default 0.042.
+- Calls go through `internal/fn`, which logs every call in `fn_calls` and
+  serves repeats from it (§1.9).
+
 #### `AI_ROLES` (JSON object)
 
 ```jsonc
-{ "embeddings": "embed-1", "eval": "eval-1" }
+{ "embeddings": "embed-1", "eval": "eval-1", "decide": "jev", "scan": "jev" }
 ```
 
 `embeddings` is **required** when `AI_ENDPOINTS` is set and MUST resolve to an
 endpoint of type `embeddings` — it is the endpoint the worker embeds chunks
 with. `eval` is **optional** and MUST resolve to a `chat` endpoint when present
 (it is reserved for a future read-only eval layer; absent → no eval).
+`decide` and `scan` are **optional** and MUST resolve to `systemone`
+endpoints when present (absent → the step is disabled). Configs without them
+are unaffected.
 
 #### Validation (fail-closed)
 
@@ -2265,6 +2378,9 @@ cause invisible embed failures. earmark refuses to start when:
 - `AI_ROLES.embeddings` is empty, points at an unknown id, or points at a
   non-`embeddings` endpoint.
 - `AI_ROLES.eval` is set but points at an unknown id or a non-`chat` endpoint.
+- `AI_ROLES.decide` or `AI_ROLES.scan` is set but points at an unknown id or a
+  non-`systemone` endpoint.
+- A `systemone` endpoint names an unpinned model or sets `options`.
 
 (When `AI_ENDPOINTS` is **absent**, a malformed `EMBEDDINGS_BASE_URL` is not
 re-validated — the legacy path preserves the prior behavior.)
@@ -2272,7 +2388,8 @@ re-validated — the legacy path preserves the prior behavior.)
 #### Health probe + dashboard
 
 Each endpoint is probed for liveness on every Models page refresh and in
-`GET /api/v1/status` (§2.12): a `GET <baseURL>/models` request with a 2s
+`GET /api/v1/status` (§2.12): a `GET <baseURL>/models` request
+(`GET <baseURL>/v1/models` for a `systemone` endpoint) with a 2s
 timeout (carrying the endpoint's bearer token when `apiKeyEnv` is set),
 TTL-cached so both render paths share one upstream call. State tokens:
 
@@ -2912,7 +3029,7 @@ on spans and logs, never labels):
 | `earmark_build_info` | gauge = 1 | `version`, `commit` | The running build. |
 | `earmark_recipe_info` | gauge = 1 | `step`, `recipe`, `model`, `revision`, `prompt_version` | One per step in `current_recipes` (§1.9), loaded by the ingest pod at startup after it registers them. |
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
-| `earmark_model_calls_total` | counter | `fn` (`judge`), `model` (requested), `outcome` (`ok` · `error` · `fallback`) | Every judge call. `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). |
+| `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 
 **Traces.** Each judge call is one `chat <model>` client span following the
 OpenTelemetry GenAI semantic conventions, **pinned to semconv v1.40.0** (they
@@ -2931,6 +3048,16 @@ body can echo the request (no exception event is recorded; the full error
 still reaches the caller's logs), and `earmark.step`, `earmark.fn`,
 `earmark.recipe_id` (the recipe that stamped its findings), `earmark.transcript_id`,
 `earmark.chunk_id`. Prompt and completion content are **never** recorded.
+
+**Pure-function spans.** Each `internal/fn` call — served from cache or
+not — is one `systemone <model>` client span: `gen_ai.operation.name=systemone`
+(custom; semconv has no decision operation), `gen_ai.provider.name=typesafe`,
+`gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens` /
+`output_tokens` (when a request was made), `earmark.fn`, `earmark.step`,
+`earmark.recipe_id`, `earmark.cache_hit`, and on failure the same bounded
+`error.type` / status rule as the judge. The state text, the questions and the
+answers are **never** recorded on spans, metrics or logs — only in the
+`fn_calls` row.
 
 **Logs.** With `LOG_FORMAT=json`, a record logged with a context inside a span
 carries `trace_id` and `span_id`. In MCP stdio mode every log line goes to
@@ -3492,15 +3619,20 @@ steps:
     revision: sha256:0a109f422b47
   asr:                           # checked against what the runner reports (§1.9 ASR stamping); a mismatch is logged
     expected_model: nvidia/parakeet-tdt-1.1b
+  decide:                        # AI_ROLES.decide (a systemone endpoint, §2.14)
+    alias: jev-1.13.0
+    params:
+      usd_per_mtok_in: 0.042     # cost estimate when the gateway reports none
 ```
 
 | Key | Meaning |
 |---|---|
 | `steps.<step>` | one of `asr`, `propose`, `decide`, `propagate`, `scan`, `format`, `embed` |
-| `alias` | optional; must equal the configured endpoint's `model` for the step's role (`propose`→`eval`, `embed`→`embeddings`) |
+| `alias` | optional; must equal the configured endpoint's `model` for the step's role (`propose`→`eval`, `embed`→`embeddings`, `decide`→`decide`, `scan`→`scan`) |
 | `expected_model` | the model the endpoint should report serving; the current recipe's `model_resolved`. Unset → the requested model |
 | `revision` | HF commit / `.nemo` sha256 / Ollama digest / provider snapshot |
 | `prompt_version` | the prompt version this deployment expects; the code's own version is authoritative, a mismatch is logged |
+| `params` | optional step settings. Known key: `usd_per_mtok_in` (decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14). An unknown key or a bad value is a startup error |
 
 Because `expected_model` becomes the current recipe's `model_resolved`, a
 response served by any other model (a LiteLLM fallback, or an alias silently

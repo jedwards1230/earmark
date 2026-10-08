@@ -18,6 +18,7 @@ version is in `goose_db_version`.
 | 4 | `00004_unanchorable.sql` | `unanchorable` patch state; `unanchorable_reason`, `reanchored_at` on `transcript_findings` |
 | 5 | `00005_requeue_archive.sql` | `superseded` patch state + `superseded_at`; `transcript_findings.transcript_id` nullable, FK to `transcripts(id) ON DELETE SET NULL`, CHECK `transcript_id IS NOT NULL OR patch_state = 'superseded'`; existing orphans archived as `superseded` first; `stale_work` skips superseded findings |
 | 6 | `00006_asr_provenance_identity.sql` | runner-reported provenance on `transcripts` (`embedded_asin`, `asr_model_sha256`, `asr_runner_version`, `asr_params`) + partial index `transcripts_asr_unstamped_idx`; `book_metadata.asin_source` / `identity_status` |
+| 7 | `00007_fn_calls.sql` | `fn_calls` (pure-function call log + cache); partial unique `fn_calls_cache_key_idx`, `fn_calls_recipe_id_idx` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -454,6 +455,41 @@ startup. Right after the first deploy every legacy row is stale (≈39,644 chunk
 step's current recipe in anything but `code_version` (unstamped rows count as
 stale; steps without a current recipe, human corrections and superseded findings never appear).
 
+### 10. `fn_calls` — Pure-function call log and cache (CONTRACT §1.9)
+
+One row per call an `internal/fn` function makes to a decision model.
+
+```sql
+CREATE TABLE fn_calls (
+    id             BIGSERIAL     PRIMARY KEY,
+    fn             TEXT          NOT NULL,
+    prompt_version TEXT          NOT NULL,
+    prompt_sha256  TEXT          NOT NULL,
+    model_alias    TEXT          NOT NULL,              -- pinned model asked for
+    model_resolved TEXT,                                -- what answered
+    model_revision TEXT,
+    recipe_id      TEXT          REFERENCES recipes (recipe_id),
+    input_sha256   TEXT          NOT NULL,              -- hex sha256 of the canonical input JSON
+    input          JSONB         NOT NULL,
+    output         JSONB,                               -- NULL on error
+    error_class    TEXT,                                -- NULL on success
+    latency_ms     INTEGER,
+    input_tokens   INTEGER,
+    output_tokens  INTEGER,
+    cost_usd       NUMERIC(14,8),
+    cache_hit      BOOLEAN       NOT NULL DEFAULT false,
+    cached_from    BIGINT        REFERENCES fn_calls (id),
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+-- unique index fn_calls_cache_key_idx: (fn, prompt_sha256, model_alias, input_sha256)
+--   WHERE error_class IS NULL AND NOT cache_hit   -- the cache + pay-once guard
+-- index fn_calls_recipe_id_idx: (recipe_id, created_at)
+```
+
+Inserts are `ON CONFLICT DO NOTHING` on the cache index; rows are never
+updated. A cached row is served only when `model_resolved` is the expected
+model (case and route prefix ignored). Cache hits are logged as their own rows (`cache_hit`, `cached_from`).
+
 ## Relationships
 
 ```
@@ -463,6 +499,8 @@ book_metadata      (key: book_dir — filepath.Dir of any file_path in the book)
 runner_control     (singleton, id=1)
 recipes (1) ←── transcripts / transcript_findings / transcript_chunks (N, via nullable recipe_id)
         (1) ←── current_recipes (one per step)
+        (1) ←── fn_calls (N, via nullable recipe_id)
+fn_calls (1) ←── fn_calls (N cache-hit rows, via cached_from)
 ```
 
 Cascade deletes propagate: deleting a job removes its transcript, all chunks,

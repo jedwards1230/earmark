@@ -3,20 +3,19 @@ package eval
 import (
 	"context"
 	"errors"
-	"net"
 	"strconv"
-	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/metric"
 	// Pinned: the GenAI semantic conventions are still "development", so
 	// earmark follows exactly semconv v1.40.0 (gen_ai.provider.name, not the
 	// older gen_ai.system) and treats its own earmark.* attributes as
 	// authoritative (CONTRACT §2.16).
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/jedwards1230/earmark/internal/genai"
 )
 
 // scopeName is the instrumentation scope of the judge's spans and metrics.
@@ -28,9 +27,9 @@ const judgeFn = "judge"
 
 // Model-call outcomes (earmark_model_calls_total{outcome}).
 const (
-	outcomeOK       = "ok"
-	outcomeError    = "error"
-	outcomeFallback = "fallback"
+	outcomeOK       = genai.OutcomeOK
+	outcomeError    = genai.OutcomeError
+	outcomeFallback = genai.OutcomeFallback
 )
 
 // earmark.* span attributes. Book, chunk and recipe ids live on spans and
@@ -43,22 +42,14 @@ const (
 	attrFn           = attribute.Key("earmark.fn")
 )
 
-// The tracer and counter are looked up from the OpenTelemetry globals on each
-// call (once per model request, which takes seconds), so they always follow
-// whatever internal/telemetry — or a test — installed last; no-op until then.
+// The tracer is looked up from the OpenTelemetry globals on each call (once
+// per model request, which takes seconds), so it always follows whatever
+// internal/telemetry — or a test — installed last; no-op until then. The
+// earmark_model_calls counter is the shared one in internal/genai.
 func tracer() trace.Tracer { return otel.Tracer(scopeName) }
 
 func countModelCall(ctx context.Context, model, outcome string) {
-	c, err := otel.Meter(scopeName).Int64Counter("earmark_model_calls",
-		metric.WithDescription("Model calls by LLM function, requested model and outcome (ok, error, fallback)."))
-	if err != nil {
-		otel.Handle(err)
-		return
-	}
-	c.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("fn", judgeFn),
-		attribute.String("model", model),
-		attribute.String("outcome", outcome)))
+	genai.CountModelCall(ctx, judgeFn, model, outcome)
 }
 
 // startChatSpan opens the gen_ai client span for one judge call. temperature
@@ -130,12 +121,12 @@ func endChatSpan(ctx context.Context, span trace.Span, model, expected string, c
 }
 
 // errorClass reduces a chat error to a bounded, content-free label for
-// error.type: the HTTP status code ("422"), "timeout", "canceled", one of the
-// unusable-reply classes ("thinking_only", "empty", "truncated", "refusal"),
-// else semconv's "_OTHER".
+// error.type: the HTTP status code ("422"), one of the unusable-reply classes
+// ("thinking_only", "empty", "truncated", "refusal"), else the shared
+// classification (genai.ErrorClass): "timeout", "canceled" or semconv's
+// "_OTHER".
 func errorClass(err error) string {
 	var se *StatusError
-	var ne net.Error
 	switch {
 	case errors.As(err, &se):
 		return strconv.Itoa(se.Code)
@@ -147,26 +138,11 @@ func errorClass(err error) string {
 		return "truncated"
 	case errors.Is(err, ErrRefusalResponse):
 		return "refusal"
-	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
-		return "timeout"
-	case errors.Is(err, context.Canceled):
-		return "canceled"
 	default:
-		return semconv.ErrorTypeOther.Value.AsString()
+		return genai.ErrorClass(err)
 	}
 }
 
-// SameModel compares model ids ignoring a router's route prefix and case: a
-// registry pin "anthropic/claude-haiku-4-5-20251001" and a LiteLLM response
-// reporting "claude-haiku-4-5-20251001" name the same model, so the call is
-// not a fallback. Shared with the dashboard's Models page (internal/mcp).
-func SameModel(a, b string) bool {
-	last := func(s string) string {
-		s = strings.ToLower(strings.TrimSpace(s))
-		if i := strings.LastIndex(s, "/"); i >= 0 {
-			return s[i+1:]
-		}
-		return s
-	}
-	return last(a) == last(b)
-}
+// SameModel compares model ids ignoring a router's route prefix and case
+// (genai.SameModel). Shared with the dashboard's Models page (internal/mcp).
+func SameModel(a, b string) bool { return genai.SameModel(a, b) }
