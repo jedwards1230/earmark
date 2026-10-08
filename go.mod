@@ -20,7 +20,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/prometheus/otlptranslator v1.0.0
-	github.com/sashabaranov/go-openai v1.42.1
+	github.com/sashabaranov/go-openai v1.43.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/contrib/bridges/prometheus v0.72.0
