@@ -1,0 +1,21 @@
+// Package decide is the decide step: it turns the judge's proposed findings
+// (CONTRACT §2.15) into decisions about which corrections to apply.
+//
+// This package currently holds rung 0 only — deterministic checks that need
+// no model call, run before anything is asked of a model:
+//
+//   - the finding still describes the chunk revision it was judged against,
+//     and its anchor resolves to exactly one span (patch.ChunkHash,
+//     patch.Locate);
+//   - the edit changes words, not just case, punctuation, hyphens or spacing;
+//   - the edit has the shape its issue type claims: a substitution must sound
+//     like what it replaces (phonetic.SoundAlike), a repeated_text fix must
+//     remove an exact adjacent repeat, a dropped_word fix must insert one or
+//     two words and change nothing else;
+//   - per chunk, overlapping candidates are deduplicated, and a candidate that
+//     overlaps a correction already accepted or applied is refused.
+//
+// A rung-0 failure is final for that finding under the current recipe. A
+// rung-0 pass is NOT a decision to apply — it only makes a finding eligible for
+// the later rungs. Everything here is pure: no database, no network, no clock.
+package decide
