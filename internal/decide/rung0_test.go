@@ -54,6 +54,12 @@ func TestCheck(t *testing.T) {
 		{"number: decimal", cand("a", IssueNumberArtifact, "about three point five liters", "three point five", "3.5", 0.9), true, ""},
 		{"number: two years", cand("a", IssueNumberArtifact, "from nineteen eighty four to nineteen ninety we", "nineteen eighty four to nineteen ninety", "1984 to 1990", 0.9), true, ""},
 		{"number: two paired readings", cand("a", IssueNumberArtifact, "at too forty at two oh five", "too forty at two oh five", "240 at 205", 0.9), true, ""},
+		{"number: decimal digits differ", cand("a", IssueNumberArtifact, "pi is 3.15 here", "3.15", "3.50", 0.9), false, ReasonNotSoundAlike},
+		{"number: grouped digits differ", cand("a", IssueNumberArtifact, "paid 1,500 dollars", "1,500", "1,550", 0.9), false, ReasonNotSoundAlike},
+		{"number: plain digits differ", cand("a", IssueNumberArtifact, "x 240 y", "240", "250", 0.9), false, ReasonNotSoundAlike},
+		{"number: grouped vs words", cand("a", IssueNumberArtifact, "some 10,000 people", "10,000", "10 thousand", 0.9), true, ""},
+		{"number: nine spelled-out words", cand("a", IssueNumberArtifact, "exactly one million two hundred thousand three hundred forty five votes",
+			"one million two hundred thousand three hundred forty five", "1,200,345", 0.9), true, ""},
 		{"number: unrelated value", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "17", 0.9), false, ReasonNotSoundAlike},
 
 		// Target exists.
@@ -98,6 +104,12 @@ func TestCheck(t *testing.T) {
 
 		// Spans must be word-bounded for every issue type.
 		{"mid-word: homophone inside therein", cand("a", IssueHomophone, "therein lies the rub", "there", "their", 0.9), false, ReasonNotWordBounded},
+		{"mid-word: before an apostrophe", cand("a", IssueHomophone, "i won't go", "won", "one", 0.9), false, ReasonNotWordBounded},
+		{"mid-word: can inside can't", cand("a", IssueMisheardWord, "you can't go", "can", "cant", 0.9), false, ReasonNotWordBounded},
+		{"mid-word: after an apostrophe", cand("a", IssueMisheardWord, "you can't go", "t go", "t goo", 0.9), false, ReasonNotWordBounded},
+		{"mid-word: inside a grouped number", cand("a", IssueNumberArtifact, "paid 1,500 now", "1", "one", 0.9), false, ReasonNotWordBounded},
+		{"mid-word: inside a decimal", cand("a", IssueNumberArtifact, "about 3.5 liters", "5", "five", 0.9), false, ReasonNotWordBounded},
+		{"apostrophe at a word end is a boundary", cand("a", IssueHomophone, "the dogs' bowl", "dogs", "dog's", 0.9), false, ReasonCosmeticOnly},
 		{"mid-word: insertion inside cathedral", cand("a", IssueDroppedWord, "near the cathedral", "the cat", "the big cat", 0.9), false, ReasonNotWordBounded},
 
 		// Substitutions that do not sound alike.
@@ -120,6 +132,9 @@ func TestCheck(t *testing.T) {
 		{"repeat: replacement longer", cand("a", IssueRepeatedText, "the cat", "the cat", "the the cat", 0.9), false, ReasonNotExactRepeat},
 		{"repeat: inside a longer word", cand("a", IssueRepeatedText, "bathe the cat", "the the", "the", 0.9), false, ReasonNotWordBounded},
 		{"repeat: across a sentence break", cand("a", IssueRepeatedText, "it was the end. the end came", "the end. the end", "the end", 0.9), false, ReasonNotExactRepeat},
+		{"repeat: across a semicolon", cand("a", IssueRepeatedText, "it ended; ended there", "ended; ended", "ended", 0.9), false, ReasonNotExactRepeat},
+		{"repeat: across an ellipsis", cand("a", IssueRepeatedText, "so\u2026 so be it", "so\u2026 so", "so", 0.9), false, ReasonNotExactRepeat},
+		{"repeat: across a question mark", cand("a", IssueRepeatedText, "why? why not", "why? why", "why", 0.9), false, ReasonNotExactRepeat},
 		{"repeat: comma inside the stutter is fine", cand("a", IssueRepeatedText, "well, well, well then", "well, well, well", "well", 0.9), true, ""},
 
 		// dropped_word.
@@ -384,18 +399,29 @@ func TestIssueTypesMatchEval(t *testing.T) {
 }
 
 func TestTokenSpans(t *testing.T) {
-	const s = "Don't, 1,000 o\u2019brien."
+	const s = "Don't, 1,000 o\u2019brien 3.15 1,2 21st end."
 	ts := tokenSpans(s)
-	var got []string
+	var got, txt []string
 	for _, tk := range ts {
 		got = append(got, string([]rune(s)[tk.start:tk.end]))
+		txt = append(txt, tk.text)
 	}
-	want := []string{"Don't", "1", "000", "o\u2019brien"}
+	want := []string{"Don't", "1,000", "o\u2019brien", "3.15", "1", "2", "21", "st", "end"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("token ranges cover %q, want %q", got, want)
 	}
-	if raw := rawText(s, ts[1:3]); raw != "1,000" {
+	wantText := []string{"dont", "1000", "obrien", "3.15", "1", "2", "21", "st", "end"}
+	if strings.Join(txt, "|") != strings.Join(wantText, "|") {
+		t.Errorf("token texts %q, want %q", txt, wantText)
+	}
+	if raw := rawText(s, ts[1:2]); raw != "1,000" {
 		t.Errorf("rawText = %q, want %q", raw, "1,000")
+	}
+	// Lower-casing that changes the rune count (İ → i̇) must not shift ranges.
+	const dotted = "\u0130stanbul 1,000"
+	dt := tokenSpans(dotted)
+	if raw := rawText(dotted, dt[1:]); raw != "1,000" {
+		t.Errorf("rawText after İ = %q, want %q", raw, "1,000")
 	}
 }
 
@@ -428,6 +454,8 @@ func FuzzCheck(f *testing.F) {
 	f.Add("about one thousand miles", "one thousand", "1,000", IssueNumberArtifact)
 	f.Add("therein lies", "there", "their", IssueHomophone)
 	f.Add("the end. the end", "the end. the end", "the end", IssueRepeatedText)
+	f.Add("paid 1,500 now", "1,500", "1,550", IssueNumberArtifact)
+	f.Add("i won't go", "won", "one", IssueHomophone)
 	f.Fuzz(func(t *testing.T, chunk, original, replacement, issue string) {
 		c := cand("a", issue, chunk, original, replacement, 0.5)
 		v := Check(c, DefaultParams())

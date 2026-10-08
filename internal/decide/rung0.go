@@ -80,8 +80,10 @@ const (
 	// differing window a substitution is scored on. A misheard word or name
 	// is a few words; a longer window is a rewrite, not a mishearing, and
 	// would also make the phonetic comparison expensive. Past either limit
-	// the candidate fails not_soundalike. MaxSubstitutionRunes equals
-	// phonetic.MaxPhraseRunes.
+	// the candidate fails not_soundalike. number_artifact windows are held
+	// to the rune limit only — "one million two hundred thousand three
+	// hundred forty five" is nine words but one number.
+	// MaxSubstitutionRunes equals phonetic.MaxPhraseRunes.
 	MaxSubstitutionTokens = 8
 	MaxSubstitutionRunes  = phonetic.MaxPhraseRunes
 )
@@ -216,7 +218,9 @@ func Check(c Candidate, p Params) Verdict {
 	}
 }
 
-// checkSubstitution requires the differing token window to sound alike. The
+// checkSubstitution requires the differing token window to sound alike. A
+// window that is numerals on both sides always fails (see allNumerals's use).
+// The
 // window is compared as the RAW text from the first differing word to the last
 // on each side, so a numeral keeps its punctuation ("1,000", "3.5") and is read
 // as one number rather than as separate digit groups.
@@ -228,11 +232,22 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 		return fail(ReasonNotSoundAlike, span, "not a substitution: %q → %q only inserts or deletes words", c.Original, c.Replacement)
 	}
 	a, b := rawText(c.Original, ow), rawText(c.Replacement, rw)
+	if allNumerals(ow) && allNumerals(rw) {
+		// Both sides are written numerals, so the edit changes a value, not a
+		// spelling. Their spoken forms share most of their sounds ("one
+		// thousand five hundred" vs "... fifty", "two hundred forty" vs
+		// "... fifty"), so a phonetic score would pass wrong numbers; rung 0
+		// has no way to tell which value was spoken.
+		return fail(ReasonNotSoundAlike, span, "numeral-to-numeral change %q → %q: a value change cannot be checked phonetically", a, b)
+	}
 	for _, side := range []struct {
 		text string
 		n    int
 	}{{a, len(ow)}, {b, len(rw)}} {
-		if side.n > MaxSubstitutionTokens || utf8.RuneCountInString(side.text) > MaxSubstitutionRunes {
+		// A spelled-out number is long in words but still one number, so
+		// number_artifact windows are measured in runes only.
+		tooManyWords := side.n > MaxSubstitutionTokens && c.IssueType != IssueNumberArtifact
+		if tooManyWords || utf8.RuneCountInString(side.text) > MaxSubstitutionRunes {
 			return fail(ReasonNotSoundAlike, span, "substituted window %q is too long to be a mishearing (%d words; limits %d words, %d runes)",
 				side.text, side.n, MaxSubstitutionTokens, MaxSubstitutionRunes)
 		}
@@ -259,8 +274,8 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 // The repeat is checked on the located span's text in the chunk (Check has
 // already required it to be word-bounded, so "bathe the" does not contain
 // "the the"), and a collapse is refused when the removed text contains
-// sentence punctuation (. ? !): "the end. The end" is two sentences, not a
-// stutter.
+// sentence punctuation (hasSentenceBreak: . ? ! and other Sentence_Terminal
+// runes, ; and …): "the end. The end" is two sentences, not a stutter.
 func checkRepeat(c Candidate, span patch.Span) Verdict {
 	raw := string([]rune(c.ChunkText)[span.Start:span.End])
 	o, r := tokenSpans(raw), tokens(c.Replacement)
@@ -292,7 +307,7 @@ func findCollapse(raw string, ot []token, r []string) (unit []string, copies int
 			// The removed region runs from the end of the kept copy to the
 			// end of the last removed one.
 			gone := []rune(raw)[ot[i+size-1].end:ot[i+k*size-1].end]
-			if slices.Equal(collapsed, r) && !strings.ContainsAny(string(gone), ".?!") {
+			if slices.Equal(collapsed, r) && !hasSentenceBreak(gone) {
 				return o[i : i+size], k, true
 			}
 		}
@@ -452,6 +467,18 @@ func occupiedSpans(text string, existing []patch.Patch) []occupied {
 	return out
 }
 
+// hasSentenceBreak reports whether rs contains a sentence terminator
+// (unicode.Sentence_Terminal: . ? ! and their script variants), a
+// semicolon, or an ellipsis.
+func hasSentenceBreak(rs []rune) bool {
+	for _, r := range rs {
+		if unicode.Is(unicode.Sentence_Terminal, r) || r == ';' || r == '\u2026' {
+			return true
+		}
+	}
+	return false
+}
+
 func firstOverlap(s patch.Span, occ []occupied, self string) (occupied, bool) {
 	for _, o := range occ {
 		if o.id != self && overlaps(s, o.span) {
@@ -488,24 +515,39 @@ type token struct {
 	start, end int // rune indices into the source string
 }
 
-// tokenSpans splits s into lower-cased words of letters and digits, with
-// their rune ranges. Apostrophes are dropped inside a word (and stay inside
-// its range); every other rune that is not a letter or digit separates words.
+// tokenSpans splits s into lower-cased words with their rune ranges.
+//
+// A numeral that starts a word is ONE token, scanned with
+// phonetic.ScanNumeral — the grammar phonetic.Readings uses — so "1,500",
+// "3.15" and "12,345.67" are never split into fragments that diff and score
+// separately. Its text is canonical: thousands separators dropped, the
+// decimal point kept ("1,500" → "1500", "3.15" → "3.15"). Otherwise a word is
+// a run of letters and digits; apostrophes are dropped inside it (and stay
+// inside its range); every other rune separates words.
 func tokenSpans(s string) []token {
+	runes := []rune(s)
 	var out []token
 	var cur strings.Builder
-	start := -1
-	n := 0
-	flush := func(end int) {
+	start, lastWord := -1, 0 // lastWord: rune index just past the last word rune
+	flush := func() {
 		if cur.Len() > 0 {
-			out = append(out, token{text: cur.String(), start: start, end: end})
+			out = append(out, token{text: cur.String(), start: start, end: lastWord})
 			cur.Reset()
 		}
 		start = -1
 	}
-	lastWord := 0 // rune index just past the last letter or digit
-	for _, r := range strings.ToLower(s) {
+	for n := 0; n < len(runes); {
+		r := unicode.ToLower(runes[n])
 		switch {
+		case start < 0 && r >= '0' && r <= '9':
+			num := phonetic.ScanNumeral(runes, n)
+			text := num.Whole
+			if num.Fraction != "" {
+				text += "." + num.Fraction
+			}
+			out = append(out, token{text: text, start: n, end: num.End})
+			n = num.End
+			continue
 		case unicode.IsLetter(r) || unicode.IsDigit(r):
 			if start < 0 {
 				start = n
@@ -514,12 +556,24 @@ func tokenSpans(s string) []token {
 			lastWord = n + 1
 		case r == '\'' || r == '\u2019':
 		default:
-			flush(lastWord)
+			flush()
 		}
 		n++
 	}
-	flush(lastWord)
+	flush()
 	return out
+}
+
+// allNumerals reports whether every token is a numeral (see tokenSpans).
+func allNumerals(ts []token) bool {
+	for _, t := range ts {
+		for _, r := range t.text {
+			if (r < '0' || r > '9') && r != '.' {
+				return false
+			}
+		}
+	}
+	return len(ts) > 0
 }
 
 // tokens is the comparison text of tokenSpans.
@@ -551,11 +605,35 @@ func diffWindow(a, b []string) (pre, suf int) {
 }
 
 // wordBoundary reports whether rune index i sits between words: at either
-// end of the text, or next to a rune that is not a letter or digit.
+// end of the text, or not inside a word. A position is inside a word when
+// both neighbours are letters or digits, or when it is next to a joiner that
+// joins its own neighbours — an apostrophe between two letters ("won|'t",
+// "can'|t") or a comma or point between two digits ("1|,000", "3.|5").
 func wordBoundary(runes []rune, i int) bool {
 	if i <= 0 || i >= len(runes) {
 		return true
 	}
-	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
-	return !isWord(runes[i-1]) || !isWord(runes[i])
+	if isWordRune(runes[i-1]) && isWordRune(runes[i]) {
+		return false
+	}
+	if i+1 < len(runes) && joins(runes[i-1], runes[i], runes[i+1]) {
+		return false
+	}
+	if i >= 2 && joins(runes[i-2], runes[i-1], runes[i]) {
+		return false
+	}
+	return true
+}
+
+func isWordRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+
+// joins reports whether j, between x and y, is part of one word.
+func joins(x, j, y rune) bool {
+	switch j {
+	case '\'', '\u2019':
+		return unicode.IsLetter(x) && unicode.IsLetter(y)
+	case ',', '.':
+		return unicode.IsDigit(x) && unicode.IsDigit(y)
+	}
+	return false
 }

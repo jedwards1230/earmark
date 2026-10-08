@@ -199,6 +199,27 @@ func TestReadingsCap(t *testing.T) {
 	}
 }
 
+func TestScanNumeral(t *testing.T) {
+	tests := []struct {
+		in   string
+		want Numeral
+	}{
+		{"240 x", Numeral{Whole: "240", End: 3}},
+		{"1,000 x", Numeral{Whole: "1000", Grouped: true, End: 5}},
+		{"12,345.67", Numeral{Whole: "12345", Grouped: true, Fraction: "67", End: 9}},
+		{"3.5.", Numeral{Whole: "3", Fraction: "5", End: 3}},
+		{"1,2,3", Numeral{Whole: "1", End: 1}},
+		{"1,0000", Numeral{Whole: "1", End: 1}},
+		{"1234,567", Numeral{Whole: "1234", End: 4}},
+		{"7.", Numeral{Whole: "7", End: 1}},
+	}
+	for _, tc := range tests {
+		if got := ScanNumeral([]rune(tc.in), 0); got != tc.want {
+			t.Errorf("ScanNumeral(%q) = %+v, want %+v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestCompareBounds(t *testing.T) {
 	long := strings.Repeat("7", MaxPhraseRunes+1)
 	if m := Compare(long, long); m.Score != 0 {

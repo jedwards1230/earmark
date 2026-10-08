@@ -181,44 +181,13 @@ func Readings(s string) []string {
 	var parts []part
 	runes := []rune(strings.ToLower(s))
 	cardinalOnly := len(runes) > MaxPhraseRunes
-	digitsAt := func(from, n int) bool {
-		if from+n > len(runes) {
-			return false
-		}
-		for _, r := range runes[from : from+n] {
-			if !isASCIIDigit(r) {
-				return false
-			}
-		}
-		return true
-	}
 	for i := 0; i < len(runes); {
 		r := runes[i]
 		switch {
 		case isASCIIDigit(r):
-			j := i
-			for j < len(runes) && isASCIIDigit(runes[j]) {
-				j++
-			}
-			whole := string(runes[i:j])
-			grouped := false
-			if j-i <= 3 {
-				for j < len(runes) && runes[j] == ',' && digitsAt(j+1, 3) && !digitsAt(j+4, 1) {
-					whole += string(runes[j+1 : j+4])
-					j += 4
-					grouped = true
-				}
-			}
-			frac := ""
-			if j+1 < len(runes) && runes[j] == '.' && isASCIIDigit(runes[j+1]) {
-				k := j + 1
-				for k < len(runes) && isASCIIDigit(runes[k]) {
-					k++
-				}
-				frac = string(runes[j+1 : k])
-				j = k
-			}
-			i = j
+			num := ScanNumeral(runes, i)
+			i = num.End
+			whole, grouped, frac := num.Whole, num.Grouped, num.Fraction
 
 			alts := []string{NumberWords(whole)}
 			if !grouped && !cardinalOnly {
@@ -303,6 +272,65 @@ func codeSimilarity(a, b string) float64 {
 }
 
 func isASCIIDigit(r rune) bool { return r >= '0' && r <= '9' }
+
+// Numeral is one numeral scanned from text by ScanNumeral.
+type Numeral struct {
+	// Whole is the integer digits with any thousands separators removed.
+	Whole string
+	// Grouped reports whether Whole was written with thousands separators.
+	Grouped bool
+	// Fraction is the digits after a decimal point, "" when there is none.
+	Fraction string
+	// End is the rune index just past the numeral.
+	End int
+}
+
+// ScanNumeral reads the numeral starting at runes[i], which must be an ASCII
+// digit. The grammar, shared by Readings and internal/decide's tokenizer so
+// the two always agree on what one number is:
+//
+//	numeral  = digits [ groups ] [ "." digits ]
+//	groups   = ( "," d d d )+   only after 1-3 leading digits, and each
+//	                            group must not be followed by a 4th digit
+//
+// So "1,000", "12,345.67" and "3.5" are one numeral each, while "1,2,3",
+// "1,0000" and "1234,567" are not grouped (the comma ends the numeral). A
+// trailing "." not followed by a digit is not part of the numeral.
+func ScanNumeral(runes []rune, i int) Numeral {
+	digitsAt := func(from, n int) bool {
+		if from+n > len(runes) {
+			return false
+		}
+		for _, r := range runes[from : from+n] {
+			if !isASCIIDigit(r) {
+				return false
+			}
+		}
+		return true
+	}
+	j := i
+	for j < len(runes) && isASCIIDigit(runes[j]) {
+		j++
+	}
+	n := Numeral{Whole: string(runes[i:j])}
+	if j-i <= 3 {
+		for j < len(runes) && runes[j] == ',' && digitsAt(j+1, 3) && !digitsAt(j+4, 1) {
+			n.Whole += string(runes[j+1 : j+4])
+			j += 4
+			n.Grouped = true
+		}
+	}
+	if j+1 < len(runes) && runes[j] == '.' && isASCIIDigit(runes[j+1]) {
+		k := j + 1
+		for k < len(runes) && isASCIIDigit(runes[k]) {
+			k++
+		}
+		n.Fraction = string(runes[j+1 : k])
+		j = k
+	}
+	n.End = j
+	return n
+}
 
 // levenshtein is the classic two-row edit distance over runes.
 func levenshtein(a, b []rune) int {
