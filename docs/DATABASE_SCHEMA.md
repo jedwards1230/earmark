@@ -20,6 +20,7 @@ version is in `goose_db_version`.
 | 6 | `00006_asr_provenance_identity.sql` | runner-reported provenance on `transcripts` (`embedded_asin`, `asr_model_sha256`, `asr_runner_version`, `asr_params`) + partial index `transcripts_asr_unstamped_idx`; `book_metadata.asin_source` / `identity_status` |
 | 7 | `00007_fn_calls.sql` | `fn_calls` (pure-function call log + cache); partial unique `fn_calls_cache_key_idx`, `fn_calls_recipe_id_idx` |
 | 8 | `00008_finding_events.sql` | `finding_events` (append-only finding version history); transition triggers on `transcript_findings`; append-only guard; backfill of decided findings; `decide` arm of `stale_work` |
+| 9 | `00009_chunk_scan.sql` | `chunk_scan` (per-chunk System One quality scan); unique `(transcript_id, chunk_index, chunk_text_sha256, recipe_id)`, `chunk_scan_recipe_id_idx`; `scan` arm of `stale_work` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -458,6 +459,9 @@ stale; steps without a current recipe, human corrections and superseded findings
 Since migration 8 a `decide` arm lists findings whose latest unrevoked
 `finding_events` decision came from a recipe other than the current `decide`
 recipe.
+Since migration 9 a `scan` arm lists every chunk with no scan of its *current* text by a
+recipe equivalent to the current `scan` recipe (`earmark monitor` sets one when
+`AI_ROLES.scan` is bound).
 
 ### 10. `fn_calls` — Pure-function call log and cache (CONTRACT §1.9)
 
@@ -528,6 +532,38 @@ CREATE TABLE finding_events (
 --           finding_events_append_only (BEFORE UPDATE OR DELETE: raises unless cascade)
 ```
 
+### 12. `chunk_scan` — Chunk quality scan (CONTRACT §1.9 "Chunk scan")
+
+One row per (chunk position, chunk text hash, scan recipe), written by
+`earmark scan --yes`.
+
+```sql
+CREATE TABLE chunk_scan (
+    id                 BIGSERIAL   PRIMARY KEY,
+    transcript_id      UUID        NOT NULL REFERENCES transcripts (id) ON DELETE CASCADE,
+    chunk_index        INTEGER     NOT NULL,              -- >= 0
+    chunk_text_sha256  TEXT        NOT NULL,              -- sha256 of COALESCE(source_text, text) as scanned
+    recipe_id          TEXT        NOT NULL REFERENCES recipes (recipe_id),
+    fn_call_id         BIGINT      REFERENCES fn_calls (id),
+    p_needs_fix        FLOAT8      NOT NULL,              -- [0,1]
+    quality            FLOAT8      NOT NULL,              -- [1,5] = System One score + 1
+    quality_confidence FLOAT8,                            -- [0,1], NULL when not reported
+    p_boilerplate      FLOAT8      NOT NULL,
+    p_garbled          FLOAT8      NOT NULL,
+    p_dialogue         FLOAT8      NOT NULL,
+    issue_type         TEXT        NOT NULL,              -- six issue types or 'none'
+    issue_probs        JSONB       NOT NULL,              -- {label: p}
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (transcript_id, chunk_index, chunk_text_sha256, recipe_id)
+);
+-- index chunk_scan_recipe_id_idx: (recipe_id)
+```
+
+Insert-only (`ON CONFLICT DO NOTHING`, after re-hashing the chunk in the same
+statement); rows go only with their transcript. A row whose hash no longer
+matches the chunk describes replaced text and is ignored by the quality index
+and by `stale_work`.
+
 ## Relationships
 
 ```
@@ -540,6 +576,8 @@ transcript_findings (1) ←── finding_events (N, ON DELETE CASCADE)
         (1) ←── current_recipes (one per step)
         (1) ←── fn_calls (N, via nullable recipe_id)
 fn_calls (1) ←── fn_calls (N cache-hit rows, via cached_from)
+transcripts (1) ←── chunk_scan (N, ON DELETE CASCADE; addressed by chunk_index + text hash)
+recipes (1) ←── chunk_scan (N);  fn_calls (1) ←── chunk_scan (N, nullable fn_call_id)
 ```
 
 Cascade deletes propagate: deleting a job removes its transcript, all chunks,

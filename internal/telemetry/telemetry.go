@@ -73,6 +73,15 @@ type RecipeInfo struct {
 	PromptVersion string
 }
 
+// QualityIndex is one earmark_quality_index series: the normalized (0..1)
+// mean chunk-scan quality of one recipe over one scope (library,
+// asin_matched, unmatched).
+type QualityIndex struct {
+	Scope  string
+	Recipe string
+	Value  float64
+}
+
 // Telemetry owns the SDK providers. The zero value is not usable; build it
 // with Setup. All methods are safe on a disabled Telemetry.
 type Telemetry struct {
@@ -87,6 +96,7 @@ type Telemetry struct {
 	legacy  atomic.Pointer[prometheus.Gatherer]
 	recipes atomic.Pointer[[]RecipeInfo]
 	stale   atomic.Pointer[map[string]int64]
+	quality atomic.Pointer[[]QualityIndex]
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -231,6 +241,20 @@ func (t *Telemetry) registerInstruments() error {
 		})); err != nil {
 		return fmt.Errorf("earmark_stale_items: %w", err)
 	}
+	if _, err := m.Float64ObservableGauge("earmark_quality_index",
+		metric.WithDescription("Mean chunk-scan quality (CONTRACT §1.9 \"Chunk scan\") of each scan recipe, normalized to 0..1, over scope library | asin_matched | unmatched; boilerplate chunks excluded. Refreshed on a timer."),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			if q := t.quality.Load(); q != nil {
+				for _, p := range *q {
+					o.Observe(p.Value, metric.WithAttributes(
+						attribute.String("scope", p.Scope),
+						attribute.String("recipe", p.Recipe)))
+				}
+			}
+			return nil
+		})); err != nil {
+		return fmt.Errorf("earmark_quality_index: %w", err)
+	}
 	return nil
 }
 
@@ -284,23 +308,50 @@ func (t *Telemetry) SetRecipes(rs []RecipeInfo) {
 // (and once immediately) until Shutdown. Each refresh is bounded by timeout; a
 // failed refresh keeps the previous values and is logged.
 func (t *Telemetry) StartStaleRefresh(interval, timeout time.Duration, count func(context.Context) (map[string]int64, error)) {
-	if t == nil || t.disabled || count == nil {
+	if count == nil {
 		return
 	}
-	refresh := func() {
+	t.startRefresh("earmark_stale_items", interval, timeout, func(ctx context.Context) error {
+		n, err := count(ctx)
+		if err == nil {
+			t.stale.Store(&n)
+		}
+		return err
+	})
+}
+
+// StartQualityRefresh refreshes earmark_quality_index from load every
+// interval (and once immediately) until Shutdown, like StartStaleRefresh.
+func (t *Telemetry) StartQualityRefresh(interval, timeout time.Duration, load func(context.Context) ([]QualityIndex, error)) {
+	if load == nil {
+		return
+	}
+	t.startRefresh("earmark_quality_index", interval, timeout, func(ctx context.Context) error {
+		q, err := load(ctx)
+		if err == nil {
+			t.quality.Store(&q)
+		}
+		return err
+	})
+}
+
+// startRefresh runs refresh now and every interval until Shutdown, each run
+// bounded by timeout. A failed run is logged and leaves the previous values.
+func (t *Telemetry) startRefresh(name string, interval, timeout time.Duration, refresh func(context.Context) error) {
+	if t == nil || t.disabled {
+		return
+	}
+	run := func() {
 		ctx, cancel := context.WithTimeout(t.runCtx, timeout)
 		defer cancel()
-		n, err := count(ctx)
-		if err != nil {
-			logger.Warn("earmark_stale_items refresh failed (keeping previous values)", "error", err)
-			return
+		if err := refresh(ctx); err != nil {
+			logger.Warn(name+" refresh failed (keeping previous values)", "error", err)
 		}
-		t.stale.Store(&n)
 	}
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
-		refresh()
+		run()
 		tick := time.NewTicker(interval)
 		defer tick.Stop()
 		for {
@@ -308,7 +359,7 @@ func (t *Telemetry) StartStaleRefresh(interval, timeout time.Duration, count fun
 			case <-t.stop:
 				return
 			case <-tick.C:
-				refresh()
+				run()
 			}
 		}
 	}()

@@ -1129,6 +1129,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 6 | `00006_asr_provenance_identity.sql` | Runner-reported provenance + `embedded_asin` on `transcripts`; `asin_source` / `identity_status` on `book_metadata` (§1.2, §1.6, §1.9). |
 | 7 | `00007_fn_calls.sql` | `fn_calls` — the pure-function call log and cache, with the partial unique cache index `fn_calls_cache_key_idx` and `fn_calls_recipe_id_idx` (§1.9 "Pure-function calls"). New table only. |
 | 8 | `00008_finding_events.sql` | `finding_events` — the append-only finding version history (§2.17 "Version history"): transition triggers on `transcript_findings` (every `patch_state` change, and every insert not in `proposed`), an append-only guard, a backfill of one transition per already-decided finding, and the `decide` arm of `stale_work` (§1.9). No ALTER on `transcript_findings`; `CREATE TRIGGER` blocks its writers until the migration commits (`lock_timeout` 5s). |
+| 9 | `00009_chunk_scan.sql` | `chunk_scan` — per-chunk System One quality scan results, unique per (transcript, chunk index, chunk text sha256, recipe), `ON DELETE CASCADE` with the transcript; the `scan` arm of `stale_work` (§1.9 "Chunk scan"). New table plus a view replacement; no ALTER. Its `stale_work` restates every earlier arm, 8's `decide` arm included. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1291,7 +1292,9 @@ records what actually ran. `asr` still has no **current** recipe: the Go side
 cannot know the runner's configuration before it reports, so asr rows are not
 yet reported stale.
 
-**Current steps.** `propose`: `step_version` 1, prompt `judge@v1` + sha256 of
+**Current steps.** `scan` (when `AI_ROLES.scan` is bound): the `scan_chunk`
+function's recipe (§1.9 "Chunk scan") with the expected model answering.
+`propose`: `step_version` 1, prompt `judge@v1` + sha256 of
 (system prompt, user template, response JSON schema), params `temperature`
 (**only when it is sent** — omitted for hosted routes unless configured, §2.15
 "Request parameters"), `min_confidence`, `max_findings_per_chunk`. `max_tokens`
@@ -1318,8 +1321,8 @@ every chunk into the HNSW index).
 
 **Current recipes and `stale_work`.** `current_recipes(step PK, recipe_id,
 updated_at)` holds the recipe each step would use now; the ingest process
-(`earmark monitor`) upserts the `embed` and (when an eval endpoint is
-configured) `propose` rows at startup — one writer, so an ad-hoc `earmark eval`
+(`earmark monitor`) upserts the `embed`, (when an eval endpoint is
+configured) `propose`, and (when `AI_ROLES.scan` is bound) `scan` rows at startup — one writer, so an ad-hoc `earmark eval`
 with other settings stamps its own findings without redefining "current".
 The `stale_work` view lists `(step, source_table, row_id, recipe_id,
 current_recipe_id)` for every output row whose recipe is not equivalent to its
@@ -1336,6 +1339,15 @@ migration 8 the view also has a **`decide`** arm (`source_table` =
 was made by a recipe not equivalent to the current `decide` recipe. Findings
 no recipe ever decided are not listed (they are undecided, not stale), nor
 are superseded ones.
+Since
+migration 9 the view also has a **`scan`** arm (`source_table` =
+`transcript_chunks`, `recipe_id` = the chunk's latest scan's recipe, NULL when
+never scanned): a chunk is listed when **no** `chunk_scan` row of its
+**current** text (`chunk_text_sha256` = sha256 of `COALESCE(source_text,
+text)`) was made by a recipe equivalent to the current `scan` recipe — never
+scanned, scanned before a rebuild changed its text, or scanned only under
+another recipe. With a current scan recipe and an unscanned library that is
+every chunk (≈40k on production): true, not noise.
 `earmark_stale_items{step}` (§2.16) counts it per step.
 
 **Expect a large `stale_work` right after the first deploy.** Every legacy row
@@ -1417,7 +1429,11 @@ CREATE INDEX fn_calls_recipe_id_idx ON fn_calls (recipe_id, created_at);
   pinned alias as `model_alias`, the reply's model as `model_resolved`, the
   prompt version and hash, and the function's params plus `"fn": <name>` (so
   two functions of a step never share a recipe). A cache hit carries the
-  served row's recipe.
+  served row's recipe. A reply naming the expected model with only a route
+  prefix or other case (`typesafe/jev-1.13.0` for `jev-1.13.0`, the
+  `genai.SameModel` comparison serving uses) is recorded as the expected
+  model, so one model has one recipe — the current one; `fn_calls.model_resolved`
+  keeps the reply's spelling.
 - **Pinned models only.** A function refuses an alias that can move under the
   same name — `*-latest`, `*-preview`, `:latest`, or an id with no dotted
   version (`jev-latest` is refused, `jev-1.13.0` accepted); a `systemone`
@@ -1425,6 +1441,97 @@ CREATE INDEX fn_calls_recipe_id_idx ON fn_calls (recipe_id, created_at);
 - `recipe_id` is the call's recipe, registered (insert-if-absent) before the
   row is written. No prompt or completion text is stored outside `input` /
   `output`.
+
+#### Chunk scan — `chunk_scan`
+
+`earmark scan` (`internal/scan`, function `scan_chunk`, prompt
+`scan_chunk@v1`, step `scan`, `step_version` 1) puts each chunk's pristine
+text to System One in **one** call of six questions, through `internal/fn`
+(so every call is a `fn_calls` row and a repeat is served from it):
+
+| Question | Type | Stored as |
+|---|---|---|
+| `needs_fix` | noul | `p_needs_fix` |
+| `quality` | score, 5 levels (0 = unusable … 4 = clean) | `quality` = score + 1 (1..5); its `confidence` → `quality_confidence` |
+| `boilerplate` | noul — credits, copyright, announcements, ads | `p_boilerplate` |
+| `garbled` | noul — word salad, loops | `p_garbled` |
+| `dialogue` | noul — mostly dialogue vs narration | `p_dialogue` |
+| `issue_type` | choice over `misheard_proper_noun`, `misheard_word`, `repeated_text`, `number_artifact`, `homophone`, `dropped_word`, `none` | `issue_type` (the choice) + `issue_probs` (its probabilities) |
+
+- **State.** The pristine text (`COALESCE(source_text, text)`) under a
+  `TEXT TO JUDGE` header, with up to `--context` (default 2, max 5)
+  neighbouring transcript segments on each side under headers marked
+  *context only — do not judge* (segments ending at or before the chunk's
+  start, starting at or after its end; §1.2.1). Every question restates that
+  the text is lowercase ASR output with no punctuation and that only the
+  judged section counts. The function input — the cache key — is
+  `{"text", "context_before", "context_after"}`; the questions and the state
+  layout are the prompt hash; the context width is a recipe param
+  (`context_segments`), so a different width is a different recipe.
+- **Strict mapping.** A reply missing any of the six answers, answering with
+  another type, a score outside 0..4, a choice or probability label outside
+  the set, or a choice with no probabilities is an error: logged in
+  `fn_calls` with `error_class = 'invalid_reply'` (never cached) and no
+  `chunk_scan` row. `quality_confidence` is the one optional field (NULL when
+  the reply has none).
+- **Fallback replies** (another model answered, §1.9 `fn_calls`) are logged
+  but not written: they belong to another recipe.
+
+```sql
+CREATE TABLE chunk_scan (
+    id                 BIGSERIAL   PRIMARY KEY,
+    transcript_id      UUID        NOT NULL REFERENCES transcripts (id) ON DELETE CASCADE,
+    chunk_index        INTEGER     NOT NULL CHECK (chunk_index >= 0),
+    chunk_text_sha256  TEXT        NOT NULL CHECK (chunk_text_sha256 ~ '^[0-9a-f]{64}$'), -- the text the model saw
+    recipe_id          TEXT        NOT NULL REFERENCES recipes (recipe_id),
+    fn_call_id         BIGINT      REFERENCES fn_calls (id),  -- NULL only if a concurrent identical call won the cache row
+    p_needs_fix        FLOAT8      NOT NULL,                  -- [0,1]
+    quality            FLOAT8      NOT NULL,                  -- [1,5]
+    quality_confidence FLOAT8,                                -- [0,1]
+    p_boilerplate      FLOAT8      NOT NULL,
+    p_garbled          FLOAT8      NOT NULL,
+    p_dialogue         FLOAT8      NOT NULL,
+    issue_type         TEXT        NOT NULL,                  -- one of the seven labels above
+    issue_probs        JSONB       NOT NULL,                  -- {label: p}
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (transcript_id, chunk_index, chunk_text_sha256, recipe_id)
+);
+CREATE INDEX chunk_scan_recipe_id_idx ON chunk_scan (recipe_id);
+```
+
+- **Reads only; writes `chunk_scan` (and `fn_calls`).** The scan never
+  touches `transcript_chunks`, `transcripts` or findings.
+- **Dry-run unless `--yes`.** Without it the model calls are still made (and
+  paid for once) and cached in `fn_calls`, but nothing is written to
+  `chunk_scan`; a following `--yes` over the same chunks is served from the
+  cache.
+- **Write.** Model calls run outside any transaction (`--concurrency`,
+  default 8). Each result is one statement (`db.InsertChunkScan`): it re-hashes
+  the chunk's pristine text in the same snapshot and inserts only when it
+  still matches `chunk_text_sha256` (else *changed*: nothing written, the
+  next run picks the new text up), `ON CONFLICT` on the unique key `DO
+  NOTHING` (*exists*). Rows are never updated; they go only with their
+  transcript (a requeue).
+- **Selection.** Chunks whose current text has no scan by the run's recipe:
+  `--sample N` picks N in an order fixed by `--seed` (same seed, same
+  library → same chunks); otherwise every candidate in `(transcript_id,
+  chunk_index)` keyset pages, capped by `--limit`; `--book` filters by path
+  substring.
+- **Recipe.** Registered once at startup (`recipes`, insert-if-absent); the
+  current `scan` recipe is set only by `earmark monitor` (single writer). A
+  reply naming the model with a route prefix (`typesafe/jev-1.13.0`) answers
+  under the run's own recipe (§1.9 `fn_calls` "Recipe"); no `MODELS_FILE`
+  pin is needed for that. The run reports answers stamped with any other
+  recipe (a cache hit from a call made under other settings) as *other
+  recipe*.
+- **GPU gate.** None: System One is hosted, so `earmark scan` ignores
+  `runner_control.phase`.
+- **Quality index.** `earmark_quality_index{scope,recipe}` (§2.16) is, per
+  recipe, the mean `quality` over chunks whose **current** text it scanned,
+  excluding `p_boilerplate > 0.5`, normalized to 0..1 as `(mean − 1) / 4`
+  and weighted by chunk. `scope` is `library` (all), `asin_matched` (the
+  chunk's book has a `book_metadata` row with a non-empty `asin`; §1.6 clears
+  it on a conflict) or `unmatched`. A scope with no chunks has no series.
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
@@ -3035,7 +3142,8 @@ The Prometheus exporter emits no `target_info` and no `otel_scope_*` labels:
 the series below are the whole addition to `/metrics`.
 
 OpenTelemetry instruments (Prometheus names; the cardinality rule holds —
-labels are only step, recipe, model, fn, outcome; book, ASIN and chunk ids go
+labels are only step, recipe, model, fn, outcome and the three-value quality
+scope (`library` · `asin_matched` · `unmatched`); book, ASIN and chunk ids go
 on spans and logs, never labels):
 
 | Metric | Type | Labels | Meaning |
@@ -3043,6 +3151,7 @@ on spans and logs, never labels):
 | `earmark_build_info` | gauge = 1 | `version`, `commit` | The running build. |
 | `earmark_recipe_info` | gauge = 1 | `step`, `recipe`, `model`, `revision`, `prompt_version` | One per step in `current_recipes` (§1.9), loaded by the ingest pod at startup after it registers them. |
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
+| `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
 | `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 
 **Traces.** Each judge call is one `chat <model>` client span following the
@@ -3752,6 +3861,8 @@ steps:
     alias: jev-1.13.0
     params:
       usd_per_mtok_in: 0.042     # cost estimate when the gateway reports none
+  scan:                          # AI_ROLES.scan — `earmark scan` (§1.9 "Chunk scan")
+    alias: jev-1.13.0
 ```
 
 | Key | Meaning |

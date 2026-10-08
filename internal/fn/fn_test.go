@@ -134,6 +134,15 @@ func TestRecipe(t *testing.T) {
 	if a == b || a == fb {
 		t.Error("function name / resolved model do not change the recipe")
 	}
+
+	// A route prefix or case on the expected model is the same model: one
+	// recipe, the current one.
+	for _, spelled := range []string{"typesafe/jev-1.13.0", " JEV-1.13.0 ", "litellm/typesafe/jev-1.13.0"} {
+		r := f.Recipe(spelled)
+		if id, _ := r.ID(); id != a || r.ModelResolved != "jev-1.13.0" {
+			t.Errorf("Recipe(%q) = %s / %q, want the expected model's recipe %s", spelled, id, r.ModelResolved, a)
+		}
+	}
 }
 
 // ─── Invoke ──────────────────────────────────────────────────────────────────
@@ -385,6 +394,12 @@ func TestInvokeFallbackIsStoredButNeverServed(t *testing.T) {
 	_, meta2, err := f.Invoke(context.Background(), store, input(), right)
 	if err != nil || meta2.CacheHit || meta2.Fallback || *m != 1 || *n != 1 || meta2.CallID == 0 {
 		t.Fatalf("after fallback = %+v, %v (fallback calls %d, right calls %d)", meta2, err, *n, *m)
+	}
+	if wantRID, _ := f.Recipe("").ID(); meta2.RecipeID != wantRID {
+		t.Errorf("a route-prefixed reply got recipe %s, want the expected model's %s", meta2.RecipeID, wantRID)
+	}
+	if got := store.rows[len(store.rows)-1].ModelResolved; got != "typesafe/jev-1.13.0" {
+		t.Errorf("fn_calls.model_resolved = %q; the reply's spelling must be kept", got)
 	}
 	want := map[string]int64{"should_apply|jev-1.13.0|fallback": 1, "should_apply|jev-1.13.0|ok": 1}
 	if got := modelCalls(t, reader); fmt.Sprint(got) != fmt.Sprint(want) {
