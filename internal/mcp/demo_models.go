@@ -182,7 +182,7 @@ func (d demoDB) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) 
 			PromptVersion: "judge@v1", Revision: "20251001", StepVersion: 1, ModelAlias: demoJudgeAlias,
 			ModelResolved: demoJudgeModel, PromptSHA: "c0ffee", UpdatedAt: proposeSince},
 		{Step: recipe.StepDecide, RecipeID: demoRecipeID(recipe.StepDecide), Model: demoJevModel,
-			PromptVersion: "should_apply@v2", StepVersion: 2, ModelAlias: demoJevModel,
+			PromptVersion: "should_apply@v3b", StepVersion: 3, ModelAlias: demoJevModel,
 			ModelResolved: demoJevModel, PromptSHA: "5e1ec7", UpdatedAt: now.Add(-2 * 24 * time.Hour)},
 		{Step: recipe.StepScan, RecipeID: demoRecipeID(recipe.StepScan), Model: demoJevModel,
 			PromptVersion: "scan_chunk@v1", StepVersion: 1, ModelAlias: demoJevModel,

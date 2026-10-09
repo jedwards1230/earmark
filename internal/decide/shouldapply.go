@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,12 +23,12 @@ import (
 // both.
 const (
 	ShouldApplyName          = "should_apply"
-	ShouldApplyPromptVersion = "should_apply@v2"
+	ShouldApplyPromptVersion = "should_apply@v3b"
 	// ShouldApplyModel is the pinned decision model. Never an alias.
 	ShouldApplyModel = "jev-1.13.0"
 	// ShouldApplyStepVersion is bumped when the decide logic around the call
 	// changes (context building, evidence, the decision rule).
-	ShouldApplyStepVersion = 2
+	ShouldApplyStepVersion = 3
 	// questionKey is the System One question name.
 	questionKey = "should_apply"
 )
@@ -66,30 +67,34 @@ const (
 // shouldApplyQuestion is the one question asked. Its canonical JSON is hashed,
 // with the state layout, into PromptSHA256; a golden test pins the hash.
 //
-// v2 (should_apply@v2) asks a question the text can settle — is ORIGINAL wrong
-// where it stands, and does PROPOSED restore what was said — instead of v1's
-// "did the narrator say it", which a model that never hears the audio can only
-// hedge on. It says what the text is (ASR: lowercase, unpunctuated by design),
-// that the error class is mishearing, that narrators also repeat words on
-// purpose, how names relate to the book reference, and what applying means.
-// The criteria are balanced, and uncertainty is left to the hold band rather
-// than named as a reason for false (a reject is final). The text evidence the
-// apply rule requires is deliberately NOT stated in the state: telling the
-// model would raise p on exactly the findings the evidence gate lets through,
-// so the two keys of the apply rule would no longer be independent.
+// v3b is v3a plus one computed line, SOUND-ALIKE: rung 0's phonetic score of
+// the changed words (soundAlikeScore), on substitutions only. It is not the
+// text evidence the apply rule keys on, and it is the same number whatever
+// the evidence, so the rule's two keys stay independent.
+//
+// v2 (should_apply@v2) asked a question the text can settle — is ORIGINAL
+// wrong where it stands, and does PROPOSED restore what was said — instead of
+// v1's "did the narrator say it", which a model that never hears the audio can
+// only hedge on. v3a keeps that question at ~60% of v2's text (the question is
+// most of a call's input): what the text is (ASR, lowercase and unpunctuated
+// by design), what the edit does, the error class (mishearing, stray repeats),
+// and that the book reference spells names. The criteria name what the
+// labelled backlog shows Jev should refuse — restyling (spelling variants,
+// number forms, tense, rewording) of a wording that already fits — and leave
+// uncertainty to the hold band rather than naming it as a reason for false (a
+// reject is final). The text evidence the apply rule requires is deliberately
+// NOT stated in the state: telling the model would raise p on exactly the
+// findings the evidence gate lets through, so the two keys of the apply rule
+// would no longer be independent.
 var shouldApplyQuestion = systemone.Question{
 	Type: systemone.TypeNoul,
-	Instructions: "An audiobook's speech-recognition (ASR) transcript is lowercase and unpunctuated by design; ignore capitals and punctuation. " +
-		"A reviewer proposes one edit: replace the [[ ]] words of ORIGINAL with the [[ ]] words of PROPOSED; applying it rewrites the stored transcript. " +
-		"BEFORE and AFTER are neighbouring transcript. ASR mostly mishears words as similar-sounding ones and sometimes repeats one, " +
-		"but narrators also say unusual names, rare words and deliberate repeats (\"had had\", \"that that\", \"no no\"). " +
-		"BOOK REFERENCE quotes the publisher's record: names are spelled as there, but a word missing from it is not evidence either way. " +
-		"From the text alone: is ORIGINAL wrong where it stands, and does PROPOSED restore what was said?",
+	Instructions: "Audiobook ASR transcript, lowercase and unpunctuated by design. " +
+		"The edit replaces the [[ ]] words of ORIGINAL with those of PROPOSED. " +
+		"ASR mishears words as similar-sounding ones and sometimes repeats one; SOUND-ALIKE (0-1) rates how alike the changed words sound; BOOK REFERENCE spells the book's names. " +
+		"Is ORIGINAL wrong where it stands, and does PROPOSED restore what was said?",
 	Criteria: map[string]string{
-		"true": "ORIGINAL makes little sense, is ungrammatical, or garbles a name in context, " +
-			"and PROPOSED sounds like it and reads naturally with BEFORE and AFTER.",
-		"false": "ORIGINAL makes sense as it stands, or PROPOSED sounds different, " +
-			"says something the context does not support, or contradicts the book reference.",
+		"true":  "ORIGINAL is a garbled word, a misspelt name or a stray repeat, and PROPOSED sounds like it and fits BEFORE and AFTER.",
+		"false": "ORIGINAL is real wording that fits, or PROPOSED only restyles it (spelling variant, number form, tense, rewording), sounds different, or contradicts the book reference.",
 	},
 }
 
@@ -100,6 +105,7 @@ const (
 	labelIssueType = "ISSUE TYPE"
 	labelOriginal  = "ORIGINAL"
 	labelProposed  = "PROPOSED"
+	labelSound     = "SOUND-ALIKE"
 	labelBefore    = "BEFORE"
 	labelAfter     = "AFTER"
 	labelReference = "BOOK REFERENCE"
@@ -108,7 +114,7 @@ const (
 )
 
 var stateLayout = []string{
-	labelIssueType, labelOriginal, labelProposed, labelBefore, labelAfter, labelReference, emptyBlock, linePrefix,
+	labelIssueType, labelOriginal, labelProposed, labelSound, labelBefore, labelAfter, labelReference, emptyBlock, linePrefix,
 }
 
 // ShouldApplyPromptSHA256 is the hex sha256 (recipe.PromptSHA256) of the
@@ -341,7 +347,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) Outcome {
 	chunk := in.Chunk
 	chunk.Text = c.ChunkText
 	state := BuildState(c.IssueType, BuildContext(in.Segments, chunk, v.Span, c.Replacement),
-		Relevant(sentences, c.Original, c.Replacement))
+		soundAlikeLine(v), Relevant(sentences, c.Original, c.Replacement))
 
 	unavailable := func(class string) Outcome {
 		out.Decision, out.Reason, out.Retryable, out.P = DecisionHold, ReasonJevUnavailable, true, nil
@@ -441,10 +447,44 @@ func decodeShouldApply(raw json.RawMessage) (float64, error) {
 	return *a.Noul, nil
 }
 
+// soundAlikeEvidence is how rung 0's checkSubstitution opens a verdict's
+// Evidence: "soundalike 0.917 (threshold 0.67): …".
+const soundAlikeEvidence = "soundalike "
+
+// soundAlikeScore reads rung 0's phonetic score of the changed words back from
+// a passing verdict's Evidence. Only substitutions carry one; ok is false for
+// every other verdict (repeats, insertions, failures) and for anything that
+// does not parse to a score in [0, 1]. A test pins this against Check, so a
+// rung-0 change to the Evidence wording fails loudly rather than silently
+// dropping the line.
+func soundAlikeScore(v Verdict) (score float64, ok bool) {
+	rest, found := strings.CutPrefix(v.Evidence, soundAlikeEvidence)
+	if !v.Pass || !found {
+		return 0, false
+	}
+	num, _, _ := strings.Cut(rest, " ")
+	f, err := strconv.ParseFloat(num, 64)
+	if err != nil || math.IsNaN(f) || f < 0 || f > 1 {
+		return 0, false
+	}
+	return f, true
+}
+
+// soundAlikeLine is the SOUND-ALIKE block's text: the score to two decimals,
+// or "" (block omitted) when the verdict has none.
+func soundAlikeLine(v Verdict) string {
+	f, ok := soundAlikeScore(v)
+	if !ok {
+		return ""
+	}
+	return strconv.FormatFloat(f, 'f', 2, 64)
+}
+
 // BuildState renders the labelled state text the model is asked about. It is
 // deterministic — the same inputs give byte-identical state, which is what
-// makes the fn_calls cache hit.
-func BuildState(issueType string, c Context, record []RecordSentence) string {
+// makes the fn_calls cache hit. soundAlike is the SOUND-ALIKE block's text;
+// "" omits the block.
+func BuildState(issueType string, c Context, soundAlike string, record []RecordSentence) string {
 	var b strings.Builder
 	block := func(label, text string) {
 		if strings.TrimSpace(text) == "" {
@@ -458,6 +498,9 @@ func BuildState(issueType string, c Context, record []RecordSentence) string {
 	block(labelIssueType, issueType)
 	block(labelOriginal, c.Original)
 	block(labelProposed, c.Corrected)
+	if soundAlike != "" {
+		block(labelSound, soundAlike)
+	}
 	block(labelBefore, c.Before)
 	block(labelAfter, c.After)
 	var lines []string

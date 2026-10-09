@@ -3,6 +3,7 @@ package decide
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -15,26 +16,34 @@ import (
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/fn"
 	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/systemone"
+	"github.com/jedwards1230/earmark/internal/tokenizer"
 )
 
 // The prompt hash (question + state layout) is the cache key's prompt
 // component: any edit to the instructions, criteria or state labels must show
 // up here, together with a bump of ShouldApplyPromptVersion.
 func TestShouldApplyPromptPinned(t *testing.T) {
-	const want = "a9e3774cb9a83e60baf5d70f42e9f01bde73d94581a051b33c12e8746e098699"
+	const want = "84baa0d87023c719b2f4b07ca2c682df1e0709be84f7b9811f9a95dd0c25da16"
 	if ShouldApplyPromptSHA256 != want {
 		t.Errorf("ShouldApplyPromptSHA256 = %s, want %s — bump ShouldApplyPromptVersion when the question changes", ShouldApplyPromptSHA256, want)
 	}
-	if ShouldApplyPromptVersion != "should_apply@v2" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 2 {
+	if ShouldApplyPromptVersion != "should_apply@v3b" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 3 {
 		t.Errorf("identity changed: %s %s step %d", ShouldApplyPromptVersion, ShouldApplyModel, ShouldApplyStepVersion)
 	}
-	// v1's hash (the question's canonical JSON alone) must never come back:
-	// cached v1 answers would be served for v2 states.
-	if ShouldApplyPromptSHA256 == "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f" {
-		t.Error("prompt hash equals should_apply@v1's")
+	// An earlier prompt's hash must never come back: its cached answers would
+	// be served for this prompt's states.
+	for version, old := range map[string]string{
+		"should_apply@v1":  "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f",
+		"should_apply@v2":  "a9e3774cb9a83e60baf5d70f42e9f01bde73d94581a051b33c12e8746e098699",
+		"should_apply@v3a": "ead8aff28d2ba53fdc1c2aa68dd6c2089142a7f23e554beab17eafb1533e168d",
+	} {
+		if ShouldApplyPromptSHA256 == old {
+			t.Errorf("prompt hash equals %s's", version)
+		}
 	}
 }
 
@@ -68,14 +77,19 @@ func TestBuildStateGolden(t *testing.T) {
 	want := "ISSUE TYPE:\nmisheard_proper_noun\n\n" +
 		"ORIGINAL:\nthe dish at [[auto sebo]] picked\n\n" +
 		"PROPOSED:\nthe dish at [[Arecibo]] picked\n\n" +
+		"SOUND-ALIKE:\n0.92\n\n" +
 		"BEFORE:\nprevious chunk words\n\n" +
 		"AFTER:\n(none)\n\n" +
 		"BOOK REFERENCE:\n- chapter: The Arecibo Message\n"
-	if got := BuildState(IssueMisheardProperNoun, c, recs); got != want {
+	if got := BuildState(IssueMisheardProperNoun, c, "0.92", recs); got != want {
 		t.Errorf("state:\n%s\nwant:\n%s", got, want)
 	}
-	if got := BuildState(IssueMisheardWord, c, nil); !strings.HasSuffix(got, "BOOK REFERENCE:\n(none)\n") {
+	got := BuildState(IssueMisheardWord, c, "", nil)
+	if !strings.HasSuffix(got, "BOOK REFERENCE:\n(none)\n") {
 		t.Errorf("empty reference: %q", got)
+	}
+	if strings.Contains(got, "SOUND-ALIKE") {
+		t.Errorf("no score must omit the SOUND-ALIKE block: %q", got)
 	}
 }
 
@@ -103,7 +117,7 @@ func TestStateOmitsEvidence(t *testing.T) {
 		if !out.Asked || out.Evidence != want {
 			t.Fatalf("want an asked %s finding, got %+v", want, out)
 		}
-		for _, leak := range []string{out.Evidence, "evidence", "verbatim", "exact repeat", "soundalike", "sound-alike", "checks"} {
+		for _, leak := range []string{out.Evidence, "evidence", "verbatim", "exact repeat", "asin", "checks"} {
 			if strings.Contains(strings.ToLower(seen.State), strings.ToLower(leak)) {
 				t.Errorf("state leaks %q (evidence %s):\n%s", leak, out.Evidence, seen.State)
 			}
@@ -451,5 +465,105 @@ func TestEvaluatorRecipe(t *testing.T) {
 	}
 	if err := r.Validate(); err != nil {
 		t.Error(err)
+	}
+}
+
+// The question is most of a call's input (the state averages ~720 characters
+// live), so its size is a cost guard: v2's question was 239 cl100k tokens and
+// v3a cut it to 161; v3b's SOUND-ALIKE sentence brings it to 178. Growing it
+// past the budget needs a measured reason.
+func TestShouldApplyQuestionBudget(t *testing.T) {
+	const budget = 180
+	canon, _, err := fn.CanonicalInput(map[string]systemone.Question{questionKey: shouldApplyQuestion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := tokenizer.CountTokens(string(canon))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > budget {
+		t.Errorf("should_apply question is %d cl100k tokens, budget %d", n, budget)
+	}
+}
+
+// soundAlikeScore parses rung 0's Evidence text: pin it against Check itself,
+// so a change to that wording breaks here rather than silently dropping the
+// SOUND-ALIKE line.
+func TestSoundAlikeScoreFromCheck(t *testing.T) {
+	const chunk = "he said the the cat sat"
+	tests := []struct {
+		name   string
+		c      Candidate
+		wantOK bool
+	}{
+		{"substitution", cand("f1", IssueMisheardProperNoun, radioChunk, "auto sebo", "Arecibo", 0.9), true},
+		{"homophone", cand("f2", IssueHomophone, "they went to there house", "there", "their", 0.9), true},
+		{"repeat", cand("f3", IssueRepeatedText, chunk, "the the cat", "the cat", 0.9), false},
+		{"insertion", cand("f4", IssueDroppedWord, chunk, "said the", "said that the", 0.9), false},
+		{"failed", cand("f5", IssueMisheardWord, radioChunk, "signal", "banana", 0.9), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Check(tc.c, DefaultParams())
+			score, ok := soundAlikeScore(v)
+			if ok != tc.wantOK {
+				t.Fatalf("soundAlikeScore(%+v) ok = %v, want %v", v, ok, tc.wantOK)
+			}
+			if !ok {
+				if soundAlikeLine(v) != "" {
+					t.Errorf("no score but line %q", soundAlikeLine(v))
+				}
+				return
+			}
+			if !v.Pass || score < DefaultParams().SoundAlikeThreshold || score > 1 {
+				t.Errorf("score %v from %+v", score, v)
+			}
+			if want := fmt.Sprintf("%.2f", score); soundAlikeLine(v) != want {
+				t.Errorf("line %q, want %q", soundAlikeLine(v), want)
+			}
+		})
+	}
+	for _, ev := range []string{"soundalike x (threshold 0.67)", "soundalike 1.5 (threshold 0.67)", "soundalike NaN (", "exact repeat: \"the\" ×2 → ×1"} {
+		if _, ok := soundAlikeScore(Verdict{Pass: true, Evidence: ev}); ok {
+			t.Errorf("parsed %q", ev)
+		}
+	}
+	if _, ok := soundAlikeScore(Verdict{Evidence: "soundalike 0.500 (threshold 0.67): a vs b"}); ok {
+		t.Error("a failed verdict's score must not be shown")
+	}
+}
+
+// The SOUND-ALIKE line is a rung-0 fact about the edit, not the text
+// evidence: the same finding gets the same line whether or not the book
+// reference carries the replacement (asin_verbatim vs none).
+func TestSoundAlikeIndependentOfEvidence(t *testing.T) {
+	var states []string
+	j := &fakeJev{}
+	j.reply = func(w http.ResponseWriter, req systemone.Request) {
+		states = append(states, req.State)
+		noul(0.5, "jev-1.13.0")(w, req)
+	}
+	e, _ := newTestEvaluator(t, j)
+	with := radioInput(IssueMisheardProperNoun, "auto sebo", "Arecibo")
+	without := with
+	without.Record = nil
+	var evidence []string
+	for _, in := range []Input{with, without} {
+		evidence = append(evidence, e.Evaluate(context.Background(), in).Evidence)
+	}
+	if evidence[0] != EvidenceASINVerbatim || evidence[1] != EvidenceNone || len(states) != 2 {
+		t.Fatalf("want asin_verbatim then none over 2 calls, got %v (%d calls)", evidence, len(states))
+	}
+	line := func(s string) string {
+		_, rest, ok := strings.Cut(s, "SOUND-ALIKE:\n")
+		if !ok {
+			t.Fatalf("state lacks SOUND-ALIKE:\n%s", s)
+		}
+		v, _, _ := strings.Cut(rest, "\n")
+		return v
+	}
+	if a, b := line(states[0]), line(states[1]); a != b {
+		t.Errorf("SOUND-ALIKE differs with evidence: %q vs %q", a, b)
 	}
 }

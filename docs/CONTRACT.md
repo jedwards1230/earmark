@@ -3987,8 +3987,8 @@ an error: every failure after rung 0 is a retryable `hold`.
      include at least one non-stopword of ≥ 4 characters;
    - `none` — anything else, including every finding of a book with no
      reference.
-5. **Model call** — `fn` `should_apply`, step `decide` (`step_version` 2),
-   prompt `should_apply@v2`, model pinned to `jev-1.13.0`, through `internal/fn`
+5. **Model call** — `fn` `should_apply`, step `decide` (`step_version` 3),
+   prompt `should_apply@v3b`, model pinned to `jev-1.13.0`, through `internal/fn`
    (logged and cached in `fn_calls`, §1.9) and the System One client (§2.14).
    One `noul` question named `should_apply` with explicit `true`/`false`
    criteria. The prompt hash is `recipe.PromptSHA256` of the question's
@@ -3998,27 +3998,30 @@ an error: every failure after rung 0 is a retryable `hold`.
    answers to an older prompt are never served).
 
    The question tells the model the text is an audiobook's ASR transcript,
-   lowercase and unpunctuated by design (capitals and punctuation are ignored);
-   that the edit replaces the `[[ ]]` words of ORIGINAL with those of PROPOSED
-   and that applying it rewrites the stored transcript; that ASR mostly mishears
-   words as similar-sounding ones and sometimes repeats one, while narrators
-   also say unusual names, rare words and deliberate repeats; and that names
-   are spelled as the book reference spells them, though a word missing from
-   it is not evidence either way. It asks a question the text can settle — *is
+   lowercase and unpunctuated by design; that the edit replaces the `[[ ]]`
+   words of ORIGINAL with those of PROPOSED; that ASR mishears words as
+   similar-sounding ones and sometimes repeats one; that SOUND-ALIKE (0–1)
+   rates how alike the changed words sound; and that the book reference
+   spells the book's names. It asks a question the text can settle — *is
    ORIGINAL wrong where it stands, and does PROPOSED restore what was said?*:
 
    | Criterion | Text |
    |---|---|
-   | `true` | ORIGINAL makes little sense, is ungrammatical, or garbles a name in context, and PROPOSED sounds like it and reads naturally with BEFORE and AFTER. |
-   | `false` | ORIGINAL makes sense as it stands, or PROPOSED sounds different, says something the context does not support, or contradicts the book reference. |
+   | `true` | ORIGINAL is a garbled word, a misspelt name or a stray repeat, and PROPOSED sounds like it and fits BEFORE and AFTER. |
+   | `false` | ORIGINAL is real wording that fits, or PROPOSED only restyles it (spelling variant, number form, tense, rewording), sounds different, or contradicts the book reference. |
 
    Uncertainty is deliberately not a `false` reason: an undecidable finding
    should land in the hold band, since a reject is final. **The state never
-   states the text evidence** (no "found in the reference" or sound-alike
-   line): the apply rule's two keys, `p` and evidence, must stay independent,
-   and telling the model would raise `p` on exactly the findings the evidence
-   gate lets through. The state is a labelled text, byte-deterministic for the
-   same inputs:
+   states the text evidence** (no "found in the reference" line): the apply
+   rule's two keys, `p` and evidence, must stay independent, and telling the
+   model would raise `p` on exactly the findings the evidence gate lets
+   through. The one computed line it does carry, **SOUND-ALIKE**, is rung 0's
+   phonetic score of the changed words (read back from the passing verdict's
+   evidence, `soundalike 0.917 (threshold …)`, to two decimals) — a fact about
+   the edit, identical whatever the text evidence, and present only on
+   substitutions (repeats and insertions have no score, and the block is
+   omitted). The state is a labelled text, byte-deterministic for the same
+   inputs:
 
    ```text
    ISSUE TYPE:
@@ -4029,6 +4032,9 @@ an error: every failure after rung 0 is a retryable `hold`.
 
    PROPOSED:
    the dish at [[Arecibo]] picked
+
+   SOUND-ALIKE:
+   0.92
 
    BEFORE:
    …
@@ -4047,10 +4053,24 @@ an error: every failure after rung 0 is a retryable `hold`.
    replacement", labelled the sentences ORIGINAL SENTENCE / CORRECTED
    SENTENCE, kept ±40 words and up to 6 reference sentences / 1,200
    characters, and named "not enough information" as a `false` reason; its
-   answers peaked at p 0.5–0.7 with none ≥ 0.95). v2 holds input tokens flat or
-   lower: the question grew by 14 cl100k tokens (225 → 239) while the state
-   shrank, a mean of −2.4% per call on the reference examples — +3% on the
-   shortest states, −10% to −13% on long segments, −37% at the v1 caps.
+   answers peaked at p 0.5–0.7 with none ≥ 0.95). v2 kept the question and cut
+   the state; measured live per uncached call, v1 706.5 → v2 681.2 input
+   tokens (−3.6%).
+
+   *v2 → v3a* (state unchanged): live input tokens fit `≈ base + 0.205 ×
+   state characters` (r 0.98), with the question inside `base`, so the
+   question is most of a call. v3a cuts its text to 59% of v2's (1,016 → 605
+   characters; 239 → 161 cl100k tokens as canonical JSON, a budget a test
+   pins at 170) and has the criteria name what Jev should refuse — restyling
+   (spelling variants, number forms, tense, rewording) of a wording that
+   already fits — which is most of what the labelled backlog shows reaching
+   it. v2's mentions of deliberate repeats ("had had"), "a word missing from
+   the reference is not evidence" and "applying rewrites the transcript" were
+   dropped.
+
+   *v3a → v3b* (`step_version` 3): the SOUND-ALIKE line and one instruction
+   clause naming it (161 → 178 cl100k question tokens, budget 180; the block
+   adds 19 characters, 10 cl100k tokens, to a substitution's state).
 
 6. **Decision rule** — with `p` the `should_apply` `noul`:
 
