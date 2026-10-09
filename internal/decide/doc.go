@@ -31,4 +31,10 @@
 // and builds a Report — outcomes, reasons, a p histogram, cost and a backlog
 // projection — and, in calibration mode, agreement with decisions people
 // already made. It writes only the decide recipe and the fn_calls log.
+//
+// Apply (`earmark decide --yes`) decides every finding in scope — proposed
+// ones, and re-checks of another decide recipe's accepts — computing with no
+// lock held and writing the decisions in short transactions through
+// db.ApplyDecisions and db.ApplyRecheckDecisions. db.RevertDecisions undoes
+// them.
 package decide

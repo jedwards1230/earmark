@@ -1322,7 +1322,8 @@ every chunk into the HNSW index).
 **Current recipes and `stale_work`.** `current_recipes(step PK, recipe_id,
 updated_at)` holds the recipe each step would use now; the ingest process
 (`earmark monitor`) upserts the `embed`, (when an eval endpoint is
-configured) `propose`, and (when `AI_ROLES.scan` is bound) `scan` rows at startup — one writer, so an ad-hoc `earmark eval`
+configured) `propose`, (when `AI_ROLES.scan` is bound) `scan`, and (when
+`AI_ROLES.decide` is bound to the pinned model) `decide` rows at startup — one writer, so an ad-hoc `earmark eval`
 with other settings stamps its own findings without redefining "current".
 The `stale_work` view lists `(step, source_table, row_id, recipe_id,
 current_recipe_id)` for every output row whose recipe is not equivalent to its
@@ -3151,6 +3152,7 @@ on spans and logs, never labels):
 | `earmark_build_info` | gauge = 1 | `version`, `commit` | The running build. |
 | `earmark_recipe_info` | gauge = 1 | `step`, `recipe`, `model`, `revision`, `prompt_version` | One per step in `current_recipes` (§1.9), loaded by the ingest pod at startup after it registers them. |
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
+| `earmark_decisions` | gauge | `outcome` (`apply` · `hold` · `reject`), `issue_type`, `evidence` (`asin_verbatim` · `exact_repeat` · `none`), `recipe` (full decide recipe id) | Findings counted by their **latest unrevoked** decide-recipe `decision` event (§2.17 "Version history", §2.19); findings a requeue superseded excluded. Ingest pod; one aggregate over `finding_events`, refreshed every 5 min. No series until a decision is written. |
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
 | `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 
@@ -3366,8 +3368,8 @@ What the log answers:
   whole decide recipe (revoke its decisions and move its findings back with a
   `revert:jev:<recipe_id>` decider: applied → reverted, accepted → rejected,
   rejected → proposed), or everything since a time (the transitions after `t`).
-  The CLI for recipe and time undo is `earmark decide revert` (phase 1, PR6);
-  the schema and DB helpers above are what it is built on.
+  The CLI for recipe, finding and time undo is `earmark decide revert`
+  (§2.19), built on these helpers (`db.RevertDecisions`).
 
 #### Anchoring
 
@@ -4020,7 +4022,7 @@ and reports what a full run would do. **It decides nothing**: no
 `finding_events`, no state change, no `decided_by`. Its only writes are the
 decide recipe row (`recipes`, via `decide.Evaluator.Recipe`) and one `fn_calls`
 row per model call — which is the point: the later full run over the same
-findings is served from the cache. There is no `--yes` yet. Requires
+findings is served from the cache. `--yes` decides and writes (below). Requires
 `AI_ROLES.decide` bound to a `systemone` endpoint whose `model` is the pinned
 `jev-1.13.0` (route prefix and case ignored); otherwise it exits 2 with a clear
 error. It does not take the GPU phase gate (System One is hosted).
@@ -4051,8 +4053,10 @@ error. It does not take the GPU phase gate (System One is hosted).
   aggregate), plus projected calls and cost at the sample's cost per uncached
   answered call. Issue types absent from the sample are reported as
   unprojected.
-- **`--calibrate`** samples findings a person already decided through the
-  review surface — `decided_by LIKE 'mcp:%'`, `patch_state` `accepted`/
+- **`--calibrate`** samples findings a person already decided — `decided_by
+  LIKE '<actor>:%'` for each `--human` prefix (default `mcp`, the review
+  surface; `--human mcp,cli` adds CLI decisions; `jev`/`revert` are refused),
+  `patch_state` `accepted`/
   `applied` (human accept) or `rejected` (human reject), same anchoring rule —
   and runs the same evaluator (still a dry run; the calls are real and
   cached). It reports the human × outcome matrix, apply precision (applies a
@@ -4062,6 +4066,116 @@ error. It does not take the GPU phase gate (System One is hosted).
   and each finding re-decided with the `p` already obtained — no new model
   call — so a finding that passes only below the run's threshold is counted
   *unasked*.
+
+#### `earmark decide --yes` (full run)
+
+`earmark decide --yes [--limit N] [--shard i/N] [--batch 20] [--max-accepts N]
+[--book X] [--issue-type T] [--concurrency 8] [--json]` decides every finding
+in scope and writes the decisions (`decide.Apply`). `--sample`, `--seed` and
+`--calibrate` are dry-run only; `--limit`, `--shard` and `--max-accepts` need
+`--yes`.
+
+- **Recipe.** `decide.Evaluator.Recipe` is registered once at startup, outside
+  any batch transaction (keeping the recipes → findings → chunks lock order).
+  Every decision and state change is attributed to it: `decided_by` and the
+  event `actor` are `jev:<recipe_id>`.
+- **Work list** (`db.DecideWork`, read-only, keyset-paged in finding-id order,
+  500 per page): anchored judge findings that are `proposed`, or
+  `accepted`/`applied` by **another** decide recipe (`decided_by` `jev:<other>`
+  — the re-check below; a person's accept is never re-checked), whose latest
+  **unrevoked** `decision` event is absent, by another recipe, or this
+  recipe's `jev_unavailable` hold. Every other verdict of this recipe is final:
+  **a re-run asks nothing again** except holds where the model was
+  unavailable. `--book` / `--issue-type` narrow it; `--shard i/N` keeps
+  transcripts with `hashtext(transcript_id) mod N = i` (folded non-negative),
+  so N runners partition the work by transcript.
+- **Compute, then write.** Per page, a compute phase with **no transaction
+  held** — loading, rung 0, evidence and the model calls (cached in
+  `fn_calls`) — then a write phase of short transactions, one per `--batch`
+  transcripts (1–500): `db.ApplyDecisions` for proposed findings,
+  `db.ApplyRecheckDecisions` for re-checks. Each locks its findings `FOR
+  UPDATE SKIP LOCKED` in id order, then their chunks `FOR SHARE`, and drops
+  (as *skipped*, decided again next run) any finding another writer holds —
+  a reviewer, `earmark reanchor`, another shard — or no longer in scope, or
+  whose chunk's pristine text no longer hashes to what the model saw. No
+  network I/O happens while a lock is held.
+- **What is written.** Every decision is a `decision` event (outcome, reason,
+  `p`, evidence, `fn_call_id`, chunk hash). apply → `accepted` (its chunk
+  flagged `embedding_stale`; the next rebuild replays it and marks it
+  `applied`), reject → `rejected` (rung-0 rejects included), hold → stays
+  `proposed`. A rung-0 `chunk_changed` / `anchor_missing` is **not written**
+  (re-anchoring's job). `proposed → applied` stays illegal: only a rebuild
+  applies.
+- **`--limit N`** stops after N findings; **`--max-accepts N`** stops after N
+  accepts, leaving further applies undecided (no event) for the next run.
+  Each accept re-embeds its **whole transcript** on the next rebuild, so
+  accepts spread over many transcripts approach a full-library re-embed; the
+  rebuild pass runs before new-transcript embedding each cycle and idles in
+  the `transcribe` phase. Bound runs with these flags and run the backlog in
+  an idle or analyze window.
+- **Report**: the dry run's sections plus what was written — accepted,
+  rejected, held, re-check kept / held for review / reverted, skipped,
+  re-anchor needed, over `--max-accepts` — and the undo command.
+- No GPU phase gate (System One is hosted).
+
+#### Re-check under a new decide recipe
+
+When the current decide recipe changes (a threshold, the prompt, the model),
+`--yes` also re-decides what an older recipe did: its holds (still
+`proposed`) and its accepts (`accepted`/`applied` with `decided_by`
+`jev:<old>`). For an accept (`db.ApplyRecheckDecisions`):
+
+| New verdict | Effect |
+|---|---|
+| apply | decision recorded; the fix stays |
+| hold | decision recorded; the fix stays and is counted *held for review* |
+| reject | decision recorded; the fix is undone — `accepted → rejected`, `applied → reverted` (chunk flagged) — as `jev:<new>` |
+
+A person's accept is never re-checked, and a recipe never re-checks its own.
+
+#### `earmark decide revert` (undo)
+
+`earmark decide revert [--recipe ID] [--finding UUID] [--since RFC3339]
+[--yes] [--json]` undoes automated decisions (`db.RevertDecisions`). At least
+one scope flag is required; together they narrow (AND). Dry-run unless
+`--yes`: it prints the count per transition and the decisions it would revoke.
+
+- **Candidates**: findings whose `decided_by` is `jev:<recipe>` (in scope by
+  recipe, id, or `decided_at ≥ since`). A person's decision, or an undo already
+  done (`revert:jev:…`), never matches — which makes revert **idempotent**.
+- **Moves** (`db.SetPatchStateBulk`'s guarded compare-and-swap, in
+  transactions of ≤ 500 findings, `decided_by` = `revert:jev:<recipe>`):
+  `applied → reverted`, `accepted → rejected`, `rejected → proposed`, and a
+  re-check's `reverted → proposed`. `proposed → applied` being illegal, an
+  older recipe's fix undone by a re-check is not restored directly: the
+  finding goes back to `proposed` and is decided again. Every move is a
+  `transition` event.
+- **Revoke**: every live `decision` event in scope gets a `revoke` event
+  (actor `revert:jev:<recipe>`) — holds included — so the next `--yes` run of
+  that recipe decides those findings afresh.
+- **Re-flag sweep**: after each batch commits, every moved finding's chunk is
+  flagged `embedding_stale`. This closes the window where a rebuild that read
+  the overlay before the revert clears the flag after it
+  (`ClearEmbeddingStale`'s watermark only sees `decided_at`); it costs at most
+  one extra re-embed per chunk.
+
+#### Runbook: deciding the backlog
+
+1. **Dry run.** `earmark decide --sample 500 --seed run1` — check the outcome
+   mix, the reasons, the p histogram and the projection; the answers are now
+   cached. Optionally `earmark decide --sample 300 --calibrate --human mcp,cli`
+   against past human decisions before trusting the thresholds.
+2. **Bounded run.** `earmark decide --yes --limit 2000 --max-accepts 500`
+   (repeat runs pick up where it stopped). Run while the pipeline is idle or
+   in the analyze phase: every accept costs a whole-transcript re-embed.
+3. **Spot-check.** Review a sample of the accepted findings (MCP review tools,
+   `db.FindingHistory`) and `earmark_decisions` by issue type and evidence.
+4. **Full run.** `earmark decide --yes` (or `--shard i/N` per runner),
+   optionally still capped with `--max-accepts` per run.
+5. **Undo if needed.** `earmark decide revert --recipe <id>` to preview, then
+   `--yes`; narrow with `--finding` or `--since`. Re-running the same recipe
+   after a revert re-decides the same findings, so change the recipe
+   (thresholds, prompt) before deciding again.
 
 ---
 

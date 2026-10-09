@@ -7,6 +7,7 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -460,13 +461,15 @@ func transcriptPatchSetAt(ctx context.Context, q rowQuerier, transcriptID string
 	return out, nil
 }
 
-// ApplyResult reports one ApplyDecisions write. Every finding id given lands
-// in exactly one list, each sorted.
+// ApplyResult reports one ApplyDecisions or ApplyRecheckDecisions write.
+// Every finding id given lands in exactly one list, each sorted.
 type ApplyResult struct {
 	Accepted []string // apply: proposed → accepted
-	Rejected []string // reject: proposed → rejected
+	Rejected []string // reject: proposed → rejected, or (re-check) accepted → rejected
+	Reverted []string // re-check reject of an applied finding: applied → reverted
 	Held     []string // hold: recorded, left proposed
-	Skipped  []string // not written: locked by someone else, no longer proposed, or its chunk changed
+	Kept     []string // re-check apply or hold: recorded, left accepted/applied
+	Skipped  []string // not written: locked by someone else, out of scope now, or its chunk changed
 }
 
 // applyDecisionsLockSQL locks the findings first (the repo-wide order:
@@ -474,8 +477,20 @@ type ApplyResult struct {
 // reanchor run or another decide shard holds right now is skipped and
 // re-decided next run, never waited on. Only proposed findings are decided.
 var applyDecisionsLockSQL = `
-	SELECT id::text FROM transcript_findings
+	SELECT id::text, patch_state FROM transcript_findings
 	 WHERE id = ANY($1) AND patch_state = 'proposed'
+	 ORDER BY id
+	   FOR UPDATE SKIP LOCKED
+`
+
+// applyRecheckLockSQL is the re-check twin (CONTRACT §2.19 "Re-check"): an
+// accepted or applied finding a DIFFERENT decide recipe accepted
+// (decided_by 'jev:<other>'). A human's accept (mcp:, cli:) is never
+// re-checked, and neither is one this recipe ($2 = 'jev:<recipe>') made.
+var applyRecheckLockSQL = `
+	SELECT id::text, patch_state FROM transcript_findings
+	 WHERE id = ANY($1) AND patch_state IN ('accepted', 'applied')
+	   AND decided_by ~ '^jev:[0-9a-f]{64}$' AND decided_by <> $2
 	 ORDER BY id
 	   FOR UPDATE SKIP LOCKED
 `
@@ -512,6 +527,42 @@ func (db *DB) ApplyDecisions(ctx context.Context, recipeID string, evs []Decisio
 }
 
 func applyDecisions(ctx context.Context, b txBeginner, recipeID string, evs []DecisionEvent) (ApplyResult, error) {
+	return applyDecisionsWith(ctx, b, recipeID, evs, applyDecisionsLockSQL, false)
+}
+
+// ApplyRecheckDecisions writes a decide recipe's verdicts on findings an
+// OTHER decide recipe accepted (CONTRACT §2.19 "Re-check under a new
+// recipe"), under the same locking and chunk-hash rules as ApplyDecisions:
+// apply and hold are recorded and the correction stays (a hold is listed for
+// review); reject is recorded and the correction is undone — accepted →
+// rejected, applied → reverted — as "jev:<recipeID>". Findings no longer
+// accepted/applied by another decide recipe are skipped.
+func (db *DB) ApplyRecheckDecisions(ctx context.Context, recipeID string, evs []DecisionEvent) (ApplyResult, error) {
+	return applyRecheckDecisions(ctx, db.pool, recipeID, evs)
+}
+
+func applyRecheckDecisions(ctx context.Context, b txBeginner, recipeID string, evs []DecisionEvent) (ApplyResult, error) {
+	return applyDecisionsWith(ctx, b, recipeID, evs, applyRecheckLockSQL, true)
+}
+
+// decideMove is where a written decision moves its finding from its locked
+// state: "" = no move. A re-check never accepts (the finding already is) and
+// undoes on reject; a first decision accepts or rejects a proposed finding.
+func decideMove(state, outcome string, recheck bool) string {
+	switch {
+	case outcome == OutcomeApply && !recheck:
+		return patch.StateAccepted
+	case outcome == OutcomeReject && !recheck:
+		return patch.StateRejected
+	case outcome == OutcomeReject && state == patch.StateAccepted:
+		return patch.StateRejected
+	case outcome == OutcomeReject && state == patch.StateApplied:
+		return patch.StateReverted
+	}
+	return ""
+}
+
+func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs []DecisionEvent, lockSQL string, recheck bool) (ApplyResult, error) {
 	if !sha256HexRe.MatchString(recipeID) {
 		return ApplyResult{}, fmt.Errorf("apply decisions: recipe_id %q is not lowercase hex sha256", recipeID)
 	}
@@ -534,6 +585,7 @@ func applyDecisions(ctx context.Context, b txBeginner, recipeID string, evs []De
 		return ApplyResult{}, nil
 	}
 	slices.Sort(ids)
+	decider := "jev:" + recipeID
 
 	tx, err := b.Begin(ctx)
 	if err != nil {
@@ -541,14 +593,27 @@ func applyDecisions(ctx context.Context, b txBeginner, recipeID string, evs []De
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	rows, err := tx.Query(ctx, applyDecisionsLockSQL, ids)
+	lockArgs := []any{ids}
+	if recheck {
+		lockArgs = append(lockArgs, decider)
+	}
+	rows, err := tx.Query(ctx, lockSQL, lockArgs...)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("lock decided findings: %w", err)
 	}
-	locked, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
+	state := make(map[string]string, len(ids))
+	var lid, lstate string
+	if _, err := pgx.ForEachRow(rows, []any{&lid, &lstate}, func() error {
+		state[lid] = lstate
+		return nil
+	}); err != nil {
 		return ApplyResult{}, fmt.Errorf("lock decided findings: %w", err)
 	}
+	locked := make([]string, 0, len(state))
+	for id := range state {
+		locked = append(locked, id)
+	}
+	slices.Sort(locked)
 	rows, err = tx.Query(ctx, applyDecisionsChunksSQL, locked)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("lock decided chunks: %w", err)
@@ -562,30 +627,37 @@ func applyDecisions(ctx context.Context, b txBeginner, recipeID string, evs []De
 		return ApplyResult{}, fmt.Errorf("lock decided chunks: %w", err)
 	}
 
+	type move struct{ from, to string }
 	var (
-		res     ApplyResult
-		write   []DecisionEvent
-		isReady = make(map[string]bool, len(locked))
+		res   ApplyResult
+		write []DecisionEvent
+		moves = map[move][]string{}
 	)
-	for _, id := range locked {
-		isReady[id] = true
-	}
 	for _, e := range evs {
+		st, isLocked := state[e.FindingID]
 		cur, hasChunk := chunkSHA[e.FindingID]
 		// A decision about text the chunk no longer holds is not written; an
 		// event that names no hash still needs the chunk to exist.
-		if !isReady[e.FindingID] || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) {
+		if !isLocked || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) {
 			res.Skipped = append(res.Skipped, e.FindingID)
 			continue
 		}
 		write = append(write, e)
-		switch e.Outcome {
-		case OutcomeApply:
+		to := decideMove(st, e.Outcome, recheck)
+		switch {
+		case to == patch.StateAccepted:
 			res.Accepted = append(res.Accepted, e.FindingID)
-		case OutcomeReject:
+		case to == patch.StateRejected:
 			res.Rejected = append(res.Rejected, e.FindingID)
+		case to == patch.StateReverted:
+			res.Reverted = append(res.Reverted, e.FindingID)
+		case recheck:
+			res.Kept = append(res.Kept, e.FindingID)
 		default:
 			res.Held = append(res.Held, e.FindingID)
+		}
+		if to != "" {
+			moves[move{st, to}] = append(moves[move{st, to}], e.FindingID)
 		}
 	}
 	if len(write) > 0 {
@@ -593,27 +665,31 @@ func applyDecisions(ctx context.Context, b txBeginner, recipeID string, evs []De
 			return ApplyResult{}, err
 		}
 	}
-	decider := "jev:" + recipeID
-	for _, mv := range []struct {
-		to  string
-		ids []string
-	}{{patch.StateAccepted, res.Accepted}, {patch.StateRejected, res.Rejected}} {
-		if len(mv.ids) == 0 {
-			continue
+	// Deterministic order: by from, then to.
+	keys := make([]move, 0, len(moves))
+	for k := range moves {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b move) int {
+		if c := strings.Compare(a.from, b.from); c != 0 {
+			return c
 		}
-		br, err := setPatchStateBulkTx(ctx, tx, patch.StateProposed, mv.to, decider, mv.ids)
+		return strings.Compare(a.to, b.to)
+	})
+	for _, mv := range keys {
+		br, err := setPatchStateBulkTx(ctx, tx, mv.from, mv.to, decider, moves[mv])
 		if err != nil {
 			return ApplyResult{}, err
 		}
-		// The findings are locked and were proposed, so nothing can be skipped.
+		// The findings are locked and in mv.from, so nothing can be skipped.
 		if len(br.Skipped) > 0 {
-			return ApplyResult{}, fmt.Errorf("apply decisions: %d locked finding(s) did not move to %s", len(br.Skipped), mv.to)
+			return ApplyResult{}, fmt.Errorf("apply decisions: %d locked finding(s) did not move %s -> %s", len(br.Skipped), mv.from, mv.to)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ApplyResult{}, fmt.Errorf("commit apply decisions: %w", err)
 	}
-	for _, l := range [][]string{res.Accepted, res.Rejected, res.Held, res.Skipped} {
+	for _, l := range [][]string{res.Accepted, res.Rejected, res.Reverted, res.Held, res.Kept, res.Skipped} {
 		slices.Sort(l)
 	}
 	return res, nil

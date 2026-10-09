@@ -1,0 +1,39 @@
+decide run (--yes) · recipe abababababab · model jev-1.13.0
+decided 8 findings (--limit 2000)
+
+outcomes: apply 2 · hold 3 · reject 2 · reanchor 1
+outcome   issue_type            evidence       count
+apply     misheard_proper_noun  asin_verbatim  1
+apply     repeated_text         exact_repeat   1
+hold      homophone             none           1
+hold      misheard_proper_noun  none           1
+hold      number_artifact       none           1
+reject    misheard_word         none           2
+reanchor  misheard_word         none           1
+
+decision reasons: confident_with_evidence 2 · issue_type_capped 1 · jev_reject 1 · jev_unavailable 1 · no_evidence 1
+rung-0 rejects:   not_soundalike 1
+reanchor needed:  anchor_missing 1
+
+p histogram (answered 5):
+  [0.0,0.1)     1 ##########
+  [0.1,0.2)     0
+  [0.2,0.3)     0
+  [0.3,0.4)     0
+  [0.4,0.5)     0
+  [0.5,0.6)     0
+  [0.6,0.7)     0
+  [0.7,0.8)     0
+  [0.8,0.9)     0
+  [0.9,1.0]     4 ########################################
+
+jev: asked 6 · answered 5 · unavailable 1 · cache hits 1
+jev errors: timeout 1
+latency: p50 900ms · p95 1200ms (uncached calls)
+tokens: 1600 in · 12 out · cost $0.000067
+
+written: accepted 2 · rejected 2 · held 2 · re-check kept 3 (held for review 1) · re-check reverted 1
+not written: skipped 1 (locked, moved or chunk changed; decided next run) · reanchor needed 1 · over --max-accepts 4
+stopped early: max-accepts reached — run again to continue
+
+Undo with: earmark decide revert --recipe abababababababababababababababababababababababababababababababab --yes (narrow with --finding / --since)

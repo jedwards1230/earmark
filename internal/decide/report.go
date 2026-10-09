@@ -51,6 +51,8 @@ type Report struct {
 	Projection Projection `json:"projection"`
 	// Calibration is set by --calibrate.
 	Calibration *Calibration `json:"calibration,omitempty"`
+	// Write is set by --yes: what was written.
+	Write *WriteStats `json:"write,omitempty"`
 }
 
 // Cell is one outcome × issue_type × evidence count.
@@ -241,11 +243,26 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	var b strings.Builder
 	p := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
 	mode := "dry run"
-	if r.Calibrate {
+	switch {
+	case r.Calibrate:
 		mode = "calibration (human-decided findings)"
+	case r.Write != nil:
+		mode = "run (--yes)"
 	}
-	p("decide %s · recipe %s · model %s · seed %q\n", mode, short(r.RecipeID), r.Model, r.Seed)
-	p("sampled %d of %d requested · scope %d\n", r.Findings, r.Requested, r.Projection.Backlog)
+	p("decide %s · recipe %s · model %s", mode, short(r.RecipeID), r.Model)
+	if r.Write == nil {
+		p(" · seed %q", r.Seed)
+	}
+	p("\n")
+	if r.Write != nil {
+		p("decided %d findings", r.Findings)
+		if r.Requested > 0 {
+			p(" (--limit %d)", r.Requested)
+		}
+		p("\n")
+	} else {
+		p("sampled %d of %d requested · scope %d\n", r.Findings, r.Requested, r.Projection.Backlog)
+	}
 	if r.Findings == 0 {
 		p("\nNo findings in scope.\n")
 		_, err := io.WriteString(w, b.String())
@@ -287,6 +304,12 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	}
 	p("tokens: %d in · %d out · cost $%.6f\n", j.InputTokens, j.OutputTokens, j.CostUSD)
 
+	if ws := r.Write; ws != nil {
+		ws.print(p)
+		p("\nUndo with: earmark decide revert --recipe %s --yes (narrow with --finding / --since)\n", r.RecipeID)
+		_, err := io.WriteString(w, b.String())
+		return err
+	}
 	pr := r.Projection
 	p("\nprojection to the scope (%d findings): %s\n", pr.Backlog, counts(pr.Outcomes, reportClasses))
 	if pr.Unprojected > 0 {

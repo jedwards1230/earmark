@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -33,9 +34,36 @@ type DecideScope struct {
 	// IssueType keeps one issue type ("" = all).
 	IssueType string
 	// Calibrate selects findings a human already decided — decided_by
-	// 'mcp:%' and patch_state accepted/applied (accepted by a human) or
-	// rejected — instead of the proposed backlog.
+	// '<actor>:%' for one of HumanActors, and patch_state accepted/applied
+	// (accepted by a human) or rejected — instead of the proposed backlog.
 	Calibrate bool
+	// HumanActors are the decided_by prefixes (without the colon) that count
+	// as a person in calibration: "mcp" (the review surface) and/or "cli".
+	// Empty = DefaultHumanActors.
+	HumanActors []string
+}
+
+// DefaultHumanActors is calibration's default: decisions made through the
+// review surface.
+var DefaultHumanActors = []string{"mcp"}
+
+var humanActorRe = regexp.MustCompile(`^[a-z]+$`)
+
+// actorPatterns is the decided_by LIKE patterns calibration matches (empty
+// when not calibrating).
+func (s DecideScope) actorPatterns() []string {
+	if !s.Calibrate {
+		return []string{}
+	}
+	actors := s.HumanActors
+	if len(actors) == 0 {
+		actors = DefaultHumanActors
+	}
+	out := make([]string, len(actors))
+	for i, a := range actors {
+		out[i] = a + ":%"
+	}
+	return out
 }
 
 // decideStates is the state scope of a run: the proposed backlog, or the
@@ -53,6 +81,11 @@ func (s DecideScope) validate() error {
 		return fmt.Errorf("decide sample must be 1..%d", MaxDecideSample)
 	case strings.TrimSpace(s.Seed) == "":
 		return errors.New("decide seed is required")
+	}
+	for _, a := range s.HumanActors {
+		if !humanActorRe.MatchString(a) || a == "jev" || a == "revert" {
+			return fmt.Errorf("decide: %q is not a human actor prefix", a)
+		}
 	}
 	return nil
 }
@@ -84,9 +117,10 @@ type DecideFinding struct {
 // decideScopeWhere is the shared filter: anchored judge findings (an anchor
 // offset and a chunk hash, so rung 0 can verify the revision), in the scope's
 // states, optionally one book / issue type, and — for calibration — decided
-// through the review surface (decided_by 'mcp:%').
+// by a person (decided_by LIKE one of the actor patterns, e.g. 'mcp:%').
 //
-//	$1 states  $2 book pattern ('' = all)  $3 issue type ('' = all)  $4 calibrate
+//	$1 states  $2 book pattern ('' = all)  $3 issue type ('' = all)
+//	$4 actor patterns (empty = not calibrating)
 const decideScopeWhere = `
 	 WHERE f.origin = 'judge'
 	   AND f.transcript_id IS NOT NULL
@@ -96,7 +130,7 @@ const decideScopeWhere = `
 	   AND f.patch_state = ANY($1)
 	   AND ($2 = '' OR f.file_path ILIKE $2)
 	   AND ($3 = '' OR f.issue_type = $3)
-	   AND (NOT $4 OR f.decided_by LIKE 'mcp:%')`
+	   AND (cardinality($4::text[]) = 0 OR f.decided_by LIKE ANY($4::text[]))`
 
 // decideSampleSQL samples the scope deterministically: md5(id || seed).
 // $5 seed, $6 limit.
@@ -126,7 +160,7 @@ func decideSample(ctx context.Context, q rowQuerier, s DecideScope) ([]DecideFin
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
-	rows, err := q.Query(ctx, decideSampleSQL, s.states(), s.bookPattern(), s.IssueType, s.Calibrate, s.Seed, s.Sample)
+	rows, err := q.Query(ctx, decideSampleSQL, s.states(), s.bookPattern(), s.IssueType, s.actorPatterns(), s.Seed, s.Sample)
 	if err != nil {
 		return nil, fmt.Errorf("decide sample: %w", err)
 	}
@@ -151,7 +185,7 @@ func (db *DB) DecideBacklog(ctx context.Context, s DecideScope) (map[string]int,
 }
 
 func decideBacklog(ctx context.Context, q rowQuerier, s DecideScope) (map[string]int, error) {
-	rows, err := q.Query(ctx, decideBacklogSQL, s.states(), s.bookPattern(), s.IssueType, s.Calibrate)
+	rows, err := q.Query(ctx, decideBacklogSQL, s.states(), s.bookPattern(), s.IssueType, s.actorPatterns())
 	if err != nil {
 		return nil, fmt.Errorf("decide backlog: %w", err)
 	}

@@ -274,7 +274,14 @@ func TestReportGolden(t *testing.T) {
 	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: 10, Seed: "golden"}}, strings.Repeat("ab", 32), items,
 		map[string]int{IssueMisheardProperNoun: 200, IssueMisheardWord: 600, IssueRepeatedText: 50, IssueHomophone: 40, IssueNumberArtifact: 30, IssueDroppedWord: 9})
 
-	for name, asJSON := range map[string]bool{"report.golden": false, "report.json.golden": true} {
+	wrep := buildReport(RunOptions{Scope: db.DecideScope{Sample: 2000}}, strings.Repeat("ab", 32), items, nil)
+	wrep.DryRun = false
+	wrep.Write = &WriteStats{Accepted: 2, Rejected: 2, Held: 2, Kept: 3, KeptHeld: 1, Reverted: 1, Skipped: 1, Reanchor: 1, Capped: 4, Stopped: "max-accepts"}
+	for name, c := range map[string]struct {
+		rep    *Report
+		asJSON bool
+	}{"report.golden": {rep, false}, "report.json.golden": {rep, true}, "report.write.golden": {wrep, false}} {
+		rep, asJSON := c.rep, c.asJSON
 		var buf bytes.Buffer
 		if err := rep.Print(&buf, asJSON); err != nil {
 			t.Fatal(err)

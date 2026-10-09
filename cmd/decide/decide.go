@@ -27,12 +27,20 @@ import (
 
 type options struct {
 	sample      int
+	sampleSet   bool // --sample given explicitly
 	seed        string
 	book        string
 	issueType   string
 	concurrency int
 	json        bool
 	calibrate   bool
+	human       []string
+	// --yes run
+	yes        bool
+	limit      int
+	shard      string // "i/N"
+	batch      int
+	maxAccepts int
 }
 
 var opts options
@@ -40,7 +48,7 @@ var opts options
 // DecideCmd is `earmark decide`.
 var DecideCmd = &cobra.Command{
 	Use:   "decide [flags]",
-	Short: "Dry-run the decide step on a sample of proposed findings (decides nothing)",
+	Short: "Decide proposed findings: dry-run a sample, or --yes to decide and write",
 	Long: `decide samples proposed, anchored judge findings and runs the decide step
 on each (CONTRACT §2.19): rung 0's deterministic checks, text evidence from the
 book's catalogue record, and the should_apply question to the pinned System One
@@ -62,11 +70,28 @@ and how agreement moves with rung 0's phonetic_min_sim (re-run offline).
 The sample is deterministic: the same --seed over the same backlog picks the
 same findings.
 
+--yes decides every finding in scope and writes the decisions (CONTRACT
+§2.19 "earmark decide --yes"): apply moves a finding to accepted (replayed by
+the next rebuild), reject to rejected, and a hold records a decision and
+leaves it proposed — every change a finding_events row with actor
+jev:<recipe_id>. It also re-checks findings an OLDER decide recipe accepted:
+a reject undoes the fix (accepted → rejected, applied → reverted), a hold
+keeps it and lists it for review. Work is computed with no transaction held
+and written in short transactions of --batch transcripts. A re-run skips
+findings this recipe already decided, except holds where the model was
+unavailable. Each accept re-embeds its whole transcript on the next rebuild:
+bound a run with --limit and --max-accepts. Undo with 'earmark decide revert'.
+
 Examples:
   earmark decide --sample 200                    # preview 200 random findings
   earmark decide --sample 200 --seed q4 --json   # the same 200, as JSON
   earmark decide --sample 500 --issue-type misheard_proper_noun
-  earmark decide --sample 300 --calibrate        # agreement with human decisions`,
+  earmark decide --sample 300 --calibrate        # agreement with human decisions
+  earmark decide --sample 300 --calibrate --human mcp,cli
+  earmark decide --yes --limit 2000 --max-accepts 500
+  earmark decide --yes --shard 0/4               # one of four parallel runners
+  earmark decide revert --recipe <id>            # preview the undo
+  earmark decide revert --recipe <id> --yes`,
 	Run: runDecide,
 }
 
@@ -79,6 +104,25 @@ func init() {
 	f.IntVar(&opts.concurrency, "concurrency", 8, "concurrent System One calls")
 	f.BoolVar(&opts.json, "json", false, "print the report as JSON")
 	f.BoolVar(&opts.calibrate, "calibrate", false, "sample human-decided findings and report agreement")
+	f.StringSliceVar(&opts.human, "human", nil, "with --calibrate: decided_by prefixes that count as a person (default mcp; e.g. mcp,cli)")
+	f.BoolVar(&opts.yes, "yes", false, "decide every finding in scope and write the decisions")
+	f.IntVar(&opts.limit, "limit", 0, "with --yes: decide at most N findings this run (0 = all in scope)")
+	f.StringVar(&opts.shard, "shard", "", "with --yes: i/N — only transcripts with hashtext(transcript_id) mod N = i")
+	f.IntVar(&opts.batch, "batch", decidepkg.DefaultWriteBatch, "with --yes: transcripts per write transaction")
+	f.IntVar(&opts.maxAccepts, "max-accepts", 0, "with --yes: stop after N accepts (bounds the re-embed; 0 = no cap)")
+	DecideCmd.AddCommand(RevertCmd)
+}
+
+// parseShard parses "i/N" (0 ≤ i < N); "" = unsharded.
+func parseShard(s string) (shard, shards int, err error) {
+	if s == "" {
+		return 0, 0, nil
+	}
+	if _, err := fmt.Sscanf(s, "%d/%d", &shard, &shards); err != nil || fmt.Sprintf("%d/%d", shard, shards) != s ||
+		shards < 1 || shard < 0 || shard >= shards {
+		return 0, 0, fmt.Errorf("--shard %q must be i/N with 0 <= i < N", s)
+	}
+	return shard, shards, nil
 }
 
 func validate(o options) error {
@@ -91,8 +135,19 @@ func validate(o options) error {
 		return errors.New("--concurrency must be 1..64")
 	case o.issueType != "" && !knownIssueType(o.issueType):
 		return fmt.Errorf("--issue-type %q is not an issue type", o.issueType)
+	case o.yes && (o.sampleSet || o.calibrate):
+		return errors.New("--yes decides the whole scope: use --limit instead of --sample, and --calibrate is dry-run only")
+	case !o.yes && (o.limit != 0 || o.shard != "" || o.maxAccepts != 0):
+		return errors.New("--limit, --shard and --max-accepts need --yes")
+	case o.limit < 0 || o.maxAccepts < 0:
+		return errors.New("--limit and --max-accepts must be >= 0")
+	case o.batch < 1 || o.batch > 500:
+		return errors.New("--batch must be 1..500")
+	case len(o.human) > 0 && !o.calibrate:
+		return errors.New("--human needs --calibrate")
 	}
-	return nil
+	_, _, err := parseShard(o.shard)
+	return err
 }
 
 func knownIssueType(t string) bool {
@@ -104,7 +159,8 @@ func knownIssueType(t string) bool {
 	return false
 }
 
-func runDecide(_ *cobra.Command, _ []string) {
+func runDecide(cmd *cobra.Command, _ []string) {
+	opts.sampleSet = cmd.Flags().Changed("sample")
 	if err := validate(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
@@ -148,17 +204,29 @@ func runDecide(_ *cobra.Command, _ []string) {
 }
 
 // run is the testable core.
-func run(ctx context.Context, out io.Writer, store decidepkg.RunStore, asker decidepkg.Asker, o options) error {
+func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker decidepkg.Asker, o options) error {
 	if err := validate(o); err != nil {
 		return err
 	}
-	rep, err := decidepkg.DryRun(ctx, store, asker, decidepkg.RunOptions{
-		Scope: db.DecideScope{
-			Sample: o.sample, Seed: o.seed, Book: o.book, IssueType: o.issueType, Calibrate: o.calibrate,
-		},
-		Concurrency: o.concurrency,
-		Params:      decidepkg.DefaultShouldApplyParams(),
-	})
+	var rep *decidepkg.Report
+	var err error
+	if o.yes {
+		shard, shards, _ := parseShard(o.shard)
+		rep, err = decidepkg.Apply(ctx, store, asker, decidepkg.ApplyOptions{
+			Book: o.book, IssueType: o.issueType, Shard: shard, Shards: shards,
+			Limit: o.limit, Batch: o.batch, MaxAccepts: o.maxAccepts,
+			Concurrency: o.concurrency, Params: decidepkg.DefaultShouldApplyParams(),
+		})
+	} else {
+		rep, err = decidepkg.DryRun(ctx, store, asker, decidepkg.RunOptions{
+			Scope: db.DecideScope{
+				Sample: o.sample, Seed: o.seed, Book: o.book, IssueType: o.issueType,
+				Calibrate: o.calibrate, HumanActors: o.human,
+			},
+			Concurrency: o.concurrency,
+			Params:      decidepkg.DefaultShouldApplyParams(),
+		})
+	}
 	if err != nil {
 		return err
 	}

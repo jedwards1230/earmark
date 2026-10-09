@@ -11,6 +11,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/decide"
 	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/ingesthttp"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
@@ -90,6 +91,7 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	tel.SetLegacyGatherer(reg.Gatherer())
 	tel.StartStaleRefresh(staleItemsInterval, 30*time.Second, database.StaleItemCounts)
 	tel.StartQualityRefresh(qualityIndexInterval, 30*time.Second, qualityIndex(database))
+	tel.StartDecisionsRefresh(decisionsInterval, 30*time.Second, decisionCounts(database))
 
 	// Once the runner reports a file's embedded ASIN tag, re-derive that
 	// book's metadata so the tag is applied as soon as it exists.
@@ -164,6 +166,28 @@ const staleItemsInterval = 5 * time.Minute
 // chunk_scan. Scans arrive in operator-run batches, so a slow timer is plenty.
 const qualityIndexInterval = 5 * time.Minute
 
+// decisionsInterval is how often earmark_decisions is recounted from
+// finding_events. Decisions land in operator-run batches, so a slow timer is
+// plenty; one count is a single aggregate.
+const decisionsInterval = 5 * time.Minute
+
+// decisionCounts loads earmark_decisions (CONTRACT §2.16, §2.19).
+func decisionCounts(database *db.DB) func(context.Context) ([]telemetry.DecisionCount, error) {
+	return func(ctx context.Context) ([]telemetry.DecisionCount, error) {
+		cs, err := database.DecisionCounts(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]telemetry.DecisionCount, 0, len(cs))
+		for _, c := range cs {
+			out = append(out, telemetry.DecisionCount{
+				Outcome: c.Outcome, IssueType: c.IssueType, Evidence: c.Evidence, Recipe: c.Recipe, N: c.N,
+			})
+		}
+		return out, nil
+	}
+}
+
 // qualityIndex loads earmark_quality_index from chunk_scan (CONTRACT §1.9
 // "Chunk scan", §2.16).
 func qualityIndex(database *db.DB) func(context.Context) ([]telemetry.QualityIndex, error) {
@@ -205,8 +229,8 @@ func publishRecipeInfo(database *db.DB, tel *telemetry.Telemetry) {
 
 // registerCurrentRecipes records, per step, the recipe this deployment would
 // use right now (CONTRACT §1.9): the embed recipe always, the propose (judge)
-// recipe when an eval chat endpoint is configured, and the scan recipe when
-// AI_ROLES.scan is bound. The stale_work view compares
+// recipe when an eval chat endpoint is configured, and the scan and decide
+// recipes when AI_ROLES.scan / AI_ROLES.decide are bound. The stale_work view compares
 // every output row against these. Only the ingest process does this, so there
 // is one writer of "current"; an ad-hoc `earmark eval` with other settings
 // stamps its own recipe on its findings without redefining current.
@@ -228,6 +252,13 @@ func registerCurrentRecipes(database *db.DB, cfg *config.Config) {
 	}
 	if ok && err == nil {
 		current = append(current, sr)
+	}
+	dr, ok, err := decide.CurrentRecipe(cfg)
+	if err != nil {
+		log.Printf("WARNING: decide endpoint is misconfigured, no current decide recipe registered: %v", err)
+	}
+	if ok && err == nil {
+		current = append(current, dr)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
