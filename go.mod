@@ -1,6 +1,6 @@
 module github.com/jedwards1230/earmark
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/abx123/go-isbn v0.0.0-20210809152938-059f94f930cd
@@ -65,7 +65,7 @@ require (
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
