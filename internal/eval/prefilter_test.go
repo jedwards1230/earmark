@@ -2,6 +2,7 @@ package eval
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -28,6 +29,11 @@ func TestPrefilterReason(t *testing.T) {
 		{"apostrophe word", issueHomophone, "there pin", "they're pin", -1, ""},
 		// Shape-valid guesses the prompt must stop; rung 0 scores them on sound.
 		{"guess passes shape", issueMisheardProperNoun, "kava akbar", "keats akbar", -1, ""},
+		// Two small mishearings 11 words apart: two one-word hunks, as rung0@v2
+		// scores them, not one 12-word first-to-last window.
+		{"far-apart hunks", issueHomophone,
+			"pin name was kava akbar and the c vocabulary and then went",
+			"pen name was kava akbar and the c vocabulary and then sent", -1, ""},
 
 		{"other type", issueOther, "kava", "java", -1, DropUnsupportedIssueType},
 		{"span not in chunk", issueMisheardWord, "teeth", "earth", -1, DropAnchorMissing},
@@ -35,9 +41,13 @@ func TestPrefilterReason(t *testing.T) {
 		{"inside a word", issueMisheardWord, "tele", "tela", -1, DropNotWordBounded},
 		{"inserted words as a substitution", issueMisheardWord, "said dogs", "he said the dogs", -1, DropNotSubstitution},
 		{"deleted words as a substitution", issueMisheardWord, "ran far and", "ran and", -1, DropNotSubstitution},
+		{"insertion hunk beside a substitution", issueMisheardWord, "pin name was kava", "pen name was the kava", -1, DropNotSubstitution},
+		{"one long hunk among short ones", issueMisheardWord,
+			"pin name was kava akbar and the c vocabulary and then went home",
+			"pen name of a poet whose verse sang fields rivers hills then went home", -1, DropWindowTooLong},
 		{"rewrite too long", issueMisheardWord,
 			"in one thousand nine hundred thirty seven he trades it was too",
-			"in the year after that she sold all of it and went", -1, DropWindowTooLong},
+			"in the year after that she sold all her goods we were two", -1, DropWindowTooLong},
 		{"words to digits", issueNumberArtifact, "one thousand nine hundred thirty seven", "1937", -1, DropNumberFormat},
 		{"anchor checked before number format", issueMisheardWord, "1937", "nineteen thirty seven", -1, DropAnchorMissing},
 		{"dropped word that rewrites", issueDroppedWord, "said dogs", "said the cats", -1, DropBadInsertion},
@@ -138,5 +148,24 @@ func TestJudgeChunk_PrefilterBeforeCap(t *testing.T) {
 	}
 	if got[DropNumberFormat] != 1 || got[DropNotSubstitution] != 1 || len(got) != 2 {
 		t.Errorf("earmark_judge_dropped_findings = %v", got)
+	}
+}
+
+// TestDiffHunks pins the alignment copied from rung0@v2: a substitution is one
+// change, so a merge is one hunk, and edits apart are separate hunks.
+func TestDiffHunks(t *testing.T) {
+	for _, tt := range []struct {
+		a, b string
+		want []hunk
+	}{
+		{"a cross a road", "across a road", []hunk{{0, 2, 0, 1}}},
+		{"cat sat on the mat", "bat sat on the hat", []hunk{{0, 1, 0, 1}, {4, 5, 4, 5}}},
+		{"said dogs", "he said the dogs", []hunk{{0, 0, 0, 1}, {1, 1, 2, 3}}},
+		{"same words", "same words", nil},
+	} {
+		got := diffHunks(words(tt.a), words(tt.b))
+		if !slices.Equal(got, tt.want) {
+			t.Errorf("diffHunks(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
 	}
 }

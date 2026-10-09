@@ -21,12 +21,13 @@ const (
 	DropAnchorMissing = "anchor_missing"
 	// DropNotWordBounded — the located span starts or ends inside a word.
 	DropNotWordBounded = "not_word_bounded"
-	// DropNotSubstitution — a misheard_*/homophone/number_artifact fix that
-	// only inserts or only deletes words: no existing word is replaced, so
-	// there is nothing to have misheard.
+	// DropNotSubstitution — a misheard_*/homophone/number_artifact fix with a
+	// changed hunk that only inserts or only deletes words: no existing word
+	// is replaced there, so there is nothing to have misheard.
 	DropNotSubstitution = "not_substitution"
-	// DropWindowTooLong — the changed words run past maxSubstitutionWords: a
-	// rewrite, not a mishearing.
+	// DropWindowTooLong — a changed hunk runs past maxSubstitutionWords on
+	// either side: a rewrite, not a mishearing. Measured per hunk, as rung0@v2
+	// does, so two small edits far apart in one span are not one long window.
 	DropWindowTooLong = "window_too_long"
 	// DropNumberFormat — a number rewritten between words and digits
 	// ("nineteen thirty seven" → "1937").
@@ -50,13 +51,14 @@ const (
 // shape alone, so they never become rows. Every check here is deterministic
 // and needs only the chunk text the judge saw — no phonetics, no model.
 //
-// Each check is meant to reject a SUBSET of what rung 0 rejects, so a finding
-// rung 0 could pass is never lost here. The two deliberate exceptions, both
-// edits the prompt forbids and rung 0 would score on sound alone, are
-// DropNumberFormat and the subsequence form of DropNotSubstitution (an
-// insertion dressed as a substitution, "said dogs" → "he said the dogs").
-// Word shapes are only checked when neither side has a digit: rung 0 reads
-// "1,500" as one numeral token, this tokenizer would not.
+// Each check is meant to reject a SUBSET of what rung 0 (rung0@v2, which
+// checks a substitution hunk by hunk) rejects, so a finding rung 0 could pass
+// is never lost here. The one deliberate exception is DropNumberFormat when
+// the two sides do not read aloud the same (rung0@v2 already rejects a
+// same-reading rewrite as cosmetic_only): the prompt forbids format changes,
+// and rung 0 would score such an edit on sound alone. Word shapes are only
+// checked when neither side has a digit: rung 0 reads "1,500" as one numeral
+// token, this tokenizer would not.
 func prefilter(chunkText string, parsed []parsedFinding, dropped []Dropped) ([]parsedFinding, []Dropped) {
 	kept := parsed[:0:0]
 	for _, p := range parsed {
@@ -102,15 +104,78 @@ func prefilterReason(chunkText string, p parsedFinding) string {
 			return DropBadInsertion
 		}
 	default: // misheard_proper_noun, misheard_word, homophone, number_artifact
-		if isSubsequence(o, r) || isSubsequence(r, o) {
-			return DropNotSubstitution
-		}
-		ow, rw := diffWindow(o, r)
-		if p.IssueType != issueNumberArtifact && (len(ow) > maxSubstitutionWords || len(rw) > maxSubstitutionWords) {
-			return DropWindowTooLong
+		// Per changed hunk, as rung0@v2 scores a substitution: two small
+		// mishearings far apart in one span are two short hunks, not one
+		// long window.
+		for _, h := range diffHunks(o, r) {
+			ow, rw := o[h.oi:h.oj], r[h.ri:h.rj]
+			if len(ow) == 0 || len(rw) == 0 {
+				return DropNotSubstitution
+			}
+			if p.IssueType != issueNumberArtifact && (len(ow) > maxSubstitutionWords || len(rw) > maxSubstitutionWords) {
+				return DropWindowTooLong
+			}
 		}
 	}
 	return ""
+}
+
+// hunk is one changed region of a word alignment: a[oi:oj] became b[ri:rj].
+// One side may be empty (a pure insertion or deletion).
+type hunk struct{ oi, oj, ri, rj int }
+
+// diffHunks aligns a and b by word edit distance (keep, substitute, insert,
+// delete; each change costs 1) and returns the maximal changed regions
+// between kept words, in order. It is a copy of rung0@v2's alignment
+// (internal/decide), tie-breaks included, so a pre-filter hunk is exactly a
+// rung-0 hunk and the per-hunk limits here can never be stricter than
+// rung 0's. Edit distance, not an LCS: a substitution is one change, so
+// "a cross a road" → "across a road" is one hunk "a cross" → "across".
+func diffHunks(a, b []string) []hunk {
+	n, m := len(a), len(b)
+	d := make([][]int, n+1)
+	for i := range d {
+		d[i] = make([]int, m+1)
+		d[i][0] = i
+	}
+	for j := 0; j <= m; j++ {
+		d[0][j] = j
+	}
+	for i := 1; i <= n; i++ {
+		for j := 1; j <= m; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			d[i][j] = min(d[i-1][j-1]+cost, d[i-1][j]+1, d[i][j-1]+1)
+		}
+	}
+	type pair struct{ i, j int }
+	var kept []pair
+	for i, j := n, m; i > 0 || j > 0; {
+		switch {
+		case i > 0 && j > 0 && a[i-1] == b[j-1] && d[i][j] == d[i-1][j-1]:
+			kept = append(kept, pair{i - 1, j - 1})
+			i, j = i-1, j-1
+		case i > 0 && j > 0 && d[i][j] == d[i-1][j-1]+1:
+			i, j = i-1, j-1
+		case i > 0 && d[i][j] == d[i-1][j]+1:
+			i--
+		default:
+			j--
+		}
+	}
+	slices.Reverse(kept)
+	kept = append(kept, pair{n, m}) // sentinel: the end of both
+	var out []hunk
+	pi, pj := 0, 0
+	for _, k := range kept {
+		if k.i > pi || k.j > pj {
+			out = append(out, hunk{oi: pi, oj: k.i, ri: pj, rj: k.j})
+		}
+		pi, pj = k.i+1, k.j+1
+	}
+	return out
 }
 
 // splitsWord reports whether rune index i falls between two letters/digits —
