@@ -15,26 +15,33 @@ import (
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/fn"
 	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/systemone"
+	"github.com/jedwards1230/earmark/internal/tokenizer"
 )
 
 // The prompt hash (question + state layout) is the cache key's prompt
 // component: any edit to the instructions, criteria or state labels must show
 // up here, together with a bump of ShouldApplyPromptVersion.
 func TestShouldApplyPromptPinned(t *testing.T) {
-	const want = "a9e3774cb9a83e60baf5d70f42e9f01bde73d94581a051b33c12e8746e098699"
+	const want = "ead8aff28d2ba53fdc1c2aa68dd6c2089142a7f23e554beab17eafb1533e168d"
 	if ShouldApplyPromptSHA256 != want {
 		t.Errorf("ShouldApplyPromptSHA256 = %s, want %s — bump ShouldApplyPromptVersion when the question changes", ShouldApplyPromptSHA256, want)
 	}
-	if ShouldApplyPromptVersion != "should_apply@v2" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 2 {
+	if ShouldApplyPromptVersion != "should_apply@v3a" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 2 {
 		t.Errorf("identity changed: %s %s step %d", ShouldApplyPromptVersion, ShouldApplyModel, ShouldApplyStepVersion)
 	}
-	// v1's hash (the question's canonical JSON alone) must never come back:
-	// cached v1 answers would be served for v2 states.
-	if ShouldApplyPromptSHA256 == "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f" {
-		t.Error("prompt hash equals should_apply@v1's")
+	// An earlier prompt's hash must never come back: its cached answers would
+	// be served for this prompt's states.
+	for version, old := range map[string]string{
+		"should_apply@v1": "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f",
+		"should_apply@v2": "a9e3774cb9a83e60baf5d70f42e9f01bde73d94581a051b33c12e8746e098699",
+	} {
+		if ShouldApplyPromptSHA256 == old {
+			t.Errorf("prompt hash equals %s's", version)
+		}
 	}
 }
 
@@ -451,5 +458,23 @@ func TestEvaluatorRecipe(t *testing.T) {
 	}
 	if err := r.Validate(); err != nil {
 		t.Error(err)
+	}
+}
+
+// The question is most of a call's input (the state averages ~720 characters
+// live), so its size is a cost guard: v2's question was 239 cl100k tokens and
+// v3a cut it to 161. Growing it past the budget needs a measured reason.
+func TestShouldApplyQuestionBudget(t *testing.T) {
+	const budget = 170
+	canon, _, err := fn.CanonicalInput(map[string]systemone.Question{questionKey: shouldApplyQuestion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := tokenizer.CountTokens(string(canon))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > budget {
+		t.Errorf("should_apply question is %d cl100k tokens, budget %d", n, budget)
 	}
 }

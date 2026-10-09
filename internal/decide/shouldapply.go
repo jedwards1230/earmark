@@ -22,7 +22,7 @@ import (
 // both.
 const (
 	ShouldApplyName          = "should_apply"
-	ShouldApplyPromptVersion = "should_apply@v2"
+	ShouldApplyPromptVersion = "should_apply@v3a"
 	// ShouldApplyModel is the pinned decision model. Never an alias.
 	ShouldApplyModel = "jev-1.13.0"
 	// ShouldApplyStepVersion is bumped when the decide logic around the call
@@ -66,30 +66,29 @@ const (
 // shouldApplyQuestion is the one question asked. Its canonical JSON is hashed,
 // with the state layout, into PromptSHA256; a golden test pins the hash.
 //
-// v2 (should_apply@v2) asks a question the text can settle — is ORIGINAL wrong
-// where it stands, and does PROPOSED restore what was said — instead of v1's
-// "did the narrator say it", which a model that never hears the audio can only
-// hedge on. It says what the text is (ASR: lowercase, unpunctuated by design),
-// that the error class is mishearing, that narrators also repeat words on
-// purpose, how names relate to the book reference, and what applying means.
-// The criteria are balanced, and uncertainty is left to the hold band rather
-// than named as a reason for false (a reject is final). The text evidence the
-// apply rule requires is deliberately NOT stated in the state: telling the
-// model would raise p on exactly the findings the evidence gate lets through,
-// so the two keys of the apply rule would no longer be independent.
+// v2 (should_apply@v2) asked a question the text can settle — is ORIGINAL
+// wrong where it stands, and does PROPOSED restore what was said — instead of
+// v1's "did the narrator say it", which a model that never hears the audio can
+// only hedge on. v3a keeps that question at ~60% of v2's text (the question is
+// most of a call's input): what the text is (ASR, lowercase and unpunctuated
+// by design), what the edit does, the error class (mishearing, stray repeats),
+// and that the book reference spells names. The criteria name what the
+// labelled backlog shows Jev should refuse — restyling (spelling variants,
+// number forms, tense, rewording) of a wording that already fits — and leave
+// uncertainty to the hold band rather than naming it as a reason for false (a
+// reject is final). The text evidence the apply rule requires is deliberately
+// NOT stated in the state: telling the model would raise p on exactly the
+// findings the evidence gate lets through, so the two keys of the apply rule
+// would no longer be independent.
 var shouldApplyQuestion = systemone.Question{
 	Type: systemone.TypeNoul,
-	Instructions: "An audiobook's speech-recognition (ASR) transcript is lowercase and unpunctuated by design; ignore capitals and punctuation. " +
-		"A reviewer proposes one edit: replace the [[ ]] words of ORIGINAL with the [[ ]] words of PROPOSED; applying it rewrites the stored transcript. " +
-		"BEFORE and AFTER are neighbouring transcript. ASR mostly mishears words as similar-sounding ones and sometimes repeats one, " +
-		"but narrators also say unusual names, rare words and deliberate repeats (\"had had\", \"that that\", \"no no\"). " +
-		"BOOK REFERENCE quotes the publisher's record: names are spelled as there, but a word missing from it is not evidence either way. " +
-		"From the text alone: is ORIGINAL wrong where it stands, and does PROPOSED restore what was said?",
+	Instructions: "Audiobook ASR transcript, lowercase and unpunctuated by design. " +
+		"The edit replaces the [[ ]] words of ORIGINAL with those of PROPOSED. " +
+		"ASR mishears words as similar-sounding ones and sometimes repeats one; BOOK REFERENCE spells the book's names. " +
+		"Is ORIGINAL wrong where it stands, and does PROPOSED restore what was said?",
 	Criteria: map[string]string{
-		"true": "ORIGINAL makes little sense, is ungrammatical, or garbles a name in context, " +
-			"and PROPOSED sounds like it and reads naturally with BEFORE and AFTER.",
-		"false": "ORIGINAL makes sense as it stands, or PROPOSED sounds different, " +
-			"says something the context does not support, or contradicts the book reference.",
+		"true":  "ORIGINAL is a garbled word, a misspelt name or a stray repeat, and PROPOSED sounds like it and fits BEFORE and AFTER.",
+		"false": "ORIGINAL is real wording that fits, or PROPOSED only restyles it (spelling variant, number form, tense, rewording), sounds different, or contradicts the book reference.",
 	},
 }
 
