@@ -69,7 +69,7 @@ func TestBuildContextFromSegments(t *testing.T) {
 		}
 	})
 
-	t.Run("truncates long segments to ContextWords", func(t *testing.T) {
+	t.Run("truncates long segments to ContextWords and NeighbourWords", func(t *testing.T) {
 		long := words("p", 60) + " target " + words("q", 60)
 		s := []db.Segment{seg(0, 1, words("b", 50)), seg(1, 2, long), seg(2, 3, words("n", 50))}
 		ch := ChunkWindow{Text: long, StartSec: 1, EndSec: 2}
@@ -80,7 +80,7 @@ func TestBuildContextFromSegments(t *testing.T) {
 		for name, got := range map[string]int{
 			"original": len(strings.Fields(c.Original)), "before": len(strings.Fields(c.Before)), "after": len(strings.Fields(c.After)),
 		} {
-			want := ContextWords
+			want := NeighbourWords
 			if name == "original" {
 				want = 2*ContextWords + 1
 			}
@@ -90,6 +90,10 @@ func TestBuildContextFromSegments(t *testing.T) {
 		}
 		if !strings.Contains(c.Original, " [[target]] ") {
 			t.Errorf("span not marked: %q", c.Original)
+		}
+		// The neighbours keep the words nearest the sentence.
+		if !strings.HasSuffix(c.Before, " bx") || !strings.HasPrefix(c.After, "na ") {
+			t.Errorf("neighbours not cut next to the sentence: before %q after %q", c.Before, c.After)
 		}
 	})
 }

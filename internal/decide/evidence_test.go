@@ -116,7 +116,7 @@ func TestRelevant(t *testing.T) {
 	total := 0
 	for _, s := range capped {
 		n := utf8.RuneCountInString(s.Text)
-		if n > maxSentenceRunes {
+		if n > MaxSentenceRunes {
 			t.Errorf("sentence of %d runes not clipped", n)
 		}
 		if !strings.HasPrefix(s.Text, "arecibo") {

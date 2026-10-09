@@ -3,8 +3,6 @@ package decide
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,15 +18,16 @@ import (
 )
 
 // should_apply identity (CONTRACT §2.19). The prompt version is bumped by hand
-// whenever the question text changes; PromptSHA256 pins the exact text.
+// whenever the question text or the state layout changes; PromptSHA256 pins
+// both.
 const (
 	ShouldApplyName          = "should_apply"
-	ShouldApplyPromptVersion = "should_apply@v1"
+	ShouldApplyPromptVersion = "should_apply@v2"
 	// ShouldApplyModel is the pinned decision model. Never an alias.
 	ShouldApplyModel = "jev-1.13.0"
 	// ShouldApplyStepVersion is bumped when the decide logic around the call
 	// changes (context building, evidence, the decision rule).
-	ShouldApplyStepVersion = 1
+	ShouldApplyStepVersion = 2
 	// questionKey is the System One question name.
 	questionKey = "should_apply"
 )
@@ -64,32 +63,63 @@ const (
 	ReasonJevUnavailable = "jev_unavailable"
 )
 
-// shouldApplyQuestion is the one question asked. Its canonical JSON is hashed
-// into PromptSHA256; a golden test pins the hash.
+// shouldApplyQuestion is the one question asked. Its canonical JSON is hashed,
+// with the state layout, into PromptSHA256; a golden test pins the hash.
+//
+// v2 (should_apply@v2) asks a question the text can settle — is ORIGINAL
+// wrong where it stands, and does PROPOSED restore what was said — instead of
+// v1's "did the narrator say it", which a model that never hears the audio can
+// only hedge on. It is kept short because it is paid on every call: what the
+// text is (ASR, lowercase and unpunctuated by design), what the edit does, the
+// error class (mishearing, stray repeats), and that the book reference spells
+// names. The criteria name restyling (spelling variants, number forms, tense,
+// rewording) of a wording that already fits as a reason for false, and leave
+// uncertainty to the hold band rather than naming it as a reason for false (a
+// reject is final). The text evidence the apply rule requires is deliberately
+// NOT stated in the state: telling the model would raise p on exactly the
+// findings the evidence gate lets through, so the two keys of the apply rule
+// would no longer be independent.
 var shouldApplyQuestion = systemone.Question{
 	Type: systemone.TypeNoul,
-	Instructions: "The state is an excerpt of an automatic speech-recognition (ASR) transcript of an audiobook. " +
-		"Transcript text is all lowercase with no punctuation. A reviewer proposes one correction: " +
-		"ORIGINAL SENTENCE marks the transcribed words in [[double brackets]] and CORRECTED SENTENCE marks the proposed replacement the same way. " +
-		"BEFORE and AFTER are the neighbouring sentences. BOOK REFERENCE lists lines from the publisher's catalogue record of the book that may bear on the edit, or (none). " +
-		"Decide whether the narrator actually said the replacement, so that applying it makes the transcript more faithful to the audio.",
+	Instructions: "Audiobook ASR transcript, lowercase and unpunctuated by design. " +
+		"The edit replaces the [[ ]] words of ORIGINAL with those of PROPOSED. " +
+		"ASR mishears words as similar-sounding ones and sometimes repeats one; BOOK REFERENCE spells the book's names. " +
+		"Is ORIGINAL wrong where it stands, and does PROPOSED restore what was said?",
 	Criteria: map[string]string{
-		"true": "The marked original is a transcription error and the replacement is what was spoken: it sounds like the marked words, " +
-			"reads naturally in the sentence and its neighbours, and agrees with the book reference wherever the reference names it.",
-		"false": "The marked original is plausibly what was spoken, or the replacement does not sound like it, changes the meaning, " +
-			"is not supported by the context, conflicts with the book reference, or there is not enough information to tell.",
+		"true":  "ORIGINAL is a garbled word, a misspelt name or a stray repeat, and PROPOSED sounds like it and fits BEFORE and AFTER.",
+		"false": "ORIGINAL is real wording that fits, or PROPOSED only restyles it (spelling variant, number form, tense, rewording), sounds different, or contradicts the book reference.",
 	},
 }
 
-// ShouldApplyPromptSHA256 is the hex sha256 of the question's canonical JSON.
-var ShouldApplyPromptSHA256 = func() string {
-	canon, _, err := fn.CanonicalInput(map[string]systemone.Question{questionKey: shouldApplyQuestion})
+// State labels, in layout order. They are hashed into ShouldApplyPromptSHA256
+// with the question: the state is the model's input, so a layout change is a
+// prompt change.
+const (
+	labelIssueType = "ISSUE TYPE"
+	labelOriginal  = "ORIGINAL"
+	labelProposed  = "PROPOSED"
+	labelBefore    = "BEFORE"
+	labelAfter     = "AFTER"
+	labelReference = "BOOK REFERENCE"
+	emptyBlock     = "(none)"
+	linePrefix     = "- "
+)
+
+var stateLayout = []string{
+	labelIssueType, labelOriginal, labelProposed, labelBefore, labelAfter, labelReference, emptyBlock, linePrefix,
+}
+
+// ShouldApplyPromptSHA256 is the hex sha256 (recipe.PromptSHA256) of the
+// question's canonical JSON and the state layout.
+var ShouldApplyPromptSHA256 = shouldApplyPromptSHA256(shouldApplyQuestion, stateLayout)
+
+func shouldApplyPromptSHA256(q systemone.Question, layout []string) string {
+	canon, _, err := fn.CanonicalInput(map[string]systemone.Question{questionKey: q})
 	if err != nil {
-		panic(fmt.Sprintf("decide: hash should_apply question: %v", err))
+		panic(fmt.Sprintf("decide: hash should_apply question: %v", err)) // static data
 	}
-	sum := sha256.Sum256(canon)
-	return hex.EncodeToString(sum[:])
-}()
+	return recipe.PromptSHA256(append([]string{string(canon)}, layout...)...)
+}
 
 // ShouldApplyParams are the decide recipe's params: changing any of them
 // yields a new recipe (CONTRACT §1.9), so decisions made under different
@@ -131,9 +161,12 @@ func (p ShouldApplyParams) recipeParams() map[string]any {
 		"evidence_rule":          EvidenceRule,
 		"rung0_version":          Rung0Version,
 		"context_words":          ContextWords,
+		"neighbour_words":        NeighbourWords,
 		"fallback_words":         FallbackWords,
 		"max_relevant_sentences": MaxRelevantSentences,
 		"max_relevant_runes":     MaxRelevantRunes,
+		"max_sentence_runes":     MaxSentenceRunes,
+		"clip_words":             ClipWords,
 	}
 }
 
@@ -413,22 +446,22 @@ func BuildState(issueType string, c Context, record []RecordSentence) string {
 	var b strings.Builder
 	block := func(label, text string) {
 		if strings.TrimSpace(text) == "" {
-			text = "(none)"
+			text = emptyBlock
 		}
 		b.WriteString(label)
 		b.WriteString(":\n")
 		b.WriteString(text)
 		b.WriteString("\n\n")
 	}
-	block("ISSUE TYPE", issueType)
-	block("ORIGINAL SENTENCE", c.Original)
-	block("CORRECTED SENTENCE", c.Corrected)
-	block("BEFORE", c.Before)
-	block("AFTER", c.After)
+	block(labelIssueType, issueType)
+	block(labelOriginal, c.Original)
+	block(labelProposed, c.Corrected)
+	block(labelBefore, c.Before)
+	block(labelAfter, c.After)
 	var lines []string
 	for _, s := range record {
-		lines = append(lines, "- "+s.Field+": "+s.Text)
+		lines = append(lines, linePrefix+s.Field+": "+s.Text)
 	}
-	block("BOOK REFERENCE", strings.Join(lines, "\n"))
+	block(labelReference, strings.Join(lines, "\n"))
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }

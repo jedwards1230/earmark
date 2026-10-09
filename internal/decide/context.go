@@ -10,9 +10,11 @@ import (
 // Context sizes, in words. They shape what the model sees, so they are recipe
 // params (ShouldApplyParams).
 const (
-	// ContextWords is how many words each side of the span a sentence keeps,
-	// and how many words Before and After keep next to the sentence.
-	ContextWords = 40
+	// ContextWords is how many words each side of the span a sentence keeps.
+	ContextWords = 25
+	// NeighbourWords is how many words Before and After keep next to the
+	// sentence: the nearest ones, which bear most on the span.
+	NeighbourWords = 20
 	// FallbackWords is the ±window around the span used when the segments do
 	// not reproduce the chunk.
 	FallbackWords = 25
@@ -65,8 +67,9 @@ type Context struct {
 // they cover the chunk; if that reproduces chunk.Text exactly, the sentence is
 // the segment(s) the span falls in and Before/After are their neighbours.
 // Otherwise — no segments, a chunk rebuilt by another chunker, a span that
-// does not fit — it falls back to a ±FallbackWords window of the chunk. Each
-// part is truncated to ContextWords words on each side of the span.
+// does not fit — it falls back to a ±FallbackWords window of the chunk. The
+// sentence keeps ContextWords words on each side of the span, Before and After
+// their NeighbourWords words nearest it.
 func BuildContext(segs []db.Segment, chunk ChunkWindow, span patch.Span, replacement string) Context {
 	runes := []rune(chunk.Text)
 	if span.Start < 0 || span.End > len(runes) || span.Start >= span.End {
@@ -144,10 +147,10 @@ func segmentContext(segs []db.Segment, chunk ChunkWindow, runes []rune, span pat
 		Reconstructed: true,
 	}
 	if i := lo + first - 1; i >= 0 {
-		c.Before = lastWords(segs[i].Text, ContextWords)
+		c.Before = lastWords(segs[i].Text, NeighbourWords)
 	}
 	if i := lo + last + 1; i < len(segs) {
-		c.After = firstWords(segs[i].Text, ContextWords)
+		c.After = firstWords(segs[i].Text, NeighbourWords)
 	}
 	return c, true
 }

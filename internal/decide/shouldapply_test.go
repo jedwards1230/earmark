@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,21 +15,55 @@ import (
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/fn"
 	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/systemone"
+	"github.com/jedwards1230/earmark/internal/tokenizer"
 )
 
-// The question's hash is the cache key's prompt component: any edit to the
-// instructions or criteria must show up here, together with a bump of
-// ShouldApplyPromptVersion.
+// The prompt hash (question + state layout) is the cache key's prompt
+// component: any edit to the instructions, criteria or state labels must show
+// up here, together with a bump of ShouldApplyPromptVersion.
 func TestShouldApplyPromptPinned(t *testing.T) {
-	const want = "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f"
+	const want = "ead8aff28d2ba53fdc1c2aa68dd6c2089142a7f23e554beab17eafb1533e168d"
 	if ShouldApplyPromptSHA256 != want {
 		t.Errorf("ShouldApplyPromptSHA256 = %s, want %s — bump ShouldApplyPromptVersion when the question changes", ShouldApplyPromptSHA256, want)
 	}
-	if ShouldApplyPromptVersion != "should_apply@v1" || ShouldApplyModel != "jev-1.13.0" {
-		t.Errorf("identity changed: %s %s", ShouldApplyPromptVersion, ShouldApplyModel)
+	if ShouldApplyPromptVersion != "should_apply@v2" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 2 {
+		t.Errorf("identity changed: %s %s step %d", ShouldApplyPromptVersion, ShouldApplyModel, ShouldApplyStepVersion)
+	}
+	// An earlier prompt's hash must never come back: its cached answers would
+	// be served for this prompt's states.
+	for version, old := range map[string]string{
+		"should_apply@v1": "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f",
+		// An undeployed v2 draft, measured live in dry runs (its answers are
+		// in fn_calls).
+		"should_apply@v2 draft": "a9e3774cb9a83e60baf5d70f42e9f01bde73d94581a051b33c12e8746e098699",
+	} {
+		if ShouldApplyPromptSHA256 == old {
+			t.Errorf("prompt hash equals %s's", version)
+		}
+	}
+}
+
+// A state-layout change alone (no question edit) must change the prompt hash.
+func TestShouldApplyPromptHashCoversLayout(t *testing.T) {
+	base := shouldApplyPromptSHA256(shouldApplyQuestion, stateLayout)
+	if base != ShouldApplyPromptSHA256 {
+		t.Fatalf("helper %s != package hash %s", base, ShouldApplyPromptSHA256)
+	}
+	for i := range stateLayout {
+		l := slices.Clone(stateLayout)
+		l[i] += "x"
+		if shouldApplyPromptSHA256(shouldApplyQuestion, l) == base {
+			t.Errorf("changing layout entry %q kept the hash", stateLayout[i])
+		}
+	}
+	q := shouldApplyQuestion
+	q.Instructions += " "
+	if shouldApplyPromptSHA256(q, stateLayout) == base {
+		t.Error("changing the instructions kept the hash")
 	}
 }
 
@@ -40,8 +75,8 @@ func TestBuildStateGolden(t *testing.T) {
 	}
 	recs := []RecordSentence{{Field: "chapter", Text: "The Arecibo Message"}}
 	want := "ISSUE TYPE:\nmisheard_proper_noun\n\n" +
-		"ORIGINAL SENTENCE:\nthe dish at [[auto sebo]] picked\n\n" +
-		"CORRECTED SENTENCE:\nthe dish at [[Arecibo]] picked\n\n" +
+		"ORIGINAL:\nthe dish at [[auto sebo]] picked\n\n" +
+		"PROPOSED:\nthe dish at [[Arecibo]] picked\n\n" +
 		"BEFORE:\nprevious chunk words\n\n" +
 		"AFTER:\n(none)\n\n" +
 		"BOOK REFERENCE:\n- chapter: The Arecibo Message\n"
@@ -50,6 +85,38 @@ func TestBuildStateGolden(t *testing.T) {
 	}
 	if got := BuildState(IssueMisheardWord, c, nil); !strings.HasSuffix(got, "BOOK REFERENCE:\n(none)\n") {
 		t.Errorf("empty reference: %q", got)
+	}
+}
+
+// The apply rule's two keys — p and text evidence — must stay independent:
+// the state never tells the model whether the evidence gate passed.
+func TestStateOmitsEvidence(t *testing.T) {
+	var seen systemone.Request
+	j := &fakeJev{}
+	j.reply = func(w http.ResponseWriter, req systemone.Request) {
+		seen = req
+		noul(0.5, "jev-1.13.0")(w, req)
+	}
+	e, _ := newTestEvaluator(t, j)
+	const stutter = "he said the the cat sat"
+	repeat := Input{
+		Candidate: cand("f2", IssueRepeatedText, stutter, "the the cat", "the cat", 0.9),
+		Chunk:     ChunkWindow{StartSec: 0, EndSec: 2},
+		Segments:  []db.Segment{seg(0, 2, stutter)},
+	}
+	for want, in := range map[string]Input{
+		EvidenceASINVerbatim: radioInput(IssueMisheardProperNoun, "auto sebo", "Arecibo"),
+		EvidenceExactRepeat:  repeat,
+	} {
+		out := e.Evaluate(context.Background(), in)
+		if !out.Asked || out.Evidence != want {
+			t.Fatalf("want an asked %s finding, got %+v", want, out)
+		}
+		for _, leak := range []string{out.Evidence, "evidence", "verbatim", "exact repeat", "soundalike", "sound-alike", "checks"} {
+			if strings.Contains(strings.ToLower(seen.State), strings.ToLower(leak)) {
+				t.Errorf("state leaks %q (evidence %s):\n%s", leak, out.Evidence, seen.State)
+			}
+		}
 	}
 }
 
@@ -112,7 +179,9 @@ func TestShouldApplyParams(t *testing.T) {
 			t.Errorf("%s change kept recipe %s", name, baseID)
 		}
 	}
-	for _, k := range []string{"evidence_rule", "rung0_version", "apply_p", "reject_p", "phonetic_min_sim"} {
+	for _, k := range []string{"evidence_rule", "rung0_version", "apply_p", "reject_p", "phonetic_min_sim",
+		"context_words", "neighbour_words", "fallback_words", "max_relevant_sentences", "max_relevant_runes",
+		"max_sentence_runes", "clip_words"} {
 		if _, ok := base.Params[k]; !ok {
 			t.Errorf("recipe params lack %s", k)
 		}
@@ -247,7 +316,8 @@ func TestEvaluateEndToEnd(t *testing.T) {
 		if seen.Model != ShouldApplyModel || len(seen.Questions) != 1 || seen.Questions[questionKey].Type != systemone.TypeNoul {
 			t.Errorf("request %+v", seen)
 		}
-		for _, want := range []string{"[[auto sebo]]", "[[Arecibo]]", "BEFORE:\nprevious words", "AFTER:\nup the signal", "- chapter: The Arecibo Message"} {
+		for _, want := range []string{"ORIGINAL:\nthe dish at [[auto sebo]] picked", "PROPOSED:\nthe dish at [[Arecibo]] picked",
+			"BEFORE:\nprevious words", "AFTER:\nup the signal", "- chapter: The Arecibo Message"} {
 			if !strings.Contains(seen.State, want) {
 				t.Errorf("state lacks %q:\n%s", want, seen.State)
 			}
@@ -390,5 +460,23 @@ func TestEvaluatorRecipe(t *testing.T) {
 	}
 	if err := r.Validate(); err != nil {
 		t.Error(err)
+	}
+}
+
+// The question is a fixed part of every call's input, so its size is a cost
+// guard: v1's question was 225 cl100k tokens as canonical JSON and v2's is
+// 161. Growing it past the budget needs a measured reason.
+func TestShouldApplyQuestionBudget(t *testing.T) {
+	const budget = 170
+	canon, _, err := fn.CanonicalInput(map[string]systemone.Question{questionKey: shouldApplyQuestion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := tokenizer.CountTokens(string(canon))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > budget {
+		t.Errorf("should_apply question is %d cl100k tokens, budget %d", n, budget)
 	}
 }

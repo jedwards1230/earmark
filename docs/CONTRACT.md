@@ -3964,9 +3964,10 @@ an error: every failure after rung 0 is a retryable `hold`.
    they cover the chunk; when that reproduces the pristine chunk text
    (`COALESCE(source_text, text)`) exactly, the sentence is the segment(s)
    holding the span, and BEFORE/AFTER are the neighbouring segments (which may
-   lie in the previous/next chunk — context only, never edited). Each is cut
-   to ±40 words around the span. Otherwise the context falls back to a
-   ±25-word window of the chunk with no BEFORE/AFTER.
+   lie in the previous/next chunk — context only, never edited). The sentence
+   is cut to ±25 words around the span; BEFORE and AFTER keep their 20 words
+   nearest it. Otherwise the context falls back to a ±25-word window of the
+   chunk with no BEFORE/AFTER.
 3. **Book reference** — the `book_metadata` row of the book directory. A book
    with no ASIN (libro.fm, unmatched files, identity conflicts) has **no
    reference**. Title, author, narrator, each series and each chapter title are
@@ -3975,8 +3976,9 @@ an error: every failure after rung 0 is a retryable `hold`.
    into sentences. Only **relevant** sentences reach the model: those sharing a
    non-stopword with the span or the replacement, or holding a word whose
    Double Metaphone code matches a span word (or the span read as one word).
-   Sentences naming the replacement's new words come first; at most 6
-   sentences and 1,200 characters, long sentences clipped around the match.
+   Sentences naming the replacement's new words come first; at most 4
+   sentences and 600 characters, a sentence over 200 characters clipped to
+   ±12 words around the match.
 4. **Text evidence** (rule `d2a_new_tokens_verbatim@v1`):
    - `exact_repeat` — a `repeated_text` finding that passed rung 0;
    - `asin_verbatim` — the words the replacement introduces (its differing
@@ -3985,22 +3987,44 @@ an error: every failure after rung 0 is a retryable `hold`.
      include at least one non-stopword of ≥ 4 characters;
    - `none` — anything else, including every finding of a book with no
      reference.
-5. **Model call** — `fn` `should_apply`, step `decide`, prompt
-   `should_apply@v1`, model pinned to `jev-1.13.0`, through `internal/fn`
+5. **Model call** — `fn` `should_apply`, step `decide` (`step_version` 2),
+   prompt `should_apply@v2`, model pinned to `jev-1.13.0`, through `internal/fn`
    (logged and cached in `fn_calls`, §1.9) and the System One client (§2.14).
    One `noul` question named `should_apply` with explicit `true`/`false`
-   criteria; its canonical JSON's sha256 is the prompt hash (pinned by a
-   golden test — changing the question text requires a new prompt version).
-   The state is a labelled text, byte-deterministic for the same inputs:
+   criteria. The prompt hash is `recipe.PromptSHA256` of the question's
+   canonical JSON and the state layout's labels, so a change to either is a
+   new prompt (pinned by a golden test — changing it requires a new prompt
+   version; the hash is also the `fn_calls` cache key's prompt component, so
+   answers to an older prompt are never served).
+
+   The question tells the model the text is an audiobook's ASR transcript,
+   lowercase and unpunctuated by design; that the edit replaces the `[[ ]]`
+   words of ORIGINAL with those of PROPOSED; that ASR mishears words as
+   similar-sounding ones and sometimes repeats one; and that the book reference
+   spells the book's names. It asks a question the text can settle — *is
+   ORIGINAL wrong where it stands, and does PROPOSED restore what was said?*:
+
+   | Criterion | Text |
+   |---|---|
+   | `true` | ORIGINAL is a garbled word, a misspelt name or a stray repeat, and PROPOSED sounds like it and fits BEFORE and AFTER. |
+   | `false` | ORIGINAL is real wording that fits, or PROPOSED only restyles it (spelling variant, number form, tense, rewording), sounds different, or contradicts the book reference. |
+
+   Uncertainty is deliberately not a `false` reason: an undecidable finding
+   should land in the hold band, since a reject is final. **The state never
+   states the text evidence** (no "found in the reference" or sound-alike
+   line): the apply rule's two keys, `p` and evidence, must stay independent,
+   and telling the model would raise `p` on exactly the findings the evidence
+   gate lets through. The state is a labelled text, byte-deterministic for the
+   same inputs:
 
    ```text
    ISSUE TYPE:
    misheard_proper_noun
 
-   ORIGINAL SENTENCE:
+   ORIGINAL:
    the dish at [[auto sebo]] picked
 
-   CORRECTED SENTENCE:
+   PROPOSED:
    the dish at [[Arecibo]] picked
 
    BEFORE:
@@ -4015,6 +4039,23 @@ an error: every failure after rung 0 is a retryable `hold`.
 
    An empty block reads `(none)`. The `fn_calls` input is `{"state": …}`; the
    output is `{"model", "answers"}` as returned.
+
+   *v1 → v2* (`should_apply@v1` asked "did the narrator actually say the
+   replacement", labelled the sentences ORIGINAL SENTENCE / CORRECTED
+   SENTENCE, kept ±40 words and up to 6 reference sentences / 1,200
+   characters, and named "not enough information" as a `false` reason; its
+   answers peaked at p 0.5–0.7 with none ≥ 0.95). v2 asks the question
+   above, cuts the state to the sizes in steps 2 and 3, and shortens the
+   question from 225 to 161 cl100k tokens as canonical JSON (a test pins a
+   170-token budget).
+   Measured live in a dry run over the same 887 rung-0 passes, v1 → v2: input
+   tokens 641 → 602 per call (−6.1%); mean `p` on findings hand-labelled good
+   fixes 0.672 → 0.671 and on junk 0.519 → 0.449 (AUC over 84 text-only
+   labels 0.749 → 0.834; the paired-bootstrap 95% interval of the difference
+   touches 0). A longer first draft of v2 (+6% tokens over v1, AUC 0.745) and
+   a variant adding rung 0's sound-alike score to the state (AUC 0.821, more
+   tokens) were measured and not shipped.
+
 6. **Decision rule** — with `p` the `should_apply` `noul`:
 
    | Condition | Decision | Reason |
@@ -4032,8 +4073,9 @@ an error: every failure after rung 0 is a retryable `hold`.
 
 **Recipe params.** `apply_p` (0.95), `reject_p` (0.20), `phonetic_min_sim`
 (rung 0's sound-alike threshold, 0.67), `evidence_rule`, `rung0_version`, the
-context sizes (`context_words` 40, `fallback_words` 25) and the relevance caps
-(`max_relevant_sentences` 6, `max_relevant_runes` 1200) are all params of the
+context sizes (`context_words` 25, `neighbour_words` 20, `fallback_words` 25)
+and the relevance caps (`max_relevant_sentences` 4, `max_relevant_runes` 600,
+`max_sentence_runes` 200, `clip_words` 12) are all params of the
 decide recipe (§1.9), so changing any of them yields a new recipe. Params must
 satisfy `0 ≤ reject_p < apply_p ≤ 1` and `0 < phonetic_min_sim ≤ 1`.
 
