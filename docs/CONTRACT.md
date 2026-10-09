@@ -3997,7 +3997,8 @@ an error: every failure after rung 0 is a retryable `hold`.
      rejects only clear junk, so the rule is deliberately narrow: compared
      lower-cased, one word must be **exactly** the other plus one of these
      suffixes, with no other stemming or fuzzy matching:
-     - `s`, stem ≥ 3 letters (`hair`→`hairs`, `book`→`books`);
+     - `s`, stem ≥ 3 letters not itself ending in `s` (`hair`→`hairs`,
+       `book`→`books`; not `les`→`less`, `pas`→`pass`);
      - `es`, stem ≥ 3 letters ending in a sibilant — `s`, `x`, `z`, `ch`,
        `sh` (`box`→`boxes`, `church`→`churches`; not `tim`→`times`);
      - `ed`, stem ≥ 4 letters (`walk`→`walked`).
@@ -4005,8 +4006,17 @@ an error: every failure after rung 0 is a retryable `hold`.
      Both directions match. **Exempt**: issue type `misheard_proper_noun`,
      and any pair where either word starts with a capital letter (the
      transcript is lower-case, so a capital marks a name: `jon`→`Jones`,
-     `luca`→`Lucas`, `robert`→`Roberts`); exempt pairs are scored like any
-     other substitution. There is no `-ing`, `-d` or `-ies`/`-ied` rule —
+     `luca`→`Lucas`, `robert`→`Roberts`), and any pair where either raw
+     word holds an apostrophe, `'` or `’` (tokens drop apostrophes, so a
+     contraction or possessive would otherwise read as an `-s` form:
+     `there`→`there's`, `that`→`that’s`, `let`→`let's`,
+     `father`→`father's`); exempt pairs are scored like any
+     other substitution. **Known rejects, kept on purpose**: the rule still
+     fails `new`→`news`, `mean`→`means`, `wick`→`wicked`,
+     `crook`→`crooked`, and lower-case `luca`→`lucas` (capitalised `Lucas`
+     is exempt) — each is a real word pair the narrow rule cannot tell from
+     an inflection, and widening it to spare them would let real
+     inflections through. There is no `-ing`, `-d` or `-ies`/`-ied` rule —
      `-ing` is where distinct words collide (`even`/`evening`,
      `brown`/`browning`, `mann`/`manning`). Pairs an earlier draft of this
      rule matched and this one does not, now scored phonetically:
@@ -4023,7 +4033,8 @@ an error: every failure after rung 0 is a retryable `hold`.
    - **Known passes the model must catch.** Rung 0 is a junk filter, not a
      verdict. A tense change that sounds alike (`trades`→`traded`, 0.750)
      passes, and so does a spelled-out year rewritten as a nearby
-     sound-alike year: `nineteen thirty seven`→`1938` passes at 0.700 —
+     sound-alike year: `nineteen thirty seven`→`1938` passes at 0.700
+     (as `number_artifact`, `misheard_word` or `homophone`) —
      only one side writes a numeral, so the numeral-value check cannot fire,
      and `1938` read as `nineteen thirty eight` shares most of its sounds.
      Jev (`should_apply`) must reject these.

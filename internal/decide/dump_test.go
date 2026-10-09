@@ -109,7 +109,7 @@ func TestDryRunRung0Only(t *testing.T) {
 	if err := rep.Print(&text, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []string{"rung 0 only", "rung0_pass 5", "no model calls, no recipe registered, nothing written"} {
+	for _, s := range []string{"rung 0 only", "rung0_pass 5", "no model calls, no recipe registered, no decisions written (startup migrations still run)"} {
 		if !strings.Contains(text.String(), s) {
 			t.Errorf("text report lacks %q:\n%s", s, text.String())
 		}

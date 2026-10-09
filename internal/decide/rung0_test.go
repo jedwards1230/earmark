@@ -267,6 +267,8 @@ func TestInflection(t *testing.T) {
 		{"jon", "jones"}, {"hugh", "hughes"}, {"tim", "times"}, {"see", "seed"}, {"breed", "bring"},
 		// Stem lengths: -s needs 3 letters, -ed needs 4.
 		{"a", "as"}, {"be", "bes"}, {"bed", "beded"}, {"red", "reded"},
+		// -s after a stem already ending in s is not a plural.
+		{"les", "less"}, {"pas", "pass"}, {"kiss", "kisss"},
 	} {
 		if inflection(p[0], p[1]) {
 			t.Errorf("%q/%q read as an inflection", p[0], p[1])
@@ -602,6 +604,16 @@ func TestCheckNotInflection(t *testing.T) {
 		{IssueMisheardWord, "breed", "bring"},
 		{IssueMisheardWord, "bring", "breed"},
 		{IssueHomophone, "robert", "Roberts"},
+		// Contractions and possessives: tokens drop the apostrophe, so
+		// "there's" tokenises as "theres", but it is a different word.
+		{IssueMisheardWord, "there", "there's"},
+		{IssueMisheardWord, "that", "that’s"},
+		{IssueHomophone, "let", "let's"},
+		{IssueMisheardWord, "father", "father’s"},
+		{IssueMisheardWord, "father's", "father"},
+		// A stem already ending in s is not a plural.
+		{IssueMisheardWord, "les", "less"},
+		{IssueMisheardWord, "pas", "pass"},
 		// Lower-case, but the judge called it a name.
 		{IssueMisheardProperNoun, "luca", "lucas"},
 		{IssueMisheardProperNoun, "robert", "roberts"},
@@ -618,6 +630,17 @@ func TestCheckNotInflection(t *testing.T) {
 	// Control: without the name signals the same pair is an inflection.
 	if v := Check(cand("a", IssueMisheardWord, "and luca went", "luca", "lucas", 0.9), DefaultParams()); v.Reason != ReasonInflectionOnly {
 		t.Errorf("lower-case misheard_word luca → lucas = %q, want inflection_only", v.Reason)
+	}
+}
+
+// Real word pairs the narrow rule still reads as inflections, on purpose:
+// listed in CONTRACT §2.19 as known rejects.
+func TestCheckKnownInflectionRejects(t *testing.T) {
+	for _, p := range [][2]string{{"new", "news"}, {"mean", "means"}, {"wick", "wicked"}, {"crook", "crooked"}, {"luca", "lucas"}} {
+		v := Check(cand("a", IssueMisheardWord, "and "+p[0]+" went", p[0], p[1], 0.9), DefaultParams())
+		if v.Reason != ReasonInflectionOnly {
+			t.Errorf("%q → %q = %q %s, want inflection_only", p[0], p[1], v.Reason, v.Evidence)
+		}
 	}
 }
 
@@ -657,8 +680,10 @@ func TestCheckChangeCap(t *testing.T) {
 // "nineteen thirty seven" read against "1938" scores 0.70. Documented in
 // CONTRACT §2.19 as a known pass the model must catch.
 func TestCheckYearOffByOnePasses(t *testing.T) {
-	v := Check(cand("a", IssueNumberArtifact, "in nineteen thirty seven we", "nineteen thirty seven", "1938", 0.9), DefaultParams())
-	if !v.Pass || !strings.Contains(v.Evidence, "soundalike 0.70") {
-		t.Errorf("nineteen thirty seven → 1938 = pass %v %q %s; want a pass at 0.70", v.Pass, v.Reason, v.Evidence)
+	for _, issue := range []string{IssueNumberArtifact, IssueMisheardWord, IssueHomophone} {
+		v := Check(cand("a", issue, "in nineteen thirty seven we", "nineteen thirty seven", "1938", 0.9), DefaultParams())
+		if !v.Pass || !strings.Contains(v.Evidence, "soundalike 0.700") {
+			t.Errorf("%s: nineteen thirty seven → 1938 = pass %v %q %s; want a pass at 0.700", issue, v.Pass, v.Reason, v.Evidence)
+		}
 	}
 }

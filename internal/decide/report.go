@@ -371,7 +371,7 @@ func (r *Report) printRung0Only(p func(string, ...any)) {
 	if c := r.Calibration; c != nil {
 		c.print(p, rung0Classes)
 	}
-	p("\n(rung 0 only) no model calls, no recipe registered, nothing written.\n")
+	p("\n(rung 0 only) no model calls, no recipe registered, no decisions written (startup migrations still run).\n")
 }
 
 func counts(m map[string]int, keys []string) string {

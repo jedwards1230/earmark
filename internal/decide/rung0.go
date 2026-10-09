@@ -263,7 +263,8 @@ func Check(c Candidate, p Params) Verdict {
 //     letter long, so the score says nothing;
 //   - a one-word change by one regular ending (inflection) fails
 //     inflection_only, unless the issue type is misheard_proper_noun or
-//     either word is capitalised (a name: "Jon" → "Jones");
+//     either word is capitalised (a name: "Jon" → "Jones") or holds an
+//     apostrophe (a contraction or possessive: "there" → "there's");
 //   - otherwise phonetic.Compare over the hunk's raw text, which joins words
 //     (so "auto sebo" ↔ "arecibo" and "placenes" ↔ "place names" compare as
 //     one word) and reads numerals every common way.
@@ -319,7 +320,8 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 			return fail(ReasonLetterSwap, span, "%s: letter swap %q → %q: letter names rhyme, so their sound is no evidence", at, a, b)
 		}
 		if len(ow) == 1 && len(rw) == 1 && c.IssueType != IssueMisheardProperNoun &&
-			!capitalised(a) && !capitalised(b) && inflection(ow[0].text, rw[0].text) {
+			!capitalised(a) && !capitalised(b) && !hasApostrophe(a) && !hasApostrophe(b) &&
+			inflection(ow[0].text, rw[0].text) {
 			return fail(ReasonInflectionOnly, span, "%s: %q → %q changes only an inflectional ending", at, a, b)
 		}
 		m := phonetic.Compare(a, b)
@@ -440,7 +442,8 @@ const (
 // inflection reports whether one of a and b (lower-cased words) is EXACTLY
 // the other plus one regular ending, and nothing else changed:
 //
-//   - "s" after a stem of at least minStemRunes letters ("hair" → "hairs");
+//   - "s" after a stem of at least minStemRunes letters that does not
+//     itself end in s ("hair" → "hairs"; not "les" → "less");
 //   - "es" after a stem of at least minStemRunes letters that ends in a
 //     sibilant — s, x, z, ch or sh ("box" → "boxes"; not "tim" → "times");
 //   - "ed" after a stem of at least minEdStemRunes letters ("walk" →
@@ -466,7 +469,8 @@ func inflection(a, b string) bool {
 	n := utf8.RuneCountInString(a)
 	switch suffix {
 	case "s":
-		return n >= minStemRunes
+		// A stem already ending in s is not a plural: "les" → "less".
+		return n >= minStemRunes && !strings.HasSuffix(a, "s")
 	case "es":
 		return n >= minStemRunes && sibilant(a)
 	case "ed":
@@ -484,6 +488,14 @@ func sibilant(stem string) bool {
 		}
 	}
 	return false
+}
+
+// hasApostrophe reports whether a raw word holds an apostrophe, straight or
+// curly. Tokens drop apostrophes, so "there's" and "father's" tokenise as
+// "theres" and "fathers"; a contraction or possessive is a different word,
+// not an inflection, and is exempt from it.
+func hasApostrophe(raw string) bool {
+	return strings.ContainsAny(raw, "'’")
 }
 
 // capitalised reports whether a raw word starts with an upper-case letter.
