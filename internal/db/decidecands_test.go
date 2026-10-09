@@ -39,7 +39,7 @@ func TestDecideSampleSQL(t *testing.T) {
 		"f.anchor_offset IS NOT NULL",
 		"f.chunk_text_sha256 IS NOT NULL",
 		"f.patch_state = ANY($1)",
-		"(NOT $4 OR f.decided_by LIKE 'mcp:%')",
+		"(cardinality($4::text[]) = 0 OR f.decided_by LIKE ANY($4::text[]))",
 		"ORDER BY md5(f.id::text || $5), f.id",
 		"LIMIT $6",
 	} {
@@ -65,12 +65,23 @@ func TestDecideScope(t *testing.T) {
 	if got := (DecideScope{Calibrate: true}).states(); len(got) != 3 {
 		t.Errorf("calibrate states %v", got)
 	}
+	if got := (DecideScope{Calibrate: true}).actorPatterns(); len(got) != 1 || got[0] != "mcp:%" {
+		t.Errorf("default actors %v", got)
+	}
+	if got := (DecideScope{Calibrate: true, HumanActors: []string{"mcp", "cli"}}).actorPatterns(); len(got) != 2 || got[1] != "cli:%" {
+		t.Errorf("actors %v", got)
+	}
+	for _, bad := range []string{"jev", "revert", "MCP", "mcp:", ""} {
+		if _, err := decideSample(ctx, newMockPool(t), DecideScope{Sample: 1, Seed: "s", Calibrate: true, HumanActors: []string{bad}}); err == nil {
+			t.Errorf("actor %q accepted", bad)
+		}
+	}
 
 	mock := newMockPool(t)
 	cols := []string{"id", "transcript_id", "file_path", "issue_type", "original_text", "suggested_correction",
 		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by"}
 	mock.ExpectQuery(`ORDER BY md5`).
-		WithArgs([]string{"proposed"}, "%Dune%", "homophone", false, "s1", 2).
+		WithArgs([]string{"proposed"}, "%Dune%", "homophone", []string{}, "s1", 2).
 		WillReturnRows(pgxmock.NewRows(cols).
 			AddRow("f1", "t1", "/b/Dune/1.m4b", "homophone", "their", "there", 0.9, 3, 10, -1, "aa", "proposed", ""))
 	got, err := decideSample(ctx, mock, DecideScope{Sample: 2, Seed: "s1", Book: "Dune", IssueType: "homophone"})

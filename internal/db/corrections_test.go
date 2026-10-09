@@ -48,6 +48,14 @@ var correctionSQL = map[string]string{
 	"patchSetAtSQL":           patchSetAtSQL,
 	"applyDecisionsLockSQL":   applyDecisionsLockSQL,
 	"applyDecisionsChunksSQL": applyDecisionsChunksSQL,
+	// Decide --yes and revert (decidewrite.go).
+	"applyRecheckLockSQL":     applyRecheckLockSQL,
+	"decideWorkSQL":           decideWorkSQL,
+	"revertCandidatesSQL":     revertCandidatesSQL,
+	"revertDecisionsCountSQL": revertDecisionsCountSQL,
+	"revokeScopeSQL":          revokeScopeSQL,
+	"reflagChunksSQL":         reflagChunksSQL,
+	"decisionCountsSQL":       decisionCountsSQL,
 }
 
 // TestCorrectionSQL_NeverTouchesTranscriptProvenance is the hard invariant of

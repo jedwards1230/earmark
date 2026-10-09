@@ -14,6 +14,7 @@ import (
 	"os"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -214,5 +215,167 @@ func TestIntegrationDecideDryRun(t *testing.T) {
 	}
 	if calls < 2 || decideRecipes != 1 {
 		t.Errorf("fn_calls %d, decide recipes %d", calls, decideRecipes)
+	}
+}
+
+func findingStates(t *testing.T, conn *pgx.Conn) map[string]string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), `SELECT right(id::text, 2), patch_state || '|' || COALESCE(decided_by, '') FROM transcript_findings`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	var k, v string
+	if _, err := pgx.ForEachRow(rows, []any{&k, &v}, func() error { out[k] = v; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func countOf(t *testing.T, conn *pgx.Conn, sql string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestIntegrationDecideApply: `earmark decide --yes` end to end — decisions
+// and state changes attributed to the recipe, nothing else touched, and a
+// re-run that asks nothing and writes nothing.
+func TestIntegrationDecideApply(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedDecide(t, conn)
+	before := findingStates(t, conn)
+
+	asker := &fakeAsker{p: func(string) (float64, error) { return 0.97, nil }}
+	rep, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 2, Params: DefaultShouldApplyParams()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := "jev:" + rep.RecipeID
+	if w := rep.Write; w.Accepted != 1 || w.Rejected != 1 || w.Skipped != 0 || asker.calls != 1 {
+		t.Fatalf("write %+v, %d calls", w, asker.calls)
+	}
+	after := findingStates(t, conn)
+	if after["f1"] != "accepted|"+actor || after["f2"] != "rejected|"+actor {
+		t.Errorf("f1 %q f2 %q", after["f1"], after["f2"])
+	}
+	for _, k := range []string{"f3", "f4", "f5", "f6", "f7"} {
+		if after[k] != before[k] {
+			t.Errorf("%s changed: %q → %q (out of scope)", k, before[k], after[k])
+		}
+	}
+	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'decision' AND actor = $1 AND recipe_id = $2`, actor, rep.RecipeID); n != 2 {
+		t.Errorf("%d decision events by %s, want 2", n, actor)
+	}
+	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'transition' AND from_state = 'proposed' AND actor = $1`, actor); n != 2 {
+		t.Errorf("%d transitions by %s, want 2", n, actor)
+	}
+	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'decision' AND fn_call_id IS NOT NULL AND p = 0.97 AND evidence = 'asin_verbatim'`); n != 1 {
+		t.Errorf("the apply decision should cite its fn_call, p and evidence (%d)", n)
+	}
+	if !chunkIsStale(t, conn) {
+		t.Error("an accept must flag its chunk for rebuild")
+	}
+
+	again, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 2, Params: DefaultShouldApplyParams()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Findings != 0 || asker.calls != 1 {
+		t.Errorf("re-run decided %d findings with %d calls; want nothing", again.Findings, asker.calls)
+	}
+}
+
+func chunkIsStale(t *testing.T, conn *pgx.Conn) bool {
+	t.Helper()
+	var b bool
+	if err := conn.QueryRow(context.Background(), `SELECT embedding_stale FROM transcript_chunks LIMIT 1`).Scan(&b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// A chunk rebuilt between compute and write: the decisions about its old
+// text are dropped, not written.
+func TestIntegrationDecideApplyChunkChanged(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedDecide(t, conn)
+	other, err := pgx.Connect(ctx, conn.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close(ctx) }()
+	asker := &fakeAsker{p: func(string) (float64, error) {
+		// The worker rebuilds the chunk while the model is thinking.
+		if _, err := other.Exec(context.Background(), `UPDATE transcript_chunks SET source_text = source_text || ' again'`); err != nil {
+			return 0, err
+		}
+		return 0.97, nil
+	}}
+	rep, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 1, Params: DefaultShouldApplyParams()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := rep.Write; w.Skipped != 2 || w.Accepted != 0 || w.Rejected != 0 {
+		t.Errorf("write %+v, want both findings skipped", w)
+	}
+	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'decision'`); n != 0 {
+		t.Errorf("%d decisions written about text the chunk no longer holds", n)
+	}
+	if s := findingStates(t, conn); s["f1"] != "proposed|" || s["f2"] != "proposed|" {
+		t.Errorf("states %v", s)
+	}
+}
+
+// A finding another writer holds (reanchor locks findings FOR UPDATE) is
+// skipped, not waited on, and decided by the next run from the cached answer.
+func TestIntegrationDecideApplyLockSkip(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedDecide(t, conn)
+	holder, err := pgx.Connect(ctx, conn.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close(ctx) }()
+	tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM transcript_findings WHERE id = '00000000-0000-0000-0000-0000000000f1' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	asker := &fakeAsker{p: func(string) (float64, error) { return 0.97, nil }}
+	done := make(chan *Report, 1)
+	go func() {
+		rep, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 1, Params: DefaultShouldApplyParams()})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- rep
+	}()
+	var rep *Report
+	select {
+	case rep = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("decide waited on a locked finding")
+	}
+	if w := rep.Write; w.Skipped != 1 || w.Rejected != 1 {
+		t.Errorf("write %+v, want f1 skipped and f2 rejected", w)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 1, Params: DefaultShouldApplyParams()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Write.Accepted != 1 || again.Jev.CacheHits != 1 || asker.calls != 1 {
+		t.Errorf("re-run %+v, cache hits %d, calls %d", again.Write, again.Jev.CacheHits, asker.calls)
 	}
 }

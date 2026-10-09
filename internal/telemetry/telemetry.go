@@ -73,6 +73,16 @@ type RecipeInfo struct {
 	PromptVersion string
 }
 
+// DecisionCount is one earmark_decisions series: how many findings' latest
+// unrevoked decision has these labels.
+type DecisionCount struct {
+	Outcome   string
+	IssueType string
+	Evidence  string
+	Recipe    string
+	N         int64
+}
+
 // QualityIndex is one earmark_quality_index series: the normalized (0..1)
 // mean chunk-scan quality of one recipe over one scope (library,
 // asin_matched, unmatched).
@@ -93,10 +103,11 @@ type Telemetry struct {
 	tp      *sdktrace.TracerProvider
 	promReg *prometheus.Registry
 
-	legacy  atomic.Pointer[prometheus.Gatherer]
-	recipes atomic.Pointer[[]RecipeInfo]
-	stale   atomic.Pointer[map[string]int64]
-	quality atomic.Pointer[[]QualityIndex]
+	legacy    atomic.Pointer[prometheus.Gatherer]
+	recipes   atomic.Pointer[[]RecipeInfo]
+	stale     atomic.Pointer[map[string]int64]
+	quality   atomic.Pointer[[]QualityIndex]
+	decisions atomic.Pointer[[]DecisionCount]
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -255,6 +266,22 @@ func (t *Telemetry) registerInstruments() error {
 		})); err != nil {
 		return fmt.Errorf("earmark_quality_index: %w", err)
 	}
+	if _, err := m.Int64ObservableGauge("earmark_decisions",
+		metric.WithDescription("Findings by their latest unrevoked decide-recipe decision (CONTRACT §2.19); labels: outcome, issue_type, evidence, recipe. Refreshed on a timer."),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			if ds := t.decisions.Load(); ds != nil {
+				for _, d := range *ds {
+					o.Observe(d.N, metric.WithAttributes(
+						attribute.String("outcome", d.Outcome),
+						attribute.String("issue_type", d.IssueType),
+						attribute.String("evidence", d.Evidence),
+						attribute.String("recipe", d.Recipe)))
+				}
+			}
+			return nil
+		})); err != nil {
+		return fmt.Errorf("earmark_decisions: %w", err)
+	}
 	return nil
 }
 
@@ -330,6 +357,21 @@ func (t *Telemetry) StartQualityRefresh(interval, timeout time.Duration, load fu
 		q, err := load(ctx)
 		if err == nil {
 			t.quality.Store(&q)
+		}
+		return err
+	})
+}
+
+// StartDecisionsRefresh refreshes earmark_decisions from load every interval
+// (and once immediately) until Shutdown, like StartStaleRefresh.
+func (t *Telemetry) StartDecisionsRefresh(interval, timeout time.Duration, load func(context.Context) ([]DecisionCount, error)) {
+	if load == nil {
+		return
+	}
+	t.startRefresh("earmark_decisions", interval, timeout, func(ctx context.Context) error {
+		d, err := load(ctx)
+		if err == nil {
+			t.decisions.Store(&d)
 		}
 		return err
 	})
