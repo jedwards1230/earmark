@@ -76,10 +76,12 @@ same findings.
 loading, rung-0 checks and dedupe, but no model call, no recipe registered and
 nothing written — so it needs no AI_ROLES.decide. It reports rung-0 passes
 and reject reasons; run two builds over the same --seed to compare rung-0
-versions. --dump FILE writes one JSON line per sampled finding (id, issue
-type, judge model, text, rung-0 verdict and evidence, and the decision when
-the model was asked), sorted by finding id; it works with or without
---rung0-only. Both are dry-run only.
+versions. Like every command that opens the database it still runs the
+goose schema migrations first (a no-op when the schema is current). --dump
+FILE writes one JSON line per sampled finding (id, issue type, judge model,
+text, rung-0 verdict and evidence, and the decision when the model was
+asked), sorted by finding id; it works with or without --rung0-only. Both
+are dry-run only.
 
 --yes decides every finding in scope and writes the decisions (CONTRACT
 §2.19 "earmark decide --yes"): apply moves a finding to accepted (replayed by
@@ -117,7 +119,7 @@ func init() {
 	f.BoolVar(&opts.json, "json", false, "print the report as JSON")
 	f.BoolVar(&opts.calibrate, "calibrate", false, "sample human-decided findings and report agreement")
 	f.StringSliceVar(&opts.human, "human", nil, "with --calibrate: decided_by prefixes that count as a person (default mcp; e.g. mcp,cli)")
-	f.BoolVar(&opts.rung0Only, "rung0-only", false, "dry run through rung 0 only: no model call, no write, no AI_ROLES.decide needed")
+	f.BoolVar(&opts.rung0Only, "rung0-only", false, "dry run through rung 0 only: no model call, no decision or fn_calls write, no AI_ROLES.decide needed (still runs goose migrations at connect, a no-op on a current schema)")
 	f.StringVar(&opts.dump, "dump", "", "dry run: write one JSON line per sampled finding to this file")
 	f.BoolVar(&opts.yes, "yes", false, "decide every finding in scope and write the decisions")
 	f.IntVar(&opts.limit, "limit", 0, "with --yes: decide at most N findings this run (0 = all in scope)")

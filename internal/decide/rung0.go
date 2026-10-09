@@ -56,11 +56,20 @@ const (
 	// do not sound like the words they replace, or that only inserts or
 	// deletes words.
 	ReasonNotSoundAlike = "not_soundalike"
-	// ReasonInflectionOnly — a substitution that changes a word only by an
-	// inflectional ending ("trades" → "traded", "hair" → "hairs"). A
+	// ReasonInflectionOnly — a substitution that changes one word only by
+	// adding or removing a single regular ending ("hair" → "hairs", "box" →
+	// "boxes", "walk" → "walked"; the exact rule is inflection's). A
 	// grammar edit and a misheard ending look the same to every rung-0
-	// signal, so neither is passed as a mishearing.
+	// signal, so neither is passed as a mishearing. Proper nouns are exempt.
 	ReasonInflectionOnly = "inflection_only"
+	// ReasonLetterSwap — a substitution hunk that swaps one single-letter
+	// word for another ("c" → "b", "i" → "a"): letter names rhyme, and their
+	// one-letter codes carry no evidence.
+	ReasonLetterSwap = "letter_swap"
+	// ReasonTooManyChanges — a substitution whose hunks each pass, but which
+	// changes more than MaxChangedWords words in total: a rewrite, not a
+	// mishearing.
+	ReasonTooManyChanges = "too_many_changes"
 	// ReasonNotExactRepeat — a repeated_text fix that is not the removal of an
 	// exact adjacent repeat, word-bounded, at the located span.
 	ReasonNotExactRepeat = "not_exact_repeat"
@@ -92,6 +101,12 @@ const (
 	// MaxSubstitutionRunes equals phonetic.MaxPhraseRunes.
 	MaxSubstitutionTokens = 8
 	MaxSubstitutionRunes  = phonetic.MaxPhraseRunes
+	// MaxChangedWords caps the words a substitution changes, summed over its
+	// hunks (each hunk counting its longer side), so many small hunks cannot
+	// add up to a rewrite. number_artifact is exempt, as it is from the
+	// per-hunk word limit: a spelled-out number is many words but one value,
+	// and number_artifact is never applied by machine (it caps at hold).
+	MaxChangedWords = 8
 	// MaxDiffTokens bounds each side of the token alignment (an O(n·m)
 	// table). An original or replacement past it fails not_soundalike for
 	// a substitution; a judge span is a few words to a sentence.
@@ -244,12 +259,18 @@ func Check(c Candidate, p Params) Verdict {
 //   - the numeral-value check: both sides write numerals with different
 //     values → fail, since spoken numbers share most of their sounds;
 //   - a letter swap (one single-letter word for another: "c" → "b", "i" →
-//     "a") fails: letter names rhyme, and their codes are one letter long,
-//     so the score says nothing;
-//   - a one-word change by an inflectional ending fails inflection_only;
+//     "a") fails letter_swap: letter names rhyme, and their codes are one
+//     letter long, so the score says nothing;
+//   - a one-word change by one regular ending (inflection) fails
+//     inflection_only, unless the issue type is misheard_proper_noun or
+//     either word is capitalised (a name: "Jon" → "Jones");
 //   - otherwise phonetic.Compare over the hunk's raw text, which joins words
 //     (so "auto sebo" ↔ "arecibo" and "placenes" ↔ "place names" compare as
 //     one word) and reads numerals every common way.
+//
+// When every hunk passes, the words changed across all hunks (the longer
+// side of each) must not exceed MaxChangedWords (too_many_changes), except
+// for number_artifact.
 //
 // A hunk is compared as the RAW text from its first word to its last on each
 // side, so a numeral keeps its punctuation ("1,000", "3.5").
@@ -260,6 +281,7 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 	}
 	hunks := diffHunks(texts(o), texts(r))
 	evs := make([]string, 0, len(hunks))
+	changed := 0
 	for k, h := range hunks {
 		ow, rw := o[h.oi:h.oj], r[h.ri:h.rj]
 		at := fmt.Sprintf("hunk %d/%d", k+1, len(hunks))
@@ -267,6 +289,7 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 			return fail(ReasonNotSoundAlike, span, "%s: not a substitution: %q → %q only inserts or deletes words",
 				at, joinTexts(ow), joinTexts(rw))
 		}
+		changed += max(len(ow), len(rw))
 		a, b := rawText(c.Original, ow), rawText(c.Replacement, rw)
 		for _, side := range []struct {
 			text string
@@ -293,9 +316,10 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 			return fail(ReasonNotSoundAlike, span, "%s: numeral change %q → %q: a value change cannot be checked phonetically", at, a, b)
 		}
 		if len(ow) == 1 && len(rw) == 1 && singleLetter(ow[0].text) && singleLetter(rw[0].text) {
-			return fail(ReasonNotSoundAlike, span, "%s: letter swap %q → %q: letter names rhyme, so their sound is no evidence", at, a, b)
+			return fail(ReasonLetterSwap, span, "%s: letter swap %q → %q: letter names rhyme, so their sound is no evidence", at, a, b)
 		}
-		if len(ow) == 1 && len(rw) == 1 && inflection(ow[0].text, rw[0].text) {
+		if len(ow) == 1 && len(rw) == 1 && c.IssueType != IssueMisheardProperNoun &&
+			!capitalised(a) && !capitalised(b) && inflection(ow[0].text, rw[0].text) {
 			return fail(ReasonInflectionOnly, span, "%s: %q → %q changes only an inflectional ending", at, a, b)
 		}
 		m := phonetic.Compare(a, b)
@@ -305,6 +329,10 @@ func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict 
 			return Verdict{Reason: ReasonNotSoundAlike, Span: span, Evidence: ev}
 		}
 		evs = append(evs, ev)
+	}
+	if changed > MaxChangedWords && c.IssueType != IssueNumberArtifact {
+		return fail(ReasonTooManyChanges, span, "%d hunks change %d words in total (limit %d): a rewrite, not a mishearing",
+			len(hunks), changed, MaxChangedWords)
 	}
 	if len(evs) == 0 { // unreachable after Check's cosmetic step; fail closed
 		return fail(ReasonCosmeticOnly, span, "%q → %q changes no word", c.Original, c.Replacement)
@@ -401,54 +429,69 @@ func singleLetter(t string) bool {
 	return size == len(t) && unicode.IsLetter(r)
 }
 
-// minStemRunes is the shortest stem inflection accepts, so short words that
-// merely end in s/d ("is", "as", "red") are not read as inflected forms.
-const minStemRunes = 3
+// minStemRunes is the shortest stem inflection accepts for -s and -es, so
+// short words that merely end in s ("is", "as") are not read as inflected
+// forms; minEdStemRunes is the shortest for -ed.
+const (
+	minStemRunes   = 3
+	minEdStemRunes = 4
+)
 
-// inflection reports whether a and b are different inflected forms of one
-// stem: each, minus at most one regular English inflectional ending — -s,
-// -es, -ies/-ied (for -y), -ed, -d (after e), -ing — leaves a common stem of
-// at least minStemRunes letters. "trades"/"traded", "hair"/"hairs",
-// "carry"/"carried", "walk"/"walking". Irregular forms ("ran"/"run") are
-// not detected; they are left to the phonetic score.
+// inflection reports whether one of a and b (lower-cased words) is EXACTLY
+// the other plus one regular ending, and nothing else changed:
+//
+//   - "s" after a stem of at least minStemRunes letters ("hair" → "hairs");
+//   - "es" after a stem of at least minStemRunes letters that ends in a
+//     sibilant — s, x, z, ch or sh ("box" → "boxes"; not "tim" → "times");
+//   - "ed" after a stem of at least minEdStemRunes letters ("walk" →
+//     "walked"; not "bed" → "bed"+"ed").
+//
+// There is no other stemming: no -ing (distinct words collide there:
+// "even"/"evening", "brown"/"browning"), no -d, no y → ies/ied, no
+// fuzzy prefixes ("see"/"seed", "breed"/"bring"). Rung 0 rejects only clear
+// junk; anything else is left to the phonetic score and the model.
 func inflection(a, b string) bool {
-	if a == b {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	suffix, ok := strings.CutPrefix(b, a)
+	if !ok || suffix == "" {
 		return false
 	}
-	bs := stems(b)
-	for _, s := range stems(a) {
-		if slices.Contains(bs, s) {
+	for _, r := range b {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	n := utf8.RuneCountInString(a)
+	switch suffix {
+	case "s":
+		return n >= minStemRunes
+	case "es":
+		return n >= minStemRunes && sibilant(a)
+	case "ed":
+		return n >= minEdStemRunes
+	}
+	return false
+}
+
+// sibilant reports whether stem ends in a sound that takes "-es" for the
+// plural: s, x, z, ch or sh.
+func sibilant(stem string) bool {
+	for _, e := range []string{"s", "x", "z", "ch", "sh"} {
+		if strings.HasSuffix(stem, e) {
 			return true
 		}
 	}
 	return false
 }
 
-// stems is w itself plus every stem left by removing one regular
-// inflectional ending, keeping only stems of at least minStemRunes letters.
-func stems(w string) []string {
-	for _, r := range w {
-		if !unicode.IsLetter(r) {
-			return []string{w}
-		}
-	}
-	out := []string{w}
-	add := func(s string) {
-		if utf8.RuneCountInString(s) >= minStemRunes && !slices.Contains(out, s) {
-			out = append(out, s)
-		}
-	}
-	for _, e := range []struct{ suffix, repl string }{
-		{"ies", "y"}, {"ied", "y"}, {"ing", ""}, {"ing", "e"}, {"es", ""}, {"ed", ""}, {"s", ""},
-	} {
-		if stem, ok := strings.CutSuffix(w, e.suffix); ok && stem != "" {
-			add(stem + e.repl)
-		}
-	}
-	if stem, ok := strings.CutSuffix(w, "d"); ok && strings.HasSuffix(stem, "e") {
-		add(stem) // "traded" → "trade"
-	}
-	return out
+// capitalised reports whether a raw word starts with an upper-case letter.
+// The transcript is lower-case by design, so a capital in the judge's text
+// marks a name ("Jones", "Lucas"), and a name is exempt from inflection.
+func capitalised(raw string) bool {
+	r, _ := utf8.DecodeRuneInString(raw)
+	return unicode.IsUpper(r)
 }
 
 func joinTexts(ts []token) string { return strings.Join(texts(ts), " ") }

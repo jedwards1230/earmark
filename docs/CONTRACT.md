@@ -3956,8 +3956,8 @@ an error: every failure after rung 0 is a retryable `hold`.
    candidates and existing accepted/applied corrections. A failure is a
    `reject` with the rung-0 reason (`chunk_changed`, `anchor_missing`,
    `not_word_bounded`, `empty_correction`, `cosmetic_only`,
-   `unsupported_issue_type`, `not_soundalike`, `inflection_only`,
-   `not_exact_repeat`, `bad_insertion`, `overlap_dup`, `overlaps_overlay`)
+   `unsupported_issue_type`, `not_soundalike`, `letter_swap`,
+   `inflection_only`, `too_many_changes`, `not_exact_repeat`, `bad_insertion`, `overlap_dup`, `overlaps_overlay`)
    and **no model call**.
 
    Words are compared lower-cased with punctuation removed (an apostrophe
@@ -3980,15 +3980,53 @@ an error: every failure after rung 0 is a retryable `hold`.
      for `number_artifact`) and 80 runes (else `not_soundalike`); a hunk
      that reads the same passes; both sides writing numerals of different
      value fails `not_soundalike`; a swap of one single-letter word for
-     another (`c`→`b`, `i`→`a`) fails `not_soundalike` (letter names rhyme
-     and their one-letter codes carry no evidence); a one-word change by a
-     regular inflectional ending (`-s`, `-es`, `-ed`, `-d`, `-ing`,
-     `-ies`/`-ied` for `-y`; common stem ≥ 3 letters: `trades`→`traded`,
-     `hair`→`hairs`) fails `inflection_only`; otherwise the hunk's raw text
-     on each side must score ≥ `phonetic_min_sim` with `phonetic.Compare`,
-     which joins the hunk's words (so splits and merges such as
-     `auto sebo`↔`Arecibo` compare as one word) and reads numerals every
-     common way. Alignment is limited to 256 words per side.
+     another (`c`→`b`, `i`→`a`) fails `letter_swap` (letter names rhyme
+     and their one-letter codes carry no evidence); a one-word change that
+     is only an inflection (rule below) fails `inflection_only`; otherwise
+     the hunk's raw text on each side must score ≥ `phonetic_min_sim` with
+     `phonetic.Compare`, which joins the hunk's words (so splits and merges
+     such as `auto sebo`↔`Arecibo` compare as one word) and reads numerals
+     every common way. Alignment is limited to 256 words per side.
+     When every hunk passes, the words changed **in total** — each hunk
+     counting its longer side — must not exceed 8 (`MaxChangedWords`), else
+     `too_many_changes`: many small hunks add up to a rewrite, not a
+     mishearing. `number_artifact` is exempt, as from the per-hunk word
+     limit (a spelled-out number is many words but one value, and that type
+     is never applied by machine).
+   - **Inflection rule** (`inflection_only`, final, no model call). Rung 0
+     rejects only clear junk, so the rule is deliberately narrow: compared
+     lower-cased, one word must be **exactly** the other plus one of these
+     suffixes, with no other stemming or fuzzy matching:
+     - `s`, stem ≥ 3 letters (`hair`→`hairs`, `book`→`books`);
+     - `es`, stem ≥ 3 letters ending in a sibilant — `s`, `x`, `z`, `ch`,
+       `sh` (`box`→`boxes`, `church`→`churches`; not `tim`→`times`);
+     - `ed`, stem ≥ 4 letters (`walk`→`walked`).
+
+     Both directions match. **Exempt**: issue type `misheard_proper_noun`,
+     and any pair where either word starts with a capital letter (the
+     transcript is lower-case, so a capital marks a name: `jon`→`Jones`,
+     `luca`→`Lucas`, `robert`→`Roberts`); exempt pairs are scored like any
+     other substitution. There is no `-ing`, `-d` or `-ies`/`-ied` rule —
+     `-ing` is where distinct words collide (`even`/`evening`,
+     `brown`/`browning`, `mann`/`manning`). Pairs an earlier draft of this
+     rule matched and this one does not, now scored phonetically:
+     `the`→`thing`, `bee`→`being`, `even`→`evening`, `brown`→`browning`,
+     `mann`→`manning`, `jon`→`Jones`, `hugh`→`Hughes`, `luca`→`Lucas`,
+     `robert`→`Roberts`, `tim`→`times`, `see`→`seed`, `breed`↔`bring`, and
+     the former positives `trades`→`traded` (passes, 0.750), `carries`→
+     `carried` (`not_soundalike`, 0.667), `carry`→`carried`,
+     `walk`→`walking` (`not_soundalike`, 0.600), `make`→`making` and
+     `trade`→`traded`. Because `rung0_version` is in the decide recipe and
+     a re-check by a later recipe rejects (and so reverts) an earlier
+     recipe's accept that now fails rung 0, a false `inflection_only` would
+     undo good fixes — hence the narrow rule.
+   - **Known passes the model must catch.** Rung 0 is a junk filter, not a
+     verdict. A tense change that sounds alike (`trades`→`traded`, 0.750)
+     passes, and so does a spelled-out year rewritten as a nearby
+     sound-alike year: `nineteen thirty seven`→`1938` passes at 0.700 —
+     only one side writes a numeral, so the numeral-value check cannot fire,
+     and `1938` read as `nineteen thirty eight` shares most of its sounds.
+     Jev (`should_apply`) must reject these.
 2. **Context** — "sentence" means **ASR segment**: transcript text is
    lowercase with no punctuation, and a chunk is whole segments joined by one
    space. The segments starting at the chunk's `start_sec` are joined until
@@ -4188,7 +4226,10 @@ error. It does not take the GPU phase gate (System One is hosted).
   report's classes are `rung0_pass` / `reject` / `reanchor` with the rung-0
   reject reasons and the projection; with `--calibrate`, rung-0 passes and
   rejects per human label and the threshold sweep. Two builds over the same
-  `--seed` compare rung-0 versions on the same findings.
+  `--seed` compare rung-0 versions on the same findings. *Side effect:* like
+  every `earmark` command that opens the database, it runs `db.New`, which
+  applies pending goose migrations (§1.8) — a no-op when the schema is
+  current, so point a replay at a database already on this build's schema.
 - **`--dump FILE`**: one JSON line per sampled finding, sorted by finding id
   — `finding_id`, `issue_type`, `judge_model` (`resolved_model`, else
   `model`), `confidence`, `patch_state`, `original`, `replacement`, `rung0`

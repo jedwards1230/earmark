@@ -175,3 +175,44 @@ func mustFn(t *testing.T) interface{ Recipe(string) recipe.Recipe } {
 	}
 	return f
 }
+
+// letter_swap and too_many_changes reach the report's rung-0 rejects and
+// the dump like any other rung-0 reason.
+func TestDryRunRung0OnlyNewReasons(t *testing.T) {
+	const tid, text = "00000000-0000-0000-0000-0000000000a3",
+		"take vitamin c and their a their b their c their d their e their f their g their h their i daily"
+	const orig = "their a their b their c their d their e their f their g their h their i"
+	path := "/b/Other/01.m4b"
+	fx := runFixture()
+	fx.sample = []db.DecideFinding{
+		finding("f-letter", tid, path, IssueMisheardWord, text, "vitamin c", "vitamin k", 0, 0.9),
+		finding("f-rewrite", tid, path, IssueHomophone, text, orig, strings.ReplaceAll(orig, "their", "there"), 0, 0.9),
+	}
+	fx.chunks[db.ChunkKey{TranscriptID: tid, ChunkIndex: 0}] = &db.DecideChunk{
+		Key: db.ChunkKey{TranscriptID: tid, ChunkIndex: 0}, Text: text, StartSec: 0, EndSec: 9}
+	var dump bytes.Buffer
+	rep, err := DryRun(context.Background(), noWriteStore{fx, t}, nil, RunOptions{
+		Scope: db.DecideScope{Sample: 50, Seed: "s"}, Concurrency: 1, Params: DefaultShouldApplyParams(),
+		Rung0Only: true, Dump: &dump,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Rung0Rejects[ReasonLetterSwap] != 1 || rep.Rung0Rejects[ReasonTooManyChanges] != 1 {
+		t.Errorf("rung-0 rejects %v, want one letter_swap and one too_many_changes", rep.Rung0Rejects)
+	}
+	got := map[string]string{}
+	for _, r := range readDump(t, dump.Bytes()) {
+		got[r.FindingID] = r.Rung0.Reason
+	}
+	if got["f-letter"] != ReasonLetterSwap || got["f-rewrite"] != ReasonTooManyChanges {
+		t.Errorf("dump reasons %v", got)
+	}
+	var out bytes.Buffer
+	if err := rep.Print(&out, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "letter_swap 1") || !strings.Contains(out.String(), "too_many_changes 1") {
+		t.Errorf("text report lacks the new reasons:\n%s", out.String())
+	}
+}

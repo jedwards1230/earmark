@@ -160,17 +160,24 @@ func TestCheck(t *testing.T) {
 
 		// Junk stays rejected.
 		{"junk: kava akbar → keats akbar", cand("a", IssueMisheardProperNoun, "said kava akbar", "kava akbar", "keats akbar", 0.9), false, ReasonNotSoundAlike},
-		{"junk: c → b vocabulary", cand("a", IssueMisheardWord, "learn the c vocabulary", "the c vocabulary", "the b vocabulary", 0.9), false, ReasonNotSoundAlike},
-		{"junk: letter swap that scores 1.0 (b → p)", cand("a", IssueMisheardWord, "learn the b vocabulary", "the b vocabulary", "the p vocabulary", 0.9), false, ReasonNotSoundAlike},
-		{"junk: letter swap c → k", cand("a", IssueMisheardWord, "vitamin c here", "vitamin c", "vitamin k", 0.9), false, ReasonNotSoundAlike},
-		{"junk: pronoun letter swap i → a", cand("a", IssueMisheardWord, "then i saw it", "i saw", "a saw", 0.9), false, ReasonNotSoundAlike},
+		{"junk: c → b vocabulary", cand("a", IssueMisheardWord, "learn the c vocabulary", "the c vocabulary", "the b vocabulary", 0.9), false, ReasonLetterSwap},
+		{"junk: letter swap that scores 1.0 (b → p)", cand("a", IssueMisheardWord, "learn the b vocabulary", "the b vocabulary", "the p vocabulary", 0.9), false, ReasonLetterSwap},
+		{"junk: letter swap c → k", cand("a", IssueMisheardWord, "vitamin c here", "vitamin c", "vitamin k", 0.9), false, ReasonLetterSwap},
+		{"junk: pronoun letter swap i → a", cand("a", IssueMisheardWord, "then i saw it", "i saw", "a saw", 0.9), false, ReasonLetterSwap},
 		{"junk: teeth → earth", cand("a", IssueMisheardWord, "the teeth moved", "teeth", "earth", 0.9), false, ReasonNotSoundAlike},
 		{"junk: let's ibid → let's leave it", cand("a", IssueMisheardWord, "ok let's ibid now", "let's ibid", "let's leave it", 0.9), false, ReasonNotSoundAlike},
 		{"junk: inserted words as a substitution", cand("a", IssueMisheardWord, "and said dogs ran", "said dogs", "he said the dogs", 0.9), false, ReasonNotSoundAlike},
-		{"junk: tense rewrite trades → traded", cand("a", IssueMisheardWord, "he trades furs", "trades", "traded", 0.9), false, ReasonInflectionOnly},
 		{"inflection: split hair → split hairs", cand("a", IssueMisheardWord, "to split hair of", "split hair", "split hairs", 0.9), false, ReasonInflectionOnly},
-		{"inflection: -ing", cand("a", IssueMisheardWord, "he walk home", "walk", "walking", 0.9), false, ReasonInflectionOnly},
-		{"inflection: -ies/-ied", cand("a", IssueMisheardWord, "she carries it", "carries", "carried", 0.9), false, ReasonInflectionOnly},
+		{"inflection: book → books", cand("a", IssueMisheardWord, "the book are here", "book", "books", 0.9), false, ReasonInflectionOnly},
+		{"inflection: books → book", cand("a", IssueHomophone, "a books is here", "books", "book", 0.9), false, ReasonInflectionOnly},
+		{"inflection: box → boxes", cand("a", IssueMisheardWord, "two box of tea", "box", "boxes", 0.9), false, ReasonInflectionOnly},
+		{"inflection: walk → walked", cand("a", IssueMisheardWord, "he walk home", "walk", "walked", 0.9), false, ReasonInflectionOnly},
+		// rung0@v2 narrowed inflection to stem + one suffix: these no longer
+		// match it and are scored like any other substitution. A tense
+		// rewrite that sounds alike passes rung 0 and is the model's to judge.
+		{"tense change passes rung 0: trades → traded", cand("a", IssueMisheardWord, "he trades furs", "trades", "traded", 0.9), true, ""},
+		{"no -ing rule: walk → walking", cand("a", IssueMisheardWord, "he walk home", "walk", "walking", 0.9), false, ReasonNotSoundAlike},
+		{"no -ies/-ied rule: carries → carried", cand("a", IssueMisheardWord, "she carries it", "carries", "carried", 0.9), false, ReasonNotSoundAlike},
 		{"not inflection: short words", cand("a", IssueHomophone, "it is red", "is", "as", 0.9), true, ""},
 		{"not inflection: different stems", cand("a", IssueHomophone, "over their by", "their", "there", 0.9), true, ""},
 
@@ -245,13 +252,22 @@ func TestDiffHunks(t *testing.T) {
 }
 
 func TestInflection(t *testing.T) {
-	for _, p := range [][2]string{{"trades", "traded"}, {"hair", "hairs"}, {"carry", "carried"}, {"walk", "walking"},
-		{"make", "making"}, {"box", "boxes"}, {"trade", "traded"}} {
+	for _, p := range [][2]string{{"hair", "hairs"}, {"book", "books"}, {"box", "boxes"}, {"church", "churches"},
+		{"wish", "wishes"}, {"buzz", "buzzes"}, {"kiss", "kisses"}, {"walk", "walked"}, {"luca", "lucas"}} {
 		if !inflection(p[0], p[1]) || !inflection(p[1], p[0]) {
 			t.Errorf("%q/%q not an inflection", p[0], p[1])
 		}
 	}
-	for _, p := range [][2]string{{"their", "there"}, {"is", "as"}, {"red", "re"}, {"holovo", "holevo"}, {"run", "ran"}, {"cat", "cat"}, {"240", "2400"}} {
+	for _, p := range [][2]string{
+		{"their", "there"}, {"is", "as"}, {"red", "re"}, {"holovo", "holevo"}, {"run", "ran"}, {"cat", "cat"}, {"240", "2400"},
+		// No other stemming (rung0@v2 narrowed rule).
+		{"trades", "traded"}, {"carry", "carried"}, {"carries", "carried"}, {"walk", "walking"}, {"make", "making"}, {"trade", "traded"},
+		// The reviewer's false matches.
+		{"the", "thing"}, {"bee", "being"}, {"even", "evening"}, {"brown", "browning"}, {"mann", "manning"},
+		{"jon", "jones"}, {"hugh", "hughes"}, {"tim", "times"}, {"see", "seed"}, {"breed", "bring"},
+		// Stem lengths: -s needs 3 letters, -ed needs 4.
+		{"a", "as"}, {"be", "bes"}, {"bed", "beded"}, {"red", "reded"},
+	} {
 		if inflection(p[0], p[1]) {
 			t.Errorf("%q/%q read as an inflection", p[0], p[1])
 		}
@@ -562,4 +578,87 @@ func FuzzCheck(f *testing.F) {
 		}
 		_ = Rung0([]Candidate{c, c}, nil, DefaultParams())
 	})
+}
+
+// The pairs a stem-and-suffix rule once matched, each of which is a
+// different word or a name: none may fail inflection_only, in either
+// direction. Capitalised replacements (Jones, Lucas) are exempt as names
+// whatever the issue type, and misheard_proper_noun is exempt outright.
+func TestCheckNotInflection(t *testing.T) {
+	tests := []struct {
+		issue, from, to string
+	}{
+		{IssueMisheardWord, "the", "thing"},
+		{IssueMisheardWord, "bee", "being"},
+		{IssueMisheardWord, "even", "evening"},
+		{IssueMisheardWord, "brown", "browning"},
+		{IssueMisheardWord, "mann", "manning"},
+		{IssueMisheardWord, "jon", "Jones"},
+		{IssueMisheardWord, "hugh", "Hughes"},
+		{IssueMisheardWord, "luca", "Lucas"},
+		{IssueMisheardWord, "robert", "Roberts"},
+		{IssueMisheardWord, "tim", "times"},
+		{IssueMisheardWord, "see", "seed"},
+		{IssueMisheardWord, "breed", "bring"},
+		{IssueMisheardWord, "bring", "breed"},
+		{IssueHomophone, "robert", "Roberts"},
+		// Lower-case, but the judge called it a name.
+		{IssueMisheardProperNoun, "luca", "lucas"},
+		{IssueMisheardProperNoun, "robert", "roberts"},
+		{IssueMisheardProperNoun, "book", "books"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.issue+" "+tc.from+"→"+tc.to, func(t *testing.T) {
+			v := Check(cand("a", tc.issue, "and "+tc.from+" went", tc.from, tc.to, 0.9), DefaultParams())
+			if v.Reason == ReasonInflectionOnly {
+				t.Errorf("%q → %q failed inflection_only: %s", tc.from, tc.to, v.Evidence)
+			}
+		})
+	}
+	// Control: without the name signals the same pair is an inflection.
+	if v := Check(cand("a", IssueMisheardWord, "and luca went", "luca", "lucas", 0.9), DefaultParams()); v.Reason != ReasonInflectionOnly {
+		t.Errorf("lower-case misheard_word luca → lucas = %q, want inflection_only", v.Reason)
+	}
+}
+
+// The total-change cap counts the words of every hunk together.
+func TestCheckChangeCap(t *testing.T) {
+	// n separate "their" → "there" hunks, each one word.
+	homophones := func(n int) Candidate {
+		var o, r []string
+		for i := range n {
+			o = append(o, "their", "w"+strconv.Itoa(i))
+			r = append(r, "there", "w"+strconv.Itoa(i))
+		}
+		orig, repl := strings.Join(o, " "), strings.Join(r, " ")
+		return cand("a", IssueHomophone, "x "+orig+" y", orig, repl, 0.9)
+	}
+	if v := Check(homophones(MaxChangedWords), DefaultParams()); !v.Pass {
+		t.Errorf("%d one-word hunks: %s %s, want pass", MaxChangedWords, v.Reason, v.Evidence)
+	}
+	if v := Check(homophones(MaxChangedWords+1), DefaultParams()); v.Reason != ReasonTooManyChanges {
+		t.Errorf("%d one-word hunks: %q %s, want too_many_changes", MaxChangedWords+1, v.Reason, v.Evidence)
+	}
+	// Four two-word hunks ("auto sebo" → "Arecibo" counts its longer side,
+	// 2) reach the cap; one more one-word hunk exceeds it.
+	const four = "auto sebo a auto sebo b auto sebo c auto sebo"
+	const fourFixed = "Arecibo a Arecibo b Arecibo c Arecibo"
+	if v := Check(cand("a", IssueMisheardProperNoun, "x "+four+" d y", four, fourFixed, 0.9), DefaultParams()); !v.Pass {
+		t.Errorf("4×2 words: %s %s, want pass", v.Reason, v.Evidence)
+	}
+	v := Check(cand("a", IssueMisheardProperNoun, "x "+four+" d their y", four+" d their", fourFixed+" d there", 0.9), DefaultParams())
+	if v.Reason != ReasonTooManyChanges || !strings.Contains(v.Evidence, "5 hunks change 9 words") {
+		t.Errorf("4×2 + 1 words: %q %s, want too_many_changes over 5 hunks", v.Reason, v.Evidence)
+	}
+}
+
+// A spelled-out year re-written as a different, sound-alike year passes
+// rung 0: one side has no numeral, so the value check cannot fire, and
+// "nineteen thirty seven" read against "1938" scores 0.70. Documented in
+// CONTRACT §2.19 as a known pass the model must catch.
+func TestCheckYearOffByOnePasses(t *testing.T) {
+	v := Check(cand("a", IssueNumberArtifact, "in nineteen thirty seven we", "nineteen thirty seven", "1938", 0.9), DefaultParams())
+	if !v.Pass || !strings.Contains(v.Evidence, "soundalike 0.70") {
+		t.Errorf("nineteen thirty seven → 1938 = pass %v %q %s; want a pass at 0.70", v.Pass, v.Reason, v.Evidence)
+	}
 }
