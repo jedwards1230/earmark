@@ -222,34 +222,47 @@ const maxJudgeResponseBytes = 10 << 20 // 10 MiB
 // confidence to [0,1], coerces an unknown issue_type to "other", and drops
 // findings with an empty original_text. A response with no extractable JSON
 // object (or an oversized one) returns an error, which the caller treats as no
-// findings (soft-fail).
-func parseFindings(raw string) ([]parsedFinding, error) {
+// findings (soft-fail). Every finding it drops is returned with its reason.
+func parseFindings(raw string) ([]parsedFinding, []Dropped, error) {
 	if len(raw) > maxJudgeResponseBytes {
-		return nil, fmt.Errorf("judge response exceeds size limit (%d > %d bytes)", len(raw), maxJudgeResponseBytes)
+		return nil, nil, fmt.Errorf("judge response exceeds size limit (%d > %d bytes)", len(raw), maxJudgeResponseBytes)
 	}
 
 	jsonText, ok := extractJSONObject(raw)
 	if !ok {
-		return nil, fmt.Errorf("no JSON object found in judge response")
+		return nil, nil, fmt.Errorf("no JSON object found in judge response")
 	}
 
 	var resp judgeResponse
 	if err := json.Unmarshal([]byte(jsonText), &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal judge response: %w", err)
+		return nil, nil, fmt.Errorf("unmarshal judge response: %w", err)
 	}
 
 	out := make([]parsedFinding, 0, len(resp.Findings))
+	var dropped []Dropped
 	for _, f := range resp.Findings {
-		text := strings.TrimSpace(f.OriginalText)
-		if text == "" {
-			continue // a finding with no span is unusable
+		issue := strings.TrimSpace(strings.ToLower(f.IssueType))
+		if !knownIssueTypes[issue] {
+			issue = issueOther
+		}
+		p := parsedFinding{
+			OriginalText:        strings.TrimSpace(f.OriginalText),
+			IssueType:           issue,
+			SuggestedCorrection: strings.TrimSpace(f.SuggestedCorrection),
+			Confidence:          clampConfidence(f.Confidence),
+			AnchorOffset:        anchorValue(f.AnchorOffset),
+			AnchorOccurrence:    anchorValue(f.AnchorOccurrence),
+		}
+		if p.OriginalText == "" {
+			dropped = append(dropped, dropOf(p, DropEmptySpan)) // a finding with no span is unusable
+			continue
 		}
 		// A finding with no proposed correction is the least actionable and, in
 		// practice, the dominant noise source (a "this looks off" with no fix).
 		// The prompt requires a correction; enforce it structurally so a model
 		// that ignores the instruction can't reintroduce that noise class.
-		correction := strings.TrimSpace(f.SuggestedCorrection)
-		if correction == "" {
+		if p.SuggestedCorrection == "" {
+			dropped = append(dropped, dropOf(p, DropEmptyCorrection))
 			continue
 		}
 		// The ASR transcript is all-lowercase and unpunctuated by design, so the
@@ -260,23 +273,13 @@ func parseFindings(raw string) ([]parsedFinding, error) {
 		// (substitution, split/merge, duplication) survives this comparison; a
 		// restyling does not. The prompt also forbids this, but the model ignores
 		// it often enough that a structural guard is warranted.
-		if normalizeForCompare(text) == normalizeForCompare(correction) {
+		if normalizeForCompare(p.OriginalText) == normalizeForCompare(p.SuggestedCorrection) {
+			dropped = append(dropped, dropOf(p, DropCosmeticOnly))
 			continue
 		}
-		issue := strings.TrimSpace(strings.ToLower(f.IssueType))
-		if !knownIssueTypes[issue] {
-			issue = issueOther
-		}
-		out = append(out, parsedFinding{
-			OriginalText:        text,
-			IssueType:           issue,
-			SuggestedCorrection: correction,
-			Confidence:          clampConfidence(f.Confidence),
-			AnchorOffset:        anchorValue(f.AnchorOffset),
-			AnchorOccurrence:    anchorValue(f.AnchorOccurrence),
-		})
+		out = append(out, p)
 	}
-	return out, nil
+	return out, dropped, nil
 }
 
 // normalizeForCompare folds a span for a "is this a real word change?" test:

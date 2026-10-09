@@ -10,7 +10,7 @@ func TestParseFindings_ValidJSON(t *testing.T) {
 		{"original_text":"Doctor Grace","issue_type":"misheard_proper_noun","suggested_correction":"Dr. Grace","confidence":0.91},
 		{"original_text":"nineteen eighty four","issue_type":"number_artifact","suggested_correction":"1984","confidence":0.5}
 	]}`
-	got, err := parseFindings(raw)
+	got, _, err := parseFindings(raw)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestParseFindings_ValidJSON(t *testing.T) {
 }
 
 func TestParseFindings_EmptyArrayIsValid(t *testing.T) {
-	got, err := parseFindings(`{"findings":[]}`)
+	got, _, err := parseFindings(`{"findings":[]}`)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestParseFindings_EmptyArrayIsValid(t *testing.T) {
 func TestParseFindings_FencedJSON(t *testing.T) {
 	// A model that wraps its answer in prose / markdown fences must still parse.
 	raw := "Sure, here are the findings:\n```json\n{\"findings\":[{\"original_text\":\"there\",\"issue_type\":\"homophone\",\"suggested_correction\":\"their\",\"confidence\":0.6}]}\n```\nHope that helps!"
-	got, err := parseFindings(raw)
+	got, _, err := parseFindings(raw)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestParseFindings_Malformed(t *testing.T) {
 		"the model refused",      // no JSON object at all
 		`{"findings": not json}`, // a brace but invalid JSON inside
 	} {
-		if _, err := parseFindings(raw); err == nil {
+		if _, _, err := parseFindings(raw); err == nil {
 			t.Errorf("expected error for malformed input %q", raw)
 		}
 	}
@@ -65,7 +65,7 @@ func TestParseFindings_ConfidenceClampedAndIssueCoerced(t *testing.T) {
 		{"original_text":"low","issue_type":"misheard_proper_noun","suggested_correction":"law","confidence":-0.3},
 		{"original_text":"weird","issue_type":"totally_made_up","suggested_correction":"wired","confidence":0.5}
 	]}`
-	got, err := parseFindings(raw)
+	got, _, err := parseFindings(raw)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestParseFindings_ConfidenceClampedAndIssueCoerced(t *testing.T) {
 func TestParseFindings_RejectsOversizedResponse(t *testing.T) {
 	// A response above the size cap is rejected before unmarshal (OOM guard).
 	huge := "{" + strings.Repeat("a", maxJudgeResponseBytes) + "}"
-	if _, err := parseFindings(huge); err == nil {
+	if _, _, err := parseFindings(huge); err == nil {
 		t.Fatal("expected error for oversized judge response")
 	}
 }
@@ -93,7 +93,7 @@ func TestParseFindings_DropsEmptyOriginalText(t *testing.T) {
 		{"original_text":"   ","issue_type":"repeated_text","suggested_correction":"x","confidence":0.9},
 		{"original_text":"real span","issue_type":"repeated_text","suggested_correction":"real","confidence":0.9}
 	]}`
-	got, err := parseFindings(raw)
+	got, _, err := parseFindings(raw)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestParseFindings_DropsEmptyCorrection(t *testing.T) {
 		{"original_text":"no correction key at all","issue_type":"homophone","confidence":0.9},
 		{"original_text":"actionable","issue_type":"misheard_word","suggested_correction":"action able","confidence":0.7}
 	]}`
-	got, err := parseFindings(raw)
+	got, _, err := parseFindings(raw)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestParseFindings_DropsRestylingOnlyCorrection(t *testing.T) {
 		{"original_text":"twenty six letters","issue_type":"number_artifact","suggested_correction":"twenty-six letters","confidence":0.9},
 		{"original_text":"unit code","issue_type":"misheard_word","suggested_correction":"Unicode","confidence":0.9}
 	]}`
-	got, err := parseFindings(raw)
+	got, _, err := parseFindings(raw)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestParseFindings_DroppedRunOnTypeCoercedToOther(t *testing.T) {
 	// run_on left the vocabulary in taxonomy rev 2; a model that still emits it
 	// must coerce to "other" rather than smuggle an off-enum value into the row.
 	raw := `{"findings":[{"original_text":"the the cat","issue_type":"run_on","suggested_correction":"the cat","confidence":0.9}]}`
-	got, err := parseFindings(raw)
+	got, _, err := parseFindings(raw)
 	if err != nil {
 		t.Fatalf("parseFindings: %v", err)
 	}
