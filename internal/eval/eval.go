@@ -162,7 +162,9 @@ type ModelPin struct {
 
 // proposeStepVersion is bumped whenever the judge's own logic (parsing,
 // filtering, capping, anchoring) changes which findings it writes (§1.9).
-const proposeStepVersion = 1
+// 2: the deterministic pre-filters (prefilter) and spacing-only edits counted
+// as cosmetic.
+const proposeStepVersion = 2
 
 // NewJudge constructs a Judge backed by the given chat client.
 func NewJudge(chat ChatClient) *Judge {
@@ -334,9 +336,12 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		return res, nil
 	}
 
+	// Shape checks first, so junk never takes one of the capped slots.
+	parsed, dropped = prefilter(c.Text, parsed, dropped)
 	parsed, dropped = j.floorFindings(c, parsed, dropped)
 	parsed, dropped = j.capFindings(c, parsed, dropped)
 	res.Dropped = dropped
+	countDropped(ctx, dropped)
 
 	model := j.chat.Model()
 	rec := j.recipeFor(resolved)

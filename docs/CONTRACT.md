@@ -1294,7 +1294,7 @@ yet reported stale.
 
 **Current steps.** `scan` (when `AI_ROLES.scan` is bound): the `scan_chunk`
 function's recipe (§1.9 "Chunk scan") with the expected model answering.
-`propose`: `step_version` 1, prompt `judge@v1` + sha256 of
+`propose`: `step_version` 2 (1 before the pre-filters, §2.15 "Noise filters"), prompt `judge@v2` + sha256 of
 (system prompt, user template, response JSON schema), params `temperature`
 (**only when it is sent** — omitted for hosted routes unless configured, §2.15
 "Request parameters"), `min_confidence`, `max_findings_per_chunk`. `max_tokens`
@@ -2866,7 +2866,7 @@ NULL when the endpoint omits the field. In-pipeline and standalone eval events
 carry it as `detail.resolved_model`.
 
 Each finding also carries `recipe_id` (§1.9): the judge's `propose` recipe —
-requested model, the model that answered, prompt version `judge@v1` and the
+requested model, the model that answered, prompt version `judge@v2` and the
 hash of every prompt part sent, and the confidence floor / per-chunk cap — so
 a fallback answer is a different, re-runnable recipe. Bump `judgePromptVersion`
 (`internal/eval/prompt.go`) whenever the prompt or response schema changes;
@@ -2904,7 +2904,7 @@ returned by the model is coerced to `other`:
 | `issue_type` | Meaning |
 |--------------|---------|
 | `misheard_proper_noun` | a name/place/brand/title mis-recognized (e.g. "auto sebo" → "Arecibo") |
-| `misheard_word` | an ordinary (non-name) word/phrase mis-recognized, or words wrongly fused/split (e.g. "Placenes" → "place names") |
+| `misheard_word` | an ordinary (non-name) word/phrase mis-recognized (e.g. "Placenes" → "place names"). A pure split/merge with the same letters ("logo graphic" → "logographic") is cosmetic since `judge@v2` and dropped |
 | `repeated_text` | a word/phrase accidentally duplicated, visible in the span (e.g. "the the" → "the") |
 | `number_artifact` | a number/date/unit that came out wrong (NOT numeral-vs-spelled-out style) |
 | `homophone` | wrong word, right sound (e.g. "pin name" → "pen name") |
@@ -3059,9 +3059,54 @@ earmark eval --backfill-eval-errors --limit 10 --write   # re-judge them
 earmark eval --backfill-eval-errors --write              # all of them
 ```
 
-**Noise filters (applied per chunk, before persistence).** Two precision filters
-trim the judge's over-flagging, in this order:
+#### Judge prompt (`judge@v2`)
 
+A finding is only worth a row if the decide step can act on it: rung 0 (§2.19)
+rejects a substitution whose changed words do not **sound** like the originals
+(Double Metaphone), a `repeated_text` fix that is not an exact repeat removal,
+a `dropped_word` fix that is not a 1–2-word insertion, and `other`; apply then
+needs exact text evidence. `judge@v2` is written around that. It asks for a
+misheard word or name only when (1) the correction read aloud sounds like the
+original (repeats and dropped words excepted) and (2) context — the sentence,
+the book/track path for names — shows what was said; it forbids grammar, tense
+and word-choice fixes, smoothing insertions, case/punctuation/hyphen/spacing
+edits, words↔digits number rewrites, and flagging plausible unusual words; it
+asks for the minimal span (both copies of a repeat; the words around a gap) and
+corrections in the transcript's style (lowercase, no punctuation). The issue
+types and the response schema are unchanged from v1. It replaced v1's
+repetitive don't-list at less than half the size — **1,105 → 501** cl100k
+tokens, so every call costs fewer input tokens — and
+`TestSystemPromptTokenBudget` fails if it grows past 520.
+
+**Noise filters (applied per chunk, before persistence).** Three stages trim
+the judge's over-flagging, in this order:
+
+0. **Pre-filters** (`internal/eval/prefilter.go`, propose `step_version` 2).
+   Deterministic checks on the reply and the chunk text the judge saw — no
+   phonetics, no model — dropping findings rung 0 would reject on their shape
+   anyway, so they never become rows (or take a capped slot):
+
+   | Reason | Dropped when |
+   |---|---|
+   | `empty_span` / `empty_correction` | no `original_text` / no `suggested_correction` (parse time) |
+   | `cosmetic_only` | the two sides are equal once case and every non-letter, non-digit rune (punctuation, hyphens, **spaces**) are removed — rung 0's rule. Before step 2 spaces were kept, so a pure split/merge survived as a row rung 0 then rejected |
+   | `unsupported_issue_type` | issue type `other` (an unknown value coerced) |
+   | `anchor_missing` | `patch.Locate` cannot place `original_text` in the chunk (absent, or repeated with no anchor saying which copy) |
+   | `not_word_bounded` | the located span starts or ends between two letters/digits |
+   | `number_format` | a substitution whose changed words are all number words on one side and all digit groups on the other ("nineteen thirty seven" → "1937") |
+   | `not_substitution` | a `misheard_*`/`homophone`/`number_artifact` fix whose words are an in-order subsequence of the other side's — it only inserts or only deletes ("said dogs" → "he said the dogs") |
+   | `window_too_long` | the changed words exceed 8 on either side (not `number_artifact`) |
+   | `bad_insertion` | a `dropped_word` fix that is not the original plus 1–2 words |
+   | `not_a_removal` | a `repeated_text` fix that is not the original minus some words |
+
+   Each check rejects a subset of what rung 0 rejects, so nothing rung 0 could
+   pass is lost — except `number_format` and the subsequence form of
+   `not_substitution` (an insertion relabelled as a substitution), edits the
+   prompt forbids that rung 0 would otherwise score on sound alone. The word
+   checks (`not_substitution` … `not_a_removal`) run only when neither side has
+   a digit, because rung 0 reads "1,500" as one numeral token. The thresholds
+   are copies of rung 0's (`MaxSubstitutionTokens`, `MaxInsertedTokens`);
+   `internal/eval` never imports `internal/decide`.
 1. **Confidence floor.** Findings below `EVAL_MIN_CONFIDENCE` (default **0.6**,
    `<= 0` disables) are dropped. A ground-truth audit found high-confidence
    findings were ~100% real while the low tail was mostly noise, so the floor
@@ -3071,10 +3116,34 @@ trim the judge's over-flagging, in this order:
    **highest-confidence** findings are kept and the remainder dropped (logged at
    DEBUG).
 
-Both are per-chunk and applied before persistence, so they bound noise without
-affecting how many chunks are evaluated. (Findings with an empty
-`suggested_correction` are dropped earlier, at parse time — see the vocabulary
-note above.)
+All are per-chunk and applied before persistence, so they bound noise without
+affecting how many chunks are evaluated. Every dropped finding is reported with
+its reason (`below_min_confidence`, `over_cap` for these two): the run report's
+"Dropped before recording" line, `--dump`, and
+`earmark_judge_dropped_findings_total{reason}` (§2.16).
+
+#### Measuring a prompt change
+
+Prompt changes are compared on the **same chunks**, in a dry run (paid calls,
+nothing written):
+
+```bash
+earmark eval --sample 200 --seed q4 --dump /tmp/judge-v2.jsonl
+```
+
+`--seed` (needs `--sample`) orders the library by `md5(seed || ':' || chunk
+id)` — the order `earmark scan --seed` uses — so the same seed over the same
+library picks the same chunks in any build. `--dump <path>` (`-` = stdout, the
+report then goes to stderr; refused with `--write` and with `--backfill-*`)
+writes one JSON line per judged chunk: `chunk_id`, `transcript_id`,
+`file_path`, `chunk_index`, `text_chars`, `prompt_version`, `prompt_sha256`,
+`step_version`, `model`, `resolved_model`, `prompt_tokens` /
+`completion_tokens` (the response `usage`; `null` when unreported), `cost_usd`
+(LiteLLM's `x-litellm-response-cost` header; `null` when absent), `latency_ms`,
+`error` (a skipped chunk, ≤300 runes), `findings` and `dropped` (each
+`original`, `correction`, `issue_type`, `confidence`; dropped ones with their
+`reason`). Kept plus dropped is everything the judge returned, so two dumps
+join on `chunk_id` and the old build's raw output can be re-filtered offline.
 
 **Clearing.** Findings only accumulate (re-running eval appends); the `/findings`
 dashboard page exposes a token-gated **clear findings** button (and the
@@ -3185,9 +3254,9 @@ The Prometheus exporter emits no `target_info` and no `otel_scope_*` labels:
 the series below are the whole addition to `/metrics`.
 
 OpenTelemetry instruments (Prometheus names; the cardinality rule holds —
-labels are only step, recipe, model, fn, outcome and the three-value quality
-scope (`library` · `asin_matched` · `unmatched`); book, ASIN and chunk ids go
-on spans and logs, never labels):
+labels are only step, recipe, model, fn, outcome, the judge's bounded drop
+`reason` and the three-value quality scope (`library` · `asin_matched` ·
+`unmatched`); book, ASIN and chunk ids go on spans and logs, never labels):
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -3196,6 +3265,7 @@ on spans and logs, never labels):
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
 | `earmark_decisions` | gauge | `outcome` (`apply` · `hold` · `reject`), `issue_type`, `evidence` (`asin_verbatim` · `exact_repeat` · `none`), `recipe` (full decide recipe id) | Findings counted by their **latest unrevoked** decide-recipe `decision` event (§2.17 "Version history", §2.19); findings a requeue superseded excluded. Ingest pod; one aggregate over `finding_events`, refreshed every 5 min. No series until a decision is written. |
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
+| `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `number_format` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |
 | `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 
 **Traces.** Each judge call is one `chat <model>` client span following the
@@ -3895,7 +3965,7 @@ steps:
     alias: earmark-judge         # optional assertion: must equal the model that endpoint requests
     expected_model: anthropic/claude-haiku-4-5-20251001   # what should ANSWER → recipe model_resolved
     revision: "20251001"         # weights pin → recipe model_revision
-    prompt_version: judge@v1     # optional: logged as a warning if the build runs another
+    prompt_version: judge@v2     # optional: logged as a warning if the build runs another
   embed:                         # AI_ROLES.embeddings
     expected_model: nomic-embed-text
     revision: sha256:0a109f422b47

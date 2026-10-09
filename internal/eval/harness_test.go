@@ -84,7 +84,7 @@ func TestJudgeChunk_RecordsDrops(t *testing.T) {
 		{"original_text":"quick","issue_type":"misheard_word","suggested_correction":"quack","confidence":0.7},
 		{"original_text":"lazy","issue_type":"misheard_word","suggested_correction":"hazy","confidence":0.8}
 	]}`
-	_, stats, err := Run(context.Background(), fakeReader{chunks: []db.EvalChunk{sampleChunk()}},
+	_, stats, err := Run(context.Background(), fakeReader{chunks: []db.EvalChunk{chunkWith("the quick lazy fox french")}},
 		NewJudge(&fakeChat{resp: resp}), &fakeWriter{}, RunOptions{Book: "b"})
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestJudgeChunk_RecordsDrops(t *testing.T) {
 		t.Errorf("FindingsFound = %d, want 1", stats.FindingsFound)
 	}
 
-	res, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), sampleChunk())
+	res, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), chunkWith("the quick lazy fox french"))
 	if err != nil {
 		t.Fatal(err)
 	}

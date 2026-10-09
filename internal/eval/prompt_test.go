@@ -3,7 +3,26 @@ package eval
 import (
 	"strings"
 	"testing"
+
+	"github.com/jedwards1230/earmark/internal/tokenizer"
 )
+
+// judgePromptTokenBudget caps the system prompt (cl100k tokens). judge@v1 was
+// 1,105; v2 is 501. Every judge call pays for it, so growing it is a cost
+// change: raise the budget only on purpose, with a measured reason.
+const judgePromptTokenBudget = 520
+
+// TestSystemPromptTokenBudget keeps the prompt from creeping back up.
+func TestSystemPromptTokenBudget(t *testing.T) {
+	n, err := tokenizer.CountTokens(systemPrompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > judgePromptTokenBudget {
+		t.Errorf("system prompt is %d tokens, budget %d", n, judgePromptTokenBudget)
+	}
+	t.Logf("system prompt: %d cl100k tokens", n)
+}
 
 func TestParseFindings_ValidJSON(t *testing.T) {
 	raw := `{"findings":[
@@ -108,7 +127,7 @@ func TestParseFindings_DropsEmptyCorrection(t *testing.T) {
 	raw := `{"findings":[
 		{"original_text":"flagged but no fix","issue_type":"misheard_word","suggested_correction":"","confidence":0.9},
 		{"original_text":"no correction key at all","issue_type":"homophone","confidence":0.9},
-		{"original_text":"actionable","issue_type":"misheard_word","suggested_correction":"action able","confidence":0.7}
+		{"original_text":"actionable","issue_type":"misheard_word","suggested_correction":"accountable","confidence":0.7}
 	]}`
 	got, _, err := parseFindings(raw)
 	if err != nil {
@@ -126,6 +145,7 @@ func TestNormalizeForCompare(t *testing.T) {
 		{"twenty-six", "twenty six"},
 		{"information its capacity", "information: its capacity"},
 		{"  Padded  Text. ", "padded text"},
+		{"logo graphic", "logographic"}, // a pure split/merge changes no sound (judge@v2)
 	}
 	for _, p := range equal {
 		if a, b := normalizeForCompare(p[0]), normalizeForCompare(p[1]); a != b {
@@ -134,9 +154,8 @@ func TestNormalizeForCompare(t *testing.T) {
 	}
 	// Pairs that should normalize DIFFERENT (a real word change).
 	diff := [][2]string{
-		{"logo graphic", "logographic"}, // split vs merged — different words
-		{"the the cat", "the cat"},      // duplication
-		{"unit code", "unicode"},        // mis-recognition
+		{"the the cat", "the cat"}, // duplication
+		{"unit code", "unicode"},   // mis-recognition
 		{"walter brtane", "walter brattain"},
 	}
 	for _, p := range diff {

@@ -43,91 +43,45 @@ var knownIssueTypes = map[string]bool{
 	issueOther:              true,
 }
 
-// systemPrompt instructs the judge: advisory-only, conservative, JSON-out. It is
-// a package var (not const) only so a test could swap it; it never changes at
-// runtime.
+// systemPrompt instructs the judge (judge@v2). It is built around what the
+// downstream steps can use: decide's rung 0 rejects any substitution whose
+// changed words do not SOUND like the originals, and apply needs exact text
+// evidence, so a finding that is not a sound-alike mishearing is pure waste.
+// v2 replaced v1's long, repetitive list of don'ts with two conditions and
+// one short list (1,105 → 501 cl100k tokens; TestSystemPromptTokenBudget). The edit shapes it
+// forbids are also enforced after parsing (prefilter), because a prompt alone
+// does not hold. It is a package var (not const) only so a test could swap it;
+// it never changes at runtime.
 var systemPrompt = strings.TrimSpace(`
-You are a transcription QA reviewer. You are given a span of an audiobook
-transcript produced by an automatic speech recognizer (ASR). Your job is to flag
-spans where the ASR almost certainly MISHEARD the spoken audio.
+You check an audiobook transcript made by speech recognition (ASR) for words the ASR MISHEARD. Each finding becomes a patch to the transcript, and a wrong patch corrupts it. Most spans have no error; for those, return {"findings":[]}.
 
-You PROPOSE edits; you never apply them. Each finding becomes a patch shown to a
-human reviewer, who accepts or rejects it before anything is written. Because an
-accepted patch DOES rewrite the stored transcript, a wrong correction is no
-longer harmless — hold a higher bar than you would for a note in the margin.
+The text is lowercase and unpunctuated by design, and numbers may be words or digits. None of that is an error.
 
-Default to flagging NOTHING. The large majority of spans contain no ASR error.
-Only flag a span when you are reasonably confident the words shown are not what
-was actually spoken AND you can give the correct words. When in doubt, do not
-flag — a missed error is fine; a false alarm is not.
+Flag a span only when both hold:
+1. A word or name was misheard as a similar-sounding one: read aloud, your correction sounds like the original ("auto sebo" → "arecibo", "pin name" → "pen name"; not "teeth" → "earth"). If it does not, it is a rewrite: skip it. (Repeats and dropped words are the only exceptions.)
+2. The context (the sentence; the book/track path for names) shows what was said. Never guess.
 
-Respond with STRICT JSON only (no prose, no markdown fences) in this shape:
-{
-  "findings": [
-    {
-      "original_text": "<verbatim span copied from the input>",
-      "issue_type": "<one of the types below>",
-      "suggested_correction": "<the corrected words — REQUIRED, never empty>",
-      "confidence": <number 0.0-1.0>,
-      "anchor_offset": <0-based character index where original_text starts>,
-      "anchor_occurrence": <0-based index among identical copies of original_text>
-    }
-  ]
-}
+Never flag:
+- grammar, tense or word-choice fixes ("trades" → "traded")
+- added words, except one or two whose absence leaves the sentence broken; never add a subject or article to smooth it ("said dogs" → "he said the dogs")
+- case, punctuation, hyphen or spacing changes
+- numbers rewritten between words and digits; flag only a misheard value
+- unusual words or names that are plausible as written
 
-anchor_offset and anchor_occurrence locate the exact span to patch. If
-original_text appears more than once in the span, anchor_occurrence says which
-copy you mean (0 = the first). Get these right — they decide which words get
-rewritten. If you are not certain which copy you mean, do not flag it.
+Fields:
+- original_text: only the misheard words, copied exactly (a repeat: every copy; a dropped word: the words around the gap).
+- suggested_correction: those words as spoken, lowercase without punctuation, never empty.
+- anchor_offset: 0-based character index of original_text within the transcript span text; anchor_occurrence: which identical copy (0 = first).
+- confidence: 0.8+ obvious, 0.6-0.8 likely; below that, do not flag.
+- issue_type:
+  - misheard_proper_noun: a name, place, brand or title
+  - misheard_word: any other word or phrase
+  - homophone: a same-sounding real word ("their" → "there")
+  - number_artifact: a number whose value was misheard ("too forty" → "two forty")
+  - repeated_text: an accidental literal repeat ("the the" → "the")
+  - dropped_word: one or two missing words; correction = original plus them
 
-issue_type — pick the single best fit:
-- misheard_proper_noun: a NAME, place, brand, or title the ASR garbled
-  (e.g. "auto sebo" → "Arecibo", "Holovo" → "Holevo").
-- misheard_word: an ordinary (non-name) word or phrase the ASR got wrong, or
-  two words wrongly fused/split (e.g. "Placenes" → "place names",
-  "thegreycourses" → "thegreatcourses", "Limpel Ziv" → "Lempel-Ziv").
-- repeated_text: a word or short phrase ACCIDENTALLY DUPLICATED, with the
-  duplication visible in the span (e.g. "the the cat" → "the cat",
-  "can be can be" → "can be"). Do NOT use this for a long or complex sentence
-  that merely sounds awkward — only for a literal stutter/duplication.
-- number_artifact: a number, date, or unit that came out WRONG
-  (e.g. "too forty" → "240"). Must include the corrected value.
-- homophone: a real word swapped for its sound-alike (e.g. "pin name" →
-  "pen name", "their" → "there").
-- dropped_word: a word clearly omitted, leaving the sentence broken.
-
-Do NOT use "other". If a suspected error does not fit a type above, do not flag it.
-
-The transcript is intentionally ALL LOWERCASE with NO punctuation. That is
-normal and correct — it is NOT an error. Your correction must change the actual
-WORDS; if your "fix" only adds capital letters, punctuation, or hyphens, do not
-emit it.
-
-NEVER flag (these are NOT errors):
-- Missing capitalization ("french" → "French", "von neumann") — the transcript
-  is lowercase by design. Never flag a span just to capitalize it.
-- Missing or different punctuation (adding commas, periods, colons, apostrophes,
-  quotation marks).
-- Numerals vs spelled-out numbers ("10 or 12" is fine — do not "correct" it to
-  "ten or twelve", and vice versa). Only flag a number that is actually WRONG.
-- Hyphenation or spacing style ("tic-tac-toe" vs "tic tac toe", "twenty-six").
-- A sentence that is grammatically correct, even if long, listy, or awkward.
-- Deliberate enumerations or read-aloud lists of words.
-- A valid word choice you would have phrased differently ("addressed" vs "sent").
-- Any span where you cannot supply a concrete correction.
-
-The test for every finding: read your suggested_correction out loud. If it sounds
-the SAME as the original (you only changed case, punctuation, or formatting), it
-is not an error — drop it. Only flag when a DIFFERENT word was written than was
-spoken.
-
-Every finding MUST include a non-empty suggested_correction. If you cannot
-propose the corrected words, do not emit the finding.
-
-Confidence: use ≥0.8 only when the error is obvious and your correction is almost
-certainly right; 0.6-0.8 when it looks wrong but the correction is a guess; below
-0.6 means you are unsure — and if you are unsure, prefer not to flag at all. An
-empty findings array is the correct, expected answer for a clean span.
+Reply with JSON only.
 `)
 
 // anchorValue normalizes an optional anchor field to the convention
@@ -154,7 +108,7 @@ const userPromptTemplate = "Book/track: %s\nSpan time: %.1fs–%.1fs\n\nTranscri
 // changes on purpose; TestJudgePromptVersionPinned fails until you do. (The
 // recipe also carries judgePromptSHA256, so even an unversioned edit yields a
 // new recipe — the version is the human-readable half.)
-const judgePromptVersion = "judge@v1"
+const judgePromptVersion = "judge@v2"
 
 // judgePromptSHA256 hashes every prompt part the judge sends: the system
 // prompt, the user template, and the JSON schema the reply is pinned to.
@@ -282,29 +236,24 @@ func parseFindings(raw string) ([]parsedFinding, []Dropped, error) {
 	return out, dropped, nil
 }
 
-// normalizeForCompare folds a span for a "is this a real word change?" test:
-// lowercase, every non-alphanumeric rune becomes a single space, runs of space
-// collapse, and the result is trimmed. Two spans that differ only in
-// capitalization, punctuation, or hyphenation normalize to the same string; a
-// different WORD (substitution, split, merge, or duplication) does not — word
-// boundaries (spaces) are preserved, so "logo graphic" ≠ "logographic" but
-// "the French" == "the french" and "twenty-six" == "twenty six". Used to drop
-// findings whose "correction" only restyles text the ASR already got right.
+// normalizeForCompare folds a span for a "is this a real word change?" test,
+// exactly as decide's rung 0 does for cosmetic_only: lowercase, and every rune
+// that is not a letter or digit removed — punctuation, hyphens AND spaces. Two
+// spans that differ only in capitalization, punctuation, hyphenation or
+// spacing fold to the same string ("the French" == "the french",
+// "twenty-six" == "twenty six", "logo graphic" == "logographic"); a different
+// word or a duplication does not. Spacing counts as cosmetic since judge@v2 /
+// propose step 2: a pure split or merge changes no sound, and rung 0 rejects
+// it, so it was only ever a row nobody could apply.
 func normalizeForCompare(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
-	prevSpace := true // leading-space suppression
 	for _, r := range strings.ToLower(s) {
-		switch {
-		case unicode.IsLetter(r) || unicode.IsDigit(r):
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			b.WriteRune(r)
-			prevSpace = false
-		case !prevSpace:
-			b.WriteByte(' ')
-			prevSpace = true
 		}
 	}
-	return strings.TrimSpace(b.String())
+	return b.String()
 }
 
 // clampConfidence forces a confidence into [0,1] so a model that emits 1.2 or a

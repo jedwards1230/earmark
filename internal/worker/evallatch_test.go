@@ -113,7 +113,7 @@ func TestEvalTranscript_UnusableReplyDoesNotLatch(t *testing.T) {
 
 const longTranscript = "Hello world this is a fairly long test transcript with plenty of words so the token chunker emits multiple chunks for the judge to evaluate one by one."
 
-const oneFindingJSON = `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`
+const oneFindingJSON = echoFindingResp
 
 // A partial judge run (one chunk fails) persists the surviving findings, records
 // a failure instead of the latch, and logs an eval/error event.

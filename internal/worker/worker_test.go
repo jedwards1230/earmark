@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -361,8 +362,24 @@ func (f *fakeDB) InsertFindings(_ context.Context, findings []db.Finding) error 
 // the worker without a real endpoint.
 type workerFakeChat struct{ resp string }
 
-func (c workerFakeChat) Complete(_ context.Context, _, _ string) (string, error) {
-	return c.resp, nil
+func (c workerFakeChat) Complete(_ context.Context, _, user string) (string, error) {
+	return echoFinding(c.resp, user), nil
+}
+
+// echoFindingResp makes a fake judge flag the first word of whatever span it
+// is shown (spelled with an extra "x" — a one-word substitution). The judge
+// drops a finding whose span is not in the chunk it judged, so a fixed reply
+// would only survive on the one chunk that happens to contain it.
+const echoFindingResp = "<echo first word>"
+
+func echoFinding(resp, user string) string {
+	if resp != echoFindingResp {
+		return resp
+	}
+	_, span, _ := strings.Cut(user, "Transcript span:\n")
+	first, _, _ := strings.Cut(strings.TrimSpace(span), " ")
+	return fmt.Sprintf(`{"findings":[{"original_text":%q,"issue_type":"misheard_word","suggested_correction":%q,"confidence":0.9}]}`,
+		first, first+"x")
 }
 func (c workerFakeChat) Model() string { return "fake-judge" }
 
@@ -373,12 +390,12 @@ type flakyChat struct {
 	calls int
 }
 
-func (c *flakyChat) Complete(_ context.Context, _, _ string) (string, error) {
+func (c *flakyChat) Complete(_ context.Context, _, user string) (string, error) {
 	c.calls++
 	if c.calls == 1 {
 		return "", fmt.Errorf("transient judge glitch")
 	}
-	return c.resp, nil
+	return echoFinding(c.resp, user), nil
 }
 func (c *flakyChat) Model() string { return "flaky-judge" }
 
@@ -414,7 +431,7 @@ func TestProcessTranscript_InlineEvalWritesFindingsLinkedToChunks(t *testing.T) 
 	// UUID), proving eval-before-embed linkage.
 	fdb := &fakeDB{}
 	judge := eval.NewJudge(workerFakeChat{
-		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+		resp: echoFindingResp,
 	})
 	w := &Worker{
 		ctx:   context.Background(),
@@ -512,7 +529,7 @@ func TestProcessTranscript_EmbedFailureDoesNotPersistFindings(t *testing.T) {
 	// stays empty.
 	fdb := &fakeDB{embedErr: fmt.Errorf("ollama offline")}
 	judge := eval.NewJudge(workerFakeChat{
-		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+		resp: echoFindingResp,
 	})
 	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), judge: judge}
 	transcript := &db.Transcript{ID: "tid-embedfail", JobID: "job-embedfail", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world this is a test."}
@@ -528,7 +545,7 @@ func TestProcessTranscript_FindingsWriteFailureStillEmbeds(t *testing.T) {
 	// (searchable-but-unflagged), never a failed embed.
 	fdb := &fakeDB{findingsErr: fmt.Errorf("findings table down")}
 	judge := eval.NewJudge(workerFakeChat{
-		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+		resp: echoFindingResp,
 	})
 	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), judge: judge}
 	transcript := &db.Transcript{ID: "tid-findfail", JobID: "job-findfail", FilePath: "/b/a/t/ch.mp3", RawText: "Hello world this is a test."}
@@ -562,7 +579,7 @@ func TestProcessTranscript_TransientJudgeErrorSkipsChunkAndPersistsRest(t *testi
 	// continues, partial findings are persisted, and embedding is unaffected.
 	fdb := &fakeDB{}
 	judge := eval.NewJudge(&flakyChat{
-		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+		resp: echoFindingResp,
 	})
 	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), judge: judge}
 	cfg := &config.Config{ChunkSize: 8}
@@ -598,7 +615,7 @@ func TestEvalTranscript_DeterministicChunkIDsMatchEmbedPass(t *testing.T) {
 	// Eval pass: judge writes findings, then eval_finished_at.
 	evalDB := &fakeDB{}
 	judge := eval.NewJudge(workerFakeChat{
-		resp: `{"findings":[{"original_text":"hello world","issue_type":"misheard_word","suggested_correction":"hello word","confidence":0.9}]}`,
+		resp: echoFindingResp,
 	})
 	evalW := &Worker{
 		ctx: context.Background(), db: evalDB, log: log.NewLogger("eval-pass"),

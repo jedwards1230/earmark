@@ -8,6 +8,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	// Pinned: the GenAI semantic conventions are still "development", so
 	// earmark follows exactly semconv v1.40.0 (gen_ai.provider.name, not the
 	// older gen_ai.system) and treats its own earmark.* attributes as
@@ -50,6 +51,28 @@ func tracer() trace.Tracer { return otel.Tracer(scopeName) }
 
 func countModelCall(ctx context.Context, model, outcome string) {
 	genai.CountModelCall(ctx, judgeFn, model, outcome)
+}
+
+// countDropped increments earmark_judge_dropped_findings_total{reason} once
+// per finding the judge returned that never became a row. reason is one of
+// the bounded Drop* constants.
+func countDropped(ctx context.Context, dropped []Dropped) {
+	if len(dropped) == 0 {
+		return
+	}
+	c, err := otel.Meter(scopeName).Int64Counter("earmark_judge_dropped_findings",
+		metric.WithDescription("Judge findings dropped before recording, by reason."))
+	if err != nil {
+		otel.Handle(err)
+		return
+	}
+	n := map[string]int64{}
+	for _, d := range dropped {
+		n[d.Reason]++
+	}
+	for reason, k := range n {
+		c.Add(ctx, k, metric.WithAttributes(attribute.String("reason", reason)))
+	}
 }
 
 // startChatSpan opens the gen_ai client span for one judge call. temperature
