@@ -2145,8 +2145,8 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 `evalCoverage == -1` means eval is not in-pipeline (not applicable). `winding-down` is the key state the original dashboard missed: transcribe queue drained but GPU still busy (eval / embed catch-up).
 No new DB queries — the bucket counts are populated from a single FILTER-aggregate query over `transcription_jobs`.
 
-**`roles[]` array** — one entry per pipeline role, always five, in order `asr`,
-`judge`, `embeddings`, `decide`, `format`. Built by the same code as the Models
+**`roles[]` array** — one entry per pipeline role, always six, in order `asr`,
+`judge`, `embeddings`, `decide`, `scan`, `format`. Built by the same code as the Models
 page role cards (§2.14), so the two cannot disagree. `endpoints[].state` is
 liveness only (`GET /models`); `roles[].state` folds in call outcomes, so a
 gateway that lists the model but fails every chat call is `endpoints[].state =
@@ -2163,11 +2163,11 @@ ready` and `roles[judge].state = failing`.
   "requested": "earmark-judge", // the model id earmark sends
   "expected": "anthropic/claude-haiku-4-5-20251001", // MODELS_FILE pin; omitted when unpinned
   "answered": "qwen3.8",        // what actually answered most recently
-  "answeredMatch": "mismatch",  // match | mismatch | unreported | none | unchecked
+  "answeredMatch": "mismatch",  // match | mismatch | unreported | none | unchecked | predates_recipe
   "modelAllowed": true,         // on the LiteLLM key allowlist, reconciled with /v1/models (see §2.14); null = unknown
   "lastOkAt": "2026-10-06T00:12:00Z",   // null = never / unknown
   "lastFailedAt": null,
-  "lastError": null,            // judge only; truncated to 300 chars
+  "lastError": null,            // judge: eval_error, truncated to 300 chars; decide/scan: the last failed call's error_class
   "failingNow": 0,              // judge only (null otherwise / when counts unavailable); transcripts whose LATEST attempt failed
   "stale": 32337,               // stale_work rows for the step; null = not tracked / unavailable / still counting
   "countsAsOf": "2026-10-06T00:13:30Z", // the 30 s aggregate snapshot; null = never loaded
@@ -2176,10 +2176,16 @@ ready` and `roles[judge].state = failing`.
 }
 ```
 
+`answeredMatch: predates_recipe` means the newest answer was recorded before
+the step's current recipe (`current_recipes.updated_at`) — the model or prompt
+changed since and nothing has been called under the new recipe — so it is not
+compared with the expected model and is never a `mismatch` (§2.14).
+
 The DB-derived fields come from two caches served stale-while-revalidate (a
 request never waits on a refresh once a value exists): `answered`, the judge's
-`lastOkAt`/`lastFailedAt`/`lastError`/`failingNow` and the ASR `lastOkAt` from
-the 30 s aggregate snapshot (`countsAsOf`); `stale` from the 5 min stale-count
+and decide/scan's `lastOkAt`/`lastFailedAt`/`lastError`, the judge's
+`failingNow` and the ASR `lastOkAt` from the 30 s aggregate snapshot
+(`countsAsOf`); `stale` from the 5 min stale-count
 snapshot (`staleAsOf`). Embeddings' `lastOkAt` comes from the live queue stats.
 A failed refresh keeps the last good snapshot (`countsError: true`); with none,
 those fields are `null` and the judge's `state` is `unknown` — the response
@@ -2533,8 +2539,8 @@ bottom:
 
 1. **Roles** — one card per configured pipeline role, in fixed order; roles
    in state `not_configured` are not cards but one muted "○ Not configured:"
-   line under them (Decide with its human-decided count; ASR/Judge/Embeddings
-   with the reason). Each card shows *requested* (the model id earmark sends,
+   line under them, each with the reason (Decide also with its decided
+   counts: "decided by humans N · by Jev M"). Each card shows *requested* (the model id earmark sends,
    `@ <endpoint id>`), *pinned* (`MODELS_FILE` `expected_model` + revision,
    §2.18; the row is omitted when unpinned), *answered* (what the endpoint
    reported serving the call) with `✓ matches pin` or `≠ expected <x>`, last
@@ -2547,10 +2553,27 @@ bottom:
    | Role | Step | Configured from | Answered from |
    |---|---|---|---|
    | ASR | `asr` | `ASR_SERVERS` primary entry's `model` (else the first) | newest `transcripts` row: `model_name`, `asr_runner_version`, `asr_model_sha256` |
-   | Judge | `propose` | `AI_ROLES.eval`, else `EVAL_CHAT_*` (shown as `@ EVAL_CHAT_*`, not probed) | newest `run_metrics.eval_resolved_model`; other models seen in 7 days listed as *also* |
+   | Judge | `propose` | `AI_ROLES.eval`, else `EVAL_CHAT_*` (shown as `@ EVAL_CHAT_*`, not probed) | newest `run_metrics.eval_resolved_model` (compared only when newer than the current `propose` recipe); other models seen in 7 days listed as *also* |
    | Embeddings | `embed` | `AI_ROLES.embeddings` | newest `run_metrics.embed_model` |
-   | Decide | `decide` | none yet (`not_configured`; the strip shows judge findings decided by humans) | — |
+   | Decide | `decide` | `AI_ROLES.decide` (System One) | newest `fn_calls.model_resolved` of the current recipe's `should_apply` calls |
+   | Scan | `scan` | `AI_ROLES.scan` (System One) | newest `fn_calls.model_resolved` of the current recipe's `scan_chunk` calls |
    | Format | `format` | none yet (`not_configured`) | — |
+
+   **Decide and Scan** read `fn_calls` (§1.9) for the rows of the current
+   recipe's *request*: its `params.fn`, `model_alias` and `prompt_sha256` —
+   the cache key, so errored calls (no `recipe_id`) and fallback replies
+   (stamped with the fallback's recipe) count too, while another prompt's or
+   model's calls do not. The card shows *last ok* (newest successful
+   non-cached call), *last fail* and its `error_class` (fallbacks excluded),
+   *calls* (model requests, cache hits, failures in 24 h, fallbacks), and the
+   recipe's *since*. Decide adds *decided*: judge findings in a decided
+   state (accepted, rejected, applied, reverted) split by `decided_by` —
+   **Jev** (`jev:<recipe_id>`), **humans** (`mcp:`, `cli:`, any other value, or
+   unattributed), **undone** (`revert:jev:<recipe_id>`, any state) — and the
+   proposed backlog awaiting a decision. Scan adds *scanned*: `chunk_scan`
+   rows under the current recipe over the library's chunk count. The
+   `fn_calls` aggregate is one query on the 30 s snapshot, run last and
+   best-effort: its failure marks only Decide and Scan `unknown`.
 
    Role health (`roles[].state` in the API) — a glyph always pairs with the word:
 
@@ -2573,6 +2596,15 @@ bottom:
      no success yet, or none in 3 h (3× the hourly backfill; `degraded`) →
      nothing unjudged (`idle`; "nothing to judge yet" on an empty library) →
      `healthy`.
+   - **Decide / Scan:** not configured (no `AI_ROLES.decide` / `.scan`) →
+     offline (`down`) → not on the key allowlist (`degraded`) → last failed
+     call after the last ok one (`failing`, with its `error_class`) → model
+     not loaded → answered ≠ expected (`degraded`: the reply is stored, never
+     served) → counts unavailable (`unknown`) → no current recipe yet
+     (`unknown`; `earmark monitor` registers it) → no calls under the current
+     recipe (`idle`) → `healthy` (Decide: with the proposed backlog). Both run
+     on demand (`earmark decide`, `earmark scan`), so a quiet role is never
+     degraded for want of recent calls.
    - **Embeddings:** not configured → offline (`down`) → not on the key
      allowlist → model not loaded → `embed_model` ≠ expected (`degraded`) →
      queue stats unavailable (`unknown`) → backlog with nothing ever embedded,
@@ -2592,7 +2624,15 @@ bottom:
    `anthropic/claude-haiku-5-5` is a match) and treats Ollama's implicit
    `:latest` as the bare name, but a bare pin does not match an arbitrary tag
    (`qwen3.8` ≠ `qwen3.8:14b`) or a dated snapshot; when unpinned, the answer
-   is compared with the requested id. The LiteLLM key-allowlist check stays
+   is compared with the requested id. Only an answer **newer than the step's
+   current recipe** is compared: when the judge's newest answer predates
+   `current_recipes.updated_at` for `propose` (the model or prompt was switched
+   and no transcript has needed judging since), *answered* reads "no calls
+   since the model changed (now <expected>) <since> · before: <old model>"
+   (`answeredMatch: predates_recipe`; "recipe changed" when the old answer is
+   the same model) and the card is not `degraded` for it. A different model
+   answering after the switch is still `degraded` ("fallback route?"). An
+   unknown answer time or no current recipe keeps the comparison. The LiteLLM key-allowlist check stays
    prefix-sensitive — LiteLLM matches the requested name exactly. A failing
    judge shows its last error in red under the state (monospace, clamped to
    two lines; full text on hover); otherwise the last error is a muted "last
@@ -2620,7 +2660,9 @@ bottom:
    row has options). An env-configured judge appears as an unprobed
    `EVAL_CHAT_*` row.
 5. **Judge output** — judge findings by `coalesce(resolved_model, model)`:
-   proposed, unanchorable, decided (accepted + rejected + applied + reverted),
+   proposed, unanchorable, decided (accepted + rejected + applied + reverted)
+   split into *Decided · human* (`mcp:`, `cli:`, other, unattributed) and
+   *Decided · Jev* (`jev:<recipe_id>`, plus `revert:jev:<recipe_id>` undos),
    superseded / other (superseded + the patch state `stale`), total.
 6. **ASR runners** — last, so the static update form in the shell follows it
    directly. The runner cards (state table above, §2.4, each state paired
@@ -2652,7 +2694,7 @@ as that refresh's error.
 
 | Data | TTL | Refresh timeout | Header stamp |
 |---|---|---|---|
-| Aggregates: model activity, current recipes, judge findings, ASR provenance | 30 s | 3 s | "counts as of" |
+| Aggregates: model activity, current recipes, judge findings by decider, ASR provenance, decide/scan `fn_calls` evidence (last, best-effort) | 30 s | 3 s | "counts as of" |
 | Per-step `stale_work` counts (a full scan of chunks + findings, ≈1.6 s at production size) | 5 min | 30 s | "stale counts as of"; "loading…" for at most 1.5 s on the first load, then shown when ready |
 | LiteLLM gateway readiness + key info | 60 s | 2 s per request (≤ 3 requests) | — |
 

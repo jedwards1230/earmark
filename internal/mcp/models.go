@@ -18,13 +18,14 @@ import (
 //
 // The page answers "is each pipeline role being done, by what, and is its
 // output current?" — one card per configured role (ASR, Judge, Embeddings,
-// Decide, Format; not-configured roles collapse to one line), then the
+// Decide, Scan, Format; not-configured roles collapse to one line), then the
 // supporting detail: recipes + stale counts, the LiteLLM gateway, the AI
 // endpoint registry, judge output by answering model, and the ASR runners.
 //
 // Endpoint liveness (GET /models) is NOT call success: a gateway that lists the
 // alias but 401s every chat call "lists model" in the endpoint table and is
-// FAILING on the Judge card. Role health therefore folds in call outcomes from run_metrics.
+// FAILING on the Judge card. Role health therefore folds in call outcomes:
+// run_metrics for the judge, fn_calls for decide and scan.
 //
 // Every builder here is pure (takes now and the cached snapshot, does no I/O),
 // so the page and GET /api/v1/status share one source and cannot disagree.
@@ -47,6 +48,10 @@ const (
 	matchUnreported = "unreported" // runs happened but recorded no model
 	matchNone       = "none"       // no runs yet
 	matchUnchecked  = "unchecked"  // answered, but nothing configured to compare against
+	// matchPredates: the newest answer predates the current recipe (the model
+	// or prompt changed since and nothing has been called under it yet), so it
+	// is not compared — a pre-change answer is no evidence of a fallback.
+	matchPredates = "predates_recipe"
 )
 
 // judgeQuietAfter is how long the judge may go without a success while
@@ -96,9 +101,8 @@ func health(token, sub string) roleHealth {
 	return h
 }
 
-// roleDef is one row of the static role table. decide and format have no
-// model role yet (AIRoles is {embeddings, eval}); when one lands, its card
-// gains a resolver here.
+// roleDef is one row of the static role table. format has no model role yet;
+// when one lands, its card gains a resolver here.
 type roleDef struct {
 	Key   string // API token
 	Title string
@@ -110,11 +114,12 @@ var roleDefs = []roleDef{
 	{Key: "judge", Title: "Judge", Step: recipe.StepPropose},
 	{Key: "embeddings", Title: "Embeddings", Step: recipe.StepEmbed},
 	{Key: "decide", Title: "Decide", Step: recipe.StepDecide},
+	{Key: "scan", Title: "Scan", Step: recipe.StepScan},
 	{Key: "format", Title: "Format", Step: recipe.StepFormat},
 }
 
 // roleTitleForStep labels a recipe step with the role that runs it ("" for
-// propagate/scan, which have no model role).
+// propagate, which has no model role).
 func roleTitleForStep(step string) string {
 	for _, d := range roleDefs {
 		if d.Step == step {
@@ -151,7 +156,33 @@ type roleCard struct {
 	CoverageDone     int // judge
 	CoverageTotal    int // judge
 	Backlog          int // embeddings
-	HumanDecided     *int
+	// HumanDecided / JevDecided / JevUndone / Proposed are the decide card's
+	// tally of judge findings (decideTally); HumanDecided is nil when the
+	// counts are unknown (the others are then 0).
+	HumanDecided *int
+	JevDecided   int
+	JevUndone    int
+	Proposed     int
+	// PriorModelChanged (matchPredates only) says the pre-recipe answer is a
+	// different model from the one now expected — "the model changed" rather
+	// than "the recipe changed".
+	PriorModelChanged bool
+	// RecipeSince is the current recipe's current_recipes.updated_at (judge,
+	// decide, scan); zero when the step has no current recipe.
+	RecipeSince time.Time
+	// Fn-role (decide/scan) call evidence from fn_calls under the current
+	// recipe. FnKnown is false when the step has no current recipe yet.
+	FnKnown        bool
+	Fn             string
+	Calls          int
+	CacheHits      int
+	Fallbacks      int
+	Failures24h    int
+	LastErrorClass string
+	// Scanned is the scan card's chunk_scan rows under the current recipe;
+	// ChunksTotal the library's chunk count (queue stats).
+	Scanned     *int64
+	ChunksTotal int
 	// Stale is the step's stale_work count; nil when not tracked (no current
 	// recipe) or unavailable. StaleKnown says the stale snapshot has loaded
 	// (it is cached separately, 5 min); StalePending says its first load is
@@ -179,10 +210,14 @@ type roleCard struct {
 	// that loaded (the snapshot for ASR/Judge, queue stats for Embeddings).
 	StatsKnown bool
 	LastKnown  bool
-	// HasModel is false for roles with no model binding yet (decide, format):
-	// their card shows only the stale and decided rows.
+	// HasModel is false for roles with no model binding yet (format): its
+	// card shows only the stale row.
 	HasModel bool
 }
+
+// IsFnRole reports whether the role runs through internal/fn (decide, scan):
+// its call evidence is fn_calls, not run_metrics.
+func (c roleCard) IsFnRole() bool { return c.Key == "decide" || c.Key == "scan" }
 
 // ExpectedRevisionShort is the pin's revision cut to 12 characters for display.
 func (c roleCard) ExpectedRevisionShort() string { return shortID(c.ExpectedRevision) }
@@ -242,7 +277,7 @@ type roleInputs struct {
 	Phase string
 }
 
-// buildRoleCards builds the five role cards in their fixed order.
+// buildRoleCards builds the six role cards in their fixed order.
 func buildRoleCards(in roleInputs) []roleCard {
 	cards := make([]roleCard, 0, len(roleDefs))
 	for _, d := range roleDefs {
@@ -258,12 +293,11 @@ func buildRoleCards(in roleInputs) []roleCard {
 		case "embeddings":
 			c.HasModel, c.LastKnown = true, in.Stats != nil
 			buildEmbedCard(&c, in)
+		case "decide", "scan":
+			c.HasModel, c.LastKnown = true, in.Snap != nil
+			buildFnCard(&c, in)
 		default:
 			c.Health = health(roleNotConfigured, "no model role for this step yet")
-			if d.Key == "decide" && in.Snap != nil {
-				n := humanDecided(in.Snap.Findings)
-				c.HumanDecided = &n
-			}
 		}
 		cards = append(cards, c)
 	}
@@ -375,6 +409,10 @@ func buildJudgeCard(c *roleCard, in roleInputs) {
 		c.FailingNow = a.EvalFailingNow
 		c.Answered = a.EvalLastModel
 		c.AnsweredMatch = answeredMatch(c.Answered, c.CompareTarget(), !c.LastOK.IsZero())
+		if cur := in.Snap.currentRecipe(c.Step); cur != nil {
+			c.RecipeSince = cur.UpdatedAt
+		}
+		gateOnRecipe(c, derefTime(a.EvalLastModelAt))
 		for _, m := range a.EvalModels7d {
 			if len(c.AlsoAnswered) == 3 {
 				break
@@ -390,6 +428,22 @@ func buildJudgeCard(c *roleCard, in roleInputs) {
 	applyAllowlist(c, in.Gateways, probe)
 	c.Health = judgeHealth(*c, probe, host, in.Stats != nil, in.Now)
 	finishAllowlist(c)
+}
+
+// gateOnRecipe sets matchPredates when the newest answer (answeredAt) is older
+// than the current recipe: an answer recorded before the model or prompt
+// changed says nothing about whether the current request falls back, so it
+// must not read as "≠ expected". An unknown answer time or recipe keeps the
+// comparison (a real fallback must still flag).
+func gateOnRecipe(c *roleCard, answeredAt time.Time) {
+	if c.RecipeSince.IsZero() || answeredAt.IsZero() || !answeredAt.Before(c.RecipeSince) {
+		return
+	}
+	switch c.AnsweredMatch {
+	case matchOK, matchMismatch, matchUnchecked:
+		c.PriorModelChanged = c.CompareTarget() != "" && !sameModel(c.Answered, c.CompareTarget())
+		c.AnsweredMatch = matchPredates
+	}
 }
 
 // judgeHealth is the Judge precedence table (first match wins). probe is the
@@ -631,17 +685,127 @@ func answeredMatch(answered, expected string, hasRuns bool) string {
 	}
 }
 
-// humanDecided counts judge findings a human decided (accepted, rejected,
-// applied, reverted).
-func humanDecided(fs []db.FindingsModelCount) int {
-	n := 0
-	for _, f := range fs {
-		if isDecidedState(f.PatchState) {
-			n += f.Count
+// fnRoleEndpoint resolves the AI_ROLES binding of a decide/scan card.
+func fnRoleEndpoint(cfg *config.Config, key string) (config.AIEndpoint, bool) {
+	if cfg == nil {
+		return config.AIEndpoint{}, false
+	}
+	if key == "scan" {
+		return cfg.ScanEndpoint()
+	}
+	return cfg.DecideEndpoint()
+}
+
+// buildFnCard builds the Decide or Scan card: a System One endpoint bound in
+// AI_ROLES, whose call outcomes are the fn_calls rows of its current recipe
+// (db.FnRoleActivity). Decide also tallies the judge findings by decider.
+func buildFnCard(c *roleCard, in roleInputs) {
+	pin := in.Cfg.ModelPin(c.Step)
+	c.Expected, c.ExpectedRevision = pin.ExpectedModel, pin.Revision
+	probe, host := "", ""
+	if ep, ok := fnRoleEndpoint(in.Cfg, c.Key); ok {
+		c.Configured = true
+		c.EndpointID, c.Requested = ep.ID, ep.Model
+		if v := findEndpointView(in.Endpoints, ep.ID); v != nil {
+			probe, host = v.StateToken, v.HostOnly
+			c.Gateway, c.GatewayInferred = v.Gateway, v.GatewayInferred
 		}
 	}
-	return n
+	if in.Snap != nil && in.Snap.FnRolesErr != nil {
+		c.CountsKnown, c.LastKnown = false, false // only this query failed: unknown, not "never"
+	}
+	if in.Snap != nil {
+		if cur := in.Snap.currentRecipe(c.Step); cur != nil {
+			c.RecipeSince = cur.UpdatedAt
+		}
+		if a := in.Snap.fnRole(c.Step); a != nil {
+			c.FnKnown, c.Fn = true, a.Fn
+			c.LastOK, c.LastFail = derefTime(a.LastOK), derefTime(a.LastFail)
+			c.Calls, c.CacheHits, c.Fallbacks, c.Failures24h = a.Calls, a.CacheHits, a.Fallbacks, a.Failures24h
+			c.LastErrorClass = a.LastErrorClass
+			c.LastError, c.LastErrorShort = a.LastErrorClass, a.LastErrorClass
+			c.Answered = a.LastModel
+			c.Scanned = a.Outputs
+		}
+		c.AnsweredMatch = answeredMatch(c.Answered, c.CompareTarget(), !c.LastOK.IsZero())
+		if c.Key == "decide" {
+			t := decideTally(in.Snap.Findings)
+			c.HumanDecided, c.JevDecided, c.JevUndone, c.Proposed = &t.Human, t.Jev, t.JevUndone, t.Proposed
+		}
+	}
+	if in.Stats != nil {
+		c.ChunksTotal = in.Stats.Chunks
+	}
+	applyAllowlist(c, in.Gateways, probe)
+	c.Health = fnRoleHealth(*c, probe, host, in.Now)
+	finishAllowlist(c)
 }
+
+// fnRoleHealth is the Decide/Scan precedence table (first match wins). Both
+// run on demand (`earmark decide`, `earmark scan`), so a quiet role is idle,
+// never degraded for want of recent calls.
+func fnRoleHealth(c roleCard, probe, host string, now time.Time) roleHealth {
+	switch {
+	case !c.Configured:
+		return health(roleNotConfigured, "no AI_ROLES."+c.Key+" binding — the "+c.Step+" step is off")
+	case probe == string(epStateOffline):
+		return health(roleDown, "endpoint unreachable (GET /models failed) — "+orDash(host))
+	case c.ModelAllowed != nil && !*c.ModelAllowed:
+		return health(roleDegraded, notAllowedSub(c.Requested))
+	case c.CountsKnown && !c.LastFail.IsZero() && c.LastFail.After(c.LastOK):
+		return health(roleFailing, fmt.Sprintf("last %s call failed %s (%s)",
+			c.Fn, humanizeSince(now.Sub(c.LastFail)), orDash(c.LastErrorClass)))
+	case probe == string(epStateModelMissing):
+		return health(roleDegraded, modelMissingSub(c))
+	case c.CountsKnown && c.AnsweredMatch == matchMismatch:
+		return health(roleDegraded, fmt.Sprintf("answered by %s, expected %s — the reply is stored but never served (fallback route?)",
+			c.Answered, c.CompareTarget()))
+	case !c.CountsKnown:
+		return health(roleUnknown, "call outcomes unavailable — counts query failed")
+	case !c.FnKnown:
+		return health(roleUnknown, "no current "+c.Step+" recipe yet — earmark monitor registers it at startup")
+	case c.LastOK.IsZero():
+		return health(roleIdle, "no calls under the current recipe yet")
+	case c.Key == "decide" && c.Proposed > 0:
+		return health(roleHealthy, fmt.Sprintf("last call ok %s; %s proposed findings await a decision",
+			humanizeSince(now.Sub(c.LastOK)), commafy(c.Proposed)))
+	default:
+		return health(roleHealthy, "last call ok "+humanizeSince(now.Sub(c.LastOK)))
+	}
+}
+
+// decisionTally is the decide card's split of judge findings by decider.
+type decisionTally struct {
+	Human     int // decided (accepted/rejected/applied/reverted) by a person, incl. unattributed
+	Jev       int // decided by a decide recipe (decided_by jev:<recipe>)
+	JevUndone int // last moved by `earmark decide revert` (revert:jev:<recipe>), any state
+	Proposed  int // awaiting a decision (undone ones included)
+}
+
+// decideTally classifies the judge findings by decider. Only a decided state
+// with a person's (or no) decided_by is a human decision: jev:<recipe> is the
+// decide step, revert:jev:<recipe> its undo.
+func decideTally(fs []db.FindingsModelCount) decisionTally {
+	var t decisionTally
+	for _, f := range fs {
+		if f.Decider == db.DeciderJevRevert {
+			t.JevUndone += f.Count
+		}
+		switch {
+		case f.PatchState == "proposed":
+			t.Proposed += f.Count
+		case !isDecidedState(f.PatchState):
+		case f.Decider == db.DeciderJev:
+			t.Jev += f.Count
+		case isHumanDecider(f.Decider):
+			t.Human += f.Count
+		}
+	}
+	return t
+}
+
+// isHumanDecider reports whether a decided_by class is a person's.
+func isHumanDecider(d string) bool { return d == db.DeciderHuman || d == db.DeciderNone }
 
 func isDecidedState(s string) bool {
 	switch s {
@@ -720,15 +884,20 @@ func buildRecipeRows(snap *modelsSnapshot, stale *staleSnapshot) (rows []recipeR
 // ─── Judge output ─────────────────────────────────────────────────────────────
 
 // findingsModelRow is one answering model's judge findings by outcome.
+// Decided findings split by decider: a person (mcp:, cli:, other, or
+// unattributed) or the decide step (jev:<recipe>, and revert:jev:<recipe> for
+// its undos).
 type findingsModelRow struct {
-	Model                                  string
-	Proposed, Unanchorable, Decided, Other int
-	Total                                  int
+	Model                                            string
+	Proposed, Unanchorable, DecidedHuman, DecidedJev int
+	Other                                            int
+	Total                                            int
 }
 
-// buildFindingsRows pivots (model, patch_state) counts into one row per model,
-// sorted by total descending, plus the totals row. "Other" is superseded plus
-// the patch state 'stale' (a quarantined replay, not stale_work).
+// buildFindingsRows pivots (model, patch_state, decider) counts into one row
+// per model, sorted by total descending, plus the totals row. "Other" is
+// superseded plus the patch state 'stale' (a quarantined replay, not
+// stale_work).
 func buildFindingsRows(fs []db.FindingsModelCount) ([]findingsModelRow, findingsModelRow) {
 	idx := map[string]int{}
 	var rows []findingsModelRow
@@ -748,9 +917,12 @@ func buildFindingsRows(fs []db.FindingsModelCount) ([]findingsModelRow, findings
 		case f.PatchState == "unanchorable":
 			r.Unanchorable += f.Count
 			total.Unanchorable += f.Count
+		case isDecidedState(f.PatchState) && isHumanDecider(f.Decider):
+			r.DecidedHuman += f.Count
+			total.DecidedHuman += f.Count
 		case isDecidedState(f.PatchState):
-			r.Decided += f.Count
-			total.Decided += f.Count
+			r.DecidedJev += f.Count
+			total.DecidedJev += f.Count
 		default:
 			r.Other += f.Count
 			total.Other += f.Count

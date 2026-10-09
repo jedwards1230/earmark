@@ -778,6 +778,11 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			},
 		}
 	}
+	if d.scenario == demoScenarioRecipeChanged {
+		// Every transcript judged before the model switch: nothing has needed
+		// a judge call since, which is what the Judge card must not misread.
+		q.EvalCoverageDone = q.Done
+	}
 	q.Paused = d.isPaused()
 	q.RunLimit = d.runLimit
 	if d.scenario == "batch-analyze" && q.RunLimit == nil {

@@ -125,10 +125,13 @@ line and the "held for the batch analyze phase" run budget),
 idle"), or `snapshot-error` (the Models page's aggregate queries fail — "counts
 unavailable" with a 200), `gateway-allowlist` (the judge's model is off
 earmark's LiteLLM key allowlist — Judge DEGRADED, "every call 403s") or
-`gateway-keyinfo` (LiteLLM `/key/info` not readable by earmark's key). On the
+`gateway-keyinfo` (LiteLLM `/key/info` not readable by earmark's key), or
+`recipe-changed` (the judge model was switched after its newest answer — "no
+calls since the model changed", not DEGRADED). On the
 Models page (`/servers`) the scenarios cover every role state: `active`
-HEALTHY, `failed` Judge FAILING, `stale` DEGRADED, `idle` Judge/Embeddings HEALTHY · idle
-(ASR DEGRADED: asr-runner stopped), `winddown` Judge/Embeddings and the LiteLLM
+HEALTHY (Decide with 1,189 decided by Jev, Scan), `failed` Judge and Decide
+FAILING, `stale` DEGRADED (Decide answered by a fallback), `idle` Judge/Embeddings HEALTHY · idle
+(ASR DEGRADED: asr-runner stopped), `winddown` Judge/Embeddings/Decide/Scan and the LiteLLM
 gateway DOWN, `empty` the "○ Not configured" strip (fixtures in
 `internal/mcp/demo_models.go`). To see the connection-lost banner, open the
 page then stop the server — htmx flags the data stale instead of freezing

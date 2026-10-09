@@ -15,13 +15,21 @@ import (
 // health state is reachable through DEMO_SCENARIO:
 //
 //	active / batch-analyze — Judge HEALTHY (Haiku, with a qwen3.8 fallback ×3
-//	                         visible in "also"), Embeddings HEALTHY
-//	failed                 — Judge FAILING (401 from LiteLLM, 12 failing)
+//	                         visible in "also"), Embeddings HEALTHY, Decide
+//	                         HEALTHY (1,189 decided by Jev, 6 by humans), Scan
+//	                         HEALTHY
+//	failed                 — Judge FAILING (401 from LiteLLM, 12 failing),
+//	                         Decide FAILING (timeout after the last ok call)
 //	stale                  — Judge DEGRADED (qwen3.8 ≠ pin), Embeddings
-//	                         DEGRADED (embed_model differs), ASR FAILING (stalled)
+//	                         DEGRADED (embed_model differs), ASR FAILING
+//	                         (stalled), Decide DEGRADED (jev-1.12.0 answered)
 //	idle                   — Judge and Embeddings HEALTHY · idle, stale counts 0
-//	winddown               — the LiteLLM gateway is offline → Judge + Embeddings DOWN
-//	empty                  — ASR/Judge/Decide/Format on the "Not configured" line, no recipes
+//	winddown               — the LiteLLM gateway is offline → Judge, Embeddings,
+//	                         Decide and Scan DOWN
+//	recipe-changed         — the judge model changed after its newest answer:
+//	                         "no calls since the model changed", not DEGRADED
+//	empty                  — ASR/Judge/Decide/Scan/Format on the "Not configured"
+//	                         line, no recipes
 //	multibackend           — two runner builds and two .nemo shas plus legacy
 //	snapshot-error         — the aggregate snapshot fails: "counts unavailable",
 //	                         the fragment still renders 200
@@ -48,7 +56,13 @@ const (
 	demoASRModel    = "nvidia/parakeet-tdt-0.6b-v3"
 	demoNemoSHA     = "9f3c2a71d4e8b6051c7f2e9a8d3b6c4f1e0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c"
 	demoNemoSHAPrev = "4b1e9d0c7a2f8e3b6d5c4a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d"
+	demoJevModel    = "jev-1.13.0"
+	// demoPrevJudgeModel answered before the recipe-changed scenario's switch.
+	demoPrevJudgeModel = "anthropic/claude-haiku-3-5-20241022"
 )
+
+// demoScenarioRecipeChanged: the judge's recipe moved after its newest answer.
+const demoScenarioRecipeChanged = "recipe-changed"
 
 // demoAIEndpoints is the synthetic AI endpoint registry: LiteLLM-fronted
 // embeddings + judge (declared gateway), and a direct, unbound, offline Ollama
@@ -63,9 +77,11 @@ var demoAIEndpoints = []config.AIEndpoint{
 		Options: map[string]string{"temperature": "0", "max_tokens": "4096"}},
 	{ID: "ollama-chat", Type: config.AIEndpointTypeChat, Backend: config.AIBackendOllama,
 		BaseURL: "http://desktop-2.demo:11434/v1", Model: demoFallback},
+	{ID: "litellm-jev", Type: config.AIEndpointTypeSystemOne,
+		BaseURL: "http://llm-gateway.demo:4000", Model: demoJevModel, Gateway: "litellm"},
 }
 
-var demoAIRoles = &config.AIRoles{Embeddings: "litellm-embed", Eval: "litellm-judge"}
+var demoAIRoles = &config.AIRoles{Embeddings: "litellm-embed", Eval: "litellm-judge", Decide: "litellm-jev", Scan: "litellm-jev"}
 
 // demoLegacyEndpoints is the empty scenario's registry: what LoadConfig
 // synthesizes from the deprecated EMBEDDINGS_* vars on a fresh install.
@@ -120,9 +136,9 @@ func (p demoGatewayProber) Probe(_ context.Context, baseURL, _ string) gatewaySt
 		st.KeyInfoErr = "key info not readable by earmark's key (HTTP 403)"
 		return st
 	}
-	models := []string{demoEmbedModel, demoJudgeAlias, "ollama/qwen3.8:latest"}
+	models := []string{demoEmbedModel, demoJudgeAlias, demoJevModel, "ollama/qwen3.8:latest"}
 	if p.scenario == demoScenarioGatewayAllowlist {
-		models = []string{demoEmbedModel, "ollama/qwen3.8:latest"}
+		models = []string{demoEmbedModel, demoJevModel, "ollama/qwen3.8:latest"}
 	}
 	blocked := false
 	k := gatewayKeyInfo{KeyAlias: "earmark", Models: models, Spend: 12.25, Status: "active", Blocked: &blocked}
@@ -141,6 +157,10 @@ func demoRecipeID(step string) string {
 	switch step {
 	case recipe.StepPropose:
 		return "5127c0de9a4f3b2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0dcff1"
+	case recipe.StepDecide:
+		return "2c78840766491d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e"
+	case recipe.StepScan:
+		return "7a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b5ca1"
 	default:
 		return "e3b1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a30e3b"
 	}
@@ -151,12 +171,22 @@ func (d demoDB) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) 
 		return nil, nil
 	}
 	now := time.Now()
+	proposeSince := now.Add(-3 * 24 * time.Hour)
+	if d.scenario == demoScenarioRecipeChanged {
+		proposeSince = now.Add(-20 * time.Hour) // after the judge's newest answer (1d ago)
+	}
 	return []db.CurrentRecipe{
 		{Step: recipe.StepEmbed, RecipeID: demoRecipeID(recipe.StepEmbed), Model: demoEmbedModel,
 			StepVersion: 1, ModelAlias: demoEmbedModel, ModelResolved: demoEmbedModel, UpdatedAt: now.Add(-9 * 24 * time.Hour)},
 		{Step: recipe.StepPropose, RecipeID: demoRecipeID(recipe.StepPropose), Model: demoJudgeModel,
 			PromptVersion: "judge@v1", Revision: "20251001", StepVersion: 1, ModelAlias: demoJudgeAlias,
-			ModelResolved: demoJudgeModel, PromptSHA: "c0ffee", UpdatedAt: now.Add(-3 * 24 * time.Hour)},
+			ModelResolved: demoJudgeModel, PromptSHA: "c0ffee", UpdatedAt: proposeSince},
+		{Step: recipe.StepDecide, RecipeID: demoRecipeID(recipe.StepDecide), Model: demoJevModel,
+			PromptVersion: "should_apply@v1", StepVersion: 1, ModelAlias: demoJevModel,
+			ModelResolved: demoJevModel, PromptSHA: "5e1ec7", UpdatedAt: now.Add(-2 * 24 * time.Hour)},
+		{Step: recipe.StepScan, RecipeID: demoRecipeID(recipe.StepScan), Model: demoJevModel,
+			PromptVersion: "scan_chunk@v1", StepVersion: 1, ModelAlias: demoJevModel,
+			ModelResolved: demoJevModel, PromptSHA: "5ca115", UpdatedAt: now.Add(-2 * 24 * time.Hour)},
 	}, nil
 }
 
@@ -165,11 +195,11 @@ func (d demoDB) StaleItemCounts(context.Context) (map[string]int64, error) {
 	case "empty":
 		return map[string]int64{}, nil
 	case "idle":
-		return map[string]int64{recipe.StepEmbed: 0, recipe.StepPropose: 0}, nil
+		return map[string]int64{recipe.StepEmbed: 0, recipe.StepPropose: 0, recipe.StepDecide: 0, recipe.StepScan: 0}, nil
 	case "stale":
-		return map[string]int64{recipe.StepEmbed: 41_210, recipe.StepPropose: 33_870}, nil
+		return map[string]int64{recipe.StepEmbed: 41_210, recipe.StepPropose: 33_870, recipe.StepDecide: 0, recipe.StepScan: 41_160}, nil
 	default:
-		return map[string]int64{recipe.StepEmbed: 39_644, recipe.StepPropose: 32_337}, nil
+		return map[string]int64{recipe.StepEmbed: 39_644, recipe.StepPropose: 32_337, recipe.StepDecide: 0, recipe.StepScan: 39_594}, nil
 	}
 }
 
@@ -192,6 +222,11 @@ func (d demoDB) GetModelActivity(context.Context) (db.ModelActivity, error) {
 			ModelSHA256: sp(demoNemoSHA), At: now.Add(-2 * time.Minute)},
 	}
 	switch d.scenario {
+	case demoScenarioRecipeChanged:
+		// The newest answer is from before the model switch (20h ago).
+		a.EvalLastOK, a.EvalLastFail, a.EvalLastError, a.EvalFailingNow = at(24*time.Hour), nil, "", 0
+		a.EvalLastModel = demoPrevJudgeModel
+		a.EvalModels7d = []db.ModelCount{{Model: demoPrevJudgeModel, Count: 52}}
 	case "failed":
 		a.EvalLastOK, a.EvalLastFail = at(2*time.Hour), at(6*time.Minute)
 		a.EvalLastError = `401 Unauthorized: {"error":{"message":"Authentication Error, invalid LiteLLM virtual key","type":"auth_error"}}`
@@ -208,7 +243,29 @@ func (d demoDB) GetModelActivity(context.Context) (db.ModelActivity, error) {
 	case "multibackend":
 		a.ASRLatest = &db.ASRLatest{Model: "whisper-large-v3", RunnerVersion: sp("v0.46.0-whisper"), At: now.Add(-5 * time.Minute)}
 	}
+	a.EvalLastModelAt = a.EvalLastOK
 	return a, nil
+}
+
+// FnRoleActivity is the decide/scan call evidence per scenario.
+func (d demoDB) FnRoleActivity(context.Context) ([]db.FnRoleActivity, error) {
+	if d.scenario == "empty" {
+		return nil, nil
+	}
+	now := time.Now()
+	at := func(ago time.Duration) *time.Time { t := now.Add(-ago); return &t }
+	scanned := int64(50)
+	dec := db.FnRoleActivity{Step: recipe.StepDecide, Fn: "should_apply", RecipeID: demoRecipeID(recipe.StepDecide),
+		ModelAlias: demoJevModel, Calls: 1_412, CacheHits: 230, LastOK: at(3 * time.Hour), LastModel: "typesafe/" + demoJevModel}
+	scn := db.FnRoleActivity{Step: recipe.StepScan, Fn: "scan_chunk", RecipeID: demoRecipeID(recipe.StepScan),
+		ModelAlias: demoJevModel, Calls: 50, LastOK: at(2 * 24 * time.Hour), LastModel: "typesafe/" + demoJevModel, Outputs: &scanned}
+	switch d.scenario {
+	case "failed":
+		dec.LastOK, dec.LastFail, dec.LastErrorClass, dec.Failures24h = at(time.Hour), at(10*time.Minute), "timeout", 7
+	case "stale":
+		dec.LastModel, dec.Fallbacks = "typesafe/jev-1.12.0", 14
+	}
+	return []db.FnRoleActivity{dec, scn}, nil
 }
 
 func (d demoDB) FindingsByModel(context.Context) ([]db.FindingsModelCount, error) {
@@ -220,12 +277,15 @@ func (d demoDB) FindingsByModel(context.Context) ([]db.FindingsModelCount, error
 	case "idle":
 		return []db.FindingsModelCount{
 			{Model: demoJudgeModel, PatchState: "proposed", Count: 120},
-			{Model: demoJudgeModel, PatchState: "accepted", Count: 4},
+			{Model: demoJudgeModel, PatchState: "accepted", Decider: db.DeciderHuman, Count: 4},
 		}, nil
 	}
 	return []db.FindingsModelCount{
 		{Model: demoJudgeModel, PatchState: "proposed", Count: 2_140},
 		{Model: demoJudgeModel, PatchState: "unanchorable", Count: 12},
+		{Model: demoJudgeModel, PatchState: "accepted", Decider: db.DeciderJev, Count: 820},
+		{Model: demoJudgeModel, PatchState: "rejected", Decider: db.DeciderJev, Count: 369},
+		{Model: demoJudgeModel, PatchState: "accepted", Decider: db.DeciderHuman, Count: 6},
 		{Model: demoFallback, PatchState: "proposed", Count: 26_861},
 		{Model: demoFallback, PatchState: "unanchorable", Count: 3_324},
 		{Model: demoFallback, PatchState: "superseded", Count: 410},

@@ -45,6 +45,10 @@ type ModelActivity struct {
 	EvalFailingNow int
 	// EvalLastModel is the most recent eval_resolved_model ("" when none).
 	EvalLastModel string
+	// EvalLastModelAt is when EvalLastModel answered (its eval_finished_at);
+	// nil when unknown. The Models page compares the answer with the expected
+	// model only when it is newer than the current propose recipe.
+	EvalLastModelAt *time.Time
 	// EvalModels7d is every eval_resolved_model that answered in the last 7
 	// days with its count, most first (at most evalModels7dLimit).
 	EvalModels7d []ModelCount
@@ -59,7 +63,8 @@ type ModelActivity struct {
 const evalModels7dLimit = 4
 
 // modelActivitySQL is one round trip of scalar subselects plus the newest
-// transcript via a LATERAL join (so an empty table still yields one row).
+// judge answer and the newest transcript via LATERAL joins (so empty tables
+// still yield one row).
 // eval_error is already capped at write time; left() keeps the read bounded
 // regardless.
 const modelActivitySQL = `
@@ -70,14 +75,17 @@ const modelActivitySQL = `
 	     WHERE eval_failed_at IS NOT NULL
 	     ORDER BY eval_failed_at DESC LIMIT 1),
 	  (SELECT count(*) FROM run_metrics WHERE eval_failed_at IS NOT NULL),
-	  (SELECT eval_resolved_model FROM run_metrics
-	     WHERE eval_resolved_model IS NOT NULL
-	     ORDER BY eval_finished_at DESC NULLS LAST LIMIT 1),
+	  em.eval_resolved_model, em.eval_finished_at,
 	  (SELECT embed_model FROM run_metrics
 	     WHERE embed_model IS NOT NULL
 	     ORDER BY embed_finished_at DESC NULLS LAST LIMIT 1),
 	  t.model_name, t.asr_runner_version, t.asr_model_sha256, t.created_at
 	FROM (SELECT 1) AS one
+	LEFT JOIN LATERAL (
+	  SELECT eval_resolved_model, eval_finished_at FROM run_metrics
+	   WHERE eval_resolved_model IS NOT NULL
+	   ORDER BY eval_finished_at DESC NULLS LAST LIMIT 1
+	) AS em ON true
 	LEFT JOIN LATERAL (
 	  SELECT model_name, asr_runner_version, asr_model_sha256, created_at
 	    FROM transcripts ORDER BY created_at DESC LIMIT 1
@@ -102,7 +110,7 @@ func (db *DB) GetModelActivity(ctx context.Context) (ModelActivity, error) {
 	)
 	if err := db.pool.QueryRow(ctx, modelActivitySQL).Scan(
 		&a.EvalLastOK, &a.EvalLastFail, &lastErr, &a.EvalFailingNow,
-		&evalModel, &embed,
+		&evalModel, &a.EvalLastModelAt, &embed,
 		&asrModel, &asrRunner, &asrSHA, &asrAt,
 	); err != nil {
 		return ModelActivity{}, fmt.Errorf("model activity: %w", err)
@@ -129,38 +137,154 @@ func (db *DB) GetModelActivity(ctx context.Context) (ModelActivity, error) {
 	return a, nil
 }
 
-// FindingsModelCount is one (answering model, patch_state) bucket of judge
-// findings. Model is coalesce(resolved_model, model).
+// FindingsModelCount is one (answering model, patch_state, decider) bucket of
+// judge findings. Model is coalesce(resolved_model, model); Decider classifies
+// decided_by (see the Decider* constants).
 type FindingsModelCount struct {
 	Model      string
 	PatchState string
+	Decider    string
 	Count      int
 }
 
+// Decider classes of transcript_findings.decided_by (CONTRACT §2.17, §2.19).
+// A decide recipe writes "jev:<recipe_id>" and its undo "revert:jev:<recipe_id>"
+// (the only two deciders the bulk path accepts); anything else — mcp:, cli:,
+// another tool — is a person. DeciderNone is a NULL/empty decided_by: an
+// undecided finding, or a decision recorded before attribution (counted as a
+// person's by the Models page, as it always was).
+const (
+	DeciderNone      = ""
+	DeciderHuman     = "human"
+	DeciderJev       = "jev"
+	DeciderJevRevert = "jev_revert"
+)
+
 // findingsByModelLimit bounds the GROUP BY result: distinct models × the
-// patch_state enum is small, so this only guards a pathological table.
+// patch_state enum × the four decider classes is small, so this only guards a
+// pathological table.
 const findingsByModelLimit = 500
 
-// FindingsByModel counts judge findings by the model that answered and their
-// patch state. Human-origin corrections are excluded (no model made them).
+// findingsByModelSQL is one pass over the judge findings. The decider CASE
+// mirrors findingevents.go's automatedDeciderRe loosely (LIKE, not the
+// 64-hex check): a malformed jev-looking decider is still not a person.
+const findingsByModelSQL = `
+	SELECT coalesce(resolved_model, model), patch_state,
+	       CASE WHEN decided_by LIKE 'jev:%'        THEN 'jev'
+	            WHEN decided_by LIKE 'revert:jev:%' THEN 'jev_revert'
+	            WHEN coalesce(decided_by, '') = ''  THEN ''
+	            ELSE 'human' END,
+	       count(*)
+	  FROM transcript_findings
+	 WHERE origin = 'judge'
+	 GROUP BY 1, 2, 3
+	 ORDER BY 1, 2, 3
+	 LIMIT $1`
+
+// FindingsByModel counts judge findings by the model that answered, their
+// patch state and who decided them. Human-origin corrections are excluded (no
+// model made them).
 func (db *DB) FindingsByModel(ctx context.Context) ([]FindingsModelCount, error) {
-	rows, err := db.pool.Query(ctx, `
-		SELECT coalesce(resolved_model, model), patch_state, count(*)
-		  FROM transcript_findings
-		 WHERE origin = 'judge'
-		 GROUP BY 1, 2
-		 ORDER BY 1, 2
-		 LIMIT $1`, findingsByModelLimit)
+	rows, err := db.pool.Query(ctx, findingsByModelSQL, findingsByModelLimit)
 	if err != nil {
 		return nil, fmt.Errorf("findings by model: %w", err)
 	}
 	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (FindingsModelCount, error) {
 		var f FindingsModelCount
-		err := r.Scan(&f.Model, &f.PatchState, &f.Count)
+		err := r.Scan(&f.Model, &f.PatchState, &f.Decider, &f.Count)
 		return f, err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan findings by model: %w", err)
+	}
+	return out, nil
+}
+
+// FnRoleActivity is the call evidence for one pure-function role (decide's
+// should_apply, scan's scan_chunk) under its CURRENT recipe: the fn_calls rows
+// with the recipe's fn, model alias and prompt hash — the request identity the
+// cache is keyed on, so errored calls (which carry no recipe_id) and fallback
+// replies (stamped with the fallback's recipe) are counted too.
+type FnRoleActivity struct {
+	Step       string // recipe step: "decide" | "scan"
+	Fn         string // the recipe's params.fn
+	RecipeID   string
+	ModelAlias string
+	// Calls are model requests (cache hits excluded); CacheHits are calls
+	// served from an earlier row.
+	Calls     int
+	CacheHits int
+	// Fallbacks are replies from another model (error_class model_fallback):
+	// stored, never served.
+	Fallbacks int
+	// Failures24h are failed calls (any error class but model_fallback) in the
+	// last 24 hours.
+	Failures24h int
+	// LastOK is the newest successful model request; LastFail the newest
+	// failed one (fallbacks excluded) and LastErrorClass its class.
+	LastOK         *time.Time
+	LastFail       *time.Time
+	LastErrorClass string
+	// LastModel is the newest reply's model_resolved (fallbacks included,
+	// cache hits excluded); "" when no request got a reply.
+	LastModel string
+	// Outputs is the step's output rows under the recipe — scan: chunk_scan
+	// rows; nil for decide (its decisions are counted from the findings).
+	Outputs *int64
+}
+
+// fnRoleActivitySQL is one round trip: the current decide/scan recipes and an
+// aggregate over their calls. fn_calls has no index on fn alone, so this is a
+// scan of the call log — bounded output (≤ 2 rows), run on the page's 30 s
+// snapshot timer. $1 is ErrorClassModelFallback.
+const fnRoleActivitySQL = `
+	WITH cur AS (
+	  SELECT cr.step, r.recipe_id, coalesce(r.model_alias, '') AS model_alias,
+	         coalesce(r.prompt_sha256, '') AS prompt_sha256, coalesce(r.params->>'fn', '') AS fn,
+	         CASE WHEN cr.step = 'scan'
+	              THEN (SELECT count(*) FROM chunk_scan s WHERE s.recipe_id = r.recipe_id) END AS outputs
+	    FROM current_recipes cr
+	    JOIN recipes r ON r.recipe_id = cr.recipe_id
+	   WHERE cr.step IN ('decide', 'scan')
+	)
+	SELECT cur.step, cur.fn, cur.recipe_id, cur.model_alias,
+	       count(c.id) FILTER (WHERE NOT c.cache_hit),
+	       count(c.id) FILTER (WHERE c.cache_hit),
+	       count(c.id) FILTER (WHERE c.error_class = $1),
+	       count(c.id) FILTER (WHERE c.error_class <> $1 AND c.created_at > now() - interval '24 hours'),
+	       max(c.created_at) FILTER (WHERE c.error_class IS NULL AND NOT c.cache_hit),
+	       max(c.created_at) FILTER (WHERE c.error_class <> $1),
+	       (array_agg(c.error_class ORDER BY c.created_at DESC, c.id DESC)
+	          FILTER (WHERE c.error_class <> $1))[1],
+	       (array_agg(c.model_resolved ORDER BY c.created_at DESC, c.id DESC)
+	          FILTER (WHERE c.model_resolved IS NOT NULL AND NOT c.cache_hit))[1],
+	       cur.outputs
+	  FROM cur
+	  LEFT JOIN fn_calls c ON c.fn = cur.fn AND c.model_alias = cur.model_alias
+	                      AND c.prompt_sha256 = cur.prompt_sha256
+	 GROUP BY cur.step, cur.fn, cur.recipe_id, cur.model_alias, cur.outputs
+	 ORDER BY cur.step`
+
+// FnRoleActivity reads the decide and scan roles' call evidence; a step with
+// no current recipe has no entry.
+func (db *DB) FnRoleActivity(ctx context.Context) ([]FnRoleActivity, error) {
+	rows, err := db.pool.Query(ctx, fnRoleActivitySQL, ErrorClassModelFallback)
+	if err != nil {
+		return nil, fmt.Errorf("fn role activity: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (FnRoleActivity, error) {
+		var (
+			a              FnRoleActivity
+			errClass, last *string
+		)
+		err := r.Scan(&a.Step, &a.Fn, &a.RecipeID, &a.ModelAlias,
+			&a.Calls, &a.CacheHits, &a.Fallbacks, &a.Failures24h,
+			&a.LastOK, &a.LastFail, &errClass, &last, &a.Outputs)
+		a.LastErrorClass, a.LastModel = derefString(errClass), derefString(last)
+		return a, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan fn role activity: %w", err)
 	}
 	return out, nil
 }

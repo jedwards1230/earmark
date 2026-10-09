@@ -313,14 +313,16 @@ func TestBuildFindingsRows(t *testing.T) {
 		{Model: "qwen", PatchState: "superseded", Count: 2},
 		{Model: "qwen", PatchState: "stale", Count: 1},
 		{Model: "haiku", PatchState: "proposed", Count: 20},
-		{Model: "haiku", PatchState: "accepted", Count: 3},
-		{Model: "haiku", PatchState: "reverted", Count: 1},
+		{Model: "haiku", PatchState: "accepted", Decider: db.DeciderHuman, Count: 3},
+		{Model: "haiku", PatchState: "reverted", Decider: db.DeciderNone, Count: 1},
+		{Model: "haiku", PatchState: "accepted", Decider: db.DeciderJev, Count: 5},
+		{Model: "haiku", PatchState: "rejected", Decider: db.DeciderJevRevert, Count: 2},
 		{Model: "haiku", PatchState: "unanchorable", Count: 4},
 	})
 	require.Len(t, rows, 2)
-	assert.Equal(t, findingsModelRow{Model: "haiku", Proposed: 20, Unanchorable: 4, Decided: 4, Total: 28}, rows[0])
+	assert.Equal(t, findingsModelRow{Model: "haiku", Proposed: 20, Unanchorable: 4, DecidedHuman: 4, DecidedJev: 7, Total: 35}, rows[0])
 	assert.Equal(t, findingsModelRow{Model: "qwen", Proposed: 10, Other: 3, Total: 13}, rows[1])
-	assert.Equal(t, findingsModelRow{Model: "total", Proposed: 30, Unanchorable: 4, Decided: 4, Other: 3, Total: 41}, total)
+	assert.Equal(t, findingsModelRow{Model: "total", Proposed: 30, Unanchorable: 4, DecidedHuman: 4, DecidedJev: 7, Other: 3, Total: 48}, total)
 }
 
 // TestBuildRoleCards_EnvJudge: a judge configured from EVAL_CHAT_* (not the
@@ -334,7 +336,7 @@ func TestBuildRoleCards_EnvJudge(t *testing.T) {
 		Snap:         &modelsSnapshot{Activity: db.ModelActivity{EvalLastModel: "qwen3.8"}},
 		Now:          testNow,
 	})
-	require.Len(t, cards, 5)
+	require.Len(t, cards, 6)
 	j := cards[1]
 	assert.Equal(t, "judge", j.Key)
 	assert.True(t, j.Configured)
@@ -347,8 +349,10 @@ func TestBuildRoleCards_EnvJudge(t *testing.T) {
 
 	assert.Equal(t, roleNotConfigured, cards[3].Health.Token) // decide
 	require.NotNil(t, cards[3].HumanDecided)
-	assert.Equal(t, roleNotConfigured, cards[4].Health.Token) // format
+	assert.Equal(t, roleNotConfigured, cards[4].Health.Token) // scan
 	assert.Nil(t, cards[4].HumanDecided)
+	assert.Equal(t, roleNotConfigured, cards[5].Health.Token) // format
+	assert.Nil(t, cards[5].HumanDecided)
 }
 
 func TestBuildRoleCards_ServersUnknown(t *testing.T) {
@@ -370,34 +374,47 @@ func TestServersDataScenarios(t *testing.T) {
 			scenario: "active",
 			wantContains: []string{"✓ HEALTHY", "transcribing on gpu-1", "via LiteLLM", "also:", "qwen3.8</span> ×3",
 				"32,337", "39,644", "counts as of", "id=\"recipe-propose\"", "href=\"#recipe-propose\"",
-				"runner version: running", "not reported (pre-provenance runner)", "AI endpoints (3)", "unbound", "direct",
+				"runner version: running", "not reported (pre-provenance runner)", "AI endpoints (4)", "unbound", "direct",
 				"✗ unreachable", "✓ lists model", `<span title="role token: eval">Judge</span>`,
-				"29,001", "3,336", "decided by humans", "· counts as of", "· stale counts as of",
+				"29,001", "3,336", "· counts as of", "· stale counts as of",
+				`id="role-decide"`, `id="role-scan"`, "<dt>decided</dt><dd>1,189 by Jev · 6 by humans · 29,001 proposed awaiting",
+				"proposed findings await a decision", "29,001 proposed findings", "1,412 <span class=\"mono\">should_apply</span> calls + 230 cached",
+				"<dt>scanned</dt><dd>50", "Decided · Jev", "Decided · human",
 				"1 transcript currently failing", "<dt>last error</dt>", "· last fail",
 				"LiteLLM gateway", "proxy healthy · db connected", "v1.102.1", "$12.25 · no budget set",
-				"<dt>used by</dt><dd>Embeddings, Judge</dd>",
+				"<dt>used by</dt><dd>Embeddings, Judge, Decide</dd>",
 				`<th scope="row" class="mono">propose</th>`, `<h2 class="section-title"`,
-				"○ Not configured: Decide", "Not tracked: asr (provenance per transcript), decide, propagate, scan, format",
+				"○ Not configured: Format", "Not tracked: asr (provenance per transcript), propagate, format",
 				`class="badge mismatch" title="a different version is requested">update requested`,
 				`title="converges only by re-judging"`, "Avg / job", "Precision", `aria-labelledby="recipes-note"`},
 			wantAbsent: []string{"counts unavailable", "FAILING", "about-page", "Family", "Size", "<form",
 				"1 transcripts", `<div class="server-sub err" title="chat completion`, "gpu-retired", "NOT ALLOWED",
 				// the gateway's role rows and the card's allowlist row only repeat "allowed"
 				"✓ allowed", "key allowlist</dt>",
-				"○ NOT CONFIGURED", `id="recipe-asr"`, `id="recipe-decide"`, "unpinned", "<caption", "Pin</th>",
+				"○ NOT CONFIGURED", `id="recipe-asr"`, "unpinned", "decided by humans", "no calls since", "<caption", "Pin</th>",
 				"Backend</th>", "openai-compat", "runner did not report provenance", "last fail <span class=\"time-muted\">never",
 				`class="badge unconfigured" title="a different version`, "✓ READY</span>", "AVG PROC", "Mode</th>"},
-			wantCount: map[string]int{`class="panel server-card role-card`: 3},
+			wantCount: map[string]int{`class="panel server-card role-card`: 5},
 		},
 		{
 			scenario: "failed",
 			wantContains: []string{"✗ FAILING", "invalid LiteLLM virtual key", "12 transcripts currently failing", "see error below",
-				`<div class="server-sub err mono err-clamp" title="401 Unauthorized`},
+				`<div class="server-sub err mono err-clamp" title="401 Unauthorized`,
+				"last should_apply call failed", "ago (timeout)", "7 failed (24h)"},
 		},
 		{
 			scenario: "stale",
 			wantContains: []string{"▲ DEGRADED", "≠ expected anthropic/claude-haiku-4-5-20251001", "answered by qwen3.8",
-				"embedded by mxbai-embed-large", "holds a claim with a stale heartbeat", "33,870"},
+				"embedded by mxbai-embed-large", "holds a claim with a stale heartbeat", "33,870",
+				"answered by typesafe/jev-1.12.0, expected jev-1.13.0", "14 fallbacks"},
+		},
+		{
+			// The judge model changed after its newest answer: neutral, not DEGRADED.
+			scenario: demoScenarioRecipeChanged,
+			wantContains: []string{"no calls since the model changed (now anthropic/claude-haiku-4-5-20251001)",
+				"before: </span><span class=\"mono\">anthropic/claude-haiku-3-5-20241022</span>",
+				`class="panel server-card role-card state-running" id="role-judge"`},
+			wantAbsent: []string{"▲ DEGRADED", "fallback route?", "≠ expected"},
 		},
 		{
 			scenario: "idle",
@@ -417,6 +434,7 @@ func TestServersDataScenarios(t *testing.T) {
 			scenario: "empty",
 			wantContains: []string{"no ASR_SERVERS", "judging is off", "no judge findings yet", "no transcripts yet", "_legacy",
 				"No current recipes yet. Current recipes are registered by", "○ Not configured: ASR", ", Format</p>",
+				"no AI_ROLES.decide binding — the decide step is off · decided by humans 0", "no AI_ROLES.scan binding",
 				"Not tracked: asr (provenance per transcript), propose, decide, propagate, scan, format, embed"},
 			wantAbsent: []string{"via LiteLLM", "LiteLLM gateway", "○ NOT CONFIGURED", `class="recipes-table"`,
 				// no endpoint has options and the judge is not env-sourced
@@ -602,12 +620,12 @@ func TestAPIStatusRolesArray(t *testing.T) {
 	}
 
 	got := get("failed")
-	require.Len(t, got.Roles, 5)
-	keys := make([]string, 0, 5)
+	require.Len(t, got.Roles, 6)
+	keys := make([]string, 0, 6)
 	for _, r := range got.Roles {
 		keys = append(keys, r.Role)
 	}
-	assert.Equal(t, []string{"asr", "judge", "embeddings", "decide", "format"}, keys)
+	assert.Equal(t, []string{"asr", "judge", "embeddings", "decide", "scan", "format"}, keys)
 
 	j := got.Roles[1]
 	assert.Equal(t, "propose", j.Step)
@@ -630,7 +648,7 @@ func TestAPIStatusRolesArray(t *testing.T) {
 	assert.Equal(t, "llm-gateway.demo:4000", g.BaseHost)
 	assert.True(t, g.Ready)
 	assert.Equal(t, "earmark", g.KeyAlias)
-	assert.Equal(t, []string{"litellm-embed", "litellm-judge"}, g.Endpoints)
+	assert.Equal(t, []string{"litellm-embed", "litellm-judge", "litellm-jev"}, g.Endpoints)
 	require.NotNil(t, g.Spend)
 	assert.InDelta(t, 12.25, *g.Spend, 0.001)
 	assert.Nil(t, g.MaxBudget)
@@ -645,7 +663,13 @@ func TestAPIStatusRolesArray(t *testing.T) {
 	require.NotNil(t, j.CountsAsOf)
 
 	assert.Nil(t, got.Roles[0].Stale, "asr has no current recipe → stale null")
-	assert.Equal(t, roleNotConfigured, got.Roles[3].State)
+	d := got.Roles[3]
+	assert.Equal(t, roleFailing, d.State, "decide: the timeout is newer than the last ok call")
+	assert.Equal(t, "litellm-jev", d.Endpoint)
+	require.NotNil(t, d.LastError)
+	assert.Equal(t, "timeout", *d.LastError)
+	assert.Equal(t, roleHealthy, got.Roles[4].State, "scan")
+	assert.Equal(t, roleNotConfigured, got.Roles[5].State, "format")
 
 	// Endpoint liveness stays liveness: the judge's gateway is READY while the
 	// role is FAILING — the exact gap roles[] exists to close.
@@ -658,7 +682,7 @@ func TestAPIStatusRolesArray(t *testing.T) {
 
 	// A failed snapshot degrades counts to null, never the response.
 	se := get(demoScenarioSnapshotError)
-	require.Len(t, se.Roles, 5)
+	require.Len(t, se.Roles, 6)
 	assert.Nil(t, se.Roles[1].CountsAsOf)
 	assert.True(t, se.Roles[1].CountsError)
 	assert.Nil(t, se.Roles[1].FailingNow, "unknown, not 0")
@@ -833,7 +857,7 @@ func TestServersFragmentRoleCards(t *testing.T) {
 		Health: health(roleDown, "gateway unreachable")}
 	allowed := roleCard{Key: "embeddings", Title: "Embeddings", Step: recipe.StepEmbed, HasModel: true, Configured: true,
 		Requested: "nomic-embed-text", AllowState: "allowed", Health: health(roleIdle, "nothing waiting to embed")}
-	decided := 7
+	decided, jev := 7, 1189
 	tests := []struct {
 		name         string
 		cards        []roleCard
@@ -858,10 +882,11 @@ func TestServersFragmentRoleCards(t *testing.T) {
 			name: "not-configured roles render in the strip, not as cards",
 			unconfigured: []roleCard{
 				{Key: "judge", Title: "Judge", HasModel: true, Health: health(roleNotConfigured, "judging is off")},
-				{Key: "decide", Title: "Decide", HumanDecided: &decided, Health: health(roleNotConfigured, "no model role for this step yet")},
+				{Key: "decide", Title: "Decide", HasModel: true, HumanDecided: &decided, JevDecided: jev,
+					Health: health(roleNotConfigured, "no AI_ROLES.decide binding — the decide step is off")},
 				{Key: "format", Title: "Format", Health: health(roleNotConfigured, "no model role for this step yet")},
 			},
-			wantContains: []string{`○ Not configured: Judge <span class="time-muted">(judging is off)</span>, Decide <span class="time-muted">(decided by humans 7)</span>, Format</p>`},
+			wantContains: []string{`○ Not configured: Judge <span class="time-muted">(judging is off)</span>, Decide <span class="time-muted">(no AI_ROLES.decide binding — the decide step is off · decided by humans 7 · by Jev 1,189)</span>, Format</p>`},
 			wantAbsent:   []string{"role-card", "NOT CONFIGURED", "no model role for this step yet", `class="panels role-panels"`},
 		},
 	}
@@ -896,5 +921,141 @@ func TestServersFragmentSectionOrder(t *testing.T) {
 		require.Positive(t, i, id)
 		assert.Greater(t, i, last, "%s is out of order", id)
 		last = i
+	}
+}
+
+// TestJudgeAnsweredGatedOnRecipe: the judge's newest answer is compared with
+// the expected model only when it is newer than the current propose recipe. A
+// pre-change answer (the model was switched and nothing needed judging since)
+// is neutral; a mismatch under the current recipe is still DEGRADED.
+func TestJudgeAnsweredGatedOnRecipe(t *testing.T) {
+	cfg := &config.Config{Models: &config.ModelRegistry{Steps: map[string]config.ModelPin{
+		recipe.StepPropose: {ExpectedModel: "anthropic/claude-haiku-5-5"},
+	}}}
+	switchedAt := ago(20 * time.Hour)
+	in := func(answeredAt time.Time, model string, recipeSince time.Time) roleInputs {
+		snap := &modelsSnapshot{Activity: db.ModelActivity{
+			EvalLastOK: &answeredAt, EvalLastModel: model, EvalLastModelAt: &answeredAt,
+		}}
+		if !recipeSince.IsZero() {
+			snap.Recipes = []db.CurrentRecipe{{Step: recipe.StepPropose, UpdatedAt: recipeSince}}
+		}
+		return roleInputs{
+			Cfg: cfg, Judge: judgeConfig{Configured: true, Source: judgeSourceEnv, Model: "anthropic/claude-haiku-5-5"},
+			ServersKnown: true, Stats: &db.QueueStats{Done: 10, EvalCoverageDone: 10}, Snap: snap, Now: testNow,
+		}
+	}
+	tests := []struct {
+		name         string
+		in           roleInputs
+		wantMatch    string
+		wantToken    string
+		modelChanged bool
+	}{
+		{"old model answered before the switch", in(ago(24*time.Hour), "anthropic/claude-haiku-4-5-20251001", switchedAt),
+			matchPredates, roleIdle, true},
+		{"same model before a prompt-only change", in(ago(24*time.Hour), "claude-haiku-5-5", switchedAt),
+			matchPredates, roleIdle, false},
+		{"fallback answered after the switch", in(ago(time.Hour), "anthropic/claude-haiku-4-5-20251001", switchedAt),
+			matchMismatch, roleDegraded, false},
+		{"expected model answered after the switch", in(ago(time.Hour), "claude-haiku-5-5", switchedAt),
+			matchOK, roleIdle, false},
+		{"no current recipe keeps the comparison", in(ago(24*time.Hour), "anthropic/claude-haiku-4-5-20251001", time.Time{}),
+			matchMismatch, roleDegraded, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			j := buildRoleCards(tc.in)[1]
+			assert.Equal(t, tc.wantMatch, j.AnsweredMatch)
+			assert.Equal(t, tc.wantToken, j.Health.Token, j.Health.Sub)
+			assert.Equal(t, tc.modelChanged, j.PriorModelChanged)
+		})
+	}
+
+	t.Run("unknown answer time keeps the comparison", func(t *testing.T) {
+		c := roleCard{Answered: "a", Expected: "b", AnsweredMatch: matchMismatch, RecipeSince: switchedAt}
+		gateOnRecipe(&c, time.Time{})
+		assert.Equal(t, matchMismatch, c.AnsweredMatch)
+	})
+}
+
+func TestFnRoleHealthPrecedence(t *testing.T) {
+	base := roleCard{
+		Key: "decide", Step: recipe.StepDecide, Fn: "should_apply", Configured: true, CountsKnown: true, FnKnown: true,
+		Requested: "jev-1.13.0", Answered: "typesafe/jev-1.13.0", AnsweredMatch: matchOK, LastOK: ago(3 * time.Hour),
+	}
+	with := func(f func(*roleCard)) roleCard { c := base; f(&c); return c }
+	tests := []struct {
+		name      string
+		card      roleCard
+		probe     string
+		wantToken string
+		wantSub   string
+	}{
+		{"not configured", with(func(c *roleCard) { c.Configured = false }), "", roleNotConfigured, "no AI_ROLES.decide binding"},
+		{"offline", base, "offline", roleDown, "endpoint unreachable"},
+		{"not on key allowlist", with(func(c *roleCard) { c.ModelAllowed = boolp(false) }), "ready", roleDegraded, "every call 403s"},
+		{"last fail after last ok", with(func(c *roleCard) { c.LastFail, c.LastErrorClass = ago(time.Minute), "timeout" }), "ready", roleFailing,
+			"last should_apply call failed 1m ago (timeout)"},
+		{"old failure, newer success", with(func(c *roleCard) { c.LastFail = ago(5 * time.Hour) }), "ready", roleHealthy, "last call ok"},
+		{"model missing", base, "model_not_loaded", roleDegraded, "endpoint does not list jev-1.13.0"},
+		{"fallback answered", with(func(c *roleCard) { c.Answered, c.AnsweredMatch = "jev-1.12.0", matchMismatch }), "ready", roleDegraded,
+			"answered by jev-1.12.0, expected jev-1.13.0"},
+		{"counts unavailable", with(func(c *roleCard) { c.CountsKnown = false }), "ready", roleUnknown, "counts query failed"},
+		{"no current recipe", with(func(c *roleCard) { c.FnKnown = false }), "ready", roleUnknown, "no current decide recipe"},
+		{"never called", with(func(c *roleCard) { c.LastOK = time.Time{} }), "ready", roleIdle, "no calls under the current recipe yet"},
+		{"healthy with a backlog", with(func(c *roleCard) { c.Proposed = 29_001 }), "ready", roleHealthy, "29,001 proposed findings await a decision"},
+		{"healthy, quiet for days", with(func(c *roleCard) { c.LastOK = ago(72 * time.Hour) }), "ready", roleHealthy, "last call ok"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := fnRoleHealth(tc.card, tc.probe, "gw:4000", testNow)
+			assert.Equal(t, tc.wantToken, h.Token)
+			assert.Contains(t, h.Sub, tc.wantSub)
+		})
+	}
+}
+
+// TestDecideTally: decided_by jev:<recipe> is the decide step, never a human;
+// revert:jev:<recipe> is its undo; mcp:/cli:/other and unattributed are people.
+func TestDecideTally(t *testing.T) {
+	got := decideTally([]db.FindingsModelCount{
+		{PatchState: "proposed", Count: 100},
+		{PatchState: "proposed", Decider: db.DeciderJevRevert, Count: 3},
+		{PatchState: "accepted", Decider: db.DeciderJev, Count: 820},
+		{PatchState: "rejected", Decider: db.DeciderJev, Count: 369},
+		{PatchState: "applied", Decider: db.DeciderJev, Count: 11},
+		{PatchState: "rejected", Decider: db.DeciderJevRevert, Count: 2},
+		{PatchState: "accepted", Decider: db.DeciderHuman, Count: 6},
+		{PatchState: "reverted", Decider: db.DeciderNone, Count: 1},
+		{PatchState: "unanchorable", Count: 9},
+		{PatchState: "superseded", Decider: db.DeciderJev, Count: 4},
+	})
+	assert.Equal(t, decisionTally{Human: 7, Jev: 1_200, JevUndone: 5, Proposed: 103}, got)
+}
+
+// TestFnRolesErrIsBestEffort: a failed fn_calls aggregate marks only the
+// Decide and Scan cards unknown; the judge still reads its evidence.
+func TestFnRolesErrIsBestEffort(t *testing.T) {
+	ok := ago(time.Hour)
+	cards := buildRoleCards(roleInputs{
+		Cfg: &config.Config{
+			AIEndpoints: []config.AIEndpoint{{ID: "jev", Type: config.AIEndpointTypeSystemOne, Model: "jev-1.13.0"}},
+			AIRoles:     &config.AIRoles{Decide: "jev", Scan: "jev"},
+		},
+		Judge:        judgeConfig{Configured: true, Source: judgeSourceEnv, Model: "haiku"},
+		ServersKnown: true,
+		Stats:        &db.QueueStats{Done: 1, EvalCoverageDone: 1},
+		Snap: &modelsSnapshot{
+			Activity:   db.ModelActivity{EvalLastOK: &ok, EvalLastModel: "haiku"},
+			FnRoles:    []db.FnRoleActivity{{Step: recipe.StepDecide, LastOK: &ok}},
+			FnRolesErr: errors.New("fn role activity: canceling statement due to statement timeout"),
+		},
+		Now: testNow,
+	})
+	assert.Equal(t, roleIdle, cards[1].Health.Token, "judge is unaffected")
+	for _, c := range cards[3:5] {
+		assert.Equal(t, roleUnknown, c.Health.Token, c.Key)
+		assert.Contains(t, c.Health.Sub, "call outcomes unavailable", c.Key)
 	}
 }
