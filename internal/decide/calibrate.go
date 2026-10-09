@@ -2,6 +2,7 @@ package decide
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/patch"
@@ -175,13 +176,15 @@ func pct(r *float64) string {
 	return fmt.Sprintf("%.1f%%", 100**r)
 }
 
-func (c *Calibration) print(p func(string, ...any)) {
+func (c *Calibration) print(p func(string, ...any), classes []string) {
 	p("\ncalibration: %d human-accepted · %d human-rejected\n", c.HumanAccepted, c.HumanRejected)
 	for _, label := range []string{HumanAccepted, HumanRejected} {
-		p("  human %-8s → %s\n", label, counts(c.Matrix[label], reportClasses))
+		p("  human %-8s → %s\n", label, counts(c.Matrix[label], classes))
 	}
-	p("  apply precision %s · apply recall %s · reject precision %s · hold rate %.1f%%\n",
-		pct(c.ApplyPrecision), pct(c.ApplyRecall), pct(c.RejectPrecision), 100*c.HoldRate)
+	if !slices.Contains(classes, ClassRung0Pass) { // no decisions in a rung-0-only run
+		p("  apply precision %s · apply recall %s · reject precision %s · hold rate %.1f%%\n",
+			pct(c.ApplyPrecision), pct(c.ApplyRecall), pct(c.RejectPrecision), 100*c.HoldRate)
+	}
 	p("  phonetic_min_sim sweep (rung 0 re-run offline; no new model calls):\n")
 	p("    %-6s %10s %10s %8s %6s %10s %7s %11s %5s\n", "sim", "pass(acc)", "pass(rej)", "unasked", "apply", "precision", "reject", "rej agree", "hold")
 	for _, r := range c.Sweep {

@@ -79,16 +79,16 @@ func TestDecideScope(t *testing.T) {
 
 	mock := newMockPool(t)
 	cols := []string{"id", "transcript_id", "file_path", "issue_type", "original_text", "suggested_correction",
-		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by"}
+		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by", "model"}
 	mock.ExpectQuery(`ORDER BY md5`).
 		WithArgs([]string{"proposed"}, "%Dune%", "homophone", []string{}, "s1", 2).
 		WillReturnRows(pgxmock.NewRows(cols).
-			AddRow("f1", "t1", "/b/Dune/1.m4b", "homophone", "their", "there", 0.9, 3, 10, -1, "aa", "proposed", ""))
+			AddRow("f1", "t1", "/b/Dune/1.m4b", "homophone", "their", "there", 0.9, 3, 10, -1, "aa", "proposed", "", "qwen3:32b"))
 	got, err := decideSample(ctx, mock, DecideScope{Sample: 2, Seed: "s1", Book: "Dune", IssueType: "homophone"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].ID != "f1" || got[0].AnchorOccurrence != -1 || got[0].ChunkIndex != 3 {
+	if len(got) != 1 || got[0].ID != "f1" || got[0].AnchorOccurrence != -1 || got[0].ChunkIndex != 3 || got[0].JudgeModel != "qwen3:32b" {
 		t.Errorf("got %+v", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

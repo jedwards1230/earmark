@@ -4101,7 +4101,7 @@ bounded; neither writes.
 #### `earmark decide` (dry run)
 
 `earmark decide [--sample N] [--seed S] [--book X] [--issue-type T]
-[--concurrency 8] [--json] [--calibrate]` runs the pipeline above on a sample
+[--concurrency 8] [--json] [--calibrate] [--rung0-only] [--dump FILE]` runs the pipeline above on a sample
 and reports what a full run would do. **It decides nothing**: no
 `finding_events`, no state change, no `decided_by`. Its only writes are the
 decide recipe row (`recipes`, via `decide.Evaluator.Recipe`) and one `fn_calls`
@@ -4150,6 +4150,22 @@ error. It does not take the GPU phase gate (System One is hosted).
   and each finding re-decided with the `p` already obtained — no new model
   call — so a finding that passes only below the run's threshold is counted
   *unasked*.
+- **`--rung0-only`** (replay): the same selection, loading, rung 0 and
+  dedupe, then text evidence for each pass — and nothing else. No model call,
+  no `recipes` row (the recipe id is computed, not registered), no `fn_calls`
+  read or write: the run is read-only, and needs no `AI_ROLES.decide`. The
+  report's classes are `rung0_pass` / `reject` / `reanchor` with the rung-0
+  reject reasons and the projection; with `--calibrate`, rung-0 passes and
+  rejects per human label and the threshold sweep. Two builds over the same
+  `--seed` compare rung-0 versions on the same findings.
+- **`--dump FILE`**: one JSON line per sampled finding, sorted by finding id
+  — `finding_id`, `issue_type`, `judge_model` (`resolved_model`, else
+  `model`), `confidence`, `patch_state`, `original`, `replacement`, `rung0`
+  (`pass`, `reason`, `evidence`), `class`, and for a rung-0 pass `evidence`
+  plus, when the model was asked, `outcome`, `reason` and `p`. Unlike the
+  report it holds finding ids and text; it is a local measurement file. It
+  works with or without `--rung0-only`, is removed if the run fails, and like
+  `--rung0-only` is dry-run only.
 
 #### `earmark decide --yes` (full run)
 

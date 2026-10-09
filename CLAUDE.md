@@ -66,6 +66,7 @@ MCP_TRANSPORT=http ./earmark mcp  # HTTP transport on :8081
 ./earmark scan --sample 50 --seed q4 --yes      # same chunks, written to chunk_scan from cache
 ./earmark decide --sample 200 --seed q4         # dry-run the decide step (decides nothing; calls cached)
 ./earmark decide --sample 300 --calibrate       # agreement with human decisions + phonetic sweep
+./earmark decide --sample 2000 --seed q4 --rung0-only --dump /tmp/r0.jsonl  # rung-0 replay: no model call, no write
 ./earmark decide --yes --limit 2000 --max-accepts 500   # decide + write (runbook: CONTRACT §2.19)
 ./earmark decide revert --recipe <id>           # preview the undo; add --yes (or --finding / --since)
 

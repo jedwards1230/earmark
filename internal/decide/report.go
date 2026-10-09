@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -16,8 +17,16 @@ import (
 // anchor no longer resolves — `earmark reanchor`'s job, not a reject.
 const ClassReanchor = "reanchor"
 
-// reportClasses is the order outcome classes are printed in.
-var reportClasses = []string{DecisionApply, DecisionHold, DecisionReject, ClassReanchor}
+// ClassRung0Pass is the class of a finding that passed rung 0 in a
+// --rung0-only replay: eligible for the model, but not decided.
+const ClassRung0Pass = "rung0_pass"
+
+// reportClasses is the order outcome classes are printed in; rung0Classes
+// the order in a --rung0-only report.
+var (
+	reportClasses = []string{DecisionApply, DecisionHold, DecisionReject, ClassReanchor}
+	rung0Classes  = []string{ClassRung0Pass, DecisionReject, ClassReanchor}
+)
 
 // pBuckets is the number of equal-width p histogram buckets over [0, 1].
 const pBuckets = 10
@@ -25,8 +34,11 @@ const pBuckets = 10
 // Report is a dry run's result (the --json output). Every count is an
 // aggregate: no finding ids or text.
 type Report struct {
-	DryRun    bool   `json:"dry_run"`
-	Calibrate bool   `json:"calibrate"`
+	DryRun    bool `json:"dry_run"`
+	Calibrate bool `json:"calibrate"`
+	// Rung0Only is set by --rung0-only: no model was asked, and passes are
+	// counted as ClassRung0Pass instead of being decided.
+	Rung0Only bool   `json:"rung0_only,omitempty"`
 	RecipeID  string `json:"recipe_id"`
 	Model     string `json:"model"`
 	Seed      string `json:"seed"`
@@ -100,6 +112,9 @@ type Projection struct {
 
 // classOf is the report class of an outcome.
 func classOf(o Outcome) string {
+	if o.Rung0.Pass && o.Decision == "" {
+		return ClassRung0Pass
+	}
 	if o.Decision == DecisionReject && (o.Reason == ReasonChunkChanged || o.Reason == ReasonAnchorMissing) {
 		return ClassReanchor
 	}
@@ -108,7 +123,7 @@ func classOf(o Outcome) string {
 
 func buildReport(o RunOptions, recipeID string, items []*item, backlog map[string]int) *Report {
 	rep := &Report{
-		DryRun: true, Calibrate: o.Scope.Calibrate, RecipeID: recipeID, Model: ShouldApplyModel,
+		DryRun: true, Calibrate: o.Scope.Calibrate, Rung0Only: o.Rung0Only, RecipeID: recipeID, Model: ShouldApplyModel,
 		Seed: o.Scope.Seed, Requested: o.Scope.Sample, Findings: len(items),
 		Outcomes: map[string]int{}, Reasons: map[string]int{}, Rung0Rejects: map[string]int{},
 		Reanchor: map[string]int{}, PHistogram: make([]int, pBuckets),
@@ -138,6 +153,7 @@ func buildReport(o RunOptions, recipeID string, items []*item, backlog map[strin
 		switch {
 		case class == ClassReanchor:
 			rep.Reanchor[out.Reason]++
+		case class == ClassRung0Pass:
 		case !out.Rung0.Pass:
 			rep.Rung0Rejects[out.Reason]++
 		default:
@@ -213,12 +229,19 @@ func buildReport(o RunOptions, recipeID string, items []*item, backlog map[strin
 }
 
 func classRank(c string) int {
-	for i, k := range reportClasses {
-		if k == c {
-			return i
-		}
+	all := append(slices.Clone(reportClasses), ClassRung0Pass)
+	if i := slices.Index(all, c); i >= 0 {
+		return i
 	}
-	return len(reportClasses)
+	return len(all)
+}
+
+// classes is the order this report's outcome classes print in.
+func (r *Report) classes() []string {
+	if r.Rung0Only {
+		return rung0Classes
+	}
+	return reportClasses
 }
 
 // percentileMS is the nearest-rank percentile of ds in milliseconds.
@@ -249,6 +272,9 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	case r.Write != nil:
 		mode = "run (--yes)"
 	}
+	if r.Rung0Only {
+		mode += ", rung 0 only"
+	}
 	p("decide %s · recipe %s · model %s", mode, short(r.RecipeID), r.Model)
 	if r.Write == nil {
 		p(" · seed %q", r.Seed)
@@ -269,7 +295,7 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 		return err
 	}
 
-	p("\noutcomes: %s\n", counts(r.Outcomes, reportClasses))
+	p("\noutcomes: %s\n", counts(r.Outcomes, r.classes()))
 	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "outcome\tissue_type\tevidence\tcount")
 	for _, c := range r.Cells {
@@ -280,6 +306,11 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	p("\ndecision reasons: %s\n", counts(r.Reasons, sortedKeys(r.Reasons)))
 	p("rung-0 rejects:   %s\n", counts(r.Rung0Rejects, sortedKeys(r.Rung0Rejects)))
 	p("reanchor needed:  %s\n", counts(r.Reanchor, sortedKeys(r.Reanchor)))
+	if r.Rung0Only {
+		r.printRung0Only(p)
+		_, err := io.WriteString(w, b.String())
+		return err
+	}
 
 	p("\np histogram (answered %d):\n", r.Jev.Answered)
 	for i, n := range r.PHistogram {
@@ -322,11 +353,25 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	}
 
 	if c := r.Calibration; c != nil {
-		c.print(p)
+		c.print(p, reportClasses)
 	}
 	p("\n(dry run) nothing decided: no finding_events, no state changes. Model answers are cached in fn_calls.\n")
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// printRung0Only is the tail of a --rung0-only report: the projection of
+// the rung-0 classes, calibration if asked, and the no-call, no-write footer.
+func (r *Report) printRung0Only(p func(string, ...any)) {
+	pr := r.Projection
+	p("\nprojection to the scope (%d findings): %s\n", pr.Backlog, counts(pr.Outcomes, rung0Classes))
+	if pr.Unprojected > 0 {
+		p("  %d findings of issue types not in the sample are not projected\n", pr.Unprojected)
+	}
+	if c := r.Calibration; c != nil {
+		c.print(p, rung0Classes)
+	}
+	p("\n(rung 0 only) no model calls, no recipe registered, nothing written.\n")
 }
 
 func counts(m map[string]int, keys []string) string {
