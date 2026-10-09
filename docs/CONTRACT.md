@@ -3950,14 +3950,45 @@ evidence → the `should_apply` model call → the decision rule. It never retur
 an error: every failure after rung 0 is a retryable `hold`.
 
 1. **Rung 0** — the deterministic checks of `internal/decide/rung0.go`
-   (version `rung0@v1`): chunk hash and a unique, word-bounded anchor; not a
+   (version `rung0@v2`): chunk hash and a unique, word-bounded anchor; not a
    cosmetic-only edit; the issue type's edit shape (sound-alike substitution,
    exact repeat removal, 1–2-word insertion); per-chunk dedupe against other
    candidates and existing accepted/applied corrections. A failure is a
    `reject` with the rung-0 reason (`chunk_changed`, `anchor_missing`,
    `not_word_bounded`, `empty_correction`, `cosmetic_only`,
-   `unsupported_issue_type`, `not_soundalike`, `not_exact_repeat`,
-   `bad_insertion`, `overlap_dup`, `overlaps_overlay`) and **no model call**.
+   `unsupported_issue_type`, `not_soundalike`, `inflection_only`,
+   `not_exact_repeat`, `bad_insertion`, `overlap_dup`, `overlaps_overlay`)
+   and **no model call**.
+
+   Words are compared lower-cased with punctuation removed (an apostrophe
+   joins, a hyphen or any other mark separates; a numeral such as `1,500` or
+   `3.5` is one word). The edit is split into **hunks**: the original's and
+   the replacement's words are aligned by edit distance (keep, substitute,
+   insert, delete — each change costs 1), and each maximal run of changes
+   between kept words is one hunk.
+   - **`cosmetic_only`** — every hunk reads aloud the same on both sides
+     (some spoken reading of each, letters only, is identical:
+     `tic tac toe`↔`tic-tac-toe`, `placenames`↔`place names`,
+     `one thousand nine hundred thirty seven`↔`1937`). Applies to every
+     issue type: a re-spelling of the same spoken words is formatting, not a
+     correction. A hunk that inserts or deletes words is never cosmetic.
+   - **Substitution** (`misheard_proper_noun`, `misheard_word`, `homophone`,
+     `number_artifact`) — **every** hunk must pass, checked on its own (the
+     unchanged words between two hunks never pad a score). Per hunk, in
+     order: both sides non-empty (else `not_soundalike`: inserting or
+     deleting words is not a mishearing); each side at most 8 words (not
+     for `number_artifact`) and 80 runes (else `not_soundalike`); a hunk
+     that reads the same passes; both sides writing numerals of different
+     value fails `not_soundalike`; a swap of one single-letter word for
+     another (`c`→`b`, `i`→`a`) fails `not_soundalike` (letter names rhyme
+     and their one-letter codes carry no evidence); a one-word change by a
+     regular inflectional ending (`-s`, `-es`, `-ed`, `-d`, `-ing`,
+     `-ies`/`-ied` for `-y`; common stem ≥ 3 letters: `trades`→`traded`,
+     `hair`→`hairs`) fails `inflection_only`; otherwise the hunk's raw text
+     on each side must score ≥ `phonetic_min_sim` with `phonetic.Compare`,
+     which joins the hunk's words (so splits and merges such as
+     `auto sebo`↔`Arecibo` compare as one word) and reads numerals every
+     common way. Alignment is limited to 256 words per side.
 2. **Context** — "sentence" means **ASR segment**: transcript text is
    lowercase with no punctuation, and a chunk is whole segments joined by one
    space. The segments starting at the chunk's `start_sec` are joined until

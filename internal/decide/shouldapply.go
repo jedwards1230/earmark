@@ -34,7 +34,7 @@ const (
 
 // Rung0Version names the rung-0 rule set Evaluate runs. Bump it with any
 // change to rung0.go that alters a verdict.
-const Rung0Version = "rung0@v1"
+const Rung0Version = "rung0@v2"
 
 // Decisions (Outcome.Decision).
 const (
