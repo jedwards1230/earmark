@@ -44,12 +44,12 @@ type runner interface {
 }
 
 type options struct {
-	sample              int  // judge a random sample of N chunks library-wide (instead of a book)
-	limit               int  // cap chunks evaluated for a book / transcripts latched by a backfill (0 → default/all)
-	maxAttempts         int  // backfill spend cap: transcripts judged, latched or not (0 → 3×limit, unbounded without --limit)
-	write               bool // persist findings; without it the command is a dry-run preview
-	backfillUnevaluated bool // judge ALL done transcripts with eval_finished_at IS NULL
-	backfillEvalErrors  bool // re-judge done transcripts whose judging failed
+	sample              int    // judge a random sample of N chunks library-wide (instead of a book)
+	limit               int    // cap chunks evaluated for a book / transcripts latched by a backfill (0 → default/all)
+	maxAttempts         int    // backfill spend cap: transcripts judged, latched or not (0 → 3×limit, unbounded without --limit)
+	write               bool   // persist findings; without it the command is a dry-run preview
+	backfillUnevaluated bool   // judge ALL done transcripts with eval_finished_at IS NULL
+	backfillEvalErrors  bool   // re-judge done transcripts whose judging failed
 	seed                string // with --sample: fix which chunks the sample picks
 	dump                string // dry run only: write one JSONL line per judged chunk here ("-" = stdout)
 	// observe is the per-chunk hook --dump installs (not a flag).
