@@ -337,7 +337,7 @@ func TestEvaluateFailsClosed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e, _ := newTestEvaluator(t, &fakeJev{reply: reply}, systemone.WithTimeout(100*time.Millisecond))
 			out := e.Evaluate(ctx, radioInput(IssueMisheardProperNoun, "auto sebo", "Arecibo"))
-			if out.Decision != DecisionHold || out.Reason != ReasonJevUnavailable || !out.Retryable || out.P != nil {
+			if out.Decision != DecisionHold || out.Reason != ReasonJevUnavailable || !out.Retryable || out.P != nil || out.ErrorClass == "" || !out.Asked {
 				t.Errorf("outcome %+v", out)
 			}
 		})

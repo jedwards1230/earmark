@@ -3997,7 +3997,10 @@ satisfy `0 ≤ reject_p < apply_p ≤ 1` and `0 < phonetic_min_sim ≤ 1`.
 retryable flag, `p` (absent when the model was not asked or gave no usable
 answer), evidence kind, the rung-0 verdict (reason, span, evidence text), the
 chunk hash decided on, the `fn_calls` row id and the recipe that row was
-stamped with, the answering model and whether the answer was a cache hit. The
+stamped with, the answering model and whether the answer was a cache hit —
+and, for reporting, whether the model was asked, the error class of a
+`jev_unavailable` hold, and the call's latency, tokens and cost (zero on a
+cache hit). The
 decision itself is attributed to the evaluator's decide recipe
 (`decide.Evaluator.Recipe`: should_apply, the pinned model, these params) for
 every outcome, including rung-0 rejects and holds that made no call; its
@@ -4008,6 +4011,57 @@ data contract: new ones may be added, existing ones are never renamed.
 **Reads.** `db.GetTranscriptSegments` (at most 32 transcripts per call) and
 `db.GetBookRecords` (at most 256 book dirs per call) are read-only, batched and
 bounded; neither writes.
+
+#### `earmark decide` (dry run)
+
+`earmark decide [--sample N] [--seed S] [--book X] [--issue-type T]
+[--concurrency 8] [--json] [--calibrate]` runs the pipeline above on a sample
+and reports what a full run would do. **It decides nothing**: no
+`finding_events`, no state change, no `decided_by`. Its only writes are the
+decide recipe row (`recipes`, via `decide.Evaluator.Recipe`) and one `fn_calls`
+row per model call — which is the point: the later full run over the same
+findings is served from the cache. There is no `--yes` yet. Requires
+`AI_ROLES.decide` bound to a `systemone` endpoint whose `model` is the pinned
+`jev-1.13.0` (route prefix and case ignored); otherwise it exits 2 with a clear
+error. It does not take the GPU phase gate (System One is hosted).
+
+- **Selection** (read-only, `db.DecideSample`): `origin = 'judge'`,
+  `patch_state = 'proposed'`, anchored (`anchor_offset` and
+  `chunk_text_sha256` NOT NULL), optionally one book (`file_path ILIKE`) and
+  one issue type; ordered `md5(id::text || seed), id`, limit `--sample`
+  (1–10,000, default 100). The same seed over the same backlog picks the same
+  findings.
+- **Loading**, per transcript batch (≤ 32 transcripts): segments
+  (`GetTranscriptSegments`), pristine chunks with their other proposed anchored
+  judge findings and their accepted/applied overlay (`db.DecideChunks`, ≤ 512
+  chunks per call) and catalogue records (`GetBookRecords`). Rung 0 runs per
+  chunk over the sampled findings **plus** the chunk's unsampled proposed
+  findings, so dedupe resolves exactly as a full run would. A sampled finding
+  whose chunk no longer exists is `chunk_changed`.
+- **Model calls** through `internal/fn` with at most `--concurrency` (1–64) in
+  flight; a rung-0 failure makes no call.
+- **Report** (text, or `--json`; aggregates only, never finding ids or text):
+  outcome classes `apply` / `hold` / `reject` / `reanchor` — a rung-0
+  `chunk_changed` or `anchor_missing` is reported as **reanchor needed**, not a
+  reject; outcome × issue type × evidence; decision reasons and rung-0 reject
+  reasons; a ten-bucket histogram of `p`; model calls asked / answered /
+  unavailable (by error class) / cache hits; latency p50/p95 over uncached
+  calls; tokens and cost; and a **projection**: each issue type's outcome
+  rates × that issue type's count in the whole scope (`db.DecideBacklog`, an
+  aggregate), plus projected calls and cost at the sample's cost per uncached
+  answered call. Issue types absent from the sample are reported as
+  unprojected.
+- **`--calibrate`** samples findings a person already decided through the
+  review surface — `decided_by LIKE 'mcp:%'`, `patch_state` `accepted`/
+  `applied` (human accept) or `rejected` (human reject), same anchoring rule —
+  and runs the same evaluator (still a dry run; the calls are real and
+  cached). It reports the human × outcome matrix, apply precision (applies a
+  human accepted ÷ applies), apply recall (÷ human accepts), reject precision
+  (re-anchor cases excluded) and hold rate, and a `phonetic_min_sim` sweep
+  (0.55, 0.60, 0.67, 0.75, 0.85): rung 0 is re-run **offline** at each value
+  and each finding re-decided with the `p` already obtained — no new model
+  call — so a finding that passes only below the run's threshold is counted
+  *unasked*.
 
 ---
 

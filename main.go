@@ -7,6 +7,7 @@ import (
 	"github.com/jedwards1230/earmark/cmd"
 	"github.com/jedwards1230/earmark/cmd/backfill"
 	"github.com/jedwards1230/earmark/cmd/batch"
+	"github.com/jedwards1230/earmark/cmd/decide"
 	"github.com/jedwards1230/earmark/cmd/eval"
 	"github.com/jedwards1230/earmark/cmd/list"
 	"github.com/jedwards1230/earmark/cmd/mcp"
@@ -33,6 +34,7 @@ func main() {
 	rootCmd.AddCommand(reanchor.ReanchorCmd)
 	rootCmd.AddCommand(eval.EvalCmd)
 	rootCmd.AddCommand(scan.ScanCmd)
+	rootCmd.AddCommand(decide.DecideCmd)
 	rootCmd.AddCommand(prunechunks.PruneChunksCmd)
 	rootCmd.AddCommand(batch.BatchCmd)
 	rootCmd.AddCommand(backfill.BackfillCmd)

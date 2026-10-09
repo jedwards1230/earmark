@@ -1,0 +1,118 @@
+{
+  "dry_run": true,
+  "calibrate": false,
+  "recipe_id": "abababababababababababababababababababababababababababababababab",
+  "model": "jev-1.13.0",
+  "seed": "golden",
+  "requested": 10,
+  "findings": 8,
+  "outcomes": {
+    "apply": 2,
+    "hold": 3,
+    "reanchor": 1,
+    "reject": 2
+  },
+  "cells": [
+    {
+      "outcome": "apply",
+      "issue_type": "misheard_proper_noun",
+      "evidence": "asin_verbatim",
+      "count": 1
+    },
+    {
+      "outcome": "apply",
+      "issue_type": "repeated_text",
+      "evidence": "exact_repeat",
+      "count": 1
+    },
+    {
+      "outcome": "hold",
+      "issue_type": "homophone",
+      "evidence": "none",
+      "count": 1
+    },
+    {
+      "outcome": "hold",
+      "issue_type": "misheard_proper_noun",
+      "evidence": "none",
+      "count": 1
+    },
+    {
+      "outcome": "hold",
+      "issue_type": "number_artifact",
+      "evidence": "none",
+      "count": 1
+    },
+    {
+      "outcome": "reject",
+      "issue_type": "misheard_word",
+      "evidence": "none",
+      "count": 2
+    },
+    {
+      "outcome": "reanchor",
+      "issue_type": "misheard_word",
+      "evidence": "none",
+      "count": 1
+    }
+  ],
+  "reasons": {
+    "confident_with_evidence": 2,
+    "issue_type_capped": 1,
+    "jev_reject": 1,
+    "jev_unavailable": 1,
+    "no_evidence": 1
+  },
+  "rung0_rejects": {
+    "not_soundalike": 1
+  },
+  "reanchor": {
+    "anchor_missing": 1
+  },
+  "p_histogram": [
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    4
+  ],
+  "jev": {
+    "asked": 6,
+    "answered": 5,
+    "unavailable": 1,
+    "cache_hits": 1,
+    "errors": {
+      "timeout": 1
+    },
+    "latency_p50_ms": 900,
+    "latency_p95_ms": 1200,
+    "input_tokens": 1600,
+    "output_tokens": 12,
+    "cost_usd": 0.0000672
+  },
+  "projection": {
+    "backlog": 929,
+    "by_issue": {
+      "dropped_word": 9,
+      "homophone": 40,
+      "misheard_proper_noun": 200,
+      "misheard_word": 600,
+      "number_artifact": 30,
+      "repeated_text": 50
+    },
+    "outcomes": {
+      "apply": 150,
+      "hold": 170,
+      "reanchor": 200,
+      "reject": 400
+    },
+    "unprojected": 9,
+    "asked": 520,
+    "cost_usd": 0.008735999999999999
+  }
+}
