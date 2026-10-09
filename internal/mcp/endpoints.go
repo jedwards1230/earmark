@@ -218,7 +218,7 @@ func (v endpointView) RoleTitle() string {
 	case "decide":
 		return roleTitleForStep(recipe.StepDecide)
 	case "scan":
-		return "Scan"
+		return roleTitleForStep(recipe.StepScan)
 	default:
 		return v.Role
 	}

@@ -548,8 +548,9 @@ var serversPage = mustPage(`{{define "content"}}
 </section>
 <details class="about-page">
   <summary>About this page</summary>
-  <p class="server-note"><strong>Roles.</strong> One card per configured pipeline role; roles with no binding are listed on one line under the cards. <em>requested</em> is the model id earmark sends; <em>pinned</em> (shown only when set) is the <code>MODELS_FILE</code> expectation; <em>answered</em> is what the endpoint reported serving the call. A different answer (≠ expected) usually means a gateway fallback, and its output is stamped with a different recipe — i.e. stale. Role health folds in call outcomes, so a gateway that lists the model but fails every call shows <em>FAILING</em> here while its endpoint row still reads <em>lists model</em>. <em>HEALTHY · idle</em> is a working role with nothing to do.</p>
+  <p class="server-note"><strong>Roles.</strong> One card per configured pipeline role; roles with no binding are listed on one line under the cards. <em>requested</em> is the model id earmark sends; <em>pinned</em> (shown only when set) is the <code>MODELS_FILE</code> expectation; <em>answered</em> is what the endpoint reported serving the call. A different answer (≠ expected) usually means a gateway fallback, and its output is stamped with a different recipe — i.e. stale. Only an answer newer than the step's current recipe is compared: after a model or prompt change, a role with no calls since reads <em>no calls since the model changed</em> (with the previous answer), not ≠ expected. Role health folds in call outcomes, so a gateway that lists the model but fails every call shows <em>FAILING</em> here while its endpoint row still reads <em>lists model</em>. <em>HEALTHY · idle</em> is a working role with nothing to do.</p>
   <p class="server-note"><em>last ok</em> on the Judge card is the newest judge success from any source (the hourly backfill CronJob, in-pipeline judging, the dashboard). earmark records no per-backfill-run marker.</p>
+  <p class="server-note"><strong>Decide and Scan</strong> run through System One (<code>AI_ROLES.decide</code> / <code>AI_ROLES.scan</code>) on demand — <code>earmark decide</code>, <code>earmark scan</code> — so a quiet card is idle, not degraded. Their evidence is the <code>fn_calls</code> log under the current recipe (its function, model and prompt): last ok, last fail and its error class, failures in 24&thinsp;h, fallbacks (a reply from another model is stored, never served), and cache hits. <em>decided</em> splits judge findings by who decided them: Jev (<code>decided_by</code> <code>jev:&lt;recipe&gt;</code>), humans (<code>mcp:</code>, <code>cli:</code>, anything else, or unattributed), and undone (<code>revert:jev:&lt;recipe&gt;</code>); the Judge output table splits <em>Decided</em> the same way.</p>
   <p class="server-note"><strong>Recipes &amp; stale work.</strong> A recipe is everything that determined a step's output (code, model, prompt). Stale rows were made under any recipe other than the current one; legacy rows from before provenance count as stale by design and converge as the work is redone. Only steps with a current recipe are tracked; the rest are listed on one <em>Not tracked</em> line. Recipes and activity are cached for 30&thinsp;s; stale counts scan the whole library, so they are cached for 5&thinsp;min. The page itself refreshes every 5&thinsp;s.</p>
   <p class="server-note"><strong>LiteLLM gateway.</strong> For endpoints behind LiteLLM, earmark reads the proxy's readiness and its own virtual key's <code>/key/info</code> (alias, allowed models, spend, budget, limits) with that key — never the master key, and never a model call. A role whose model is not on the key's allowlist is DEGRADED: every call to it 403s; each role's model is listed on the gateway card only when one is not allowed (or cannot be checked).</p>
   <p class="server-note"><strong>AI endpoints.</strong> The <code>AI_ENDPOINTS</code> registry (<code>AI_ROLES</code> binds each to a role). Liveness is a <code>GET /models</code> probe only: <em>lists model</em>, <em>model not listed</em> (behind LiteLLM: <em>not allowed</em> — not on the key allowlist), or <em>unreachable</em>. <em>Gateway</em> is the declared <code>gateway</code> field, or LiteLLM inferred from the host name. The legacy <code>EMBEDDINGS_BASE_URL</code>/<code>EMBEDDINGS_MODEL</code> vars appear as a synthesized <code>_legacy</code> endpoint; a judge configured from <code>EVAL_CHAT_*</code> appears as an unprobed <code>EVAL_CHAT_*</code> row.</p>
@@ -565,7 +566,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   {{with .RoleCards}}<div class="panels role-panels">
   {{range .}}{{template "roleCard" .}}{{end}}
   </div>{{end}}
-  {{with .UnconfiguredRoles}}<p class="server-note roles-unconfigured">○ Not configured: {{range $i, $r := .}}{{if $i}}, {{end}}{{$r.Title}}{{if $r.HasModel}} <span class="time-muted">({{$r.Health.Sub}})</span>{{else if $r.HumanDecided}} <span class="time-muted">(decided by humans {{commafyPtr $r.HumanDecided}})</span>{{end}}{{end}}</p>{{end}}
+  {{with .UnconfiguredRoles}}<p class="server-note roles-unconfigured">○ Not configured: {{range $i, $r := .}}{{if $i}}, {{end}}{{$r.Title}}{{if $r.HasModel}} <span class="time-muted">({{$r.Health.Sub}}{{if $r.HumanDecided}} · decided by humans {{commafyPtr $r.HumanDecided}}{{if $r.JevDecided}} · by Jev {{commafy $r.JevDecided}}{{end}}{{end}})</span>{{end}}{{end}}</p>{{end}}
 </section>
 
 <section class="section" aria-labelledby="recipes-title">
@@ -673,7 +674,8 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
       <th scope="col">Answered by</th>
       <th scope="col" class="num">Proposed</th>
       <th scope="col" class="num">Unanchorable</th>
-      <th scope="col" class="num" title="accepted + rejected + applied + reverted">Decided</th>
+      <th scope="col" class="num" title="accepted + rejected + applied + reverted, decided by a person (mcp:, cli:, other, or unattributed)">Decided · human</th>
+      <th scope="col" class="num" title="accepted + rejected + applied + reverted by the decide step (jev:&lt;recipe&gt;), incl. its undos (revert:jev:&lt;recipe&gt;)">Decided · Jev</th>
       <th scope="col" class="num" title="superseded by a re-transcribe, plus the patch state 'stale' (a replay quarantine — not stale_work)">Superseded / other</th>
       <th scope="col" class="num">Total</th>
     </tr></thead>
@@ -683,7 +685,8 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
       <th scope="row" class="mono">{{.Model}}</th>
       <td class="num">{{commafy .Proposed}}</td>
       <td class="num">{{commafy .Unanchorable}}</td>
-      <td class="num">{{commafy .Decided}}</td>
+      <td class="num">{{commafy .DecidedHuman}}</td>
+      <td class="num">{{commafy .DecidedJev}}</td>
       <td class="num">{{commafy .Other}}</td>
       <td class="num">{{commafy .Total}}</td>
     </tr>
@@ -694,7 +697,8 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
       <th scope="row">total</th>
       <td class="num">{{commafy .Proposed}}</td>
       <td class="num">{{commafy .Unanchorable}}</td>
-      <td class="num">{{commafy .Decided}}</td>
+      <td class="num">{{commafy .DecidedHuman}}</td>
+      <td class="num">{{commafy .DecidedJev}}</td>
       <td class="num">{{commafy .Other}}</td>
       <td class="num">{{commafy .Total}}</td>
     </tr></tfoot>
@@ -803,19 +807,21 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
     {{if .Expected}}<dt>pinned</dt><dd><span class="mono">{{.Expected}}</span>{{with .ExpectedRevisionShort}} <span class="time-muted">· rev {{.}}</span>{{end}}{{if eq .Key "asr"}} <span class="time-muted">· recorded only</span>{{end}}</dd>{{end}}
     <dt>answered</dt><dd>{{template "roleAnswered" .}}</dd>
     {{if .AlsoAnswered}}<dt><span class="sr-only">also answered</span></dt><dd class="time-muted">also: {{range $i, $m := .AlsoAnswered}}{{if $i}}, {{end}}<span class="mono">{{$m.Model}}</span> ×{{commafy $m.Count}}{{end}} (7d)</dd>{{end}}
-    <dt>last ok</dt><dd>{{if not .LastKnown}}—{{else if .LastOK.IsZero}}<span class="time-muted">never</span>{{else}}<span title="{{formatTime .LastOK}}">{{relTime .LastOK}}</span>{{end}}{{if and (eq .Key "judge") .LastKnown}} · {{if .LastFail.IsZero}}<span class="time-muted">no failures</span>{{else}}last fail <span title="{{formatTime .LastFail}}">{{relTime .LastFail}}</span>{{end}}{{end}}</dd>
+    <dt>last ok</dt><dd>{{if not .LastKnown}}—{{else if .LastOK.IsZero}}<span class="time-muted">never</span>{{else}}<span title="{{formatTime .LastOK}}">{{relTime .LastOK}}</span>{{end}}{{if and (or (eq .Key "judge") .IsFnRole) .LastKnown}} · {{if .LastFail.IsZero}}<span class="time-muted">no failures</span>{{else}}last fail <span title="{{formatTime .LastFail}}">{{relTime .LastFail}}</span>{{end}}{{end}}</dd>
     {{if and .LastErrorShort (ne .Health.Token "failing")}}<dt>last error</dt><dd class="time-muted" title="{{.LastError}}">{{if not .LastFail.IsZero}}{{relTime .LastFail}}: {{end}}{{.LastErrorShort}}</dd>{{end}}
     {{if .FailingNow}}<dt>failing</dt><dd>{{commafy .FailingNow}} {{plural .FailingNow "transcript" "transcripts"}} currently failing</dd>{{end}}
     {{if eq .Key "judge"}}<dt>coverage</dt><dd>{{if .StatsKnown}}{{commafy .CoverageDone}} / {{commafy .CoverageTotal}} {{plural .CoverageTotal "transcript" "transcripts"}} judged{{else}}—{{end}}</dd>{{end}}
+    {{if and .IsFnRole .FnKnown .CountsKnown}}<dt>calls</dt><dd>{{commafy .Calls}} <span class="mono">{{.Fn}}</span> {{plural .Calls "call" "calls"}}{{if .CacheHits}} + {{commafy .CacheHits}} cached{{end}}{{if .Failures24h}} · <span class="err">{{commafy .Failures24h}} failed (24h)</span>{{end}}{{if .Fallbacks}} · {{commafy .Fallbacks}} {{plural .Fallbacks "fallback" "fallbacks"}}{{end}} <span class="time-muted">· current recipe{{if not .RecipeSince.IsZero}}, since <span title="{{formatTime .RecipeSince}}">{{relTime .RecipeSince}}</span>{{end}}</span></dd>{{end}}
+    {{if and (eq .Key "decide") .HumanDecided}}<dt>decided</dt><dd>{{commafy .JevDecided}} by Jev · {{commafyPtr .HumanDecided}} by humans{{if .JevUndone}} · {{commafy .JevUndone}} undone{{end}} · {{commafy .Proposed}} proposed awaiting</dd>{{end}}
+    {{if and (eq .Key "scan") .Scanned}}<dt>scanned</dt><dd>{{commafy64Ptr .Scanned}}{{if .ChunksTotal}} / {{commafy .ChunksTotal}}{{end}} chunks <span class="time-muted">· current recipe</span></dd>{{end}}
     {{if eq .Key "embeddings"}}<dt>backlog</dt><dd>{{if .StatsKnown}}{{commafy .Backlog}} {{plural .Backlog "transcript" "transcripts"}} awaiting embedding{{else}}—{{end}}</dd>{{end}}
   {{end}}
-    {{if .HumanDecided}}<dt>decided by humans</dt><dd>{{commafyPtr .HumanDecided}}</dd>{{end}}
     <dt>stale</dt><dd>{{if not .StaleKnown}}{{if .StalePending}}<span class="time-muted">counting…</span>{{else}}—{{end}}{{else if .StaleTracked}}{{if .CountsKnown}}<a href="#recipe-{{.Step}}">{{commafy64Ptr .Stale}} rows</a>{{else}}{{commafy64Ptr .Stale}} rows{{end}}{{else}}<span class="time-muted">not tracked</span>{{end}}</dd>
   </dl>
 </div>
 {{end}}
 
-{{define "roleAnswered"}}{{if not .CountsKnown}}—{{else if eq .AnsweredMatch "none"}}<span class="time-muted">no runs yet</span>{{else if eq .AnsweredMatch "unreported"}}<span class="time-muted">not reported by endpoint</span>{{else}}<span class="mono">{{.Answered}}</span>{{if and (eq .Key "asr") .ASRRunnerVersion}} · runner <span class="mono">{{.ASRRunnerVersion}}</span>{{if .ASRModelSHA}} · .nemo <span class="mono" title="{{.ASRModelSHA}}">{{.ASRModelSHAShort}}</span>{{end}}{{end}}{{if eq .AnsweredMatch "match"}} <span class="match-ok">✓ matches {{if .Expected}}pin{{else}}request{{end}}</span>{{else if eq .AnsweredMatch "mismatch"}} <span class="badge mismatch">≠ expected {{.CompareTarget}}</span>{{end}}{{end}}{{end}}
+{{define "roleAnswered"}}{{if not .CountsKnown}}—{{else if eq .AnsweredMatch "none"}}<span class="time-muted">no runs yet</span>{{else if eq .AnsweredMatch "predates_recipe"}}<span class="time-muted">no calls since the {{if .PriorModelChanged}}model{{else}}recipe{{end}} changed{{with .CompareTarget}} (now {{.}}){{end}}{{if not .RecipeSince.IsZero}} <span title="{{formatTime .RecipeSince}}">{{relTime .RecipeSince}}</span>{{end}} · before: </span><span class="mono">{{.Answered}}</span>{{else if eq .AnsweredMatch "unreported"}}<span class="time-muted">not reported by endpoint</span>{{else}}<span class="mono">{{.Answered}}</span>{{if and (eq .Key "asr") .ASRRunnerVersion}} · runner <span class="mono">{{.ASRRunnerVersion}}</span>{{if .ASRModelSHA}} · .nemo <span class="mono" title="{{.ASRModelSHA}}">{{.ASRModelSHAShort}}</span>{{end}}{{end}}{{if eq .AnsweredMatch "match"}} <span class="match-ok">✓ matches {{if .Expected}}pin{{else}}request{{end}}</span>{{else if eq .AnsweredMatch "mismatch"}} <span class="badge mismatch">≠ expected {{.CompareTarget}}</span>{{end}}{{end}}{{end}}
 
 {{define "endpointRow"}}
 <tr>

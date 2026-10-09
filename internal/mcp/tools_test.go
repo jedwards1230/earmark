@@ -182,6 +182,10 @@ func (m *MockDBInterface) FindingsByModel(context.Context) ([]db.FindingsModelCo
 	return nil, nil
 }
 
+func (m *MockDBInterface) FnRoleActivity(context.Context) ([]db.FnRoleActivity, error) {
+	return nil, nil
+}
+
 func (m *MockDBInterface) ASRProvenanceGroups(context.Context, int) ([]db.ASRProvenanceGroup, error) {
 	return nil, nil
 }

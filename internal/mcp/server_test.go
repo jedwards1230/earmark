@@ -200,6 +200,10 @@ func (m *SimpleMockDB) FindingsByModel(context.Context) ([]db.FindingsModelCount
 	return nil, nil
 }
 
+func (m *SimpleMockDB) FnRoleActivity(context.Context) ([]db.FnRoleActivity, error) {
+	return nil, nil
+}
+
 func (m *SimpleMockDB) ASRProvenanceGroups(context.Context, int) ([]db.ASRProvenanceGroup, error) {
 	return nil, nil
 }

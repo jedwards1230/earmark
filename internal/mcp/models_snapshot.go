@@ -13,8 +13,9 @@ import (
 // stale-while-revalidate by refreshCache (so a poll never waits on a refresh
 // once a value exists):
 //
-//   - modelsSnapshot — role activity, current recipes, judge findings, ASR
-//     provenance. Cheap (a few ms each); refreshed every 30 s, 3 s timeout.
+//   - modelsSnapshot — role activity, current recipes, judge findings, the
+//     decide/scan call evidence, ASR provenance. Cheap (a few ms each; the
+//     fn_calls aggregate scans the call log); refreshed every 30 s, 3 s timeout.
 //   - staleSnapshot — per-step stale_work counts. The view seq-scans chunks
 //     and findings (EXPLAIN ANALYZE ≈ 1.6 s on production), so it gets its own
 //     5 min TTL and 30 s timeout — the same budget as the ingest pod's
@@ -36,7 +37,33 @@ type modelsSnapshot struct {
 	Activity  db.ModelActivity
 	Recipes   []db.CurrentRecipe
 	Findings  []db.FindingsModelCount
+	FnRoles   []db.FnRoleActivity
 	ASRGroups []db.ASRProvenanceGroup
+	// FnRolesErr is the decide/scan call-evidence query's error. That query
+	// scans the fn_calls log, so it runs last and is best-effort: a failure
+	// marks only the Decide and Scan cards unknown, never the whole snapshot.
+	FnRolesErr error
+}
+
+// fnRole returns the call evidence for step, nil when the step has no current
+// recipe.
+func (s *modelsSnapshot) fnRole(step string) *db.FnRoleActivity {
+	for i := range s.FnRoles {
+		if s.FnRoles[i].Step == step {
+			return &s.FnRoles[i]
+		}
+	}
+	return nil
+}
+
+// currentRecipe returns step's current recipe, nil when it has none.
+func (s *modelsSnapshot) currentRecipe(step string) *db.CurrentRecipe {
+	for i := range s.Recipes {
+		if s.Recipes[i].Step == step {
+			return &s.Recipes[i]
+		}
+	}
+	return nil
 }
 
 // staleSnapshot is the per-step stale_work count map; a missing step key means
@@ -45,7 +72,8 @@ type staleSnapshot struct {
 	Counts map[string]int64
 }
 
-// loadModelsSnapshot runs the four cheap aggregate queries sequentially.
+// loadModelsSnapshot runs the five aggregate queries sequentially; only the
+// last (fn_calls) may fail without failing the snapshot.
 func loadModelsSnapshot(ctx context.Context, d DBInterface) (modelsSnapshot, error) {
 	var (
 		s   modelsSnapshot
@@ -62,6 +90,9 @@ func loadModelsSnapshot(ctx context.Context, d DBInterface) (modelsSnapshot, err
 	}
 	if s.ASRGroups, err = d.ASRProvenanceGroups(ctx, asrProvenanceGroupLimit); err != nil {
 		return modelsSnapshot{}, fmt.Errorf("models snapshot: %w", err)
+	}
+	if s.FnRoles, err = d.FnRoleActivity(ctx); err != nil {
+		s.FnRoles, s.FnRolesErr = nil, fmt.Errorf("models snapshot: %w", err)
 	}
 	return s, nil
 }
@@ -83,7 +114,13 @@ type modelsCaches struct {
 func newModelsCaches(d DBInterface, logWarn func(msg string, args ...any)) modelsCaches {
 	c := modelsCaches{
 		models: newRefreshCache(modelsSnapshotTTL, modelsSnapshotTimeout,
-			func(ctx context.Context) (modelsSnapshot, error) { return loadModelsSnapshot(ctx, d) }),
+			func(ctx context.Context) (modelsSnapshot, error) {
+				s, err := loadModelsSnapshot(ctx, d)
+				if s.FnRolesErr != nil && logWarn != nil {
+					logWarn("models: fn_calls activity query failed; Decide/Scan cards unknown", "error", s.FnRolesErr)
+				}
+				return s, err
+			}),
 		stale: newRefreshCache(staleSnapshotTTL, staleSnapshotTimeout,
 			func(ctx context.Context) (staleSnapshot, error) { return loadStaleSnapshot(ctx, d) }),
 	}

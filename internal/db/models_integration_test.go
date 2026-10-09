@@ -6,6 +6,10 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -91,6 +95,10 @@ func TestIntegrationModelActivity(t *testing.T) {
 	if a.EvalLastModel != "qwen3.8" {
 		t.Errorf("EvalLastModel = %q, want the newest resolved model qwen3.8", a.EvalLastModel)
 	}
+	// qwen3.8 (c2) is the newest finish, so its time is max(eval_finished_at).
+	if a.EvalLastModelAt == nil || !a.EvalLastModelAt.Equal(*a.EvalLastOK) {
+		t.Errorf("EvalLastModelAt = %v, want qwen3.8's finish %v", a.EvalLastModelAt, a.EvalLastOK)
+	}
 	if len(a.EvalModels7d) != 2 {
 		t.Errorf("EvalModels7d = %+v, want two models", a.EvalModels7d)
 	}
@@ -114,18 +122,163 @@ func TestIntegrationFindingsByModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindingsByModel: %v", err)
 	}
-	want := map[[2]string]int{
-		{"anthropic/claude-haiku", "proposed"}: 2,
-		{"anthropic/claude-haiku", "rejected"}: 1,
-		{"qwen3.8", "proposed"}:                1, // resolved_model NULL → falls back to model
+	want := map[[3]string]int{
+		{"anthropic/claude-haiku", "proposed", DeciderNone}: 2,
+		{"anthropic/claude-haiku", "rejected", DeciderNone}: 1, // decided before attribution
+		{"qwen3.8", "proposed", DeciderNone}:                1, // resolved_model NULL → falls back to model
 	}
 	if len(got) != len(want) {
 		t.Fatalf("FindingsByModel = %+v, want %d buckets (human row excluded)", got, len(want))
 	}
 	for _, g := range got {
-		if want[[2]string{g.Model, g.PatchState}] != g.Count {
+		if want[[3]string{g.Model, g.PatchState, g.Decider}] != g.Count {
 			t.Errorf("bucket %+v not expected", g)
 		}
+	}
+}
+
+// TestIntegrationFindingsByModelDecider: decided_by is classified by the SQL —
+// jev:<recipe> is the decide step and revert:jev:<recipe> its undo, never a
+// person; mcp:, cli: and anything else are people.
+func TestIntegrationFindingsByModelDecider(t *testing.T) {
+	ctx := context.Background()
+	d := integrationDB(t, newTestDatabase(t))
+	if _, err := d.pool.Exec(ctx, modelsSeedSQL); err != nil {
+		t.Fatal(err)
+	}
+	rid, err := d.RegisterRecipe(ctx, recipe.Recipe{Step: recipe.StepDecide, StepVersion: 1, CodeVersion: "test",
+		ModelAlias: "jev-1.13.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jev := "jev:" + rid // the finding_events trigger resolves it to a registered recipe
+	for i, by := range []string{jev, jev, jev, "revert:" + jev, "mcp:alice", "cli:bob", "agent"} {
+		state := "accepted"
+		if i == 3 {
+			state = "rejected"
+		}
+		if _, err := d.pool.Exec(ctx, `
+			INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec, original_text,
+			                                 issue_type, confidence, model, resolved_model, patch_state, origin,
+			                                 decided_by, decided_at)
+			VALUES ('00000000-0000-0000-0000-0000000000d2', '/b/A/02.m4b', $1::float8, $1::float8 + 1, 'x', 'misheard', 0.9,
+			        'earmark-judge', 'anthropic/claude-haiku', $2, 'judge', $3, now())`, 10+i, state, by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := d.FindingsByModel(ctx)
+	if err != nil {
+		t.Fatalf("FindingsByModel: %v", err)
+	}
+	by := map[[2]string]int{}
+	for _, g := range got {
+		if g.Model == "anthropic/claude-haiku" {
+			by[[2]string{g.PatchState, g.Decider}] += g.Count
+		}
+	}
+	want := map[[2]string]int{
+		{"proposed", DeciderNone}:      2,
+		{"rejected", DeciderNone}:      1,
+		{"accepted", DeciderJev}:       3,
+		{"rejected", DeciderJevRevert}: 1,
+		{"accepted", DeciderHuman}:     3, // mcp:, cli: and a bare "agent"
+	}
+	if len(by) != len(want) {
+		t.Fatalf("haiku buckets = %+v, want %+v", by, want)
+	}
+	for k, n := range want {
+		if by[k] != n {
+			t.Errorf("bucket %v = %d, want %d", k, by[k], n)
+		}
+	}
+}
+
+// TestIntegrationFnRoleActivity: the decide/scan evidence is the fn_calls rows
+// of the current recipe's request (fn + model alias + prompt hash) — errors and
+// fallbacks included, another prompt's calls excluded — plus the scan recipe's
+// chunk_scan rows.
+func TestIntegrationFnRoleActivity(t *testing.T) {
+	ctx := context.Background()
+	d := integrationDB(t, newTestDatabase(t))
+	if _, err := d.pool.Exec(ctx, modelsSeedSQL); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := d.FnRoleActivity(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("no current recipes: %+v, %v; want none", got, err)
+	}
+	mk := func(step, fn, prompt string) recipe.Recipe {
+		return recipe.Recipe{Step: step, StepVersion: 1, CodeVersion: "test", ModelAlias: "jev-1.13.0",
+			ModelResolved: "jev-1.13.0", PromptVersion: fn + "@v1", PromptSHA256: prompt,
+			Params: map[string]any{"fn": fn}}
+	}
+	dec, scn := mk(recipe.StepDecide, "should_apply", "5e1ec7"), mk(recipe.StepScan, "scan_chunk", "5ca115")
+	if err := d.SetCurrentRecipes(ctx, dec, scn); err != nil {
+		t.Fatal(err)
+	}
+	decID, _ := dec.ID()
+	scnID, _ := scn.ID()
+
+	call := func(fn, prompt, resolved, errClass string, ago time.Duration, hit *int64, rid string) int64 {
+		t.Helper()
+		c := FnCall{Fn: fn, PromptVersion: fn + "@v1", PromptSHA256: prompt, ModelAlias: "jev-1.13.0",
+			ModelResolved: resolved, RecipeID: rid, InputSHA256: hexSHA(fmt.Sprintf("%s%s%s%d", fn, prompt, resolved, ago)),
+			Input: json.RawMessage(`{}`), ErrorClass: errClass, CacheHit: hit != nil, CachedFrom: hit}
+		if errClass == "" || errClass == ErrorClassModelFallback {
+			c.Output = json.RawMessage(`{"p":0.5}`)
+		}
+		id, ok, err := d.InsertFnCall(ctx, c)
+		if err != nil || !ok {
+			t.Fatalf("insert %s: %v, %v", fn, ok, err)
+		}
+		if _, err := d.pool.Exec(ctx, `UPDATE fn_calls SET created_at = now() - $2 * interval '1 second' WHERE id = $1`,
+			id, int(ago.Seconds())); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	okID := call("should_apply", "5e1ec7", "typesafe/jev-1.13.0", "", 3*time.Hour, nil, decID)
+	call("should_apply", "5e1ec7", "typesafe/jev-1.13.0", "", 2*time.Hour, &okID, decID) // cache hit
+	call("should_apply", "5e1ec7", "jev-1.12.0", ErrorClassModelFallback, 90*time.Minute, nil, "")
+	call("should_apply", "5e1ec7", "", "timeout", time.Hour, nil, "")
+	call("should_apply", "5e1ec7", "", "429", 48*time.Hour, nil, "")
+	call("should_apply", "0dd", "typesafe/jev-1.13.0", "", time.Minute, nil, "") // another prompt: not this recipe
+	call("scan_chunk", "5ca115", "typesafe/jev-1.13.0", "", 5*time.Hour, nil, scnID)
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO chunk_scan (transcript_id, chunk_index, chunk_text_sha256, recipe_id, p_needs_fix, quality,
+		                        p_boilerplate, p_garbled, p_dialogue, issue_type, issue_probs)
+		VALUES ('00000000-0000-0000-0000-0000000000d1', 0, $1, $2, 0.1, 4, 0, 0, 0, 'none', '{}'),
+		       ('00000000-0000-0000-0000-0000000000d1', 1, $1, $2, 0.1, 4, 0, 0, 0, 'none', '{}')`,
+		hexSHA("chunk"), scnID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := d.FnRoleActivity(ctx)
+	if err != nil {
+		t.Fatalf("FnRoleActivity: %v", err)
+	}
+	if len(got) != 2 || got[0].Step != recipe.StepDecide || got[1].Step != recipe.StepScan {
+		t.Fatalf("FnRoleActivity = %+v, want decide then scan", got)
+	}
+	a := got[0]
+	if a.Fn != "should_apply" || a.RecipeID != decID || a.ModelAlias != "jev-1.13.0" {
+		t.Errorf("decide identity = %+v", a)
+	}
+	if a.Calls != 4 || a.CacheHits != 1 || a.Fallbacks != 1 || a.Failures24h != 1 {
+		t.Errorf("decide counts calls/hits/fallbacks/fail24h = %d/%d/%d/%d, want 4/1/1/1",
+			a.Calls, a.CacheHits, a.Fallbacks, a.Failures24h)
+	}
+	if a.LastOK == nil || a.LastFail == nil || !a.LastFail.After(*a.LastOK) || a.LastErrorClass != "timeout" {
+		t.Errorf("decide last ok/fail/class = %v/%v/%q", a.LastOK, a.LastFail, a.LastErrorClass)
+	}
+	if a.LastModel != "jev-1.12.0" {
+		t.Errorf("decide LastModel = %q, want the newest reply (the fallback)", a.LastModel)
+	}
+	if a.Outputs != nil {
+		t.Errorf("decide Outputs = %v, want nil", *a.Outputs)
+	}
+	s := got[1]
+	if s.Calls != 1 || s.LastFail != nil || s.LastModel != "typesafe/jev-1.13.0" || s.Outputs == nil || *s.Outputs != 2 {
+		t.Errorf("scan = %+v", s)
 	}
 }
 
@@ -230,4 +383,10 @@ func TestIntegrationServerObservationRecency(t *testing.T) {
 	if old.JobsDone != 2 {
 		t.Errorf("JobsDone = %d", old.JobsDone)
 	}
+}
+
+// hexSHA is s's lowercase hex sha256 (a valid fn_calls/chunk_scan hash).
+func hexSHA(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
