@@ -3998,19 +3998,16 @@ an error: every failure after rung 0 is a retryable `hold`.
    answers to an older prompt are never served).
 
    The question tells the model the text is an audiobook's ASR transcript,
-   lowercase and unpunctuated by design (capitals and punctuation are ignored);
-   that the edit replaces the `[[ ]]` words of ORIGINAL with those of PROPOSED
-   and that applying it rewrites the stored transcript; that ASR mostly mishears
-   words as similar-sounding ones and sometimes repeats one, while narrators
-   also say unusual names, rare words and deliberate repeats; and that names
-   are spelled as the book reference spells them, though a word missing from
-   it is not evidence either way. It asks a question the text can settle — *is
+   lowercase and unpunctuated by design; that the edit replaces the `[[ ]]`
+   words of ORIGINAL with those of PROPOSED; that ASR mishears words as
+   similar-sounding ones and sometimes repeats one; and that the book reference
+   spells the book's names. It asks a question the text can settle — *is
    ORIGINAL wrong where it stands, and does PROPOSED restore what was said?*:
 
    | Criterion | Text |
    |---|---|
-   | `true` | ORIGINAL makes little sense, is ungrammatical, or garbles a name in context, and PROPOSED sounds like it and reads naturally with BEFORE and AFTER. |
-   | `false` | ORIGINAL makes sense as it stands, or PROPOSED sounds different, says something the context does not support, or contradicts the book reference. |
+   | `true` | ORIGINAL is a garbled word, a misspelt name or a stray repeat, and PROPOSED sounds like it and fits BEFORE and AFTER. |
+   | `false` | ORIGINAL is real wording that fits, or PROPOSED only restyles it (spelling variant, number form, tense, rewording), sounds different, or contradicts the book reference. |
 
    Uncertainty is deliberately not a `false` reason: an undecidable finding
    should land in the hold band, since a reject is final. **The state never
@@ -4047,10 +4044,17 @@ an error: every failure after rung 0 is a retryable `hold`.
    replacement", labelled the sentences ORIGINAL SENTENCE / CORRECTED
    SENTENCE, kept ±40 words and up to 6 reference sentences / 1,200
    characters, and named "not enough information" as a `false` reason; its
-   answers peaked at p 0.5–0.7 with none ≥ 0.95). v2 holds input tokens flat or
-   lower: the question grew by 14 cl100k tokens (225 → 239) while the state
-   shrank, a mean of −2.4% per call on the reference examples — +3% on the
-   shortest states, −10% to −13% on long segments, −37% at the v1 caps.
+   answers peaked at p 0.5–0.7 with none ≥ 0.95). v2 asks the question
+   above, cuts the state to the sizes in steps 2 and 3, and shortens the
+   question from 225 to 161 cl100k tokens as canonical JSON (a test pins a
+   170-token budget).
+   Measured live in a dry run over the same 887 rung-0 passes, v1 → v2: input
+   tokens 641 → 602 per call (−6.1%); mean `p` on findings hand-labelled good
+   fixes 0.672 → 0.671 and on junk 0.519 → 0.449 (AUC over 84 text-only
+   labels 0.749 → 0.834; the paired-bootstrap 95% interval of the difference
+   touches 0). A longer first draft of v2 (+6% tokens over v1, AUC 0.745) and
+   a variant adding rung 0's sound-alike score to the state (AUC 0.821, more
+   tokens) were measured and not shipped.
 
 6. **Decision rule** — with `p` the `should_apply` `noul`:
 
