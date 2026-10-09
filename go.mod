@@ -1,6 +1,6 @@
 module github.com/jedwards1230/earmark
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/abx123/go-isbn v0.0.0-20210809152938-059f94f930cd
