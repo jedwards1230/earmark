@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,16 +20,41 @@ import (
 	"github.com/jedwards1230/earmark/internal/systemone"
 )
 
-// The question's hash is the cache key's prompt component: any edit to the
-// instructions or criteria must show up here, together with a bump of
-// ShouldApplyPromptVersion.
+// The prompt hash (question + state layout) is the cache key's prompt
+// component: any edit to the instructions, criteria or state labels must show
+// up here, together with a bump of ShouldApplyPromptVersion.
 func TestShouldApplyPromptPinned(t *testing.T) {
-	const want = "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f"
+	const want = "a9e3774cb9a83e60baf5d70f42e9f01bde73d94581a051b33c12e8746e098699"
 	if ShouldApplyPromptSHA256 != want {
 		t.Errorf("ShouldApplyPromptSHA256 = %s, want %s — bump ShouldApplyPromptVersion when the question changes", ShouldApplyPromptSHA256, want)
 	}
-	if ShouldApplyPromptVersion != "should_apply@v1" || ShouldApplyModel != "jev-1.13.0" {
-		t.Errorf("identity changed: %s %s", ShouldApplyPromptVersion, ShouldApplyModel)
+	if ShouldApplyPromptVersion != "should_apply@v2" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 2 {
+		t.Errorf("identity changed: %s %s step %d", ShouldApplyPromptVersion, ShouldApplyModel, ShouldApplyStepVersion)
+	}
+	// v1's hash (the question's canonical JSON alone) must never come back:
+	// cached v1 answers would be served for v2 states.
+	if ShouldApplyPromptSHA256 == "53b1fdd5811e8f49d3c938c500c747536ef89f6e4bc859bff05ec81a6f754a5f" {
+		t.Error("prompt hash equals should_apply@v1's")
+	}
+}
+
+// A state-layout change alone (no question edit) must change the prompt hash.
+func TestShouldApplyPromptHashCoversLayout(t *testing.T) {
+	base := shouldApplyPromptSHA256(shouldApplyQuestion, stateLayout)
+	if base != ShouldApplyPromptSHA256 {
+		t.Fatalf("helper %s != package hash %s", base, ShouldApplyPromptSHA256)
+	}
+	for i := range stateLayout {
+		l := slices.Clone(stateLayout)
+		l[i] += "x"
+		if shouldApplyPromptSHA256(shouldApplyQuestion, l) == base {
+			t.Errorf("changing layout entry %q kept the hash", stateLayout[i])
+		}
+	}
+	q := shouldApplyQuestion
+	q.Instructions += " "
+	if shouldApplyPromptSHA256(q, stateLayout) == base {
+		t.Error("changing the instructions kept the hash")
 	}
 }
 
@@ -40,8 +66,8 @@ func TestBuildStateGolden(t *testing.T) {
 	}
 	recs := []RecordSentence{{Field: "chapter", Text: "The Arecibo Message"}}
 	want := "ISSUE TYPE:\nmisheard_proper_noun\n\n" +
-		"ORIGINAL SENTENCE:\nthe dish at [[auto sebo]] picked\n\n" +
-		"CORRECTED SENTENCE:\nthe dish at [[Arecibo]] picked\n\n" +
+		"ORIGINAL:\nthe dish at [[auto sebo]] picked\n\n" +
+		"PROPOSED:\nthe dish at [[Arecibo]] picked\n\n" +
 		"BEFORE:\nprevious chunk words\n\n" +
 		"AFTER:\n(none)\n\n" +
 		"BOOK REFERENCE:\n- chapter: The Arecibo Message\n"
@@ -50,6 +76,38 @@ func TestBuildStateGolden(t *testing.T) {
 	}
 	if got := BuildState(IssueMisheardWord, c, nil); !strings.HasSuffix(got, "BOOK REFERENCE:\n(none)\n") {
 		t.Errorf("empty reference: %q", got)
+	}
+}
+
+// The apply rule's two keys — p and text evidence — must stay independent:
+// the state never tells the model whether the evidence gate passed.
+func TestStateOmitsEvidence(t *testing.T) {
+	var seen systemone.Request
+	j := &fakeJev{}
+	j.reply = func(w http.ResponseWriter, req systemone.Request) {
+		seen = req
+		noul(0.5, "jev-1.13.0")(w, req)
+	}
+	e, _ := newTestEvaluator(t, j)
+	const stutter = "he said the the cat sat"
+	repeat := Input{
+		Candidate: cand("f2", IssueRepeatedText, stutter, "the the cat", "the cat", 0.9),
+		Chunk:     ChunkWindow{StartSec: 0, EndSec: 2},
+		Segments:  []db.Segment{seg(0, 2, stutter)},
+	}
+	for want, in := range map[string]Input{
+		EvidenceASINVerbatim: radioInput(IssueMisheardProperNoun, "auto sebo", "Arecibo"),
+		EvidenceExactRepeat:  repeat,
+	} {
+		out := e.Evaluate(context.Background(), in)
+		if !out.Asked || out.Evidence != want {
+			t.Fatalf("want an asked %s finding, got %+v", want, out)
+		}
+		for _, leak := range []string{out.Evidence, "evidence", "verbatim", "exact repeat", "soundalike", "sound-alike", "checks"} {
+			if strings.Contains(strings.ToLower(seen.State), strings.ToLower(leak)) {
+				t.Errorf("state leaks %q (evidence %s):\n%s", leak, out.Evidence, seen.State)
+			}
+		}
 	}
 }
 
@@ -112,7 +170,9 @@ func TestShouldApplyParams(t *testing.T) {
 			t.Errorf("%s change kept recipe %s", name, baseID)
 		}
 	}
-	for _, k := range []string{"evidence_rule", "rung0_version", "apply_p", "reject_p", "phonetic_min_sim"} {
+	for _, k := range []string{"evidence_rule", "rung0_version", "apply_p", "reject_p", "phonetic_min_sim",
+		"context_words", "neighbour_words", "fallback_words", "max_relevant_sentences", "max_relevant_runes",
+		"max_sentence_runes", "clip_words"} {
 		if _, ok := base.Params[k]; !ok {
 			t.Errorf("recipe params lack %s", k)
 		}
@@ -247,7 +307,8 @@ func TestEvaluateEndToEnd(t *testing.T) {
 		if seen.Model != ShouldApplyModel || len(seen.Questions) != 1 || seen.Questions[questionKey].Type != systemone.TypeNoul {
 			t.Errorf("request %+v", seen)
 		}
-		for _, want := range []string{"[[auto sebo]]", "[[Arecibo]]", "BEFORE:\nprevious words", "AFTER:\nup the signal", "- chapter: The Arecibo Message"} {
+		for _, want := range []string{"ORIGINAL:\nthe dish at [[auto sebo]] picked", "PROPOSED:\nthe dish at [[Arecibo]] picked",
+			"BEFORE:\nprevious words", "AFTER:\nup the signal", "- chapter: The Arecibo Message"} {
 			if !strings.Contains(seen.State, want) {
 				t.Errorf("state lacks %q:\n%s", want, seen.State)
 			}

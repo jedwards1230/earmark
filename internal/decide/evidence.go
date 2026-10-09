@@ -30,13 +30,13 @@ const EvidenceRule = "d2a_new_tokens_verbatim@v1"
 
 // Relevance caps on the record sentences shown to the model.
 const (
-	MaxRelevantSentences = 6
-	MaxRelevantRunes     = 1200
-	// maxSentenceRunes clips one long sentence to a window around its match so
+	MaxRelevantSentences = 4
+	MaxRelevantRunes     = 600
+	// MaxSentenceRunes clips one long sentence to a window around its match so
 	// a single blurb paragraph cannot take the whole budget.
-	maxSentenceRunes = 300
-	// clipWords is the ±window kept around the match when clipping.
-	clipWords = 20
+	MaxSentenceRunes = 200
+	// ClipWords is the ±window kept around the match when clipping.
+	ClipWords = 12
 )
 
 // minEvidenceRunes is the shortest non-stopword that can carry asin_verbatim
@@ -284,15 +284,15 @@ func Relevant(sentences []RecordSentence, original, replacement string) []Record
 	return out
 }
 
-// clip keeps ±clipWords words around word index at when s is longer than
-// maxSentenceRunes. Word indices count whitespace-separated words, which
+// clip keeps ±ClipWords words around word index at when s is longer than
+// MaxSentenceRunes. Word indices count whitespace-separated words, which
 // match token indices for ordinary text and stay close otherwise.
 func clip(s string, at int) string {
-	if utf8.RuneCountInString(s) <= maxSentenceRunes {
+	if utf8.RuneCountInString(s) <= MaxSentenceRunes {
 		return s
 	}
 	f := strings.Fields(s)
-	lo, hi := max(0, at-clipWords), min(len(f), at+clipWords+1)
+	lo, hi := max(0, at-ClipWords), min(len(f), at+ClipWords+1)
 	out := strings.Join(f[lo:hi], " ")
 	if lo > 0 {
 		out = "… " + out
@@ -300,8 +300,8 @@ func clip(s string, at int) string {
 	if hi < len(f) {
 		out += " …"
 	}
-	if r := []rune(out); len(r) > maxSentenceRunes {
-		out = string(r[:maxSentenceRunes-1]) + "…"
+	if r := []rune(out); len(r) > MaxSentenceRunes {
+		out = string(r[:MaxSentenceRunes-1]) + "…"
 	}
 	return out
 }
