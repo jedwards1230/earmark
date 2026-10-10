@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -266,7 +267,7 @@ func dryRun(ctx context.Context, store decidepkg.RunStore, asker decidepkg.Asker
 	if path == "" {
 		return decidepkg.DryRun(ctx, store, asker, ro)
 	}
-	f, err := os.Create(path)
+	f, err := os.Create(filepath.Clean(path)) // #nosec G304 -- operator-supplied --dump path
 	if err != nil {
 		return nil, fmt.Errorf("--dump: %w", err)
 	}
