@@ -51,11 +51,13 @@ func seedLegacyRows(t *testing.T, dbURL string) {
 	}
 }
 
+// legacyID is the id 00002's SQL backfill gives a legacy recipe: ID format 1
+// (code_version hashed), frozen with the migration.
 func legacyID(t *testing.T, step, alias, resolved string) string {
 	t.Helper()
 	id, err := recipe.Recipe{
 		Step: step, CodeVersion: recipe.LegacyCodeVersion, ModelAlias: alias, ModelResolved: resolved,
-	}.ID()
+	}.IDV1()
 	if err != nil {
 		t.Fatal(err)
 	}

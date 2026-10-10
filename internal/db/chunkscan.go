@@ -76,7 +76,9 @@ func (c ScanCandidate) Cursor() ScanCursor {
 	return ScanCursor{TranscriptID: c.TranscriptID, ChunkIndex: c.ChunkIndex}
 }
 
-// scanCandidatesSQL selects chunks to scan. $1 recipe ("" = no exclusion),
+// scanCandidatesSQL selects chunks to scan. $1 recipe ("" = no exclusion; a
+// chunk whose current text was scanned by $1 or a recipe equivalent to it —
+// equivalentRecipesCTE — is not a candidate),
 // $2 book pattern ("" = all), $3 context segments per side, $4 sample (0 =
 // keyset walk), $5 seed, $6/$7 keyset cursor (NULL = start), $8 limit.
 //
@@ -85,7 +87,8 @@ func (c ScanCandidate) Cursor() ScanCursor {
 // at or before its start and starting at or after its end (a 1 ms tolerance
 // absorbs float noise). Only the segment text is read, never the word list.
 const scanCandidatesSQL = `
-	WITH c AS (
+	WITH` + equivalentRecipesCTE + `,
+	c AS (
 		SELECT c.id, c.transcript_id, c.file_path, c.chunk_index, c.start_sec, c.end_sec,
 		       COALESCE(c.source_text, c.text) AS text,
 		       encode(sha256(convert_to(COALESCE(c.source_text, c.text), 'UTF8')), 'hex') AS sha
@@ -112,7 +115,8 @@ const scanCandidatesSQL = `
 	 WHERE $1 = '' OR NOT EXISTS (
 	         SELECT 1 FROM chunk_scan s
 	          WHERE s.transcript_id = c.transcript_id AND s.chunk_index = c.chunk_index
-	            AND s.chunk_text_sha256 = c.sha AND s.recipe_id = $1)
+	            AND s.chunk_text_sha256 = c.sha
+	            AND s.recipe_id IN (SELECT eq.recipe_id FROM eq))
 	 ORDER BY CASE WHEN $4 > 0 THEN md5($5 || ':' || c.id::text) END,
 	          c.transcript_id, c.chunk_index
 	 LIMIT $8
