@@ -460,6 +460,12 @@ func (e *Evaluator) call(state string) fn.Call {
 		if resp == nil {
 			return fn.Result{}, &systemone.DecodeError{Reason: "empty reply"}
 		}
+		if _, ok := resp.Answers[questionKey]; !ok {
+			// LiteLLM's unified /v1/systemone drops a refused answer from
+			// "answers". An error, not a result: never cached, so a later
+			// run asks again; Evaluate turns it into a retryable hold.
+			return fn.Result{}, &systemone.DecodeError{Reason: "should_apply has no answer (refused)"}
+		}
 		raw, err := json.Marshal(shouldApplyOutput{Model: resp.Model, Answers: resp.Answers})
 		if err != nil {
 			return fn.Result{}, fmt.Errorf("decide: encode reply: %w", err)

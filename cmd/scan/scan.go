@@ -85,7 +85,7 @@ Examples:
   earmark scan --sample 50 --seed q4 --yes  # the same 50 chunks, written
   earmark scan --book "Children of Dune" --yes
   earmark scan --limit 2000 --yes --json    # first 2000 unscanned chunks
-  earmark scan --sample 50 --seed q4 --model clef-1.0.0 --endpoint ollama-clef
+  earmark scan --sample 50 --seed q4 --model clef:27b --endpoint litellm-s1
 
 Model: the scan step's effective model (CONTRACT §2.20): --endpoint/--model
 for this run, else the model_settings row ('earmark models set scan ...'),

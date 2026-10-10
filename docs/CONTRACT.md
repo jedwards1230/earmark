@@ -2669,10 +2669,28 @@ LiteLLM pass-through, e.g.
 - `baseURL` is the route prefix: the client (`internal/systemone`) calls
   `POST {baseURL}/v1/systemone` and `GET {baseURL}/v1/models`, with the
   `apiKeyEnv` token as `Authorization: Bearer`. It never follows a redirect.
-- `model` MUST be a pinned version (`jev-1.13.0`); a moving alias
-  (`jev-latest`, `jev-preview`, any `*-latest`/`*-preview`/`:latest`) or an id
-  with no dotted version is a startup error. `options` are refused (the client
-  sends only `model`, `state`, `questions`).
+- `model` MUST name one fixed build: a dotted version (`jev-1.13.0`) or an
+  explicit Ollama tag (`clef:27b`, `qwen3.8:27b-q8_0`). Any id containing
+  `latest` or `preview` (`jev-latest`, `gemma3:latest`, `x-preview-2`) or an
+  id with neither (`jev`, `clef`) is a startup error (`config.PinnedModel`).
+  `options` are refused (the client sends only `model`, `state`,
+  `questions`).
+- **Two routes through LiteLLM.** A `baseURL` of `…/typesafe` is LiteLLM's
+  TypeSafe **pass-through**: it forwards to api.typesafe.ai and ignores
+  LiteLLM's `model_list`, so only TypeSafe's `jev-*` models can be served
+  there. A `baseURL` of the LiteLLM **root** (`http://litellm…:4000`) makes the
+  client post to LiteLLM's **unified** `POST /v1/systemone`, which routes
+  `model` (the bare name, e.g. `clef:27b`) through `model_list` — the way to
+  reach a local decision model such as Clef. Declare one endpoint per route;
+  a model setting (§2.20) picks the route by picking the endpoint. A non-`jev-*`
+  model on a pass-through endpoint is refused (`config.CheckSystemOneRoute`:
+  at startup for `AI_ENDPOINTS`, and for every model setting or override),
+  since it would silently be sent to TypeSafe.
+- The unified route rebuilds the reply: `usage` may carry `cached_tokens` and
+  `cache_write_tokens` (accepted, not used), and a **refused** answer is
+  dropped from `answers`. A missing answer is a decode error like any other —
+  for `should_apply` a retryable `hold` (`jev_unavailable`), never an apply,
+  and never cached, so a later run asks again.
 - **Request** `{"model", "state": <string>, "questions": {<name>: {"type",
   "instructions", "criteria"}}}` — `model` always sent (omitting it is a 422);
   every question needs `instructions`; `noul` criteria optional
@@ -4743,15 +4761,31 @@ sees the effective model unchanged:
   fields are unpinned (answers are expected from the requested model), exactly
   like an unpinned env step; `prompt_version` stays. A setting equal to the
   env endpoint and model with no pins keeps the env pin.
+- **Back to env.** Whenever a setting — a row, or an override undoing a row —
+  resolves to exactly the env endpoint and model with no pins of its own, the
+  env `MODELS_FILE` pin (expected model, revision, `usd_per_mtok_in`) is
+  restored, so the run stamps the env recipe and keeps the env price.
+- **Endpoint-only change.** An override that keeps a pinned row's model id but
+  names another endpoint is a new binding: the row's pin does not carry over
+  (it pinned what the other endpoint serves). Pass the pins again if they
+  still apply.
 - **Recipes.** The effective model and pin are recipe inputs exactly like env
   (§1.9): another model is another recipe, unsetting gives back the env one.
+  Recipe ids hash the **model** fields, not the endpoint: a row that moves a
+  step to another endpoint serving the same model id with no pins keeps the
+  env recipe id — exactly as moving the env binding would.
 
 **Validation (fail closed).** The step is settable; the endpoint is a
 registered `AI_ENDPOINTS` id (not a synthesized one) of the type the step
 needs; the model is non-empty without whitespace and, for `systemone`, a
 pinned version (`config.PinnedModel`); params are known keys with valid
-values (the `MODELS_FILE` rule). `earmark models set` refuses invalid input
-before writing. A stored row that is invalid against the **current**
+values (the `MODELS_FILE` rule); `expected_model` and `revision` hold no
+whitespace; a `systemone` model on the TypeSafe pass-through must be `jev-*`
+(§2.14). `earmark models set` refuses invalid input before writing, and
+`set embed` also embeds one probe string through the endpoint and refuses a
+model whose vectors are not 768-dimension (or an unreachable endpoint;
+`--no-probe` stores without the check). Setting the stored value again writes
+nothing and records no event. A stored row that is invalid against the **current**
 registry (its endpoint was removed from `AI_ENDPOINTS`, or changed type) is
 an error, never a fallback to another model: `eval`/`decide`/`scan` exit with
 a message naming the step, the row and the fix (`earmark models unset
@@ -4765,18 +4799,34 @@ unchanged. Rows for other steps are unaffected.
 | Process | Reads `model_settings` | Applies |
 |---|---|---|
 | `earmark eval` / `decide` / `scan` (incl. `--sample`, `--dump`, `--rung0-only`, `--backfill-*`, the eval-backfill CronJob) | once at start | its own step, strictly, then the run's override |
-| `earmark monitor` worker (in-pipeline judge, embedder) | at the start of every cycle (≤ 30 s poll; back-to-back while draining) | `embed`, and `propose` when `EVAL_IN_PIPELINE`, strictly; one config per cycle, so a batch never mixes two models. Also re-registers `current_recipes` (all steps, invalid ones skipped) when they change |
-| `earmark mcp` / `serve` search | every 30 s (`db.ModelSettingsRefresh`) | `embed`, for the query embedder; an invalid row or a failed read keeps the embedder last applied (logged) |
-| Models page, `GET /api/v1/status` | every render (2 s deadline) | all steps, invalid rows shown as errors |
+| `earmark monitor` worker (in-pipeline judge, embedder) | at the start of every cycle (≤ 30 s poll; back-to-back while draining) | `embed`, and `propose` when `EVAL_IN_PIPELINE`, strictly; one config per cycle, so a batch never mixes two models. A new embedder is dimension-probed before the swap; a failed probe idles the cycle. With no row and no usable env judge, inline eval stays off and embedding continues (env behaviour). Also re-registers `current_recipes` (all steps, invalid ones skipped) when they change |
+| `earmark mcp` / `serve` search | once **before serving** (synchronous), then every 30 s (`db.ModelSettingsRefresh`) | `embed`, for the query embedder. A new embedder is dimension-probed before the swap; a failed probe, an invalid row or a failed read keeps the embedder in use, is logged, and shows on the Models page Embeddings card (DEGRADED, "search kept its previous embedder") |
+| Models page, `GET /api/v1/status` | every render (2 s deadline) | all steps, invalid rows shown as errors; the judge card and "run eval" buttons are enabled by a valid `propose` row even with no env judge |
 | Dashboard "run eval" button | each click | `propose`, strictly |
 
 `earmark batch` (phase coordination) and `earmark backfill` (metadata) call no
 model and do not read it.
 
+**Bake-off example** (two judges × two decision models, each arm a dry run
+over the same labelled findings; `litellm-s1` is a systemone endpoint whose
+baseURL is the LiteLLM root, so `clef:27b` goes through LiteLLM's unified
+route rather than the TypeSafe pass-through):
+
+```bash
+earmark eval --sample 200 --seed bake --dump /tmp/judge-haiku.jsonl                                   # A: env judge
+earmark eval --sample 200 --seed bake --dump /tmp/judge-qwen.jsonl --model ollama/qwen3.8:27b-q8_0    # B: Qwen judge
+earmark decide --sample 84 --calibrate --human mcp,cli --json                                          # Jev (env)
+earmark decide --sample 84 --calibrate --human mcp,cli --json --endpoint litellm-s1 --model clef:27b   # Clef
+earmark models set decide --endpoint litellm-s1 --model clef:27b --note "Clef wins the bake-off"       # make it the default
+```
+
 **Changing the embed model** is legitimate but heavier than the others. The
 model must produce 768-dimension vectors (`transcript_chunks.embedding` is
-`vector(768)`): any other size fails every chunk insert, so the worker stops
-embedding until the row is fixed. Chunks already embedded are **not**
+`vector(768)`): any other size would fail every chunk insert and every
+search, so it is refused three times over — by `models set embed`'s probe,
+and by every running process, which probes a new embedder before switching
+and keeps the one it has if the probe fails (the worker idles; search keeps
+answering with the previous model and the Models page says so). Chunks already embedded are **not**
 re-embedded (the worker never re-embeds on a recipe change, §1.9): new chunks
 use the new model under a new embed recipe, the old ones are listed stale,
 and the index mixes two vector spaces until `earmark requeue --reembed ""
@@ -4788,23 +4838,23 @@ chunks. `earmark models set embed` prints this.
 ```sql
 CREATE TABLE model_settings (
     step           TEXT        PRIMARY KEY,   -- propose | decide | scan | embed (CHECK)
-    endpoint_id    TEXT        NOT NULL,      -- an AI_ENDPOINTS id; never a URL or key
-    model          TEXT        NOT NULL,      -- the model id to request
-    expected_model TEXT,                      -- pin: what should answer (NULL = the requested model)
-    revision       TEXT,                      -- pin: weights revision
+    endpoint_id    TEXT        NOT NULL,      -- an AI_ENDPOINTS id; never a URL or key (non-empty, ≤ 256)
+    model          TEXT        NOT NULL,      -- the model id to request (non-empty, ≤ 256)
+    expected_model TEXT,                      -- pin: what should answer; NULL = the requested model ('' refused)
+    revision       TEXT,                      -- pin: weights revision; NULL = unpinned ('' refused)
     params         JSONB       NOT NULL DEFAULT '{}',  -- pin params (object), e.g. {"usd_per_mtok_in": 0.042}
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_by     TEXT        NOT NULL       -- e.g. "cli:justin"
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- same clock as the event
+    updated_by     TEXT        NOT NULL       -- e.g. "cli:justin" (non-empty, ≤ 256)
 );
 
 CREATE TABLE model_setting_events (           -- append-only (trigger refuses UPDATE/DELETE)
     id         BIGSERIAL   PRIMARY KEY,
-    step       TEXT        NOT NULL,
+    step       TEXT        NOT NULL,           -- propose | decide | scan | embed (CHECK)
     action     TEXT        NOT NULL,           -- set | unset (set ⇒ new_value, unset ⇒ no new_value)
-    old_value  JSONB,                          -- the row before; NULL = the env default was in effect
-    new_value  JSONB,                          -- the row after; NULL = unset
-    actor      TEXT        NOT NULL,
-    note       TEXT,
+    old_value  JSONB,                          -- the row before (object); NULL = the env default was in effect
+    new_value  JSONB,                          -- the row after (object); NULL = unset
+    actor      TEXT        NOT NULL,           -- non-empty, ≤ 256
+    note       TEXT,                           -- ≤ 512
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX model_setting_events_step_idx ON model_setting_events (step, id DESC);
@@ -4819,7 +4869,7 @@ delete, and its event with the value it replaced (`db.SetModelSetting`,
 ```bash
 earmark models [--json]                      # per step: source, endpoint, model, pin, env default, who set it; invalid rows
 earmark models set <step> [--endpoint <id>] [--model <id>] [--expected-model <id>] [--revision <r>] \
-                          [--param key=value ...] [--note "why"]
+                          [--param key=value ...] [--note "why"] [--no-probe]
 earmark models unset <step> [--note "why"]   # back to the env default
 earmark models history [step] [--limit 50] [--json]
 earmark eval|decide|scan ... --endpoint <id> --model <id>   # this run only

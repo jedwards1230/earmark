@@ -362,12 +362,29 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 // guaranteed failure. The runner binds s.db as the read-only ChunkReader and
 // insert-only FindingWriter; the judge issues no transcript mutations.
 func (s *MCPServer) initEval(cfg *config.Config) {
+	db := s.db
+	// The judge is resolved per run on the propose step's effective model
+	// (CONTRACT §2.20): a model_settings change applies to the next click
+	// without a restart, and an invalid row fails the run instead of judging
+	// with the env model. Bound even without an env judge, so a valid
+	// propose row alone enables the buttons (evalConfigured).
+	s.eval.run = func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {
+		eff, err := s.effectiveStep(ctx, cfg, recipe.StepPropose)
+		if err != nil {
+			return eval.RunStats{}, err
+		}
+		chat, err := eval.ResolveChatClient(eval.ConfigSource(eff))
+		if err != nil {
+			return eval.RunStats{}, err
+		}
+		_, stats, err := eval.Run(ctx, db, eval.NewJudgeForConfig(chat, eff), db, opts)
+		return stats, err
+	}
 	chat, err := eval.ResolveChatClient(eval.ConfigSource(cfg))
 	if err != nil {
-		s.logger.Info("eval layer disabled (no chat endpoint configured)", "reason", err)
+		s.logger.Info("eval layer disabled in env (no chat endpoint configured); a propose model setting can enable it", "reason", err)
 		return
 	}
-	db := s.db
 	s.eval.configured = true
 	s.eval.model = chat.Model()
 	s.eval.source = judgeSourceEnv
@@ -381,22 +398,6 @@ func (s *MCPServer) initEval(cfg *config.Config) {
 				s.eval.host = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
 			}
 		}
-	}
-	// The judge is resolved per run on the propose step's effective model
-	// (CONTRACT §2.20): a model_settings change applies to the next click
-	// without a restart, and an invalid row fails the run instead of judging
-	// with the env model.
-	s.eval.run = func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {
-		eff, err := s.effectiveStep(ctx, cfg, recipe.StepPropose)
-		if err != nil {
-			return eval.RunStats{}, err
-		}
-		chat, err := eval.ResolveChatClient(eval.ConfigSource(eff))
-		if err != nil {
-			return eval.RunStats{}, err
-		}
-		_, stats, err := eval.Run(ctx, db, eval.NewJudgeForConfig(chat, eff), db, opts)
-		return stats, err
 	}
 }
 

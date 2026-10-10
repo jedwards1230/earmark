@@ -480,3 +480,63 @@ func TestShouldApplyQuestionBudget(t *testing.T) {
 		t.Errorf("should_apply question is %d cl100k tokens, budget %d", n, budget)
 	}
 }
+
+// staticAsker answers every call with resp (no HTTP, no decode).
+type staticAsker struct {
+	resp  *systemone.Response
+	calls int
+	model string
+}
+
+func (a *staticAsker) Decide(_ context.Context, req systemone.Request) (*systemone.Response, error) {
+	a.calls++
+	a.model = req.Model
+	return a.resp, nil
+}
+
+// The unified route drops a refused answer: the outcome is a retryable hold
+// (never an apply, never a panic), and nothing is cached, so the next run
+// asks again. Over HTTP the client's strict decode already refuses the
+// reply; a reply that reaches the evaluator without the answer is refused
+// here too.
+func TestEvaluateRefusedAnswerHolds(t *testing.T) {
+	ctx := context.Background()
+	in := radioInput(IssueMisheardProperNoun, "auto sebo", "Arecibo")
+
+	t.Run("over HTTP, unified-route reply with no answer", func(t *testing.T) {
+		j := &fakeJev{}
+		j.reply = func(w http.ResponseWriter, _ systemone.Request) {
+			_, _ = w.Write([]byte(`{"model":"clef:27b","answers":{},"usage":{"input_tokens":10,"output_tokens":0,"cached_tokens":4,"cache_write_tokens":0}}`))
+		}
+		e, _ := newTestEvaluator(t, j)
+		for i := 0; i < 2; i++ {
+			out := e.Evaluate(ctx, in)
+			if out.Decision != DecisionHold || out.Reason != ReasonJevUnavailable || !out.Retryable || out.P != nil || out.CacheHit {
+				t.Fatalf("outcome %+v", out)
+			}
+		}
+		if j.calls.Load() != 2 {
+			t.Errorf("calls = %d: a refused answer must not be cached", j.calls.Load())
+		}
+	})
+
+	t.Run("asker reply without the answer", func(t *testing.T) {
+		a := &staticAsker{resp: &systemone.Response{Model: "clef:27b", Answers: map[string]systemone.Answer{}}}
+		e, err := NewEvaluatorFor(&memStore{}, a, DefaultShouldApplyParams(), Model{Alias: "clef:27b"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			out := e.Evaluate(ctx, in)
+			if out.Decision != DecisionHold || out.Reason != ReasonJevUnavailable || !out.Retryable {
+				t.Fatalf("outcome %+v", out)
+			}
+		}
+		if a.calls != 2 || a.model != "clef:27b" {
+			t.Errorf("calls %d model %q: want 2 uncached calls asking clef:27b", a.calls, a.model)
+		}
+		if e.Recipe().ModelAlias != "clef:27b" {
+			t.Errorf("recipe model %q", e.Recipe().ModelAlias)
+		}
+	})
+}

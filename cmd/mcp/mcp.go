@@ -86,9 +86,15 @@ func runMCP(cmd *cobra.Command, args []string) {
 
 	// Search embeds queries with the embed step's effective model (CONTRACT
 	// §2.20): follow the model_settings row, re-read every 30 s.
+	// The first apply is synchronous, so no query is served with the env
+	// embedder while an embed row is set; a failure is logged and search
+	// keeps the env embedder (shown on the Models page).
+	if _, err := database.ApplyEmbedSettings(context.Background(), database, cfg); err != nil {
+		log.Printf("ERROR: embed model setting not applied; search uses the env embedder: %v", err)
+	}
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
-	go database.WatchEmbedSettings(watchCtx, cfg, db.ModelSettingsRefresh)
+	go database.WatchEmbedSettings(watchCtx, database, cfg, db.ModelSettingsRefresh)
 
 	// Determine transport from env; default to stdio.
 	// Do NOT set the env var globally — read it once and pass it through.

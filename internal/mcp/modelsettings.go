@@ -6,6 +6,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
 // ─── Runtime step model settings on the Models page (CONTRACT §2.20) ─────────
@@ -38,12 +39,27 @@ type effectiveModels struct {
 	// Err is a failed read: Cfg is then the env config and the cards say the
 	// settings are unknown rather than claiming "env".
 	Err error
+	// EmbedErr is why this process's search embedder is not on the effective
+	// embed setting (a refused swap: a dimension probe failure or an invalid
+	// row), from the DB's EmbedSettingError; "" when it is.
+	EmbedErr string
+}
+
+// embedSettingReporter is the optional DB capability reporting a refused
+// search-embedder swap (*db.DB implements it).
+type embedSettingReporter interface {
+	EmbedSettingError() string
 }
 
 // effectiveModels reads model_settings and applies the valid rows onto the
 // server's env config. It never fails the render.
-func (s *MCPServer) effectiveModels(ctx context.Context) effectiveModels {
-	em := effectiveModels{Cfg: s.cfg}
+func (s *MCPServer) effectiveModels(ctx context.Context) (em effectiveModels) {
+	em = effectiveModels{Cfg: s.cfg}
+	defer func() {
+		if er, ok := s.db.(embedSettingReporter); ok {
+			em.EmbedErr = er.EmbedSettingError()
+		}
+	}()
 	r, ok := s.db.(modelSettingsReader)
 	if !ok || s.cfg == nil {
 		return em
@@ -56,7 +72,8 @@ func (s *MCPServer) effectiveModels(ctx context.Context) effectiveModels {
 		em.Err = err
 		return em
 	}
-	return applyModelSettings(s.cfg, rows)
+	em = applyModelSettings(s.cfg, rows)
+	return em
 }
 
 // applyModelSettings is the pure half of effectiveModels.
@@ -109,6 +126,13 @@ func applySettingState(c *roleCard, em effectiveModels) {
 	if hasRow {
 		c.SettingBy, c.SettingAt = row.UpdatedBy, row.UpdatedAt
 	}
+	if c.Step == recipe.StepEmbed && em.EmbedErr != "" {
+		// This process refused to switch search to the set embed model (its
+		// vectors do not fit vector(768), or it could not be probed): search
+		// still embeds queries with the previous model.
+		c.SearchEmbedError = em.EmbedErr
+		c.Health = health(roleDegraded, "search kept its previous embedder — the embed setting was refused (see below)")
+	}
 	if ep, ok := em.Cfg.StepEndpoint(c.Step); ok && ep.BaseID != "" {
 		// A synthesized endpoint (another model on a registered one): name
 		// the registered endpoint on the card.
@@ -127,4 +151,24 @@ func (s *MCPServer) effectiveStep(ctx context.Context, base *config.Config, step
 	ctx, cancel := context.WithTimeout(ctx, modelSettingsTimeout)
 	defer cancel()
 	return db.EffectiveConfig(ctx, r, base, step)
+}
+
+// evalConfigured reports whether the "run eval" buttons may show: an env
+// judge, or a valid propose model setting naming a chat endpoint.
+func (s *MCPServer) evalConfigured(ctx context.Context) bool {
+	if s.eval.configured {
+		return true
+	}
+	if s.eval.run == nil || s.cfg == nil {
+		return false
+	}
+	if _, ok := s.db.(modelSettingsReader); !ok {
+		return false
+	}
+	eff, err := s.effectiveStep(ctx, s.cfg, recipe.StepPropose)
+	if err != nil {
+		return false
+	}
+	_, ok := eff.EvalEndpoint()
+	return ok
 }

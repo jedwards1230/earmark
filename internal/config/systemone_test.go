@@ -80,12 +80,57 @@ func TestLoadConfig_SystemOneFailsClosed(t *testing.T) {
 }
 
 func TestPinnedModel(t *testing.T) {
-	for _, ok := range []string{"jev-1.13.0", "typesafe/jev-1.13.0", "claude-haiku-4.5"} {
-		assert.NoError(t, PinnedModel(ok), ok)
+	tests := []struct {
+		model string
+		ok    bool
+	}{
+		{"jev-1.13.0", true},
+		{"typesafe/jev-1.13.0", true},
+		{"claude-haiku-4.5", true},
+		// Ollama tags name one build: pinned.
+		{"clef:27b", true},
+		{"qwen3.8:27b-q8_0", true},
+		{"ollama/clef:27b", true},
+		{"clef:27b-q4_K_M", true},
+		{"", false},
+		{" ", false},
+		{"jev", false},
+		{"clef", false},
+		{"clef:", false},
+		{"jev-latest", false},
+		{"JEV-Preview", false},
+		{"gemma3:latest", false},
+		{"jev-1.13.0-latest", false},
+		{"clef:latest-27b", false},
+		{"clef:27b-preview", false},
+		{"x-preview-2.0", false},
 	}
-	for _, bad := range []string{"", " ", "jev", "jev-latest", "JEV-Preview", "gemma3:latest", "jev-1.13.0-latest"} {
-		assert.Error(t, PinnedModel(bad), bad)
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			err := PinnedModel(tt.model)
+			if tt.ok {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
 	}
+}
+
+// The TypeSafe pass-through always calls api.typesafe.ai: only jev-* may be
+// sent there; any model on another systemone endpoint (the LiteLLM root's
+// unified /v1/systemone) is fine.
+func TestCheckSystemOneRoute(t *testing.T) {
+	pass := AIEndpoint{ID: "litellm-jev", Type: AIEndpointTypeSystemOne, BaseURL: "http://litellm:4000/typesafe"}
+	unified := AIEndpoint{ID: "litellm-s1", Type: AIEndpointTypeSystemOne, BaseURL: "http://litellm:4000"}
+	assert.NoError(t, CheckSystemOneRoute(pass, "jev-1.13.0"))
+	assert.NoError(t, CheckSystemOneRoute(pass, "typesafe/JEV-1.14.0"))
+	assert.Error(t, CheckSystemOneRoute(pass, "clef:27b"))
+	pass.BaseURL += "/"
+	assert.Error(t, CheckSystemOneRoute(pass, "clef:27b"), "a trailing slash is the same route")
+	assert.NoError(t, CheckSystemOneRoute(unified, "clef:27b"))
+	assert.NoError(t, CheckSystemOneRoute(unified, "jev-1.13.0"))
+	assert.NoError(t, CheckSystemOneRoute(AIEndpoint{Type: AIEndpointTypeChat, BaseURL: "http://x/typesafe"}, "clef:27b"))
 }
 
 // MODELS_FILE: decide/scan aliases are checked against AI_ROLES.decide/scan,

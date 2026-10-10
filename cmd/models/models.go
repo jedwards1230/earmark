@@ -11,6 +11,7 @@ package models
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
@@ -42,6 +44,16 @@ type setOptions struct {
 	expectedModel, revision string
 	params                  []string
 	note                    string
+	noProbe                 bool
+}
+
+// probeEmbed checks an embed setting's vector dimension against
+// transcript_chunks.embedding (vector(768)) before it is stored; a test
+// replaces it.
+var probeEmbed = func(ctx context.Context, cfg *config.Config) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return openai.NewEmbeddings(cfg).CheckDimension(ctx)
 }
 
 var (
@@ -83,7 +95,7 @@ Examples:
   earmark models                                     # effective model per step
   earmark models --json
   earmark models set propose --model ollama/qwen3.8:27b-q8_0 --note "bake-off arm B"
-  earmark models set decide --endpoint ollama-clef --model clef-1.0.0
+  earmark models set decide --endpoint litellm-s1 --model clef:27b
   earmark models set decide --endpoint litellm-jev --model jev-1.13.0 --param usd_per_mtok_in=0.042
   earmark models unset decide --note "back to Jev"
   earmark models history decide --limit 20`,
@@ -106,7 +118,11 @@ var setCmd = &cobra.Command{
 transaction. --endpoint is an AI_ENDPOINTS id of the type the step needs
 (propose: chat, decide/scan: systemone, embed: embeddings); it defaults to the
 step's env endpoint. --model defaults to the endpoint's own model. A
-systemone model must name a pinned version (e.g. jev-1.13.0, clef-1.0.0).
+systemone model must name one build: a dotted version or an explicit Ollama
+tag (jev-1.13.0, clef:27b; anything with "latest"/"preview" is refused). A
+non-jev model needs a systemone endpoint whose baseURL is the LiteLLM root
+(LiteLLM's unified /v1/systemone): the …/typesafe pass-through always calls
+TypeSafe, so such a model is refused there.
 
 Pins: --expected-model (the model that should ANSWER — the recipe's
 model_resolved), --revision and --param key=value (known: usd_per_mtok_in)
@@ -116,7 +132,10 @@ endpoint or model, or sets any pin; unset pin fields are then unpinned
 endpoint and model with no pins keeps the env pin.
 
 embed: the model must produce 768-dimension vectors (transcript_chunks is
-vector(768); any other size fails every insert). Chunks already embedded are
+vector(768)). set embeds one probe string through the endpoint and refuses
+any other size (or an unreachable endpoint; --no-probe skips this when the
+endpoint is down on purpose). Every running process probes again before it
+switches, and keeps its current embedder if the probe fails. Chunks already embedded are
 NOT re-embedded: new chunks use the new model, so the index mixes two models
 until 'earmark requeue --reembed "" --yes'.
 
@@ -148,6 +167,7 @@ func init() {
 	f.StringVar(&setOpts.revision, "revision", "", "pin: weights revision (HF commit, Ollama digest, provider snapshot)")
 	f.StringArrayVar(&setOpts.params, "param", nil, "pin param key=value (known: usd_per_mtok_in); repeatable")
 	f.StringVar(&setOpts.note, "note", "", "why, recorded in the history")
+	f.BoolVar(&setOpts.noProbe, "no-probe", false, "embed only: store without embedding a probe string to check the vector dimension (running processes still probe before switching)")
 	unsetCmd.Flags().StringVar(&unsetNote, "note", "", "why, recorded in the history")
 	historyCmd.Flags().IntVar(&historyLimit, "limit", 50, fmt.Sprintf("events to list (1..%d)", db.MaxModelSettingHistory))
 	ModelsCmd.AddCommand(showCmd, setCmd, unsetCmd, historyCmd)
@@ -445,10 +465,24 @@ func Set(ctx context.Context, out io.Writer, store Store, base *config.Config, s
 	if err != nil {
 		return err
 	}
+	if step == recipe.StepEmbed && !o.noProbe {
+		eff, err := base.WithStepSettings(s)
+		if err != nil {
+			return err
+		}
+		if err := probeEmbed(ctx, eff); err != nil {
+			return fmt.Errorf("models set embed refused (nothing stored): %w", err)
+		}
+	}
 	prev, stored, err := store.SetModelSetting(ctx, db.ModelSetting{
 		Step: s.Step, EndpointID: s.EndpointID, Model: s.Model,
 		ExpectedModel: s.ExpectedModel, Revision: s.Revision, Params: s.Params,
 	}, actor, o.note)
+	if errors.Is(err, db.ErrModelSettingUnchanged) {
+		_, _ = fmt.Fprintf(out, "%s: unchanged (already %s @ %s, set by %s); nothing written\n",
+			step, stored.Model, stored.EndpointID, stored.UpdatedBy)
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -458,7 +492,7 @@ func Set(ctx context.Context, out io.Writer, store Store, base *config.Config, s
 	}
 	_, _ = fmt.Fprintf(out, "%s: %s → %s @ %s (by %s)\n", step, before, stored.Model, stored.EndpointID, actor)
 	if step == recipe.StepEmbed {
-		_, _ = fmt.Fprintln(out, "note: the embed model must produce 768-dimension vectors. Existing chunks are not re-embedded;\n"+
+		_, _ = fmt.Fprintln(out, "note: Existing chunks are not re-embedded;\n"+
 			"      new chunks use this model (a new embed recipe) and search follows within 30 s.\n"+
 			"      Re-embed the library with: earmark requeue --reembed \"\" --yes")
 	}

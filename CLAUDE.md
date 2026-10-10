@@ -74,10 +74,10 @@ MCP_TRANSPORT=http ./earmark mcp  # HTTP transport on :8081
 # Precedence: per-run --endpoint/--model > model_settings row > env (AI_ENDPOINTS/AI_ROLES/MODELS_FILE).
 ./earmark models                                # effective endpoint/model/pins/source per step (+ invalid rows)
 ./earmark models set propose --model ollama/qwen3.8:27b-q8_0 --note "bake-off arm B"
-./earmark models set decide --endpoint ollama-clef --model clef-1.0.0
+./earmark models set decide --endpoint litellm-s1 --model clef:27b   # litellm-s1: systemone at the LiteLLM root (unified /v1/systemone); the /typesafe pass-through only serves jev-*
 ./earmark models unset decide                   # back to the env default
 ./earmark models history decide
-./earmark decide --sample 200 --seed q4 --endpoint ollama-clef --model clef-1.0.0  # this run only
+./earmark decide --sample 200 --seed q4 --endpoint litellm-s1 --model clef:27b  # this run only
 # decide / scan / eval each record their run in step_runs while it runs (CONTRACT §1.10):
 # watch the "Running now" panel (Pipeline + Models pages) or GET /api/v1/runs.
 

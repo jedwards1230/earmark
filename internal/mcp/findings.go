@@ -478,7 +478,7 @@ func (s *MCPServer) renderFindingsFragment(w http.ResponseWriter, r *http.Reques
 	data := findingsData{
 		Summary:          summary,
 		RenderedAt:       time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
-		EvalConfigured:   s.eval.configured,
+		EvalConfigured:   s.evalConfigured(r.Context()),
 		EvalSampleN:      defaultEvalSampleN,
 		ControlEnabled:   s.controlToken != "",
 		Groups:           groupFindings(matched),
@@ -570,7 +570,7 @@ func (s *MCPServer) evalGate(w http.ResponseWriter, r *http.Request) bool {
 		writeActionError(w, "eval is disabled: CONTROL_API_TOKEN is not configured")
 		return false
 	}
-	if !s.eval.configured || s.eval.run == nil {
+	if !s.evalConfigured(r.Context()) {
 		writeActionError(w, "no eval chat endpoint configured — see Models & Services")
 		return false
 	}

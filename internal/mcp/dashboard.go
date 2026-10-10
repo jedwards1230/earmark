@@ -2510,7 +2510,7 @@ func (s *MCPServer) renderBookFragmentWithNotice(w http.ResponseWriter, r *http.
 	}
 
 	d := bookData{Dir: dir, DirQuery: url.QueryEscape(dir), Tracks: tracks, Total: len(tracks),
-		EvalConfigured: s.eval.configured, EvalNotice: evalNotice}
+		EvalConfigured: s.evalConfigured(r.Context()), EvalNotice: evalNotice}
 	for _, t := range tracks {
 		switch t.Status {
 		case "pending":

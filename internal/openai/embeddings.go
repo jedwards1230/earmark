@@ -137,6 +137,29 @@ func (e *Embeddings) EmbedQuery(query string) ([]float32, error) {
 	return vecs[0], nil
 }
 
+// CheckDimension embeds one short query and verifies the endpoint returns
+// EmbeddingDimension values — the size of transcript_chunks.embedding. A
+// model of another size would fail every insert and every search, so a
+// runtime model setting is probed with this before it is used (CONTRACT
+// §2.20). ctx bounds the call.
+func (e *Embeddings) CheckDimension(ctx context.Context) error {
+	resp, err := e.c.CreateEmbeddings(ctx, openai.EmbeddingRequest{
+		Input: []string{"earmark embedding dimension probe"},
+		Model: openai.EmbeddingModel(e.model),
+	})
+	if err != nil {
+		return fmt.Errorf("probe embeddings model %q at %s: %w", e.model, e.baseURL, err)
+	}
+	if len(resp.Data) != 1 {
+		return fmt.Errorf("probe embeddings model %q at %s: got %d vectors for 1 input", e.model, e.baseURL, len(resp.Data))
+	}
+	if n := len(resp.Data[0].Embedding); n != EmbeddingDimension {
+		return fmt.Errorf("embeddings model %q returns %d-dimension vectors; transcript_chunks.embedding is vector(%d)",
+			e.model, n, EmbeddingDimension)
+	}
+	return nil
+}
+
 // embed is the shared embedding core. prefix is prepended to each input only
 // when this model wants task prefixes (modelWantsTaskPrefixes); otherwise inputs
 // are sent verbatim. Callers MUST pass the role-appropriate prefix (document vs

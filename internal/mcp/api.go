@@ -227,8 +227,8 @@ func apiRolesFrom(cards []roleCard, ev modelsEvidence) []apiRole {
 			Stale: c.Stale, CountsAsOf: asOf, CountsError: ev.SnapErr != nil, StaleAsOf: staleAsOf,
 		}
 		r.ModelSource, r.SettingUpdatedBy, r.SettingUpdatedAt = c.ModelSource, c.SettingBy, rfc3339Ptr(c.SettingAt)
-		if c.SettingError != "" {
-			e := truncateRunes(c.SettingError, maxAPIErrorLen)
+		if msg := cmp.Or(c.SettingError, c.SearchEmbedError); msg != "" {
+			e := truncateRunes(msg, maxAPIErrorLen)
 			r.SettingError = &e
 		}
 		if c.Key == "judge" && c.CountsKnown {

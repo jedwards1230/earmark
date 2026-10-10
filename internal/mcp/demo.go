@@ -1309,6 +1309,8 @@ func newDemoServer(addr, scenario string) *MCPServer {
 	// the scenario configured an eval endpoint in the first place.
 	if srv.eval.configured {
 		srv.eval.run = demoEvalRun(srv.db)
+	} else {
+		srv.eval.run = nil // the demo makes no live calls
 	}
 	return srv
 }

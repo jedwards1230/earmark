@@ -122,7 +122,7 @@ Examples:
   earmark decide --yes --shard 0/4               # one of four parallel runners
   earmark decide revert --recipe <id>            # preview the undo
   earmark decide revert --recipe <id> --yes
-  earmark decide --sample 200 --seed q4 --endpoint ollama-clef --model clef-1.0.0`,
+  earmark decide --sample 200 --seed q4 --endpoint litellm-s1 --model clef:27b`,
 	Run: runDecide,
 }
 

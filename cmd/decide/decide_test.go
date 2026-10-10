@@ -260,3 +260,46 @@ func TestRunUsesResolvedModel(t *testing.T) {
 		t.Errorf("args %q do not record the override", got)
 	}
 }
+
+// The bake-off runs `decide --model clef:27b` as a dry run in every mode
+// (sample, calibrate --human, rung-0 replay) and as --yes: the resolved model
+// reaches the report (and the recipe whenever one is registered) in each.
+// Overrides never write model_settings: run() has no settings store at all,
+// and ResolveStep only reads (db.TestResolveStep).
+func TestRunModelInEveryMode(t *testing.T) {
+	clef := decidepkg.Model{Alias: "clef:27b"}
+	modes := map[string]options{
+		"sample":       {sample: 84, seed: "bake", concurrency: 1, batch: 20, json: true, model: clef},
+		"calibrate":    {sample: 84, seed: "bake", concurrency: 1, batch: 20, json: true, calibrate: true, human: []string{"mcp", "cli"}, model: clef},
+		"rung0-only":   {sample: 84, seed: "bake", concurrency: 1, batch: 20, json: true, rung0Only: true, model: clef},
+		"yes (--live)": {sample: 100, seed: "s", concurrency: 1, batch: 20, json: true, yes: true, limit: 10, model: clef},
+	}
+	for name, o := range modes {
+		t.Run(name, func(t *testing.T) {
+			store := &modelSpy{}
+			var out bytes.Buffer
+			var asker decidepkg.Asker = noAsker{}
+			if o.rung0Only {
+				asker = nil
+			}
+			if err := run(context.Background(), &out, store, asker, o); err != nil {
+				t.Fatal(err)
+			}
+			var rep decidepkg.Report
+			if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+				t.Fatalf("report: %v\n%s", err, out.String())
+			}
+			if rep.Model != "clef:27b" {
+				t.Errorf("report model %q", rep.Model)
+			}
+			for _, r := range store.recipes {
+				if r.ModelAlias != "clef:27b" {
+					t.Errorf("registered a %s recipe", r.ModelAlias)
+				}
+			}
+			if o.rung0Only != (len(store.recipes) == 0) {
+				t.Errorf("registered %d recipes (rung0-only %v)", len(store.recipes), o.rung0Only)
+			}
+		})
+	}
+}

@@ -131,6 +131,14 @@ func (c *Config) ValidateStepSetting(s StepSetting) error {
 		if err := PinnedModel(model); err != nil {
 			return err
 		}
+		if err := CheckSystemOneRoute(ep, model); err != nil {
+			return err
+		}
+	}
+	for name, v := range map[string]string{"expected model": s.ExpectedModel, "revision": s.Revision} {
+		if strings.ContainsAny(strings.TrimSpace(v), " \t\r\n") {
+			return fmt.Errorf("%s %q contains whitespace", name, v)
+		}
 	}
 	if err := validatePinParams(s.Params); err != nil {
 		return fmt.Errorf("params%w", err)
@@ -179,7 +187,45 @@ func (c *Config) Clone() *Config {
 		maps.Copy(n.Models.Steps, c.Models.Steps)
 	}
 	n.stepSources = maps.Clone(c.stepSources)
+	if n.env == nil {
+		// c is the env config itself (no setting applied yet): remember its
+		// binding and pins, so a later setting equal to env restores them.
+		n.env = snapshotEnv(c)
+	}
 	return &n
+}
+
+// envStep is one setting step as the env config binds it.
+type envStep struct {
+	endpoint string // registered endpoint id ("" when unbound or EVAL_CHAT_*)
+	model    string
+	pin      ModelPin
+}
+
+// envSnapshot is the env binding of every setting step, shared read-only by
+// all clones derived from one env config.
+type envSnapshot map[string]envStep
+
+func snapshotEnv(c *Config) *envSnapshot {
+	snap := envSnapshot{}
+	for _, step := range SettingSteps {
+		e := envStep{pin: c.ModelPin(step)}
+		if ep, ok := c.StepEndpoint(step); ok {
+			e.endpoint, e.model = ep.ID, ep.Model
+		}
+		snap[step] = e
+	}
+	return &snap
+}
+
+// isEnvBinding reports whether a setting names exactly the env endpoint and
+// model of its step.
+func (c *Config) isEnvBinding(s StepSetting) (envStep, bool) {
+	if c.env == nil {
+		return envStep{}, false
+	}
+	e := (*c.env)[s.Step]
+	return e, e.endpoint != "" && e.endpoint == s.EndpointID && e.model == s.Model
 }
 
 // WithStepSettings returns a clone of c with each setting applied, in order
@@ -250,6 +296,15 @@ func (c *Config) applyStepSetting(s StepSetting) error {
 		id = derived.ID
 	}
 	c.bindRole(role, id)
+
+	if env, ok := c.isEnvBinding(s); ok && !s.HasPin() {
+		// Back to the env endpoint and model (an override undoing a db row,
+		// or a row equal to env): the env MODELS_FILE pin describes it again,
+		// so the recipe is the env recipe.
+		c.Models.Steps[s.Step] = env.pin
+		c.setStepSource(s.Step, s.source())
+		return nil
+	}
 
 	// The step's model changed (or the setting pins it): the env pin no longer
 	// describes it. The setting's pin replaces it wholesale; prompt_version

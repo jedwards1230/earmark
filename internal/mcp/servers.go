@@ -801,6 +801,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   <div class="server-state {{.Health.Class}}">{{.Health.Glyph}} {{.Health.Label}}</div>
   <div class="server-sub">{{.Health.Sub}}</div>
   {{if .AllowlistWarn}}<div class="server-sub err">✗ {{.Requested}} is not on earmark's LiteLLM key allowlist — every call 403s</div>{{end}}
+  {{if .SearchEmbedError}}<div class="server-sub err mono err-clamp" title="{{.SearchEmbedError}}">{{.SearchEmbedError}}</div>{{end}}
   {{if .SettingError}}<div class="server-sub err mono err-clamp" title="{{.SettingError}}">{{.SettingError}}</div>{{else if and .LastErrorShort (eq .Health.Token "failing")}}<div class="server-sub err mono err-clamp" title="{{.LastError}}">{{.LastErrorShort}}</div>{{end}}
   <dl class="role-kv">
   {{with .ActiveRun}}<dt>running</dt><dd><a href="#run-{{.ID}}" class="{{if .Stale}}err{{else}}run-link{{end}}">{{.Text}}</a></dd>{{end}}

@@ -202,6 +202,11 @@ type DB struct {
 	embedMu  sync.RWMutex
 	embedCfg *config.Config
 	embedKey string
+	// embedErr is the last refused embed swap (EmbedSettingError).
+	embedErr string
+	// embedProbe checks a new embeddings model before ApplyEmbedConfig
+	// swaps to it (vector dimension); nil skips the check (tests).
+	embedProbe func(context.Context, *openai.Embeddings) error
 }
 
 // New opens a PostgreSQL connection pool and runs schema migrations.
@@ -235,6 +240,7 @@ func New(cfg *config.Config) (*DB, error) {
 	}
 	db.embedRecipe = db.EmbedRecipe()
 	db.embedKey = embedConfigKey(cfg)
+	db.embedProbe = probeEmbedDimension
 
 	if err := db.initialize(context.Background()); err != nil {
 		pool.Close()

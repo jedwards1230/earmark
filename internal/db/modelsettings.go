@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -33,8 +34,13 @@ const ModelSettingsRefresh = 30 * time.Second
 // MaxModelSettingHistory caps one ModelSettingHistory read.
 const MaxModelSettingHistory = 1000
 
-// maxModelSettingText bounds every text column a setting carries.
-const maxModelSettingText = 256
+// maxModelSettingText bounds every text column a setting carries, and
+// maxModelSettingNote an event's note (both also CHECKed by the table, in
+// characters).
+const (
+	maxModelSettingText = 256
+	maxModelSettingNote = 512
+)
 
 // ModelSetting is one model_settings row.
 type ModelSetting struct {
@@ -141,33 +147,35 @@ func ResolveStep(ctx context.Context, r SettingsReader, base *config.Config, ste
 	return cfg.WithStepSettings(ov)
 }
 
-// WatchEmbedSettings keeps a search process's query embedder on the
-// effective embed setting (CONTRACT §2.20): it applies the embed row onto
-// base now and then every interval until ctx ends. A read error or an
-// invalid row keeps the embedder last applied (logged once per distinct
-// error) — the query side of search, unlike a pipeline step, has no run to
-// fail.
-func (db *DB) WatchEmbedSettings(ctx context.Context, base *config.Config, interval time.Duration) {
-	var lastErr string
-	apply := func() {
-		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		cfg, err := EffectiveConfig(cctx, db, base, recipe.StepEmbed)
-		if err != nil {
-			if err.Error() != lastErr {
-				db.log.Error("embed model setting not applied; search keeps its current embedder", "error", err)
-			}
-			lastErr = err.Error()
-			return
-		}
-		lastErr = ""
-		if db.ApplyEmbedConfig(cfg) {
-			ep, _ := cfg.EmbeddingsEndpoint()
-			db.log.Info("search embedder follows the embed model setting",
-				"endpoint", ep.ID, "model", ep.Model, "source", cfg.StepSource(recipe.StepEmbed))
-		}
+// ApplyEmbedSettings points this process's embedder at the effective embed
+// setting: base with the embed row of r applied (CONTRACT §2.20). A read
+// error, an invalid row or a failed dimension probe keeps the current
+// embedder and returns the error (also kept for EmbedSettingError, so the
+// Models page shows why search is not on the set model). Search processes
+// call it once before serving, then WatchEmbedSettings keeps it current.
+func (db *DB) ApplyEmbedSettings(ctx context.Context, r SettingsReader, base *config.Config) (changed bool, err error) {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cfg, err := EffectiveConfig(cctx, r, base, recipe.StepEmbed)
+	if err != nil {
+		db.setEmbedSettingErr(err.Error())
+		return false, err
 	}
-	apply()
+	changed, err = db.ApplyEmbedConfig(cfg)
+	if changed {
+		ep, _ := cfg.EmbeddingsEndpoint()
+		db.log.Info("search embedder follows the embed model setting",
+			"endpoint", ep.ID, "model", ep.Model, "source", cfg.StepSource(recipe.StepEmbed))
+	}
+	return changed, err
+}
+
+// WatchEmbedSettings re-applies the embed setting every interval until ctx
+// ends (ApplyEmbedSettings). Failures keep the embedder last applied and are
+// logged once per distinct error — the query side of search has no run to
+// fail.
+func (db *DB) WatchEmbedSettings(ctx context.Context, r SettingsReader, base *config.Config, interval time.Duration) {
+	var lastErr string
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -175,7 +183,14 @@ func (db *DB) WatchEmbedSettings(ctx context.Context, base *config.Config, inter
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			apply()
+		}
+		_, err := db.ApplyEmbedSettings(ctx, r, base)
+		switch {
+		case err == nil:
+			lastErr = ""
+		case err.Error() != lastErr:
+			lastErr = err.Error()
+			db.log.Error("embed model setting not applied; search keeps its current embedder", "error", err)
 		}
 	}
 }
@@ -237,11 +252,11 @@ const selectModelSettingForUpdateSQL = `
 
 const upsertModelSettingSQL = `
 	INSERT INTO model_settings (step, endpoint_id, model, expected_model, revision, params, updated_at, updated_by)
-	VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6::jsonb, now(), $7)
+	VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6::jsonb, clock_timestamp(), $7)
 	ON CONFLICT (step) DO UPDATE
 	SET endpoint_id = EXCLUDED.endpoint_id, model = EXCLUDED.model,
 	    expected_model = EXCLUDED.expected_model, revision = EXCLUDED.revision,
-	    params = EXCLUDED.params, updated_at = now(), updated_by = EXCLUDED.updated_by
+	    params = EXCLUDED.params, updated_at = clock_timestamp(), updated_by = EXCLUDED.updated_by
 	RETURNING updated_at`
 
 const deleteModelSettingSQL = `DELETE FROM model_settings WHERE step = $1`
@@ -272,7 +287,7 @@ func checkSettingText(step, actor string, s *ModelSetting) error {
 		return fmt.Errorf("%w: endpoint and model are required", ErrInvalidModelSetting)
 	}
 	for _, v := range []string{s.EndpointID, s.Model, s.ExpectedModel, s.Revision, actor} {
-		if len(v) > maxModelSettingText {
+		if utf8.RuneCountInString(v) > maxModelSettingText {
 			return fmt.Errorf("%w: value longer than %d bytes", ErrInvalidModelSetting, maxModelSettingText)
 		}
 	}
@@ -284,6 +299,7 @@ func checkSettingText(step, actor string, s *ModelSetting) error {
 // its registry (config.ValidateStepSetting). Returns the previous row (nil
 // when the env default was in effect) and the stored row.
 func (db *DB) SetModelSetting(ctx context.Context, s ModelSetting, actor, note string) (prev *ModelSetting, stored ModelSetting, err error) {
+	unchanged := false
 	s.Step, s.EndpointID, s.Model = strings.TrimSpace(s.Step), strings.TrimSpace(s.EndpointID), strings.TrimSpace(s.Model)
 	s.ExpectedModel, s.Revision = strings.TrimSpace(s.ExpectedModel), strings.TrimSpace(s.Revision)
 	if err := checkSettingText(s.Step, actor, &s); err != nil {
@@ -301,6 +317,12 @@ func (db *DB) SetModelSetting(ctx context.Context, s ModelSetting, actor, note s
 		if prev, err = lockAndReadSetting(ctx, tx, s.Step); err != nil {
 			return err
 		}
+		if prev != nil && sameSettingValue(prev.value(), s.value()) {
+			// Nothing changes: no write, no event (CLI says "unchanged").
+			s = *prev
+			unchanged = true
+			return nil
+		}
 		if err := tx.QueryRow(ctx, upsertModelSettingSQL, s.Step, s.EndpointID, s.Model, s.ExpectedModel,
 			s.Revision, string(rawParams), actor).Scan(&s.UpdatedAt); err != nil {
 			return fmt.Errorf("upsert model setting %s: %w", s.Step, err)
@@ -311,7 +333,22 @@ func (db *DB) SetModelSetting(ctx context.Context, s ModelSetting, actor, note s
 	if err != nil {
 		return nil, ModelSetting{}, err
 	}
+	if unchanged {
+		return prev, s, ErrModelSettingUnchanged
+	}
 	return prev, s, nil
+}
+
+// ErrModelSettingUnchanged is SetModelSetting's answer to a set equal to the
+// stored row: nothing was written (no event). prev and stored are the row.
+var ErrModelSettingUnchanged = errors.New("model setting unchanged")
+
+// sameSettingValue compares two setting values by their JSON form (params
+// decoded from the database are float64 like the CLI's).
+func sameSettingValue(a, b ModelSettingValue) bool {
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(ja) == string(jb)
 }
 
 // UnsetModelSetting deletes the step's row and appends an "unset" event, in
@@ -377,8 +414,8 @@ func appendSettingEvent(ctx context.Context, tx pgx.Tx, step, action string, pre
 	if err != nil {
 		return fmt.Errorf("encode new model setting: %w", err)
 	}
-	if r := []rune(note); len(r) > maxStepRunMsg {
-		note = string(r[:maxStepRunMsg])
+	if r := []rune(note); len(r) > maxModelSettingNote {
+		note = string(r[:maxModelSettingNote])
 	}
 	if _, err := tx.Exec(ctx, insertModelSettingEventSQL, step, action, oldV, newV, actor, note); err != nil {
 		return fmt.Errorf("record model setting event: %w", err)
@@ -386,12 +423,21 @@ func appendSettingEvent(ctx context.Context, tx pgx.Tx, step, action string, pre
 	return nil
 }
 
-const modelSettingHistorySQL = `
+// The history reads: one statement per shape, so the step filter can use
+// model_setting_events_step_idx under a cached generic plan.
+const (
+	modelSettingHistoryAllSQL = `
 	SELECT id, step, action, old_value, new_value, actor, COALESCE(note, ''), created_at
 	  FROM model_setting_events
-	 WHERE ($1 = '' OR step = $1)
+	 ORDER BY id DESC
+	 LIMIT $1`
+	modelSettingHistoryStepSQL = `
+	SELECT id, step, action, old_value, new_value, actor, COALESCE(note, ''), created_at
+	  FROM model_setting_events
+	 WHERE step = $1
 	 ORDER BY id DESC
 	 LIMIT $2`
+)
 
 // ModelSettingHistory returns the newest limit events (1..MaxModelSettingHistory),
 // newest first, for one step or every step ("").
@@ -399,7 +445,15 @@ func (db *DB) ModelSettingHistory(ctx context.Context, step string, limit int) (
 	if limit < 1 || limit > MaxModelSettingHistory {
 		return nil, fmt.Errorf("history limit must be 1..%d", MaxModelSettingHistory)
 	}
-	rows, err := db.pool.Query(ctx, modelSettingHistorySQL, step, limit)
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if step == "" {
+		rows, err = db.pool.Query(ctx, modelSettingHistoryAllSQL, limit)
+	} else {
+		rows, err = db.pool.Query(ctx, modelSettingHistoryStepSQL, step, limit)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("model setting history: %w", err)
 	}

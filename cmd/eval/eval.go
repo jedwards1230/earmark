@@ -182,8 +182,9 @@ func runEval(cmd *cobra.Command, args []string) {
 	cfg, err = db.ResolveStep(context.Background(), database, cfg, recipe.StepPropose,
 		opts.overrideEndpoint, opts.overrideModel)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+		// stderr: with --dump - stdout is the JSONL stream.
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
 	}
 	log.Print(cfg.DescribeStep(recipe.StepPropose))
 

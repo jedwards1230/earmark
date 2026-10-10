@@ -99,3 +99,59 @@ func TestDemoModelSettings(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, rows)
 }
+
+// settingsDemoDB is the demo DB with chosen model_settings rows.
+type settingsDemoDB struct {
+	demoDB
+	rows []db.ModelSetting
+}
+
+func (d settingsDemoDB) ListModelSettings(context.Context) ([]db.ModelSetting, error) {
+	return d.rows, nil
+}
+
+// Review regression: with no env judge, a valid propose row makes the judge
+// card configured and enables the "run eval" buttons; without the row they
+// stay off, and an invalid row does not enable them.
+func TestEvalConfiguredFollowsProposeSetting(t *testing.T) {
+	srv := newDemoServer(":0", "empty")
+	cfg := srv.cfg.Clone()
+	cfg.AIEndpoints = append(cfg.AIEndpoints, config.AIEndpoint{ID: "judge", Type: config.AIEndpointTypeChat,
+		BaseURL: "http://litellm.demo:4000/v1", Model: "anthropic/claude-haiku-5-5"})
+	srv.cfg = cfg
+	srv.eval.run = demoEvalRun(srv.db)
+	ctx := context.Background()
+
+	srv.db = settingsDemoDB{demoDB: demoDB{scenario: "empty"}}
+	assert.False(t, srv.evalConfigured(ctx))
+
+	srv.db = settingsDemoDB{demoDB: demoDB{scenario: "empty"}, rows: []db.ModelSetting{
+		{Step: recipe.StepPropose, EndpointID: "gone", Model: "x"}}}
+	assert.False(t, srv.evalConfigured(ctx), "an invalid row enables nothing")
+
+	srv.db = settingsDemoDB{demoDB: demoDB{scenario: "empty"}, rows: []db.ModelSetting{
+		{Step: recipe.StepPropose, EndpointID: "judge", Model: "ollama/qwen3.8:27b-q8_0", UpdatedBy: "cli:justin"}}}
+	assert.True(t, srv.evalConfigured(ctx))
+
+	em := srv.effectiveModels(ctx)
+	cards := buildRoleCards(roleInputs{Cfg: em.Cfg, Settings: em, Judge: srv.judgeConfig(), Now: time.Now(), ServersKnown: true})
+	for _, c := range cards {
+		if c.Key == "judge" {
+			assert.True(t, c.Configured)
+			assert.NotEqual(t, roleNotConfigured, c.Health.Token)
+			assert.Equal(t, config.SourceDB, c.ModelSource)
+		}
+	}
+}
+
+// A refused search-embedder swap is shown on the Embeddings card.
+func TestEmbedSwapErrorOnCard(t *testing.T) {
+	em := applyModelSettings(settingsCfg(), nil)
+	em.EmbedErr = `embeddings model "bge-m3" returns 1024-dimension vectors; transcript_chunks.embedding is vector(768)`
+	for _, c := range buildRoleCards(roleInputs{Cfg: em.Cfg, Settings: em, Now: time.Now(), ServersKnown: true}) {
+		if c.Key == "embeddings" {
+			assert.Equal(t, roleDegraded, c.Health.Token)
+			assert.Contains(t, c.SearchEmbedError, "1024-dimension")
+		}
+	}
+}

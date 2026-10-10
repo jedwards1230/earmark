@@ -639,29 +639,30 @@ empty table is the env behaviour.
 ```sql
 CREATE TABLE model_settings (
     step           TEXT        PRIMARY KEY,               -- propose | decide | scan | embed
-    endpoint_id    TEXT        NOT NULL,                  -- an AI_ENDPOINTS id (never a URL or key)
-    model          TEXT        NOT NULL,                  -- model id to request
-    expected_model TEXT,                                  -- pin; NULL = the requested model
-    revision       TEXT,                                  -- pin
+    endpoint_id    TEXT        NOT NULL,                  -- an AI_ENDPOINTS id (never a URL or key); ≤ 256
+    model          TEXT        NOT NULL,                  -- model id to request; ≤ 256
+    expected_model TEXT,                                  -- pin; NULL = the requested model ('' refused)
+    revision       TEXT,                                  -- pin; NULL = unpinned ('' refused)
     params         JSONB       NOT NULL DEFAULT '{}',     -- pin params, e.g. {"usd_per_mtok_in": 0.042}
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_by     TEXT        NOT NULL                   -- "cli:<user>"
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_by     TEXT        NOT NULL                   -- "cli:<user>"; ≤ 256
 );
 
 CREATE TABLE model_setting_events (                       -- append-only: UPDATE/DELETE refused by trigger
     id         BIGSERIAL   PRIMARY KEY,
-    step       TEXT        NOT NULL,
+    step       TEXT        NOT NULL,                      -- propose | decide | scan | embed
     action     TEXT        NOT NULL,                      -- set | unset
-    old_value  JSONB,                                     -- NULL = env default was in effect
-    new_value  JSONB,                                     -- NULL = unset
-    actor      TEXT        NOT NULL,
-    note       TEXT,
+    old_value  JSONB,                                     -- object; NULL = env default was in effect
+    new_value  JSONB,                                     -- object; NULL = unset
+    actor      TEXT        NOT NULL,                      -- ≤ 256
+    note       TEXT,                                      -- ≤ 512
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 -- index model_setting_events_step_idx: (step, id DESC)
 ```
 
-Each change writes the row and its event in one transaction. A row whose
+Each change writes the row and its event in one transaction; setting the
+stored value again writes nothing. A row whose
 endpoint is no longer in `AI_ENDPOINTS` is an error for its step (never a
 fallback): see CONTRACT §2.20. No foreign keys.
 

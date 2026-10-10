@@ -303,3 +303,76 @@ func TestDescribeStep(t *testing.T) {
 	c.AIRoles.Scan = ""
 	assert.Equal(t, "scan: off (unset)", c.DescribeStep(recipe.StepScan))
 }
+
+// Review regression: an override back to the env model after a db row must
+// restore the env MODELS_FILE pin (so the run stamps the env recipe and keeps
+// decide's price), not leave the step unpinned.
+func TestStepSettingsBackToEnvRestoresEnvPin(t *testing.T) {
+	base := settingsBase()
+	envPropose, envDecide := base.ModelPin(recipe.StepPropose), base.ModelPin(recipe.StepDecide)
+
+	c, err := base.WithStepSettings(
+		StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "ollama/qwen3.8:27b-q8_0"},
+		StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "anthropic/claude-haiku-5-5", Source: SourceOverride},
+		StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0"},
+		StepSetting{Step: recipe.StepDecide, EndpointID: "jev", Model: "jev-1.13.0", Source: SourceOverride},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, envPropose, c.ModelPin(recipe.StepPropose))
+	assert.Equal(t, envDecide, c.ModelPin(recipe.StepDecide))
+	p, ok := c.ModelPin(recipe.StepDecide).FloatParam(ParamUSDPerMTokIn)
+	assert.True(t, ok)
+	assert.Equal(t, 0.042, p)
+	ep, _ := c.EvalEndpoint()
+	assert.Equal(t, "judge", ep.ID, "bound to the registered endpoint again, no synthesized copy")
+	assert.Len(t, c.AIEndpoints, len(base.AIEndpoints))
+	assert.Equal(t, SourceOverride, c.StepSource(recipe.StepPropose))
+
+	// The override's own pins still win over env.
+	c, err = base.WithStepSettings(
+		StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "ollama/qwen3.8:27b-q8_0"},
+		StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "anthropic/claude-haiku-5-5", Revision: "r9", Source: SourceOverride},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ModelPin{Revision: "r9", PromptVersion: "judge@v2"}, c.ModelPin(recipe.StepPropose))
+}
+
+// Documented (CONTRACT §2.20): an override that changes only the endpoint,
+// keeping a pinned db row's model id, is a new binding — the row's pin does
+// not carry over (it pinned what the other endpoint serves).
+func TestStepSettingsEndpointOnlyOverrideUnpins(t *testing.T) {
+	c, err := settingsBase().WithStepSettings(
+		StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "qwen3.8", ExpectedModel: "qwen3.8:27b"},
+	)
+	require.NoError(t, err)
+	ov, ok, err := c.OverrideSetting(recipe.StepPropose, "ollama-chat", "qwen3.8")
+	require.NoError(t, err)
+	require.True(t, ok)
+	c, err = c.WithStepSettings(ov)
+	require.NoError(t, err)
+	assert.Equal(t, ModelPin{PromptVersion: "judge@v2"}, c.ModelPin(recipe.StepPropose))
+}
+
+func TestStepSettingsPinWhitespaceAndRoute(t *testing.T) {
+	base := settingsBase()
+	base.AIEndpoints = append(base.AIEndpoints,
+		AIEndpoint{ID: "litellm-jev", Type: AIEndpointTypeSystemOne, BaseURL: "http://litellm:4000/typesafe", Model: "jev-1.13.0"},
+		AIEndpoint{ID: "litellm-s1", Type: AIEndpointTypeSystemOne, BaseURL: "http://litellm:4000", Model: "jev-1.13.0"})
+	for _, s := range []StepSetting{
+		{Step: recipe.StepPropose, EndpointID: "judge", Model: "m", ExpectedModel: "a b"},
+		{Step: recipe.StepPropose, EndpointID: "judge", Model: "m", Revision: "r\t1"},
+		{Step: recipe.StepDecide, EndpointID: "litellm-jev", Model: "clef:27b"},
+	} {
+		_, err := base.WithStepSettings(s)
+		assert.Error(t, err, "%+v", s)
+	}
+	c, err := base.WithStepSettings(
+		StepSetting{Step: recipe.StepDecide, EndpointID: "litellm-s1", Model: "clef:27b"},
+		StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "m", ExpectedModel: " e "},
+	)
+	require.NoError(t, err)
+	ep, _ := c.DecideEndpoint()
+	assert.Equal(t, "clef:27b", ep.Model)
+	assert.Equal(t, "http://litellm:4000", ep.BaseURL, "the unified route: the client posts {base}/v1/systemone")
+	assert.Equal(t, "e", c.ModelPin(recipe.StepPropose).ExpectedModel)
+}

@@ -126,7 +126,7 @@ type Worker struct {
 // EmbedConfigurer is the optional DB capability that swaps the embeddings
 // client and embed recipe for a new effective config (*db.DB implements it).
 type EmbedConfigurer interface {
-	ApplyEmbedConfig(cfg *config.Config) bool
+	ApplyEmbedConfig(cfg *config.Config) (changed bool, err error)
 }
 
 // SetModelSettings makes the worker apply the model_settings rows (CONTRACT
@@ -298,14 +298,41 @@ func (w *Worker) applyConfig(eff *config.Config) error {
 		if key := judgeKey(eff); key != w.activeJudge {
 			chat, err := eval.ResolveChatClient(eval.ConfigSource(eff))
 			if err != nil {
-				return fmt.Errorf("propose step: %w", err)
+				src := eff.StepSource(recipe.StepPropose)
+				if src == config.SourceDB || src == config.SourceOverride || w.evalGatesEmbed {
+					// A row names this judge (or embedding waits on it):
+					// never run without it.
+					return fmt.Errorf("propose step: %w", err)
+				}
+				// Back on an env config with no usable judge (e.g. a propose
+				// row was unset): exactly NewWorker's env behaviour — inline
+				// eval off, embedding carries on.
+				w.judge, w.activeJudge = nil, key
+				w.log.Warn("in-pipeline eval disabled: the env config has no usable eval chat endpoint", "error", err)
+				return w.applyEmbed(eff)
 			}
 			w.judge = eval.NewJudgeForConfig(chat, eff)
 			w.activeJudge = key
 			w.log.Info("in-pipeline judge follows the model settings", "step", eff.DescribeStep(recipe.StepPropose))
 		}
 	}
-	if ec, ok := w.db.(EmbedConfigurer); ok && ec.ApplyEmbedConfig(eff) {
+	return w.applyEmbed(eff)
+}
+
+// applyEmbed points the embedder at eff's embed step. The DB probes a new
+// embedder's vector dimension before swapping (db.ApplyEmbedConfig); a
+// refused swap is an error, so the cycle idles rather than embedding with
+// a model the vector column cannot hold.
+func (w *Worker) applyEmbed(eff *config.Config) error {
+	ec, ok := w.db.(EmbedConfigurer)
+	if !ok {
+		return nil
+	}
+	changed, err := ec.ApplyEmbedConfig(eff)
+	if err != nil {
+		return fmt.Errorf("embed step: %w", err)
+	}
+	if changed {
 		w.log.Info("embedder follows the model settings", "step", eff.DescribeStep(recipe.StepEmbed))
 	}
 	return nil

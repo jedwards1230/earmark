@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -205,9 +206,25 @@ func TestSetUnset(t *testing.T) {
 	require.Error(t, err)
 	assert.Len(t, st.events, 1)
 
+	// embed: the dimension probe gates the write.
+	probed := 0
+	orig := probeEmbed
+	t.Cleanup(func() { probeEmbed = orig })
+	probeEmbed = func(context.Context, *config.Config) error {
+		probed++
+		return errors.New("embeddings model \"mxbai-embed-large\" returns 1024-dimension vectors; transcript_chunks.embedding is vector(768)")
+	}
+	err = Set(ctx, &buf, st, baseCfg(), "embed", setOptions{model: "mxbai-embed-large"}, "cli:justin")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nothing stored")
+	_, stored := st.rows["embed"]
+	assert.False(t, stored)
 	buf.Reset()
-	require.NoError(t, Set(ctx, &buf, st, baseCfg(), "embed", setOptions{model: "mxbai-embed-large"}, "cli:justin"))
-	assert.Contains(t, buf.String(), "768-dimension", "an embed change warns about the vector column and re-embedding")
+	require.NoError(t, Set(ctx, &buf, st, baseCfg(), "embed", setOptions{model: "mxbai-embed-large", noProbe: true}, "cli:justin"))
+	assert.Equal(t, 1, probed, "--no-probe skips the probe")
+	assert.Contains(t, buf.String(), "requeue --reembed", "an embed change warns about re-embedding")
+	probeEmbed = func(context.Context, *config.Config) error { return nil }
+	require.NoError(t, Set(ctx, &buf, st, baseCfg(), "embed", setOptions{endpoint: "embed-1"}, "cli:justin"))
 
 	buf.Reset()
 	require.NoError(t, Unset(ctx, &buf, st, baseCfg(), "decide", "back", "cli:justin"))
@@ -215,7 +232,7 @@ func TestSetUnset(t *testing.T) {
 	buf.Reset()
 	require.NoError(t, Unset(ctx, &buf, st, baseCfg(), "decide", "", "cli:justin"))
 	assert.Contains(t, buf.String(), "already on the env default")
-	assert.Len(t, st.events, 3, "a no-op unset records nothing")
+	assert.Len(t, st.events, 4, "a no-op unset records nothing")
 }
 
 func TestHistory(t *testing.T) {

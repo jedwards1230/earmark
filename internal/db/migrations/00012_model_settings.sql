@@ -20,26 +20,36 @@ CREATE TABLE model_settings (
     step           TEXT        PRIMARY KEY
                    CONSTRAINT model_settings_step_valid CHECK (step IN ('propose', 'decide', 'scan', 'embed')),
     endpoint_id    TEXT        NOT NULL
-                   CONSTRAINT model_settings_endpoint_nonempty CHECK (endpoint_id <> ''),
+                   CONSTRAINT model_settings_endpoint_valid CHECK (endpoint_id <> '' AND char_length(endpoint_id) <= 256),
     model          TEXT        NOT NULL
-                   CONSTRAINT model_settings_model_nonempty CHECK (model <> ''),
-    expected_model TEXT,
-    revision       TEXT,
+                   CONSTRAINT model_settings_model_valid CHECK (model <> '' AND char_length(model) <= 256),
+    -- NULL is the only "unpinned": an empty pin is refused.
+    expected_model TEXT
+                   CONSTRAINT model_settings_expected_model_valid CHECK (expected_model <> '' AND char_length(expected_model) <= 256),
+    revision       TEXT
+                   CONSTRAINT model_settings_revision_valid CHECK (revision <> '' AND char_length(revision) <= 256),
     params         JSONB       NOT NULL DEFAULT '{}'::jsonb
                    CONSTRAINT model_settings_params_object CHECK (jsonb_typeof(params) = 'object'),
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- clock_timestamp(), like the event's created_at: one clock for both.
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_by     TEXT        NOT NULL
+                   CONSTRAINT model_settings_updated_by_valid CHECK (updated_by <> '' AND char_length(updated_by) <= 256)
 );
 
 CREATE TABLE model_setting_events (
     id         BIGSERIAL   PRIMARY KEY,
-    step       TEXT        NOT NULL,
+    step       TEXT        NOT NULL
+               CONSTRAINT model_setting_events_step_valid CHECK (step IN ('propose', 'decide', 'scan', 'embed')),
     action     TEXT        NOT NULL
                CONSTRAINT model_setting_events_action_valid CHECK (action IN ('set', 'unset')),
-    old_value  JSONB,      -- the row before (NULL: the env default was in effect)
-    new_value  JSONB,      -- the row after (NULL: unset, back to the env default)
-    actor      TEXT        NOT NULL,
-    note       TEXT,
+    old_value  JSONB       -- the row before (NULL: the env default was in effect)
+               CONSTRAINT model_setting_events_old_object CHECK (jsonb_typeof(old_value) = 'object'),
+    new_value  JSONB       -- the row after (NULL: unset, back to the env default)
+               CONSTRAINT model_setting_events_new_object CHECK (jsonb_typeof(new_value) = 'object'),
+    actor      TEXT        NOT NULL
+               CONSTRAINT model_setting_events_actor_valid CHECK (actor <> '' AND char_length(actor) <= 256),
+    note       TEXT
+               CONSTRAINT model_setting_events_note_length CHECK (char_length(note) <= 512),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT model_setting_events_shape CHECK (
         (action = 'set' AND new_value IS NOT NULL) OR (action = 'unset' AND new_value IS NULL)

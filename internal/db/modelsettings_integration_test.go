@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/recipe"
@@ -44,10 +45,21 @@ func TestIntegrationModelSettings(t *testing.T) {
 	if _, _, err := d.SetModelSetting(ctx, ModelSetting{Step: "propose", EndpointID: "judge", Model: "ollama/qwen3.8:27b-q8_0"}, "cli:justin", ""); err != nil {
 		t.Fatal(err)
 	}
+	// Setting the stored value again writes nothing and records no event.
+	if _, stored, err := d.SetModelSetting(ctx, ModelSetting{Step: "propose", EndpointID: "judge", Model: "ollama/qwen3.8:27b-q8_0"}, "cli:other", ""); !errors.Is(err, ErrModelSettingUnchanged) || stored.UpdatedBy != "cli:justin" {
+		t.Fatalf("no-op set: err %v stored %+v", err, stored)
+	}
 
 	rows, err = d.ListModelSettings(ctx)
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("rows = %+v, %v", rows, err)
+	}
+	var eventAt time.Time
+	if err := d.pool.QueryRow(ctx, `SELECT max(created_at) FROM model_setting_events WHERE step = 'decide'`).Scan(&eventAt); err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].UpdatedAt.After(eventAt) {
+		t.Errorf("row updated_at %v after its event %v: one clock expected", rows[0].UpdatedAt, eventAt)
 	}
 	if r := rows[0]; r.Step != "decide" || r.Model != "jev-1.14.0" || r.ExpectedModel != "typesafe/jev-1.14.0" ||
 		r.Revision != "r9" || r.Params != nil || r.UpdatedBy != "cli:carol" {
@@ -114,6 +126,12 @@ func TestIntegrationModelSettings(t *testing.T) {
 		`INSERT INTO model_settings (step, endpoint_id, model, updated_by) VALUES ('scan', '', 'm', 'x')`,
 		`INSERT INTO model_settings (step, endpoint_id, model, params, updated_by) VALUES ('scan', 'e', 'm', '[]', 'x')`,
 		`INSERT INTO model_setting_events (step, action, new_value, actor) VALUES ('scan', 'unset', '{}', 'x')`,
+		`INSERT INTO model_setting_events (step, action, new_value, actor) VALUES ('asr', 'set', '{}', 'x')`,
+		`INSERT INTO model_setting_events (step, action, new_value, actor) VALUES ('scan', 'set', '[]', 'x')`,
+		`INSERT INTO model_settings (step, endpoint_id, model, expected_model, updated_by) VALUES ('scan', 'e', 'm', '', 'x')`,
+		`INSERT INTO model_settings (step, endpoint_id, model, revision, updated_by) VALUES ('scan', 'e', 'm', '', 'x')`,
+		`INSERT INTO model_settings (step, endpoint_id, model, updated_by) VALUES ('scan', 'e', repeat('m', 257), 'x')`,
+		`INSERT INTO model_settings (step, endpoint_id, model, updated_by) VALUES ('scan', 'e', 'm', '')`,
 	} {
 		if _, err := d.pool.Exec(ctx, sql); err == nil {
 			t.Errorf("accepted: %s", sql)
@@ -213,10 +231,12 @@ func TestIntegrationModelSettingRecipes(t *testing.T) {
 	}
 
 	// The process follows the setting: chunks are stamped with its recipe.
-	if !d.ApplyEmbedConfig(eff) {
-		t.Fatal("ApplyEmbedConfig saw no change")
+	// (No live embeddings endpoint here: skip the dimension probe.)
+	d.embedProbe = nil
+	if changed, err := d.ApplyEmbedConfig(eff); !changed || err != nil {
+		t.Fatalf("ApplyEmbedConfig: changed %v err %v", changed, err)
 	}
-	if d.ApplyEmbedConfig(eff) {
+	if changed, _ := d.ApplyEmbedConfig(eff); changed {
 		t.Error("re-applying the same config reported a change")
 	}
 	if got := mustID(t, d.currentEmbedRecipe()); got != dbID {
@@ -234,7 +254,9 @@ func TestIntegrationModelSettingRecipes(t *testing.T) {
 	if got := mustID(t, EmbedRecipeFor(back)); got != envID {
 		t.Errorf("after unset the embed recipe is %s, want the env %s", got, envID)
 	}
-	d.ApplyEmbedConfig(back)
+	if _, err := d.ApplyEmbedConfig(back); err != nil {
+		t.Fatal(err)
+	}
 	if got := mustID(t, d.currentEmbedRecipe()); got != envID {
 		t.Errorf("after unset the chunk stamp is %s, want the env %s", got, envID)
 	}

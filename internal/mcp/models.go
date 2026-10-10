@@ -224,6 +224,9 @@ type roleCard struct {
 	// updated_at (zero without a row).
 	SettingBy string
 	SettingAt time.Time
+	// SearchEmbedError (Embeddings only) is why search did not switch to the
+	// effective embed model (CONTRACT §2.20); "" when it did.
+	SearchEmbedError string
 	// EndpointLabel names the registered endpoint when EndpointID is one a
 	// runtime setting synthesized ("litellm-judge" for
 	// "litellm-judge@propose"); "" = EndpointID.
@@ -414,6 +417,9 @@ func buildJudgeCard(c *roleCard, in roleInputs) {
 	probe := "" // "" = not probed (env-sourced judge, or none)
 	host := in.Judge.Host
 	if ep, ok := evalEndpoint(in.Cfg); ok {
+		// A registry judge — the env binding or a propose model setting
+		// (CONTRACT §2.20) — is configured even with no env judge at startup.
+		c.Configured = true
 		c.EndpointID, c.Requested = ep.ID, ep.Model
 		if v := findEndpointView(in.Endpoints, ep.ID); v != nil {
 			probe, host = v.StateToken, v.HostOnly

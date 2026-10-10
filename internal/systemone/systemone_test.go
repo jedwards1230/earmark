@@ -43,6 +43,25 @@ func TestDecodeResponseDocumentedShapes(t *testing.T) {
 	}
 }
 
+// LiteLLM's unified POST /v1/systemone rebuilds the reply: usage gains
+// cached_tokens / cache_write_tokens (decoded without error), and a refused
+// answer is dropped from "answers" (a DecodeError, never a crash).
+func TestDecodeResponseUnifiedRoute(t *testing.T) {
+	req := Request{Model: "clef:27b", State: "s", Questions: map[string]Question{"a": noulQ}}
+	body := `{"model":"clef:27b","answers":{"a":` + docNoul + `},` +
+		`"usage":{"input_tokens":391,"output_tokens":67,"cached_tokens":128,"cache_write_tokens":0}}`
+	got, err := decodeResponse([]byte(body), req)
+	if err != nil || got.Usage.InputTokens != 391 || *got.Answers["a"].Noul != 0.99 {
+		t.Fatalf("unified reply: %+v, %v", got, err)
+	}
+	refused := `{"model":"clef:27b","answers":{},"usage":{"input_tokens":391,"output_tokens":0,"cached_tokens":0}}`
+	_, err = decodeResponse([]byte(refused), req)
+	var de *DecodeError
+	if !errors.As(err, &de) {
+		t.Fatalf("refused answer: %v, want a DecodeError", err)
+	}
+}
+
 func TestDecodeResponseStrict(t *testing.T) {
 	one := func(q Question) Request {
 		return Request{Model: "jev-1.13.0", State: "s", Questions: map[string]Question{"q": q}}

@@ -23,6 +23,7 @@ type settingsDB struct {
 	readErr error
 	applied []string // the embed model of each ApplyEmbedConfig that changed it
 	cur     string
+	refuse  string // an embed model whose dimension probe fails
 }
 
 func (s *settingsDB) ListModelSettings(context.Context) ([]db.ModelSetting, error) {
@@ -31,14 +32,17 @@ func (s *settingsDB) ListModelSettings(context.Context) ([]db.ModelSetting, erro
 	return s.rows, s.readErr
 }
 
-func (s *settingsDB) ApplyEmbedConfig(cfg *config.Config) bool {
+func (s *settingsDB) ApplyEmbedConfig(cfg *config.Config) (bool, error) {
 	ep, _ := cfg.EmbeddingsEndpoint()
 	if ep.Model == s.cur {
-		return false
+		return false, nil
+	}
+	if ep.Model == s.refuse {
+		return false, errors.New("returns 1024-dimension vectors; transcript_chunks.embedding is vector(768)")
 	}
 	s.cur = ep.Model
 	s.applied = append(s.applied, ep.Model)
-	return true
+	return true, nil
 }
 
 func settingsWorkerCfg() *config.Config {
@@ -143,4 +147,50 @@ func TestCycleConfigWithoutSettings(t *testing.T) {
 	cfg, ok := w.cycleConfig(base)
 	require.True(t, ok)
 	require.Same(t, base, cfg)
+}
+
+// A refused embedder swap (dimension probe) idles the cycle and keeps the
+// previous embedder.
+func TestCycleConfigRefusedEmbedSwapIdles(t *testing.T) {
+	base := settingsWorkerCfg()
+	sdb := &settingsDB{cur: "nomic-embed-text", refuse: "mxbai-embed-large"}
+	w := NewWorker(&queue.Queue{}, sdb, base)
+	w.SetModelSettings(sdb, nil)
+	sdb.rows = []db.ModelSetting{{Step: recipe.StepEmbed, EndpointID: "embed-2", Model: "mxbai-embed-large"}}
+	_, ok := w.cycleConfig(base)
+	require.False(t, ok)
+	require.Empty(t, sdb.applied)
+}
+
+// Review regression: with no usable env judge, setting then unsetting a
+// propose row must leave the worker embedding (inline eval off), exactly as
+// before the row existed — not idle until a restart.
+func TestCycleConfigUnsetProposeWithoutEnvJudge(t *testing.T) {
+	t.Setenv("EVAL_CHAT_BASE_URL", "")
+	t.Setenv("EVAL_CHAT_MODEL", "")
+	base := settingsWorkerCfg()
+	base.AIRoles.Eval = "" // no env judge
+	sdb := &settingsDB{cur: "nomic-embed-text"}
+	w := NewWorker(&queue.Queue{}, sdb, base)
+	w.SetModelSettings(sdb, nil)
+	require.Nil(t, w.judge)
+
+	_, ok := w.cycleConfig(base)
+	require.True(t, ok, "env with no judge embeds")
+
+	sdb.rows = []db.ModelSetting{{Step: recipe.StepPropose, EndpointID: "judge", Model: "ollama/qwen3.8:27b-q8_0"}}
+	_, ok = w.cycleConfig(base)
+	require.True(t, ok)
+	require.NotNil(t, w.judge)
+
+	sdb.rows = nil
+	_, ok = w.cycleConfig(base)
+	require.True(t, ok, "after unset the worker must keep embedding")
+	require.Nil(t, w.judge, "inline eval back off")
+
+	// The same failure under EVAL_GATES_EMBED, or for a row-named judge, idles.
+	w.evalGatesEmbed = true
+	sdb.rows = []db.ModelSetting{{Step: recipe.StepPropose, EndpointID: "judge", Model: "x"}}
+	_, ok = w.cycleConfig(base)
+	require.True(t, ok, "a resolvable row judge runs")
 }
