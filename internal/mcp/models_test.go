@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1058,4 +1059,46 @@ func TestFnRolesErrIsBestEffort(t *testing.T) {
 		assert.Equal(t, roleUnknown, c.Health.Token, c.Key)
 		assert.Contains(t, c.Health.Sub, "call outcomes unavailable", c.Key)
 	}
+}
+
+// countingStatsDB counts GetServiceStatus calls and can be slow.
+type countingStatsDB struct {
+	SimpleMockDB
+	calls atomic.Int64
+	delay time.Duration
+}
+
+func (c *countingStatsDB) GetServiceStatus(ctx context.Context) (*db.QueueStats, error) {
+	c.calls.Add(1)
+	select {
+	case <-time.After(c.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return c.SimpleMockDB.GetServiceStatus(ctx)
+}
+
+// TestServersData_QueueStatsCached: the Models page no longer runs the queue
+// stats (a full count of transcript_chunks) on every poll. Repeated polls
+// within the TTL share one load, a slow first load is cut at
+// queueStatsFirstWait (the page still renders 200, inside the 5 s htmx
+// timeout), and the runner-update POST still reads live stats.
+func TestServersData_QueueStatsCached(t *testing.T) {
+	d := &countingStatsDB{}
+	srv := NewMCPServer(d, &config.Config{})
+	mux := srv.buildMux()
+	for i := 0; i < 5; i++ {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers/data", nil))
+		require.Equal(t, http.StatusOK, w.Code)
+	}
+	assert.Equal(t, int64(1), d.calls.Load(), "five polls within the TTL load the stats once")
+
+	slow := &countingStatsDB{delay: 4 * time.Second}
+	srv = NewMCPServer(slow, &config.Config{})
+	w := httptest.NewRecorder()
+	start := time.Now()
+	srv.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers/data", nil))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Less(t, time.Since(start), queueStatsFirstWait+time.Second, "a slow first load must not hold the poll")
 }
