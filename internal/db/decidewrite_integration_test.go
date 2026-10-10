@@ -37,6 +37,13 @@ func workIDs(t *testing.T, d *DB, s DecideWorkScope) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The progress total counts exactly the list the pages return (without
+	// a cursor: DecideWorkCount ignores After).
+	if s.After == "" {
+		if n, err := d.DecideWorkCount(context.Background(), s); err != nil || n != len(fs) {
+			t.Errorf("DecideWorkCount = %d, %v; DecideWork returned %d", n, err, len(fs))
+		}
+	}
 	var out []string
 	for _, f := range fs {
 		out = append(out, f.ID)
