@@ -99,6 +99,11 @@ type DBInterface interface {
 	FindingsByModel(ctx context.Context) ([]db.FindingsModelCount, error)
 	FnRoleActivity(ctx context.Context) ([]db.FnRoleActivity, error)
 	ASRProvenanceGroups(ctx context.Context, limit int) ([]db.ASRProvenanceGroup, error)
+	// StepRuns lists the ad-hoc step runs (CONTRACT §1.10): at most
+	// activeLimit open ones and recentLimit others, newest first — the
+	// "Running now" panel, the role cards' active-run link and GET
+	// /api/v1/runs. Two index-backed LIMIT queries.
+	StepRuns(ctx context.Context, activeLimit, recentLimit int) (db.StepRunList, error)
 	// GetFindingsSummary returns the read-only eval-layer findings rollup
 	// (totals, confidence buckets, issue-type tally, per-book) for the /findings
 	// dashboard page (CONTRACT §2.15).

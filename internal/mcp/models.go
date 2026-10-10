@@ -187,7 +187,10 @@ type roleCard struct {
 	// recipe) or unavailable. StaleKnown says the stale snapshot has loaded
 	// (it is cached separately, 5 min); StalePending says its first load is
 	// still running.
-	Stale        *int64
+	Stale *int64
+	// ActiveRun links the card to its step's newest open run in the
+	// "Running now" panel (CONTRACT §1.10); nil when none.
+	ActiveRun    *roleRunLink
 	StaleTracked bool
 	StaleKnown   bool
 	StalePending bool

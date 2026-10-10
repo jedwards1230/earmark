@@ -186,6 +186,10 @@ func (m *MockDBInterface) FnRoleActivity(context.Context) ([]db.FnRoleActivity, 
 	return nil, nil
 }
 
+func (m *MockDBInterface) StepRuns(context.Context, int, int) (db.StepRunList, error) {
+	return db.StepRunList{}, nil
+}
+
 func (m *MockDBInterface) ASRProvenanceGroups(context.Context, int) ([]db.ASRProvenanceGroup, error) {
 	return nil, nil
 }

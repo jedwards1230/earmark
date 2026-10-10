@@ -523,6 +523,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 var serversPage = mustPage(`{{define "content"}}
 <p class="subtitle">Each pipeline role: what is configured, what actually answered, whether it is healthy, and how much output predates the current recipe.</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
+` + runsRegion + `
 <div id="models-region"
      hx-get="/servers/data" hx-trigger="load, every 5s" hx-swap="innerHTML"
      hx-sync="this:replace" hx-config='{"timeout": 5000}' hx-status:5xx="swap:none"
@@ -802,6 +803,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   {{if .AllowlistWarn}}<div class="server-sub err">✗ {{.Requested}} is not on earmark's LiteLLM key allowlist — every call 403s</div>{{end}}
   {{if and .LastErrorShort (eq .Health.Token "failing")}}<div class="server-sub err mono err-clamp" title="{{.LastError}}">{{.LastErrorShort}}</div>{{end}}
   <dl class="role-kv">
+  {{with .ActiveRun}}<dt>running</dt><dd><a href="#run-{{.ID}}" class="{{if .Stale}}err{{else}}run-link{{end}}">{{.Text}}</a></dd>{{end}}
   {{if .HasModel}}
     <dt>requested</dt><dd>{{if .Requested}}<span class="mono">{{.Requested}}</span>{{if .EndpointID}} <span class="time-muted">@ {{.EndpointID}}</span>{{end}}{{else}}—{{end}}</dd>
     {{if .Expected}}<dt>pinned</dt><dd><span class="mono">{{.Expected}}</span>{{with .ExpectedRevisionShort}} <span class="time-muted">· rev {{.}}</span>{{end}}{{if eq .Key "asr"}} <span class="time-muted">· recorded only</span>{{end}}</dd>{{end}}
@@ -959,6 +961,7 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 	eps := buildEndpointViews(s.cfg, s.probeEndpoints(ctx))
 	gws, targets, gwByEndpoint := s.probeGateways(ctx)
 	roles, ev := s.modelRoles(ctx, stats, runners, true, eps, gwByEndpoint, now)
+	s.attachRoleRuns(ctx, roles)
 
 	data := modelsData{
 		RenderedAt:   now.UTC().Format("15:04:05 UTC"),

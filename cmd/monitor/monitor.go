@@ -92,6 +92,7 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	tel.StartStaleRefresh(staleItemsInterval, 30*time.Second, database.StaleItemCounts)
 	tel.StartQualityRefresh(qualityIndexInterval, 30*time.Second, qualityIndex(database))
 	tel.StartDecisionsRefresh(decisionsInterval, 30*time.Second, decisionCounts(database))
+	tel.StartStepRunsRefresh(stepRunsInterval, 10*time.Second, stepRunStats(database))
 
 	// Once the runner reports a file's embedded ASIN tag, re-derive that
 	// book's metadata so the tag is applied as soon as it exists.
@@ -171,6 +172,11 @@ const qualityIndexInterval = 5 * time.Minute
 // plenty; one count is a single aggregate.
 const decisionsInterval = 5 * time.Minute
 
+// stepRunsInterval is how often the earmark_step_run_* series are re-read
+// from step_runs: often enough to follow a run, cheap (two index-backed reads
+// and a scan of a small table).
+const stepRunsInterval = 15 * time.Second
+
 // decisionCounts loads earmark_decisions (CONTRACT §2.16, §2.19).
 func decisionCounts(database *db.DB) func(context.Context) ([]telemetry.DecisionCount, error) {
 	return func(ctx context.Context) ([]telemetry.DecisionCount, error) {
@@ -183,6 +189,28 @@ func decisionCounts(database *db.DB) func(context.Context) ([]telemetry.Decision
 			out = append(out, telemetry.DecisionCount{
 				Outcome: c.Outcome, IssueType: c.IssueType, Evidence: c.Evidence, Recipe: c.Recipe, N: c.N,
 			})
+		}
+		return out, nil
+	}
+}
+
+// stepRunStats loads the earmark_step_run_* series from step_runs (CONTRACT
+// §1.10, §2.16).
+func stepRunStats(database *db.DB) func(context.Context) (telemetry.StepRunStats, error) {
+	return func(ctx context.Context) (telemetry.StepRunStats, error) {
+		s, err := database.StepRunStats(ctx)
+		if err != nil {
+			return telemetry.StepRunStats{}, err
+		}
+		var out telemetry.StepRunStats
+		for _, a := range s.Active {
+			out.Active = append(out.Active, telemetry.StepRunActive{Step: a.Step, Mode: a.Mode, N: a.N})
+		}
+		for _, p := range s.Progress {
+			out.Progress = append(out.Progress, telemetry.StepRunProgress{Step: p.Step, Ratio: p.Ratio})
+		}
+		for _, i := range s.Items {
+			out.Items = append(out.Items, telemetry.StepRunItems{Step: i.Step, Outcome: i.Outcome, N: i.N})
 		}
 		return out, nil
 	}

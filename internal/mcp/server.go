@@ -468,6 +468,7 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/track/segments", getOnly(s.handleTrackSegments))
 	mux.HandleFunc("/servers", getOnly(s.handleServersPage))
 	mux.HandleFunc("/servers/data", getOnly(s.handleServersData))
+	mux.HandleFunc("/runs/data", getOnly(s.handleRunsData))
 	mux.HandleFunc("/findings", getOnly(s.handleFindingsPage))
 	mux.HandleFunc("/findings/data", getOnly(s.handleFindingsData))
 
