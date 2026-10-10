@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -195,6 +196,12 @@ type DB struct {
 	meta metaprovider.MetadataProvider
 	// embedRecipe stamps every chunk InsertChunks writes (CONTRACT §1.9).
 	embedRecipe recipe.Recipe
+	// embedMu guards e, embedRecipe, embedCfg and embedKey, which
+	// ApplyEmbedConfig swaps when a runtime embed setting changes (CONTRACT
+	// §2.20). embedCfg nil = cfg.
+	embedMu  sync.RWMutex
+	embedCfg *config.Config
+	embedKey string
 }
 
 // New opens a PostgreSQL connection pool and runs schema migrations.
@@ -227,6 +234,7 @@ func New(cfg *config.Config) (*DB, error) {
 		meta: metaprovider.New(cfg),
 	}
 	db.embedRecipe = db.EmbedRecipe()
+	db.embedKey = embedConfigKey(cfg)
 
 	if err := db.initialize(context.Background()); err != nil {
 		pool.Close()
@@ -868,7 +876,7 @@ func (db *DB) insertChunks(ctx context.Context, b txBeginner, chunks []Chunk) er
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	recipeID, err := registerRecipe(ctx, tx, db.embedRecipe)
+	recipeID, err := registerRecipe(ctx, tx, db.currentEmbedRecipe())
 	if err != nil {
 		return fmt.Errorf("chunk recipe: %w", err)
 	}
@@ -970,13 +978,13 @@ func getStoredChunkHashes(ctx context.Context, q rowQuerier, transcriptID string
 // each input is prefixed with "search_document: ". Never use this for a search
 // query (use EmbedQuery) — the two embedding sides must diverge.
 func (db *DB) EmbedDocuments(texts []string) ([][]float32, error) {
-	return db.e.EmbedDocuments(texts)
+	return db.embedder().EmbedDocuments(texts)
 }
 
 // EmbedDocumentsWithUsage is EmbedDocuments plus the provider-reported token
 // usage (which Ollama may leave zeroed).
 func (db *DB) EmbedDocumentsWithUsage(texts []string) ([][]float32, openai.EmbeddingUsage, error) {
-	return db.e.EmbedDocumentsWithUsage(texts)
+	return db.embedder().EmbedDocumentsWithUsage(texts)
 }
 
 // EmbedQuery delegates to the openai.Embeddings client's QUERY path — a single
@@ -984,7 +992,7 @@ func (db *DB) EmbedDocumentsWithUsage(texts []string) ([][]float32, openai.Embed
 // prefixed with "search_query: ". Never use this to embed a stored passage (use
 // EmbedDocuments).
 func (db *DB) EmbedQuery(query string) ([]float32, error) {
-	return db.e.EmbedQuery(query)
+	return db.embedder().EmbedQuery(query)
 }
 
 // ─── Run metrics (per-run observability, CONTRACT §1.5) ──────────────────────
@@ -1339,7 +1347,7 @@ func decodeChapters(chaptersJSON []byte) ([]metaprovider.Chapter, error) {
 
 // Search performs a vector-similarity search over transcript_chunks.
 func (db *DB) Search(ctx context.Context, query string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	vec, err := db.e.EmbedQuery(query)
+	vec, err := db.embedder().EmbedQuery(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
@@ -1407,7 +1415,7 @@ var searchInBookSQL = `
 // book's chunks — see searchInBookSQL for why HNSW is bypassed here. dir must be
 // an exact book_dir as returned by GetBookSummaries.
 func (db *DB) SearchInBook(ctx context.Context, query, dir string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	vec, err := db.e.EmbedQuery(query)
+	vec, err := db.embedder().EmbedQuery(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
@@ -4378,6 +4386,8 @@ func scanIDPaths(rows pgx.Rows) (ids, paths []string, err error) {
 // TestResetRebuildsFreshSchema (integration) fails if one survives.
 var resetSQL = `
 	DROP VIEW     IF EXISTS stale_work;
+	DROP TABLE    IF EXISTS model_setting_events CASCADE;
+	DROP TABLE    IF EXISTS model_settings      CASCADE;
 	DROP TABLE    IF EXISTS step_runs           CASCADE;
 	DROP TABLE    IF EXISTS recipe_builds       CASCADE;
 	DROP TABLE    IF EXISTS chunk_scan          CASCADE;
@@ -4397,6 +4407,7 @@ var resetSQL = `
 	DROP FUNCTION IF EXISTS transcription_jobs_set_completed_at() CASCADE;
 	DROP FUNCTION IF EXISTS finding_events_record_transition()    CASCADE;
 	DROP FUNCTION IF EXISTS finding_events_append_only()          CASCADE;
+	DROP FUNCTION IF EXISTS model_setting_events_append_only()    CASCADE;
 	DROP TABLE    IF EXISTS goose_db_version;
 `
 

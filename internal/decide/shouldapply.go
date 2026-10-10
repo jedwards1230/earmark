@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/fn"
 	"github.com/jedwards1230/earmark/internal/genai"
@@ -170,17 +171,67 @@ func (p ShouldApplyParams) recipeParams() map[string]any {
 	}
 }
 
-// ShouldApplyFn returns the should_apply function for params.
+// Model is the decision model should_apply asks: the model id requested
+// (Alias), the model expected to answer ("" = Alias) and its revision pin.
+// They are the decide recipe's model fields, so another model — e.g. a
+// runtime model setting (CONTRACT §2.20) choosing another System One
+// model — is another recipe. The zero value is DefaultModel.
+type Model struct {
+	Alias    string
+	Expected string
+	Revision string
+}
+
+// DefaultModel is should_apply's built-in model, ShouldApplyModel, unpinned.
+func DefaultModel() Model { return Model{Alias: ShouldApplyModel} }
+
+func (m Model) orDefault() Model {
+	if m.Alias == "" {
+		return DefaultModel()
+	}
+	return m
+}
+
+// ModelFromConfig is the decide model cfg configures: the model the
+// AI_ROLES.decide endpoint requests, with the decide pin's expected model and
+// revision (MODELS_FILE, or a runtime setting's pin). ok=false when the role
+// is unbound.
+func ModelFromConfig(cfg *config.Config) (Model, bool) {
+	ep, ok := cfg.DecideEndpoint()
+	if !ok {
+		return Model{}, false
+	}
+	pin := cfg.ModelPin(recipe.StepDecide)
+	alias := ep.Model
+	if genai.SameModel(alias, ShouldApplyModel) {
+		// The built-in model, perhaps behind a provider prefix
+		// ("typesafe/jev-1.13.0"): ask for it verbatim, as before runtime
+		// settings, so the recipe and the request are unchanged.
+		alias = ShouldApplyModel
+	}
+	return Model{Alias: alias, Expected: pin.ExpectedModel, Revision: pin.Revision}, true
+}
+
+// ShouldApplyFn returns the should_apply function for params, asking the
+// default model.
 func ShouldApplyFn(p ShouldApplyParams) (fn.Fn, error) {
+	return ShouldApplyFnFor(p, DefaultModel())
+}
+
+// ShouldApplyFnFor returns the should_apply function for params, asking m.
+func ShouldApplyFnFor(p ShouldApplyParams, m Model) (fn.Fn, error) {
 	if err := p.Validate(); err != nil {
 		return fn.Fn{}, err
 	}
+	m = m.orDefault()
 	return fn.New(fn.Fn{
 		Name:          ShouldApplyName,
 		Step:          recipe.StepDecide,
 		PromptVersion: ShouldApplyPromptVersion,
 		PromptSHA256:  ShouldApplyPromptSHA256,
-		ModelAlias:    ShouldApplyModel,
+		ModelAlias:    m.Alias,
+		ExpectedModel: m.Expected,
+		Revision:      m.Revision,
 		StepVersion:   ShouldApplyStepVersion,
 		Params:        p.recipeParams(),
 	})
@@ -297,13 +348,18 @@ type Evaluator struct {
 	asker  Asker
 }
 
-// NewEvaluator builds an Evaluator. store logs and caches the model calls
-// (*db.DB); asker makes them (*systemone.Client).
+// NewEvaluator builds an Evaluator asking the default model. store logs and
+// caches the model calls (*db.DB); asker makes them (*systemone.Client).
 func NewEvaluator(store fn.Store, asker Asker, p ShouldApplyParams) (*Evaluator, error) {
+	return NewEvaluatorFor(store, asker, p, DefaultModel())
+}
+
+// NewEvaluatorFor builds an Evaluator asking model m (zero = DefaultModel).
+func NewEvaluatorFor(store fn.Store, asker Asker, p ShouldApplyParams, m Model) (*Evaluator, error) {
 	if store == nil || asker == nil {
 		return nil, errors.New("decide: evaluator needs a store and a System One client")
 	}
-	f, err := ShouldApplyFn(p)
+	f, err := ShouldApplyFnFor(p, m)
 	if err != nil {
 		return nil, err
 	}
@@ -311,9 +367,12 @@ func NewEvaluator(store fn.Store, asker Asker, p ShouldApplyParams) (*Evaluator,
 }
 
 // Recipe is the decide recipe every outcome of this Evaluator is attributed
-// to: should_apply answered by the pinned model, with this Evaluator's params.
+// to: should_apply answered by its pinned model, with this Evaluator's params.
 // Register it (db.RegisterRecipe) before recording decisions.
 func (e *Evaluator) Recipe() recipe.Recipe { return e.fn.Recipe("") }
+
+// Model is the model id this Evaluator asks.
+func (e *Evaluator) Model() string { return e.fn.ModelAlias }
 
 // Evaluate decides one finding: rung 0 (in.Verdict, or Check), then text
 // evidence, then — only for a rung-0 pass — the should_apply model call, then
@@ -391,7 +450,7 @@ type shouldApplyOutput struct {
 func (e *Evaluator) call(state string) fn.Call {
 	return func(ctx context.Context) (fn.Result, error) {
 		resp, err := e.asker.Decide(ctx, systemone.Request{
-			Model:     ShouldApplyModel,
+			Model:     e.fn.ModelAlias,
 			State:     state,
 			Questions: map[string]systemone.Question{questionKey: shouldApplyQuestion},
 		})

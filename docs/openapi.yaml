@@ -671,6 +671,14 @@ components:
           type:
             - boolean
             - "null"
+        modelSource:
+          description: Where the step's model comes from (CONTRACT §2.20) — `db` (a model_settings row), `env` (AI_ENDPOINTS + AI_ROLES), `unset`, or `unknown` when model_settings could not be read. Omitted for roles with no runtime setting (asr, format).
+          enum:
+            - db
+            - env
+            - unset
+            - unknown
+          type: string
         reason:
           description: One-sentence human explanation of `state`.
           type: string
@@ -684,6 +692,15 @@ components:
             - embeddings
             - decide
             - format
+          type: string
+        settingError:
+          description: Set when the step's model_settings row is invalid against this deployment's AI_ENDPOINTS (e.g. its endpoint was removed); the role is then `failing` and the step's runs fail until the row is fixed (`earmark models unset <step>`). CONTRACT §2.20.
+          type: string
+        settingUpdatedAt:
+          description: RFC 3339 time the step's model_settings row was last set; omitted without a row.
+          type: string
+        settingUpdatedBy:
+          description: Who set the step's model_settings row (e.g. `cli:justin`); omitted without a row.
           type: string
         stale:
           description: |

@@ -84,6 +84,12 @@ func runMCP(cmd *cobra.Command, args []string) {
 	}
 	defer database.Close()
 
+	// Search embeds queries with the embed step's effective model (CONTRACT
+	// §2.20): follow the model_settings row, re-read every 30 s.
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	go database.WatchEmbedSettings(watchCtx, cfg, db.ModelSettingsRefresh)
+
 	// Determine transport from env; default to stdio.
 	// Do NOT set the env var globally — read it once and pass it through.
 	transport := os.Getenv("MCP_TRANSPORT")

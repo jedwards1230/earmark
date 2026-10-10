@@ -1132,6 +1132,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` — per-chunk System One quality scan results, unique per (transcript, chunk index, chunk text sha256, recipe), `ON DELETE CASCADE` with the transcript; the `scan` arm of `stale_work` (§1.9 "Chunk scan"). New table plus a view replacement; no ALTER. Its `stale_work` restates every earlier arm, 8's `decide` arm included. |
 | 10 | `00010_step_runs.sql` | `step_runs` — one row per ad-hoc step run (decide, decide revert, scan, eval) with its live progress and outcome (§1.10), a partial index on the open runs and a `started_at` index for the recent list. New table only; no ALTER, no lock on an existing table. |
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` — every (recipe, earmark build) pair, PK `(recipe_id, code_version)` plus `recipe_builds_code_version_idx`, backfilled with each existing recipe's registering build; a column comment marking `recipes.code_version` as the *first* build (§1.9 "Recipe ID format" / "Builds"). New table plus a `COMMENT` (SHARE UPDATE EXCLUSIVE, which writers' INSERTs do not wait on); no id is rewritten. |
+| 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1442,8 +1443,26 @@ every chunk into the HNSW index).
 updated_at)` holds the recipe each step would use now; the ingest process
 (`earmark monitor`) upserts the `embed`, (when an eval endpoint is
 configured) `propose`, (when `AI_ROLES.scan` is bound) `scan`, and (when
-`AI_ROLES.decide` is bound to the pinned model) `decide` rows at startup — one writer, so an ad-hoc `earmark eval`
-with other settings stamps its own findings without redefining "current".
+`AI_ROLES.decide` is bound) `decide` rows for each step's **effective**
+model — the env registry plus the runtime model settings (§2.20) — at
+startup and again whenever that set of recipe ids changes (checked every
+worker cycle, so `earmark models set|unset` moves "current" within one
+poll interval). One writer, so an ad-hoc `earmark eval` with other settings
+(or a per-run `--model`) stamps its own findings without redefining
+"current". A step whose `model_settings` row is invalid keeps its previous
+current recipe.
+
+**A runtime model setting is a recipe input like env.** The effective
+endpoint model and pin of a step (§2.20) are exactly what the env registry
+would supply: they become the recipe's `model_alias`, `model_resolved` and
+`model_revision`, so a `model_settings` row (or a per-run override) that
+changes a step's model registers a **different** recipe — its outputs are
+never confused with the env model's, `stale_work` lists the other model's
+outputs as stale, and the work selectors (`decide --yes`, `scan`) redo them
+under the new recipe, by equivalence as always. Unsetting the row gives back
+the env recipe id; a row equal to the env endpoint and model with no pins is
+the env recipe. Pinned by `cmd/monitor` `TestCurrentRecipesFollowModelSettings`
+and `TestIntegrationModelSettingRecipes`.
 The `stale_work` view lists `(step, source_table, row_id, recipe_id,
 current_recipe_id)` for every output row whose recipe is not equivalent to its
 step's current recipe. Equivalence compares `step_version`, the three model
@@ -2368,9 +2387,21 @@ ready` and `roles[judge].state = failing`.
   "stale": 32337,               // stale_work rows for the step; null = not tracked / unavailable / still counting
   "countsAsOf": "2026-10-06T00:13:30Z", // the 30 s aggregate snapshot; null = never loaded
   "countsError": false,         // the latest aggregate refresh failed (last good still served)
-  "staleAsOf": "2026-10-06T00:10:02Z"   // the separate 5 min stale-count snapshot; null = not loaded yet
+  "staleAsOf": "2026-10-06T00:10:02Z",  // the separate 5 min stale-count snapshot; null = not loaded yet
+  "modelSource": "db",          // §2.20: db | env | unset | unknown (settings unreadable); omitted for asr, format
+  "settingUpdatedBy": "cli:justin",            // the model_settings row's updated_by; omitted without a row
+  "settingUpdatedAt": "2026-10-10T09:00:00Z",  // its updated_at; omitted without a row
+  "settingError": "model_settings row for step decide is invalid …"  // set only for an invalid row (state failing)
 }
 ```
+
+`requested`, `endpoint`, `expected` and the endpoint table (`endpoints[]`)
+describe each step's **effective** model (§2.20). A model setting that asks a
+registered endpoint for another model appears in `endpoints[]` as an extra
+entry `<endpoint id>@<step>` (same URL and key, the other model) so its probe
+checks the model actually requested; `roles[].endpoint` names the registered
+id. A role whose row is invalid is `failing` with `settingError`, and its
+`requested`/`endpoint` are the row's — never the env model's.
 
 `answeredMatch: predates_recipe` means the newest answer was recorded before
 the step's current recipe (`current_recipes.updated_at`) — the model or prompt
@@ -2744,7 +2775,12 @@ bottom:
    §2.18; the row is omitted when unpinned), *answered* (what the endpoint
    reported serving the call) with `✓ matches pin` or `≠ expected <x>`, last
    ok / last fail ("no failures" when none), and the step's stale count
-   linking to its recipe row. While a run of the role's step is open (§1.10;
+   linking to its recipe row. Judge, Embeddings, Decide and Scan also show
+   *source* (§2.20): a "db" badge with who set the `model_settings` row and
+   when, or "env default". An invalid row turns its card ✗ FAILING with the
+   row's model and endpoint, the error and the fix ("earmark models unset
+   <step>"); the env model is never shown in its place. Read-only — the
+   settings are changed with `earmark models`, not on the page. While a run of the role's step is open (§1.10;
    Decide: `decide`/`decide_revert`, Scan: `scan`, Judge: `eval_*`) the card
    leads with a *running* row linking to its card in the runs panel
    (`#run-<id>`: "decide (write) · 12,400 / 29,000 · page 25: asking
@@ -4224,6 +4260,12 @@ unknown step or field, or an `alias` that contradicts the endpoint registry
 stops startup. Unset → an empty registry: recipes are still stamped, with the
 requested model as the expected one and no revision.
 
+The registry pins the **env** model of each step. A runtime model setting
+(§2.20) that changes a step's endpoint or model, or sets a pin itself,
+replaces that step's pin wholesale with its own pin fields (unset ones are
+unpinned); `prompt_version` stays. The decide step's `expected_model` and
+`revision` are part of its recipe like every other step's (§2.19).
+
 ### 2.19 Decide step — `should_apply`
 
 The decide step turns a **proposed** finding (§2.15) into a decision about
@@ -4354,7 +4396,9 @@ an error: every failure after rung 0 is a retryable `hold`.
    - `none` — anything else, including every finding of a book with no
      reference.
 5. **Model call** — `fn` `should_apply`, step `decide` (`step_version` 2),
-   prompt `should_apply@v2`, model pinned to `jev-1.13.0`, through `internal/fn`
+   prompt `should_apply@v2`, the decide step's effective model — by default
+   `jev-1.13.0`, or another pinned System One model through a runtime model
+   setting (§2.20; e.g. Clef) — through `internal/fn`
    (logged and cached in `fn_calls`, §1.9) and the System One client (§2.14).
    One `noul` question named `should_apply` with explicit `true`/`false`
    criteria. The prompt hash is `recipe.PromptSHA256` of the question's
@@ -4426,7 +4470,7 @@ an error: every failure after rung 0 is a retryable `hold`.
 
    | Condition | Decision | Reason |
    |---|---|---|
-   | no usable answer: transport error, timeout, 4xx/5xx, a reply that fails strict decoding, an answer from a model other than `jev-1.13.0` (fallback), `p` NaN or outside [0, 1], a cancelled context | `hold` (retryable) | `jev_unavailable` |
+   | no usable answer: transport error, timeout, 4xx/5xx, a reply that fails strict decoding, an answer from a model other than the expected one (`jev-1.13.0` by default; fallback), `p` NaN or outside [0, 1], a cancelled context | `hold` (retryable) | `jev_unavailable` |
    | `p ≥ apply_p`, issue type `dropped_word` or `number_artifact` | `hold` | `issue_type_capped` |
    | `p ≥ apply_p`, evidence `asin_verbatim` or `exact_repeat` | `apply` | `confident_with_evidence` |
    | `p ≥ apply_p`, evidence `none` | `hold` | `no_evidence` |
@@ -4473,9 +4517,14 @@ and reports what a full run would do. **It decides nothing**: no
 decide recipe row (`recipes`, via `decide.Evaluator.Recipe`) and one `fn_calls`
 row per model call — which is the point: the later full run over the same
 findings is served from the cache. `--yes` decides and writes (below). Requires
-`AI_ROLES.decide` bound to a `systemone` endpoint whose `model` is the pinned
-`jev-1.13.0` (route prefix and case ignored); otherwise it exits 2 with a clear
-error. It does not take the GPU phase gate (System One is hosted).
+`AI_ROLES.decide` bound to a `systemone` endpoint (or a `decide` model setting,
+§2.20); otherwise it exits 2 with a clear error. The model asked is the decide
+step's effective model: `--endpoint`/`--model` for the run, else the
+`model_settings` row, else the endpoint's `model` — any pinned version. The
+built-in `jev-1.13.0` (route prefix and case ignored) is asked verbatim, so
+its recipe is unchanged; any other model, and the decide pin's
+`expected_model`/`revision`, is another decide recipe. It does not take the
+GPU phase gate (System One is hosted).
 
 - **Selection** (read-only, `db.DecideSample`): `origin = 'judge'`,
   `patch_state = 'proposed'`, anchored (`anchor_offset` and
@@ -4656,6 +4705,133 @@ one scope flag is required; together they narrow (AND). Dry-run unless
    `--yes`; narrow with `--finding` or `--since`. Re-running the same recipe
    after a revert re-decides the same findings, so change the recipe
    (thresholds, prompt) before deciding again.
+
+### 2.20 Runtime step model settings (`model_settings`)
+
+Which model each AI step runs on can change at runtime, without a Helm or
+Ansible change: a `model_settings` row overrides the env default for one
+step until it is unset. It exists for comparisons such as a four-arm
+bake-off (Haiku judge × Jev decide, a local Qwen judge × Jev, Haiku × Clef,
+Qwen × Clef) and to make the default model a database decision.
+
+**Steps.** `propose` (the eval judge, `AI_ROLES.eval`, a `chat` endpoint),
+`decide` and `scan` (`systemone` endpoints), `embed` (`AI_ROLES.embeddings`,
+an `embeddings` endpoint). The CLI also accepts `eval`/`judge` and
+`embeddings`.
+
+**Precedence.** per-run override (`--endpoint`/`--model` on `earmark eval`,
+`decide`, `scan`) > `model_settings` row > env default (`AI_ENDPOINTS` +
+`AI_ROLES` + `MODELS_FILE`; `EVAL_CHAT_*` for an unbound judge) > unset (the
+step is off). An override never writes `model_settings`.
+
+**What a setting is.** An `AI_ENDPOINTS` id and a model id to request from
+it, plus optional pins with `MODELS_FILE` semantics (§2.18):
+`expected_model`, `revision`, `params` (known: `usd_per_mtok_in`). URLs and
+keys are never stored: where to connect and with which credential stays in
+the env registry, so a setting can only choose among endpoints the deployment
+already declares. Applying it (`config.(*Config).WithStepSettings`) returns a
+clone of the env config, so every consumer — the judge, the System One
+clients, the embedder, recipe stamping, `fn_calls`, `step_runs.model` —
+sees the effective model unchanged:
+
+- **Same endpoint, another model.** Two roles may share an endpoint (decide
+  and scan on one System One route). A setting that asks an endpoint for
+  another model binds its role to a synthesized copy `<id>@<step>` (same
+  URL, key and options, the other model), so the other role keeps its model.
+- **Pins.** When a setting changes the step's endpoint or model, or sets any
+  pin field, its pin fields replace the step's env pin wholesale — unset
+  fields are unpinned (answers are expected from the requested model), exactly
+  like an unpinned env step; `prompt_version` stays. A setting equal to the
+  env endpoint and model with no pins keeps the env pin.
+- **Recipes.** The effective model and pin are recipe inputs exactly like env
+  (§1.9): another model is another recipe, unsetting gives back the env one.
+
+**Validation (fail closed).** The step is settable; the endpoint is a
+registered `AI_ENDPOINTS` id (not a synthesized one) of the type the step
+needs; the model is non-empty without whitespace and, for `systemone`, a
+pinned version (`config.PinnedModel`); params are known keys with valid
+values (the `MODELS_FILE` rule). `earmark models set` refuses invalid input
+before writing. A stored row that is invalid against the **current**
+registry (its endpoint was removed from `AI_ENDPOINTS`, or changed type) is
+an error, never a fallback to another model: `eval`/`decide`/`scan` exit with
+a message naming the step, the row and the fix (`earmark models unset
+<step>`); the worker idles (logged once) while the row is invalid for a step
+it runs; the Models page shows the role ✗ FAILING with the row (§2.14);
+`earmark models` flags it `db INVALID`; that step's current recipe is left
+unchanged. Rows for other steps are unaffected.
+
+**Who reads it, when.**
+
+| Process | Reads `model_settings` | Applies |
+|---|---|---|
+| `earmark eval` / `decide` / `scan` (incl. `--sample`, `--dump`, `--rung0-only`, `--backfill-*`, the eval-backfill CronJob) | once at start | its own step, strictly, then the run's override |
+| `earmark monitor` worker (in-pipeline judge, embedder) | at the start of every cycle (≤ 30 s poll; back-to-back while draining) | `embed`, and `propose` when `EVAL_IN_PIPELINE`, strictly; one config per cycle, so a batch never mixes two models. Also re-registers `current_recipes` (all steps, invalid ones skipped) when they change |
+| `earmark mcp` / `serve` search | every 30 s (`db.ModelSettingsRefresh`) | `embed`, for the query embedder; an invalid row or a failed read keeps the embedder last applied (logged) |
+| Models page, `GET /api/v1/status` | every render (2 s deadline) | all steps, invalid rows shown as errors |
+| Dashboard "run eval" button | each click | `propose`, strictly |
+
+`earmark batch` (phase coordination) and `earmark backfill` (metadata) call no
+model and do not read it.
+
+**Changing the embed model** is legitimate but heavier than the others. The
+model must produce 768-dimension vectors (`transcript_chunks.embedding` is
+`vector(768)`): any other size fails every chunk insert, so the worker stops
+embedding until the row is fixed. Chunks already embedded are **not**
+re-embedded (the worker never re-embeds on a recipe change, §1.9): new chunks
+use the new model under a new embed recipe, the old ones are listed stale,
+and the index mixes two vector spaces until `earmark requeue --reembed ""
+--yes`. Search follows the setting within 30 s, so queries match the new
+chunks. `earmark models set embed` prints this.
+
+**Schema** (migration 12):
+
+```sql
+CREATE TABLE model_settings (
+    step           TEXT        PRIMARY KEY,   -- propose | decide | scan | embed (CHECK)
+    endpoint_id    TEXT        NOT NULL,      -- an AI_ENDPOINTS id; never a URL or key
+    model          TEXT        NOT NULL,      -- the model id to request
+    expected_model TEXT,                      -- pin: what should answer (NULL = the requested model)
+    revision       TEXT,                      -- pin: weights revision
+    params         JSONB       NOT NULL DEFAULT '{}',  -- pin params (object), e.g. {"usd_per_mtok_in": 0.042}
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by     TEXT        NOT NULL       -- e.g. "cli:justin"
+);
+
+CREATE TABLE model_setting_events (           -- append-only (trigger refuses UPDATE/DELETE)
+    id         BIGSERIAL   PRIMARY KEY,
+    step       TEXT        NOT NULL,
+    action     TEXT        NOT NULL,           -- set | unset (set ⇒ new_value, unset ⇒ no new_value)
+    old_value  JSONB,                          -- the row before; NULL = the env default was in effect
+    new_value  JSONB,                          -- the row after; NULL = unset
+    actor      TEXT        NOT NULL,
+    note       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX model_setting_events_step_idx ON model_setting_events (step, id DESC);
+```
+
+Every change is one transaction: a per-step advisory lock, the row upsert or
+delete, and its event with the value it replaced (`db.SetModelSetting`,
+`db.UnsetModelSetting`). Unsetting a step with no row writes nothing.
+
+**CLI.**
+
+```bash
+earmark models [--json]                      # per step: source, endpoint, model, pin, env default, who set it; invalid rows
+earmark models set <step> [--endpoint <id>] [--model <id>] [--expected-model <id>] [--revision <r>] \
+                          [--param key=value ...] [--note "why"]
+earmark models unset <step> [--note "why"]   # back to the env default
+earmark models history [step] [--limit 50] [--json]
+earmark eval|decide|scan ... --endpoint <id> --model <id>   # this run only
+```
+
+`set`: `--endpoint` defaults to the step's env endpoint, `--model` to the
+endpoint's own model. For an override, an omitted `--endpoint` keeps the
+step's effective endpoint and an omitted `--model` takes the named
+endpoint's model. Changes are attributed `cli:<$USER>` (the os user when
+`$USER` is unset), the convention of other CLI-attributed writes. The
+dashboard is read-only for settings; editing them there (and a write route on
+the control API) is a follow-up.
 
 ---
 

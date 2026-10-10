@@ -216,3 +216,47 @@ func TestRunDumpRemovedOnError(t *testing.T) {
 		t.Errorf("partial dump left behind: %v", err)
 	}
 }
+
+// modelSpy records the recipes a run registers.
+type modelSpy struct {
+	emptyStore
+	recipes []recipe.Recipe
+}
+
+func (s *modelSpy) RegisterRecipe(ctx context.Context, r recipe.Recipe) (string, error) {
+	s.recipes = append(s.recipes, r)
+	return s.emptyStore.RegisterRecipe(ctx, r)
+}
+
+// The resolved decide model (a model setting or --model, CONTRACT §2.20)
+// flows into the registered recipe, the report, and step_runs' args; the
+// zero model is the built-in one.
+func TestRunUsesResolvedModel(t *testing.T) {
+	for _, tc := range []struct {
+		model     decidepkg.Model
+		wantAlias string
+	}{
+		{decidepkg.Model{}, decidepkg.ShouldApplyModel},
+		{decidepkg.Model{Alias: "clef-1.0.0", Expected: "typesafe/clef-1.0.0"}, "clef-1.0.0"},
+	} {
+		store := &modelSpy{}
+		var out bytes.Buffer
+		o := options{sample: 5, seed: "s", concurrency: 1, batch: 20, json: true, model: tc.model}
+		if err := run(context.Background(), &out, store, noAsker{}, o); err != nil {
+			t.Fatal(err)
+		}
+		if len(store.recipes) != 1 || store.recipes[0].ModelAlias != tc.wantAlias {
+			t.Fatalf("registered %+v, want model %s", store.recipes, tc.wantAlias)
+		}
+		if tc.model.Expected != "" && store.recipes[0].ModelResolved != tc.model.Expected {
+			t.Errorf("model_resolved %q, want the pin %q", store.recipes[0].ModelResolved, tc.model.Expected)
+		}
+		var rep decidepkg.Report
+		if err := json.Unmarshal(out.Bytes(), &rep); err != nil || rep.Model != tc.wantAlias {
+			t.Errorf("report model %q (err %v), want %s", rep.Model, err, tc.wantAlias)
+		}
+	}
+	if got := argsSummary(options{sample: 5, seed: "s", overrideEndpoint: "clef", overrideModel: "clef-1.0.0"}); !strings.Contains(got, "--endpoint clef --model clef-1.0.0") {
+		t.Errorf("args %q do not record the override", got)
+	}
+}

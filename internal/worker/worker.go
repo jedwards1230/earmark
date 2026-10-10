@@ -23,6 +23,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/queue"
+	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/tokenizer"
 )
 
@@ -112,6 +113,32 @@ type Worker struct {
 	// monitor's RefreshBookMetadata). Called after ASR stamping for files the
 	// runner found an embedded ASIN tag in. nil → skipped.
 	refreshBook func(ctx context.Context, filePath string)
+	// Runtime model settings (CONTRACT §2.20), re-read every cycle; see
+	// SetModelSettings. nil settings = the env config, as before.
+	settings      db.SettingsReader
+	onSettings    func(full *config.Config, invalid map[string]error)
+	evalInPipe    bool
+	active        *config.Config // the effective config of the last cycle
+	activeJudge   string         // judgeKey of the judge in use
+	lastSettingEr string         // last logged settings error (log once)
+}
+
+// EmbedConfigurer is the optional DB capability that swaps the embeddings
+// client and embed recipe for a new effective config (*db.DB implements it).
+type EmbedConfigurer interface {
+	ApplyEmbedConfig(cfg *config.Config) bool
+}
+
+// SetModelSettings makes the worker apply the model_settings rows (CONTRACT
+// §2.20) onto its base config at the start of every cycle, so `earmark models
+// set|unset` takes effect within one poll interval without a restart. The
+// worker's own steps — embed, and propose when EVAL_IN_PIPELINE runs the
+// judge — are applied strictly: an invalid row for either idles the worker
+// (logged) instead of running the step on another model. onChange, if set,
+// receives every cycle's full effective config (all steps, invalid rows
+// skipped and reported) — the monitor uses it to keep current_recipes in step.
+func (w *Worker) SetModelSettings(r db.SettingsReader, onChange func(full *config.Config, invalid map[string]error)) {
+	w.settings, w.onSettings = r, onChange
 }
 
 // ASRStamper is the optional DB capability the worker uses to stamp new
@@ -184,6 +211,7 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 		db:             database,
 		log:            log.NewLogger("worker"),
 		evalGatesEmbed: cfg.EvalGatesEmbed,
+		evalInPipe:     cfg.EvalInPipeline,
 	}
 	if cfg.EvalInPipeline {
 		chat, err := eval.ResolveChatClient(eval.ConfigSource(cfg))
@@ -195,12 +223,98 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 			w.log.Info("in-pipeline eval enabled", "judge_model", chat.Model(),
 				"eval_gates_embed", cfg.EvalGatesEmbed)
 		}
+		w.activeJudge = judgeKey(cfg)
 	}
 	return w
 }
 
-// Start runs the embed loop until Stop is called.
-func (w *Worker) Start(cfg *config.Config) {
+// judgeKey identifies everything about the propose step a runtime setting
+// can change: the chat endpoint (URL, key, model) and the propose pin.
+func judgeKey(cfg *config.Config) string {
+	ep, _ := cfg.EvalEndpoint()
+	pin := cfg.ModelPin(recipe.StepPropose)
+	return strings.Join([]string{ep.ID, ep.BaseURL, ep.Model, ep.APIKey, pin.ExpectedModel, pin.Revision}, "\x00")
+}
+
+// workerSteps are the steps the worker itself runs.
+func (w *Worker) workerSteps() []string {
+	if w.evalInPipe {
+		return []string{recipe.StepEmbed, recipe.StepPropose}
+	}
+	return []string{recipe.StepEmbed}
+}
+
+// cycleConfig is the effective config for one cycle (CONTRACT §2.20): base
+// with the current model_settings rows applied. ok=false idles the cycle: a
+// row for one of the worker's steps is invalid, the judge it names cannot be
+// built, or the rows could not be read before any cycle applied them. Within
+// the cycle every transcript is judged and embedded with this one config, so
+// a batch never mixes two models; the next cycle picks up any change.
+func (w *Worker) cycleConfig(base *config.Config) (*config.Config, bool) {
+	if w.settings == nil {
+		return base, true
+	}
+	rows, err := w.settings.ListModelSettings(w.ctx)
+	if err != nil {
+		if w.active != nil {
+			w.log.Warn("model_settings unreadable; keeping the last applied model settings", "error", err)
+			return w.active, true
+		}
+		w.settingsError(fmt.Errorf("model_settings unreadable before the first cycle; the worker idles: %w", err))
+		return nil, false
+	}
+	if w.onSettings != nil {
+		full, invalid := base.WithValidStepSettings(db.StepSettings(rows)...)
+		w.onSettings(full, invalid)
+	}
+	eff, err := base.WithStepSettings(db.StepSettings(rows, w.workerSteps()...)...)
+	if err == nil {
+		err = w.applyConfig(eff)
+	}
+	if err != nil {
+		w.settingsError(fmt.Errorf("the worker idles until the setting is fixed: %w", err))
+		return nil, false
+	}
+	if w.lastSettingEr != "" {
+		w.log.Info("model settings valid again; the worker resumes")
+		w.lastSettingEr = ""
+	}
+	w.active = eff
+	return eff, true
+}
+
+// settingsError logs a settings failure once per distinct message.
+func (w *Worker) settingsError(err error) {
+	if err.Error() != w.lastSettingEr {
+		w.log.Error("model settings not applied", "error", err)
+		w.lastSettingEr = err.Error()
+	}
+}
+
+// applyConfig points the judge and the embedder at eff when its propose or
+// embed step differs from the one in use.
+func (w *Worker) applyConfig(eff *config.Config) error {
+	if w.evalInPipe {
+		if key := judgeKey(eff); key != w.activeJudge {
+			chat, err := eval.ResolveChatClient(eval.ConfigSource(eff))
+			if err != nil {
+				return fmt.Errorf("propose step: %w", err)
+			}
+			w.judge = eval.NewJudgeForConfig(chat, eff)
+			w.activeJudge = key
+			w.log.Info("in-pipeline judge follows the model settings", "step", eff.DescribeStep(recipe.StepPropose))
+		}
+	}
+	if ec, ok := w.db.(EmbedConfigurer); ok && ec.ApplyEmbedConfig(eff) {
+		w.log.Info("embedder follows the model settings", "step", eff.DescribeStep(recipe.StepEmbed))
+	}
+	return nil
+}
+
+// Start runs the embed loop until Stop is called. base is the env config;
+// each cycle runs on base with the runtime model settings applied
+// (SetModelSettings).
+func (w *Worker) Start(base *config.Config) {
 	w.log.Info("worker started")
 	defer close(w.done)
 
@@ -219,7 +333,7 @@ func (w *Worker) Start(cfg *config.Config) {
 
 		// Recover stale jobs periodically.
 		if time.Since(lastStale) >= staleRecoveryInterval {
-			failed, err := w.db.RecoverStaleJobs(w.ctx, cfg.StaleJobTimeout)
+			failed, err := w.db.RecoverStaleJobs(w.ctx, base.StaleJobTimeout)
 			if err != nil {
 				w.log.Error("stale job recovery failed", "error", err)
 			} else if failed > 0 && w.metrics != nil {
@@ -258,6 +372,14 @@ func (w *Worker) Start(cfg *config.Config) {
 		}
 		if phase == db.PhaseTranscribe {
 			w.log.Debug("pipeline in transcribe phase; embed worker idling this cycle")
+			w.sleep(pollInterval)
+			continue
+		}
+
+		// Runtime model settings (CONTRACT §2.20): one effective config per
+		// cycle, re-read from model_settings each time.
+		cfg, ok := w.cycleConfig(base)
+		if !ok {
 			w.sleep(pollInterval)
 			continue
 		}
@@ -975,8 +1097,14 @@ func embedBatchSize(cfg *config.Config) int {
 }
 
 // embedModel returns the configured embeddings model, falling back to the
-// CONTRACT default when unset.
+// CONTRACT default when unset. A runtime model setting (CONTRACT §2.20) names
+// the effective endpoint's model.
 func embedModel(cfg *config.Config) string {
+	if src := cfg.StepSource(recipe.StepEmbed); src == config.SourceDB || src == config.SourceOverride {
+		if ep, ok := cfg.EmbeddingsEndpoint(); ok {
+			return ep.Model
+		}
+	}
 	if cfg.EmbeddingsModel != "" {
 		return cfg.EmbeddingsModel
 	}

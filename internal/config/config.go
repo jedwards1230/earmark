@@ -128,6 +128,10 @@ type AIEndpoint struct {
 	// and API only — no code path routes or behaves differently on it. The
 	// Models page infers "litellm" from the host name when it is absent.
 	Gateway string `json:"gateway,omitempty"`
+	// BaseID is set only on an endpoint WithStepSettings synthesized for a
+	// runtime model setting (CONTRACT §2.20): the AI_ENDPOINTS id it copies,
+	// asking for another model. Never parsed from AI_ENDPOINTS.
+	BaseID string `json:"-"`
 }
 
 // AIRoles binds function names to endpoint IDs. The "embeddings" role is
@@ -556,6 +560,10 @@ type Config struct {
 	// per-step expected model, revision pin and prompt version, stamped into
 	// provenance recipes. Empty (never nil) after LoadConfig when unset.
 	Models *ModelRegistry
+
+	// stepSources records, per step, where WithStepSettings took the step's
+	// model from (SourceDB / SourceOverride). Absent = the env default.
+	stepSources map[string]string
 
 	// Debug enables verbose structured logging.
 	Debug bool

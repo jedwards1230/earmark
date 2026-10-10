@@ -778,7 +778,7 @@ func (d demoDB) GetServiceStatus(context.Context) (*db.QueueStats, error) {
 			},
 		}
 	}
-	if d.scenario == demoScenarioRecipeChanged {
+	if d.scenario == demoScenarioRecipeChanged || d.scenario == demoScenarioModelSettings {
 		// Every transcript judged before the model switch: nothing has needed
 		// a judge call since, which is what the Judge card must not misread.
 		q.EvalCoverageDone = q.Done
@@ -1245,7 +1245,7 @@ func renumber(p string, n int) string {
 // StartDemoDashboard starts the HTTP transport (status dashboard + /mcp +
 // /health + /readyz) backed by synthetic data, with no database connection.
 // Intended for local UI iteration and AI-agent visual verification only.
-// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend|winddown|idle|batch-analyze|snapshot-error|gateway-allowlist|gateway-keyinfo
+// Set DEMO_SCENARIO=empty|stale|failed|active|multibackend|winddown|idle|batch-analyze|snapshot-error|gateway-allowlist|gateway-keyinfo|recipe-changed|model-settings
 // to render a state.
 func StartDemoDashboard(addr string) error {
 	if addr == "" {

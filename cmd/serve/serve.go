@@ -47,6 +47,12 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 	defer database.Close()
 
+	// Search embeds queries with the embed step's effective model (CONTRACT
+	// §2.20): follow the model_settings row, re-read every 30 s.
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	go database.WatchEmbedSettings(watchCtx, cfg, db.ModelSettingsRefresh)
+
 	// Initialize and start HTTP server
 	srv := server.NewServer(database, cfg)
 	httpServer := srv.Start()

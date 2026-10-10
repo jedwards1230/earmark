@@ -801,11 +801,12 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   <div class="server-state {{.Health.Class}}">{{.Health.Glyph}} {{.Health.Label}}</div>
   <div class="server-sub">{{.Health.Sub}}</div>
   {{if .AllowlistWarn}}<div class="server-sub err">✗ {{.Requested}} is not on earmark's LiteLLM key allowlist — every call 403s</div>{{end}}
-  {{if and .LastErrorShort (eq .Health.Token "failing")}}<div class="server-sub err mono err-clamp" title="{{.LastError}}">{{.LastErrorShort}}</div>{{end}}
+  {{if .SettingError}}<div class="server-sub err mono err-clamp" title="{{.SettingError}}">{{.SettingError}}</div>{{else if and .LastErrorShort (eq .Health.Token "failing")}}<div class="server-sub err mono err-clamp" title="{{.LastError}}">{{.LastErrorShort}}</div>{{end}}
   <dl class="role-kv">
   {{with .ActiveRun}}<dt>running</dt><dd><a href="#run-{{.ID}}" class="{{if .Stale}}err{{else}}run-link{{end}}">{{.Text}}</a></dd>{{end}}
   {{if .HasModel}}
-    <dt>requested</dt><dd>{{if .Requested}}<span class="mono">{{.Requested}}</span>{{if .EndpointID}} <span class="time-muted">@ {{.EndpointID}}</span>{{end}}{{else}}—{{end}}</dd>
+    <dt>requested</dt><dd>{{if .Requested}}<span class="mono">{{.Requested}}</span>{{if .EndpointID}} <span class="time-muted">@ {{or .EndpointLabel .EndpointID}}</span>{{end}}{{else}}—{{end}}</dd>
+    {{if .ModelSource}}<dt>source</dt><dd>{{template "roleSource" .}}</dd>{{end}}
     {{if .Expected}}<dt>pinned</dt><dd><span class="mono">{{.Expected}}</span>{{with .ExpectedRevisionShort}} <span class="time-muted">· rev {{.}}</span>{{end}}{{if eq .Key "asr"}} <span class="time-muted">· recorded only</span>{{end}}</dd>{{end}}
     <dt>answered</dt><dd>{{template "roleAnswered" .}}</dd>
     {{if .AlsoAnswered}}<dt><span class="sr-only">also answered</span></dt><dd class="time-muted">also: {{range $i, $m := .AlsoAnswered}}{{if $i}}, {{end}}<span class="mono">{{$m.Model}}</span> ×{{commafy $m.Count}}{{end}} (7d)</dd>{{end}}
@@ -823,11 +824,13 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
 </div>
 {{end}}
 
+{{define "roleSource"}}{{if .SettingError}}<span class="badge source-db source-invalid">db · invalid</span>{{if .SettingBy}} <span class="time-muted">set by <span class="mono">{{.SettingBy}}</span>{{if not .SettingAt.IsZero}} <span title="{{formatTime .SettingAt}}">{{relTime .SettingAt}}</span>{{end}}</span>{{end}}{{else if eq .ModelSource "db"}}<span class="badge source-db" title="a model_settings row (earmark models) overrides AI_ROLES">db</span>{{if .SettingBy}} <span class="time-muted">set by <span class="mono">{{.SettingBy}}</span>{{if not .SettingAt.IsZero}} <span title="{{formatTime .SettingAt}}">{{relTime .SettingAt}}</span>{{end}}</span>{{end}}{{else if eq .ModelSource "env"}}<span class="time-muted" title="AI_ENDPOINTS + AI_ROLES (+ MODELS_FILE); no model_settings row">env default</span>{{else if eq .ModelSource "unknown"}}<span class="time-muted">model settings unavailable</span>{{else}}<span class="time-muted">{{.ModelSource}}</span>{{end}}{{end}}
+
 {{define "roleAnswered"}}{{if not .CountsKnown}}—{{else if eq .AnsweredMatch "none"}}<span class="time-muted">no runs yet</span>{{else if eq .AnsweredMatch "predates_recipe"}}<span class="time-muted">no calls since the {{if .PriorModelChanged}}model{{else}}recipe{{end}} changed{{with .CompareTarget}} (now {{.}}){{end}}{{if not .RecipeSince.IsZero}} <span title="{{formatTime .RecipeSince}}">{{relTime .RecipeSince}}</span>{{end}} · before: </span><span class="mono">{{.Answered}}</span>{{else if eq .AnsweredMatch "unreported"}}<span class="time-muted">not reported by endpoint</span>{{else}}<span class="mono">{{.Answered}}</span>{{if and (eq .Key "asr") .ASRRunnerVersion}} · runner <span class="mono">{{.ASRRunnerVersion}}</span>{{if .ASRModelSHA}} · .nemo <span class="mono" title="{{.ASRModelSHA}}">{{.ASRModelSHAShort}}</span>{{end}}{{end}}{{if eq .AnsweredMatch "match"}} <span class="match-ok">✓ matches {{if .Expected}}pin{{else}}request{{end}}</span>{{else if eq .AnsweredMatch "mismatch"}} <span class="badge mismatch">≠ expected {{.CompareTarget}}</span>{{end}}{{end}}{{end}}
 
 {{define "endpointRow"}}
 <tr>
-  <th scope="row" class="mono">{{.V.ID}}</th>
+  <th scope="row" class="mono">{{.V.ID}}{{if .V.BaseID}} <span class="time-muted" title="a model_settings row asks {{.V.BaseID}} for another model (CONTRACT §2.20)">(model setting)</span>{{end}}</th>
   <td>{{if .V.Role}}<span title="role token: {{.V.Role}}">{{.V.RoleTitle}}</span>{{else}}<span class="time-muted">unbound</span>{{end}}</td>
   <td><span class="badge role-{{.V.Type}}">{{.V.Type}}</span></td>
   <td>{{if .V.Gateway}}<strong>{{.V.GatewayLabel}}</strong>{{if .V.GatewayInferred}} <span class="time-muted" title="inferred from the host name; set gateway in AI_ENDPOINTS to confirm">(inferred)</span>{{end}}{{else}}<span class="time-muted">direct</span>{{end}}</td>
@@ -969,9 +972,10 @@ func (s *MCPServer) renderServersData(w http.ResponseWriter, r *http.Request, li
 		s.logger.Warn("models: queue stats unavailable; coverage/backlog/runner version degraded", "error", err)
 	}
 	runners := buildServerViews(s.asrServers, obs, s.probeServers(ctx), now, s.runnerStaleAfter)
-	eps := buildEndpointViews(s.cfg, s.probeEndpoints(ctx))
-	gws, targets, gwByEndpoint := s.probeGateways(ctx)
-	roles, ev := s.modelRoles(ctx, stats, runners, true, eps, gwByEndpoint, now)
+	em := s.effectiveModels(ctx)
+	eps := buildEndpointViews(em.Cfg, s.probeEndpointsFor(ctx, em.Cfg))
+	gws, targets, gwByEndpoint := s.probeGatewaysFor(ctx, em.Cfg)
+	roles, ev := s.modelRoles(ctx, em, stats, runners, true, eps, gwByEndpoint, now)
 	s.attachRoleRuns(ctx, roles)
 
 	data := modelsData{
@@ -1032,7 +1036,7 @@ const staleFirstWait = 1500 * time.Millisecond
 // modelRoles builds the role cards from the cached snapshots. The page and
 // GET /api/v1/status both call it, so they cannot disagree. Snapshot refresh
 // errors are logged once per failed refresh by the caches themselves.
-func (s *MCPServer) modelRoles(ctx context.Context, stats *db.QueueStats, runners []serverView, runnersKnown bool,
+func (s *MCPServer) modelRoles(ctx context.Context, em effectiveModels, stats *db.QueueStats, runners []serverView, runnersKnown bool,
 	eps []endpointView, gateways map[string]gatewayStatus, now time.Time,
 ) ([]roleCard, modelsEvidence) {
 	ev := s.models.read(ctx, staleFirstWait)
@@ -1043,7 +1047,8 @@ func (s *MCPServer) modelRoles(ctx context.Context, stats *db.QueueStats, runner
 	}
 	roles := buildRoleCards(roleInputs{
 		Phase:        phase,
-		Cfg:          s.cfg,
+		Cfg:          em.Cfg,
+		Settings:     em,
 		Judge:        s.judgeConfig(),
 		ASRServers:   s.asrServers,
 		Servers:      runners,

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/openai"
@@ -127,8 +128,64 @@ func (db *DB) SetCurrentRecipes(ctx context.Context, rs ...recipe.Recipe) error 
 const embedStepVersion = 1
 
 // EmbedRecipe is the recipe every chunk this process writes is stamped with.
+// It follows the effective embeddings endpoint (ApplyEmbedConfig).
 func (db *DB) EmbedRecipe() recipe.Recipe {
-	return embedRecipe(db.cfg, db.e.DocumentPrefix())
+	db.embedMu.RLock()
+	defer db.embedMu.RUnlock()
+	cfg := db.embedCfg
+	if cfg == nil {
+		cfg = db.cfg
+	}
+	return embedRecipe(cfg, db.e.DocumentPrefix())
+}
+
+// currentEmbedRecipe is the recipe InsertChunks stamps now.
+func (db *DB) currentEmbedRecipe() recipe.Recipe {
+	db.embedMu.RLock()
+	defer db.embedMu.RUnlock()
+	return db.embedRecipe
+}
+
+// embedder is the embeddings client in effect now.
+func (db *DB) embedder() *openai.Embeddings {
+	db.embedMu.RLock()
+	defer db.embedMu.RUnlock()
+	return db.e
+}
+
+// embedConfigKey identifies everything about the embed step a runtime setting
+// can change: the endpoint (URL, key, model) and the embed pin.
+func embedConfigKey(cfg *config.Config) string {
+	ep, _ := cfg.EmbeddingsEndpoint()
+	pin := cfg.ModelPin(recipe.StepEmbed)
+	return strings.Join([]string{ep.ID, ep.BaseURL, ep.Model, ep.APIKey, pin.ExpectedModel, pin.Revision}, "\x00")
+}
+
+// ApplyEmbedConfig points the embeddings client and the embed recipe at
+// cfg's embeddings endpoint and pin — the effective config after runtime
+// model settings (CONTRACT §2.20) — and reports whether anything changed.
+// The worker calls it once per cycle, before it embeds, so one batch never
+// mixes two embed models; search processes call it on a short timer so the
+// query side follows the same setting. The vector column stays
+// vector(768): a model of another dimension fails every insert.
+func (db *DB) ApplyEmbedConfig(cfg *config.Config) bool {
+	key := embedConfigKey(cfg)
+	db.embedMu.Lock()
+	defer db.embedMu.Unlock()
+	if key == db.embedKey && db.e != nil {
+		return false
+	}
+	e := openai.NewEmbeddings(cfg)
+	db.e, db.embedCfg, db.embedKey = e, cfg, key
+	db.embedRecipe = embedRecipe(cfg, e.DocumentPrefix())
+	return true
+}
+
+// EmbedRecipeFor is the embed recipe cfg's embeddings endpoint would stamp —
+// for deciding the current embed recipe of an effective config (CONTRACT
+// §2.20) without swapping this process's embedder.
+func EmbedRecipeFor(cfg *config.Config) recipe.Recipe {
+	return embedRecipe(cfg, openai.NewEmbeddings(cfg).DocumentPrefix())
 }
 
 // embedRecipe builds the embed recipe: the embeddings endpoint's model (what we

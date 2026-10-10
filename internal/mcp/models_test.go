@@ -418,6 +418,22 @@ func TestServersDataScenarios(t *testing.T) {
 			wantAbsent: []string{"▲ DEGRADED", "fallback route?", "≠ expected"},
 		},
 		{
+			// Runtime model settings (CONTRACT §2.20): the judge on a db-set
+			// model, the decide row invalid (its endpoint is not registered).
+			scenario: demoScenarioModelSettings,
+			wantContains: []string{
+				`<span class="mono">ollama/qwen3.8:27b-q8_0</span> <span class="time-muted">@ litellm-judge</span>`,
+				`<span class="badge source-db"`, "set by <span class=\"mono\">cli:justin</span>",
+				"no calls since the model changed (now ollama/qwen3.8:27b-q8_0)",
+				`class="panel server-card role-card state-stalled" id="role-decide"`,
+				"model_settings row is invalid — decide runs fail until it is fixed (earmark models unset decide)",
+				`endpoint &#34;ollama-clef&#34; is not in AI_ENDPOINTS`, "db · invalid",
+				`<span class="mono">clef-1.0.0</span> <span class="time-muted">@ ollama-clef</span>`,
+				"litellm-judge@propose", "(model setting)",
+				`title="AI_ENDPOINTS + AI_ROLES (+ MODELS_FILE); no model_settings row">env default`,
+			},
+		},
+		{
 			scenario: "idle",
 			wantContains: []string{"✓ HEALTHY · idle", "every transcript judged", "nothing waiting to embed",
 				`class="panel server-card role-card state-running" id="role-judge"`,

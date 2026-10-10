@@ -37,6 +37,9 @@ import (
 //	                         key allowlist → Judge DEGRADED ("every call 403s")
 //	gateway-keyinfo        — /key/info is not readable by earmark's key (403):
 //	                         the gateway card degrades, roles are unaffected
+//	model-settings         — runtime model settings (CONTRACT §2.20): Judge on a
+//	                         db-set model ("source db · set by cli:justin"),
+//	                         Decide FAILING on an invalid row (endpoint removed)
 //
 // The LiteLLM gateway is READY with key "earmark" ($12.25, no budget) in every
 // scenario except winddown (gateway down); idle sets a budget and limits.
@@ -63,6 +66,31 @@ const (
 
 // demoScenarioRecipeChanged: the judge's recipe moved after its newest answer.
 const demoScenarioRecipeChanged = "recipe-changed"
+
+// demoScenarioModelSettings: runtime model settings (CONTRACT §2.20) — the
+// judge runs on a db-set model (another model on the LiteLLM chat endpoint,
+// set 2h ago, after its newest answer), and the decide row names an endpoint
+// no longer in AI_ENDPOINTS (invalid: Decide FAILING with the fix).
+const demoScenarioModelSettings = "model-settings"
+
+// demoSettingJudgeModel is the db-set judge model in the model-settings
+// scenario.
+const demoSettingJudgeModel = "ollama/qwen3.8:27b-q8_0"
+
+// ListModelSettings is the model_settings fixture: rows only in the
+// model-settings scenario, so every other scenario renders the env models.
+func (d demoDB) ListModelSettings(context.Context) ([]db.ModelSetting, error) {
+	if d.scenario != demoScenarioModelSettings {
+		return nil, nil
+	}
+	now := time.Now()
+	return []db.ModelSetting{
+		{Step: recipe.StepDecide, EndpointID: "ollama-clef", Model: "clef-1.0.0",
+			UpdatedAt: now.Add(-26 * time.Hour), UpdatedBy: "cli:justin"},
+		{Step: recipe.StepPropose, EndpointID: "litellm-judge", Model: demoSettingJudgeModel,
+			UpdatedAt: now.Add(-2 * time.Hour), UpdatedBy: "cli:justin"},
+	}, nil
+}
 
 // demoAIEndpoints is the synthetic AI endpoint registry: LiteLLM-fronted
 // embeddings + judge (declared gateway), and a direct, unbound, offline Ollama
@@ -175,6 +203,9 @@ func (d demoDB) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) 
 	if d.scenario == demoScenarioRecipeChanged {
 		proposeSince = now.Add(-20 * time.Hour) // after the judge's newest answer (1d ago)
 	}
+	if d.scenario == demoScenarioModelSettings {
+		proposeSince = now.Add(-2 * time.Hour) // the model_settings row, after the newest answer
+	}
 	return []db.CurrentRecipe{
 		{Step: recipe.StepEmbed, RecipeID: demoRecipeID(recipe.StepEmbed), Model: demoEmbedModel,
 			StepVersion: 1, ModelAlias: demoEmbedModel, ModelResolved: demoEmbedModel, UpdatedAt: now.Add(-9 * 24 * time.Hour)},
@@ -222,6 +253,9 @@ func (d demoDB) GetModelActivity(context.Context) (db.ModelActivity, error) {
 			ModelSHA256: sp(demoNemoSHA), At: now.Add(-2 * time.Minute)},
 	}
 	switch d.scenario {
+	case demoScenarioModelSettings:
+		// The newest answer is from before the db setting (2h ago).
+		a.EvalLastOK, a.EvalLastFail, a.EvalLastError, a.EvalFailingNow = at(24*time.Hour), nil, "", 0
 	case demoScenarioRecipeChanged:
 		// The newest answer is from before the model switch (20h ago).
 		a.EvalLastOK, a.EvalLastFail, a.EvalLastError, a.EvalFailingNow = at(24*time.Hour), nil, "", 0

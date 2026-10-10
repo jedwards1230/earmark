@@ -15,6 +15,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/metaprovider"
 	"github.com/jedwards1230/earmark/internal/metrics"
+	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/telemetry"
 )
 
@@ -366,7 +367,6 @@ func (s *MCPServer) initEval(cfg *config.Config) {
 		s.logger.Info("eval layer disabled (no chat endpoint configured)", "reason", err)
 		return
 	}
-	judge := eval.NewJudgeForConfig(chat, cfg)
 	db := s.db
 	s.eval.configured = true
 	s.eval.model = chat.Model()
@@ -382,8 +382,20 @@ func (s *MCPServer) initEval(cfg *config.Config) {
 			}
 		}
 	}
+	// The judge is resolved per run on the propose step's effective model
+	// (CONTRACT §2.20): a model_settings change applies to the next click
+	// without a restart, and an invalid row fails the run instead of judging
+	// with the env model.
 	s.eval.run = func(ctx context.Context, opts eval.RunOptions) (eval.RunStats, error) {
-		_, stats, err := eval.Run(ctx, db, judge, db, opts)
+		eff, err := s.effectiveStep(ctx, cfg, recipe.StepPropose)
+		if err != nil {
+			return eval.RunStats{}, err
+		}
+		chat, err := eval.ResolveChatClient(eval.ConfigSource(eff))
+		if err != nil {
+			return eval.RunStats{}, err
+		}
+		_, stats, err := eval.Run(ctx, db, eval.NewJudgeForConfig(chat, eff), db, opts)
 		return stats, err
 	}
 }

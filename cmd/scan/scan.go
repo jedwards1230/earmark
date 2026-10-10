@@ -28,6 +28,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/fn"
 	"github.com/jedwards1230/earmark/internal/genai"
+	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/runs"
 	scanpkg "github.com/jedwards1230/earmark/internal/scan"
 	"github.com/jedwards1230/earmark/internal/telemetry"
@@ -49,6 +50,10 @@ type options struct {
 	limit       int
 	json        bool
 	yes         bool
+	// --endpoint / --model: the scan step's model for this run only
+	// (CONTRACT §2.20).
+	overrideEndpoint string
+	overrideModel    string
 }
 
 var opts options
@@ -79,7 +84,13 @@ Examples:
   earmark scan --sample 50                  # preview 50 random chunks
   earmark scan --sample 50 --seed q4 --yes  # the same 50 chunks, written
   earmark scan --book "Children of Dune" --yes
-  earmark scan --limit 2000 --yes --json    # first 2000 unscanned chunks`,
+  earmark scan --limit 2000 --yes --json    # first 2000 unscanned chunks
+  earmark scan --sample 50 --seed q4 --model clef-1.0.0 --endpoint ollama-clef
+
+Model: the scan step's effective model (CONTRACT §2.20): --endpoint/--model
+for this run, else the model_settings row ('earmark models set scan ...'),
+else AI_ROLES.scan. A different model is a different scan recipe. Neither
+flag writes model_settings.`,
 	Run: runScan,
 }
 
@@ -93,6 +104,8 @@ func init() {
 	f.IntVar(&opts.limit, "limit", 0, "without --sample, scan at most N chunks (0 = all)")
 	f.BoolVar(&opts.json, "json", false, "print the report as JSON")
 	f.BoolVar(&opts.yes, "yes", false, "write results to chunk_scan (otherwise dry-run)")
+	f.StringVar(&opts.overrideEndpoint, "endpoint", "", "this run only: the AI_ENDPOINTS id (a systemone endpoint) to ask (default: the scan step's effective endpoint)")
+	f.StringVar(&opts.overrideModel, "model", "", "this run only: the pinned System One model id to ask (default: the scan step's effective model)")
 }
 
 func runScan(_ *cobra.Command, _ []string) {
@@ -104,21 +117,31 @@ func runScan(_ *cobra.Command, _ []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
 	}
-	f, client, ok, err := scanpkg.FnFromConfig(cfg, opts.context)
-	if !ok {
-		fmt.Fprintln(os.Stderr, "Error: earmark scan needs AI_ROLES.scan bound to a systemone endpoint in AI_ENDPOINTS (CONTRACT §2.14)")
-		os.Exit(2)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: scan endpoint: %v\n", err)
-		os.Exit(2)
-	}
 	database, err := db.New(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer database.Close()
+	// The scan step's effective model (CONTRACT §2.20): --endpoint/--model,
+	// else its model_settings row, else AI_ROLES.scan. An invalid row fails
+	// the run rather than scanning with another model.
+	cfg, err = db.ResolveStep(context.Background(), database, cfg, recipe.StepScan,
+		opts.overrideEndpoint, opts.overrideModel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	log.Print(cfg.DescribeStep(recipe.StepScan))
+	f, client, ok, err := scanpkg.FnFromConfig(cfg, opts.context)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "Error: earmark scan needs AI_ROLES.scan bound to a systemone endpoint in AI_ENDPOINTS (CONTRACT §2.14), or a scan model setting (earmark models set scan)")
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: scan endpoint: %v\n", err)
+		os.Exit(2)
+	}
 
 	tel, terr := telemetry.Setup(context.Background())
 	if terr != nil {
@@ -332,6 +355,12 @@ func argsSummary(o options) string {
 	}
 	if o.yes {
 		parts = append(parts, "--yes")
+	}
+	if o.overrideEndpoint != "" {
+		parts = append(parts, "--endpoint "+o.overrideEndpoint)
+	}
+	if o.overrideModel != "" {
+		parts = append(parts, "--model "+o.overrideModel)
 	}
 	return strings.Join(parts, " ")
 }
