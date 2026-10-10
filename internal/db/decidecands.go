@@ -112,6 +112,10 @@ type DecideFinding struct {
 	ChunkTextSHA256  string
 	PatchState       string
 	DecidedBy        string // "" when undecided
+	// JudgeModel is the model that proposed the finding (resolved_model,
+	// else the requested model). Only DecideSample fills it — the decide
+	// dry run's --dump reports it; nothing decides on it.
+	JudgeModel string
 }
 
 // decideScopeWhere is the shared filter: anchored judge findings (an anchor
@@ -133,12 +137,13 @@ const decideScopeWhere = `
 	   AND (cardinality($4::text[]) = 0 OR f.decided_by LIKE ANY($4::text[]))`
 
 // decideSampleSQL samples the scope deterministically: md5(id || seed).
-// $5 seed, $6 limit.
+// $5 seed, $6 limit. Its last column is the judge model (DecideFinding.JudgeModel).
 var decideSampleSQL = `
 	SELECT f.id::text, f.transcript_id::text, f.file_path, f.issue_type, f.original_text,
 	       COALESCE(f.suggested_correction, ''), f.confidence, f.chunk_index,
 	       f.anchor_offset, COALESCE(f.anchor_occurrence, -1), f.chunk_text_sha256,
-	       f.patch_state, COALESCE(f.decided_by, '')
+	       f.patch_state, COALESCE(f.decided_by, ''),
+	       COALESCE(NULLIF(f.resolved_model, ''), f.model)
 	  FROM transcript_findings f` + decideScopeWhere + `
 	 ORDER BY md5(f.id::text || $5), f.id
 	 LIMIT $6`
@@ -164,7 +169,7 @@ func decideSample(ctx context.Context, q rowQuerier, s DecideScope) ([]DecideFin
 	if err != nil {
 		return nil, fmt.Errorf("decide sample: %w", err)
 	}
-	out, err := pgx.CollectRows(rows, scanDecideFinding)
+	out, err := pgx.CollectRows(rows, scanDecideSampleFinding)
 	if err != nil {
 		return nil, fmt.Errorf("decide sample: %w", err)
 	}
@@ -176,6 +181,16 @@ func scanDecideFinding(r pgx.CollectableRow) (DecideFinding, error) {
 	err := r.Scan(&f.ID, &f.TranscriptID, &f.FilePath, &f.IssueType, &f.Original, &f.Replacement,
 		&f.Confidence, &f.ChunkIndex, &f.AnchorOffset, &f.AnchorOccurrence, &f.ChunkTextSHA256,
 		&f.PatchState, &f.DecidedBy)
+	return f, err
+}
+
+// scanDecideSampleFinding scans decideSampleSQL: scanDecideFinding's columns
+// plus the judge model.
+func scanDecideSampleFinding(r pgx.CollectableRow) (DecideFinding, error) {
+	var f DecideFinding
+	err := r.Scan(&f.ID, &f.TranscriptID, &f.FilePath, &f.IssueType, &f.Original, &f.Replacement,
+		&f.Confidence, &f.ChunkIndex, &f.AnchorOffset, &f.AnchorOccurrence, &f.ChunkTextSHA256,
+		&f.PatchState, &f.DecidedBy, &f.JudgeModel)
 	return f, err
 }
 

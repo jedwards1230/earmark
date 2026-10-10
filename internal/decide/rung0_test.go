@@ -2,6 +2,7 @@ package decide
 
 import (
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,22 +49,32 @@ func TestCheck(t *testing.T) {
 		{"prompt: Limpel Ziv → Lempel-Ziv", cand("a", IssueMisheardWord, "limpel ziv coding", "limpel ziv", "Lempel-Ziv", 0.9), true, ""},
 		// "240" is scored by its best spoken reading, "two forty" (TFRT).
 		{"prompt: too forty → 240", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "240", 0.9), true, ""},
-		{"number: nineteen eighty four → 1984", cand("a", IssueNumberArtifact, "in nineteen eighty four we", "nineteen eighty four", "1984", 0.9), true, ""},
-		{"number: grouped thousands", cand("a", IssueNumberArtifact, "about one thousand miles", "one thousand", "1,000", 0.9), true, ""},
-		{"number: grouped tens of thousands", cand("a", IssueNumberArtifact, "some twenty five thousand people", "twenty five thousand", "25,000", 0.9), true, ""},
-		{"number: decimal", cand("a", IssueNumberArtifact, "about three point five liters", "three point five", "3.5", 0.9), true, ""},
-		{"number: two years", cand("a", IssueNumberArtifact, "from nineteen eighty four to nineteen ninety we", "nineteen eighty four to nineteen ninety", "1984 to 1990", 0.9), true, ""},
+		// A numeral written for words that read the same is formatting, not a
+		// change to what was said (rung0@v2).
+		{"number: nineteen eighty four → 1984 is formatting", cand("a", IssueNumberArtifact, "in nineteen eighty four we", "nineteen eighty four", "1984", 0.9), false, ReasonCosmeticOnly},
+		{"number: cardinal → 1937 is formatting", cand("a", IssueNumberArtifact, "in one thousand nine hundred thirty seven we", "one thousand nine hundred thirty seven", "1937", 0.9), false, ReasonCosmeticOnly},
+		{"number: 1937 → words is formatting", cand("a", IssueMisheardWord, "in 1937 we", "1937", "nineteen thirty seven", 0.9), false, ReasonCosmeticOnly},
+		{"number: grouped thousands is formatting", cand("a", IssueNumberArtifact, "about one thousand miles", "one thousand", "1,000", 0.9), false, ReasonCosmeticOnly},
+		{"number: grouped tens of thousands is formatting", cand("a", IssueNumberArtifact, "some twenty five thousand people", "twenty five thousand", "25,000", 0.9), false, ReasonCosmeticOnly},
+		{"number: decimal is formatting", cand("a", IssueNumberArtifact, "about three point five liters", "three point five", "3.5", 0.9), false, ReasonCosmeticOnly},
+		{"number: two years is formatting", cand("a", IssueNumberArtifact, "from nineteen eighty four to nineteen ninety we", "nineteen eighty four to nineteen ninety", "1984 to 1990", 0.9), false, ReasonCosmeticOnly},
+		{"number: decimal point dropped is a value change", cand("a", IssueNumberArtifact, "about 3.5 liters", "3.5", "35", 0.9), false, ReasonNotSoundAlike},
+		{"number: misheard word plus a re-spelling", cand("a", IssueNumberArtifact, "about too forty and nineteen eighty four", "too forty and nineteen eighty four", "240 and 1984", 0.9), true, ""},
 		{"number: two paired readings", cand("a", IssueNumberArtifact, "at too forty at two oh five", "too forty at two oh five", "240 at 205", 0.9), true, ""},
 		{"number: decimal digits differ", cand("a", IssueNumberArtifact, "pi is 3.15 here", "3.15", "3.50", 0.9), false, ReasonNotSoundAlike},
 		{"number: grouped digits differ", cand("a", IssueNumberArtifact, "paid 1,500 dollars", "1,500", "1,550", 0.9), false, ReasonNotSoundAlike},
 		{"number: plain digits differ", cand("a", IssueNumberArtifact, "x 240 y", "240", "250", 0.9), false, ReasonNotSoundAlike},
 		{"number: value change beside a word", cand("a", IssueNumberArtifact, "about 240 feat high", "240 feat", "250 feet", 0.9), false, ReasonNotSoundAlike},
 		{"number: value change in a phrase", cand("a", IssueMisheardWord, "the 15 men left", "15 men", "50 man", 0.9), false, ReasonNotSoundAlike},
-		{"number: same value re-spelled with digits", cand("a", IssueNumberArtifact, "in nineteen 84 we", "nineteen 84", "1984", 0.9), true, ""},
-		{"number: same numeral, words around it changed", cand("a", IssueHomophone, "x the 240 feat y", "the 240 feat", "a 240 feet", 0.9), true, ""},
-		{"number: grouped vs words", cand("a", IssueNumberArtifact, "some 10,000 people", "10,000", "10 thousand", 0.9), true, ""},
-		{"number: nine spelled-out words", cand("a", IssueNumberArtifact, "exactly one million two hundred thousand three hundred forty five votes",
-			"one million two hundred thousand three hundred forty five", "1,200,345", 0.9), true, ""},
+		{"number: same value re-spelled with digits", cand("a", IssueNumberArtifact, "in nineteen 84 we", "nineteen 84", "1984", 0.9), false, ReasonCosmeticOnly},
+		{"number: same numeral, words around it changed", cand("a", IssueHomophone, "x the 240 feat y", "the 240", "the 240 feet", 0.9), false, ReasonNotSoundAlike},
+		{"number: same numeral, homophone beside it", cand("a", IssueHomophone, "x the 240 feat y", "240 feat", "240 feet", 0.9), true, ""},
+		{"number: article swap beside a numeral", cand("a", IssueHomophone, "x the 240 feat y", "the 240 feat", "a 240 feet", 0.9), false, ReasonNotSoundAlike},
+		{"number: grouped vs words is formatting", cand("a", IssueNumberArtifact, "some 10,000 people", "10,000", "10 thousand", 0.9), false, ReasonCosmeticOnly},
+		{"number: nine spelled-out words are formatting", cand("a", IssueNumberArtifact, "exactly one million two hundred thousand three hundred forty five votes",
+			"one million two hundred thousand three hundred forty five", "1,200,345", 0.9), false, ReasonCosmeticOnly},
+		{"number: nine spelled-out words, one misheard", cand("a", IssueNumberArtifact, "exactly one million too hundred thousand three hundred forty five votes",
+			"one million too hundred thousand three hundred forty five", "1,200,345", 0.9), true, ""},
 		{"number: unrelated value", cand("a", IssueNumberArtifact, "about too forty miles", "too forty", "17", 0.9), false, ReasonNotSoundAlike},
 
 		// Target exists.
@@ -101,6 +112,9 @@ func TestCheck(t *testing.T) {
 		{"cosmetic: capitalisation", cand("a", IssueMisheardProperNoun, "speaks french well", "french", "French", 0.9), false, ReasonCosmeticOnly},
 		{"cosmetic: punctuation", cand("a", IssueMisheardWord, "well i think so", "well i think", "Well, I think", 0.9), false, ReasonCosmeticOnly},
 		{"cosmetic beats unsupported type", cand("a", IssueOther, "speaks french well", "french", "French", 0.9), false, ReasonCosmeticOnly},
+		{"cosmetic: apostrophe", cand("a", IssueMisheardWord, "split hairs here", "hairs", "hair's", 0.9), false, ReasonCosmeticOnly},
+		{"cosmetic: re-spacing", cand("a", IssueMisheardWord, "old placenames survive", "placenames", "place names", 0.9), false, ReasonCosmeticOnly},
+		{"cosmetic: case and punctuation over several words", cand("a", IssueMisheardProperNoun, "the dwarf was oric derun", "the dwarf was oric derun", "The dwarf was Oric-Derun.", 0.9), false, ReasonCosmeticOnly},
 
 		// Unsupported issue types fail closed.
 		{"other", cand("a", IssueOther, "over their by", "their", "there", 0.9), false, ReasonUnsupportedIssueType},
@@ -125,6 +139,47 @@ func TestCheck(t *testing.T) {
 		{"not soundalike: pure deletion", cand("a", IssueMisheardWord, "a big red ball", "big red ball", "red ball", 0.9), false, ReasonNotSoundAlike},
 		{"not soundalike: pure insertion", cand("a", IssueHomophone, "a red ball", "red ball", "big red ball", 0.9), false, ReasonNotSoundAlike},
 		{"soundalike window ignores shared context", cand("a", IssueHomophone, "i went over their by the door", "over their by", "over there by", 0.9), true, ""},
+
+		// rung0@v2: each changed hunk is checked on its own.
+		{"hunks: two separate mishearings with case added", cand("a", IssueMisheardProperNoun, "x erugon realized that the dwarf was orig derun y",
+			"erugon realized that the dwarf was orig derun", "Eragon realized that the dwarf was Oric Derun", 0.9), true, ""},
+		{"hunks: two mishearings far apart exceed the old window", cand("a", IssueMisheardWord, "x their dog ran across the long wide field to meet pin friends y",
+			"their dog ran across the long wide field to meet pin friends", "there dog ran across the long wide field to meet pen friends", 0.9), true, ""},
+		{"hunks: one good, one junk", cand("a", IssueMisheardProperNoun, "x erugon realized that the dwarf was kava y",
+			"erugon realized that the dwarf was kava", "Eragon realized that the dwarf was keats", 0.9), false, ReasonNotSoundAlike},
+		{"hunks: shared middle words do not pad the score", cand("a", IssueMisheardWord, "the cat sat on the mat", "cat sat on the mat", "bat sat on the hat", 0.9), false, ReasonNotSoundAlike},
+		{"hunks: substitution plus a deleted word", cand("a", IssueMisheardProperNoun, "x erugon was here today y", "erugon was here today", "Eragon was here", 0.9), false, ReasonNotSoundAlike},
+		{"hunks: re-spacing alone is cosmetic", cand("a", IssueMisheardWord, "x a cross a road y", "a cross a road", "across a road", 0.9), false, ReasonCosmeticOnly},
+		{"hunks: merge two words into one", cand("a", IssueMisheardWord, "x in to the woods y", "in to the woods", "unto the woods", 0.9), true, ""},
+		{"hunks: split one word into two", cand("a", IssueMisheardWord, "old placenes survive", "placenes", "place names", 0.9), true, ""},
+		{"hunks: hyphenated proper noun", cand("a", IssueMisheardWord, "the limpel ziv coding", "the limpel ziv coding", "the Lempel-Ziv coding", 0.9), true, ""},
+		// The hunk is compared joined ("shortingscircuitry" vs
+		// "shortcircuiting"), but the "-ing" moves across the word boundary,
+		// so the codes differ by more than a third: 0.600.
+		{"hunks: re-segmentation that reorders sounds", cand("a", IssueMisheardWord, "a shorting's circuitry fault", "shorting's circuitry", "short circuiting", 0.9), false, ReasonNotSoundAlike},
+
+		// Junk stays rejected.
+		{"junk: kava akbar → keats akbar", cand("a", IssueMisheardProperNoun, "said kava akbar", "kava akbar", "keats akbar", 0.9), false, ReasonNotSoundAlike},
+		{"junk: c → b vocabulary", cand("a", IssueMisheardWord, "learn the c vocabulary", "the c vocabulary", "the b vocabulary", 0.9), false, ReasonLetterSwap},
+		{"junk: letter swap that scores 1.0 (b → p)", cand("a", IssueMisheardWord, "learn the b vocabulary", "the b vocabulary", "the p vocabulary", 0.9), false, ReasonLetterSwap},
+		{"junk: letter swap c → k", cand("a", IssueMisheardWord, "vitamin c here", "vitamin c", "vitamin k", 0.9), false, ReasonLetterSwap},
+		{"junk: pronoun letter swap i → a", cand("a", IssueMisheardWord, "then i saw it", "i saw", "a saw", 0.9), false, ReasonLetterSwap},
+		{"junk: teeth → earth", cand("a", IssueMisheardWord, "the teeth moved", "teeth", "earth", 0.9), false, ReasonNotSoundAlike},
+		{"junk: let's ibid → let's leave it", cand("a", IssueMisheardWord, "ok let's ibid now", "let's ibid", "let's leave it", 0.9), false, ReasonNotSoundAlike},
+		{"junk: inserted words as a substitution", cand("a", IssueMisheardWord, "and said dogs ran", "said dogs", "he said the dogs", 0.9), false, ReasonNotSoundAlike},
+		{"inflection: split hair → split hairs", cand("a", IssueMisheardWord, "to split hair of", "split hair", "split hairs", 0.9), false, ReasonInflectionOnly},
+		{"inflection: book → books", cand("a", IssueMisheardWord, "the book are here", "book", "books", 0.9), false, ReasonInflectionOnly},
+		{"inflection: books → book", cand("a", IssueHomophone, "a books is here", "books", "book", 0.9), false, ReasonInflectionOnly},
+		{"inflection: box → boxes", cand("a", IssueMisheardWord, "two box of tea", "box", "boxes", 0.9), false, ReasonInflectionOnly},
+		{"inflection: walk → walked", cand("a", IssueMisheardWord, "he walk home", "walk", "walked", 0.9), false, ReasonInflectionOnly},
+		// rung0@v2 narrowed inflection to stem + one suffix: these no longer
+		// match it and are scored like any other substitution. A tense
+		// rewrite that sounds alike passes rung 0 and is the model's to judge.
+		{"tense change passes rung 0: trades → traded", cand("a", IssueMisheardWord, "he trades furs", "trades", "traded", 0.9), true, ""},
+		{"no -ing rule: walk → walking", cand("a", IssueMisheardWord, "he walk home", "walk", "walking", 0.9), false, ReasonNotSoundAlike},
+		{"no -ies/-ied rule: carries → carried", cand("a", IssueMisheardWord, "she carries it", "carries", "carried", 0.9), false, ReasonNotSoundAlike},
+		{"not inflection: short words", cand("a", IssueHomophone, "it is red", "is", "as", 0.9), true, ""},
+		{"not inflection: different stems", cand("a", IssueHomophone, "over their by", "their", "there", 0.9), true, ""},
 
 		// repeated_text.
 		{"repeat: three copies collapsed", cand("a", IssueRepeatedText, "no no no way", "no no no", "no", 0.9), true, ""},
@@ -171,6 +226,53 @@ func TestCheck(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDiffHunks(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want []hunk
+	}{
+		{"", "", nil},
+		{"a b c", "a b c", nil},
+		{"their dog", "there dog", []hunk{{0, 1, 0, 1}}},
+		// One substitution, not an insertion plus a deletion around a kept "a".
+		{"a cross a road", "across a road", []hunk{{0, 2, 0, 1}}},
+		{"said dogs", "he said the dogs", []hunk{{0, 0, 0, 1}, {1, 1, 2, 3}}},
+		{"x y z", "", []hunk{{0, 3, 0, 0}}},
+		{"erugon was orig derun", "eragon was oric derun", []hunk{{0, 1, 0, 1}, {2, 3, 2, 3}}},
+		{"placenes", "place names", []hunk{{0, 1, 0, 2}}},
+	}
+	for _, tc := range tests {
+		if got := diffHunks(strings.Fields(tc.a), strings.Fields(tc.b)); !slices.Equal(got, tc.want) {
+			t.Errorf("diffHunks(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestInflection(t *testing.T) {
+	for _, p := range [][2]string{{"hair", "hairs"}, {"book", "books"}, {"box", "boxes"}, {"church", "churches"},
+		{"wish", "wishes"}, {"buzz", "buzzes"}, {"kiss", "kisses"}, {"walk", "walked"}, {"luca", "lucas"}} {
+		if !inflection(p[0], p[1]) || !inflection(p[1], p[0]) {
+			t.Errorf("%q/%q not an inflection", p[0], p[1])
+		}
+	}
+	for _, p := range [][2]string{
+		{"their", "there"}, {"is", "as"}, {"red", "re"}, {"holovo", "holevo"}, {"run", "ran"}, {"cat", "cat"}, {"240", "2400"},
+		// No other stemming (rung0@v2 narrowed rule).
+		{"trades", "traded"}, {"carry", "carried"}, {"carries", "carried"}, {"walk", "walking"}, {"make", "making"}, {"trade", "traded"},
+		// The reviewer's false matches.
+		{"the", "thing"}, {"bee", "being"}, {"even", "evening"}, {"brown", "browning"}, {"mann", "manning"},
+		{"jon", "jones"}, {"hugh", "hughes"}, {"tim", "times"}, {"see", "seed"}, {"breed", "bring"},
+		// Stem lengths: -s needs 3 letters, -ed needs 4.
+		{"a", "as"}, {"be", "bes"}, {"bed", "beded"}, {"red", "reded"},
+		// -s after a stem already ending in s is not a plural.
+		{"les", "less"}, {"pas", "pass"}, {"kiss", "kisss"},
+	} {
+		if inflection(p[0], p[1]) {
+			t.Errorf("%q/%q read as an inflection", p[0], p[1])
+		}
 	}
 }
 
@@ -478,4 +580,110 @@ func FuzzCheck(f *testing.F) {
 		}
 		_ = Rung0([]Candidate{c, c}, nil, DefaultParams())
 	})
+}
+
+// The pairs a stem-and-suffix rule once matched, each of which is a
+// different word or a name: none may fail inflection_only, in either
+// direction. Capitalised replacements (Jones, Lucas) are exempt as names
+// whatever the issue type, and misheard_proper_noun is exempt outright.
+func TestCheckNotInflection(t *testing.T) {
+	tests := []struct {
+		issue, from, to string
+	}{
+		{IssueMisheardWord, "the", "thing"},
+		{IssueMisheardWord, "bee", "being"},
+		{IssueMisheardWord, "even", "evening"},
+		{IssueMisheardWord, "brown", "browning"},
+		{IssueMisheardWord, "mann", "manning"},
+		{IssueMisheardWord, "jon", "Jones"},
+		{IssueMisheardWord, "hugh", "Hughes"},
+		{IssueMisheardWord, "luca", "Lucas"},
+		{IssueMisheardWord, "robert", "Roberts"},
+		{IssueMisheardWord, "tim", "times"},
+		{IssueMisheardWord, "see", "seed"},
+		{IssueMisheardWord, "breed", "bring"},
+		{IssueMisheardWord, "bring", "breed"},
+		{IssueHomophone, "robert", "Roberts"},
+		// Contractions and possessives: tokens drop the apostrophe, so
+		// "there's" tokenises as "theres", but it is a different word.
+		{IssueMisheardWord, "there", "there's"},
+		{IssueMisheardWord, "that", "that’s"},
+		{IssueHomophone, "let", "let's"},
+		{IssueMisheardWord, "father", "father’s"},
+		{IssueMisheardWord, "father's", "father"},
+		// A stem already ending in s is not a plural.
+		{IssueMisheardWord, "les", "less"},
+		{IssueMisheardWord, "pas", "pass"},
+		// Lower-case, but the judge called it a name.
+		{IssueMisheardProperNoun, "luca", "lucas"},
+		{IssueMisheardProperNoun, "robert", "roberts"},
+		{IssueMisheardProperNoun, "book", "books"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.issue+" "+tc.from+"→"+tc.to, func(t *testing.T) {
+			v := Check(cand("a", tc.issue, "and "+tc.from+" went", tc.from, tc.to, 0.9), DefaultParams())
+			if v.Reason == ReasonInflectionOnly {
+				t.Errorf("%q → %q failed inflection_only: %s", tc.from, tc.to, v.Evidence)
+			}
+		})
+	}
+	// Control: without the name signals the same pair is an inflection.
+	if v := Check(cand("a", IssueMisheardWord, "and luca went", "luca", "lucas", 0.9), DefaultParams()); v.Reason != ReasonInflectionOnly {
+		t.Errorf("lower-case misheard_word luca → lucas = %q, want inflection_only", v.Reason)
+	}
+}
+
+// Real word pairs the narrow rule still reads as inflections, on purpose:
+// listed in CONTRACT §2.19 as known rejects.
+func TestCheckKnownInflectionRejects(t *testing.T) {
+	for _, p := range [][2]string{{"new", "news"}, {"mean", "means"}, {"wick", "wicked"}, {"crook", "crooked"}, {"luca", "lucas"}} {
+		v := Check(cand("a", IssueMisheardWord, "and "+p[0]+" went", p[0], p[1], 0.9), DefaultParams())
+		if v.Reason != ReasonInflectionOnly {
+			t.Errorf("%q → %q = %q %s, want inflection_only", p[0], p[1], v.Reason, v.Evidence)
+		}
+	}
+}
+
+// The total-change cap counts the words of every hunk together.
+func TestCheckChangeCap(t *testing.T) {
+	// n separate "their" → "there" hunks, each one word.
+	homophones := func(n int) Candidate {
+		var o, r []string
+		for i := range n {
+			o = append(o, "their", "w"+strconv.Itoa(i))
+			r = append(r, "there", "w"+strconv.Itoa(i))
+		}
+		orig, repl := strings.Join(o, " "), strings.Join(r, " ")
+		return cand("a", IssueHomophone, "x "+orig+" y", orig, repl, 0.9)
+	}
+	if v := Check(homophones(MaxChangedWords), DefaultParams()); !v.Pass {
+		t.Errorf("%d one-word hunks: %s %s, want pass", MaxChangedWords, v.Reason, v.Evidence)
+	}
+	if v := Check(homophones(MaxChangedWords+1), DefaultParams()); v.Reason != ReasonTooManyChanges {
+		t.Errorf("%d one-word hunks: %q %s, want too_many_changes", MaxChangedWords+1, v.Reason, v.Evidence)
+	}
+	// Four two-word hunks ("auto sebo" → "Arecibo" counts its longer side,
+	// 2) reach the cap; one more one-word hunk exceeds it.
+	const four = "auto sebo a auto sebo b auto sebo c auto sebo"
+	const fourFixed = "Arecibo a Arecibo b Arecibo c Arecibo"
+	if v := Check(cand("a", IssueMisheardProperNoun, "x "+four+" d y", four, fourFixed, 0.9), DefaultParams()); !v.Pass {
+		t.Errorf("4×2 words: %s %s, want pass", v.Reason, v.Evidence)
+	}
+	v := Check(cand("a", IssueMisheardProperNoun, "x "+four+" d their y", four+" d their", fourFixed+" d there", 0.9), DefaultParams())
+	if v.Reason != ReasonTooManyChanges || !strings.Contains(v.Evidence, "5 hunks change 9 words") {
+		t.Errorf("4×2 + 1 words: %q %s, want too_many_changes over 5 hunks", v.Reason, v.Evidence)
+	}
+}
+
+// A spelled-out year re-written as a different, sound-alike year passes
+// rung 0: one side has no numeral, so the value check cannot fire, and
+// "nineteen thirty seven" read against "1938" scores 0.70. Documented in
+// CONTRACT §2.19 as a known pass the model must catch.
+func TestCheckYearOffByOnePasses(t *testing.T) {
+	for _, issue := range []string{IssueNumberArtifact, IssueMisheardWord, IssueHomophone} {
+		v := Check(cand("a", issue, "in nineteen thirty seven we", "nineteen thirty seven", "1938", 0.9), DefaultParams())
+		if !v.Pass || !strings.Contains(v.Evidence, "soundalike 0.700") {
+			t.Errorf("%s: nineteen thirty seven → 1938 = pass %v %q %s; want a pass at 0.700", issue, v.Pass, v.Reason, v.Evidence)
+		}
+	}
 }

@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -35,6 +38,8 @@ func TestValidate(t *testing.T) {
 		"negative limit":      func(o *options) { o.yes, o.limit = true, -1 },
 		"zero batch":          func(o *options) { o.batch = 0 },
 		"human w/o calibrate": func(o *options) { o.human = []string{"cli"} },
+		"yes with rung0-only": func(o *options) { o.yes, o.rung0Only = true, true },
+		"yes with dump":       func(o *options) { o.yes, o.dump = true, "/tmp/x.jsonl" },
 	} {
 		o := ok
 		mut(&o)
@@ -152,5 +157,62 @@ func TestParseShard(t *testing.T) {
 		if _, _, err := parseShard(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// registerSpy is emptyStore with a register hook, so a test can see whether a
+// run registered a recipe.
+type registerSpy struct {
+	emptyStore
+	registered int
+}
+
+func (s *registerSpy) RegisterRecipe(ctx context.Context, r recipe.Recipe) (string, error) {
+	s.registered++
+	return s.emptyStore.RegisterRecipe(ctx, r)
+}
+
+// --rung0-only runs without an asker and registers no recipe; --dump writes
+// the file (empty for an empty scope).
+func TestRunRung0OnlyDump(t *testing.T) {
+	store := &registerSpy{}
+	path := filepath.Join(t.TempDir(), "r0.jsonl")
+	var out bytes.Buffer
+	o := options{sample: 5, seed: "s", concurrency: 1, batch: 20, rung0Only: true, dump: path}
+	if err := run(context.Background(), &out, store, nil, o); err != nil {
+		t.Fatal(err)
+	}
+	if store.registered != 0 {
+		t.Errorf("rung-0 replay registered %d recipes", store.registered)
+	}
+	if b, err := os.ReadFile(path); err != nil || len(b) != 0 {
+		t.Errorf("dump %q, %v", b, err)
+	}
+	if !strings.Contains(out.String(), "rung 0 only") {
+		t.Errorf("output:\n%s", out.String())
+	}
+
+	// A dump into a missing directory fails before any work.
+	o.dump = filepath.Join(t.TempDir(), "missing", "r0.jsonl")
+	if err := run(context.Background(), &out, store, nil, o); err == nil || !strings.Contains(err.Error(), "--dump") {
+		t.Errorf("bad dump path: %v", err)
+	}
+}
+
+type failingSample struct{ emptyStore }
+
+func (failingSample) DecideSample(context.Context, db.DecideScope) ([]db.DecideFinding, error) {
+	return nil, errors.New("boom")
+}
+
+// A failed run leaves no partial dump behind.
+func TestRunDumpRemovedOnError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "r0.jsonl")
+	o := options{sample: 5, seed: "s", concurrency: 1, batch: 20, rung0Only: true, dump: path}
+	if err := run(context.Background(), &bytes.Buffer{}, &failingSample{}, nil, o); err == nil {
+		t.Fatal("store error swallowed")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("partial dump left behind: %v", err)
 	}
 }

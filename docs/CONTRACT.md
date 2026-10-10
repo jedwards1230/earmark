@@ -3950,14 +3950,94 @@ evidence → the `should_apply` model call → the decision rule. It never retur
 an error: every failure after rung 0 is a retryable `hold`.
 
 1. **Rung 0** — the deterministic checks of `internal/decide/rung0.go`
-   (version `rung0@v1`): chunk hash and a unique, word-bounded anchor; not a
+   (version `rung0@v2`): chunk hash and a unique, word-bounded anchor; not a
    cosmetic-only edit; the issue type's edit shape (sound-alike substitution,
    exact repeat removal, 1–2-word insertion); per-chunk dedupe against other
    candidates and existing accepted/applied corrections. A failure is a
    `reject` with the rung-0 reason (`chunk_changed`, `anchor_missing`,
    `not_word_bounded`, `empty_correction`, `cosmetic_only`,
-   `unsupported_issue_type`, `not_soundalike`, `not_exact_repeat`,
-   `bad_insertion`, `overlap_dup`, `overlaps_overlay`) and **no model call**.
+   `unsupported_issue_type`, `not_soundalike`, `letter_swap`,
+   `inflection_only`, `too_many_changes`, `not_exact_repeat`, `bad_insertion`, `overlap_dup`, `overlaps_overlay`)
+   and **no model call**.
+
+   Words are compared lower-cased with punctuation removed (an apostrophe
+   joins, a hyphen or any other mark separates; a numeral such as `1,500` or
+   `3.5` is one word). The edit is split into **hunks**: the original's and
+   the replacement's words are aligned by edit distance (keep, substitute,
+   insert, delete — each change costs 1), and each maximal run of changes
+   between kept words is one hunk.
+   - **`cosmetic_only`** — every hunk reads aloud the same on both sides
+     (some spoken reading of each, letters only, is identical:
+     `tic tac toe`↔`tic-tac-toe`, `placenames`↔`place names`,
+     `one thousand nine hundred thirty seven`↔`1937`). Applies to every
+     issue type: a re-spelling of the same spoken words is formatting, not a
+     correction. A hunk that inserts or deletes words is never cosmetic.
+   - **Substitution** (`misheard_proper_noun`, `misheard_word`, `homophone`,
+     `number_artifact`) — **every** hunk must pass, checked on its own (the
+     unchanged words between two hunks never pad a score). Per hunk, in
+     order: both sides non-empty (else `not_soundalike`: inserting or
+     deleting words is not a mishearing); each side at most 8 words (not
+     for `number_artifact`) and 80 runes (else `not_soundalike`); a hunk
+     that reads the same passes; both sides writing numerals of different
+     value fails `not_soundalike`; a swap of one single-letter word for
+     another (`c`→`b`, `i`→`a`) fails `letter_swap` (letter names rhyme
+     and their one-letter codes carry no evidence); a one-word change that
+     is only an inflection (rule below) fails `inflection_only`; otherwise
+     the hunk's raw text on each side must score ≥ `phonetic_min_sim` with
+     `phonetic.Compare`, which joins the hunk's words (so splits and merges
+     such as `auto sebo`↔`Arecibo` compare as one word) and reads numerals
+     every common way. Alignment is limited to 256 words per side.
+     When every hunk passes, the words changed **in total** — each hunk
+     counting its longer side — must not exceed 8 (`MaxChangedWords`), else
+     `too_many_changes`: many small hunks add up to a rewrite, not a
+     mishearing. `number_artifact` is exempt, as from the per-hunk word
+     limit (a spelled-out number is many words but one value, and that type
+     is never applied by machine).
+   - **Inflection rule** (`inflection_only`, final, no model call). Rung 0
+     rejects only clear junk, so the rule is deliberately narrow: compared
+     lower-cased, one word must be **exactly** the other plus one of these
+     suffixes, with no other stemming or fuzzy matching:
+     - `s`, stem ≥ 3 letters not itself ending in `s` (`hair`→`hairs`,
+       `book`→`books`; not `les`→`less`, `pas`→`pass`);
+     - `es`, stem ≥ 3 letters ending in a sibilant — `s`, `x`, `z`, `ch`,
+       `sh` (`box`→`boxes`, `church`→`churches`; not `tim`→`times`);
+     - `ed`, stem ≥ 4 letters (`walk`→`walked`).
+
+     Both directions match. **Exempt**: issue type `misheard_proper_noun`,
+     and any pair where either word starts with a capital letter (the
+     transcript is lower-case, so a capital marks a name: `jon`→`Jones`,
+     `luca`→`Lucas`, `robert`→`Roberts`), and any pair where either raw
+     word holds an apostrophe, `'` or `’` (tokens drop apostrophes, so a
+     contraction or possessive would otherwise read as an `-s` form:
+     `there`→`there's`, `that`→`that’s`, `let`→`let's`,
+     `father`→`father's`); exempt pairs are scored like any
+     other substitution. **Known rejects, kept on purpose**: the rule still
+     fails `new`→`news`, `mean`→`means`, `wick`→`wicked`,
+     `crook`→`crooked`, and lower-case `luca`→`lucas` (capitalised `Lucas`
+     is exempt) — each is a real word pair the narrow rule cannot tell from
+     an inflection, and widening it to spare them would let real
+     inflections through. There is no `-ing`, `-d` or `-ies`/`-ied` rule —
+     `-ing` is where distinct words collide (`even`/`evening`,
+     `brown`/`browning`, `mann`/`manning`). Pairs an earlier draft of this
+     rule matched and this one does not, now scored phonetically:
+     `the`→`thing`, `bee`→`being`, `even`→`evening`, `brown`→`browning`,
+     `mann`→`manning`, `jon`→`Jones`, `hugh`→`Hughes`, `luca`→`Lucas`,
+     `robert`→`Roberts`, `tim`→`times`, `see`→`seed`, `breed`↔`bring`, and
+     the former positives `trades`→`traded` (passes, 0.750), `carries`→
+     `carried` (`not_soundalike`, 0.667), `carry`→`carried`,
+     `walk`→`walking` (`not_soundalike`, 0.600), `make`→`making` and
+     `trade`→`traded`. Because `rung0_version` is in the decide recipe and
+     a re-check by a later recipe rejects (and so reverts) an earlier
+     recipe's accept that now fails rung 0, a false `inflection_only` would
+     undo good fixes — hence the narrow rule.
+   - **Known passes the model must catch.** Rung 0 is a junk filter, not a
+     verdict. A tense change that sounds alike (`trades`→`traded`, 0.750)
+     passes, and so does a spelled-out year rewritten as a nearby
+     sound-alike year: `nineteen thirty seven`→`1938` passes at 0.700
+     (as `number_artifact`, `misheard_word` or `homophone`) —
+     only one side writes a numeral, so the numeral-value check cannot fire,
+     and `1938` read as `nineteen thirty eight` shares most of its sounds.
+     Jev (`should_apply`) must reject these.
 2. **Context** — "sentence" means **ASR segment**: transcript text is
    lowercase with no punctuation, and a chunk is whole segments joined by one
    space. The segments starting at the chunk's `start_sec` are joined until
@@ -4101,7 +4181,7 @@ bounded; neither writes.
 #### `earmark decide` (dry run)
 
 `earmark decide [--sample N] [--seed S] [--book X] [--issue-type T]
-[--concurrency 8] [--json] [--calibrate]` runs the pipeline above on a sample
+[--concurrency 8] [--json] [--calibrate] [--rung0-only] [--dump FILE]` runs the pipeline above on a sample
 and reports what a full run would do. **It decides nothing**: no
 `finding_events`, no state change, no `decided_by`. Its only writes are the
 decide recipe row (`recipes`, via `decide.Evaluator.Recipe`) and one `fn_calls`
@@ -4150,6 +4230,25 @@ error. It does not take the GPU phase gate (System One is hosted).
   and each finding re-decided with the `p` already obtained — no new model
   call — so a finding that passes only below the run's threshold is counted
   *unasked*.
+- **`--rung0-only`** (replay): the same selection, loading, rung 0 and
+  dedupe, then text evidence for each pass — and nothing else. No model call,
+  no `recipes` row (the recipe id is computed, not registered), no `fn_calls`
+  read or write: the run is read-only, and needs no `AI_ROLES.decide`. The
+  report's classes are `rung0_pass` / `reject` / `reanchor` with the rung-0
+  reject reasons and the projection; with `--calibrate`, rung-0 passes and
+  rejects per human label and the threshold sweep. Two builds over the same
+  `--seed` compare rung-0 versions on the same findings. *Side effect:* like
+  every `earmark` command that opens the database, it runs `db.New`, which
+  applies pending goose migrations (§1.8) — a no-op when the schema is
+  current, so point a replay at a database already on this build's schema.
+- **`--dump FILE`**: one JSON line per sampled finding, sorted by finding id
+  — `finding_id`, `issue_type`, `judge_model` (`resolved_model`, else
+  `model`), `confidence`, `patch_state`, `original`, `replacement`, `rung0`
+  (`pass`, `reason`, `evidence`), `class`, and for a rung-0 pass `evidence`
+  plus, when the model was asked, `outcome`, `reason` and `p`. Unlike the
+  report it holds finding ids and text; it is a local measurement file. It
+  works with or without `--rung0-only`, is removed if the run fails, and like
+  `--rung0-only` is dry-run only.
 
 #### `earmark decide --yes` (full run)
 

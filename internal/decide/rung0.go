@@ -52,9 +52,24 @@ const (
 	// ReasonUnsupportedIssueType — the issue type ("other", or anything rung 0
 	// does not know) names no edit shape that can be checked. Fails closed.
 	ReasonUnsupportedIssueType = "unsupported_issue_type"
-	// ReasonNotSoundAlike — a substitution whose changed words do not sound
-	// like the words they replace.
+	// ReasonNotSoundAlike — a substitution with a changed region whose words
+	// do not sound like the words they replace, or that only inserts or
+	// deletes words.
 	ReasonNotSoundAlike = "not_soundalike"
+	// ReasonInflectionOnly — a substitution that changes one word only by
+	// adding or removing a single regular ending ("hair" → "hairs", "box" →
+	// "boxes", "walk" → "walked"; the exact rule is inflection's). A
+	// grammar edit and a misheard ending look the same to every rung-0
+	// signal, so neither is passed as a mishearing. Proper nouns are exempt.
+	ReasonInflectionOnly = "inflection_only"
+	// ReasonLetterSwap — a substitution hunk that swaps one single-letter
+	// word for another ("c" → "b", "i" → "a"): letter names rhyme, and their
+	// one-letter codes carry no evidence.
+	ReasonLetterSwap = "letter_swap"
+	// ReasonTooManyChanges — a substitution whose hunks each pass, but which
+	// changes more than MaxChangedWords words in total: a rewrite, not a
+	// mishearing.
+	ReasonTooManyChanges = "too_many_changes"
 	// ReasonNotExactRepeat — a repeated_text fix that is not the removal of an
 	// exact adjacent repeat, word-bounded, at the located span.
 	ReasonNotExactRepeat = "not_exact_repeat"
@@ -76,16 +91,26 @@ const (
 	MaxRepeatTokens = 6
 	// MaxInsertedTokens is the most words a dropped_word fix may insert.
 	MaxInsertedTokens = 2
-	// MaxSubstitutionTokens and MaxSubstitutionRunes bound each side of the
-	// differing window a substitution is scored on. A misheard word or name
-	// is a few words; a longer window is a rewrite, not a mishearing, and
-	// would also make the phonetic comparison expensive. Past either limit
-	// the candidate fails not_soundalike. number_artifact windows are held
-	// to the rune limit only — "one million two hundred thousand three
+	// MaxSubstitutionTokens and MaxSubstitutionRunes bound each side of each
+	// changed region (hunk) a substitution is scored on. A misheard word or
+	// name is a few words; a longer region is a rewrite, not a mishearing,
+	// and would also make the phonetic comparison expensive. Past either
+	// limit the candidate fails not_soundalike. number_artifact hunks are
+	// held to the rune limit only — "one million two hundred thousand three
 	// hundred forty five" is nine words but one number.
 	// MaxSubstitutionRunes equals phonetic.MaxPhraseRunes.
 	MaxSubstitutionTokens = 8
 	MaxSubstitutionRunes  = phonetic.MaxPhraseRunes
+	// MaxChangedWords caps the words a substitution changes, summed over its
+	// hunks (each hunk counting its longer side), so many small hunks cannot
+	// add up to a rewrite. number_artifact is exempt, as it is from the
+	// per-hunk word limit: a spelled-out number is many words but one value,
+	// and number_artifact is never applied by machine (it caps at hold).
+	MaxChangedWords = 8
+	// MaxDiffTokens bounds each side of the token alignment (an O(n·m)
+	// table). An original or replacement past it fails not_soundalike for
+	// a substitution; a judge span is a few words to a sentence.
+	MaxDiffTokens = 256
 )
 
 // Candidate is one proposed finding, with the pristine text of the chunk it
@@ -165,14 +190,18 @@ func Rung0(cands []Candidate, existing []patch.Patch, p Params) []Verdict {
 //     one span (anchor_missing), and that span starts and ends on word
 //     boundaries in the chunk (not_word_bounded);
 //  2. the replacement is not empty (empty_correction);
-//  3. the edit changes more than case, punctuation, hyphens and spacing
-//     (cosmetic_only);
+//  3. the edit changes more than case, punctuation, hyphens and spacing, or
+//     re-spellings that read aloud the same ("1937" for "nineteen thirty
+//     seven") (cosmetic_only);
 //  4. the issue-type rule — substitution, repeat removal or insertion; any
 //     other type fails closed (unsupported_issue_type).
 //
 // Words are compared case-insensitively with punctuation removed: an
 // apostrophe joins ("don't" is one word "dont"), any other non-letter,
-// non-digit rune separates.
+// non-digit rune separates. The edit is split into hunks — the maximal
+// changed regions of a token alignment (diffHunks) — so two separate
+// mishearings in one span are checked separately, never as one window
+// padded with the unchanged words between them.
 func Check(c Candidate, p Params) Verdict {
 	if c.ChunkHash == "" {
 		return fail(ReasonChunkChanged, patch.Span{}, "finding recorded no chunk hash; the judged revision cannot be verified")
@@ -202,8 +231,8 @@ func Check(c Candidate, p Params) Verdict {
 	if strings.TrimSpace(c.Replacement) == "" {
 		return fail(ReasonEmptyCorrection, span, "suggested correction is empty")
 	}
-	if a, b := squash(c.Original), squash(c.Replacement); a == b {
-		return fail(ReasonCosmeticOnly, span, "%q and %q differ only in case, punctuation, hyphens or spacing", c.Original, c.Replacement)
+	if cosmetic(c.Original, c.Replacement) {
+		return fail(ReasonCosmeticOnly, span, "%q and %q differ only in case, punctuation, hyphens, spacing or a re-spelling that reads the same", c.Original, c.Replacement)
 	}
 
 	switch c.IssueType {
@@ -218,51 +247,266 @@ func Check(c Candidate, p Params) Verdict {
 	}
 }
 
-// checkSubstitution requires the differing token window to sound alike. A
-// window whose two sides both contain numerals, with different written
-// values, fails unless it is a pure re-spelling (see the numeral check). The
-// window is compared as the RAW text from the first differing word to the last
-// on each side, so a numeral keeps its punctuation ("1,000", "3.5") and is read
-// as one number rather than as separate digit groups.
+// checkSubstitution requires every changed hunk of the edit to be a
+// sound-alike substitution. Per hunk, in order:
+//
+//   - both sides non-empty: a hunk that only inserts or deletes words is not
+//     a mishearing (that is dropped_word's or repeated_text's shape);
+//   - each side within MaxSubstitutionTokens / MaxSubstitutionRunes;
+//   - a hunk that reads aloud the same on both sides ("1937" ↔ "nineteen
+//     thirty seven") passes as a re-spelling (Check has already refused an
+//     edit made only of those);
+//   - the numeral-value check: both sides write numerals with different
+//     values → fail, since spoken numbers share most of their sounds;
+//   - a letter swap (one single-letter word for another: "c" → "b", "i" →
+//     "a") fails letter_swap: letter names rhyme, and their codes are one
+//     letter long, so the score says nothing;
+//   - a one-word change by one regular ending (inflection) fails
+//     inflection_only, unless the issue type is misheard_proper_noun or
+//     either word is capitalised (a name: "Jon" → "Jones") or holds an
+//     apostrophe (a contraction or possessive: "there" → "there's");
+//   - otherwise phonetic.Compare over the hunk's raw text, which joins words
+//     (so "auto sebo" ↔ "arecibo" and "placenes" ↔ "place names" compare as
+//     one word) and reads numerals every common way.
+//
+// When every hunk passes, the words changed across all hunks (the longer
+// side of each) must not exceed MaxChangedWords (too_many_changes), except
+// for number_artifact.
+//
+// A hunk is compared as the RAW text from its first word to its last on each
+// side, so a numeral keeps its punctuation ("1,000", "3.5").
 func checkSubstitution(c Candidate, span patch.Span, threshold float64) Verdict {
 	o, r := tokenSpans(c.Original), tokenSpans(c.Replacement)
-	pre, suf := diffWindow(texts(o), texts(r))
-	ow, rw := o[pre:len(o)-suf], r[pre:len(r)-suf]
-	if len(ow) == 0 || len(rw) == 0 {
-		return fail(ReasonNotSoundAlike, span, "not a substitution: %q → %q only inserts or deletes words", c.Original, c.Replacement)
+	if len(o) > MaxDiffTokens || len(r) > MaxDiffTokens {
+		return fail(ReasonNotSoundAlike, span, "%d → %d words is too long to align (limit %d)", len(o), len(r), MaxDiffTokens)
 	}
-	a, b := rawText(c.Original, ow), rawText(c.Replacement, rw)
-	for _, side := range []struct {
-		text string
-		n    int
-	}{{a, len(ow)}, {b, len(rw)}} {
-		// A spelled-out number is long in words but still one number, so
-		// number_artifact windows are measured in runes only.
-		tooManyWords := side.n > MaxSubstitutionTokens && c.IssueType != IssueNumberArtifact
-		if tooManyWords || utf8.RuneCountInString(side.text) > MaxSubstitutionRunes {
-			return fail(ReasonNotSoundAlike, span, "substituted window %q is too long to be a mishearing (%d words; limits %d words, %d runes)",
-				side.text, side.n, MaxSubstitutionTokens, MaxSubstitutionRunes)
+	hunks := diffHunks(texts(o), texts(r))
+	evs := make([]string, 0, len(hunks))
+	changed := 0
+	for k, h := range hunks {
+		ow, rw := o[h.oi:h.oj], r[h.ri:h.rj]
+		at := fmt.Sprintf("hunk %d/%d", k+1, len(hunks))
+		if len(ow) == 0 || len(rw) == 0 {
+			return fail(ReasonNotSoundAlike, span, "%s: not a substitution: %q → %q only inserts or deletes words",
+				at, joinTexts(ow), joinTexts(rw))
+		}
+		changed += max(len(ow), len(rw))
+		a, b := rawText(c.Original, ow), rawText(c.Replacement, rw)
+		for _, side := range []struct {
+			text string
+			n    int
+		}{{a, len(ow)}, {b, len(rw)}} {
+			// A spelled-out number is long in words but still one number,
+			// so number_artifact hunks are measured in runes only.
+			tooManyWords := side.n > MaxSubstitutionTokens && c.IssueType != IssueNumberArtifact
+			if tooManyWords || utf8.RuneCountInString(side.text) > MaxSubstitutionRunes {
+				return fail(ReasonNotSoundAlike, span, "%s: substituted words %q are too long to be a mishearing (%d words; limits %d words, %d runes)",
+					at, side.text, side.n, MaxSubstitutionTokens, MaxSubstitutionRunes)
+			}
+		}
+		if phonetic.SameReading(a, b) {
+			evs = append(evs, fmt.Sprintf("%s: %q reads the same as %q", at, a, b))
+			continue
+		}
+		if na, nb := numerals(ow), numerals(rw); len(na) > 0 && len(nb) > 0 && !slices.Equal(na, nb) {
+			// Both sides write numerals and the written values differ, so
+			// the edit changes a value, not a spelling. Spoken numbers share
+			// most of their sounds ("two hundred forty" vs "... fifty"), so
+			// a phonetic score would pass wrong numbers; rung 0 cannot tell
+			// which value was spoken.
+			return fail(ReasonNotSoundAlike, span, "%s: numeral change %q → %q: a value change cannot be checked phonetically", at, a, b)
+		}
+		if len(ow) == 1 && len(rw) == 1 && singleLetter(ow[0].text) && singleLetter(rw[0].text) {
+			return fail(ReasonLetterSwap, span, "%s: letter swap %q → %q: letter names rhyme, so their sound is no evidence", at, a, b)
+		}
+		if len(ow) == 1 && len(rw) == 1 && c.IssueType != IssueMisheardProperNoun &&
+			!capitalised(a) && !capitalised(b) && !hasApostrophe(a) && !hasApostrophe(b) &&
+			inflection(ow[0].text, rw[0].text) {
+			return fail(ReasonInflectionOnly, span, "%s: %q → %q changes only an inflectional ending", at, a, b)
+		}
+		m := phonetic.Compare(a, b)
+		ev := fmt.Sprintf("%s: soundalike %.3f (threshold %.2f): %s vs %s",
+			at, m.Score, threshold, describe(a, m.A), describe(b, m.B))
+		if !m.Passes(threshold) {
+			return Verdict{Reason: ReasonNotSoundAlike, Span: span, Evidence: ev}
+		}
+		evs = append(evs, ev)
+	}
+	if changed > MaxChangedWords && c.IssueType != IssueNumberArtifact {
+		return fail(ReasonTooManyChanges, span, "%d hunks change %d words in total (limit %d): a rewrite, not a mishearing",
+			len(hunks), changed, MaxChangedWords)
+	}
+	if len(evs) == 0 { // unreachable after Check's cosmetic step; fail closed
+		return fail(ReasonCosmeticOnly, span, "%q → %q changes no word", c.Original, c.Replacement)
+	}
+	return Verdict{Pass: true, Span: span, Evidence: strings.Join(evs, "; ")}
+}
+
+// hunk is one changed region of a token alignment: a[oi:oj] became b[ri:rj].
+// One side may be empty (a pure insertion or deletion).
+type hunk struct{ oi, oj, ri, rj int }
+
+// diffHunks aligns a and b by token edit distance — keep, substitute, insert
+// and delete, each change costing 1 — and returns the maximal runs of
+// changes between kept tokens, in order. Edit distance rather than a
+// longest-common-subsequence diff because a substitution is one change, not
+// a delete plus an insert: "a cross a road" → "across a road" aligns as one
+// hunk "a cross" → "across", where an LCS may keep the first "a" and split
+// the edit into an insertion and a deletion. Ties keep tokens first, then
+// substitute; the result is deterministic.
+func diffHunks(a, b []string) []hunk {
+	n, m := len(a), len(b)
+	d := make([][]int, n+1)
+	for i := range d {
+		d[i] = make([]int, m+1)
+		d[i][0] = i
+	}
+	for j := 0; j <= m; j++ {
+		d[0][j] = j
+	}
+	for i := 1; i <= n; i++ {
+		for j := 1; j <= m; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			d[i][j] = min(d[i-1][j-1]+cost, d[i-1][j]+1, d[i][j-1]+1)
 		}
 	}
-	if na, nb := numerals(ow), numerals(rw); len(na) > 0 && len(nb) > 0 &&
-		!slices.Equal(na, nb) && !phonetic.SameReading(a, b) {
-		// Both sides write numerals and the written values differ, so the edit
-		// changes a value, not a spelling. Spoken numbers share most of their
-		// sounds ("one thousand five hundred" vs "... fifty", "two hundred
-		// forty" vs "... fifty"), so a phonetic score would pass wrong numbers;
-		// rung 0 has no way to tell which value was spoken. The one exception
-		// is a pure re-spelling that some reading of each side says
-		// identically ("10,000" → "10 thousand").
-		return fail(ReasonNotSoundAlike, span, "numeral change %q → %q: a value change cannot be checked phonetically", a, b)
+	// Walk back from the end, marking kept pairs; hunks are the gaps.
+	type pair struct{ i, j int }
+	var kept []pair
+	for i, j := n, m; i > 0 || j > 0; {
+		switch {
+		case i > 0 && j > 0 && a[i-1] == b[j-1] && d[i][j] == d[i-1][j-1]:
+			kept = append(kept, pair{i - 1, j - 1})
+			i, j = i-1, j-1
+		case i > 0 && j > 0 && d[i][j] == d[i-1][j-1]+1:
+			i, j = i-1, j-1
+		case i > 0 && d[i][j] == d[i-1][j]+1:
+			i--
+		default:
+			j--
+		}
 	}
-	m := phonetic.Compare(a, b)
-	ev := fmt.Sprintf("soundalike %.3f (threshold %.2f): %s vs %s",
-		m.Score, threshold, describe(a, m.A), describe(b, m.B))
-	if !m.Passes(threshold) {
-		return Verdict{Reason: ReasonNotSoundAlike, Span: span, Evidence: ev}
+	slices.Reverse(kept)
+	kept = append(kept, pair{n, m}) // sentinel: the end of both
+	var out []hunk
+	pi, pj := 0, 0
+	for _, k := range kept {
+		if k.i > pi || k.j > pj {
+			out = append(out, hunk{oi: pi, oj: k.i, ri: pj, rj: k.j})
+		}
+		pi, pj = k.i+1, k.j+1
 	}
-	return Verdict{Pass: true, Span: span, Evidence: ev}
+	return out
 }
+
+// cosmetic reports whether the edit from a to b changes nothing that is
+// spoken: the same words after case, punctuation, hyphens and spacing are
+// normalised, where every changed hunk reads aloud the same on both sides
+// ("tic tac toe" ↔ "tic-tac-toe", "place names" ↔ "placenames",
+// "nineteen thirty seven" ↔ "1937"). A hunk that inserts or deletes words
+// is never cosmetic. Inputs past MaxDiffTokens are compared token for token.
+func cosmetic(a, b string) bool {
+	at, bt := tokenSpans(a), tokenSpans(b)
+	if len(at) > MaxDiffTokens || len(bt) > MaxDiffTokens {
+		return slices.Equal(texts(at), texts(bt))
+	}
+	for _, h := range diffHunks(texts(at), texts(bt)) {
+		if h.oi == h.oj || h.ri == h.rj {
+			return false
+		}
+		if !phonetic.SameReading(rawText(a, at[h.oi:h.oj]), rawText(b, bt[h.ri:h.rj])) {
+			return false
+		}
+	}
+	return true
+}
+
+// singleLetter reports whether a token is one letter — a spelled-out letter
+// ("the c vocabulary") or the one-letter words "a" and "i".
+func singleLetter(t string) bool {
+	r, size := utf8.DecodeRuneInString(t)
+	return size == len(t) && unicode.IsLetter(r)
+}
+
+// minStemRunes is the shortest stem inflection accepts for -s and -es, so
+// short words that merely end in s ("is", "as") are not read as inflected
+// forms; minEdStemRunes is the shortest for -ed.
+const (
+	minStemRunes   = 3
+	minEdStemRunes = 4
+)
+
+// inflection reports whether one of a and b (lower-cased words) is EXACTLY
+// the other plus one regular ending, and nothing else changed:
+//
+//   - "s" after a stem of at least minStemRunes letters that does not
+//     itself end in s ("hair" → "hairs"; not "les" → "less");
+//   - "es" after a stem of at least minStemRunes letters that ends in a
+//     sibilant — s, x, z, ch or sh ("box" → "boxes"; not "tim" → "times");
+//   - "ed" after a stem of at least minEdStemRunes letters ("walk" →
+//     "walked"; not "bed" → "bed"+"ed").
+//
+// There is no other stemming: no -ing (distinct words collide there:
+// "even"/"evening", "brown"/"browning"), no -d, no y → ies/ied, no
+// fuzzy prefixes ("see"/"seed", "breed"/"bring"). Rung 0 rejects only clear
+// junk; anything else is left to the phonetic score and the model.
+func inflection(a, b string) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	suffix, ok := strings.CutPrefix(b, a)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range b {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	n := utf8.RuneCountInString(a)
+	switch suffix {
+	case "s":
+		// A stem already ending in s is not a plural: "les" → "less".
+		return n >= minStemRunes && !strings.HasSuffix(a, "s")
+	case "es":
+		return n >= minStemRunes && sibilant(a)
+	case "ed":
+		return n >= minEdStemRunes
+	}
+	return false
+}
+
+// sibilant reports whether stem ends in a sound that takes "-es" for the
+// plural: s, x, z, ch or sh.
+func sibilant(stem string) bool {
+	for _, e := range []string{"s", "x", "z", "ch", "sh"} {
+		if strings.HasSuffix(stem, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasApostrophe reports whether a raw word holds an apostrophe, straight or
+// curly. Tokens drop apostrophes, so "there's" and "father's" tokenise as
+// "theres" and "fathers"; a contraction or possessive is a different word,
+// not an inflection, and is exempt from it.
+func hasApostrophe(raw string) bool {
+	return strings.ContainsAny(raw, "'’")
+}
+
+// capitalised reports whether a raw word starts with an upper-case letter.
+// The transcript is lower-case by design, so a capital in the judge's text
+// marks a name ("Jones", "Lucas"), and a name is exempt from inflection.
+func capitalised(raw string) bool {
+	r, _ := utf8.DecodeRuneInString(raw)
+	return unicode.IsUpper(r)
+}
+
+func joinTexts(ts []token) string { return strings.Join(texts(ts), " ") }
 
 // checkRepeat requires the replacement to be the original with an exact
 // adjacent repeat collapsed: P + X×k + S → P + X + S, for a unit X of 1 to
@@ -508,18 +752,6 @@ func overlaps(a, b patch.Span) bool { return a.Start < b.End && b.Start < a.End 
 
 func fail(reason string, span patch.Span, format string, args ...any) Verdict {
 	return Verdict{Reason: reason, Span: span, Evidence: fmt.Sprintf(format, args...)}
-}
-
-// squash lower-cases s and keeps only letters and digits, for the
-// cosmetic-only comparison.
-func squash(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }
 
 // token is one word of a string: its comparison text and its rune range in

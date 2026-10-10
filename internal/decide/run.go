@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -40,6 +41,13 @@ type RunOptions struct {
 	Params      ShouldApplyParams
 	// Sweep is the thresholds calibration re-runs rung 0 at (nil = DefaultSweep).
 	Sweep []float64
+	// Rung0Only stops after rung 0 and text evidence: no model call, no
+	// recipe registration, no write of any kind. The report counts rung-0
+	// passes (ClassRung0Pass) and reject reasons. The asker may be nil.
+	Rung0Only bool
+	// Dump, when set, receives one JSON line per sampled finding (DumpRecord),
+	// sorted by finding id so two runs over the same sample diff line by line.
+	Dump io.Writer
 }
 
 // ClientFromConfig builds the System One client for AI_ROLES.decide. ok is
@@ -78,18 +86,32 @@ type item struct {
 // DryRun samples findings, decides each — rung 0, evidence, should_apply —
 // and reports what a full run would do. It writes nothing but the decide
 // recipe row and the fn_calls rows the model calls leave (so a later full run
-// is served from cache): no decision events, no state changes.
+// is served from cache): no decision events, no state changes. With
+// o.Rung0Only it writes nothing at all and makes no model call.
 func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Report, error) {
 	if o.Concurrency < 1 {
 		return nil, errors.New("decide: concurrency must be >= 1")
 	}
-	ev, err := NewEvaluator(store, asker, o.Params)
-	if err != nil {
-		return nil, err
-	}
-	recipeID, err := store.RegisterRecipe(ctx, ev.Recipe())
-	if err != nil {
-		return nil, fmt.Errorf("register decide recipe: %w", err)
+	var ev *Evaluator
+	var recipeID string
+	if o.Rung0Only {
+		// The recipe id is computed, never registered: a rung-0 replay
+		// writes nothing.
+		f, err := ShouldApplyFn(o.Params)
+		if err != nil {
+			return nil, err
+		}
+		if recipeID, err = f.Recipe("").ID(); err != nil {
+			return nil, fmt.Errorf("decide recipe id: %w", err)
+		}
+	} else {
+		var err error
+		if ev, err = NewEvaluator(store, asker, o.Params); err != nil {
+			return nil, err
+		}
+		if recipeID, err = store.RegisterRecipe(ctx, ev.Recipe()); err != nil {
+			return nil, fmt.Errorf("register decide recipe: %w", err)
+		}
 	}
 	sample, err := store.DecideSample(ctx, o.Scope)
 	if err != nil {
@@ -103,7 +125,11 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 	if err != nil {
 		return nil, err
 	}
-	evaluateAll(ctx, ev, items, o.Concurrency)
+	if o.Rung0Only {
+		rung0Outcomes(items)
+	} else {
+		evaluateAll(ctx, ev, items, o.Concurrency)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -115,7 +141,28 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 		}
 		rep.Calibration = calibrate(items, o.Params, sweep)
 	}
+	if o.Dump != nil {
+		if err := writeDump(o.Dump, items); err != nil {
+			return nil, fmt.Errorf("write dump: %w", err)
+		}
+	}
 	return rep, nil
+}
+
+// rung0Outcomes fills each item's outcome from its rung-0 verdict alone: a
+// failure is the reject Evaluate would return, a pass is left undecided
+// (Decision "", reported as ClassRung0Pass) with its text evidence. No call.
+func rung0Outcomes(items []*item) {
+	for _, it := range items {
+		c, v := it.input.Candidate, *it.input.Verdict
+		out := Outcome{FindingID: c.FindingID, Rung0: v, ChunkHash: c.ChunkHash, Evidence: EvidenceNone}
+		if v.Pass {
+			out.Evidence = TextEvidence(c, v, it.sentences)
+		} else {
+			out.Decision, out.Reason = DecisionReject, v.Reason
+		}
+		it.outcome = out
+	}
 }
 
 // prepare groups the sample by transcript, loads chunks, segments and book

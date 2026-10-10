@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -35,6 +36,8 @@ type options struct {
 	json        bool
 	calibrate   bool
 	human       []string
+	rung0Only   bool
+	dump        string // --dump path ("" = none)
 	// --yes run
 	yes        bool
 	limit      int
@@ -70,6 +73,17 @@ and how agreement moves with rung 0's phonetic_min_sim (re-run offline).
 The sample is deterministic: the same --seed over the same backlog picks the
 same findings.
 
+--rung0-only replays the sample through rung 0 alone: the same sampling,
+loading, rung-0 checks and dedupe, but no model call, no recipe registered and
+nothing written — so it needs no AI_ROLES.decide. It reports rung-0 passes
+and reject reasons; run two builds over the same --seed to compare rung-0
+versions. Like every command that opens the database it still runs the
+goose schema migrations first (a no-op when the schema is current). --dump
+FILE writes one JSON line per sampled finding (id, issue type, judge model,
+text, rung-0 verdict and evidence, and the decision when the model was
+asked), sorted by finding id; it works with or without --rung0-only. Both
+are dry-run only.
+
 --yes decides every finding in scope and writes the decisions (CONTRACT
 §2.19 "earmark decide --yes"): apply moves a finding to accepted (replayed by
 the next rebuild), reject to rejected, and a hold records a decision and
@@ -88,6 +102,7 @@ Examples:
   earmark decide --sample 500 --issue-type misheard_proper_noun
   earmark decide --sample 300 --calibrate        # agreement with human decisions
   earmark decide --sample 300 --calibrate --human mcp,cli
+  earmark decide --sample 2000 --seed q4 --rung0-only --dump /tmp/r0.jsonl
   earmark decide --yes --limit 2000 --max-accepts 500
   earmark decide --yes --shard 0/4               # one of four parallel runners
   earmark decide revert --recipe <id>            # preview the undo
@@ -105,6 +120,8 @@ func init() {
 	f.BoolVar(&opts.json, "json", false, "print the report as JSON")
 	f.BoolVar(&opts.calibrate, "calibrate", false, "sample human-decided findings and report agreement")
 	f.StringSliceVar(&opts.human, "human", nil, "with --calibrate: decided_by prefixes that count as a person (default mcp; e.g. mcp,cli)")
+	f.BoolVar(&opts.rung0Only, "rung0-only", false, "dry run through rung 0 only: no model call, no decision or fn_calls write, no AI_ROLES.decide needed (still runs goose migrations at connect, a no-op on a current schema)")
+	f.StringVar(&opts.dump, "dump", "", "dry run: write one JSON line per sampled finding to this file")
 	f.BoolVar(&opts.yes, "yes", false, "decide every finding in scope and write the decisions")
 	f.IntVar(&opts.limit, "limit", 0, "with --yes: decide at most N findings this run (0 = all in scope)")
 	f.StringVar(&opts.shard, "shard", "", "with --yes: i/N — only transcripts with hashtext(transcript_id) mod N = i")
@@ -145,6 +162,8 @@ func validate(o options) error {
 		return errors.New("--batch must be 1..500")
 	case len(o.human) > 0 && !o.calibrate:
 		return errors.New("--human needs --calibrate")
+	case o.yes && (o.rung0Only || o.dump != ""):
+		return errors.New("--rung0-only and --dump are dry-run only")
 	}
 	_, _, err := parseShard(o.shard)
 	return err
@@ -169,14 +188,19 @@ func runDecide(cmd *cobra.Command, _ []string) {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-	client, ok, err := decidepkg.ClientFromConfig(cfg)
-	if !ok {
-		fmt.Fprintln(os.Stderr, "Error: earmark decide needs AI_ROLES.decide bound to a systemone endpoint in AI_ENDPOINTS (CONTRACT §2.14)")
-		os.Exit(2)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: decide endpoint: %v\n", err)
-		os.Exit(2)
+	// A rung-0 replay asks no model, so it needs no decide endpoint.
+	var asker decidepkg.Asker
+	if !opts.rung0Only {
+		client, ok, err := decidepkg.ClientFromConfig(cfg)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "Error: earmark decide needs AI_ROLES.decide bound to a systemone endpoint in AI_ENDPOINTS (CONTRACT §2.14)")
+			os.Exit(2)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: decide endpoint: %v\n", err)
+			os.Exit(2)
+		}
+		asker = client
 	}
 	database, err := db.New(cfg)
 	if err != nil {
@@ -190,7 +214,7 @@ func runDecide(cmd *cobra.Command, _ []string) {
 		log.Printf("WARNING: OpenTelemetry disabled: %v", terr)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err = run(ctx, os.Stdout, database, client, opts)
+	err = run(ctx, os.Stdout, database, asker, opts)
 	stop()
 	flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if serr := tel.Shutdown(flushCtx); serr != nil {
@@ -218,17 +242,43 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 			Concurrency: o.concurrency, Params: decidepkg.DefaultShouldApplyParams(),
 		})
 	} else {
-		rep, err = decidepkg.DryRun(ctx, store, asker, decidepkg.RunOptions{
+		ro := decidepkg.RunOptions{
 			Scope: db.DecideScope{
 				Sample: o.sample, Seed: o.seed, Book: o.book, IssueType: o.issueType,
 				Calibrate: o.calibrate, HumanActors: o.human,
 			},
 			Concurrency: o.concurrency,
 			Params:      decidepkg.DefaultShouldApplyParams(),
-		})
+			Rung0Only:   o.rung0Only,
+		}
+		rep, err = dryRun(ctx, store, asker, ro, o.dump)
 	}
 	if err != nil {
 		return err
 	}
 	return rep.Print(out, o.json)
+}
+
+// dryRun runs decidepkg.DryRun, writing the --dump file when path is set.
+// The file is created before the run so a bad path fails fast, and it is
+// removed again if the run fails, so a partial dump is never mistaken for a
+// measurement.
+func dryRun(ctx context.Context, store decidepkg.RunStore, asker decidepkg.Asker, ro decidepkg.RunOptions, path string) (*decidepkg.Report, error) {
+	if path == "" {
+		return decidepkg.DryRun(ctx, store, asker, ro)
+	}
+	f, err := os.Create(filepath.Clean(path)) // #nosec G304 -- operator-supplied --dump path
+	if err != nil {
+		return nil, fmt.Errorf("--dump: %w", err)
+	}
+	ro.Dump = f
+	rep, err := decidepkg.DryRun(ctx, store, asker, ro)
+	if cerr := f.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("--dump: %w", cerr)
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return nil, err
+	}
+	return rep, nil
 }
