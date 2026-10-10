@@ -22,6 +22,7 @@ version is in `goose_db_version`.
 | 8 | `00008_finding_events.sql` | `finding_events` (append-only finding version history); transition triggers on `transcript_findings`; append-only guard; backfill of decided findings; `decide` arm of `stale_work` |
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` (per-chunk System One quality scan); unique `(transcript_id, chunk_index, chunk_text_sha256, recipe_id)`, `chunk_scan_recipe_id_idx`; `scan` arm of `stale_work` |
 | 10 | `00010_step_runs.sql` | `step_runs` (live progress of ad-hoc decide/scan/eval runs); partial `step_runs_running_idx`, `step_runs_started_at_idx` |
+| 11 | `00011_recipe_builds.sql` | `recipe_builds` (every build that registered a recipe), `recipe_builds_code_version_idx`, backfilled from `recipes`; comment on `recipes.code_version` (first build) |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -423,10 +424,10 @@ updated or deleted.
 
 ```sql
 CREATE TABLE recipes (
-    recipe_id      TEXT        NOT NULL PRIMARY KEY,  -- hex sha256 of the canonical JSON (CONTRACT §1.9)
+    recipe_id      TEXT        NOT NULL PRIMARY KEY,  -- hex sha256 of the canonical JSON (CONTRACT §1.9; ID format 2 excludes code_version)
     step           TEXT        NOT NULL,              -- asr | propose | decide | propagate | scan | format | embed
     step_version   INTEGER     NOT NULL,              -- 0 = legacy
-    code_version   TEXT        NOT NULL,              -- "<tag>+<commit>" or 'legacy-unknown'
+    code_version   TEXT        NOT NULL,              -- the build that FIRST registered it: "<tag>+<commit>" or 'legacy-unknown'
     model_alias    TEXT,                              -- what was asked for
     model_resolved TEXT,                              -- what answered
     model_revision TEXT,
@@ -440,6 +441,32 @@ CREATE TABLE recipes (
 
 Referenced by the nullable `recipe_id` on `transcripts` (asr),
 `transcript_findings` (propose) and `transcript_chunks` (embed), each indexed.
+
+The id hashes only what shapes the output — never the build — so a release
+that changes nothing about a step registers the same recipe again (ID format
+2). Recipes registered before that keep their format-1 ids (which hashed
+`code_version`); they are never rewritten and are treated as *equivalent* to
+the format-2 recipe of the same configuration by `stale_work`, the decide work
+list and the scan candidates (CONTRACT §1.9 "Recipe ID format", "Equivalent
+recipes").
+
+#### `recipe_builds` — which builds ran a recipe (migration 11)
+
+```sql
+CREATE TABLE recipe_builds (
+    recipe_id    TEXT        NOT NULL REFERENCES recipes (recipe_id),
+    code_version TEXT        NOT NULL,                -- an earmark build (runner tag for asr)
+    first_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (recipe_id, code_version)
+);
+-- index recipe_builds_code_version_idx: (code_version)
+```
+
+One row per (recipe, build), inserted by `db.RegisterRecipe` in the same
+statement as the recipe (`ON CONFLICT DO NOTHING`, never updated). Migration 11
+backfilled one row per existing recipe from `recipes.code_version` /
+`created_at`. Output row → `recipe_id` says what made it; `recipe_builds` says
+which binaries ran that recipe.
 
 ### 9. `current_recipes` and the `stale_work` view (CONTRACT §1.9)
 
@@ -608,6 +635,7 @@ transcription_jobs (1) ←── transcripts (1) ←── transcript_chunks (N)
 book_metadata      (key: book_dir — filepath.Dir of any file_path in the book)
 runner_control     (singleton, id=1)
 recipes (1) ←── transcripts / transcript_findings / transcript_chunks (N, via nullable recipe_id)
+recipes (1) ←── recipe_builds (N, one per build that registered it)
 transcript_findings (1) ←── finding_events (N, ON DELETE CASCADE)
         (1) ←── current_recipes (one per step)
         (1) ←── fn_calls (N, via nullable recipe_id)

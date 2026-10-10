@@ -8,6 +8,13 @@
 // field yields a new one. Output rows (transcripts, transcript_findings,
 // transcript_chunks) carry the ID of the recipe that produced them.
 //
+// The ID hashes only what shapes the output — step, step_version, the three
+// model fields, the prompt version and hash, and params. It does NOT hash the
+// build (CodeVersion): a release that changes nothing about a step keeps its
+// recipe. That is ID format 2 (IDFormat); format 1 (IDV1) also hashed
+// code_version and is kept only because existing recipe ids, including the
+// 00002 legacy backfill, were computed with it and stay valid forever.
+//
 // Leaf package: no database or HTTP dependencies.
 package recipe
 
@@ -59,7 +66,10 @@ type Recipe struct {
 	// StepVersion is bumped whenever earmark's own logic for the step changes
 	// its output. 0 is reserved for legacy recipes.
 	StepVersion int
-	// CodeVersion is the earmark build (tag+commit) or, for asr, the runner tag.
+	// CodeVersion is the earmark build (tag+commit) or, for asr, the runner
+	// tag. It is recorded, not identifying: it is NOT part of the ID, so the
+	// recipes row keeps the build that first registered the recipe and
+	// recipe_builds every build that registered it since (CONTRACT §1.9).
 	CodeVersion string
 	// ModelAlias is what was asked for (the model id sent to the endpoint,
 	// e.g. a LiteLLM alias).
@@ -80,12 +90,17 @@ type Recipe struct {
 	Params map[string]any
 }
 
+// IDFormat is the recipe ID format Canonical/ID produce (CONTRACT §1.9
+// "Canonical form / ID"). Format 1 hashed code_version too (IDV1); format 2
+// dropped it so a release that changes nothing does not mint new recipes.
+const IDFormat = 2
+
 // canonical is the wire shape hashed into the ID. Field order is fixed by the
-// struct; nil pointers encode as null.
+// struct; nil pointers encode as null. It deliberately has no code_version:
+// nothing build-varying may enter the ID.
 type canonical struct {
 	Step          string          `json:"step"`
 	StepVersion   int             `json:"step_version"`
-	CodeVersion   *string         `json:"code_version"`
 	ModelAlias    *string         `json:"model_alias"`
 	ModelResolved *string         `json:"model_resolved"`
 	ModelRevision *string         `json:"model_revision"`
@@ -110,16 +125,15 @@ func (r Recipe) ParamsJSON() ([]byte, error) {
 	return MarshalCanonical(r.Params)
 }
 
-// Canonical returns the bytes the ID hashes:
+// Canonical returns the bytes the ID hashes (ID format 2):
 //
-//	{"step":…,"step_version":…,"code_version":…,"model_alias":…,
-//	 "model_resolved":…,"model_revision":…,"prompt_version":…,
-//	 "prompt_sha256":…,"params":{…}}
+//	{"step":…,"step_version":…,"model_alias":…,"model_resolved":…,
+//	 "model_revision":…,"prompt_version":…,"prompt_sha256":…,"params":{…}}
 //
 // in exactly that key order, with no whitespace, empty strings as null, and
-// params canonicalized by ParamsJSON. Anything that computes a recipe ID
-// outside Go (the 00002 migration's legacy backfill, the ASR runner) must
-// produce these exact bytes. TestCanonicalVector pins an example.
+// params canonicalized by ParamsJSON. CodeVersion is not part of it. Anything
+// that computes a recipe ID outside Go must produce these exact bytes.
+// TestCanonicalVector pins an example.
 func (r Recipe) Canonical() ([]byte, error) {
 	params, err := r.ParamsJSON()
 	if err != nil {
@@ -128,7 +142,6 @@ func (r Recipe) Canonical() ([]byte, error) {
 	return MarshalCanonical(canonical{
 		Step:          r.Step,
 		StepVersion:   r.StepVersion,
-		CodeVersion:   nullable(r.CodeVersion),
 		ModelAlias:    nullable(r.ModelAlias),
 		ModelResolved: nullable(r.ModelResolved),
 		ModelRevision: nullable(r.ModelRevision),
@@ -144,8 +157,58 @@ func (r Recipe) ID() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return hashHex(b), nil
+}
+
+// canonicalV1 is ID format 1's wire shape: format 2 plus code_version after
+// step_version.
+type canonicalV1 struct {
+	Step          string          `json:"step"`
+	StepVersion   int             `json:"step_version"`
+	CodeVersion   *string         `json:"code_version"`
+	ModelAlias    *string         `json:"model_alias"`
+	ModelResolved *string         `json:"model_resolved"`
+	ModelRevision *string         `json:"model_revision"`
+	PromptVersion *string         `json:"prompt_version"`
+	PromptSHA256  *string         `json:"prompt_sha256"`
+	Params        json.RawMessage `json:"params"`
+}
+
+// CanonicalV1 returns ID format 1's bytes — Canonical with "code_version"
+// after "step_version". Every recipe registered before format 2, and every
+// legacy recipe the 00002 migration backfills (by string concatenation in
+// SQL), has a format-1 ID. Those IDs are never rewritten; this exists so they
+// can still be recomputed and checked. Nothing registers new format-1 IDs.
+func (r Recipe) CanonicalV1() ([]byte, error) {
+	params, err := r.ParamsJSON()
+	if err != nil {
+		return nil, fmt.Errorf("recipe params: %w", err)
+	}
+	return MarshalCanonical(canonicalV1{
+		Step:          r.Step,
+		StepVersion:   r.StepVersion,
+		CodeVersion:   nullable(r.CodeVersion),
+		ModelAlias:    nullable(r.ModelAlias),
+		ModelResolved: nullable(r.ModelResolved),
+		ModelRevision: nullable(r.ModelRevision),
+		PromptVersion: nullable(r.PromptVersion),
+		PromptSHA256:  nullable(r.PromptSHA256),
+		Params:        params,
+	})
+}
+
+// IDV1 is the format-1 ID: lowercase hex SHA-256 of CanonicalV1.
+func (r Recipe) IDV1() (string, error) {
+	b, err := r.CanonicalV1()
+	if err != nil {
+		return "", err
+	}
+	return hashHex(b), nil
+}
+
+func hashHex(b []byte) string {
 	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(sum[:])
 }
 
 // Validate checks the fields the database constrains.
@@ -173,7 +236,8 @@ func MarshalCanonical(v any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
-// CodeVersion is this earmark build as recorded in recipes: "<version>+<commit>"
+// CodeVersion is this earmark build as recorded in recipes.code_version (first
+// seen) and recipe_builds: "<version>+<commit>"
 // (e.g. "v0.41.0+abc1234"; "dev+unknown" for an unstamped local build).
 func CodeVersion() string {
 	return version.Version + "+" + version.Commit

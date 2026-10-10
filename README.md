@@ -31,7 +31,9 @@ env-var names are specified in [`docs/CONTRACT.md`](docs/CONTRACT.md), which is
 authoritative for both sides. Every finding and chunk records the **recipe** that made it
 (model asked for and model that answered, revision, prompt version and hash, parameters),
 and the `stale_work` view lists rows a newer recipe would produce differently
-(CONTRACT §1.9). The runner itself lives in [`runner/`](runner/README.md) and
+(CONTRACT §1.9). A recipe's id hashes only what shapes the output, never the build, so
+a release that changes nothing registers the same recipes; every build that ran a recipe
+is recorded in `recipe_builds`. The runner itself lives in [`runner/`](runner/README.md) and
 is deployed separately, on a GPU host.
 
 ## Quickstart

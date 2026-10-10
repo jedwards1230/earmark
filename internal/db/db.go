@@ -4379,6 +4379,7 @@ func scanIDPaths(rows pgx.Rows) (ids, paths []string, err error) {
 var resetSQL = `
 	DROP VIEW     IF EXISTS stale_work;
 	DROP TABLE    IF EXISTS step_runs           CASCADE;
+	DROP TABLE    IF EXISTS recipe_builds       CASCADE;
 	DROP TABLE    IF EXISTS chunk_scan          CASCADE;
 	DROP TABLE    IF EXISTS finding_events      CASCADE;
 	DROP TABLE    IF EXISTS fn_calls            CASCADE;
