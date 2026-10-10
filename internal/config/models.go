@@ -30,7 +30,7 @@ import (
 //	    alias: earmark-judge         # optional; must equal the eval endpoint's model
 //	    expected_model: anthropic/claude-haiku-4-5-20251001
 //	    revision: "20251001"
-//	    prompt_version: judge@v1     # optional; checked against the code's prompt
+//	    prompt_version: judge@v2     # optional; checked against the code's prompt
 //	  embed:                         # AI_ROLES.embeddings
 //	    expected_model: nomic-embed-text
 //	    revision: sha256:0a109f422b47

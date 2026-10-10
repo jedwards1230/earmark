@@ -132,6 +132,7 @@ func TestBuildPromptBytesUnchanged(t *testing.T) {
 func TestJudgePromptVersionPinned(t *testing.T) {
 	pinned := map[string]string{
 		"judge@v1": "3ed9ca07704aa769150724f487a7c35012c170419eb8fe33596b3a4e59fc927b",
+		"judge@v2": "27cafa9f7d96a728078ecfb434ef3a48254d0872ce2d8fc65cfe7e48bcaee92f",
 	}
 	want, ok := pinned[judgePromptVersion]
 	if !ok {

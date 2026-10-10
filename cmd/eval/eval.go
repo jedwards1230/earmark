@@ -25,6 +25,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,12 +44,16 @@ type runner interface {
 }
 
 type options struct {
-	sample              int  // judge a random sample of N chunks library-wide (instead of a book)
-	limit               int  // cap chunks evaluated for a book / transcripts latched by a backfill (0 → default/all)
-	maxAttempts         int  // backfill spend cap: transcripts judged, latched or not (0 → 3×limit, unbounded without --limit)
-	write               bool // persist findings; without it the command is a dry-run preview
-	backfillUnevaluated bool // judge ALL done transcripts with eval_finished_at IS NULL
-	backfillEvalErrors  bool // re-judge done transcripts whose judging failed
+	sample              int    // judge a random sample of N chunks library-wide (instead of a book)
+	limit               int    // cap chunks evaluated for a book / transcripts latched by a backfill (0 → default/all)
+	maxAttempts         int    // backfill spend cap: transcripts judged, latched or not (0 → 3×limit, unbounded without --limit)
+	write               bool   // persist findings; without it the command is a dry-run preview
+	backfillUnevaluated bool   // judge ALL done transcripts with eval_finished_at IS NULL
+	backfillEvalErrors  bool   // re-judge done transcripts whose judging failed
+	seed                string // with --sample: fix which chunks the sample picks
+	dump                string // dry run only: write one JSONL line per judged chunk here ("-" = stdout)
+	// observe is the per-chunk hook --dump installs (not a flag).
+	observe func(evalpkg.Result, error)
 }
 
 var opts options
@@ -103,7 +108,15 @@ Examples:
   earmark eval --backfill-unevaluated           # preview backfill (dry-run)
   earmark eval --backfill-unevaluated --write   # backfill all unevaluated transcripts
   earmark eval --backfill-eval-errors --limit 10          # preview the first 10 re-judges
-  earmark eval --backfill-eval-errors --limit 10 --write  # re-judge them`,
+  earmark eval --backfill-eval-errors --limit 10 --write  # re-judge them
+
+Measuring a prompt change (dry run only; CONTRACT §2.15):
+  earmark eval --sample 200 --seed q4 --dump /tmp/judge.jsonl
+--seed fixes which chunks --sample picks (same seed, same library → same
+chunks), so two builds judge identical input. --dump writes one JSON line per
+chunk: tokens and cost as the endpoint reports them, and every finding the
+judge returned — kept, or dropped with its reason. "--dump -" writes the lines
+to stdout and the report to stderr.`,
 	Run: runEval,
 }
 
@@ -118,6 +131,10 @@ func init() {
 		"judge ALL done transcripts with eval_finished_at IS NULL (regardless of embed state)")
 	EvalCmd.Flags().BoolVar(&opts.backfillEvalErrors, "backfill-eval-errors", false,
 		"re-judge done transcripts whose judging failed (incl. legacy runs latched despite an error)")
+	EvalCmd.Flags().StringVar(&opts.seed, "seed", "",
+		"with --sample: pick the sample in an order fixed by this seed (same seed → same chunks)")
+	EvalCmd.Flags().StringVar(&opts.dump, "dump", "",
+		"dry run only: write one JSON line per judged chunk (tokens, cost, kept and dropped findings) to this path; - = stdout")
 	EvalCmd.MarkFlagsMutuallyExclusive("backfill-unevaluated", "backfill-eval-errors")
 }
 
@@ -176,6 +193,10 @@ func runJudge(database *db.DB, judge *evalpkg.Judge, cfg *config.Config, book st
 		if opts.backfillEvalErrors {
 			mode = backfillEvalErrors
 		}
+		if opts.seed != "" || opts.dump != "" {
+			fmt.Println("Error: --seed and --dump apply to --sample/book runs, not --backfill-*")
+			os.Exit(1)
+		}
 		if opts.maxAttempts < 0 || opts.limit < 0 {
 			fmt.Println("Error: --limit and --max-attempts must be >= 0")
 			os.Exit(1)
@@ -188,9 +209,46 @@ func runJudge(database *db.DB, judge *evalpkg.Judge, cfg *config.Config, book st
 		return 0
 	}
 
+	return runSelected(database, judge, book, opts)
+}
+
+// runSelected runs a book or sample judge pass, with the optional --dump
+// harness, and returns the process exit code.
+func runSelected(database *db.DB, judge *evalpkg.Judge, book string, o options) int {
+	out := io.Writer(os.Stdout)
+	var dump *dumper
+	if o.dump != "" {
+		if o.write {
+			fmt.Println("Error: --dump is a dry-run measurement; it cannot be combined with --write")
+			return 1
+		}
+		w := io.Writer(os.Stdout)
+		if o.dump == "-" {
+			out = os.Stderr // stdout carries the JSON lines
+		} else {
+			f, err := os.Create(o.dump)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				return 1
+			}
+			defer func() {
+				if cerr := f.Close(); cerr != nil {
+					fmt.Fprintf(os.Stderr, "Error: close dump: %v\n", cerr)
+				}
+			}()
+			w = f
+		}
+		dump = newDumper(w, judge.Model(), judge.Recipe())
+		o.observe = dump.observe
+	}
+
 	r := &dbRunner{reader: database, judge: judge, writer: database, events: database}
-	if err := run(context.Background(), os.Stdout, r, book, opts); err != nil {
-		fmt.Printf("Error: %v\n", err)
+	if err := run(context.Background(), out, r, book, o); err != nil {
+		_, _ = fmt.Fprintf(out, "Error: %v\n", err)
+		return 1
+	}
+	if dump != nil && dump.err != nil {
+		_, _ = fmt.Fprintf(out, "Error: %v\n", dump.err)
 		return 1
 	}
 	return 0
@@ -278,6 +336,9 @@ func (d *dbRunner) Run(ctx context.Context, o evalpkg.RunOptions) ([]db.Finding,
 		}
 		if stats.ResolvedModel != "" {
 			ev.Detail["resolved_model"] = stats.ResolvedModel
+		}
+		if o.Seed != "" {
+			ev.Detail["seed"] = o.Seed
 		}
 		if o.Book != "" {
 			ev.FilePath = o.Book
@@ -661,12 +722,20 @@ func run(ctx context.Context, out io.Writer, r runner, book string, o options) e
 	if o.sample > 0 && book != "" {
 		return fmt.Errorf("--sample and a book substring cannot be combined")
 	}
+	if o.seed != "" && o.sample <= 0 {
+		return fmt.Errorf("--seed needs --sample N")
+	}
+	if o.dump != "" && o.write {
+		return fmt.Errorf("--dump is a dry-run measurement; it cannot be combined with --write")
+	}
 
 	runOpts := evalpkg.RunOptions{
-		Book:   book,
-		Sample: o.sample,
-		Limit:  o.limit,
-		Write:  o.write,
+		Book:    book,
+		Sample:  o.sample,
+		Seed:    o.seed,
+		Limit:   o.limit,
+		Write:   o.write,
+		Observe: o.observe,
 	}
 
 	findings, stats, err := r.Run(ctx, runOpts)
@@ -677,11 +746,17 @@ func run(ctx context.Context, out io.Writer, r runner, book string, o options) e
 	scope := fmt.Sprintf("book %q", book)
 	if o.sample > 0 {
 		scope = fmt.Sprintf("a %d-chunk sample", o.sample)
+		if o.seed != "" {
+			scope += fmt.Sprintf(" (seed %q)", o.seed)
+		}
 	}
 	p("Evaluated %d chunk(s) from %s — %d suspected error(s) found.\n",
 		stats.ChunksEvaluated, scope, stats.FindingsFound)
 	if stats.ChunksSkipped > 0 {
 		p("(%d chunk(s) skipped due to transient judge errors — partial results below.)\n", stats.ChunksSkipped)
+	}
+	if line := droppedLine(stats.Dropped); line != "" {
+		p("Dropped before recording: %s.\n", line)
 	}
 
 	for _, f := range findings {
@@ -699,6 +774,26 @@ func run(ctx context.Context, out io.Writer, r runner, book string, o options) e
 		p("\nNo findings to record.\n")
 	}
 	return nil
+}
+
+// droppedLine renders per-reason drop counts, largest first then by reason
+// ("cosmetic_only 4, below_min_confidence 2"); "" when nothing was dropped.
+func droppedLine(dropped map[string]int) string {
+	reasons := make([]string, 0, len(dropped))
+	for r := range dropped {
+		reasons = append(reasons, r)
+	}
+	sort.Slice(reasons, func(i, j int) bool {
+		if dropped[reasons[i]] != dropped[reasons[j]] {
+			return dropped[reasons[i]] > dropped[reasons[j]]
+		}
+		return reasons[i] < reasons[j]
+	})
+	parts := make([]string, len(reasons))
+	for i, r := range reasons {
+		parts[i] = fmt.Sprintf("%s %d", r, dropped[r])
+	}
+	return strings.Join(parts, ", ")
 }
 
 // truncate shortens a string to n runes for the preview line, appending an

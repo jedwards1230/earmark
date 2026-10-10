@@ -43,6 +43,23 @@ func sampleChunk() db.EvalChunk {
 	}
 }
 
+// chunkWith is sampleChunk with other text — the judge's pre-filters drop a
+// finding whose span is not in the chunk it judged.
+func chunkWith(text string) db.EvalChunk {
+	c := sampleChunk()
+	c.Text = text
+	return c
+}
+
+// manyFindingsChunk holds every span manyFindingsJSON(n) flags.
+func manyFindingsChunk(n int) db.EvalChunk {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = fmt.Sprintf("finding-%02d", i)
+	}
+	return chunkWith(strings.Join(parts, " "))
+}
+
 func TestJudgeChunk_MapsFindings(t *testing.T) {
 	chat := &fakeChat{resp: `{"findings":[{"original_text":"fox","issue_type":"homophone","suggested_correction":"folks","confidence":0.7}]}`}
 	j := NewJudge(chat)
@@ -107,7 +124,7 @@ func TestJudgeChunk_CapsPerChunkKeepingHighestConfidence(t *testing.T) {
 	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "") // exercise the default
 	chat := &fakeChat{resp: manyFindingsJSON(12)}
 	j := NewJudge(chat)
-	res, err := j.JudgeChunk(context.Background(), sampleChunk())
+	res, err := j.JudgeChunk(context.Background(), manyFindingsChunk(12))
 	if err != nil {
 		t.Fatalf("JudgeChunk: %v", err)
 	}
@@ -136,7 +153,7 @@ func TestJudgeChunk_CapEnvOverrideAndDisable(t *testing.T) {
 	// Override the cap to 2.
 	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "2")
 	chat := &fakeChat{resp: manyFindingsJSON(5)}
-	if res, err := NewJudge(chat).JudgeChunk(context.Background(), sampleChunk()); err != nil {
+	if res, err := NewJudge(chat).JudgeChunk(context.Background(), manyFindingsChunk(5)); err != nil {
 		t.Fatalf("JudgeChunk: %v", err)
 	} else if len(res.Findings) != 2 {
 		t.Fatalf("want 2 findings with cap=2, got %d", len(res.Findings))
@@ -145,7 +162,7 @@ func TestJudgeChunk_CapEnvOverrideAndDisable(t *testing.T) {
 	// A negative value disables the cap entirely (all findings retained).
 	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "-1")
 	chat2 := &fakeChat{resp: manyFindingsJSON(5)}
-	if res, err := NewJudge(chat2).JudgeChunk(context.Background(), sampleChunk()); err != nil {
+	if res, err := NewJudge(chat2).JudgeChunk(context.Background(), manyFindingsChunk(5)); err != nil {
 		t.Fatalf("JudgeChunk: %v", err)
 	} else if len(res.Findings) != 5 {
 		t.Fatalf("want 5 findings with cap disabled, got %d", len(res.Findings))
@@ -162,7 +179,7 @@ func TestJudgeChunk_ConfidenceFloorDropsLow(t *testing.T) {
 		{"original_text":"bird","issue_type":"misheard_word","suggested_correction":"beard","confidence":0.30}
 	]}`
 	t.Setenv("EVAL_MIN_CONFIDENCE", "") // exercise the default (0.6)
-	res, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), sampleChunk())
+	res, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), chunkWith("cat dog fish bird"))
 	if err != nil {
 		t.Fatalf("JudgeChunk: %v", err)
 	}
@@ -177,7 +194,7 @@ func TestJudgeChunk_ConfidenceFloorDropsLow(t *testing.T) {
 
 	// EVAL_MIN_CONFIDENCE=0 disables the floor → all four survive (the cap is 5).
 	t.Setenv("EVAL_MIN_CONFIDENCE", "0")
-	res2, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), sampleChunk())
+	res2, err := NewJudge(&fakeChat{resp: resp}).JudgeChunk(context.Background(), chunkWith("cat dog fish bird"))
 	if err != nil {
 		t.Fatalf("JudgeChunk: %v", err)
 	}

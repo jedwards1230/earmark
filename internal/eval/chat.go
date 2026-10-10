@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -501,6 +502,29 @@ type Completion struct {
 	InputTokens  int
 	OutputTokens int
 	HasUsage     bool
+	// CostUSD is the call's cost as the gateway reports it (LiteLLM's
+	// x-litellm-response-cost header); HasCost is false when it reported none.
+	// Never estimated here: a local endpoint has no price.
+	CostUSD float64
+	HasCost bool
+}
+
+// costHeader is the LiteLLM response header carrying the call's cost in USD
+// (the same header internal/systemone reads).
+const costHeader = "x-litellm-response-cost"
+
+// responseCost parses the gateway's reported cost; ok is false when the header
+// is absent or not a finite, non-negative number.
+func responseCost(h http.Header) (float64, bool) {
+	v := strings.TrimSpace(h.Get(costHeader))
+	if v == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) {
+		return 0, false
+	}
+	return f, true
 }
 
 // Endpoint describes where a chat client sends requests, for telemetry
@@ -634,6 +658,7 @@ func (c *openAIChatClient) CompleteWithModel(ctx context.Context, system, user s
 		out.OutputTokens = parsed.Usage.CompletionTokens
 		out.HasUsage = true
 	}
+	out.CostUSD, out.HasCost = responseCost(resp.Header)
 	// Fail closed on an unusable reply. Returning it as Content would parse to
 	// zero findings and be recorded as a clean chunk — a silent false negative
 	// across every chunk the judge touches. The resolved model and usage are

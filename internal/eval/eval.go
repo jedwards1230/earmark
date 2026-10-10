@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/log"
@@ -161,7 +162,9 @@ type ModelPin struct {
 
 // proposeStepVersion is bumped whenever the judge's own logic (parsing,
 // filtering, capping, anchoring) changes which findings it writes (§1.9).
-const proposeStepVersion = 1
+// 2: the deterministic pre-filters (prefilter), and cosmetic_only made rung
+// 0's own test (spacing and same-reading number re-spellings count).
+const proposeStepVersion = 2
 
 // NewJudge constructs a Judge backed by the given chat client.
 func NewJudge(chat ChatClient) *Judge {
@@ -259,6 +262,29 @@ type Result struct {
 	// ResolvedModel is the model the endpoint reported serving this chunk
 	// ("" when unknown).
 	ResolvedModel string
+	// Usage is the call's token and cost accounting, as the endpoint reported
+	// it (also set on a failed call that got a reply).
+	Usage Usage
+	// Elapsed is the wall time of the model call.
+	Elapsed time.Duration
+	// Dropped is every finding the judge returned that did not become a row,
+	// with the reason.
+	Dropped []Dropped
+}
+
+// Usage is one judge call's accounting: token counts from the response's
+// usage block and the gateway-reported cost (Completion).
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+	HasUsage     bool
+	CostUSD      float64
+	HasCost      bool
+}
+
+func usageOf(c Completion) Usage {
+	return Usage{InputTokens: c.InputTokens, OutputTokens: c.OutputTokens, HasUsage: c.HasUsage,
+		CostUSD: c.CostUSD, HasCost: c.HasCost}
 }
 
 // JudgeChunk evaluates a single chunk: build the prompt, call the model, parse
@@ -272,7 +298,9 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		ep = er.Endpoint()
 	}
 	ctx, span := startChatSpan(ctx, j.chat.Model(), j.sentTemperature(), ep, chunkRef{transcriptID: c.TranscriptID, chunkID: c.ChunkID})
+	callStart := time.Now()
 	comp, err := j.complete(ctx, system, user)
+	elapsed := time.Since(callStart)
 	resolved := comp.ResolvedModel
 	var recipeID string
 	if err == nil {
@@ -280,7 +308,7 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 	}
 	endChatSpan(ctx, span, j.chat.Model(), j.pin.ExpectedModel, comp, recipeID, err)
 	if err != nil {
-		return Result{Chunk: c}, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
+		return Result{Chunk: c, Usage: usageOf(comp), Elapsed: elapsed}, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
 	}
 	if resolved != "" && resolved != j.chat.Model() {
 		j.logger.DebugContext(ctx, "judge request served by a different model id",
@@ -297,18 +325,23 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		})
 	}
 
-	parsed, perr := parseFindings(comp.Content)
+	res := Result{Chunk: c, ResolvedModel: resolved, Usage: usageOf(comp), Elapsed: elapsed}
+	parsed, dropped, perr := parseFindings(comp.Content)
 	if perr != nil {
 		// A malformed judge response is a soft failure: log and treat the chunk
 		// as "no findings" rather than aborting the whole run. The judge is
 		// advisory; a parse miss costs nothing.
 		j.logger.WarnContext(ctx, "dropping unparseable judge response",
 			"chunk_id", c.ChunkID, "recipe_id", recipeID, "error", perr)
-		return Result{Chunk: c, ResolvedModel: resolved}, nil
+		return res, nil
 	}
 
-	parsed = j.floorFindings(c, parsed)
-	parsed = j.capFindings(c, parsed)
+	// Shape checks first, so junk never takes one of the capped slots.
+	parsed, dropped = prefilter(c.Text, parsed, dropped)
+	parsed, dropped = j.floorFindings(c, parsed, dropped)
+	parsed, dropped = j.capFindings(c, parsed, dropped)
+	res.Dropped = dropped
+	countDropped(ctx, dropped)
 
 	model := j.chat.Model()
 	rec := j.recipeFor(resolved)
@@ -340,7 +373,8 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 			Recipe:          &rec,
 		})
 	}
-	return Result{Chunk: c, Findings: findings, ResolvedModel: resolved}, nil
+	res.Findings = findings
+	return res, nil
 }
 
 // complete calls the chat client, using CompleteWithModel when the client
@@ -356,21 +390,23 @@ func (j *Judge) complete(ctx context.Context, system, user string) (Completion, 
 // floorFindings drops findings below the confidence floor (j.minConf). Applied
 // before capFindings so the cap operates on the survivors. A floor of 0
 // (disabled) returns the input unchanged. Logs at DEBUG when it drops any.
-func (j *Judge) floorFindings(c db.EvalChunk, parsed []parsedFinding) []parsedFinding {
+func (j *Judge) floorFindings(c db.EvalChunk, parsed []parsedFinding, dropped []Dropped) ([]parsedFinding, []Dropped) {
 	if j.minConf <= 0 || len(parsed) == 0 {
-		return parsed
+		return parsed, dropped
 	}
 	kept := parsed[:0:0]
 	for _, p := range parsed {
 		if p.Confidence >= j.minConf {
 			kept = append(kept, p)
+		} else {
+			dropped = append(dropped, dropOf(p, DropBelowMinConfidence))
 		}
 	}
-	if dropped := len(parsed) - len(kept); dropped > 0 {
+	if n := len(parsed) - len(kept); n > 0 {
 		j.logger.Debug("dropping low-confidence chunk findings",
-			"chunk_id", c.ChunkID, "kept", len(kept), "dropped", dropped, "floor", j.minConf)
+			"chunk_id", c.ChunkID, "kept", len(kept), "dropped", n, "floor", j.minConf)
 	}
-	return kept
+	return kept, dropped
 }
 
 // capFindings bounds a single chunk's findings to j.maxPerChunk, keeping the
@@ -379,17 +415,19 @@ func (j *Judge) floorFindings(c db.EvalChunk, parsed []parsedFinding) []parsedFi
 // descending (stable, so equal-confidence findings keep their original order
 // for a deterministic result) and truncates. A cap of 0 (disabled) or a set
 // already within the cap is returned unchanged. Logs at DEBUG when it truncates.
-func (j *Judge) capFindings(c db.EvalChunk, parsed []parsedFinding) []parsedFinding {
+func (j *Judge) capFindings(c db.EvalChunk, parsed []parsedFinding, dropped []Dropped) ([]parsedFinding, []Dropped) {
 	if j.maxPerChunk <= 0 || len(parsed) <= j.maxPerChunk {
-		return parsed
+		return parsed, dropped
 	}
 	sort.SliceStable(parsed, func(a, b int) bool {
 		return parsed[a].Confidence > parsed[b].Confidence
 	})
-	dropped := len(parsed) - j.maxPerChunk
+	for _, p := range parsed[j.maxPerChunk:] {
+		dropped = append(dropped, dropOf(p, DropOverCap))
+	}
 	j.logger.Debug("capping over-flagged chunk findings",
-		"chunk_id", c.ChunkID, "kept", j.maxPerChunk, "dropped", dropped, "cap", j.maxPerChunk)
-	return parsed[:j.maxPerChunk]
+		"chunk_id", c.ChunkID, "kept", j.maxPerChunk, "dropped", len(parsed)-j.maxPerChunk, "cap", j.maxPerChunk)
+	return parsed[:j.maxPerChunk], dropped
 }
 
 // servedUnexpectedModel reports whether a response came from a model other
