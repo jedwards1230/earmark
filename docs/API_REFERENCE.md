@@ -112,7 +112,8 @@ JSON endpoints on the same `:8081` port as the MCP server. Read endpoints are al
 
 | Method | Path | Auth | Body | Response |
 |--------|------|------|------|----------|
-| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot |
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (incl. `runs`, the same body as `/api/v1/runs`) |
+| `GET` | `/api/v1/runs[?recent=N]` | none | — | `200 {"active":[…],"recent":[…],"staleAfterSeconds":120}` — ad-hoc decide/scan/eval runs: progress (`done`/`total`/`progress`), `etaSeconds`, `counters`, `costUsd`, the current phase (`message`), and `status` `running`·`stale`·`done`·`failed`·`cancelled` (CONTRACT §1.10) |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` also clears any run bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` |

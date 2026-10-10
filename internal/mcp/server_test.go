@@ -204,6 +204,10 @@ func (m *SimpleMockDB) FnRoleActivity(context.Context) ([]db.FnRoleActivity, err
 	return nil, nil
 }
 
+func (m *SimpleMockDB) StepRuns(context.Context, int, int) (db.StepRunList, error) {
+	return db.StepRunList{}, nil
+}
+
 func (m *SimpleMockDB) ASRProvenanceGroups(context.Context, int) ([]db.ASRProvenanceGroup, error) {
 	return nil, nil
 }

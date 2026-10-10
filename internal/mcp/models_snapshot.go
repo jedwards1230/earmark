@@ -28,6 +28,22 @@ const (
 	staleSnapshotTimeout  = 30 * time.Second
 )
 
+// The Models page also needs the queue stats (coverage, embed backlog, chunk
+// total, last embed, runner version). GetServiceStatus counts every row of
+// transcript_chunks (COUNT(*) and MAX(created_at), a full scan of the
+// largest table) and, run inline on every 5 s poll, pushed the fragment past
+// its 5 s htmx timeout on a large library. The page reads them through a
+// third stale-while-revalidate cache instead: refreshed every 15 s with a
+// 30 s budget, the first load waited for at most queueStatsFirstWait (the
+// cards render "—" meanwhile). The Pipeline page and GET /api/v1/status keep
+// reading them live; a runner-update POST re-renders with live stats so the
+// request it just made shows at once.
+const (
+	queueStatsTTL       = 15 * time.Second
+	queueStatsTimeout   = 30 * time.Second
+	queueStatsFirstWait = 2 * time.Second
+)
+
 // asrProvenanceGroupLimit is how many runner-build groups the page shows.
 const asrProvenanceGroupLimit = 8
 
@@ -109,6 +125,7 @@ func loadStaleSnapshot(ctx context.Context, d DBInterface) (staleSnapshot, error
 type modelsCaches struct {
 	models *refreshCache[modelsSnapshot]
 	stale  *refreshCache[staleSnapshot]
+	queue  *refreshCache[*db.QueueStats]
 }
 
 func newModelsCaches(d DBInterface, logWarn func(msg string, args ...any)) modelsCaches {
@@ -123,6 +140,7 @@ func newModelsCaches(d DBInterface, logWarn func(msg string, args ...any)) model
 			}),
 		stale: newRefreshCache(staleSnapshotTTL, staleSnapshotTimeout,
 			func(ctx context.Context) (staleSnapshot, error) { return loadStaleSnapshot(ctx, d) }),
+		queue: newRefreshCache(queueStatsTTL, queueStatsTimeout, d.GetServiceStatus),
 	}
 	// A failed FIRST stale count retries after the aggregates' TTL rather than
 	// leaving the counts "unavailable" for the full 5 min.
@@ -134,8 +152,24 @@ func newModelsCaches(d DBInterface, logWarn func(msg string, args ...any)) model
 		c.stale.onError = func(err error, haveLast bool) {
 			logWarn("models: stale-count refresh failed; serving last good counts", "error", err, "have_last_good", haveLast)
 		}
+		c.queue.onError = func(err error, haveLast bool) {
+			logWarn("models: queue-stats refresh failed; serving last good stats", "error", err, "have_last_good", haveLast)
+		}
 	}
 	return c
+}
+
+// queueStats returns the cached queue stats, nil while the first load is
+// still running past wait or when no load has succeeded (the cards then show
+// "—"). After the first load it never waits.
+func (c modelsCaches) queueStats(ctx context.Context, wait time.Duration) (*db.QueueStats, error) {
+	wctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	v, err := c.queue.get(wctx)
+	if v == nil {
+		return nil, err
+	}
+	return v.Val, err
 }
 
 // modelsEvidence is one read of both snapshots, as the builders consume it.

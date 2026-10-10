@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -287,5 +288,87 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		if err := validate(o); err == nil {
 			t.Errorf("%s accepted", name)
 		}
+	}
+}
+
+// stepRunStore is a fakeStore that is also a runs.Store, recording the
+// step_runs writes — or failing every one of them when broken.
+type stepRunStore struct {
+	*fakeStore
+	broken   bool
+	srMu     sync.Mutex
+	start    db.StepRunStart
+	status   string
+	final    db.StepRunProgress
+	finished int
+}
+
+func (s *stepRunStore) StartStepRun(_ context.Context, st db.StepRunStart) (int64, error) {
+	if s.broken {
+		return 0, errors.New(`relation "step_runs" does not exist`)
+	}
+	s.srMu.Lock()
+	defer s.srMu.Unlock()
+	s.start = st
+	return 7, nil
+}
+
+func (s *stepRunStore) UpdateStepRun(context.Context, int64, db.StepRunProgress) error {
+	if s.broken {
+		return errors.New("connection reset")
+	}
+	return nil
+}
+
+func (s *stepRunStore) FinishStepRun(_ context.Context, _ int64, status string, p db.StepRunProgress, _ string) error {
+	if s.broken {
+		return errors.New("connection reset")
+	}
+	s.srMu.Lock()
+	defer s.srMu.Unlock()
+	s.status, s.final = status, p
+	s.finished++
+	return nil
+}
+
+// TestRunRecordsStepRun: a scan run against a store that records step runs
+// leaves one closed row with the run's counters; a store whose every step_runs
+// write fails changes nothing about the scan (CONTRACT §1.10: recording never
+// fails the step).
+func TestRunRecordsStepRun(t *testing.T) {
+	srv, _ := fakeSystemOne(t)
+	o := options{sample: 10, seed: "s", concurrency: 3, context: 2, yes: true, json: true}
+
+	ok := &stepRunStore{fakeStore: &fakeStore{cands: cands("a clean chunk", "pure garbage here", "a broken reply", "another clean one")}}
+	var out1 strings.Builder
+	if err := run(context.Background(), &out1, ok, newScanner(t, srv.URL, ok.fakeStore), o); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if ok.start.Step != "scan" || ok.start.Mode != db.StepRunWrite || ok.start.Total == nil || *ok.start.Total != 10 ||
+		!strings.Contains(ok.start.Args, "--sample 10") {
+		t.Errorf("start = %+v", ok.start)
+	}
+	if ok.finished != 1 || ok.status != db.StepRunDone || *ok.final.Done != 4 || ok.final.Counters["scanned"] != 3 ||
+		ok.final.Counters["errors"] != 1 || ok.final.Counters["written"] != 3 || ok.final.RecipeID == "" {
+		t.Errorf("finish = %s %d %+v", ok.status, ok.finished, ok.final)
+	}
+
+	broken := &stepRunStore{fakeStore: &fakeStore{cands: cands("a clean chunk", "pure garbage here", "a broken reply", "another clean one")}, broken: true}
+	var out2 strings.Builder
+	if err := run(context.Background(), &out2, broken, newScanner(t, srv.URL, broken.fakeStore), o); err != nil {
+		t.Fatalf("a broken step_runs store failed the scan: %v", err)
+	}
+	if len(broken.scans) != 3 {
+		t.Errorf("wrote %d chunk_scan rows with recording broken, want 3", len(broken.scans))
+	}
+	var r1, r2 Report
+	if err := json.Unmarshal([]byte(out1.String()), &r1); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(out2.String()), &r2); err != nil {
+		t.Fatal(err)
+	}
+	if r1.Chunks != r2.Chunks || r1.Written != r2.Written || r1.Scanned != r2.Scanned {
+		t.Errorf("recording changed the scan: %+v vs %+v", r1, r2)
 	}
 }

@@ -189,6 +189,13 @@ func TestMetricsEndpointServesOTelAndLegacy(t *testing.T) {
 	tel.StartDecisionsRefresh(time.Hour, time.Second, func(context.Context) ([]telemetry.DecisionCount, error) {
 		return []telemetry.DecisionCount{{Outcome: "apply", IssueType: "homophone", Evidence: "asin_verbatim", Recipe: "d1", N: 4}}, nil
 	})
+	tel.StartStepRunsRefresh(time.Hour, time.Second, func(context.Context) (telemetry.StepRunStats, error) {
+		return telemetry.StepRunStats{
+			Active:   []telemetry.StepRunActive{{Step: "decide", Mode: "write", N: 1}},
+			Progress: []telemetry.StepRunProgress{{Step: "decide", Ratio: 0.5}},
+			Items:    []telemetry.StepRunItems{{Step: "decide", Outcome: "apply", N: 12}},
+		}, nil
+	})
 
 	want := []string{
 		`earmark_build_info{commit="` + version.Commit + `",version="` + version.Version + `"} 1`,
@@ -196,6 +203,9 @@ func TestMetricsEndpointServesOTelAndLegacy(t *testing.T) {
 		`earmark_stale_items{step="embed"} 7`,
 		`earmark_quality_index{recipe="r1",scope="library"} 0.75`,
 		`earmark_decisions{evidence="asin_verbatim",issue_type="homophone",outcome="apply",recipe="d1"} 4`,
+		`earmark_step_run_active{mode="write",step="decide"} 1`,
+		`earmark_step_run_progress_ratio{step="decide"} 0.5`,
+		`earmark_step_run_items_total{outcome="apply",step="decide"} 12`,
 		// legacy names unchanged
 		`earmark_jobs{status="pending"} 2`,
 		`earmark_jobs_failed_total 0`,
@@ -205,7 +215,8 @@ func TestMetricsEndpointServesOTelAndLegacy(t *testing.T) {
 	for {
 		body = scrape(t, reg)
 		if (strings.Contains(body, `earmark_stale_items{step="embed"} 7`) &&
-			strings.Contains(body, `earmark_quality_index{`) && strings.Contains(body, `earmark_decisions{`)) ||
+			strings.Contains(body, `earmark_quality_index{`) && strings.Contains(body, `earmark_decisions{`) &&
+			strings.Contains(body, `earmark_step_run_items_total{`)) ||
 			time.Now().After(deadline) {
 			break
 		}

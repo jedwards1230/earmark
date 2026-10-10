@@ -74,6 +74,8 @@ func schemaTypes() []schemaType {
 		{"Gateway", reflect.TypeOf(apiGateway{}), roleResponse},
 		{"Server", reflect.TypeOf(apiServer{}), roleResponse},
 		{"PipelineLifecycle", reflect.TypeOf(pipelineLifecycle{}), roleResponse},
+		{"StepRun", reflect.TypeOf(apiRun{}), roleResponse},
+		{"StepRuns", reflect.TypeOf(apiRuns{}), roleResponse},
 		{"Status", reflect.TypeOf(apiStatus{}), roleResponse},
 	}
 }

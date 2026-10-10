@@ -21,6 +21,7 @@ version is in `goose_db_version`.
 | 7 | `00007_fn_calls.sql` | `fn_calls` (pure-function call log + cache); partial unique `fn_calls_cache_key_idx`, `fn_calls_recipe_id_idx` |
 | 8 | `00008_finding_events.sql` | `finding_events` (append-only finding version history); transition triggers on `transcript_findings`; append-only guard; backfill of decided findings; `decide` arm of `stale_work` |
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` (per-chunk System One quality scan); unique `(transcript_id, chunk_index, chunk_text_sha256, recipe_id)`, `chunk_scan_recipe_id_idx`; `scan` arm of `stale_work` |
+| 10 | `00010_step_runs.sql` | `step_runs` (live progress of ad-hoc decide/scan/eval runs); partial `step_runs_running_idx`, `step_runs_started_at_idx` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -563,6 +564,41 @@ Insert-only (`ON CONFLICT DO NOTHING`, after re-hashing the chunk in the same
 statement); rows go only with their transcript. A row whose hash no longer
 matches the chunk describes replaced text and is ignored by the quality index
 and by `stale_work`.
+
+### 13. `step_runs` — Live progress of ad-hoc steps (CONTRACT §1.10)
+
+One row per `earmark decide` / `decide revert` / `scan` / `eval` run, written
+by `internal/runs` while the run runs (insert at start, a throttled heartbeat,
+a closing status). Read by the "Running now" panel, `GET /api/v1/runs` and the
+`earmark_step_run_*` metrics.
+
+```sql
+CREATE TABLE step_runs (
+    id           BIGSERIAL   PRIMARY KEY,
+    step         TEXT        NOT NULL,              -- decide | decide_revert | scan | eval_sample | eval_book | eval_backfill
+    mode         TEXT        NOT NULL,              -- dry_run | write
+    recipe_id    TEXT,                              -- no FK (a rung-0 replay never registers its recipe)
+    model        TEXT,
+    args         TEXT,
+    host         TEXT,                              -- the pod / host name
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at  TIMESTAMPTZ,                       -- NULL iff status = 'running'
+    status       TEXT        NOT NULL DEFAULT 'running', -- running | done | failed | cancelled
+    total        BIGINT,                            -- NULL = unknown
+    done         BIGINT,
+    counters     JSONB       NOT NULL DEFAULT '{}', -- {outcome: n}
+    cost_usd     FLOAT8,
+    error        TEXT,
+    last_message TEXT                               -- the current phase
+);
+-- index step_runs_running_idx:    (started_at DESC) WHERE status = 'running'
+-- index step_runs_started_at_idx: (started_at DESC, id DESC)
+```
+
+A running row whose heartbeat is older than 2 minutes is **stale** (its process
+died); that is computed at read time and nothing reaps rows. No foreign keys:
+the table references nothing and nothing references it.
 
 ## Relationships
 

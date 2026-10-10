@@ -72,6 +72,36 @@ paths:
               schema: { $ref: "#/components/schemas/Status" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/runs:
+    get:
+      tags: [status]
+      operationId: getRuns
+      summary: Ad-hoc step runs — what is running now and recent outcomes
+      description: >
+        The `step_runs` table (CONTRACT §1.10): every `earmark decide` (dry
+        run, `--yes`, `revert`), `earmark scan` and `earmark eval` run records
+        one row with a throttled heartbeat. `active` lists the open runs whose
+        heartbeat is less than 24 h old, newest first — a run whose heartbeat
+        is older than `staleAfterSeconds` (120) has `stale: true` and `status:
+        "stale"`: its process died (killed `kubectl exec`, OOM) and it will
+        never finish. `recent` lists the newest other runs, including open
+        runs abandoned for over 24 h (also stale). Unauthenticated.
+      security: []
+      parameters:
+        - name: recent
+          in: query
+          required: false
+          description: How many non-active runs to list (1..100, default 10).
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+      responses:
+        "200":
+          description: Active and recent step runs.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepRuns" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/pipeline/pause:
     get:
       tags: [pipeline]
@@ -893,6 +923,12 @@ components:
           type: string
         runnerUpdate:
           $ref: '#/components/schemas/RunnerUpdate'
+        runs:
+          description: |
+            The ad-hoc step runs (decide, scan, eval) — the same body as GET /api/v1/runs. `null` when the read failed.
+          oneOf:
+            - $ref: '#/components/schemas/StepRuns'
+            - type: "null"
         servers:
           description: |
             Configured-vs-observed transcription servers. `null` when none are configured or observed, or when the supplementary query failed.
@@ -929,6 +965,152 @@ components:
         - servers
         - endpoints
         - roles
+        - runs
         - gateways
         - pipeline
+      type: object
+    StepRun:
+      properties:
+        args:
+          type:
+            - string
+            - "null"
+        costUsd:
+          type:
+            - number
+            - "null"
+        counters:
+          additionalProperties:
+            type: integer
+          description: |
+            Outcome counters (decide: apply/hold/reject/reanchor/cached/errors/skipped/capped; scan: scanned/cached/fallback/errors/written; eval: evaluated/errors/findings, or for a backfill latched/failed/not_embedded/skipped/chunks/chunk_errors/findings; revert: moved/skipped/revoked/reflagged).
+          type: object
+        done:
+          description: |
+            Items finished so far.
+          type:
+            - integer
+            - "null"
+        elapsedSeconds:
+          type: number
+        error:
+          description: |
+            The error a failed or cancelled run ended with.
+          type:
+            - string
+            - "null"
+        etaSeconds:
+          description: |
+            Remaining time at the run's average pace; only for a live running run with a total and some progress.
+          type:
+            - number
+            - "null"
+        finishedAt:
+          type:
+            - string
+            - "null"
+        heartbeatAt:
+          type: string
+        host:
+          type:
+            - string
+            - "null"
+        id:
+          type: integer
+        message:
+          description: |
+            The current phase — what the run is waiting on ("page 3: asking jev-1.13.0", "writing batch 2/9").
+          type:
+            - string
+            - "null"
+        mode:
+          enum:
+            - dry_run
+            - write
+          type: string
+        model:
+          type:
+            - string
+            - "null"
+        progress:
+          description: |
+            done / total (0..1); null without a total.
+          type:
+            - number
+            - "null"
+        recipeId:
+          type:
+            - string
+            - "null"
+        stale:
+          description: |
+            True for a running row whose heartbeat stopped advancing (computed at read time).
+          type: boolean
+        startedAt:
+          type: string
+        status:
+          description: |
+            running, done, failed, cancelled, or stale (running with a heartbeat older than staleAfterSeconds — the process is gone).
+          enum:
+            - running
+            - stale
+            - done
+            - failed
+            - cancelled
+          type: string
+        step:
+          description: |
+            The step token: decide, decide_revert, scan, eval_sample, eval_book, eval_backfill.
+          type: string
+        total:
+          description: |
+            Items the run will visit, when known up front (decide --yes counts its work list, capped by --limit; --sample sizes); null = unknown.
+          type:
+            - integer
+            - "null"
+      required:
+        - id
+        - step
+        - mode
+        - status
+        - stale
+        - recipeId
+        - model
+        - args
+        - host
+        - startedAt
+        - heartbeatAt
+        - finishedAt
+        - total
+        - done
+        - progress
+        - elapsedSeconds
+        - etaSeconds
+        - counters
+        - costUsd
+        - message
+        - error
+      type: object
+    StepRuns:
+      properties:
+        active:
+          items:
+            $ref: '#/components/schemas/StepRun'
+          type:
+            - array
+            - "null"
+        recent:
+          items:
+            $ref: '#/components/schemas/StepRun'
+          type:
+            - array
+            - "null"
+        staleAfterSeconds:
+          description: |
+            Heartbeat age (seconds) past which a running run reports stale.
+          type: integer
+      required:
+        - active
+        - recent
+        - staleAfterSeconds
       type: object

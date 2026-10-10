@@ -101,6 +101,31 @@ var decideWorkSQL = `
 	 ORDER BY f.id
 	 LIMIT $7`
 
+// decideWorkCountSQL counts the whole work list: decideWorkSQL itself, with
+// no cursor ($6 NULL) and no limit ($7 NULL → LIMIT ALL), so the count can
+// never disagree with what the pages return.
+var decideWorkCountSQL = `SELECT count(*) FROM (` + decideWorkSQL + `) w`
+
+// DecideWorkCount counts the findings the --yes run over s would visit
+// (s.After and s.Limit are ignored). Read-only; a progress total, so callers
+// bound it with a deadline.
+func (db *DB) DecideWorkCount(ctx context.Context, s DecideWorkScope) (int, error) {
+	s.After, s.Limit = "", 1
+	if err := s.validate(); err != nil {
+		return 0, err
+	}
+	book := ""
+	if strings.TrimSpace(s.Book) != "" {
+		book = likePattern(s.Book)
+	}
+	var n int
+	if err := db.pool.QueryRow(ctx, decideWorkCountSQL, s.RecipeID, book, s.IssueType, s.Shards, s.Shard,
+		nil, nil, s.RetryReason).Scan(&n); err != nil {
+		return 0, fmt.Errorf("decide work count: %w", err)
+	}
+	return n, nil
+}
+
 // DecideWork returns one page of the --yes work list (read-only). A finding
 // is a re-check when its PatchState is accepted or applied.
 func (db *DB) DecideWork(ctx context.Context, s DecideWorkScope) ([]DecideFinding, error) {

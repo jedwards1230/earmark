@@ -232,6 +232,7 @@ var pipelinePage = mustPage(`{{define "content"}}
 <p class="subtitle">pipeline status &nbsp;·&nbsp; auto-refreshes every 3 s</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
 <div id="action-error" aria-live="assertive"></div>
+` + runsRegion + `
 <div id="data-region"
      hx-get="/status/data" hx-trigger="load, every 3s" hx-swap="innerHTML"
      hx-sync="this:drop" hx-config='{"timeout": 5000}' hx-status:5xx="swap:none"

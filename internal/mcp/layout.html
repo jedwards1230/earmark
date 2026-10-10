@@ -578,6 +578,21 @@
   .badge.role-chat       { background: var(--badge-purple); color: var(--purple); }
   .badge.role-systemone  { background: var(--badge-green); color: var(--green); }
   .server-note { color: var(--text-2); font-size: var(--fs-sm); line-height: 1.5; margin-top: 12px; max-width: 760px; }
+
+  /* ── step runs: "Running now" + "Recent runs" (Pipeline + Models) ──────── */
+  .runs-active { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .run-card .run-progress { margin: 8px 0 10px; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+  .run-card .progress { width: 180px; }
+  .run-card .progress-text { margin-left: 4px; }
+  .badge.run-mode       { background: var(--track-bg); color: var(--text-2); }
+  .badge.mode-write     { background: var(--tint-blue); color: var(--blue); }
+  .badge.run-running    { background: var(--badge-green); color: var(--green); }
+  .badge.run-done       { background: var(--badge-green); color: var(--green); }
+  .badge.run-failed     { background: var(--tint-red); color: var(--red); }
+  .badge.run-stale      { background: var(--badge-amber); color: var(--amber); }
+  .badge.run-cancelled  { background: var(--track-bg); color: var(--muted); }
+  .runs-none { margin: 0 0 4px; }
+  .run-card .server-sub.stale-note { color: var(--amber); }
   /* collapsible "About this page" — routing prose folded out of the way */
   .about-page { margin-top: 14px; margin-bottom: 8px; }
   .about-page > summary { cursor: pointer; color: var(--text-2); font-size: var(--fs-sm); list-style: revert; min-height: 28px; }

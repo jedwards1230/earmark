@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"text/tabwriter"
@@ -27,6 +28,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/fn"
 	"github.com/jedwards1230/earmark/internal/genai"
+	"github.com/jedwards1230/earmark/internal/runs"
 	scanpkg "github.com/jedwards1230/earmark/internal/scan"
 	"github.com/jedwards1230/earmark/internal/telemetry"
 )
@@ -191,15 +193,29 @@ type outcome struct {
 
 // run is the testable core: select, scan concurrently, optionally write,
 // report. Errors on individual chunks are counted, not fatal; a store error
-// (candidate query or insert) stops the run.
-func run(ctx context.Context, out io.Writer, store Store, sc scanpkg.Scanner, o options) error {
+// (candidate query or insert) stops the run. The run is recorded in
+// step_runs (CONTRACT §1.10) when store is the real database; recording
+// never fails the scan.
+func run(ctx context.Context, out io.Writer, store Store, sc scanpkg.Scanner, o options) (err error) {
 	if err := validate(o); err != nil {
 		return err
 	}
+	mode := db.StepRunDryRun
+	if o.yes {
+		mode = db.StepRunWrite
+	}
+	spec := runs.Spec{Step: runs.StepScan, Mode: mode, Model: sc.Fn.ModelAlias, Args: argsSummary(o)}
+	if o.sample > 0 {
+		n := int64(o.sample)
+		spec.Total = &n
+	}
+	rec := runs.StartIfStore(ctx, store, spec)
+	defer func() { rec.Finish(err) }()
 	recipeID, err := store.RegisterRecipe(ctx, sc.Fn.Recipe(""))
 	if err != nil {
 		return fmt.Errorf("register scan recipe: %w", err)
 	}
+	rec.SetRecipe(recipeID, sc.Fn.ModelAlias)
 	rep := &Report{
 		DryRun: !o.yes, RecipeID: recipeID, Model: sc.Fn.ModelAlias,
 		Errors: map[string]int{}, QualityHist: map[string]int{}, IssueTypes: map[string]int{},
@@ -216,6 +232,7 @@ func run(ctx context.Context, out io.Writer, store Store, sc scanpkg.Scanner, o 
 		if o.sample == 0 && o.limit > 0 {
 			scope.Limit = min(remaining, 500)
 		}
+		rec.Phase("selecting chunks")
 		cands, err := store.ScanCandidates(ctx, scope)
 		if err != nil {
 			runErr = err
@@ -224,8 +241,13 @@ func run(ctx context.Context, out io.Writer, store Store, sc scanpkg.Scanner, o 
 		if len(cands) == 0 {
 			break
 		}
-		for _, oc := range scanAll(ctx, sc, cands, o.concurrency) {
-			if err := tally(ctx, store, rep, &qualitySum, oc, o.yes); err != nil {
+		rec.Phase("asking " + sc.Fn.ModelAlias)
+		outs := scanAll(ctx, sc, cands, o.concurrency, rec)
+		if o.yes {
+			rec.Phase("writing chunk_scan")
+		}
+		for _, oc := range outs {
+			if err := tally(ctx, store, rep, &qualitySum, oc, o.yes, rec); err != nil {
 				runErr = err
 				break
 			}
@@ -254,8 +276,9 @@ func run(ctx context.Context, out io.Writer, store Store, sc scanpkg.Scanner, o 
 }
 
 // scanAll scans cands with up to n calls in flight, returning outcomes in
-// candidate order. A cancelled context stops new calls.
-func scanAll(ctx context.Context, sc scanpkg.Scanner, cands []db.ScanCandidate, n int) []outcome {
+// candidate order. A cancelled context stops new calls. Each answered call
+// ticks rec (nil = no recording).
+func scanAll(ctx context.Context, sc scanpkg.Scanner, cands []db.ScanCandidate, n int, rec *runs.Run) []outcome {
 	outs := make([]outcome, len(cands))
 	sem := make(chan struct{}, n)
 	var wg sync.WaitGroup
@@ -271,15 +294,51 @@ func scanAll(ctx context.Context, sc scanpkg.Scanner, cands []db.ScanCandidate, 
 			defer func() { <-sem }()
 			r, meta, err := sc.Scan(ctx, c)
 			outs[i] = outcome{cand: c, result: r, meta: meta, err: err}
+			tickScan(rec, outs[i])
 		}(i, c)
 	}
 	wg.Wait()
 	return outs
 }
 
+// tickScan records one finished chunk on rec: scanned, fallback or errors,
+// a cache hit, and the spend.
+func tickScan(rec *runs.Run, oc outcome) {
+	switch {
+	case rec == nil:
+	case oc.err != nil:
+		rec.Tick("errors", 0)
+	case oc.meta.Fallback:
+		rec.Tick("fallback", 0)
+	default:
+		rec.Tick("scanned", oc.result.CostUSD)
+		if oc.meta.CacheHit {
+			rec.Count("cached", 1)
+		}
+	}
+}
+
+// argsSummary is the step_runs.args line: the flags that shape the run.
+func argsSummary(o options) string {
+	var parts []string
+	if o.sample > 0 {
+		parts = append(parts, fmt.Sprintf("--sample %d --seed %s", o.sample, o.seed))
+	}
+	if o.limit > 0 {
+		parts = append(parts, fmt.Sprintf("--limit %d", o.limit))
+	}
+	if o.book != "" {
+		parts = append(parts, fmt.Sprintf("--book %q", o.book))
+	}
+	if o.yes {
+		parts = append(parts, "--yes")
+	}
+	return strings.Join(parts, " ")
+}
+
 // tally records one outcome and, with write, stores it. Only a store error is
 // returned.
-func tally(ctx context.Context, store Store, rep *Report, qualitySum *float64, oc outcome, write bool) error {
+func tally(ctx context.Context, store Store, rep *Report, qualitySum *float64, oc outcome, write bool, rec *runs.Run) error {
 	rep.Chunks++
 	if oc.err != nil {
 		rep.Errors[genai.ErrorClass(oc.err)]++
@@ -325,6 +384,7 @@ func tally(ctx context.Context, store Store, rep *Report, qualitySum *float64, o
 	switch res {
 	case db.ChunkScanInserted:
 		rep.Written++
+		rec.Count("written", 1)
 	case db.ChunkScanExists:
 		rep.Exists++
 	case db.ChunkScanChanged:

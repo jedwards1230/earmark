@@ -92,6 +92,34 @@ type QualityIndex struct {
 	Value  float64
 }
 
+// StepRunStats backs the earmark_step_run_* series (CONTRACT §1.10): live
+// runs per step and mode, the progress ratio of each step's newest live run
+// with a known total, and every recorded counter summed per step. No run id
+// is a label.
+type StepRunStats struct {
+	Active   []StepRunActive
+	Progress []StepRunProgress
+	Items    []StepRunItems
+}
+
+// StepRunActive is one earmark_step_run_active series.
+type StepRunActive struct {
+	Step, Mode string
+	N          int64
+}
+
+// StepRunProgress is one earmark_step_run_progress_ratio series.
+type StepRunProgress struct {
+	Step  string
+	Ratio float64
+}
+
+// StepRunItems is one earmark_step_run_items_total series.
+type StepRunItems struct {
+	Step, Outcome string
+	N             int64
+}
+
 // Telemetry owns the SDK providers. The zero value is not usable; build it
 // with Setup. All methods are safe on a disabled Telemetry.
 type Telemetry struct {
@@ -108,6 +136,7 @@ type Telemetry struct {
 	stale     atomic.Pointer[map[string]int64]
 	quality   atomic.Pointer[[]QualityIndex]
 	decisions atomic.Pointer[[]DecisionCount]
+	stepRuns  atomic.Pointer[StepRunStats]
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -282,6 +311,48 @@ func (t *Telemetry) registerInstruments() error {
 		})); err != nil {
 		return fmt.Errorf("earmark_decisions: %w", err)
 	}
+	return t.registerStepRunInstruments(m)
+}
+
+// registerStepRunInstruments creates the earmark_step_run_* instruments,
+// read from the step_runs snapshot StartStepRunsRefresh keeps.
+func (t *Telemetry) registerStepRunInstruments(m metric.Meter) error {
+	if _, err := m.Int64ObservableGauge("earmark_step_run_active",
+		metric.WithDescription("Ad-hoc step runs (decide, decide_revert, scan, eval_*) running now with a live heartbeat (CONTRACT §1.10); labels: step, mode (dry_run|write). A run whose heartbeat stopped is not counted. Refreshed on a timer."),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			if s := t.stepRuns.Load(); s != nil {
+				for _, a := range s.Active {
+					o.Observe(a.N, metric.WithAttributes(attribute.String("step", a.Step), attribute.String("mode", a.Mode)))
+				}
+			}
+			return nil
+		})); err != nil {
+		return fmt.Errorf("earmark_step_run_active: %w", err)
+	}
+	if _, err := m.Float64ObservableGauge("earmark_step_run_progress_ratio",
+		metric.WithDescription("done / total (0..1) of the newest live run of each step that knows its total (CONTRACT §1.10); absent when none does. Refreshed on a timer."),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			if s := t.stepRuns.Load(); s != nil {
+				for _, p := range s.Progress {
+					o.Observe(p.Ratio, metric.WithAttributes(attribute.String("step", p.Step)))
+				}
+			}
+			return nil
+		})); err != nil {
+		return fmt.Errorf("earmark_step_run_progress_ratio: %w", err)
+	}
+	if _, err := m.Int64ObservableCounter("earmark_step_run_items",
+		metric.WithDescription("Items counted by recorded step runs, summed over every run in step_runs (CONTRACT §1.10); labels: step, outcome (the run's counter: apply/hold/reject/reanchor/cached/errors for decide, scanned/cached/fallback/errors/written for scan, evaluated/errors/findings or latched/failed/… for eval). Refreshed on a timer."),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			if s := t.stepRuns.Load(); s != nil {
+				for _, i := range s.Items {
+					o.Observe(i.N, metric.WithAttributes(attribute.String("step", i.Step), attribute.String("outcome", i.Outcome)))
+				}
+			}
+			return nil
+		})); err != nil {
+		return fmt.Errorf("earmark_step_run_items: %w", err)
+	}
 	return nil
 }
 
@@ -372,6 +443,22 @@ func (t *Telemetry) StartDecisionsRefresh(interval, timeout time.Duration, load 
 		d, err := load(ctx)
 		if err == nil {
 			t.decisions.Store(&d)
+		}
+		return err
+	})
+}
+
+// StartStepRunsRefresh refreshes the earmark_step_run_* series from load
+// every interval (and once immediately) until Shutdown, like
+// StartStaleRefresh.
+func (t *Telemetry) StartStepRunsRefresh(interval, timeout time.Duration, load func(context.Context) (StepRunStats, error)) {
+	if load == nil {
+		return
+	}
+	t.startRefresh("earmark_step_run", interval, timeout, func(ctx context.Context) error {
+		s, err := load(ctx)
+		if err == nil {
+			t.stepRuns.Store(&s)
 		}
 		return err
 	})

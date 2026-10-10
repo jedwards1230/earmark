@@ -15,6 +15,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/recipe"
+	"github.com/jedwards1230/earmark/internal/runs"
 	"github.com/jedwards1230/earmark/internal/systemone"
 )
 
@@ -48,6 +49,9 @@ type RunOptions struct {
 	// Dump, when set, receives one JSON line per sampled finding (DumpRecord),
 	// sorted by finding id so two runs over the same sample diff line by line.
 	Dump io.Writer
+	// Progress, when set, records the run's live progress (CONTRACT §1.10):
+	// the phase, one tick per decided finding and the spend. nil = none.
+	Progress *runs.Run
 }
 
 // ClientFromConfig builds the System One client for AI_ROLES.decide. ok is
@@ -113,22 +117,32 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 			return nil, fmt.Errorf("register decide recipe: %w", err)
 		}
 	}
+	rec := o.Progress
+	rec.SetRecipe(recipeID, ShouldApplyModel)
+	rec.Phase("sampling findings")
 	sample, err := store.DecideSample(ctx, o.Scope)
 	if err != nil {
 		return nil, err
 	}
+	rec.SetTotal(int64(len(sample)))
 	backlog, err := store.DecideBacklog(ctx, o.Scope)
 	if err != nil {
 		return nil, err
 	}
+	rec.Phase("loading chunks + rung-0")
 	items, err := prepare(ctx, store, sample, o.Params)
 	if err != nil {
 		return nil, err
 	}
 	if o.Rung0Only {
+		rec.Phase("rung-0")
 		rung0Outcomes(items)
+		for _, it := range items {
+			tickOutcome(rec, it.outcome)
+		}
 	} else {
-		evaluateAll(ctx, ev, items, o.Concurrency)
+		rec.Phase(askingPhase)
+		evaluateAll(ctx, ev, items, o.Concurrency, rec)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -314,14 +328,34 @@ func candidateOf(f db.DecideFinding, chunk *db.DecideChunk) Candidate {
 	return c
 }
 
+// askingPhase is the phase recorded while should_apply calls are in flight.
+const askingPhase = "asking " + ShouldApplyModel
+
+// tickOutcome records one decided finding on rec: its class (apply, hold,
+// reject, reanchor, rung0_pass), a cache hit, a model error, and the spend.
+func tickOutcome(rec *runs.Run, o Outcome) {
+	if rec == nil {
+		return
+	}
+	rec.Tick(classOf(o), o.CostUSD)
+	if o.CacheHit {
+		rec.Count("cached", 1)
+	}
+	if o.ErrorClass != "" {
+		rec.Count("errors", 1)
+	}
+}
+
 // evaluateAll runs Evaluate over items with at most n calls in flight.
-// Rung-0 failures return without a call, so they never wait for a slot.
-func evaluateAll(ctx context.Context, ev *Evaluator, items []*item, n int) {
+// Rung-0 failures return without a call, so they never wait for a slot. Each
+// finished item ticks rec (nil = no progress recording).
+func evaluateAll(ctx context.Context, ev *Evaluator, items []*item, n int, rec *runs.Run) {
 	sem := make(chan struct{}, n)
 	var wg sync.WaitGroup
 	for _, it := range items {
 		if !it.input.Verdict.Pass {
 			it.outcome = ev.Evaluate(ctx, it.input)
+			tickOutcome(rec, it.outcome)
 			continue
 		}
 		if ctx.Err() != nil {
@@ -337,6 +371,7 @@ func evaluateAll(ctx context.Context, ev *Evaluator, items []*item, n int) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			it.outcome = ev.Evaluate(ctx, it.input)
+			tickOutcome(rec, it.outcome)
 		}(it)
 	}
 	wg.Wait()

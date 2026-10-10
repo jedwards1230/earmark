@@ -78,6 +78,9 @@ type apiStatus struct {
 	// folded from liveness AND call outcomes, what was requested vs pinned vs
 	// answered, and the step's stale count. Always five entries.
 	Roles []apiRole `json:"roles"`
+	// Runs is the ad-hoc step runs (CONTRACT §1.10) — the same body as GET
+	// /api/v1/runs with the default recent count; null when the read failed.
+	Runs *apiRuns `json:"runs"`
 	// Gateways is every distinct LiteLLM gateway the AI registry routes
 	// through, read with earmark's own virtual key: readiness, key alias,
 	// status, spend/budget, limits, and the key's allowed models. Empty when
@@ -546,6 +549,14 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	out.Gateways = apiGatewaysFrom(gws, targets)
 	roles, ev := s.modelRoles(r.Context(), stats, runners, runnersKnown, eps, gwByEndpoint, now)
 	out.Roles = apiRolesFrom(roles, ev)
+
+	// Step runs (CONTRACT §1.10): best-effort, under their own deadline.
+	if l, err := s.stepRuns(r.Context(), runsQueryTimeout); err != nil {
+		s.logger.Warn("api status: step runs error; runs omitted", "error", err)
+	} else {
+		runs := apiRunsFrom(l)
+		out.Runs = &runs
+	}
 
 	writeJSON(w, http.StatusOK, out)
 }

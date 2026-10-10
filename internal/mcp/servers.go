@@ -523,6 +523,7 @@ func applyObserved(v *serverView, live *db.LiveRunner, host *db.HostMetrics, pro
 var serversPage = mustPage(`{{define "content"}}
 <p class="subtitle">Each pipeline role: what is configured, what actually answered, whether it is healthy, and how much output predates the current recipe.</p>
 <div id="conn" class="conn-lost" role="status" aria-live="polite" hidden>&#9888;&#xFE0F;&nbsp;connection lost — data below may be stale</div>
+` + runsRegion + `
 <div id="models-region"
      hx-get="/servers/data" hx-trigger="load, every 5s" hx-swap="innerHTML"
      hx-sync="this:replace" hx-config='{"timeout": 5000}' hx-status:5xx="swap:none"
@@ -802,6 +803,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   {{if .AllowlistWarn}}<div class="server-sub err">✗ {{.Requested}} is not on earmark's LiteLLM key allowlist — every call 403s</div>{{end}}
   {{if and .LastErrorShort (eq .Health.Token "failing")}}<div class="server-sub err mono err-clamp" title="{{.LastError}}">{{.LastErrorShort}}</div>{{end}}
   <dl class="role-kv">
+  {{with .ActiveRun}}<dt>running</dt><dd><a href="#run-{{.ID}}" class="{{if .Stale}}err{{else}}run-link{{end}}">{{.Text}}</a></dd>{{end}}
   {{if .HasModel}}
     <dt>requested</dt><dd>{{if .Requested}}<span class="mono">{{.Requested}}</span>{{if .EndpointID}} <span class="time-muted">@ {{.EndpointID}}</span>{{end}}{{else}}—{{end}}</dd>
     {{if .Expected}}<dt>pinned</dt><dd><span class="mono">{{.Expected}}</span>{{with .ExpectedRevisionShort}} <span class="time-muted">· rev {{.}}</span>{{end}}{{if eq .Key "asr"}} <span class="time-muted">· recorded only</span>{{end}}</dd>{{end}}
@@ -942,6 +944,13 @@ func (s *MCPServer) handleServersPage(w http.ResponseWriter, r *http.Request) {
 // connection); a failed or slow snapshot still renders 200 with "counts
 // unavailable" for exactly the sections it backs.
 func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
+	s.renderServersData(w, r, false)
+}
+
+// renderServersData renders the Models fragment. The queue stats come from
+// the 15 s cache (models_snapshot.go) unless liveStats — the runner-update
+// POST, which must show the request it just recorded.
+func (s *MCPServer) renderServersData(w http.ResponseWriter, r *http.Request, liveStats bool) {
 	ctx := r.Context()
 	obs, err := s.db.GetServerObservation(ctx)
 	if err != nil {
@@ -950,15 +959,20 @@ func (s *MCPServer) handleServersData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	stats, err := s.db.GetServiceStatus(ctx)
+	var stats *db.QueueStats
+	if liveStats {
+		stats, err = s.db.GetServiceStatus(ctx)
+	} else {
+		stats, err = s.models.queueStats(ctx, queueStatsFirstWait)
+	}
 	if err != nil {
-		s.logger.Warn("models: GetServiceStatus error; coverage/backlog/runner version degraded", "error", err)
-		stats = nil
+		s.logger.Warn("models: queue stats unavailable; coverage/backlog/runner version degraded", "error", err)
 	}
 	runners := buildServerViews(s.asrServers, obs, s.probeServers(ctx), now, s.runnerStaleAfter)
 	eps := buildEndpointViews(s.cfg, s.probeEndpoints(ctx))
 	gws, targets, gwByEndpoint := s.probeGateways(ctx)
 	roles, ev := s.modelRoles(ctx, stats, runners, true, eps, gwByEndpoint, now)
+	s.attachRoleRuns(ctx, roles)
 
 	data := modelsData{
 		RenderedAt:   now.UTC().Format("15:04:05 UTC"),
@@ -1107,7 +1121,7 @@ func (s *MCPServer) handleRunnerUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		s.logger.Info("runner update requested via dashboard", "version", version)
 	}
-	s.handleServersData(w, r)
+	s.renderServersData(w, r, true)
 }
 
 // runnerUpdateVersion reads the requested version. A `version` field in the

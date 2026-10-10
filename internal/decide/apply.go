@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/recipe"
+	"github.com/jedwards1230/earmark/internal/runs"
 )
 
 // DefaultWriteBatch is how many transcripts one --yes write transaction covers.
@@ -27,6 +29,17 @@ type WriteStore interface {
 	ApplyRecheckDecisions(ctx context.Context, recipeID string, evs []db.DecisionEvent) (db.ApplyResult, error)
 }
 
+// WorkCounter is the optional WriteStore extension that sizes a --yes run up
+// front (*db.DB implements it): the progress total. Without it, or when the
+// count fails, the run reports done with no total.
+type WorkCounter interface {
+	DecideWorkCount(ctx context.Context, s db.DecideWorkScope) (int, error)
+}
+
+// workCountTimeout bounds the up-front count: it is a progress nicety, never
+// worth delaying the run for.
+const workCountTimeout = 10 * time.Second
+
 // ApplyOptions configures a --yes run.
 type ApplyOptions struct {
 	Book, IssueType string
@@ -43,6 +56,8 @@ type ApplyOptions struct {
 	MaxAccepts  int
 	Concurrency int
 	Params      ShouldApplyParams
+	// Progress, when set, records the run's live progress (CONTRACT §1.10).
+	Progress *runs.Run
 }
 
 // WriteStats counts what a --yes run wrote.
@@ -107,6 +122,8 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 	if err != nil {
 		return nil, fmt.Errorf("register decide recipe: %w", err)
 	}
+	rec := o.Progress
+	rec.SetRecipe(recipeID, ShouldApplyModel)
 
 	ws := &WriteStats{}
 	var all []*item
@@ -114,7 +131,13 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		RecipeID: recipeID, RetryReason: ReasonJevUnavailable, Book: o.Book, IssueType: o.IssueType,
 		Shard: o.Shard, Shards: o.Shards,
 	}
-	for ws.Stopped == "" {
+	if rec != nil {
+		rec.Phase("counting work")
+		if total, ok := workTotal(ctx, store, scope, o.Limit); ok {
+			rec.SetTotal(total)
+		}
+	}
+	for page := 1; ws.Stopped == ""; page++ {
 		scope.Limit = workPage
 		if o.Limit > 0 {
 			if left := o.Limit - len(all); left < scope.Limit {
@@ -125,6 +148,7 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 				break
 			}
 		}
+		rec.Phase(fmt.Sprintf("loading page %d", page))
 		work, err := store.DecideWork(ctx, scope)
 		if err != nil {
 			return nil, err
@@ -134,17 +158,22 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		}
 		scope.After = work[len(work)-1].ID
 
+		rec.Phase(fmt.Sprintf("page %d: loading chunks + rung-0", page))
 		items, err := prepare(ctx, store, work, o.Params)
 		if err != nil {
 			return nil, err
 		}
-		evaluateAll(ctx, ev, items, o.Concurrency)
+		rec.Phase(fmt.Sprintf("page %d: %s", page, askingPhase))
+		evaluateAll(ctx, ev, items, o.Concurrency, rec)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := writeItems(ctx, store, recipeID, items, batch, o.MaxAccepts, ws); err != nil {
+		before := *ws
+		if err := writeItems(ctx, store, recipeID, items, batch, o.MaxAccepts, ws, pageRecorder{rec, page}); err != nil {
 			return nil, err
 		}
+		rec.Count("skipped", int64(ws.Skipped-before.Skipped))
+		rec.Count("capped", int64(ws.Capped-before.Capped))
 		for _, it := range items {
 			it.input, it.chunk, it.sentences = Input{}, nil, nil // the report needs finding + outcome only
 		}
@@ -155,6 +184,36 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 	rep.DryRun = false
 	rep.Write = ws
 	return rep, nil
+}
+
+// workTotal sizes the run: the work list's count, capped by limit. ok=false
+// when the store cannot count or the count failed; the total then stays
+// unknown (--limit alone is not used: the scope may be smaller).
+func workTotal(ctx context.Context, store WriteStore, scope db.DecideWorkScope, limit int) (int64, bool) {
+	wc, ok := store.(WorkCounter)
+	if !ok {
+		return 0, false
+	}
+	cctx, cancel := context.WithTimeout(ctx, workCountTimeout)
+	defer cancel()
+	n, err := wc.DecideWorkCount(cctx, scope)
+	if err != nil {
+		return 0, false
+	}
+	if limit > 0 && n > limit {
+		n = limit
+	}
+	return int64(n), true
+}
+
+// pageRecorder labels the write phase of one page on the run.
+type pageRecorder struct {
+	rec  *runs.Run
+	page int
+}
+
+func (p pageRecorder) batch(i, n int) {
+	p.rec.Phase(fmt.Sprintf("page %d: writing batch %d/%d", p.page, i, n))
 }
 
 // eventOf is the decision event an outcome records; ok=false for an outcome
@@ -177,8 +236,10 @@ func eventOf(recipeID string, o Outcome) (db.DecisionEvent, bool) {
 	return e, true
 }
 
-// writeItems writes items' decisions, Batch transcripts per transaction.
-func writeItems(ctx context.Context, store WriteStore, recipeID string, items []*item, batch, maxAccepts int, ws *WriteStats) error {
+// writeItems writes items' decisions, Batch transcripts per transaction. The
+// phase is recorded before each transaction, never inside one.
+func writeItems(ctx context.Context, store WriteStore, recipeID string, items []*item, batch, maxAccepts int,
+	ws *WriteStats, pr pageRecorder) error {
 	byTranscript := map[string][]*item{}
 	var tids []string
 	for _, it := range items {
@@ -190,7 +251,9 @@ func writeItems(ctx context.Context, store WriteStore, recipeID string, items []
 	}
 	sort.Strings(tids)
 
+	nBatches := (len(tids) + batch - 1) / batch
 	for start := 0; start < len(tids); start += batch {
+		pr.batch(start/batch+1, nBatches)
 		var fresh, recheck []db.DecisionEvent
 		recheckHold := map[string]bool{}
 		for _, t := range tids[start:min(start+batch, len(tids))] {
