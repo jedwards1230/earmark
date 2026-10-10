@@ -279,7 +279,16 @@ func (c *Config) applyStepSetting(s StepSetting) error {
 		return nil
 	}
 
-	// A synthesized endpoint belongs to exactly one step; drop the old one.
+	// Synthesized endpoint lifecycle. A synthesized "<id>@<step>" entry
+	// belongs to exactly one step, so it is replaced, never stacked:
+	//   1. If the step is currently bound to a synthesized entry (cur.BaseID
+	//      != ""), remove that entry by ITS OWN id, cur.ID — never by
+	//      base.ID, which is the registered AI_ENDPOINTS entry other roles
+	//      may still be bound to.
+	//   2. Below, a new synthesized entry is created only when the setting
+	//      asks the registered endpoint for a model other than its own
+	//      (base.Model != s.Model); otherwise the role binds to the
+	//      registered entry directly and no synthesized entry remains.
 	if bound && cur.BaseID != "" {
 		c.AIEndpoints = slices.DeleteFunc(c.AIEndpoints, func(ep AIEndpoint) bool { return ep.ID == cur.ID })
 	}
