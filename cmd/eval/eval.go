@@ -32,6 +32,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/runs"
 	"github.com/jedwards1230/earmark/internal/telemetry"
 	"github.com/jedwards1230/earmark/internal/worker"
 	"github.com/spf13/cobra"
@@ -54,6 +55,10 @@ type options struct {
 	dump                string // dry run only: write one JSONL line per judged chunk here ("-" = stdout)
 	// observe is the per-chunk hook --dump installs (not a flag).
 	observe func(evalpkg.Result, error)
+	// steps records the run's progress in step_runs (CONTRACT §1.10); model
+	// is the judge model it names. nil steps (tests) records nothing.
+	steps runs.Store
+	model string
 }
 
 var opts options
@@ -243,6 +248,7 @@ func runSelected(database *db.DB, judge *evalpkg.Judge, book string, o options) 
 	}
 
 	r := &dbRunner{reader: database, judge: judge, writer: database, events: database}
+	o.steps, o.model = database, judge.Model()
 	if err := run(context.Background(), out, r, book, o); err != nil {
 		_, _ = fmt.Fprintf(out, "Error: %v\n", err)
 		return 1
@@ -427,8 +433,20 @@ type backfillTally struct {
 // In dry-run mode (write=false) it prints what it would record but writes
 // nothing. A cancelled context stops the sweep without recording anything for
 // the in-flight transcript.
-func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *evalpkg.Judge, cfg *config.Config, o backfillOptions) error {
+func runBackfill(ctx context.Context, out io.Writer, bdb backfillDB, judge *evalpkg.Judge, cfg *config.Config, o backfillOptions) (err error) {
 	p := func(format string, a ...any) { _, _ = fmt.Fprintf(out, format, a...) }
+
+	// Recorded in step_runs (CONTRACT §1.10) when bdb is the real database;
+	// recording never fails the backfill. No total: --limit counts latched
+	// transcripts, not visited ones, so a ratio would mislead.
+	mode := db.StepRunDryRun
+	if o.write {
+		mode = db.StepRunWrite
+	}
+	rec := runs.StartIfStore(ctx, bdb, runs.Spec{
+		Step: runs.StepEvalBackfill, Mode: mode, Model: judge.Model(), Args: o.summary(),
+	})
+	defer func() { rec.Finish(err) }()
 
 	selectPage := bdb.GetUnevaluatedJobTranscripts
 	what := "done transcript(s) with eval_finished_at IS NULL"
@@ -464,10 +482,12 @@ walk:
 			}
 			tl.seen++
 			cursor = db.CursorAfter(t) // advance past every row, whatever its outcome
+			rec.Phase(fmt.Sprintf("judging %s · asking %s", filepath.Base(t.FilePath), judge.Model()))
 			res, err := backfillOne(ctx, p, bdb, judge, chunkSize, cfg.EvalGatesEmbed, t, o.write)
 			if err != nil {
 				return err
 			}
+			tickBackfill(rec, res)
 			if res.judged {
 				tl.attempts++
 			}
@@ -521,6 +541,45 @@ walk:
 		return fmt.Errorf("no transcript latched: %d judged transcript(s) failed (judge endpoint, API key, or writes broken?)", tl.failed)
 	}
 	return nil
+}
+
+// summary is the step_runs.args line of a backfill.
+func (o backfillOptions) summary() string {
+	s := "--backfill-unevaluated"
+	if o.mode == backfillEvalErrors {
+		s = "--backfill-eval-errors"
+	}
+	if o.limit > 0 {
+		s += fmt.Sprintf(" --limit %d", o.limit)
+	}
+	if o.maxAttempts > 0 {
+		s += fmt.Sprintf(" --max-attempts %d", o.maxAttempts)
+	}
+	if o.write {
+		s += " --write"
+	}
+	return s
+}
+
+// tickBackfill records one visited transcript: its outcome (latched, failed,
+// not_embedded, skipped), the chunks judged and failed, and new findings.
+func tickBackfill(rec *runs.Run, res backfillResult) {
+	if rec == nil {
+		return
+	}
+	outcome := "skipped"
+	switch {
+	case res.latched:
+		outcome = "latched"
+	case res.failed:
+		outcome = "failed"
+	case res.notEmbedded:
+		outcome = "not_embedded"
+	}
+	rec.Tick(outcome, 0)
+	rec.Count("chunks", int64(res.stats.ChunksEvaluated))
+	rec.Count("chunk_errors", int64(res.stats.ChunksSkipped))
+	rec.Count("findings", int64(res.newFindings))
 }
 
 // printBackfillSummary prints the end-of-run report. In a dry run "latched"
@@ -713,7 +772,9 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 
 // run holds the testable logic: validate flags, run the judge, and report.
 // In dry-run (no --write) it prints what it would record and persists nothing.
-func run(ctx context.Context, out io.Writer, r runner, book string, o options) error {
+// With o.steps set the run is recorded in step_runs (CONTRACT §1.10);
+// recording never fails the run.
+func run(ctx context.Context, out io.Writer, r runner, book string, o options) (err error) {
 	p := func(format string, a ...any) { _, _ = fmt.Fprintf(out, format, a...) }
 
 	if o.sample <= 0 && book == "" {
@@ -729,13 +790,24 @@ func run(ctx context.Context, out io.Writer, r runner, book string, o options) e
 		return fmt.Errorf("--dump is a dry-run measurement; it cannot be combined with --write")
 	}
 
+	rec := startSelectedRun(ctx, book, o)
+	defer func() { rec.Finish(err) }()
+	observe := o.observe
+	if rec != nil {
+		observe = func(res evalpkg.Result, jerr error) {
+			if o.observe != nil {
+				o.observe(res, jerr)
+			}
+			tickJudged(rec, res, jerr)
+		}
+	}
 	runOpts := evalpkg.RunOptions{
 		Book:    book,
 		Sample:  o.sample,
 		Seed:    o.seed,
 		Limit:   o.limit,
 		Write:   o.write,
-		Observe: o.observe,
+		Observe: observe,
 	}
 
 	findings, stats, err := r.Run(ctx, runOpts)
@@ -774,6 +846,43 @@ func run(ctx context.Context, out io.Writer, r runner, book string, o options) e
 		p("\nNo findings to record.\n")
 	}
 	return nil
+}
+
+// startSelectedRun records a book or --sample run (nil when o.steps is nil).
+func startSelectedRun(ctx context.Context, book string, o options) *runs.Run {
+	if o.steps == nil {
+		return nil
+	}
+	mode := db.StepRunDryRun
+	if o.write {
+		mode = db.StepRunWrite
+	}
+	spec := runs.Spec{Step: runs.StepEvalBook, Mode: mode, Model: o.model, Args: fmt.Sprintf("book %q", book)}
+	if o.sample > 0 {
+		n := int64(o.sample)
+		spec.Step, spec.Total = runs.StepEvalSample, &n
+		spec.Args = fmt.Sprintf("--sample %d", o.sample)
+		if o.seed != "" {
+			spec.Args += " --seed " + o.seed
+		}
+	}
+	if o.write {
+		spec.Args += " --write"
+	}
+	rec := runs.Start(ctx, o.steps, spec)
+	rec.Phase("asking " + o.model)
+	return rec
+}
+
+// tickJudged records one judged chunk: evaluated or errors, the findings it
+// produced, and the gateway-reported cost.
+func tickJudged(rec *runs.Run, res evalpkg.Result, jerr error) {
+	if jerr != nil {
+		rec.Tick("errors", res.Usage.CostUSD)
+		return
+	}
+	rec.Tick("evaluated", res.Usage.CostUSD)
+	rec.Count("findings", int64(len(res.Findings)))
 }
 
 // droppedLine renders per-reason drop counts, largest first then by reason

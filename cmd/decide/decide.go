@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	decidepkg "github.com/jedwards1230/earmark/internal/decide"
+	"github.com/jedwards1230/earmark/internal/runs"
 	"github.com/jedwards1230/earmark/internal/telemetry"
 )
 
@@ -227,19 +229,28 @@ func runDecide(cmd *cobra.Command, _ []string) {
 	}
 }
 
-// run is the testable core.
-func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker decidepkg.Asker, o options) error {
+// run is the testable core. The run is recorded in step_runs (CONTRACT
+// §1.10) when store is the real database; recording never fails the run.
+func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker decidepkg.Asker, o options) (err error) {
 	if err := validate(o); err != nil {
 		return err
 	}
+	mode := db.StepRunDryRun
+	if o.yes {
+		mode = db.StepRunWrite
+	}
+	rec := runs.StartIfStore(ctx, store, runs.Spec{
+		Step: runs.StepDecide, Mode: mode, Model: decidepkg.ShouldApplyModel, Args: argsSummary(o),
+	})
+	defer func() { rec.Finish(err) }()
 	var rep *decidepkg.Report
-	var err error
 	if o.yes {
 		shard, shards, _ := parseShard(o.shard)
 		rep, err = decidepkg.Apply(ctx, store, asker, decidepkg.ApplyOptions{
 			Book: o.book, IssueType: o.issueType, Shard: shard, Shards: shards,
 			Limit: o.limit, Batch: o.batch, MaxAccepts: o.maxAccepts,
 			Concurrency: o.concurrency, Params: decidepkg.DefaultShouldApplyParams(),
+			Progress: rec,
 		})
 	} else {
 		ro := decidepkg.RunOptions{
@@ -250,6 +261,7 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 			Concurrency: o.concurrency,
 			Params:      decidepkg.DefaultShouldApplyParams(),
 			Rung0Only:   o.rung0Only,
+			Progress:    rec,
 		}
 		rep, err = dryRun(ctx, store, asker, ro, o.dump)
 	}
@@ -257,6 +269,44 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 		return err
 	}
 	return rep.Print(out, o.json)
+}
+
+// argsSummary is the step_runs.args line: the flags that shape the run.
+func argsSummary(o options) string {
+	var b strings.Builder
+	add := func(format string, a ...any) {
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, format, a...)
+	}
+	if o.yes {
+		add("--yes")
+		if o.limit > 0 {
+			add("--limit %d", o.limit)
+		}
+		if o.maxAccepts > 0 {
+			add("--max-accepts %d", o.maxAccepts)
+		}
+		if o.shard != "" {
+			add("--shard %s", o.shard)
+		}
+	} else {
+		add("--sample %d --seed %s", o.sample, o.seed)
+		if o.calibrate {
+			add("--calibrate")
+		}
+		if o.rung0Only {
+			add("--rung0-only")
+		}
+	}
+	if o.book != "" {
+		add("--book %q", o.book)
+	}
+	if o.issueType != "" {
+		add("--issue-type %s", o.issueType)
+	}
+	return b.String()
 }
 
 // dryRun runs decidepkg.DryRun, writing the --dump file when path is set.

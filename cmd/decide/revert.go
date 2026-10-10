@@ -18,6 +18,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/runs"
 )
 
 type revertOptions struct {
@@ -110,15 +111,30 @@ func runRevert(_ *cobra.Command, _ []string) {
 	}
 }
 
-func revert(ctx context.Context, out io.Writer, store Reverter, o revertOptions) error {
+func revert(ctx context.Context, out io.Writer, store Reverter, o revertOptions) (err error) {
 	s, err := o.scope()
 	if err != nil {
 		return err
 	}
+	mode, phase := db.StepRunDryRun, "previewing the undo"
+	if o.yes {
+		mode, phase = db.StepRunWrite, "revoking decisions"
+	}
+	// One transaction, so there is no incremental progress: the row says what
+	// is running and, at the end, what moved (CONTRACT §1.10).
+	rec := runs.StartIfStore(ctx, store, runs.Spec{
+		Step: runs.StepDecideRevert, Mode: mode, RecipeID: s.RecipeID, Args: shortScope(s),
+	})
+	defer func() { rec.Finish(err) }()
+	rec.Phase(phase)
 	rep, err := store.RevertDecisions(ctx, s, o.yes)
 	if err != nil {
 		return err
 	}
+	rec.Progress(int64(rep.Moved), map[string]int64{
+		"moved": int64(rep.Moved), "skipped": int64(rep.Skipped),
+		"revoked": rep.Revoked, "reflagged": rep.Reflagged,
+	}, 0, "done")
 	if o.json {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
@@ -146,6 +162,15 @@ func revert(ctx context.Context, out io.Writer, store Reverter, o revertOptions)
 	}
 	_, err = io.WriteString(out, b.String())
 	return err
+}
+
+// shortScope is describeScope with the recipe id cut to 12 characters (the
+// full id is the run's recipe_id).
+func shortScope(s db.RevertScope) string {
+	if len(s.RecipeID) > 12 {
+		s.RecipeID = s.RecipeID[:12]
+	}
+	return describeScope(s)
 }
 
 func describeScope(s db.RevertScope) string {
