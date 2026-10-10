@@ -156,7 +156,7 @@ func keptBy(chunk, issue, orig, corr string) string {
 
 // TestPrefilterNeverStricter pins the invariant: no proposal-time filter
 // rejects a finding rung0@v2 passes. The vectors are every passing case of
-// internal/decide's rung-0 tests as at 2e37f08 (TestCheck, TestCheckChangeCap,
+// internal/decide's rung-0 tests as at 6a031c7 (TestCheck, TestCheckChangeCap,
 // TestCheckYearOffByOnePasses), copied verbatim — internal/eval cannot import
 // the decide step. When rung 0 gains a passing vector, add it here.
 func TestPrefilterNeverStricter(t *testing.T) {
@@ -223,7 +223,7 @@ func TestPrefilterNeverStricter(t *testing.T) {
 }
 
 // TestCosmeticMatchesRung0: every rung-0 cosmetic_only vector (TestCheck at
-// 2e37f08) is dropped as cosmetic_only here, and the near misses rung 0
+// 6a031c7) is dropped as cosmetic_only here, and the near misses rung 0
 // scores instead are kept.
 func TestCosmeticMatchesRung0(t *testing.T) {
 	cosmeticPairs := [][2]string{
@@ -274,7 +274,7 @@ func TestCosmeticMatchesRung0(t *testing.T) {
 }
 
 // TestDiffHunksMatchesRung0 pins the alignment copied from rung0@v2: the
-// first block is internal/decide's TestDiffHunks verbatim (2e37f08), so the
+// first block is internal/decide's TestDiffHunks verbatim (6a031c7), so the
 // same inputs give the same hunks, tie-breaks included.
 func TestDiffHunksMatchesRung0(t *testing.T) {
 	for _, tt := range []struct {
@@ -306,7 +306,7 @@ func TestDiffHunksMatchesRung0(t *testing.T) {
 }
 
 // TestTokenSpansMatchesRung0 is internal/decide's TestTokenSpans and
-// TestTokens verbatim (2e37f08): the tokenizer the hunks are cut from.
+// TestTokens verbatim (6a031c7): the tokenizer the hunks are cut from.
 func TestTokenSpansMatchesRung0(t *testing.T) {
 	const s = "Don't, 1,000 o’brien 3.15 1,2 21st end."
 	ts := tokenSpans(s)

@@ -134,7 +134,7 @@ func substitutionReason(p parsedFinding) string {
 }
 
 // The rest of this file is copied from internal/decide/rung0.go as at
-// rung0@v2 (jedwards1230/earmark branch feat/decide-quality-wins, 2e37f08):
+// rung0@v2 (main at 6a031c7, jedwards1230/earmark#181):
 // hunk, diffHunks, cosmetic, token, tokenSpans, tokens, texts and rawText,
 // with their tie-breaks. TestDiffHunksMatchesRung0, TestTokenSpansMatchesRung0
 // and TestPrefilterNeverStricter carry rung 0's own vectors, so a drift on
