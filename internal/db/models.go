@@ -228,8 +228,10 @@ type FnRoleActivity struct {
 	// LastModel is the newest reply's model_resolved (fallbacks included,
 	// cache hits excluded); "" when no request got a reply.
 	LastModel string
-	// Outputs is the step's output rows under the recipe — scan: chunk_scan
-	// rows; nil for decide (its decisions are counted from the findings).
+	// Outputs is the step's output rows under the recipe or one equivalent to
+	// it (a format-1 id differing only in its build, CONTRACT §1.9) — scan:
+	// chunk_scan rows; nil for decide (its decisions are counted from the
+	// findings).
 	Outputs *int64
 }
 
@@ -242,7 +244,12 @@ const fnRoleActivitySQL = `
 	  SELECT cr.step, r.recipe_id, coalesce(r.model_alias, '') AS model_alias,
 	         coalesce(r.prompt_sha256, '') AS prompt_sha256, coalesce(r.params->>'fn', '') AS fn,
 	         CASE WHEN cr.step = 'scan'
-	              THEN (SELECT count(*) FROM chunk_scan s WHERE s.recipe_id = r.recipe_id) END AS outputs
+	              THEN (SELECT count(*) FROM chunk_scan s JOIN recipes o ON o.recipe_id = s.recipe_id
+	                     WHERE (o.step, o.step_version, o.model_alias, o.model_resolved, o.model_revision,
+	                            o.prompt_version, o.prompt_sha256, o.params)
+	                           IS NOT DISTINCT FROM
+	                           (r.step, r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+	                            r.prompt_version, r.prompt_sha256, r.params)) END AS outputs
 	    FROM current_recipes cr
 	    JOIN recipes r ON r.recipe_id = cr.recipe_id
 	   WHERE cr.step IN ('decide', 'scan')

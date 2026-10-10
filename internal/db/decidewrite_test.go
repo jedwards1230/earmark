@@ -19,11 +19,14 @@ func TestDecideWorkSQL(t *testing.T) {
 		// the scope
 		"f.origin = 'judge'", "f.anchor_offset IS NOT NULL", "f.chunk_text_sha256 IS NOT NULL",
 		// proposed, or a re-check of another decide recipe's accept — never a person's
-		"(f.patch_state = 'proposed' OR (f.patch_state IN ('accepted', 'applied') AND f.decided_by ~ '^jev:[0-9a-f]{64}$' AND f.decided_by <> 'jev:' || $1))",
+		"(f.patch_state = 'proposed' OR (f.patch_state IN ('accepted', 'applied') AND f.decided_by ~ '^jev:[0-9a-f]{64}$' AND f.decided_by NOT IN (SELECT 'jev:' || eq.recipe_id FROM eq)))",
+		// "this recipe" = the run's recipe and the recipes equivalent to it
+		"SELECT $1::text AS recipe_id UNION SELECT o.recipe_id FROM recipes c JOIN recipes o",
+		"WHERE c.recipe_id = $1",
 		// latest live decision: absent, another recipe's, or this recipe's retryable hold
 		"NOT EXISTS (SELECT 1 FROM finding_events v WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)",
 		"ORDER BY e.id DESC LIMIT 1",
-		"(d.recipe_id IS NULL OR d.recipe_id <> $1 OR (d.outcome = 'hold' AND d.reason = $8))",
+		"(d.recipe_id IS NULL OR d.recipe_id NOT IN (SELECT eq.recipe_id FROM eq) OR (d.outcome = 'hold' AND d.reason = $8))",
 		// the shard, non-negative
 		"($4 = 0 OR mod(mod(hashtext(f.transcript_id::text)::bigint, $4) + $4, $4) = $5)",
 		// keyset

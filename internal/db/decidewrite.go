@@ -66,12 +66,18 @@ func (s DecideWorkScope) validate() error {
 // or is this recipe's retryable hold ($8, jev_unavailable). Every other
 // verdict of this recipe is final, so a re-run does not ask again.
 //
+// "This recipe" is the recipe and every recipe equivalent to it
+// (equivalentRecipesCTE): a format-1 recipe id that differs from the run's
+// only by the build that registered it is not "another recipe", so upgrading
+// to ID format 2 does not re-check every accept or re-ask every hold.
+//
 // The shard is hashtext(transcript_id) mod $4, folded to be non-negative
 // (hashtext is a signed int4; abs() would overflow on its minimum).
 //
 //	$1 recipe  $2 book pattern ('' = all)  $3 issue type ('' = all)
 //	$4 shards (0 = all)  $5 shard  $6 cursor (NULL = start)  $7 limit  $8 retry reason
 var decideWorkSQL = `
+	WITH` + equivalentRecipesCTE + `
 	SELECT f.id::text, f.transcript_id::text, f.file_path, f.issue_type, f.original_text,
 	       COALESCE(f.suggested_correction, ''), f.confidence, f.chunk_index,
 	       f.anchor_offset, COALESCE(f.anchor_occurrence, -1), f.chunk_text_sha256,
@@ -92,8 +98,10 @@ var decideWorkSQL = `
 	   AND f.chunk_text_sha256 IS NOT NULL
 	   AND (f.patch_state = 'proposed'
 	        OR (f.patch_state IN ('accepted', 'applied')
-	            AND f.decided_by ~ '^jev:[0-9a-f]{64}$' AND f.decided_by <> 'jev:' || $1))
-	   AND (d.recipe_id IS NULL OR d.recipe_id <> $1 OR (d.outcome = 'hold' AND d.reason = $8))
+	            AND f.decided_by ~ '^jev:[0-9a-f]{64}$'
+	            AND f.decided_by NOT IN (SELECT 'jev:' || eq.recipe_id FROM eq)))
+	   AND (d.recipe_id IS NULL OR d.recipe_id NOT IN (SELECT eq.recipe_id FROM eq)
+	        OR (d.outcome = 'hold' AND d.reason = $8))
 	   AND ($2 = '' OR f.file_path ILIKE $2)
 	   AND ($3 = '' OR f.issue_type = $3)
 	   AND ($4 = 0 OR mod(mod(hashtext(f.transcript_id::text)::bigint, $4) + $4, $4) = $5)

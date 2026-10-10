@@ -98,7 +98,7 @@ CREATE TABLE transcripts (
     -- runner that predates it.
     embedded_asin       TEXT,       -- ASIN tag embedded in the audio (ffprobe), validated; §1.6
     asr_model_sha256    TEXT,       -- sha256 of the .nemo file the runner loaded → recipe model_revision
-    asr_runner_version  TEXT,       -- runner version tag → recipe code_version
+    asr_runner_version  TEXT,       -- runner version tag → recipe code_version (first seen) + recipe_builds
     asr_params          JSONB,      -- runner output-shaping settings → recipe params
 
     CONSTRAINT transcripts_job_id_unique UNIQUE (job_id)
@@ -1131,6 +1131,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 8 | `00008_finding_events.sql` | `finding_events` — the append-only finding version history (§2.17 "Version history"): transition triggers on `transcript_findings` (every `patch_state` change, and every insert not in `proposed`), an append-only guard, a backfill of one transition per already-decided finding, and the `decide` arm of `stale_work` (§1.9). No ALTER on `transcript_findings`; `CREATE TRIGGER` blocks its writers until the migration commits (`lock_timeout` 5s). |
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` — per-chunk System One quality scan results, unique per (transcript, chunk index, chunk text sha256, recipe), `ON DELETE CASCADE` with the transcript; the `scan` arm of `stale_work` (§1.9 "Chunk scan"). New table plus a view replacement; no ALTER. Its `stale_work` restates every earlier arm, 8's `decide` arm included. |
 | 10 | `00010_step_runs.sql` | `step_runs` — one row per ad-hoc step run (decide, decide revert, scan, eval) with its live progress and outcome (§1.10), a partial index on the open runs and a `started_at` index for the recent list. New table only; no ALTER, no lock on an existing table. |
+| 11 | `00011_recipe_builds.sql` | `recipe_builds` — every (recipe, earmark build) pair, PK `(recipe_id, code_version)` plus `recipe_builds_code_version_idx`, backfilled with each existing recipe's registering build; a column comment marking `recipes.code_version` as the *first* build (§1.9 "Recipe ID format" / "Builds"). New table plus a `COMMENT` (SHARE UPDATE EXCLUSIVE, which writers' INSERTs do not wait on); no id is rewritten. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1239,7 +1240,7 @@ CREATE TABLE recipes (
     recipe_id      TEXT        NOT NULL PRIMARY KEY,  -- lowercase hex sha256 of the canonical JSON below
     step           TEXT        NOT NULL,              -- asr | propose | decide | propagate | scan | format | embed
     step_version   INTEGER     NOT NULL,              -- bumped when earmark's logic for the step changes output; 0 = legacy
-    code_version   TEXT        NOT NULL,              -- earmark "<tag>+<commit>" (runner tag for asr); 'legacy-unknown'
+    code_version   TEXT        NOT NULL,              -- the build that FIRST registered it: earmark "<tag>+<commit>" (runner tag for asr); 'legacy-unknown'. Not part of recipe_id (format 2)
     model_alias    TEXT,                              -- what was asked for (the model id / LiteLLM alias sent)
     model_resolved TEXT,                              -- what answered (the response "model" field)
     model_revision TEXT,                              -- HF commit / .nemo sha256 / Ollama digest / provider snapshot
@@ -1248,6 +1249,14 @@ CREATE TABLE recipes (
     params         JSONB       NOT NULL DEFAULT '{}', -- temperature, thresholds, chunk size, dimensions, prefixes…
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE recipe_builds (                          -- migration 11
+    recipe_id    TEXT        NOT NULL REFERENCES recipes (recipe_id),
+    code_version TEXT        NOT NULL,                -- a build that registered the recipe
+    first_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),  -- when that build first registered it
+    PRIMARY KEY (recipe_id, code_version)
+);
+CREATE INDEX recipe_builds_code_version_idx ON recipe_builds (code_version);
 ```
 
 | Row | Column | Recipe of | Written by |
@@ -1258,20 +1267,129 @@ CREATE TABLE recipes (
 
 All three are nullable FKs to `recipes`. NULL means "unstamped".
 
-**Canonical form / ID.** `recipe_id` = lowercase hex SHA-256 of these exact
-bytes — keys in this order, no whitespace, empty strings as `null`, `params`
-canonicalized (object keys sorted, no whitespace, no HTML escaping, `{}` when
-empty):
+**Canonical form / ID (format 2).** `recipe_id` = lowercase hex SHA-256 of
+these exact bytes — keys in this order, no whitespace, empty strings as `null`,
+`params` canonicalized (object keys sorted, no whitespace, no HTML escaping,
+`{}` when empty):
 
 ```json
-{"step":"propose","step_version":1,"code_version":"v0.41.0+abc1234","model_alias":"earmark-judge","model_resolved":"anthropic/claude-haiku-4-5-20251001","model_revision":null,"prompt_version":"judge@v1","prompt_sha256":"00ff","params":{"a<b":"x&y","min_confidence":0.6,"temperature":0}}
+{"step":"propose","step_version":1,"model_alias":"earmark-judge","model_resolved":"anthropic/claude-haiku-4-5-20251001","model_revision":null,"prompt_version":"judge@v1","prompt_sha256":"00ff","params":{"a<b":"x&y","min_confidence":0.6,"temperature":0}}
 ```
 
-→ `51274b9640f28301dccaf6fc52f6f9c60c83984ee21f62c00840c1e4007dcff1`
-(`internal/recipe` `TestCanonicalVector`). Any writer outside Go (the runner)
-MUST reproduce these bytes, and registers its recipe with
+→ `3b3d62674f5630afa8aa7209bfa32e5052389cc762ff8e3ba1f5655d2493e4ac`
+(`internal/recipe` `TestCanonicalVector`; `recipe.IDFormat` = 2). Any writer
+outside Go MUST reproduce these bytes, and registers its recipe with
 `INSERT … ON CONFLICT (recipe_id) DO NOTHING` before referencing it. Recipes are
 never updated or deleted.
+
+#### Recipe ID format
+
+The id hashes **only what shapes a step's output**: `step`, `step_version`,
+`model_alias`, `model_resolved`, `model_revision`, `prompt_version`,
+`prompt_sha256` and `params` (which carry the rest — `rung0_version`,
+`evidence_rule`, thresholds, `chunk_size`, `context_segments`, `fn`, …). It
+hashes **nothing build-varying**: not `code_version`, and no builder puts a
+build stamp in `params` (audited: asr, propose, decide, scan, embed; `fn_calls`
+recipes add only `fn`). So:
+
+- A release that changes nothing about a step registers the **same** recipe as
+  the build before it — `current_recipes` does not move, nothing is re-done,
+  and only `recipe_builds` gains a row.
+- A change in earmark's logic for a step **must** bump its `step_version` (or
+  the prompt version, or a versioned param such as `rung0_version`) — that,
+  not the build, is what mints a new recipe. `TestIDSensitivity` pins that
+  each of these changes the id and `TestIDExcludesBuild` that the build does
+  not.
+- **asr:** the runner's version tag is a build stamp too, so it is no longer
+  identifying: two runner releases with the same model, `.nemo` sha256 and
+  `asr_params` share a recipe. Per-row truth stays on the transcript
+  (`transcripts.asr_runner_version`, §1.2); a runner change that alters output
+  must say so in `asr_params`.
+
+| Format | Hashed | Registered by |
+|---|---|---|
+| 1 | format 2 plus `"code_version"` right after `"step_version"` | every build before format 2, and the 00002 legacy backfill (`code_version` `legacy-unknown`, computed in SQL). Vector: the bytes above with `"code_version":"v0.41.0+abc1234"` → `51274b9640f28301dccaf6fc52f6f9c60c83984ee21f62c00840c1e4007dcff1` (`TestCanonicalVectorV1`, `Recipe.IDV1`) |
+| 2 | the bytes above | every build since |
+
+Format-1 ids are **never rewritten** — findings, `finding_events`, chunks,
+`chunk_scan`, `fn_calls` and `current_recipes` reference them — and nothing
+registers a new one. A format-1 recipe and the format-2 recipe of the same
+configuration are therefore two rows that differ only in id and
+`code_version`: **equivalent** (below).
+
+#### Builds — which binary ran a recipe
+
+The build moved out of the identity and into provenance; nothing about it was
+dropped:
+
+- `recipes.code_version` is the build that **first** registered the recipe
+  (unchanged column, so no reader breaks; documented by a column comment).
+- `recipe_builds` holds one row per `(recipe, build)`, written by
+  `db.RegisterRecipe` in the **same statement** as the recipes insert (a CTE;
+  both `ON CONFLICT DO NOTHING`, never updated), so every step that registers a
+  recipe — the worker's embed and asr stamping, the judge's findings, decide,
+  scan, every `fn_calls` row — records its build at no extra round trip.
+  Migration 11 backfilled it from `recipes`, so it is complete.
+- Chosen over a `code_version` column on `step_runs`: step_runs only exists
+  for the ad-hoc decide/scan/eval runs, so it would miss the long-running
+  worker (embed, asr stamping) and the judge's ingest-path findings.
+
+Provenance of any output row is then two hops: the row's `recipe_id` says
+**what** produced it (step, step_version, models, prompt, params — immutable),
+and `recipe_builds` says **which binaries** ran that recipe (with
+`first_seen`). For a run-level answer, `step_runs.recipe_id` + `started_at`
+place a decide/scan/eval run against those builds; `fn_calls.created_at` and
+`finding_events.created_at` do the same per call and per decision. What is not
+recorded is the exact build of an individual row produced while two builds ran
+the same recipe at once (a rolling deploy) — by construction those builds
+produce the same output.
+
+#### Equivalent recipes
+
+Two recipes are **equivalent** when they agree on every hashed field — i.e.
+differ at most in `code_version`. Since format 2 an equivalence class is a
+single format-2 id plus any format-1 ids of the same configuration. Everything
+that asks "was this already done by the current recipe?" compares by
+equivalence, not by id:
+
+- `stale_work` — always has (it never compared `code_version`).
+- `earmark decide --yes`'s work list (`db.DecideWork`): an accept or verdict by
+  an equivalent recipe is the run's own, not "another recipe's" (§2.19
+  "Re-check under a new decide recipe").
+- `earmark scan`'s candidates (`db.ScanCandidates`): a chunk scanned by an
+  equivalent recipe is not rescanned.
+- The Models page Scan row's output count.
+
+The equivalent set is computed per query (`equivalentRecipesCTE`, a scan of
+the small `recipes` table). `earmark decide revert --recipe` still names one
+exact id.
+
+#### Upgrading to format 2 (one-time)
+
+The first build on format 2 registers a new id for every step it registers
+(the old ids hashed `code_version`); `current_recipes` moves to them once and
+then stays put across releases. On production that is decide `426a4e4dd67b…`
+/ `398b8afede7d…`, propose `c80e2c60ca4f…`, embed `b4093c5cb990…` and scan
+`0079b8b4661d…` → one new id each. What that changes:
+
+- **`stale_work` / Models page stale counts / `earmark_stale_items`: no
+  change.** The view compares content, so the outputs of those recipes are
+  not stale under their format-2 twins. (The large stale counts seen today —
+  ≈39,644 embed, ≈32,635 propose — are not build churn: they are legacy
+  `step_version` 0 chunks and judge findings from before `judge@v2`, genuinely
+  made by another configuration.)
+- **decide / scan: no redo**, by equivalence (above).
+- **Embeddings: no re-embed.** The worker never re-embeds on recipe change: it
+  rebuilds only chunks flagged `embedding_stale` (a correction applied or
+  reverted, §2.17) and new transcripts. A stale-by-recipe chunk is reported,
+  never re-embedded automatically — so no release has ever triggered a
+  library re-embed on mini-1, before or after this change.
+- **Per-recipe series and groupings** that key on the exact id start a new
+  series once: `earmark_recipe_info`, `earmark_quality_index{recipe}`,
+  `decide revert --recipe`, and the decide report's `recipe` line.
+
+Nothing is rewritten, so the upgrade is safe to roll back: an older build
+re-registers its own format-1 ids.
 
 **What answered.** The judge records the model the chat response reports
 serving the request, not just the one it asked for. A LiteLLM fallback answer
@@ -1284,7 +1402,7 @@ alias.
 `asr_model_sha256`, `asr_runner_version`, `asr_params`); each worker cycle
 (`StampASRRecipes`, up to `EMBED_BATCH_SIZE` rows, via the partial index
 `transcripts_asr_unstamped_idx`) builds the asr recipe — `step_version` 1,
-`code_version` = runner version, `model_alias` = `model_resolved` = the loaded
+`code_version` = runner version (first seen; not identifying since format 2), `model_alias` = `model_resolved` = the loaded
 model, `model_revision` = the `.nemo` sha256, `params` = `asr_params` — registers
 it and sets `recipe_id` where it is still NULL, in one transaction. Rows without
 `asr_runner_version` are never stamped (nothing is invented). A runner model
@@ -1514,7 +1632,8 @@ CREATE INDEX chunk_scan_recipe_id_idx ON chunk_scan (recipe_id);
   next run picks the new text up), `ON CONFLICT` on the unique key `DO
   NOTHING` (*exists*). Rows are never updated; they go only with their
   transcript (a requeue).
-- **Selection.** Chunks whose current text has no scan by the run's recipe:
+- **Selection.** Chunks whose current text has no scan by the run's recipe
+  or one equivalent to it (§1.9 "Equivalent recipes"):
   `--sample N` picks N in an order fixed by `--seed` (same seed, same
   library → same chunks); otherwise every candidate in `(transcript_id,
   chunk_index)` keyset pages, capped by `--limit`; `--book` filters by path
@@ -4487,7 +4606,12 @@ When the current decide recipe changes (a threshold, the prompt, the model),
 | hold | decision recorded; the fix stays and is counted *held for review* |
 | reject | decision recorded; the fix is undone — `accepted → rejected`, `applied → reverted` (chunk flagged) — as `jev:<new>` |
 
-A person's accept is never re-checked, and a recipe never re-checks its own.
+A person's accept is never re-checked, and a recipe never re-checks its own —
+"its own" includes every recipe **equivalent** to it (§1.9 "Equivalent
+recipes"): a release changes neither the decide recipe nor, for a format-1
+recipe of the same configuration, what counts as decided. Only a change to
+`step_version`, the prompt, the model or a param (thresholds, `rung0_version`,
+…) starts a re-check.
 
 #### `earmark decide revert` (undo)
 

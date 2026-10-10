@@ -32,9 +32,8 @@ func TestASRRecipe(t *testing.T) {
 	}
 	baseID := id(base)
 	for name, mut := range map[string]func(*ASRProvenance){
-		"model":  func(p *ASRProvenance) { p.ModelName = "nvidia/parakeet-tdt-0.6b-v3" },
-		"sha":    func(p *ASRProvenance) { p.ModelSHA256 = "def" },
-		"runner": func(p *ASRProvenance) { p.RunnerVersion = "v0.42.0" },
+		"model": func(p *ASRProvenance) { p.ModelName = "nvidia/parakeet-tdt-0.6b-v3" },
+		"sha":   func(p *ASRProvenance) { p.ModelSHA256 = "def" },
 		"dtype": func(p *ASRProvenance) {
 			p.Params = map[string]any{"compute_type": "float16", "chunk_window_seconds": 600.0}
 		},
@@ -47,5 +46,12 @@ func TestASRRecipe(t *testing.T) {
 		if id(p) == baseID {
 			t.Errorf("changing %s did not change the recipe ID", name)
 		}
+	}
+	// The runner version is the runner's build stamp: recorded (code_version,
+	// recipe_builds, transcripts.asr_runner_version), never identifying.
+	newRunner := base
+	newRunner.RunnerVersion = "v0.42.0"
+	if id(newRunner) != baseID {
+		t.Error("a runner release alone changed the asr recipe ID")
 	}
 }
