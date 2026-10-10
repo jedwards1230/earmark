@@ -27,7 +27,7 @@ func TestSystemPromptTokenBudget(t *testing.T) {
 func TestParseFindings_ValidJSON(t *testing.T) {
 	raw := `{"findings":[
 		{"original_text":"Doctor Grace","issue_type":"misheard_proper_noun","suggested_correction":"Dr. Grace","confidence":0.91},
-		{"original_text":"nineteen eighty four","issue_type":"number_artifact","suggested_correction":"1984","confidence":0.5}
+		{"original_text":"too forty","issue_type":"number_artifact","suggested_correction":"240","confidence":0.5}
 	]}`
 	got, _, err := parseFindings(raw)
 	if err != nil {
@@ -39,7 +39,7 @@ func TestParseFindings_ValidJSON(t *testing.T) {
 	if got[0].IssueType != issueMisheardProperNoun || got[0].Confidence != 0.91 {
 		t.Errorf("finding[0] mismatch: %+v", got[0])
 	}
-	if got[1].SuggestedCorrection != "1984" {
+	if got[1].SuggestedCorrection != "240" {
 		t.Errorf("finding[1] correction = %q", got[1].SuggestedCorrection)
 	}
 }
@@ -135,33 +135,6 @@ func TestParseFindings_DropsEmptyCorrection(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].OriginalText != "actionable" {
 		t.Fatalf("want only the finding with a correction, got %+v", got)
-	}
-}
-
-func TestNormalizeForCompare(t *testing.T) {
-	// Pairs that should normalize EQUAL (restyling only — caps/punct/hyphen).
-	equal := [][2]string{
-		{"the French", "the french"},
-		{"twenty-six", "twenty six"},
-		{"information its capacity", "information: its capacity"},
-		{"  Padded  Text. ", "padded text"},
-		{"logo graphic", "logographic"}, // a pure split/merge changes no sound (judge@v2)
-	}
-	for _, p := range equal {
-		if a, b := normalizeForCompare(p[0]), normalizeForCompare(p[1]); a != b {
-			t.Errorf("want equal: %q (%q) vs %q (%q)", p[0], a, p[1], b)
-		}
-	}
-	// Pairs that should normalize DIFFERENT (a real word change).
-	diff := [][2]string{
-		{"the the cat", "the cat"}, // duplication
-		{"unit code", "unicode"},   // mis-recognition
-		{"walter brtane", "walter brattain"},
-	}
-	for _, p := range diff {
-		if a, b := normalizeForCompare(p[0]), normalizeForCompare(p[1]); a == b {
-			t.Errorf("want different: %q vs %q both normalized to %q", p[0], p[1], a)
-		}
 	}
 }
 

@@ -3083,36 +3083,37 @@ the judge's over-flagging, in this order:
 
 0. **Pre-filters** (`internal/eval/prefilter.go`, propose `step_version` 2).
    Deterministic checks on the reply and the chunk text the judge saw — no
-   phonetics, no model — dropping findings rung 0 would reject on their shape
-   anyway, so they never become rows (or take a capped slot):
+   model — dropping findings rung 0 would reject anyway, so they never become
+   rows (or take a capped slot):
 
    | Reason | Dropped when |
    |---|---|
    | `empty_span` / `empty_correction` | no `original_text` / no `suggested_correction` (parse time) |
-   | `cosmetic_only` | the two sides are equal once case and every non-letter, non-digit rune (punctuation, hyphens, **spaces**) are removed — rung 0's rule. Before step 2 spaces were kept, so a pure split/merge survived as a row rung 0 then rejected |
+   | `cosmetic_only` | rung 0's own `cosmetic_only` test (parse time): the same words once case, punctuation, hyphens and **spacing** are folded, where every changed hunk reads aloud the same — so a pure split/merge and a same-reading number re-spelling ("nineteen thirty seven" → "1937") are dropped too. Before step 2 spaces were kept, so a split/merge survived as a row rung 0 then rejected |
    | `unsupported_issue_type` | issue type `other` (an unknown value coerced) |
    | `anchor_missing` | `patch.Locate` cannot place `original_text` in the chunk (absent, or repeated with no anchor saying which copy) |
    | `not_word_bounded` | the located span starts or ends between two letters/digits |
-   | `number_format` | a substitution whose changed words are all number words on one side and all digit groups on the other ("nineteen thirty seven" → "1937") |
    | `not_substitution` | a `misheard_*`/`homophone`/`number_artifact` fix with a changed hunk that only inserts or only deletes words ("said dogs" → "he said the dogs") |
-   | `window_too_long` | a changed hunk exceeds 8 words on either side (not `number_artifact`) |
+   | `window_too_long` | a changed hunk exceeds 8 words (not `number_artifact`) or 80 runes on either side, or a side exceeds 256 words |
    | `bad_insertion` | a `dropped_word` fix that is not the original plus 1–2 words |
    | `not_a_removal` | a `repeated_text` fix that is not the original minus some words |
 
    A "hunk" is a maximal changed region of a word edit-distance alignment —
-   the same alignment, copied with its tie-breaks, that rung0@v2 checks a
-   substitution by — so two small mishearings far apart in one span are two
-   short hunks, never one long first-to-last window. Each check rejects a
-   subset of what rung0@v2 rejects, so nothing it could pass is lost — except
-   `number_format` when the two sides do not read aloud the same (a
-   same-reading rewrite rung0@v2 already rejects as `cosmetic_only`), an edit
-   the prompt forbids that rung 0 would otherwise score on sound alone.
-   Against the single-window rung0@v1 the per-hunk `not_substitution` can also
-   drop an insertion relabelled as a substitution that v1 would have scored.
-   The word checks (`not_substitution` … `not_a_removal`) run only when
-   neither side has a digit, because rung 0 reads "1,500" as one numeral
-   token. The thresholds are copies of rung 0's (`MaxSubstitutionTokens`,
-   `MaxInsertedTokens`); `internal/eval` never imports `internal/decide`.
+   the same tokenizer (a numeral such as "1,500" is one token) and alignment,
+   copied with its tie-breaks, that rung0@v2 checks a substitution by — so two
+   small mishearings far apart in one span are two short hunks, never one long
+   first-to-last window. Every filter rejects a subset of what rung0@v2
+   rejects, with no exception: nothing rung 0 could pass is lost.
+   `TestPrefilterNeverStricter` runs rung 0's own passing test vectors through
+   them, including the sound-alike year rewrite rung 0 passes ("nineteen
+   thirty seven" → "1938"), which the prompt forbids but only the model can
+   catch. The checks with a phonetic step in rung 0 (`not_soundalike`,
+   `letter_swap`, `inflection_only`) and the summed `too_many_changes` are not
+   pre-filtered. Against the single-window rung0@v1 the per-hunk
+   `not_substitution` can also drop an insertion relabelled as a substitution
+   that v1 would have scored. The thresholds are copies of rung 0's
+   (`MaxSubstitutionTokens`, `MaxSubstitutionRunes`, `MaxInsertedTokens`,
+   `MaxDiffTokens`); `internal/eval` never imports `internal/decide`.
 1. **Confidence floor.** Findings below `EVAL_MIN_CONFIDENCE` (default **0.6**,
    `<= 0` disables) are dropped. A ground-truth audit found high-confidence
    findings were ~100% real while the low tail was mostly noise, so the floor
@@ -3271,7 +3272,7 @@ labels are only step, recipe, model, fn, outcome, the judge's bounded drop
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
 | `earmark_decisions` | gauge | `outcome` (`apply` · `hold` · `reject`), `issue_type`, `evidence` (`asin_verbatim` · `exact_repeat` · `none`), `recipe` (full decide recipe id) | Findings counted by their **latest unrevoked** decide-recipe `decision` event (§2.17 "Version history", §2.19); findings a requeue superseded excluded. Ingest pod; one aggregate over `finding_events`, refreshed every 5 min. No series until a decision is written. |
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
-| `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `number_format` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |
+| `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |
 | `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 
 **Traces.** Each judge call is one `chat <model>` client span following the

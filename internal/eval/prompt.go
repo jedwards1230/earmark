@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"unicode"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/recipe"
@@ -221,39 +220,21 @@ func parseFindings(raw string) ([]parsedFinding, []Dropped, error) {
 		}
 		// The ASR transcript is all-lowercase and unpunctuated by design, so the
 		// judge tends to "correct" spans purely to add capitalization or
-		// punctuation (or to hyphenate / restyle). Those are not transcription
-		// errors. Drop any finding whose correction is identical to the original
-		// once case and punctuation are normalized away — a genuine word change
-		// (substitution, split/merge, duplication) survives this comparison; a
-		// restyling does not. The prompt also forbids this, but the model ignores
-		// it often enough that a structural guard is warranted.
-		if normalizeForCompare(p.OriginalText) == normalizeForCompare(p.SuggestedCorrection) {
+		// punctuation (or to hyphenate, re-space or re-spell a number). Those
+		// are not transcription errors. Drop any finding rung 0 would refuse as
+		// cosmetic_only — the same words once case, punctuation, hyphens and
+		// spacing are folded, where every changed hunk reads aloud the same
+		// ("nineteen thirty seven" ↔ "1937"). It is rung0@v2's own test,
+		// copied (cosmetic), so this never drops a finding rung 0 could pass.
+		// The prompt also forbids these, but the model ignores it often enough
+		// that a structural guard is warranted.
+		if cosmetic(p.OriginalText, p.SuggestedCorrection) {
 			dropped = append(dropped, dropOf(p, DropCosmeticOnly))
 			continue
 		}
 		out = append(out, p)
 	}
 	return out, dropped, nil
-}
-
-// normalizeForCompare folds a span for a "is this a real word change?" test,
-// exactly as decide's rung 0 does for cosmetic_only: lowercase, and every rune
-// that is not a letter or digit removed — punctuation, hyphens AND spaces. Two
-// spans that differ only in capitalization, punctuation, hyphenation or
-// spacing fold to the same string ("the French" == "the french",
-// "twenty-six" == "twenty six", "logo graphic" == "logographic"); a different
-// word or a duplication does not. Spacing counts as cosmetic since judge@v2 /
-// propose step 2: a pure split or merge changes no sound, and rung 0 rejects
-// it, so it was only ever a row nobody could apply.
-func normalizeForCompare(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range strings.ToLower(s) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }
 
 // clampConfidence forces a confidence into [0,1] so a model that emits 1.2 or a

@@ -162,8 +162,8 @@ type ModelPin struct {
 
 // proposeStepVersion is bumped whenever the judge's own logic (parsing,
 // filtering, capping, anchoring) changes which findings it writes (§1.9).
-// 2: the deterministic pre-filters (prefilter) and spacing-only edits counted
-// as cosmetic.
+// 2: the deterministic pre-filters (prefilter), and cosmetic_only made rung
+// 0's own test (spacing and same-reading number re-spellings count).
 const proposeStepVersion = 2
 
 // NewJudge constructs a Judge backed by the given chat client.
