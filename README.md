@@ -96,6 +96,15 @@ This renders the full status dashboard against synthetic data — no Postgres, n
 
 Run `earmark <command> --help` for the full flag list.
 
+`decide` (incl. `revert`), `scan` and `eval` record each run in the `step_runs` table
+while it runs — wherever it was started (`kubectl exec`, the backfill CronJob). The
+Pipeline and Models pages show them in a **Running now** panel (step, mode, model, recipe,
+a done/total bar, counts, elapsed, ETA, the current phase — e.g. "page 25: asking
+jev-1.13.0"); a run whose heartbeat stopped for over 2 minutes (a killed exec) shows as
+**stale**. Below it, the last 10 runs with their outcome, counts, cost and duration.
+Agents read the same via `GET /api/v1/runs`. Recording never fails the step. See
+CONTRACT §1.10.
+
 ## Using it from an MCP client
 
 Point your client at the server over stdio:
@@ -144,10 +153,11 @@ reversible. Full parameter documentation is in
 | `/mcp` | MCP streamable-HTTP endpoint |
 | `/` | htmx status dashboard — pipeline, library, per-book/track, models, findings |
 | `/api/v1/status` | JSON pipeline status (read-only, unauthenticated) |
+| `/api/v1/runs` | JSON step runs — what `decide`/`scan`/`eval` is running now (progress, phase, stale) and the recent outcomes (read-only, unauthenticated) |
 | `/api/v1/pipeline/pause`, `/api/v1/pipeline/run` | Pause/resume and run-N-then-pause. `PUT`/`POST`/`DELETE` require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed with `503` when it is unset |
 | `/api/v1/openapi.yaml` | OpenAPI 3.1 contract for the JSON control API, embedded in the binary (read-only, unauthenticated) |
 | `/healthz`, `/health` | Liveness |
-| `/metrics` | Prometheus metrics — the pipeline gauges/counters plus the OpenTelemetry instruments (`earmark_build_info`, `earmark_recipe_info`, `earmark_stale_items`, `earmark_model_calls_total`), CONTRACT §2.16 |
+| `/metrics` | Prometheus metrics — the pipeline gauges/counters plus the OpenTelemetry instruments (`earmark_build_info`, `earmark_recipe_info`, `earmark_stale_items`, `earmark_model_calls_total`, `earmark_step_run_active`, `earmark_step_run_progress_ratio`, `earmark_step_run_items_total`, …), CONTRACT §2.16 |
 
 `earmark monitor` serves its own `/healthz` and `/metrics` on `INGEST_HTTP_ADDR` (`:8082`).
 

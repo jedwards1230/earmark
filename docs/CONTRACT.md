@@ -1130,6 +1130,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 7 | `00007_fn_calls.sql` | `fn_calls` — the pure-function call log and cache, with the partial unique cache index `fn_calls_cache_key_idx` and `fn_calls_recipe_id_idx` (§1.9 "Pure-function calls"). New table only. |
 | 8 | `00008_finding_events.sql` | `finding_events` — the append-only finding version history (§2.17 "Version history"): transition triggers on `transcript_findings` (every `patch_state` change, and every insert not in `proposed`), an append-only guard, a backfill of one transition per already-decided finding, and the `decide` arm of `stale_work` (§1.9). No ALTER on `transcript_findings`; `CREATE TRIGGER` blocks its writers until the migration commits (`lock_timeout` 5s). |
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` — per-chunk System One quality scan results, unique per (transcript, chunk index, chunk text sha256, recipe), `ON DELETE CASCADE` with the transcript; the `scan` arm of `stale_work` (§1.9 "Chunk scan"). New table plus a view replacement; no ALTER. Its `stale_work` restates every earlier arm, 8's `decide` arm included. |
+| 10 | `00010_step_runs.sql` | `step_runs` — one row per ad-hoc step run (decide, decide revert, scan, eval) with its live progress and outcome (§1.10), a partial index on the open runs and a `started_at` index for the recent list. New table only; no ALTER, no lock on an existing table. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1533,6 +1534,81 @@ CREATE INDEX chunk_scan_recipe_id_idx ON chunk_scan (recipe_id);
   and weighted by chunk. `scope` is `library` (all), `asin_matched` (the
   chunk's book has a `book_metadata` row with a non-empty `asin`; §1.6 clears
   it on a conflict) or `unmatched`. A scope with no chunks has no series.
+
+### 1.10 Step runs — `step_runs`
+
+The ad-hoc batch steps — `earmark decide` (dry run, `--rung0-only`, `--yes`,
+`revert`), `earmark scan` and `earmark eval` (`--sample`, a book,
+`--backfill-*`) — run from `kubectl exec` or the hourly CronJob, not inside
+the long-running pods. Each run records **one row** in `step_runs` while it
+runs (`internal/runs`), so the dashboard ("Running now", §2.12.1, §2.14), `GET
+/api/v1/runs` (§2.12) and the `earmark_step_run_*` metrics (§2.16) can show
+what is running, what it is waiting on and how far it has got.
+
+```sql
+CREATE TABLE step_runs (
+    id           BIGSERIAL   PRIMARY KEY,
+    step         TEXT        NOT NULL CHECK (step ~ '^[a-z][a-z0-9_]{0,31}$'),
+    mode         TEXT        NOT NULL CHECK (mode IN ('dry_run', 'write')),
+    recipe_id    TEXT,                     -- no FK: a rung-0 replay never registers its recipe
+    model        TEXT,
+    args         TEXT,                     -- a short summary of the flags
+    host         TEXT,                     -- os.Hostname(): the pod name in Kubernetes
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at  TIMESTAMPTZ,              -- NULL iff status = 'running'
+    status       TEXT        NOT NULL DEFAULT 'running'
+                 CHECK (status IN ('running', 'done', 'failed', 'cancelled')),
+    total        BIGINT CHECK (total >= 0), -- NULL = unknown
+    done         BIGINT CHECK (done >= 0),
+    counters     JSONB       NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(counters) = 'object'),
+    cost_usd     FLOAT8 CHECK (cost_usd >= 0),
+    error        TEXT,                     -- the error a failed/cancelled run ended with
+    last_message TEXT                      -- the current phase
+);
+CREATE INDEX step_runs_running_idx    ON step_runs (started_at DESC) WHERE status = 'running';
+CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
+```
+
+| Step | Mode | Total | Counters | Phases |
+|---|---|---|---|---|
+| `decide` | `write` with `--yes`, else `dry_run` | `--yes`: the work list's size (`db.DecideWorkCount`, the very query `DecideWork` pages, 10 s budget) capped by `--limit`; NULL when the count fails. Dry run: the sample size | one per decided finding: `apply`, `hold`, `reject`, `reanchor` (`rung0_pass` with `--rung0-only`), plus `cached`, `errors` (a `jev_unavailable` hold's model error), and with `--yes` `skipped`, `capped` | `sampling findings`, `counting work`, `loading page N`, `page N: loading chunks + rung-0`, `page N: asking jev-1.13.0`, `page N: writing batch i/n` |
+| `decide_revert` | `write` with `--yes` | — (one transaction) | `moved`, `skipped`, `revoked`, `reflagged` | `previewing the undo` / `revoking decisions`, then `done` |
+| `scan` | `write` with `--yes` | `--sample N`; NULL otherwise | `scanned`, `cached`, `fallback`, `errors`, `written` | `selecting chunks`, `asking <model>`, `writing chunk_scan` |
+| `eval_sample` / `eval_book` | `write` with `--write` | `--sample N` / NULL | `evaluated`, `errors`, `findings` | `asking <model>` |
+| `eval_backfill` | `write` with `--write` | NULL (`--limit` counts latched transcripts, not visited ones) | one per visited transcript: `latched`, `failed`, `not_embedded`, `skipped`; plus `chunks`, `chunk_errors`, `findings` | `judging <file> · asking <model>` |
+
+`done` counts finished items; `cost_usd` sums the calls' reported cost
+(cached calls are free).
+
+- **Lifecycle.** Inserted at start (synchronously, so the run is visible at
+  once), heartbeated, closed with `done`, `failed` (any error) or `cancelled`
+  (SIGINT/SIGTERM — recorded even though the run's own context is gone). A
+  heartbeat or close only touches a row still `running`
+  (`UPDATE … WHERE status = 'running'`), so a late write never reopens a
+  closed run.
+- **Throttled, off the hot path.** Progress calls update memory only; one
+  writer goroutine per run writes **at most once every 2 s and at least once
+  every 30 s** (a heartbeat even with nothing new, so a run waiting on a slow
+  model call is not mistaken for a dead one). Each write is one short
+  statement on the pool with a 5 s timeout — **never inside a decide write
+  transaction** — and holds no lock the step's own writes need.
+- **Recording never fails the step.** Every store error is logged (the
+  first, then every 20th) and swallowed; a failed insert is retried on later
+  heartbeats; a row closed by someone else stops the writes. Proved by
+  `TestIntegrationRecordingFailureNeverFailsTheStep` and
+  `TestIntegrationRevertRecordsStepRun` (step_runs dropped mid-test).
+- **Stale is computed at read time.** A process that dies (a killed `kubectl
+  exec`, an OOM, an evicted pod) leaves its row `running` with a heartbeat
+  that stops advancing. Readers call a running row **stale** when
+  `now() − heartbeat_at > 2 min` (`db.StepRunStaleAfter`), comparing the
+  database clock with itself; its elapsed time ends at the last heartbeat.
+  Nothing reaps rows. The active list holds open rows whose heartbeat is
+  under 24 h old (`db.StepRunAbandonAfter`); older ones are listed with the
+  recent runs, still stale.
+- **Reads** are two index-backed `LIMIT` queries (`db.StepRuns`): the open
+  runs newest first (partial index), and the newest other runs.
+- `DEBUG_DB_RESET` drops the table with the rest (§1.8).
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
@@ -2106,7 +2182,8 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 
 | Method | Path | Auth | Body | Result |
 |--------|------|------|------|--------|
-| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed, gateway, gatewayInferred — the AI endpoint registry with **liveness-only** probes, §2.14), a **`roles[]`** array (the Models page role board — see below), an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed), and a **`pipeline`** object (see below) |
+| `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed, gateway, gatewayInferred — the AI endpoint registry with **liveness-only** probes, §2.14), a **`roles[]`** array (the Models page role board — see below), an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed), a **`pipeline`** object (see below), and a **`runs`** object (the `GET /api/v1/runs` body; `null` when its read failed) |
+| `GET` | `/api/v1/runs[?recent=N]` | none | — | `200 {"active":[…],"recent":[…],"staleAfterSeconds":120}` — the ad-hoc step runs (§1.10): `active` = open runs with a heartbeat under 24 h old, newest first; `recent` = the newest N (1–100, default 10) other runs. Each: `id, step, mode, status` (`running`·`stale`·`done`·`failed`·`cancelled`), `stale, recipeId, model, args, host, startedAt, heartbeatAt, finishedAt, total, done, progress` (0..1, null without a total), `elapsedSeconds, etaSeconds` (live runs with a total only), `counters, costUsd, message` (the current phase), `error`. `400` on a bad `recent`. |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
@@ -2214,7 +2291,7 @@ with `503` — the pipeline can never be paused/driven by an unauthenticated
 caller. Read endpoints are always open. This is layered on the LAN-only ingress.
 
 **Machine-readable contract**: `docs/openapi.yaml` (OpenAPI 3.1) specifies the
-seven `/api/v1` operations above and is embedded in the binary, served at
+eight `/api/v1` operations above and is embedded in the binary, served at
 `GET /api/v1/openapi.yaml`. It covers **only** this JSON API — the htmx
 dashboard routes below return HTML fragments and are deliberately out of scope.
 The spec cannot drift: `apiRoutes` (internal/mcp/routes.go) is the single source
@@ -2259,12 +2336,13 @@ LAN-only; only reachable under the HTTP transport.
 | Path | Purpose |
 |------|---------|
 | `GET /` | **Home — the Pipeline ops page** (same as `/pipeline`). The `/` route is a catch-all, so an unmatched path 404s. |
-| `GET /pipeline` | **Pipeline ops page** — the auto-refreshing status fragment (counts, pipeline state, read-only phase badge, pause + run-budget controls) with the **Failed jobs view folded in** as a second region. |
+| `GET /pipeline` | **Pipeline ops page** — the "Running now" runs region on top (`/runs/data`), then the auto-refreshing status fragment (counts, pipeline state, read-only phase badge, pause + run-budget controls) with the **Failed jobs view folded in** as a further region. |
 | `GET /library` | **Library page** (book list with search, status chips, sort + ⚑ has-findings filter). |
 | `GET /library/data` | Library fragment. Query: `status`, `q`, `sort` (`recent`\|`title`\|`progress`\|`findings`), `findings` (`1` → only books with recorded findings), `offset`. Sort + has-findings filter are applied **all-in-Go** over the full filtered set. |
 | `GET /status/data` | Status fragment (htmx-refreshed every 3 s): counts, pipeline state, read-only phase badge, and the token-gated pause + run-budget controls. |
 | `GET /failed/data` | Failed-jobs fragment. **No standalone `/failed` page** — it renders inside `/pipeline`. |
-| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the role board, recipes & stale work, LiteLLM gateway, AI endpoints, judge output, ASR runners. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s and stale counts 5 min, both served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
+| `GET /runs/data` | **Running now + Recent runs** fragment (§1.10), the first region of both `/pipeline` and `/servers`, polled every 3 s (5 s htmx timeout; the read has a 2 s server-side deadline). Each active run is a card (`id="run-<id>"`): step, mode, status, the current phase, a done/total bar (or "N done · total unknown"), model, recipe short id, counts, elapsed and ETA (live runs with a total), spend, host and args. A stale run (heartbeat > 2 min) shows amber, "⚠ stale", with its last heartbeat and no ETA. "Recent runs" lists the newest 10 others: outcome, counts, cost, duration, start. A failed or slow read renders `200` "run status unavailable" — never the page's connection-lost banner. |
+| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the "Running now" runs region (`/runs/data`) on top, then the role board, recipes & stale work, LiteLLM gateway, AI endpoints, judge output, ASR runners. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s, queue stats 15 s and stale counts 5 min, all served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
 | `GET /findings` · `/findings/data` | Findings page + fragment (§2.15). |
 | `GET /book` · `/book/data` | Per-book detail page + fragment. |
 | `GET /track?id=…[&t=<startSec>]` | Per-track detail page. The optional **`t`** (seconds) is the finding "Where" deep-jump: the reader preloads pages `[0 .. the page containing the segment spanning t]`, marks that segment active, and scrolls to it. |
@@ -2537,6 +2615,8 @@ Models/Services page — the URL stays `/servers`) is a **role board**:
 observability only, earmark does **not** route work between endpoints. Top to
 bottom:
 
+0. **Running now / Recent runs** — the step-runs region (§1.10, `/runs/data`,
+   §2.12.1), polled on its own every 3 s, shared with the Pipeline page.
 1. **Roles** — one card per configured pipeline role, in fixed order; roles
    in state `not_configured` are not cards but one muted "○ Not configured:"
    line under them, each with the reason (Decide also with its decided
@@ -2545,7 +2625,13 @@ bottom:
    §2.18; the row is omitted when unpinned), *answered* (what the endpoint
    reported serving the call) with `✓ matches pin` or `≠ expected <x>`, last
    ok / last fail ("no failures" when none), and the step's stale count
-   linking to its recipe row. A role behind a gateway carries a "via LiteLLM"
+   linking to its recipe row. While a run of the role's step is open (§1.10;
+   Decide: `decide`/`decide_revert`, Scan: `scan`, Judge: `eval_*`) the card
+   leads with a *running* row linking to its card in the runs panel
+   (`#run-<id>`: "decide (write) · 12,400 / 29,000 · page 25: asking
+   jev-1.13.0"; a live run wins over a stale one, which is marked "· stale").
+   That read has a 1 s deadline and is best-effort: a failure only drops the
+   row. A role behind a gateway carries a "via LiteLLM"
    badge in its header. The LiteLLM key allowlist verdict is not a card row:
    a denied model shows as the health line or, when another state outranks
    it, a red "✗ <model> is not on earmark's LiteLLM key allowlist" line.
@@ -2696,6 +2782,7 @@ as that refresh's error.
 |---|---|---|---|
 | Aggregates: model activity, current recipes, judge findings by decider, ASR provenance, decide/scan `fn_calls` evidence (last, best-effort) | 30 s | 3 s | "counts as of" |
 | Per-step `stale_work` counts (a full scan of chunks + findings, ≈1.6 s at production size) | 5 min | 30 s | "stale counts as of"; "loading…" for at most 1.5 s on the first load, then shown when ready |
+| Queue stats (`GetServiceStatus`: coverage, embed backlog, chunk total and last embed — a full count of `transcript_chunks` — and the runner version). The **page only**: the Pipeline page and `GET /api/v1/status` read them live, and the runner-update POST re-renders with live stats | 15 s | 30 s | — ("—" in the cards for at most 2 s on the first load) |
 | LiteLLM gateway readiness + key info | 60 s | 2 s per request (≤ 3 requests) | — |
 
 A slow or failed stale count marks only the stale numbers unavailable; with no
@@ -3261,8 +3348,8 @@ The Prometheus exporter emits no `target_info` and no `otel_scope_*` labels:
 the series below are the whole addition to `/metrics`.
 
 OpenTelemetry instruments (Prometheus names; the cardinality rule holds —
-labels are only step, recipe, model, fn, outcome, the judge's bounded drop
-`reason` and the three-value quality scope (`library` · `asin_matched` ·
+labels are only step, recipe, model, fn, outcome, the step-run `mode`, the
+judge's bounded drop `reason` and the three-value quality scope (`library` · `asin_matched` ·
 `unmatched`); book, ASIN and chunk ids go on spans and logs, never labels):
 
 | Metric | Type | Labels | Meaning |
@@ -3272,6 +3359,9 @@ labels are only step, recipe, model, fn, outcome, the judge's bounded drop
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
 | `earmark_decisions` | gauge | `outcome` (`apply` · `hold` · `reject`), `issue_type`, `evidence` (`asin_verbatim` · `exact_repeat` · `none`), `recipe` (full decide recipe id) | Findings counted by their **latest unrevoked** decide-recipe `decision` event (§2.17 "Version history", §2.19); findings a requeue superseded excluded. Ingest pod; one aggregate over `finding_events`, refreshed every 5 min. No series until a decision is written. |
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
+| `earmark_step_run_active` | gauge | `step` (`decide` · `decide_revert` · `scan` · `eval_sample` · `eval_book` · `eval_backfill`), `mode` (`dry_run` · `write`) | Step runs (§1.10) open with a live heartbeat (≤ 2 min old); a stale run is not counted. Ingest pod; read from `step_runs` every 15 s. No series while nothing runs. |
+| `earmark_step_run_progress_ratio` | gauge | `step` | `done / total` (0..1) of the step's newest live run that knows its total. No series without one. Ingest pod, every 15 s. |
+| `earmark_step_run_items_total` | counter | `step`, `outcome` (the run counters of §1.10: `apply`, `hold`, `reject`, `reanchor`, `cached`, `errors`, `scanned`, `written`, `evaluated`, `latched`, …) | Every counter summed over every recorded run in `step_runs` (an observable counter read from the table, so it survives pod restarts). Ingest pod, every 15 s. **No run id is ever a label.** |
 | `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |
 | `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 
@@ -4376,6 +4466,12 @@ in scope and writes the decisions (`decide.Apply`). `--sample`, `--seed` and
 - **Report**: the dry run's sections plus what was written — accepted,
   rejected, held, re-check kept / held for review / reverted, skipped,
   re-anchor needed, over `--max-accepts` — and the undo command.
+- **Live progress** (§1.10): the run's `step_runs` row carries the work-list
+  size as its total (capped by `--limit`), one tick per decided finding with
+  its outcome, the spend, and the phase — which page, and whether it is
+  asking the model or writing batch i/n. Progress is written by its own
+  goroutine on its own pooled connection, never inside a batch transaction. Watch it on the Pipeline or Models
+  page, or `GET /api/v1/runs`.
 - No GPU phase gate (System One is hosted).
 
 #### Re-check under a new decide recipe
