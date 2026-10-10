@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -129,19 +130,40 @@ func ParseModelRegistry(r io.Reader) (*ModelRegistry, error) {
 			strings.Join(unknown, ", "), strings.Join(recipe.Steps, ", "))
 	}
 	for step, pin := range reg.Steps {
-		for k, v := range pin.Params {
-			if k != ParamUSDPerMTokIn {
-				// A misspelt key must not silently fall back to a default.
-				return nil, fmt.Errorf("model registry: steps.%s.params: unknown key %q (known: %s)",
-					step, k, ParamUSDPerMTokIn)
-			}
-			if f, ok := toFloat(v); !ok || f < 0 {
-				return nil, fmt.Errorf("model registry: steps.%s.params.%s must be a non-negative number, got %v",
-					step, k, v)
-			}
+		if err := validatePinParams(pin.Params); err != nil {
+			return nil, fmt.Errorf("model registry: steps.%s.params%w", step, err)
 		}
 	}
 	return &reg, nil
+}
+
+// pinParamError is a params validation failure. Its message starts with the
+// key path suffix (": unknown key …" or ".<key> must be …") so callers can
+// prefix the location ("steps.decide.params", "--param").
+type pinParamError struct{ msg string }
+
+func (e *pinParamError) Error() string { return e.msg }
+
+// validatePinParams accepts only the known pin params (usd_per_mtok_in, a
+// non-negative number). Shared by MODELS_FILE and the runtime model settings
+// (CONTRACT §2.20) so both refuse the same input.
+func validatePinParams(params map[string]any) error {
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := params[k]
+		if k != ParamUSDPerMTokIn {
+			// A misspelt key must not silently fall back to a default.
+			return &pinParamError{fmt.Sprintf(": unknown key %q (known: %s)", k, ParamUSDPerMTokIn)}
+		}
+		if f, ok := toFloat(v); !ok || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return &pinParamError{fmt.Sprintf(".%s must be a non-negative number, got %v", k, v)}
+		}
+	}
+	return nil
 }
 
 // loadModelRegistry reads MODELS_FILE into c.Models and checks every pinned

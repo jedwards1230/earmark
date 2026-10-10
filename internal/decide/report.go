@@ -123,7 +123,7 @@ func classOf(o Outcome) string {
 
 func buildReport(o RunOptions, recipeID string, items []*item, backlog map[string]int) *Report {
 	rep := &Report{
-		DryRun: true, Calibrate: o.Scope.Calibrate, Rung0Only: o.Rung0Only, RecipeID: recipeID, Model: ShouldApplyModel,
+		DryRun: true, Calibrate: o.Scope.Calibrate, Rung0Only: o.Rung0Only, RecipeID: recipeID, Model: o.Model.orDefault().Alias,
 		Seed: o.Scope.Seed, Requested: o.Scope.Sample, Findings: len(items),
 		Outcomes: map[string]int{}, Reasons: map[string]int{}, Rung0Rejects: map[string]int{},
 		Reanchor: map[string]int{}, PHistogram: make([]int, pBuckets),

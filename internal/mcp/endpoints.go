@@ -70,6 +70,9 @@ type endpointView struct {
 	// FromEnv marks the synthetic EVAL_CHAT_* row: a judge configured outside
 	// the registry, never probed (its key is not held by the registry).
 	FromEnv bool
+	// BaseID is set on an endpoint a runtime model setting synthesized
+	// (CONTRACT §2.20): the registered endpoint it asks for another model.
+	BaseID string
 
 	State  endpointStateMeta
 	Probed bool
@@ -134,6 +137,7 @@ func buildEndpointViews(cfg *config.Config, probes map[string]endpointProbe) []e
 			BaseURL:         ep.BaseURL,
 			HostOnly:        hostOnly(ep.BaseURL),
 			Role:            cfg.RoleForEndpoint(ep.ID),
+			BaseID:          ep.BaseID,
 			Options:         sortedOptions(ep.Options),
 			State:           meta,
 			Probed:          probe.Probed,
@@ -157,11 +161,18 @@ func probeStateToken(p endpointProbe) endpointProbeState {
 // Returns nil when no prober is wired (the views then render UNKNOWN). The
 // prober caches per baseURL, so calling this on both render paths is cheap.
 func (s *MCPServer) probeEndpoints(ctx context.Context) map[string]endpointProbe {
-	if s.endpointProber == nil || s.cfg == nil {
+	return s.probeEndpointsFor(ctx, s.cfg)
+}
+
+// probeEndpointsFor probes cfg's endpoints — the effective config, whose
+// endpoints include any a runtime model setting synthesized (CONTRACT §2.20),
+// so the probe checks the model actually requested.
+func (s *MCPServer) probeEndpointsFor(ctx context.Context, cfg *config.Config) map[string]endpointProbe {
+	if s.endpointProber == nil || cfg == nil {
 		return nil
 	}
-	out := make(map[string]endpointProbe, len(s.cfg.AIEndpoints))
-	for _, ep := range s.cfg.AIEndpoints {
+	out := make(map[string]endpointProbe, len(cfg.AIEndpoints))
+	for _, ep := range cfg.AIEndpoints {
 		out[ep.ID] = s.endpointProber.Probe(ctx, probeBase(ep), ep.Model, ep.APIKey)
 	}
 	if len(out) == 0 {

@@ -216,6 +216,25 @@ type roleCard struct {
 	// HasModel is false for roles with no model binding yet (format): its
 	// card shows only the stale row.
 	HasModel bool
+	// ModelSource is where the step's model comes from (CONTRACT §2.20):
+	// "db" (a model_settings row), "env", "unset", or "unknown" when the
+	// settings could not be read; "" for roles with no runtime setting (ASR).
+	ModelSource string
+	// SettingBy / SettingAt are the model_settings row's updated_by /
+	// updated_at (zero without a row).
+	SettingBy string
+	SettingAt time.Time
+	// SearchEmbedError (Embeddings only) is why search did not switch to the
+	// effective embed model (CONTRACT §2.20); "" when it did.
+	SearchEmbedError string
+	// EndpointLabel names the registered endpoint when EndpointID is one a
+	// runtime setting synthesized ("litellm-judge" for
+	// "litellm-judge@propose"); "" = EndpointID.
+	EndpointLabel string
+	// SettingError is set when the step's model_settings row is invalid
+	// against this deployment's AI_ENDPOINTS: the card is FAILING and shows
+	// the row, not the env model.
+	SettingError string
 }
 
 // IsFnRole reports whether the role runs through internal/fn (decide, scan):
@@ -278,6 +297,9 @@ type roleInputs struct {
 	// Phase is the coordinator's pipeline phase ("" when unknown). In the
 	// batch analyze phase the asr-runner is parked on purpose.
 	Phase string
+	// Settings are the runtime model settings (CONTRACT §2.20); Cfg is
+	// already the effective config they produce.
+	Settings effectiveModels
 }
 
 // buildRoleCards builds the six role cards in their fixed order.
@@ -302,6 +324,7 @@ func buildRoleCards(in roleInputs) []roleCard {
 		default:
 			c.Health = health(roleNotConfigured, "no model role for this step yet")
 		}
+		applySettingState(&c, in.Settings)
 		cards = append(cards, c)
 	}
 	return cards
@@ -394,6 +417,9 @@ func buildJudgeCard(c *roleCard, in roleInputs) {
 	probe := "" // "" = not probed (env-sourced judge, or none)
 	host := in.Judge.Host
 	if ep, ok := evalEndpoint(in.Cfg); ok {
+		// A registry judge — the env binding or a propose model setting
+		// (CONTRACT §2.20) — is configured even with no env judge at startup.
+		c.Configured = true
 		c.EndpointID, c.Requested = ep.ID, ep.Model
 		if v := findEndpointView(in.Endpoints, ep.ID); v != nil {
 			probe, host = v.StateToken, v.HostOnly

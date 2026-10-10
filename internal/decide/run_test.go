@@ -325,11 +325,55 @@ func TestClientFromConfig(t *testing.T) {
 	if _, ok, err := ClientFromConfig(&config.Config{}); ok || err != nil {
 		t.Errorf("unbound role: ok=%v err=%v", ok, err)
 	}
-	if _, ok, err := ClientFromConfig(ep("jev-1.12.0")); !ok || err == nil {
-		t.Errorf("wrong model accepted: ok=%v err=%v", ok, err)
+	// Another pinned model is another recipe, not an error (CONTRACT §2.20).
+	if c, ok, err := ClientFromConfig(ep("clef-1.0.0")); !ok || err != nil || c == nil {
+		t.Errorf("another pinned model refused: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := ClientFromConfig(ep("jev-latest")); !ok || err == nil {
+		t.Errorf("moving alias accepted: ok=%v err=%v", ok, err)
 	}
 	if c, ok, err := ClientFromConfig(ep("typesafe/jev-1.13.0")); !ok || err != nil || c == nil {
 		t.Errorf("pinned model refused: ok=%v err=%v", ok, err)
+	}
+}
+
+// ModelFromConfig: the built-in model keeps its exact recipe (a provider
+// prefix is tolerated, as before), another model and a pin are new recipes.
+func TestModelFromConfig(t *testing.T) {
+	cfg := func(model string, pin config.ModelPin) *config.Config {
+		return &config.Config{
+			AIEndpoints: []config.AIEndpoint{{ID: "jev", Type: config.AIEndpointTypeSystemOne, BaseURL: "http://gw:4000/typesafe", Model: model}},
+			AIRoles:     &config.AIRoles{Decide: "jev"},
+			Models:      &config.ModelRegistry{Steps: map[string]config.ModelPin{"decide": pin}},
+		}
+	}
+	if _, ok := ModelFromConfig(&config.Config{}); ok {
+		t.Error("unbound role resolved a model")
+	}
+	base, _ := ShouldApplyFn(DefaultShouldApplyParams())
+	baseID, _ := base.Recipe("").ID()
+	id := func(c *config.Config) string {
+		m, ok := ModelFromConfig(c)
+		if !ok {
+			t.Fatal("bound role resolved no model")
+		}
+		f, err := ShouldApplyFnFor(DefaultShouldApplyParams(), m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, _ := f.Recipe("").ID()
+		return r
+	}
+	if got := id(cfg("jev-1.13.0", config.ModelPin{})); got != baseID {
+		t.Errorf("built-in model changed the recipe: %s != %s", got, baseID)
+	}
+	if got := id(cfg("typesafe/jev-1.13.0", config.ModelPin{})); got != baseID {
+		t.Errorf("provider-prefixed built-in model changed the recipe: %s != %s", got, baseID)
+	}
+	clef := id(cfg("clef-1.0.0", config.ModelPin{}))
+	pinned := id(cfg("clef-1.0.0", config.ModelPin{ExpectedModel: "typesafe/clef-1.0.0"}))
+	if clef == baseID || pinned == baseID || pinned == clef {
+		t.Errorf("model and pin must each mint a recipe: base %s clef %s pinned %s", baseID, clef, pinned)
 	}
 }
 

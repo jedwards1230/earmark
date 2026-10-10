@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/openai"
@@ -127,8 +129,103 @@ func (db *DB) SetCurrentRecipes(ctx context.Context, rs ...recipe.Recipe) error 
 const embedStepVersion = 1
 
 // EmbedRecipe is the recipe every chunk this process writes is stamped with.
+// It follows the effective embeddings endpoint (ApplyEmbedConfig).
 func (db *DB) EmbedRecipe() recipe.Recipe {
-	return embedRecipe(db.cfg, db.e.DocumentPrefix())
+	db.embedMu.RLock()
+	defer db.embedMu.RUnlock()
+	cfg := db.embedCfg
+	if cfg == nil {
+		cfg = db.cfg
+	}
+	return embedRecipe(cfg, db.e.DocumentPrefix())
+}
+
+// currentEmbedRecipe is the recipe InsertChunks stamps now.
+func (db *DB) currentEmbedRecipe() recipe.Recipe {
+	db.embedMu.RLock()
+	defer db.embedMu.RUnlock()
+	return db.embedRecipe
+}
+
+// embedder is the embeddings client in effect now.
+func (db *DB) embedder() *openai.Embeddings {
+	db.embedMu.RLock()
+	defer db.embedMu.RUnlock()
+	return db.e
+}
+
+// embedConfigKey identifies everything about the embed step a runtime setting
+// can change: the endpoint (URL, key, model) and the embed pin.
+func embedConfigKey(cfg *config.Config) string {
+	ep, _ := cfg.EmbeddingsEndpoint()
+	pin := cfg.ModelPin(recipe.StepEmbed)
+	return strings.Join([]string{ep.ID, ep.BaseURL, ep.Model, ep.APIKey, pin.ExpectedModel, pin.Revision}, "\x00")
+}
+
+// embedProbeTimeout bounds the dimension probe of a new embeddings model.
+const embedProbeTimeout = 15 * time.Second
+
+// ApplyEmbedConfig points the embeddings client and the embed recipe at
+// cfg's embeddings endpoint and pin — the effective config after runtime
+// model settings (CONTRACT §2.20) — and reports whether anything changed.
+// A new embedder is first probed (embedProbe: one query, which must return
+// vector(768) values); a probe failure keeps the current embedder and
+// returns the error, so neither search nor the worker ever switches to a
+// model the vector column cannot hold. The worker calls it once per cycle,
+// before it embeds, so one batch never mixes two embed models; search
+// processes call it on a short timer so the query side follows the setting.
+func (db *DB) ApplyEmbedConfig(cfg *config.Config) (bool, error) {
+	key := embedConfigKey(cfg)
+	db.embedMu.RLock()
+	same := key == db.embedKey && db.e != nil
+	db.embedMu.RUnlock()
+	if same {
+		return false, nil
+	}
+	e := openai.NewEmbeddings(cfg)
+	if db.embedProbe != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), embedProbeTimeout)
+		err := db.embedProbe(ctx, e)
+		cancel()
+		if err != nil {
+			db.setEmbedSettingErr(err.Error())
+			return false, err
+		}
+	}
+	db.embedMu.Lock()
+	defer db.embedMu.Unlock()
+	db.e, db.embedCfg, db.embedKey = e, cfg, key
+	db.embedRecipe = embedRecipe(cfg, e.DocumentPrefix())
+	db.embedErr = ""
+	return true, nil
+}
+
+// probeEmbedDimension is the default embedProbe.
+func probeEmbedDimension(ctx context.Context, e *openai.Embeddings) error {
+	return e.CheckDimension(ctx)
+}
+
+func (db *DB) setEmbedSettingErr(msg string) {
+	db.embedMu.Lock()
+	defer db.embedMu.Unlock()
+	db.embedErr = msg
+}
+
+// EmbedSettingError is why this process's embedder is not on the effective
+// embed setting ("" when it is): the last refused swap (a failed dimension
+// probe) or invalid embed row seen by WatchEmbedSettings. Shown on the
+// Models page.
+func (db *DB) EmbedSettingError() string {
+	db.embedMu.RLock()
+	defer db.embedMu.RUnlock()
+	return db.embedErr
+}
+
+// EmbedRecipeFor is the embed recipe cfg's embeddings endpoint would stamp —
+// for deciding the current embed recipe of an effective config (CONTRACT
+// §2.20) without swapping this process's embedder.
+func EmbedRecipeFor(cfg *config.Config) recipe.Recipe {
+	return embedRecipe(cfg, openai.NewEmbeddings(cfg).DocumentPrefix())
 }
 
 // embedRecipe builds the embed recipe: the embeddings endpoint's model (what we

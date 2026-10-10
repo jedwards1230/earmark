@@ -58,6 +58,8 @@ type ApplyOptions struct {
 	Params      ShouldApplyParams
 	// Progress, when set, records the run's live progress (CONTRACT §1.10).
 	Progress *runs.Run
+	// Model is the decision model asked (zero = DefaultModel).
+	Model Model
 }
 
 // WriteStats counts what a --yes run wrote.
@@ -89,7 +91,8 @@ func CurrentRecipe(cfg *config.Config) (recipe.Recipe, bool, error) {
 	if _, ok, err := ClientFromConfig(cfg); !ok || err != nil {
 		return recipe.Recipe{}, ok, err
 	}
-	f, err := ShouldApplyFn(DefaultShouldApplyParams())
+	m, _ := ModelFromConfig(cfg)
+	f, err := ShouldApplyFnFor(DefaultShouldApplyParams(), m)
 	if err != nil {
 		return recipe.Recipe{}, true, err
 	}
@@ -114,7 +117,7 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 	if batch == 0 {
 		batch = DefaultWriteBatch
 	}
-	ev, err := NewEvaluator(store, asker, o.Params)
+	ev, err := NewEvaluatorFor(store, asker, o.Params, o.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +126,7 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		return nil, fmt.Errorf("register decide recipe: %w", err)
 	}
 	rec := o.Progress
-	rec.SetRecipe(recipeID, ShouldApplyModel)
+	rec.SetRecipe(recipeID, ev.Model())
 
 	ws := &WriteStats{}
 	var all []*item
@@ -163,7 +166,7 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		if err != nil {
 			return nil, err
 		}
-		rec.Phase(fmt.Sprintf("page %d: %s", page, askingPhase))
+		rec.Phase(fmt.Sprintf("page %d: %s", page, askingPhase(o.Model)))
 		evaluateAll(ctx, ev, items, o.Concurrency, rec)
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -180,7 +183,7 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		all = append(all, items...)
 	}
 
-	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: o.Limit}}, recipeID, all, nil)
+	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: o.Limit}, Model: o.Model}, recipeID, all, nil)
 	rep.DryRun = false
 	rep.Write = ws
 	return rep, nil

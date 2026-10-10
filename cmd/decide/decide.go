@@ -24,6 +24,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	decidepkg "github.com/jedwards1230/earmark/internal/decide"
+	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/runs"
 	"github.com/jedwards1230/earmark/internal/telemetry"
 )
@@ -46,6 +47,12 @@ type options struct {
 	shard      string // "i/N"
 	batch      int
 	maxAccepts int
+	// --endpoint / --model: the decide step's model for this run only
+	// (CONTRACT §2.20).
+	overrideEndpoint string
+	overrideModel    string
+	// model is the resolved decision model (not a flag; zero = default).
+	model decidepkg.Model
 }
 
 var opts options
@@ -64,8 +71,14 @@ the sample's rates onto every finding in scope.
 It is a dry run: nothing is decided. No finding_events are written and no
 finding changes state. The model calls are real (and paid for), and are logged
 and cached in fn_calls, so a later full run over the same findings is served
-from the cache. Requires AI_ROLES.decide bound to a systemone endpoint asking
-for the pinned model (CONTRACT §2.14).
+from the cache. Requires AI_ROLES.decide bound to a systemone endpoint
+(CONTRACT §2.14), or a model_settings row for the decide step.
+
+Model: should_apply asks the decide step's effective model (CONTRACT §2.20):
+--endpoint/--model for this run, else the model_settings row ('earmark
+models set decide ...'), else AI_ROLES.decide. Any pinned System One model
+works; a different model is a different decide recipe, so its decisions are
+never confused with another model's. Neither flag writes model_settings.
 
 --calibrate samples findings a person already decided through the review
 surface (accepted/applied vs rejected) instead, and reports how often the
@@ -108,7 +121,8 @@ Examples:
   earmark decide --yes --limit 2000 --max-accepts 500
   earmark decide --yes --shard 0/4               # one of four parallel runners
   earmark decide revert --recipe <id>            # preview the undo
-  earmark decide revert --recipe <id> --yes`,
+  earmark decide revert --recipe <id> --yes
+  earmark decide --sample 200 --seed q4 --endpoint litellm-s1 --model clef:27b`,
 	Run: runDecide,
 }
 
@@ -129,6 +143,8 @@ func init() {
 	f.StringVar(&opts.shard, "shard", "", "with --yes: i/N — only transcripts with hashtext(transcript_id) mod N = i")
 	f.IntVar(&opts.batch, "batch", decidepkg.DefaultWriteBatch, "with --yes: transcripts per write transaction")
 	f.IntVar(&opts.maxAccepts, "max-accepts", 0, "with --yes: stop after N accepts (bounds the re-embed; 0 = no cap)")
+	f.StringVar(&opts.overrideEndpoint, "endpoint", "", "this run only: the AI_ENDPOINTS id (a systemone endpoint) to ask (default: the decide step's effective endpoint)")
+	f.StringVar(&opts.overrideModel, "model", "", "this run only: the pinned System One model id to ask (default: the decide step's effective model)")
 	DecideCmd.AddCommand(RevertCmd)
 }
 
@@ -190,12 +206,29 @@ func runDecide(cmd *cobra.Command, _ []string) {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	database, err := db.New(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
+		os.Exit(1)
+	}
+	defer database.Close()
+	// The decide step's effective model (CONTRACT §2.20): --endpoint/--model,
+	// else its model_settings row, else AI_ROLES.decide. An invalid row fails
+	// the run (even a rung-0 replay, whose recipe id names the model).
+	cfg, err = db.ResolveStep(context.Background(), database, cfg, recipe.StepDecide,
+		opts.overrideEndpoint, opts.overrideModel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	log.Print(cfg.DescribeStep(recipe.StepDecide))
+	opts.model, _ = decidepkg.ModelFromConfig(cfg)
 	// A rung-0 replay asks no model, so it needs no decide endpoint.
 	var asker decidepkg.Asker
 	if !opts.rung0Only {
 		client, ok, err := decidepkg.ClientFromConfig(cfg)
 		if !ok {
-			fmt.Fprintln(os.Stderr, "Error: earmark decide needs AI_ROLES.decide bound to a systemone endpoint in AI_ENDPOINTS (CONTRACT §2.14)")
+			fmt.Fprintln(os.Stderr, "Error: earmark decide needs AI_ROLES.decide bound to a systemone endpoint in AI_ENDPOINTS (CONTRACT §2.14), or a decide model setting (earmark models set decide)")
 			os.Exit(2)
 		}
 		if err != nil {
@@ -204,12 +237,6 @@ func runDecide(cmd *cobra.Command, _ []string) {
 		}
 		asker = client
 	}
-	database, err := db.New(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
-		os.Exit(1)
-	}
-	defer database.Close()
 
 	tel, terr := telemetry.Setup(context.Background())
 	if terr != nil {
@@ -240,7 +267,7 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 		mode = db.StepRunWrite
 	}
 	rec := runs.StartIfStore(ctx, store, runs.Spec{
-		Step: runs.StepDecide, Mode: mode, Model: decidepkg.ShouldApplyModel, Args: argsSummary(o),
+		Step: runs.StepDecide, Mode: mode, Model: modelOrDefault(o.model), Args: argsSummary(o),
 	})
 	defer func() { rec.Finish(err) }()
 	var rep *decidepkg.Report
@@ -250,7 +277,7 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 			Book: o.book, IssueType: o.issueType, Shard: shard, Shards: shards,
 			Limit: o.limit, Batch: o.batch, MaxAccepts: o.maxAccepts,
 			Concurrency: o.concurrency, Params: decidepkg.DefaultShouldApplyParams(),
-			Progress: rec,
+			Progress: rec, Model: o.model,
 		})
 	} else {
 		ro := decidepkg.RunOptions{
@@ -262,6 +289,7 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 			Params:      decidepkg.DefaultShouldApplyParams(),
 			Rung0Only:   o.rung0Only,
 			Progress:    rec,
+			Model:       o.model,
 		}
 		rep, err = dryRun(ctx, store, asker, ro, o.dump)
 	}
@@ -269,6 +297,14 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 		return err
 	}
 	return rep.Print(out, o.json)
+}
+
+// modelOrDefault names the model a run asks.
+func modelOrDefault(m decidepkg.Model) string {
+	if m.Alias == "" {
+		return decidepkg.ShouldApplyModel
+	}
+	return m.Alias
 }
 
 // argsSummary is the step_runs.args line: the flags that shape the run.
@@ -305,6 +341,12 @@ func argsSummary(o options) string {
 	}
 	if o.issueType != "" {
 		add("--issue-type %s", o.issueType)
+	}
+	if o.overrideEndpoint != "" {
+		add("--endpoint %s", o.overrideEndpoint)
+	}
+	if o.overrideModel != "" {
+		add("--model %s", o.overrideModel)
 	}
 	return b.String()
 }

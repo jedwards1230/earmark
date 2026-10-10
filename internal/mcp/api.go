@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -143,6 +144,13 @@ type apiRole struct {
 	CountsAsOf      *string `json:"countsAsOf"`
 	CountsError     bool    `json:"countsError"`
 	StaleAsOf       *string `json:"staleAsOf"`
+	// Runtime model settings (§2.20): modelSource db|env|unset|unknown
+	// (omitted for roles without one), the db row's who/when, and the error
+	// of a row invalid against this deployment's AI_ENDPOINTS.
+	ModelSource      string  `json:"modelSource,omitempty"`
+	SettingUpdatedBy string  `json:"settingUpdatedBy,omitempty"`
+	SettingUpdatedAt *string `json:"settingUpdatedAt,omitempty"`
+	SettingError     *string `json:"settingError,omitempty"`
 }
 
 // apiGateway is one LiteLLM gateway as seen through earmark's virtual key
@@ -211,12 +219,17 @@ func apiRolesFrom(cards []roleCard, ev modelsEvidence) []apiRole {
 	for _, c := range cards {
 		r := apiRole{
 			Role: c.Key, Step: c.Step, State: c.Health.Token, Reason: c.Health.Sub,
-			Configured: c.Configured, Endpoint: c.EndpointID,
+			Configured: c.Configured, Endpoint: cmp.Or(c.EndpointLabel, c.EndpointID),
 			Gateway: c.Gateway, GatewayInferred: c.GatewayInferred,
 			Requested: c.Requested, Expected: c.Expected,
 			Answered: c.Answered, AnsweredMatch: c.AnsweredMatch, ModelAllowed: c.ModelAllowed,
 			LastOKAt: rfc3339Ptr(c.LastOK), LastFailedAt: rfc3339Ptr(c.LastFail),
 			Stale: c.Stale, CountsAsOf: asOf, CountsError: ev.SnapErr != nil, StaleAsOf: staleAsOf,
+		}
+		r.ModelSource, r.SettingUpdatedBy, r.SettingUpdatedAt = c.ModelSource, c.SettingBy, rfc3339Ptr(c.SettingAt)
+		if msg := cmp.Or(c.SettingError, c.SearchEmbedError); msg != "" {
+			e := truncateRunes(msg, maxAPIErrorLen)
+			r.SettingError = &e
 		}
 		if c.Key == "judge" && c.CountsKnown {
 			n := c.FailingNow
@@ -520,13 +533,15 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 
 	// AI endpoint registry (CONTRACT §2.14), merged with liveness probes. Options
 	// are emitted from the raw registry (the view drops the map for rendering).
+	// The effective config: env plus the runtime model settings (§2.20).
+	em := s.effectiveModels(r.Context())
 	optsByID := map[string]map[string]string{}
-	if s.cfg != nil {
-		for _, ep := range s.cfg.AIEndpoints {
+	if em.Cfg != nil {
+		for _, ep := range em.Cfg.AIEndpoints {
 			optsByID[ep.ID] = ep.Options
 		}
 	}
-	eps := buildEndpointViews(s.cfg, s.probeEndpoints(r.Context()))
+	eps := buildEndpointViews(em.Cfg, s.probeEndpointsFor(r.Context(), em.Cfg))
 	for _, v := range eps {
 		out.Endpoints = append(out.Endpoints, apiEndpoint{
 			ID:              v.ID,
@@ -545,9 +560,9 @@ func (s *MCPServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Role board (CONTRACT §2.14): the same builder and 30 s snapshot as the
 	// Models page. A snapshot error degrades counts to null, never the response.
-	gws, targets, gwByEndpoint := s.probeGateways(r.Context())
+	gws, targets, gwByEndpoint := s.probeGatewaysFor(r.Context(), em.Cfg)
 	out.Gateways = apiGatewaysFrom(gws, targets)
-	roles, ev := s.modelRoles(r.Context(), stats, runners, runnersKnown, eps, gwByEndpoint, now)
+	roles, ev := s.modelRoles(r.Context(), em, stats, runners, runnersKnown, eps, gwByEndpoint, now)
 	out.Roles = apiRolesFrom(roles, ev)
 
 	// Step runs (CONTRACT §1.10): best-effort, under their own deadline.

@@ -292,10 +292,16 @@ func gatewayTargets(cfg *config.Config) []gatewayTarget {
 // probeGateways probes every distinct LiteLLM gateway and returns the statuses
 // in registry order plus a map from endpoint id to its gateway's status.
 func (s *MCPServer) probeGateways(ctx context.Context) ([]gatewayStatus, []gatewayTarget, map[string]gatewayStatus) {
+	return s.probeGatewaysFor(ctx, s.cfg)
+}
+
+// probeGatewaysFor probes the gateways behind cfg's endpoints (the effective
+// config, CONTRACT §2.20).
+func (s *MCPServer) probeGatewaysFor(ctx context.Context, cfg *config.Config) ([]gatewayStatus, []gatewayTarget, map[string]gatewayStatus) {
 	if s.gatewayProber == nil {
 		return nil, nil, nil
 	}
-	targets := gatewayTargets(s.cfg)
+	targets := gatewayTargets(cfg)
 	if len(targets) == 0 {
 		return nil, nil, nil
 	}

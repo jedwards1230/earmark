@@ -1,6 +1,6 @@
 # Database Schema Reference
 
-> **See CONTRACT.md §§1.1, 1.2, 1.5, 1.6, 1.8, 1.9 and 3 for authoritative definitions.**
+> **See CONTRACT.md §§1.1, 1.2, 1.5, 1.6, 1.8, 1.9, 2.20 and 3 for authoritative definitions.**
 > This document summarises the current schema; CONTRACT.md wins on any discrepancy.
 
 ## Migrations
@@ -23,6 +23,7 @@ version is in `goose_db_version`.
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` (per-chunk System One quality scan); unique `(transcript_id, chunk_index, chunk_text_sha256, recipe_id)`, `chunk_scan_recipe_id_idx`; `scan` arm of `stale_work` |
 | 10 | `00010_step_runs.sql` | `step_runs` (live progress of ad-hoc decide/scan/eval runs); partial `step_runs_running_idx`, `step_runs_started_at_idx` |
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` (every build that registered a recipe), `recipe_builds_code_version_idx`, backfilled from `recipes`; comment on `recipes.code_version` (first build) |
+| 12 | `00012_model_settings.sql` | `model_settings` (runtime per-step model overrides) and the append-only `model_setting_events` history + `model_setting_events_step_idx`; nothing backfilled |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -626,6 +627,44 @@ CREATE TABLE step_runs (
 A running row whose heartbeat is older than 2 minutes is **stale** (its process
 died); that is computed at read time and nothing reaps rows. No foreign keys:
 the table references nothing and nothing references it.
+
+### 14. `model_settings` / `model_setting_events` — Runtime step models (CONTRACT §2.20)
+
+At most one row per AI step (`propose`, `decide`, `scan`, `embed`) overriding
+the env default (`AI_ENDPOINTS` + `AI_ROLES` + `MODELS_FILE`) until unset;
+written only by `earmark models set|unset`, read by every process that runs
+the step. Precedence: a per-run `--endpoint`/`--model` > this row > env. An
+empty table is the env behaviour.
+
+```sql
+CREATE TABLE model_settings (
+    step           TEXT        PRIMARY KEY,               -- propose | decide | scan | embed
+    endpoint_id    TEXT        NOT NULL,                  -- an AI_ENDPOINTS id (never a URL or key); ≤ 256
+    model          TEXT        NOT NULL,                  -- model id to request; ≤ 256
+    expected_model TEXT,                                  -- pin; NULL = the requested model ('' refused)
+    revision       TEXT,                                  -- pin; NULL = unpinned ('' refused)
+    params         JSONB       NOT NULL DEFAULT '{}',     -- pin params, e.g. {"usd_per_mtok_in": 0.042}
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_by     TEXT        NOT NULL                   -- "cli:<user>"; ≤ 256
+);
+
+CREATE TABLE model_setting_events (                       -- append-only: UPDATE/DELETE refused by trigger
+    id         BIGSERIAL   PRIMARY KEY,
+    step       TEXT        NOT NULL,                      -- propose | decide | scan | embed
+    action     TEXT        NOT NULL,                      -- set | unset
+    old_value  JSONB,                                     -- object; NULL = env default was in effect
+    new_value  JSONB,                                     -- object; NULL = unset
+    actor      TEXT        NOT NULL,                      -- ≤ 256
+    note       TEXT,                                      -- ≤ 512
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+-- index model_setting_events_step_idx: (step, id DESC)
+```
+
+Each change writes the row and its event in one transaction; setting the
+stored value again writes nothing. A row whose
+endpoint is no longer in `AI_ENDPOINTS` is an error for its step (never a
+fallback): see CONTRACT §2.20. No foreign keys.
 
 ## Relationships
 

@@ -128,6 +128,10 @@ type AIEndpoint struct {
 	// and API only — no code path routes or behaves differently on it. The
 	// Models page infers "litellm" from the host name when it is absent.
 	Gateway string `json:"gateway,omitempty"`
+	// BaseID is set only on an endpoint WithStepSettings synthesized for a
+	// runtime model setting (CONTRACT §2.20): the AI_ENDPOINTS id it copies,
+	// asking for another model. Never parsed from AI_ENDPOINTS.
+	BaseID string `json:"-"`
 }
 
 // AIRoles binds function names to endpoint IDs. The "embeddings" role is
@@ -145,27 +149,65 @@ func validAIType(t AIEndpointType) bool {
 	return t == AIEndpointTypeEmbeddings || t == AIEndpointTypeChat || t == AIEndpointTypeSystemOne
 }
 
-// unpinnedModelRE matches a moving model alias: "*-latest", "*-preview" and
-// ollama's ":latest" tag.
-var unpinnedModelRE = regexp.MustCompile(`(?i)(-latest|-preview|:latest)$`)
+// movingModelRE matches a moving model alias: any id that mentions "latest"
+// or "preview" ("jev-latest", "gemma3:latest", "x-preview-2").
+var movingModelRE = regexp.MustCompile(`(?i)(latest|preview)`)
 
 // pinnedVersionRE requires a dotted version number somewhere in the id.
 var pinnedVersionRE = regexp.MustCompile(`\d+(\.\d+)+`)
 
+// ollamaTagRE matches an explicit Ollama tag "<name>:<tag>" ("clef:27b",
+// "qwen3.8:27b-q8_0"): the tag names one build, so the id is pinned.
+var ollamaTagRE = regexp.MustCompile(`^[^:\s]+:[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
 // PinnedModel rejects a model id that does not name one fixed version: a
-// moving alias ("jev-latest", "jev-preview", anything "*-latest"/"*-preview")
-// or an id without a dotted version ("jev"). Decisions are cached and replayed
-// against the model that made them (CONTRACT §1.9 "fn_calls"), so a model that
-// can change under the same name is refused (e.g. "jev-1.13.0" is accepted).
+// moving alias (any id containing "latest" or "preview") or an id with
+// neither a dotted version ("jev-1.13.0") nor an explicit Ollama tag
+// ("clef:27b"). Decisions are cached and replayed against the model that
+// made them (CONTRACT §1.9 "fn_calls"), so a model that can change under the
+// same name is refused.
 func PinnedModel(model string) error {
 	m := strings.TrimSpace(model)
 	switch {
 	case m == "":
 		return fmt.Errorf("model is required")
-	case unpinnedModelRE.MatchString(m):
-		return fmt.Errorf("model %q is a moving alias; pin a version (e.g. jev-1.13.0)", model)
-	case !pinnedVersionRE.MatchString(m):
-		return fmt.Errorf("model %q names no version; pin one (e.g. jev-1.13.0)", model)
+	case movingModelRE.MatchString(m):
+		return fmt.Errorf("model %q is a moving alias; pin a version (e.g. jev-1.13.0, clef:27b)", model)
+	case !pinnedVersionRE.MatchString(m) && !ollamaTagRE.MatchString(m):
+		return fmt.Errorf("model %q names no version; pin one (e.g. jev-1.13.0, clef:27b)", model)
+	}
+	return nil
+}
+
+// typesafePassThrough reports whether a systemone endpoint is LiteLLM's
+// TypeSafe pass-through route (a base URL path ending in "/typesafe"). That
+// route forwards to api.typesafe.ai and ignores LiteLLM's model_list, so only
+// TypeSafe's own jev-* models can be served there (CONTRACT §2.14).
+func typesafePassThrough(baseURL string) bool {
+	u, err := neturl.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(strings.TrimRight(u.Path, "/")), "/typesafe")
+}
+
+// CheckSystemOneRoute refuses a non-jev model on a TypeSafe pass-through
+// endpoint: the request would silently go to TypeSafe, not to the model
+// LiteLLM routes that name to (e.g. a local Clef). Use an endpoint whose
+// baseURL is the LiteLLM root, whose unified POST /v1/systemone honours the
+// model_list.
+func CheckSystemOneRoute(ep AIEndpoint, model string) error {
+	if ep.Type != AIEndpointTypeSystemOne || !typesafePassThrough(ep.BaseURL) {
+		return nil
+	}
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	if !strings.HasPrefix(m, "jev-") {
+		return fmt.Errorf("endpoint %q is the TypeSafe pass-through (%s), which always calls api.typesafe.ai: "+
+			"model %q would not be routed by LiteLLM; use a systemone endpoint whose baseURL is the LiteLLM root "+
+			"(unified POST /v1/systemone)", ep.ID, ep.BaseURL, model)
 	}
 	return nil
 }
@@ -271,6 +313,9 @@ func parseAIEndpoints(raw string) ([]AIEndpoint, error) {
 		if ep.Type == AIEndpointTypeSystemOne {
 			if err := PinnedModel(ep.Model); err != nil {
 				return nil, fmt.Errorf("%s (%q): %w", where, ep.ID, err)
+			}
+			if err := CheckSystemOneRoute(ep, ep.Model); err != nil {
+				return nil, fmt.Errorf("%s: %w", where, err)
 			}
 			if len(ep.Options) > 0 {
 				// The client sends only model/state/questions; an option would
@@ -556,6 +601,13 @@ type Config struct {
 	// per-step expected model, revision pin and prompt version, stamped into
 	// provenance recipes. Empty (never nil) after LoadConfig when unset.
 	Models *ModelRegistry
+
+	// stepSources records, per step, where WithStepSettings took the step's
+	// model from (SourceDB / SourceOverride). Absent = the env default.
+	stepSources map[string]string
+	// env is the env binding and pins of every setting step, captured by the
+	// first Clone of the env config (nil on the env config itself).
+	env *envSnapshot
 
 	// Debug enables verbose structured logging.
 	Debug bool

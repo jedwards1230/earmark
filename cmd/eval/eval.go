@@ -32,6 +32,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	evalpkg "github.com/jedwards1230/earmark/internal/eval"
+	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/runs"
 	"github.com/jedwards1230/earmark/internal/telemetry"
 	"github.com/jedwards1230/earmark/internal/worker"
@@ -59,6 +60,10 @@ type options struct {
 	// is the judge model it names. nil steps (tests) records nothing.
 	steps runs.Store
 	model string
+	// overrideEndpoint / overrideModel are --endpoint / --model: the
+	// propose step's model for this run only (CONTRACT §2.20).
+	overrideEndpoint string
+	overrideModel    string
 }
 
 var opts options
@@ -121,7 +126,14 @@ Measuring a prompt change (dry run only; CONTRACT §2.15):
 chunks), so two builds judge identical input. --dump writes one JSON line per
 chunk: tokens and cost as the endpoint reports them, and every finding the
 judge returned — kept, or dropped with its reason. "--dump -" writes the lines
-to stdout and the report to stderr.`,
+to stdout and the report to stderr.
+
+Model: the judge runs on the propose step's effective model (CONTRACT §2.20):
+--endpoint/--model for this run, else the model_settings row ('earmark
+models set propose ...'), else AI_ROLES.eval. --model alone keeps the
+endpoint; --endpoint alone uses that endpoint's own model. A different model
+is a different propose recipe. Neither flag writes model_settings.
+  earmark eval --sample 200 --seed q4 --dump /tmp/qwen.jsonl --model ollama/qwen3.8:27b-q8_0`,
 	Run: runEval,
 }
 
@@ -140,6 +152,10 @@ func init() {
 		"with --sample: pick the sample in an order fixed by this seed (same seed → same chunks)")
 	EvalCmd.Flags().StringVar(&opts.dump, "dump", "",
 		"dry run only: write one JSON line per judged chunk (tokens, cost, kept and dropped findings) to this path; - = stdout")
+	EvalCmd.Flags().StringVar(&opts.overrideEndpoint, "endpoint", "",
+		"this run only: the AI_ENDPOINTS id (a chat endpoint) the judge calls (default: the propose step's effective endpoint)")
+	EvalCmd.Flags().StringVar(&opts.overrideModel, "model", "",
+		"this run only: the model id the judge requests (default: the propose step's effective model)")
 	EvalCmd.MarkFlagsMutuallyExclusive("backfill-unevaluated", "backfill-eval-errors")
 }
 
@@ -159,6 +175,18 @@ func runEval(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	defer database.Close()
+
+	// The propose step's effective model (CONTRACT §2.20): --endpoint/--model,
+	// else its model_settings row, else the env registry. An invalid row fails
+	// the run rather than judging with another model.
+	cfg, err = db.ResolveStep(context.Background(), database, cfg, recipe.StepPropose,
+		opts.overrideEndpoint, opts.overrideModel)
+	if err != nil {
+		// stderr: with --dump - stdout is the JSONL stream.
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	log.Print(cfg.DescribeStep(recipe.StepPropose))
 
 	// Resolve the chat endpoint: AI_ROLES["eval"] from the registry when set,
 	// else the standalone EVAL_CHAT_* env vars (#48 resolved).

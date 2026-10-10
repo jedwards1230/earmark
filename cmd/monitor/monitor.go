@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -69,8 +70,10 @@ func runMonitor(cmd *cobra.Command, args []string) {
 		log.Printf("WARNING: OpenTelemetry disabled: %v", err)
 	}
 
-	registerCurrentRecipes(database, cfg)
-	publishRecipeInfo(database, tel)
+	// Current recipes follow the effective config: env plus the runtime
+	// model settings (CONTRACT §2.20), re-checked by the worker every cycle.
+	current := &currentRecipes{db: database, tel: tel}
+	current.registerFromDB(cfg)
 
 	// The embedded ASIN tag the runner reports is the third ASIN source
 	// (CONTRACT §1.6); only this write path pays for consulting it.
@@ -79,6 +82,7 @@ func runMonitor(cmd *cobra.Command, args []string) {
 	workQueue := queue.NewQueue()
 	fileMonitor := monitor.NewFileMonitor(cfg, database, meta)
 	w := worker.NewWorker(workQueue, database, cfg)
+	w.SetModelSettings(database, current.register)
 
 	// Prometheus metrics for the ingest pod (CONTRACT §2.16). The scrape-time
 	// collector reads the DB for current-state gauges; the worker records stage
@@ -255,51 +259,96 @@ func publishRecipeInfo(database *db.DB, tel *telemetry.Telemetry) {
 	tel.SetRecipes(infos)
 }
 
-// registerCurrentRecipes records, per step, the recipe this deployment would
-// use right now (CONTRACT §1.9): the embed recipe always, the propose (judge)
+// currentRecipes records, per step, the recipe this deployment would use
+// right now (CONTRACT §1.9): the embed recipe always, the propose (judge)
 // recipe when an eval chat endpoint is configured, and the scan and decide
-// recipes when AI_ROLES.scan / AI_ROLES.decide are bound. The stale_work view compares
-// every output row against these. Only the ingest process does this, so there
-// is one writer of "current"; an ad-hoc `earmark eval` with other settings
-// stamps its own recipe on its findings without redefining current.
+// recipes when their roles are bound — each for the step's EFFECTIVE model,
+// env plus the runtime model settings (CONTRACT §2.20). The stale_work view
+// compares every output row against these. Only the ingest process does
+// this, so there is one writer of "current"; an ad-hoc `earmark eval` with
+// other settings (or a --model override) stamps its own recipe on its
+// findings without redefining current.
 //
-// Best-effort: stamping does not depend on it (writes register their recipe
-// themselves), so a failure is logged, not fatal.
-func registerCurrentRecipes(database *db.DB, cfg *config.Config) {
-	current := []recipe.Recipe{database.EmbedRecipe()}
-	r, ok, err := eval.CurrentRecipe(cfg)
-	if err != nil {
-		log.Printf("WARNING: eval chat endpoint is misconfigured, no current propose recipe registered: %v", err)
-	}
-	if ok {
-		current = append(current, r)
-	}
-	sr, ok, err := scan.CurrentRecipe(cfg)
-	if err != nil {
-		log.Printf("WARNING: scan endpoint is misconfigured, no current scan recipe registered: %v", err)
-	}
-	if ok && err == nil {
-		current = append(current, sr)
-	}
-	dr, ok, err := decide.CurrentRecipe(cfg)
-	if err != nil {
-		log.Printf("WARNING: decide endpoint is misconfigured, no current decide recipe registered: %v", err)
-	}
-	if ok && err == nil {
-		current = append(current, dr)
-	}
+// register runs at startup and on every worker cycle; it writes only when
+// the set of current recipe ids changed. A step whose model_settings row is
+// invalid keeps its previous current recipe (nothing runs under it until the
+// row is fixed). Best-effort: stamping does not depend on it (writes register
+// their recipe themselves), so a failure is logged, not fatal.
+type currentRecipes struct {
+	db   *db.DB
+	tel  *telemetry.Telemetry
+	last string // the ids registered last, joined
+}
+
+// registerFromDB applies the model_settings rows onto base and registers
+// the result. An unreadable model_settings registers nothing: the worker's
+// first cycle retries.
+func (c *currentRecipes) registerFromDB(base *config.Config) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := database.SetCurrentRecipes(ctx, current...); err != nil {
-		log.Printf("WARNING: could not register current recipes: %v", err)
+	rows, err := c.db.ListModelSettings(ctx)
+	if err != nil {
+		log.Printf("WARNING: model_settings unreadable; current recipes registered by the worker's first cycle: %v", err)
 		return
 	}
+	full, invalid := base.WithValidStepSettings(db.StepSettings(rows)...)
+	c.register(full, invalid)
+}
+
+// currentRecipeSet is the current recipe of every step cfg configures,
+// skipping steps whose model setting is invalid (and, with a warning, steps
+// whose endpoint cannot be built).
+func currentRecipeSet(cfg *config.Config, invalid map[string]error) []recipe.Recipe {
+	var current []recipe.Recipe
+	add := func(step string, r recipe.Recipe, ok bool, err error) {
+		if invalid[step] != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("WARNING: %s endpoint is misconfigured, no current %s recipe registered: %v", step, step, err)
+			return
+		}
+		if ok {
+			current = append(current, r)
+		}
+	}
+	add(recipe.StepEmbed, db.EmbedRecipeFor(cfg), true, nil)
+	r, ok, err := eval.CurrentRecipe(cfg)
+	add(recipe.StepPropose, r, ok, err)
+	r, ok, err = scan.CurrentRecipe(cfg)
+	add(recipe.StepScan, r, ok, err)
+	r, ok, err = decide.CurrentRecipe(cfg)
+	add(recipe.StepDecide, r, ok, err)
+	return current
+}
+
+func (c *currentRecipes) register(cfg *config.Config, invalid map[string]error) {
+	current := currentRecipeSet(cfg, invalid)
+	ids := make([]string, 0, len(current))
 	for _, r := range current {
 		id, err := r.ID()
 		if err != nil {
 			log.Printf("WARNING: could not compute the current %s recipe id: %v", r.Step, err)
-			continue
+			return
 		}
-		log.Printf("current %s recipe %s (model %s, resolved %s)", r.Step, id, r.ModelAlias, r.ModelResolved)
+		ids = append(ids, r.Step+"="+id)
 	}
+	key := strings.Join(ids, ",")
+	if key == c.last {
+		return
+	}
+	for step, err := range invalid {
+		log.Printf("ERROR: current %s recipe left unchanged: %v", step, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := c.db.SetCurrentRecipes(ctx, current...); err != nil {
+		log.Printf("WARNING: could not register current recipes: %v", err)
+		return
+	}
+	c.last = key
+	for i, r := range current {
+		log.Printf("current %s · %s · resolved %s", cfg.DescribeStep(r.Step), ids[i], r.ModelResolved)
+	}
+	publishRecipeInfo(c.db, c.tel)
 }

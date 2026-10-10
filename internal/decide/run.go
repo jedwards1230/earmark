@@ -12,7 +12,6 @@ import (
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/fn"
-	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/runs"
@@ -52,19 +51,22 @@ type RunOptions struct {
 	// Progress, when set, records the run's live progress (CONTRACT §1.10):
 	// the phase, one tick per decided finding and the spend. nil = none.
 	Progress *runs.Run
+	// Model is the decision model asked (zero = DefaultModel): the decide
+	// step's effective model (ModelFromConfig after runtime settings).
+	Model Model
 }
 
 // ClientFromConfig builds the System One client for AI_ROLES.decide. ok is
-// false when the role is unbound. The endpoint must ask for the model
-// should_apply is pinned to: the recipe names that model, so another one would
-// make every answer a fallback.
+// false when the role is unbound. The model it asks is ModelFromConfig's —
+// the endpoint's (pinned-version) model, which the decide recipe names, so
+// a run on another model is another recipe (CONTRACT §2.20).
 func ClientFromConfig(cfg *config.Config) (client *systemone.Client, ok bool, err error) {
 	ep, ok := cfg.DecideEndpoint()
 	if !ok {
 		return nil, false, nil
 	}
-	if !genai.SameModel(ep.Model, ShouldApplyModel) {
-		return nil, true, fmt.Errorf("decide endpoint %q asks for model %q; should_apply is pinned to %s", ep.ID, ep.Model, ShouldApplyModel)
+	if err := config.PinnedModel(ep.Model); err != nil {
+		return nil, true, fmt.Errorf("decide endpoint %q: %w", ep.ID, err)
 	}
 	var opts []systemone.Option
 	if p, set := cfg.ModelPin(recipe.StepDecide).FloatParam(config.ParamUSDPerMTokIn); set {
@@ -101,7 +103,7 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 	if o.Rung0Only {
 		// The recipe id is computed, never registered: a rung-0 replay
 		// writes nothing.
-		f, err := ShouldApplyFn(o.Params)
+		f, err := ShouldApplyFnFor(o.Params, o.Model)
 		if err != nil {
 			return nil, err
 		}
@@ -110,7 +112,7 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 		}
 	} else {
 		var err error
-		if ev, err = NewEvaluator(store, asker, o.Params); err != nil {
+		if ev, err = NewEvaluatorFor(store, asker, o.Params, o.Model); err != nil {
 			return nil, err
 		}
 		if recipeID, err = store.RegisterRecipe(ctx, ev.Recipe()); err != nil {
@@ -118,7 +120,7 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 		}
 	}
 	rec := o.Progress
-	rec.SetRecipe(recipeID, ShouldApplyModel)
+	rec.SetRecipe(recipeID, o.Model.orDefault().Alias)
 	rec.Phase("sampling findings")
 	sample, err := store.DecideSample(ctx, o.Scope)
 	if err != nil {
@@ -141,7 +143,7 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 			tickOutcome(rec, it.outcome)
 		}
 	} else {
-		rec.Phase(askingPhase)
+		rec.Phase(askingPhase(o.Model))
 		evaluateAll(ctx, ev, items, o.Concurrency, rec)
 	}
 	if err := ctx.Err(); err != nil {
@@ -329,7 +331,7 @@ func candidateOf(f db.DecideFinding, chunk *db.DecideChunk) Candidate {
 }
 
 // askingPhase is the phase recorded while should_apply calls are in flight.
-const askingPhase = "asking " + ShouldApplyModel
+func askingPhase(m Model) string { return "asking " + m.orDefault().Alias }
 
 // tickOutcome records one decided finding on rec: its class (apply, hold,
 // reject, reanchor, rung0_pass), a cache hit, a model error, and the spend.
