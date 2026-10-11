@@ -3742,6 +3742,15 @@ var (
 	), ` + clearFindingsCTE
 )
 
+// setLocalLockTimeoutSQL bounds every lock wait of the transaction it runs in
+// (Postgres lock_timeout, transaction-local). ClearFindings and
+// ClearEmbeddingStale run it first: both lock findings a rebuild, a decide run
+// or a requeue may hold, and neither caller's context carries a deadline (the
+// worker's never does). A timeout aborts the transaction with SQLSTATE 55P03:
+// nothing is half-written, a clear can be retried, and a chunk whose flag was
+// not cleared stays flagged and is rebuilt again next cycle.
+const setLocalLockTimeoutSQL = `SET LOCAL lock_timeout = '5s'`
+
 // clearFindingsReason is the finding_events reason of a clear's transitions.
 const clearFindingsReason = "cleared"
 
@@ -3817,6 +3826,9 @@ type clearTx interface {
 // statement sequence is testable against a pgxmock transaction.
 func clearFindingsTx(ctx context.Context, tx clearTx, dir, actor string) (clearResult, error) {
 	var res clearResult
+	if _, err := tx.Exec(ctx, setLocalLockTimeoutSQL); err != nil {
+		return res, fmt.Errorf("clear findings: set lock_timeout: %w", err)
+	}
 	if err := SetEventContext(ctx, tx, EventContext{Actor: actor, Reason: clearFindingsReason}); err != nil {
 		return res, err
 	}
@@ -4393,21 +4405,25 @@ const requeueDefaultActor = "system"
 //
 // The findings are locked first, in id order (lk), then updated: every writer
 // that locks several findings takes them in id order (ClearFindings,
-// SetPatchStateBulk, ApplyDecisions), so a requeue racing a clear over the
-// same findings queues instead of deadlocking (40P01). A requeue's full lock
+// SetPatchStateBulk, ApplyDecisions, ClearEmbeddingStale), so a requeue racing
+// one of them over the same findings queues instead of deadlocking (40P01).
+// lk locks EVERY finding of the requeued transcripts, whatever its state:
+// ClearEmbeddingStale locks a rebuild's replayed ids FOR SHARE even when one
+// is already superseded, so a lock set narrowed by state would let the two
+// interleave out of id order. The state filter ($2) is on the UPDATE only. A requeue's full lock
 // order is transcripts (requeueLockTranscriptsSQL) → findings in id order →
 // chunks (the transcript delete's cascade).
 const requeueSupersedeFindingsSQL = `WITH lk AS (
 	    SELECT id FROM transcript_findings
 	     WHERE transcript_id IN (SELECT id FROM transcripts WHERE job_id = ANY($1))
-	       AND patch_state = ANY($2)
 	     ORDER BY id
 	       FOR UPDATE
 	)
 	UPDATE transcript_findings f
 	   SET patch_state = 'superseded', superseded_at = now(), unanchorable_reason = NULL
 	  FROM lk
-	 WHERE f.id = lk.id`
+	 WHERE f.id = lk.id
+	   AND f.patch_state = ANY($2)`
 
 // requeueDeleteTranscriptsSQL deletes the requeued jobs' transcripts. Chunks
 // cascade; findings keep their row and get transcript_id = NULL (ON DELETE SET

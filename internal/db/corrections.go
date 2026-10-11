@@ -206,7 +206,10 @@ func (db *DB) getCorrectionOverlay(ctx context.Context, b txBeginner, transcript
 //     set against the current states can.
 //
 // The replayed findings are locked FOR SHARE (in id order) before the UPDATE,
-// in its own transaction: a clear, revert or review holding one of them is
+// in its own transaction, which waits at most 5 s for any lock
+// (setLocalLockTimeoutSQL; the worker's context has no deadline). On a
+// timeout the transaction aborts, the chunk stays flagged and the worker logs
+// it and moves on — the next rebuild clears it: a clear, revert or review holding one of them is
 // waited for, and the UPDATE — a new statement under READ COMMITTED — then
 // sees its committed state; one that comes later waits for this transaction
 // and re-flags the chunk itself. Findings are locked before chunks, like every
@@ -256,6 +259,9 @@ func (db *DB) clearEmbeddingStale(ctx context.Context, b txBeginner, transcriptI
 		return fmt.Errorf("begin clear embedding_stale tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, setLocalLockTimeoutSQL); err != nil {
+		return fmt.Errorf("clear embedding_stale: set lock_timeout: %w", err)
+	}
 	if len(replayed) > 0 {
 		if _, err := tx.Exec(ctx, lockReplayedFindingsSQL, replayed); err != nil {
 			return fmt.Errorf("lock replayed findings for transcript %s: %w", transcriptID, err)

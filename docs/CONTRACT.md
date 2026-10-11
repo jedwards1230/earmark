@@ -675,9 +675,12 @@ an exception while the table has rows, unless the session running it sets
 earmark.allow_data_loss=on'`, or `ALTER DATABASE … SET` before and `RESET`
 after). Back the table up first.
 
-**Lock order.** A requeue locks the transcripts (step 2), then their findings
-in id order (step 3 is `WITH lk AS (SELECT id … ORDER BY id FOR UPDATE)
-UPDATE … FROM lk`), then the chunks through the delete's cascade. Every other
+**Lock order.** A requeue locks the transcripts (step 2), then **every**
+finding of those transcripts in id order — superseded ones included, because
+`ClearEmbeddingStale` may hold any replayed id — (step 3 is `WITH lk AS
+(SELECT id … ORDER BY id FOR UPDATE) UPDATE … FROM lk WHERE … AND
+patch_state = ANY(from-states)`), then the chunks through the delete's
+cascade. Every other
 multi-finding writer (the dashboard clear, `SetPatchStateBulk`,
 `ApplyDecisions`, `ClearEmbeddingStale`) also takes findings in id order and
 before chunks, so a requeue racing them queues instead of failing with a
@@ -3588,7 +3591,8 @@ delete** (`db.ClearFindings`): in one transaction it sets `earmark.actor =
 <caller's actor>'` (`ClearFindings(ctx, dir, actor)`; the dashboard passes
 `mcp:dashboard`) and `earmark.reason = 'cleared'`, then — in one statement,
 findings locked in id order before any chunk — moves every finding in scope
-that is not already `superseded` to `superseded`, stamping `superseded_at`
+that is not already `superseded` to `superseded` (the transaction waits at
+most 5 s for any lock, `SET LOCAL lock_timeout`), stamping `superseded_at`
 (and clearing an `unanchorable_reason`). Each move is a `transition` in
 `finding_events`, so decisions and their history survive. The book scope is
 `file_path LIKE likePrefix(dir) || '/%' ESCAPE '\' OR file_path = dir`: a `_`
@@ -4298,7 +4302,10 @@ watermark can still commit after the overlay read, and a clear stamps no
 `decided_at` at all. So the rebuild passes `ClearEmbeddingStale` the ids of
 the corrections it actually applied to the embedded text
 (`replayOutcome.applied`, not the quarantined ones), and the clear runs in its
-own transaction: it locks those findings `FOR SHARE` in id order, then unflags
+own transaction, bounded by `SET LOCAL lock_timeout = '5s'` (the worker's
+context has no deadline; on a timeout the chunk stays flagged, the worker
+logs it and the next rebuild clears it): it locks those findings `FOR SHARE`
+in id order, then unflags
 only chunks where none of them has moved out of `accepted`/`applied`
 (`f.id = ANY(replayed) AND f.patch_state <> ALL(overlay states)`). A writer
 already holding one of them (a clear, revert, reject — all lock findings

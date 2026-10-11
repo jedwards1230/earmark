@@ -168,6 +168,7 @@ func TestClearFindingsTx(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer mock.Close()
+			mock.ExpectExec(setLocalLockTimeoutSQL).WillReturnResult(pgxmock.NewResult("SET", 0))
 			mock.ExpectExec(setEventContextSQL).WithArgs("mcp:test", "", "cleared").
 				WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(tc.sql).WithArgs(tc.args...).

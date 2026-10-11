@@ -96,6 +96,16 @@ func TestProcessTranscript_ClearsStaleFlagWithOverlayWatermark(t *testing.T) {
 		require.Empty(t, fdb.clearCalls[0].replayed)
 	})
 
+	// A failed clear (e.g. its 5 s lock_timeout) is not fatal: the chunks are
+	// already rebuilt, the flag simply stays set for the next cycle.
+	t.Run("a failed clear does not fail the rebuild", func(t *testing.T) {
+		fdb := &fakeDB{overlayReadAt: watermark, clearErr: fmt.Errorf("canceling statement due to lock timeout (SQLSTATE 55P03)")}
+		w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test")}
+
+		require.NoError(t, w.processTranscript(cfg, overlayTranscript()))
+		require.Empty(t, fdb.clearCalls)
+	})
+
 	t.Run("not cleared when the overlay could not be read", func(t *testing.T) {
 		fdb := &fakeDB{overlayErr: fmt.Errorf("overlay query exploded")}
 		w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test")}

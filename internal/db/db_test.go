@@ -1540,11 +1540,21 @@ func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 		t.Error("superseding must UPDATE findings, never DELETE them")
 	}
 	// Findings are locked in id order before the UPDATE, like every other
-	// multi-finding writer (ClearFindings, SetPatchStateBulk), so a requeue
-	// racing a clear queues instead of deadlocking.
-	if n := norm(requeueSupersedeFindingsSQL); !strings.Contains(n, "ORDER BY id FOR UPDATE ) UPDATE transcript_findings f") ||
-		!strings.Contains(n, "FROM lk WHERE f.id = lk.id") {
+	// multi-finding writer (ClearFindings, SetPatchStateBulk,
+	// ClearEmbeddingStale), so a requeue racing one of them queues instead of
+	// deadlocking. The lock set is EVERY finding of the requeued transcripts —
+	// no state filter in lk (ClearEmbeddingStale locks superseded ids too) —
+	// and the state filter is on the UPDATE.
+	n := norm(requeueSupersedeFindingsSQL)
+	lk, upd, ok := strings.Cut(n, ") UPDATE transcript_findings f")
+	if !ok || !strings.HasSuffix(lk, "ORDER BY id FOR UPDATE ") {
 		t.Errorf("requeueSupersedeFindingsSQL must lock findings in id order, then update:\n%s", n)
+	}
+	if strings.Contains(lk, "patch_state") {
+		t.Errorf("the lock CTE must lock every finding of the transcripts, not filter by state:\n%s", lk)
+	}
+	if !strings.Contains(upd, "FROM lk WHERE f.id = lk.id AND f.patch_state = ANY($2)") {
+		t.Errorf("the UPDATE must keep the from-state filter:\n%s", upd)
 	}
 	// The archive keeps every transcripts column worth keeping, and the whole
 	// run_metrics row.

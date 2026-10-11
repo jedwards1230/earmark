@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -885,5 +886,71 @@ func TestIntegrationAuditLineageDownRefusesWithArchive(t *testing.T) {
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM pg_tables WHERE tablename = 'transcript_archive'`); n != 0 {
 		t.Error("the opted-in Down kept transcript_archive")
+	}
+}
+
+// TestIntegrationRequeueLocksSupersededFindings: a requeue's lock set is every
+// finding of the requeued transcripts, superseded ones included — the same
+// rows ClearEmbeddingStale may hold FOR SHARE — so it waits for such a holder
+// (in id order) instead of interleaving with it.
+func TestIntegrationRequeueLocksSupersededFindings(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	seedRequeueRows(t, dbURL)
+	conn := connect(t, dbURL)
+	var cleared string
+	if err := conn.QueryRow(ctx, `UPDATE transcript_findings SET patch_state = 'superseded', superseded_at = now()
+		WHERE id = (SELECT id FROM transcript_findings WHERE transcript_id = $1 ORDER BY id LIMIT 1)
+		RETURNING id::text`, rqTranscriptA).Scan(&cleared); err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := d.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, lockReplayedFindingsSQL, []string{cleared}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.RequeueByID(ctx, rqJobA)
+		done <- err
+	}()
+	// The requeue must queue on the lock CTE of its supersede — the ordered
+	// lock pass over every finding — not later (the transcript delete's
+	// ON DELETE SET NULL would also touch the row, out of id order).
+	var waitingIn string
+	deadline := time.Now().Add(10 * time.Second)
+	for waitingIn == "" && time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			t.Fatalf("requeue finished (%v) while a superseded finding of its transcript was locked", err)
+		default:
+		}
+		_ = conn.QueryRow(ctx, `SELECT left(btrim(query), 40) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()
+			LIMIT 1`).Scan(&waitingIn)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.HasPrefix(waitingIn, "WITH lk AS") {
+		t.Errorf("requeue waits in %q, want its supersede's ordered lock pass (WITH lk AS …)", waitingIn)
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("requeue: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("requeue still blocked after the holder committed")
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
+		WHERE file_path LIKE '/b/Author/A/%' AND patch_state = 'superseded' AND transcript_id IS NULL`); n != 7 {
+		t.Errorf("%d of 7 book-A findings archived", n)
 	}
 }
