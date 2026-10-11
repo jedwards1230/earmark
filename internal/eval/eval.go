@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/log"
 	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/recipe"
@@ -360,6 +361,11 @@ type Result struct {
 	FnCallID *int64
 	// Attempts is the number of model calls made (0 when served from cache).
 	Attempts int
+	// Fallback is true when the reply came from a model other than the one
+	// the propose recipe expects (genai.SameModel): its findings carry the
+	// fallback's recipe and its fn_calls row is model_fallback — stored, never
+	// served from cache.
+	Fallback bool
 }
 
 // Usage is one judge call's accounting: token counts from the response's
@@ -432,6 +438,7 @@ func (j *Judge) JudgeChunkWithBook(ctx context.Context, c db.EvalChunk, bc BookC
 		res.Attempts, res.ResolvedModel, res.Usage, res.Elapsed = attempt+1, comp.ResolvedModel, usage, elapsed
 		if err == nil {
 			content := comp.Content
+			res.Fallback = comp.ResolvedModel != "" && !genai.SameModel(comp.ResolvedModel, j.Recipe().ModelResolved)
 			res, err = j.readReply(ctx, res, content, comp.ResolvedModel)
 			if err != nil {
 				// Paid for, and unusable: the chunk FAILED. Never "no

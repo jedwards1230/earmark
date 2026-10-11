@@ -869,9 +869,9 @@ func TestIntegrationAuditLineageDownRefusesWithArchive(t *testing.T) {
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_archive`); n != 1 {
 		t.Error("a refused Down must leave the archive intact")
 	}
-	// Later migrations roll back first; migration 13 itself must stay.
+	// Later migrations roll back first; the refusal keeps 13 applied.
 	if v := gooseVersion(t, dbURL); v != 13 {
-		t.Errorf("goose version = %d after a refused Down, want 13 (still applied)", v)
+		t.Errorf("goose version = %d after a refused Down, want 13", v)
 	}
 
 	// Opting in (new sessions pick the database default up).

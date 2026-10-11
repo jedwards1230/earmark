@@ -99,3 +99,41 @@ func TestEvalTranscript_PassCommitFailureFallsBack(t *testing.T) {
 	require.NotEmpty(t, pdb.findings, "fallback stores the findings")
 	require.Len(t, pdb.evalMetrics, 1, "fallback records the outcome")
 }
+
+// stopSecondChat answers the first chunk, then shuts the worker down on the
+// second call — a shutdown arriving mid-judge after some work was done.
+type stopSecondChat struct {
+	cancel context.CancelFunc
+	calls  *int
+}
+
+func (c stopSecondChat) Complete(_ context.Context, _, user string) (string, error) {
+	*c.calls++
+	if *c.calls == 1 {
+		return echoFinding(oneFindingJSON, user), nil
+	}
+	c.cancel()
+	return "", context.Canceled
+}
+func (stopSecondChat) Model() string { return "stop-judge" }
+
+// A shutdown on the gated eval pass closes the pass through closeStoppedPass:
+// partial, with the findings of the chunk judged before the stop, and no
+// run_metrics write (the job stays unlatched and unfailed).
+func TestEvalTranscript_StopClosesPassWithJudgedFindings(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pdb := &passDB{fakeDB: &fakeDB{}}
+	calls := 0
+	w := passWorker(ctx, pdb, stopSecondChat{cancel: cancel, calls: &calls})
+	tr := &db.Transcript{ID: "tid-stop2", JobID: "job-stop2", FilePath: "/b/a/t/ch.mp3", RawText: longTranscript}
+	require.ErrorIs(t, w.evalTranscript(&config.Config{ChunkSize: 8, EvalGatesEmbed: true}, tr), context.Canceled)
+	require.Len(t, pdb.opened, 1)
+	require.Len(t, pdb.commits, 1, "the stopped pass is closed exactly once")
+	c := pdb.commits[0]
+	require.Equal(t, db.JudgePassPartial, c.Close.Status)
+	require.Equal(t, 1, c.Close.ChunksJudged)
+	require.NotEmpty(t, c.Findings, "the findings judged before the stop are stored")
+	require.Nil(t, c.Metrics)
+	require.Empty(t, pdb.evalMetrics)
+}

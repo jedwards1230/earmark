@@ -1,0 +1,44 @@
+{
+ "decide_disagreements_top60": [
+  {
+   "finding_id": "22498907-495b-400f-98ef-2208bc832aa3",
+   "label": "G",
+   "reason": "Eragon (asin evidence)",
+   "jev_p": 0.24,
+   "clef_p": 0.9437222715985669,
+   "original": "erugon had felt himself changing during the trip",
+   "replacement": "eragon had felt himself changing during the trip",
+   "prior_label": null
+  },
+  {
+   "finding_id": "b2e10778-623a-4765-baa9-9687853f6b95",
+   "label": "G",
+   "reason": "Eragon",
+   "jev_p": 0.26,
+   "clef_p": 0.9048735398998707,
+   "original": "ergorn fell victim to three bouts of agony while fighting vaner",
+   "replacement": "eragon fell victim to three bouts of agony while fighting vaner",
+   "prior_label": null
+  }
+ ],
+ "clef_applies": [
+  {
+   "finding_id": "0508278b-732f-4f83-bce7-4f2e4ff5f9c4",
+   "label": "G",
+   "reason": "repeated-word ASR duplication; removal matches print (small risk it was an intended stammer)",
+   "jev_p": 0.84,
+   "clef_p": 0.9589279585386297,
+   "original": "essentially essentially",
+   "replacement": "essentially"
+  },
+  {
+   "finding_id": "4873efe0-1300-477a-b840-26d8b30fdd2d",
+   "label": "G",
+   "reason": "repeated-word ASR duplication; removal matches print (small risk it was an intended stammer)",
+   "jev_p": 0.88,
+   "clef_p": 0.9550082307990029,
+   "original": "he picked up the blanket it was barely bigger than a kerchief and smelled of smelled of fear",
+   "replacement": "he picked up the blanket it was barely bigger than a kerchief and smelled of fear"
+  }
+ ]
+}

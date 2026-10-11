@@ -772,7 +772,12 @@ row has a non-NULL `eval_finished_at`. Eval coverage is thus a real ratio
 (`COUNT(eval_finished_at) / COUNT(done jobs)`) rather than a findings-row count
 (a clean job has 0 findings but is still "evaluated"). `eval_model` is the judge
 model id; `eval_chunks`/`eval_skipped`/`eval_findings` are the run's
-`ChunksEvaluated`/`ChunksSkipped`/`FindingsFound`. The eval slice is written
+`ChunksEvaluated`/`ChunksSkipped`/`FindingsFound` — except under a judge pass
+(`--backfill-* --write`, `--rejudge --write`, the worker against the real
+database), where `eval_findings` is the number of rows THIS run inserted: a
+resumed or repeated run whose findings were already stored by the same recipe
+writes `0`. The full count is on the pass: `judge_passes.findings_kept` plus
+`dropped->'already_recorded'` (§2.15 "Lineage"). The eval slice is written
 **only by the per-job paths** — the in-pipeline judge (`EVAL_IN_PIPELINE`) and
 the `earmark eval --backfill-*` sweeps — where the chunk set maps cleanly to one
 job (`job_id`).
@@ -1172,6 +1177,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` — every (recipe, earmark build) pair, PK `(recipe_id, code_version)` plus `recipe_builds_code_version_idx`, backfilled with each existing recipe's registering build; a column comment marking `recipes.code_version` as the *first* build (§1.9 "Recipe ID format" / "Builds"). New table plus a `COMMENT` (SHARE UPDATE EXCLUSIVE, which writers' INSERTs do not wait on); no id is rewritten. |
 | 13 | `00013_audit_lineage.sql` | Audit lineage (§1.4, §2.15 "Lineage", §2.17): `judge_passes` (legacy rows backfilled) and `transcript_archive`; on `transcript_findings` `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (trigger-filled, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` state; `finding_events.anchor_offset` + the reanchor trigger; transitions read `earmark.reason`; `stale_work`'s propose arm skips duplicates. Locks `recipes` (SHARE ROW EXCLUSIVE) then `transcript_findings` (ACCESS EXCLUSIVE) first — a running judge's order — and rewrites `transcript_findings` (`lock_timeout` 5s). |
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
+| 14 | `00014_finding_labels_scorecard.sql` | Model quality over time (§2.15 "Labels and scorecards"): the append-only `finding_labels` table (UPDATE/DELETE refused by a row trigger, TRUNCATE by a statement trigger; generated `correction_key` and `target`), the `finding_correction_key()` function (13's `correction_key` expression verbatim), and the read-only views `finding_label_current`, `recipe_scorecard` and `decide_scorecard`. One new table, three views, two functions; no ALTER, no backfill, no lock beyond the ACCESS SHARE a view takes (`lock_timeout` 5s). Down refuses while `finding_labels` has rows unless the session sets `earmark.allow_data_loss = 'on'`. |
 | 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
@@ -1195,7 +1201,7 @@ nothing — so the reset now drops **every** earmark object and
 `goose_db_version`, then migrates from version 1. That includes
 `transcript_findings` (**human corrections too**, `origin='human'`),
 `book_metadata`, `run_metrics`, `pipeline_events`, `recipes` /
-`current_recipes`, `fn_calls`, and `runner_control` — the runner comes back **unpaused**
+`current_recipes`, `fn_calls`, `finding_labels`, and `runner_control` — the runner comes back **unpaused**
 with no `run_limit`.
 
 **Deadlines.** A migration must not outlive the pod's patience:
@@ -3548,7 +3554,18 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
 - **Retries.** `earmark eval --retries N` (default **4**; the worker's judge
   retries nothing — a failed chunk is recorded and re-judged by a later run)
   retries an attempt that failed **transiently**: an HTTP 429 or 5xx, an
-  attempt that hit its own deadline, or a transport error. The wait is the
+  attempt that hit its own deadline or another network timeout, a connection
+  refused or reset, or a connection that closed before the reply arrived
+  (`EOF` / unexpected `EOF` from the transport — a bare `EOF` is kept because
+  net/http returns it when a server closes a reused keep-alive connection
+  before answering; no reply exists, so nothing was billed), a DNS failure
+  other than "no such host", or an HTTP/2 stream reset, GOAWAY or lost
+  connection. **Never retried:** a failure reading the body of a reply that
+  did arrive (`error_class` `body_read`) — the call may have been billed, and
+  its usage and cost are lost with the body, so a retry would pay again
+  unseen. A TLS certificate failure
+  and a `url.Error` that wraps no network failure (a bad URL, an unsupported
+  scheme) fail the same way every time and are not retried. The wait is the
   endpoint's `Retry-After` (delta-seconds or an HTTP date, capped at 5 min)
   when a 429/5xx sends one, else exponential backoff with equal jitter (2 s ·
   2^attempt, capped at 1 min, half fixed and half random). Never retried: a
@@ -3563,7 +3580,17 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
   `model_resolved` the model the endpoint reported (the expected model when it
   reports none), `recipe_id` the propose recipe of the reply. Because the cache
   key does not include recipe params, **`input`** carries everything else the
-  reply depends on: `chunk_text`, `file_path`, `start_sec`/`end_sec`, the
+  reply depends on: the model identity the key's `model_alias` (the requested
+  id) does not pin — `expected_model` (the recipe's expected model),
+  `model_revision` (the pin's revision) and the judge's `step_version` — so a
+  revision bump or a new expected model on the same alias is a cache miss,
+  never the old model's reply served as the new one's. **Deploy note:** this
+  changed the input, so `judge_chunk` rows written before it never hit under
+  the new key — the first `--rejudge` (or any judge run) after deploying it
+  pays for every chunk once, including the chunks a run killed before the
+  deploy had already paid for and a resume after the deploy would otherwise
+  have served. Then `chunk_text`,
+  `file_path`, `start_sec`/`end_sec`, the
   `prompt_version`, `book_context` (`source`, `sha256`, and the rendered
   `block`) and `request` — every output-affecting request field the client
   sends: `temperature`, `top_p`, `max_tokens`, `reasoning_effort`,
@@ -3580,9 +3607,18 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
   `EVAL_MAX_FINDINGS_PER_CHUNK`), so its findings carry the current recipe; a
   finding's `fn_call_id` is the original paid row. This is what makes a killed
   run resumable without paying twice. Rows that never serve: `invalid_reply`,
-  any failure, and a reply from a model other than the expected one
+  any failure, a reply from a model other than the expected one
   (`model_fallback` — its findings are still kept, stamped with the fallback's
-  recipe, as before).
+  recipe, as before), and `cache_slot_taken`: a successful paid reply whose
+  key's cache slot another row already held when it was logged (two identical
+  calls in flight) — it is still stored, with its cost, because a paid call is
+  never dropped from the log; its findings point at it. Each fn_calls write is
+  bounded (30 s) and survives the run's cancellation. **Fallbacks defeat the
+  cache:** when the propose step has no pinned `expected_model` and the
+  endpoint reports a dated snapshot id for the alias, every reply is a
+  `model_fallback` and every run pays again. Runs count them
+  (`RunStats.ChunksFallback`); `--rejudge` warns on the first and in its
+  summary — pin `steps.propose.expected_model` (§2.18).
 - **`invalid_reply`.** A reply with content that is not valid findings JSON
   fails its chunk (`ErrInvalidReply`): it is logged with `error_class =
   'invalid_reply'` and its `output` (the raw content and `parse_error`), the
@@ -3608,7 +3644,7 @@ local binary against the database without loading the library.
 | `--expect-recipe <id>` | — | refuse to start unless the current judge recipe is `<id>` or equivalent to it — checked before any model call, pass or step run. Pin it for a long run so a restart under a changed model setting or prompt cannot silently judge under another recipe |
 | `--concurrency N` | 16 | judge calls in flight, as ONE bound shared by every chunk of every transcript the run has in flight (`eval.Limiter`); also the cap on transcripts in flight |
 | `--call-timeout` / `--retries` | 180 s / 4 | "Judge calls" above |
-| `--limit N` | 0 = all | transcripts attempted |
+| `--limit N` | 0 = all | transcripts dispatched (skipped ones included) — not `--backfill-*`'s "latched" count |
 | `--book <substr>` | — | only transcripts whose path contains it (case-insensitive) |
 | `--shard i/N` | — | only transcripts with `hashtext(transcript_id) mod N = i` (folded non-negative) — `earmark decide --shard`'s partition, so N runners cover the selection disjointly |
 
@@ -3627,6 +3663,11 @@ recipe on purpose:** a finding identical to one from a *different* recipe is
 inserted, so two models agreeing on a fix is recorded as two rows sharing a
 `correction_key` (deciding them is §2.19's job).
 
+**Concurrent runs need disjoint `--shard` values.** Two unsharded runs (or
+two runs on the same shard) select the same transcripts and pay for them
+twice: a `running` pass does not exclude a transcript, because a killed run
+leaves one behind and its transcript must stay selectable.
+
 Stop and resume: SIGINT/SIGTERM closes in-flight passes `partial`/`failed`
 with the findings judged so far (`run_metrics` untouched) and exits non-zero;
 a hard kill leaves the open passes `running`. Either way the transcript has no
@@ -3634,7 +3675,9 @@ complete pass and is selected again; the chunks already answered are served
 from `fn_calls` (no second payment) and their findings, if already inserted,
 count as `already_recorded`. **Exit status** is non-zero when the recipe check
 fails, the run is stopped, a judge@v3 book record cannot be read (the run
-stops: never judge path-only under a v3 recipe), or transcripts were attempted
+stops: never judge path-only under a v3 recipe; that transcript's pass is
+closed `failed` and its `run_metrics` is left alone, since nothing was
+judged), or transcripts were attempted
 and none completed. The run is recorded in `step_runs` as `eval_rejudge`
 (§1.10).
 
@@ -3903,6 +3946,162 @@ stands). Beyond `transcript_findings` (and
 `finding_events`, by trigger) the clear writes only that flag — never the
 transcript tables or chunk text — so the read-only-transcripts contract
 holds.
+
+#### Labels and scorecards
+
+Migration 14 (design: `docs/design/audit-lineage.md` "Model quality over
+time"). How well each model has done for us, over time, is a query — not a
+spreadsheet kept beside the bake-off.
+
+**`finding_labels`** — append-only quality labels on proposed fixes:
+
+| Column | Meaning |
+|---|---|
+| `label` | `good` · `junk` · `partial` (right target, still wrong — **counts against** precision, as the bake-off scored it) · `unsure` (excluded) |
+| `labeler` | who: `kind:name` — `human:justin`, `opus:bakeoff-2026-10`. `human:` labelers outrank every other labeler |
+| `label_set` | the import it came from (`bakeoff-2026-10-qw2`, …) |
+| `reason` | free text (≤ 2000) |
+| `chunk_id`, `chunk_text_sha256`, `original`, `correction` | the fix and the chunk **revision** it is about |
+| `correction_key` | generated: `finding_correction_key(chunk_text_sha256, original, correction)` — the §2.15 "Lineage" expression verbatim, so a label joins every finding of every recipe that proposed that fix to that chunk text, before or after the label. NULL for a legacy finding with no chunk hash |
+| `finding_id` | the finding it was resolved through, if any (plain column, no FK); the target of a keyless label |
+| `target` | generated: `correction_key`, else `'finding:' ‖ finding_id` |
+| `issue_type` | as the source stated it (informational; scorecards use the finding's) |
+| `resolved_by` | `finding` · `hash` · `chunk` (below) |
+| `source_ref` | the item's id in its source file (`J003`, `Q120`, …) |
+| `labelled_at` | when the label was made (the source's date; default the import time) |
+
+UPDATE, DELETE and TRUNCATE are refused (`restrict_violation`); a change of
+mind is a newer row. `DEBUG_DB_RESET` drops the table; migration 14's Down
+refuses while it has rows unless the session sets
+`earmark.allow_data_loss = 'on'` (as 13's Down does for
+`transcript_archive`). `finding_id`/`chunk_id` carry no foreign key: chunks
+are a disposable projection, and a label outlives what it was resolved
+through.
+
+**`finding_label_current`** — the label in force per finding. A label
+applies to a finding when its `correction_key` is the finding's current key,
+**or a key the finding had before a re-anchor moved it** (the
+`reanchor_moved` / `reanchor_placed` transitions keep the old hash, §2.17),
+or it was resolved through that finding (`finding_id` — so a legacy
+finding's pinned label survives its first anchoring). `human:` labelers
+first, then the latest `labelled_at`, then the latest row.
+
+**`earmark labels import --set <name> --labeler <kind:name> [flags] <file>`**
+appends a file's labels in one transaction. Each item names a finding
+(`finding_id`) or a fix (`chunk_id` + `original` + `correction`, optionally
+`chunk_text_sha256`, optionally `context`). Resolution never guesses:
+
+| `resolved_by` | When |
+|---|---|
+| `finding` | `finding_id` names a finding whose texts match the item's (normalised: Unicode lower case, whitespace runs collapsed) — its recorded hash is used; or the item names no hash and findings proposing the same fix on the chunk recorded the chunk's **current** revision (and the item's context, if any, is in it) |
+| `hash` | `chunk_text_sha256` is the current chunk's (whose text must contain the span and context) or one any finding — live or archived — recorded for that chunk |
+| `chunk` | only with `--match-current-chunk`: no finding proposed the fix and no hash is given, and the current chunk text contains the span (and context) |
+
+Unresolved, reported with the reason and never stored: `invalid`,
+`finding_not_found`, `finding_text_mismatch`, `hash_mismatch`, `no_target`,
+`chunk_not_found`, `chunk_changed` (the findings proposing the fix saw
+another revision than the chunk's current text — the chunk was re-chunked
+since), `unknown_revision`, `no_recorded_revision` (no finding proposed the
+fix and `--match-current-chunk` is off), `span_not_in_chunk`,
+`context_not_in_chunk`, `conflicting_labels` (items of one file give one fix
+different labels or reasons — all of them are refused).
+
+Idempotency: under a per-(set, labeler) advisory lock, an item is skipped
+when the latest stored row of its (set, labeler, `target`) has the same
+label and reason, or it repeats an earlier item of the same file. So
+re-importing a file inserts nothing, while a change of mind — including a
+revert, good → junk → good — inserts a row each time (and, with a later
+`labelled_at`, is in force). `--dry-run` resolves in a read-only
+transaction; `--parse-only` never connects. `--json` prints the report.
+Formats (`--format`, default by extension):
+
+- `jsonl` — canonical, one object per line, unknown fields refused:
+  `{"id", "finding_id", "chunk_id", "chunk_text_sha256", "original",
+  "correction", "issue_type", "context", "label", "reason", "labelled_at"}`;
+  `label` is `good|junk|partial|unsure` or `G|B|P|U`; `labelled_at` RFC 3339
+  or `YYYY-MM-DD`.
+- `bakeoff` — the October 2026 bake-off dumps: a `.json` file or the
+  ```` ```json ```` appendix blocks of a `verdict*.md` (every array of objects
+  carrying `label`, at any depth, `legend` skipped; `id|bid`,
+  `chunk_id|chunk`, `original|orig`, `correction|replacement|corr`;
+  `issue_type` a string or a per-arm map, kept only when the arms agree). The
+  report's `Date:` is the default `labelled_at`.
+- `bakeoff-key` — `judge_items_key.json` with `--labels jlabels.py` (the
+  `"J000":("B","reason"),` dict) or a JSON object `{"J000": ["B", "reason"]}`
+  (a file starting with `{` must be valid JSON).
+
+`--labelled-at` overrides the file's date for items without their own.
+
+**`recipe_scorecard`** — one row per propose recipe that left a finding or
+a judge pass, plus one NULL-recipe row for unattributed legacy findings.
+`judge_passes` columns mean what their writer records (§2.15 "Lineage"):
+`chunks_judged` includes `chunks_cached` and excludes `chunks_failed`;
+`findings_kept` is the rows the pass inserted; `dropped` counts the rest by
+reason (only numeric values are summed). Columns: pass counts by status,
+transcripts judged (`complete` or `legacy` passes), chunks judged / cached /
+failed and the cached share (cached ÷ judged), findings (all, and not
+superseded), findings per 1k chunks judged (`findings_kept` +
+`dropped.already_recorded`, ÷ `chunks_judged`), `issue_mix` and `state_mix`
+(jsonb), `drops`, `parse_failures` (`fn_calls` `judge_chunk` rows with
+`error_class = 'invalid_reply'`; the judge logs every attempt there, §2.15
+"Judge calls" — a cache hit is its own row with `cache_hit`, no cost and
+`cached_from`, and a fallback model's answer is stored under that model's
+recipe with `error_class = 'model_fallback'`, so neither counts as an
+answered call of this recipe), `decisions` (jsonb: per decide recipe, the
+outcome of **that recipe's latest live — unrevoked — decision** on each of
+the recipe's findings, with `outcome:reason` counts), `applied_ever` /
+`reverted` / `revert_rate` (from `finding_events` transitions to `applied` /
+`reverted`), `correction_keys`, `comparable_keys`, `agreed_keys`,
+`agreement_rate` = agreed ÷ comparable: a fix is **comparable** when its
+transcript was also judged by a recipe of **another configuration** (not
+equivalent, §1.9) — a judge pass or a finding of its own there — and
+**agreed** when such a configuration proposed the same key (unattributed
+findings never count as a partner), labelled good / junk / partial / unsure
+counts over the recipe's distinct labelled fixes (the label in force on the
+fix's first finding), the same for its `misheard_proper_noun` findings
+(`proper_noun_*`) — counts only: precision, good ÷ (good + junk + partial),
+is computed by the reader (`db.LabelTally`, `earmark models report`), cost, cost per chunk judged, latency
+p50/p95 (`fn_calls` answered calls when the judge logged calls, else
+`judge_passes` p50/p95 weighted by chunks; `latency_source` says which),
+and first/last activity (last: the latest finding, judge pass, judge call
+or `finding_events` row on its findings). A recipe with no recorded
+(non-`legacy`) pass and no logged judge call is `legacy = true`: its chunk
+counts, cost, latency, drops and parse failures were never recorded and are
+NULL — `earmark models report` prints `n/a (legacy)`, never 0. A recipe with
+both recorded and legacy passes is `mixed = true`: those columns cover its
+recorded passes only, and the report marks them `*`.
+
+**`decide_scorecard`** — one row per decide recipe with a decision or an
+`fn_calls` row: decisions, revoked and the revoke rate, findings decided,
+the live outcome counts, `outcome_evidence` (outcome → evidence → count, per
+live decision), `reasons`, `label_outcomes` (outcome → label counts) and
+`label_calibration` **per distinct labelled fix** (correction key, else the
+finding; `duplicate` findings excluded; the live decision on the fix's first
+finding), `human_calibration` (five p buckets of 0.2, the top one closed at
+1; a finding `decided_by` `mcp:…` in `accepted`/`applied` is an accept, in
+`rejected`/`reverted` a reject), `human_decided` / `human_agree` (live
+applies a human accepted plus live rejects a human rejected),
+`prev_recipe_id` / `flips` / `flip_rate` against the previous decide recipe
+(the latest non-equivalent one to start deciding before this one; each
+recipe's latest decision per finding, revoked or not), and from the
+recipe's `fn_calls` rows (dry runs included): answered calls (not cached,
+no error), cached, errors, `cost_usd` (every non-cached call, failed
+attempts included), `cost_per_call_usd` (the answered calls' cost ÷ their
+number), latency p50/p95 over the answered calls; last activity is the
+latest decision or call.
+
+Readers query the views with **JIT off** (`SET LOCAL jit = off` in a
+read-only transaction): their CTE row estimates push the planner's cost
+over `jit_above_cost`, and LLVM compilation then dominates. Measured on a
+synthetic dataset of the live scale (33k findings, 4.3k transcripts, 67k
+finding events, 135k `fn_calls`, 15.6k judge passes, 1.5k labels; local
+Postgres 16): see `docs/design/audit-lineage.md` "Cost".
+
+**`earmark models report [--since <date>] [--step propose|decide] [--json]`**
+prints both scorecards — a summary table and one block per recipe, oldest
+first; `--since` keeps recipes whose last activity (as defined above) is at
+or after the date; `--json` is the rows as the views return them (precision
+and calibration rates filled in).
 
 #### Dashboard surfaces (read-only)
 
