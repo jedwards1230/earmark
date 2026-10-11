@@ -2033,7 +2033,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `EMBED_BATCH_SIZE` | no | `32`. Max transcripts the embed worker selects **per poll cycle** for BOTH gated-flow (`EVAL_GATES_EMBED`) passes — the eval pass and the embed pass each `… ORDER BY t.created_at ASC LIMIT $1`. Bounds the worker's per-cycle memory: an unbounded selection loads every matching transcript's `segments` JSONB into one slice, which OOM-kills the pod on a large backlog (e.g. a full re-embed after re-segmentation). The worker drains a backlog across cycles — a transcript that gets eval'd/embedded drops out of the next cycle's selection — and **loops immediately (no `pollInterval` sleep) whenever a pass returns a full batch**, so a multi-thousand-item backlog drains in back-to-back cycles rather than one batch per poll interval. Must be a **positive integer** — a non-positive or non-numeric value is fatal at startup (the OOM guard must never silently round-trip to unbounded). The ungated single-pass selection (`GetCompletedTranscripts`) is bounded by the same value but **keyset-paged** (`ORDER BY created_at, id`, `(created_at, id) > cursor`, `LIMIT`): each cycle walks every page, embedding one page before loading the next, so memory is bounded by one page while transcripts that keep failing to embed can never starve the ones behind them; the worker then sleeps `pollInterval` unless something was embedded (no hot retry of a failing transcript). |
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
-| `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `5`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
+| `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `12`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
 | `EVAL_REASONING_EFFORT` | no | `auto`. The judge request's `reasoning_effort`. `auto`: `"none"` for local models, omitted when the model id contains `anthropic/` (aliases that hide the provider need `omit`); `omit`: never sent; any other value is sent verbatim. See §2.15. |
 | `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto`. The judge request's `chat_template_kwargs`. `auto`: `{"enable_thinking": false}` for local models, omitted when the model id contains `anthropic/` (aliases that hide the provider need `omit`); `omit`: never sent; a JSON object is sent verbatim. Anything else is a configuration error (the eval client fails to resolve). See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
@@ -3379,9 +3379,17 @@ the judge's over-flagging, in this order:
    findings were ~100% real while the low tail was mostly noise, so the floor
    trades a little recall for precision.
 2. **Per-chunk cap.** The survivors are capped at `EVAL_MAX_FINDINGS_PER_CHUNK`
-   (default **5**, `<= 0` disables) — when a chunk exceeds the cap the
+   (default **12**, `<= 0` disables) — when a chunk exceeds the cap the
    **highest-confidence** findings are kept and the remainder dropped (logged at
-   DEBUG).
+   DEBUG). The cap counts rows, and a name misheard several times in one chunk
+   is one row per occurrence: each finding anchors to a single occurrence
+   (`anchor_occurrence`, §2.17), so repeats are never collapsed. The default
+   was 5 until a 150-chunk bake-off showed a 96%-precision judge losing 16
+   findings to `over_cap`, 13 of them good name fixes; with the pre-filters and
+   floor running first, the cap is now only a bound on a runaway reply. The cap
+   is a recipe param (`max_findings_per_chunk`), so changing it — default or
+   env — is a new `propose` recipe without a `step_version` bump (§1.9). The
+   judge prompt states no count, so it needs no prompt-version bump either.
 
 All are per-chunk and applied before persistence, so they bound noise without
 affecting how many chunks are evaluated. Every dropped finding is reported with

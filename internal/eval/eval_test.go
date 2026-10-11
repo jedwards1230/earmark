@@ -118,34 +118,124 @@ func manyFindingsJSON(n int) string {
 	return b.String()
 }
 
-func TestJudgeChunk_CapsPerChunkKeepingHighestConfidence(t *testing.T) {
-	// Feed 12 findings (confidence 0.99 desc, all above the floor) and expect
-	// the top defaultMaxFindingsPerChunk by confidence to survive.
-	t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "") // exercise the default
-	chat := &fakeChat{resp: manyFindingsJSON(12)}
-	j := NewJudge(chat)
-	res, err := j.JudgeChunk(context.Background(), manyFindingsChunk(12))
-	if err != nil {
-		t.Fatalf("JudgeChunk: %v", err)
-	}
-	if len(res.Findings) != defaultMaxFindingsPerChunk {
-		t.Fatalf("want %d findings after cap, got %d", defaultMaxFindingsPerChunk, len(res.Findings))
-	}
-	// The retained set must be the highest-confidence ones: every kept finding's
-	// confidence >= every dropped one's. finding-00 (0.99) must be present;
-	// finding-11 (0.88, the lowest) must be gone.
-	kept := map[string]bool{}
-	for _, f := range res.Findings {
-		kept[f.OriginalText] = true
-		if f.Confidence < 0.99-float64(defaultMaxFindingsPerChunk-1)*0.01-1e-9 {
-			t.Errorf("kept a low-confidence finding %q (conf %.2f) — cap must keep the highest", f.OriginalText, f.Confidence)
+// repeatedNameJSON builds a judge response that fixes the same misheard name
+// at each of its n occurrences in repeatedNameChunk(n) — one finding per
+// occurrence, as the patch path needs — followed by `others` distinct fixes
+// of the other-NN spans.
+func repeatedNameJSON(n, others int) string {
+	text := repeatedNameChunk(n, others).Text
+	var b strings.Builder
+	b.WriteString(`{"findings":[`)
+	off := 0
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
 		}
+		off += strings.Index(text[off:], "auto sebo")
+		fmt.Fprintf(&b, `{"original_text":"auto sebo","issue_type":"misheard_proper_noun","suggested_correction":"arecibo","confidence":0.95,"anchor_offset":%d,"anchor_occurrence":%d}`, off, i)
+		off++
 	}
-	if !kept["finding-00"] {
-		t.Error("highest-confidence finding (finding-00) was dropped")
+	for i := 0; i < others; i++ {
+		fmt.Fprintf(&b, `,{"original_text":"other-%02d","issue_type":"misheard_word","suggested_correction":"fix-%02d","confidence":0.7}`, i, i)
 	}
-	if kept["finding-11"] {
-		t.Error("lowest-confidence finding (finding-11) was kept — should have been truncated")
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// repeatedNameChunk mentions "auto sebo" n times, then holds `others` other
+// spans.
+func repeatedNameChunk(n, others int) db.EvalChunk {
+	parts := make([]string, 0, n+others)
+	for i := 0; i < n; i++ {
+		parts = append(parts, "the dish at auto sebo")
+	}
+	for i := 0; i < others; i++ {
+		parts = append(parts, fmt.Sprintf("other-%02d", i))
+	}
+	return chunkWith(strings.Join(parts, " "))
+}
+
+// TestJudgeChunk_PerChunkCap: the default cap leaves room for a misheard name
+// repeated through a chunk (each occurrence its own row, as patch anchoring
+// needs) alongside other fixes, while a chunk with genuinely many findings is
+// still bounded to the highest-confidence ones and the rest are counted as
+// over_cap.
+func TestJudgeChunk_PerChunkCap(t *testing.T) {
+	tests := []struct {
+		name        string
+		resp        string
+		chunk       db.EvalChunk
+		wantKept    int
+		wantOverCap int
+		// wantOccurrences: the auto sebo → arecibo rows must cover these
+		// anchor_occurrence values, one row each.
+		wantOccurrences int
+	}{
+		{
+			// The bake-off shape that the old cap of 5 broke: one name misheard
+			// seven times plus four other fixes. All eleven are kept.
+			name:            "repeated name fixes survive",
+			resp:            repeatedNameJSON(7, 4),
+			chunk:           repeatedNameChunk(7, 4),
+			wantKept:        11,
+			wantOccurrences: 7,
+		},
+		{
+			name:     "exactly at the cap",
+			resp:     manyFindingsJSON(defaultMaxFindingsPerChunk),
+			chunk:    manyFindingsChunk(defaultMaxFindingsPerChunk),
+			wantKept: defaultMaxFindingsPerChunk,
+		},
+		{
+			name:        "many distinct findings are still bounded",
+			resp:        manyFindingsJSON(defaultMaxFindingsPerChunk + 8),
+			chunk:       manyFindingsChunk(defaultMaxFindingsPerChunk + 8),
+			wantKept:    defaultMaxFindingsPerChunk,
+			wantOverCap: 8,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EVAL_MAX_FINDINGS_PER_CHUNK", "") // exercise the default
+			t.Setenv("EVAL_MIN_CONFIDENCE", "")
+			res, err := NewJudge(&fakeChat{resp: tc.resp}).JudgeChunk(context.Background(), tc.chunk)
+			if err != nil {
+				t.Fatalf("JudgeChunk: %v", err)
+			}
+			if len(res.Findings) != tc.wantKept {
+				t.Errorf("kept %d findings, want %d (dropped: %+v)", len(res.Findings), tc.wantKept, res.Dropped)
+			}
+			overCap := 0
+			for _, d := range res.Dropped {
+				if d.Reason != DropOverCap {
+					t.Errorf("unexpected %s drop of %q", d.Reason, d.OriginalText)
+					continue
+				}
+				overCap++
+			}
+			if overCap != tc.wantOverCap {
+				t.Errorf("over_cap drops = %d, want %d", overCap, tc.wantOverCap)
+			}
+
+			occ := map[int]bool{}
+			minKept := 1.0
+			for _, f := range res.Findings {
+				minKept = min(minKept, f.Confidence)
+				if f.OriginalText == "auto sebo" && f.AnchorOccurrence != nil {
+					occ[*f.AnchorOccurrence] = true
+				}
+			}
+			if len(occ) != tc.wantOccurrences {
+				t.Errorf("repeated-name rows cover %d occurrences, want %d", len(occ), tc.wantOccurrences)
+			}
+			// The cap keeps the highest-confidence findings: nothing dropped
+			// outranks anything kept.
+			for _, d := range res.Dropped {
+				if d.Confidence > minKept+1e-9 {
+					t.Errorf("dropped %q (conf %.2f) outranks a kept finding (conf %.2f)", d.OriginalText, d.Confidence, minKept)
+				}
+			}
+		})
 	}
 }
 

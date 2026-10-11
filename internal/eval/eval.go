@@ -37,11 +37,19 @@ import (
 // single chunk. The judge over-flags in practice (one chunk produced 31;
 // llama3.2:3b and qwen2.5:7b both averaged ~3/chunk over a 50-chunk sample, but
 // the tail is long), so a per-chunk cap keeps the highest-confidence signal and
-// drops the noisy remainder. Lowered 8 → 5 with taxonomy rev 2: a ~10-minute
-// chunk with more than a handful of genuine ASR errors is rare, so a tighter cap
-// trims the over-flagged tail. Tunable via EVAL_MAX_FINDINGS_PER_CHUNK; <= 0
+// drops the noisy remainder. Tunable via EVAL_MAX_FINDINGS_PER_CHUNK; <= 0
 // disables the cap.
-const defaultMaxFindingsPerChunk = 5
+//
+// History: 8, lowered to 5 with taxonomy rev 2, raised to 12 once the
+// pre-filters and confidence floor ran ahead of the cap. At 5 the cap was
+// discarding good fixes: a misheard name repeats within a chunk, and every
+// occurrence is its own finding (internal/patch anchors each row to ONE
+// occurrence via anchor_occurrence, so the repeats cannot be collapsed into a
+// single row without leaving the other occurrences unpatched). In a 150-chunk
+// bake-off a 96%-precision judge lost 16 findings to over_cap, 13 of them good
+// name fixes. 12 still bounds a runaway reply; the junk it once trimmed is now
+// dropped by prefilter and the floor before it reaches the cap.
+const defaultMaxFindingsPerChunk = 12
 
 // defaultMinConfidence is the floor below which a finding is dropped. A
 // ground-truth audit found high-confidence (≥0.8) findings were ~100% real while
@@ -164,6 +172,8 @@ type ModelPin struct {
 // filtering, capping, anchoring) changes which findings it writes (§1.9).
 // 2: the deterministic pre-filters (prefilter), and cosmetic_only made rung
 // 0's own test (spacing and same-reading number re-spellings count).
+// Changing only a threshold (min_confidence, max_findings_per_chunk) needs no
+// bump: both are recipe params, so a new value is already a new recipe.
 const proposeStepVersion = 2
 
 // NewJudge constructs a Judge backed by the given chat client.
