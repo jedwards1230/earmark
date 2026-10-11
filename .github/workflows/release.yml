@@ -158,7 +158,7 @@ jobs:
                 DEV_ONLY_DIFF=true
               else
                 FIRST_PRODUCT=$(comm -23 <(printf '%s\n' "${CHANGED[@]}") \
-                  <(printf '%s\n' "${MATCHED[@]}" | sort -u) | head -n1)
+                  <(printf '%s\n' "${MATCHED[@]}" | sort -u) | sed -n 1p)
               fi
             fi
           fi
@@ -196,7 +196,7 @@ jobs:
           echo "dry_run=false" >> "$GITHUB_OUTPUT"
           if [ "$DEV_ONLY_DIFF" = true ]; then
             COUNT=$(printf '%s\n' "$FILES" | wc -l)
-            echo "::notice::Dev-only rule: all ${COUNT} changed file(s) in PR #${PR} are dev-only (e.g. $(printf '%s\n' "$FILES" | head -3 | paste -sd, -)) -- skipping release"
+            echo "::notice::Dev-only rule: all ${COUNT} changed file(s) in PR #${PR} are dev-only (e.g. $(printf '%s\n' "$FILES" | sed -n 1,3p | paste -sd, -)) -- skipping release"
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::PR #${PR} releases as patch; first non-dev-only file: ${FIRST_PRODUCT}"
