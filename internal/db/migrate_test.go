@@ -443,3 +443,85 @@ func TestAuditLineageMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestFindingLabelsMigration pins 00014: the correction-key function is the
+// 13 column expression verbatim, finding_labels refuses UPDATE, DELETE and
+// TRUNCATE, its key and target are generated, labels follow a re-anchor,
+// Down refuses to drop labels without earmark.allow_data_loss and then drops
+// everything, and resetSQL drops the new objects.
+func TestFindingLabelsMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00014_finding_labels_scorecard.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	b13, err := migrationFiles.ReadFile("migrations/00013_audit_lineage.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	up13, _, _ := strings.Cut(string(b13), "-- +goose Down")
+	expr := func(src, start string) string {
+		i := strings.Index(src, start)
+		j := strings.Index(src[i:], " END")
+		if i < 0 || j < 0 {
+			return ""
+		}
+		return src[i : i+j]
+	}
+	// The same CASE … END: the function's parameters carry 13's column names.
+	want := expr(norm(stripSQLComments(up13)), "CASE WHEN chunk_text_sha256 IS NULL THEN NULL")
+	got := expr(up, "CASE WHEN chunk_text_sha256 IS NULL THEN NULL")
+	if want == "" || got != want {
+		t.Errorf("finding_correction_key must repeat 13's correction_key expression:\n 13: %s\n 14: %s", want, got)
+	}
+	for _, want := range []string{
+		"SET LOCAL lock_timeout = '5s'",
+		"CREATE FUNCTION finding_correction_key(chunk_text_sha256 TEXT, original_text TEXT, suggested_correction TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE",
+		"CREATE TABLE finding_labels",
+		"CHECK (label IN ('good', 'junk', 'partial', 'unsure'))",
+		"GENERATED ALWAYS AS (finding_correction_key(chunk_text_sha256, original, correction)) STORED",
+		"(COALESCE(finding_correction_key(chunk_text_sha256, original, correction), 'finding:' || finding_id::text)) STORED",
+		"CREATE INDEX finding_labels_set_target_idx ON finding_labels (label_set, labeler, target, id DESC)",
+		"BEFORE UPDATE OR DELETE ON finding_labels FOR EACH ROW",
+		"BEFORE TRUNCATE ON finding_labels FOR EACH STATEMENT",
+		"CREATE VIEW finding_label_current",
+		"e.reason IN ('reanchor_moved', 'reanchor_placed')",
+		"ORDER BY finding_id, (labeler LIKE 'human:%') DESC, labelled_at DESC, id DESC",
+		"CREATE VIEW recipe_scorecard",
+		"CREATE VIEW decide_scorecard",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("00014 Up is missing %q", want)
+		}
+	}
+	if strings.Contains(strings.ToUpper(up), "ALTER TABLE") {
+		t.Error("00014 must not alter an existing table")
+	}
+	for _, want := range []string{
+		"refusing to roll back migration 14",
+		"current_setting('earmark.allow_data_loss', true)",
+		"DROP VIEW decide_scorecard", "DROP VIEW recipe_scorecard", "DROP VIEW finding_label_current",
+		"DROP TABLE finding_labels", "DROP FUNCTION finding_labels_append_only()",
+		"DROP FUNCTION finding_correction_key(TEXT, TEXT, TEXT)",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("00014 Down is missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"DROP TABLE    IF EXISTS finding_labels",
+		"DROP VIEW     IF EXISTS recipe_scorecard",
+		"DROP VIEW     IF EXISTS decide_scorecard",
+		"DROP VIEW     IF EXISTS finding_label_current",
+		"DROP FUNCTION IF EXISTS finding_labels_append_only()",
+		"DROP FUNCTION IF EXISTS finding_correction_key(TEXT, TEXT, TEXT)",
+	} {
+		if !strings.Contains(resetSQL, want) {
+			t.Errorf("resetSQL is missing %q (every migration-created object is reset)", want)
+		}
+	}
+}
