@@ -143,23 +143,31 @@ jobs:
             echo "::notice::.github/.releaseignore is missing or empty -- nothing is dev-only"
             FIRST_PRODUCT="${FILES%%$'\n'*}"
           elif [ -n "$FILES" ]; then
-            mapfile -t CHANGED < <(printf '%s\n' "$FILES" | sort -u)
-            SCRATCH=$(mktemp -d)
-            git init -q "$SCRATCH"
-            printf '%s\0' "${CHANGED[@]}" > "$SCRATCH.paths"
-            rc=0
-            git -C "$SCRATCH" -c core.excludesFile="$RELEASEIGNORE" \
-              check-ignore --no-index -z --stdin < "$SCRATCH.paths" > "$SCRATCH.matched" || rc=$?
-            if [ "$rc" -gt 1 ]; then
-              CLASSIFY_ERR=1
-            else
-              mapfile -d '' MATCHED < "$SCRATCH.matched"
+            # Every step is guarded: any failure here (mktemp, git, I/O) sets
+            # CLASSIFY_ERR=1 instead of aborting the job under errexit. A function
+            # run in an `if` context ignores errexit, hence the explicit `|| return 1`.
+            classify() {
+              local rc=0 SCRATCH
+              mapfile -t CHANGED < <(printf '%s\n' "$FILES" | sort -u) || return 1
+              [ "${#CHANGED[@]}" -gt 0 ] || return 1
+              SCRATCH=$(mktemp -d) || return 1
+              git init -q "$SCRATCH" || return 1
+              printf '%s\0' "${CHANGED[@]}" > "$SCRATCH.paths" || return 1
+              git -C "$SCRATCH" -c core.excludesFile="$RELEASEIGNORE" \
+                check-ignore --no-index -z --stdin < "$SCRATCH.paths" > "$SCRATCH.matched" || rc=$?
+              [ "$rc" -le 1 ] || return 1
+              mapfile -d '' MATCHED < "$SCRATCH.matched" || return 1
               if [ "${#MATCHED[@]}" -eq "${#CHANGED[@]}" ]; then
                 DEV_ONLY_DIFF=true
               else
                 FIRST_PRODUCT=$(comm -23 <(printf '%s\n' "${CHANGED[@]}") \
-                  <(printf '%s\n' "${MATCHED[@]}" | sort -u) | sed -n 1p)
+                  <(printf '%s\n' "${MATCHED[@]}" | sort -u) | sed -n 1p) || return 1
               fi
+            }
+            if ! classify; then
+              CLASSIFY_ERR=1
+              DEV_ONLY_DIFF=false
+              echo "::warning::Could not evaluate .github/.releaseignore for PR #${PR}"
             fi
           fi
 
@@ -177,9 +185,7 @@ jobs:
               echo "type=patch" >> "$GITHUB_OUTPUT"
               echo "release=false" >> "$GITHUB_OUTPUT"
             else
-              if [ "$CLASSIFY_ERR" = 1 ]; then
-                echo "::warning::Could not evaluate .github/.releaseignore for PR #${PR}; skipping the dev-only check"
-              elif [ "$DEV_ONLY_DIFF" = true ]; then
+              if [ "$DEV_ONLY_DIFF" = true ]; then
                 echo "::warning::PR #${PR} carries semver:${LABEL_TYPE} but its diff is dev-only; semver:none (or no label) would skip the release"
               fi
               echo "type=${LABEL_TYPE}" >> "$GITHUB_OUTPUT"
@@ -191,7 +197,7 @@ jobs:
 
           # Rule 2: no label -- decide from the changed files.
           [ -n "$FILES" ] || fallback "Could not list changed files for PR #${PR}"
-          [ "$CLASSIFY_ERR" = 0 ] || fallback "git check-ignore failed on .github/.releaseignore for PR #${PR}"
+          [ "$CLASSIFY_ERR" = 0 ] || fallback "Could not evaluate .github/.releaseignore for PR #${PR}"
           echo "type=patch" >> "$GITHUB_OUTPUT"
           echo "dry_run=false" >> "$GITHUB_OUTPUT"
           if [ "$DEV_ONLY_DIFF" = true ]; then
