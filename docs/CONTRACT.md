@@ -3105,7 +3105,8 @@ it wins:
 
 `auto` in a layer means the route default (it does not fall through to the
 next layer); `omit` never sends the field. An invalid value in any layer — an
-effort with whitespace or of another type, kwargs that are not a JSON object —
+effort with whitespace or of another type, kwargs that are not a non-empty
+JSON object (`{}` could never be sent; use `omit`) —
 is a configuration error naming the layer: `earmark models set` refuses it,
 and the judge refuses to start (never a silent fallback to the next layer).
 `earmark models` and the Models page's Judge card show the knobs the judge

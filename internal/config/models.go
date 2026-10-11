@@ -227,8 +227,14 @@ func ReasoningEffortParam(v any) (string, error) {
 // accepts an object (YAML / a JSON params document) or a string holding
 // "auto", "omit" or a JSON object (a --param flag).
 func ChatTemplateKwargsParam(v any) (string, error) {
+	// An empty object is refused: the judge request drops an empty
+	// chat_template_kwargs (omitempty), so it could never take effect.
+	const want = "must be \"auto\", \"omit\" or a non-empty JSON object"
 	switch t := v.(type) {
 	case map[string]any:
+		if len(t) == 0 {
+			return "", fmt.Errorf("%s (use omit), got {}", want)
+		}
 		b, err := json.Marshal(t)
 		if err != nil {
 			return "", fmt.Errorf("must be a JSON object: %w", err)
@@ -240,12 +246,12 @@ func ChatTemplateKwargsParam(v any) (string, error) {
 			return l, nil
 		}
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(s), &obj); err != nil || obj == nil {
-			return "", fmt.Errorf("must be \"auto\", \"omit\" or a JSON object, got %q", t)
+		if err := json.Unmarshal([]byte(s), &obj); err != nil || len(obj) == 0 {
+			return "", fmt.Errorf("%s, got %q", want, t)
 		}
 		return s, nil
 	}
-	return "", fmt.Errorf("must be \"auto\", \"omit\" or a JSON object, got %v", v)
+	return "", fmt.Errorf("%s, got %v", want, v)
 }
 
 // loadModelRegistry reads MODELS_FILE into c.Models and checks every pinned

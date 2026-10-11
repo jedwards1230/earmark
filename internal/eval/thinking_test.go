@@ -77,6 +77,8 @@ func TestResolveThinking_Invalid(t *testing.T) {
 		{name: "setting effort with whitespace", setting: ThinkingSetting{ReasoningEffort: "lo w"}, wantErr: "propose model setting param reasoning_effort"},
 		{name: "setting kwargs array", setting: ThinkingSetting{ChatTemplateKwargs: "[1]"}, wantErr: "propose model setting param chat_template_kwargs"},
 		{name: "setting kwargs null", setting: ThinkingSetting{ChatTemplateKwargs: "null"}, wantErr: "chat_template_kwargs"},
+		{name: "setting kwargs empty object", setting: ThinkingSetting{ChatTemplateKwargs: "{}"}, wantErr: "non-empty JSON object"},
+		{name: "env kwargs empty object", kwargsEnv: " {} ", wantErr: envChatTemplateKwargs},
 		{name: "env kwargs not JSON", kwargsEnv: "{nope", wantErr: envChatTemplateKwargs},
 		{name: "env effort with whitespace", effortEnv: "very low", wantErr: envReasoningEffort},
 		{name: "setting shadows a bad env", setting: ThinkingSetting{ChatTemplateKwargs: "omit"}, kwargsEnv: "{nope"},

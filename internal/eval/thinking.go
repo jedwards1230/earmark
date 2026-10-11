@@ -112,9 +112,11 @@ func ResolveThinking(model string, s ThinkingSetting) (Thinking, error) {
 		t.ChatTemplateKwargs = autoKwargs
 	case thinkingOmit:
 	default:
+		// An empty object is refused: the request's omitempty would drop it,
+		// so it could never take effect (use "omit").
 		var kwargs map[string]any
-		if err := json.Unmarshal([]byte(raw), &kwargs); err != nil || kwargs == nil {
-			return Thinking{}, fmt.Errorf("%s must be \"auto\", \"omit\" or a JSON object: %q", where, raw)
+		if err := json.Unmarshal([]byte(raw), &kwargs); err != nil || len(kwargs) == 0 {
+			return Thinking{}, fmt.Errorf("%s must be \"auto\", \"omit\" or a non-empty JSON object: %q", where, raw)
 		}
 		t.ChatTemplateKwargs = kwargs
 	}

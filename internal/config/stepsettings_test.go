@@ -117,9 +117,11 @@ func TestStepSettingsValidation(t *testing.T) {
 		{"blank reasoning_effort", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
 			Params: map[string]any{ParamReasoningEffort: " "}}, "reasoning_effort must be a non-empty token"},
 		{"kwargs not an object", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
-			Params: map[string]any{ParamChatTemplateKwargs: "[1]"}}, `chat_template_kwargs must be "auto", "omit" or a JSON object`},
+			Params: map[string]any{ParamChatTemplateKwargs: "[1]"}}, `chat_template_kwargs must be "auto", "omit" or a non-empty JSON object`},
 		{"kwargs a number", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
 			Params: map[string]any{ParamChatTemplateKwargs: 3.0}}, "chat_template_kwargs must be"},
+		{"kwargs empty object", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamChatTemplateKwargs: "{}"}}, "non-empty JSON object"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -417,7 +419,7 @@ func TestChatTemplateKwargsParam(t *testing.T) {
 	got, err := ChatTemplateKwargsParam(map[string]any{"b": true, "a": 1})
 	require.NoError(t, err)
 	assert.Equal(t, `{"a":1,"b":true}`, got)
-	for _, bad := range []any{"", "null", "[]", "{", 1.0, true, []any{"x"}} {
+	for _, bad := range []any{"", "null", "[]", "{", "{}", map[string]any{}, 1.0, true, []any{"x"}} {
 		_, err := ChatTemplateKwargsParam(bad)
 		assert.Error(t, err, "%v", bad)
 	}
