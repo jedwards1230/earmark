@@ -41,7 +41,8 @@
 --
 -- Precision = good / (good + junk + partial): 'partial' (right target, still
 -- misspelt) is NOT a usable patch, so it counts against, as the bake-off
--- verdicts scored it; 'unsure' is excluded. Both scorecards count distinct
+-- verdicts scored it; 'unsure' is excluded. The views expose the counts;
+-- readers (db.LabelTally) compute the ratio. Both scorecards count distinct
 -- labelled fixes (correction_key, else the finding) per recipe, never label
 -- rows or decisions; duplicates (patch_state 'duplicate') are left out of
 -- the decide label counts.
@@ -410,12 +411,10 @@ SELECT p.recipe_id,
        COALESCE(lab.junk, 0)::bigint AS labelled_junk,
        COALESCE(lab.partial, 0)::bigint AS labelled_partial,
        COALESCE(lab.unsure, 0)::bigint AS labelled_unsure,
-       (lab.good::float8 / NULLIF(lab.good + lab.junk + lab.partial, 0)) AS label_precision,
        COALESCE(lab.pn_good, 0)::bigint AS proper_noun_good,
        COALESCE(lab.pn_junk, 0)::bigint AS proper_noun_junk,
        COALESCE(lab.pn_partial, 0)::bigint AS proper_noun_partial,
        COALESCE(lab.pn_unsure, 0)::bigint AS proper_noun_unsure,
-       (lab.pn_good::float8 / NULLIF(lab.pn_good + lab.pn_junk + lab.pn_partial, 0)) AS proper_noun_precision,
        jp.cost_usd::float8 AS cost_usd,
        (jp.cost_usd / NULLIF(jp.costed_chunks, 0))::float8 AS cost_per_chunk_usd,
        COALESCE(calls.call_latency_ms_p50, jp.pass_latency_ms_p50) AS latency_ms_p50,

@@ -849,7 +849,7 @@ and reason. Views:
 - `recipe_scorecard` — one row per propose recipe (plus a NULL-recipe row):
   coverage, findings per 1k chunks, issue/state mix, drops, parse failures,
   decide outcomes per decide recipe, revert rate, agreement over comparable
-  fixes, labelled precision (overall and `misheard_proper_noun`), cost and
+  fixes, label counts (overall and `misheard_proper_noun`; readers compute precision), cost and
   latency. `legacy = true` when the recipe has no recorded judge pass and no
   logged judge call (the per-chunk columns are then NULL); `mixed = true` when
   it has both kinds of pass (they cover the recorded ones).

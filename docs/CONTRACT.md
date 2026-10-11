@@ -4014,9 +4014,10 @@ transcript was also judged by a recipe of **another configuration** (not
 equivalent, §1.9) — a judge pass or a finding of its own there — and
 **agreed** when such a configuration proposed the same key (unattributed
 findings never count as a partner), labelled good / junk / partial / unsure
-and `label_precision` over the recipe's distinct labelled fixes (the label
-in force on the fix's first finding), the same for its
-`misheard_proper_noun` findings, cost, cost per chunk judged, latency
+counts over the recipe's distinct labelled fixes (the label in force on the
+fix's first finding), the same for its `misheard_proper_noun` findings
+(`proper_noun_*`) — counts only: precision, good ÷ (good + junk + partial),
+is computed by the reader (`db.LabelTally`, `earmark models report`), cost, cost per chunk judged, latency
 p50/p95 (`fn_calls` answered calls when the judge logged calls, else
 `judge_passes` p50/p95 weighted by chunks; `latency_source` says which),
 and first/last activity (last: the latest finding, judge pass, judge call
