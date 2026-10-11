@@ -2,13 +2,19 @@ package eval
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -415,5 +421,145 @@ func TestPassClose(t *testing.T) {
 	}
 	if cl := PassClose(RunStats{ChunksEvaluated: 2}, 5, context.Canceled); cl.ChunksFailed != 3 {
 		t.Errorf("unreached chunks must count as failed: %+v", cl)
+	}
+}
+
+// TestJudgeChunk_CacheKeyCoversModelIdentity: a new pinned revision or a new
+// expected model on the same alias is a cache MISS (never the old model's
+// reply served as the new one's), and every call leaves exactly one row.
+func TestJudgeChunk_CacheKeyCoversModelIdentity(t *testing.T) {
+	log := &memCallLog{}
+	judge := func(pin ModelPin) *fakeChat {
+		t.Helper()
+		chat := &fakeChat{resp: validReply}
+		j := NewJudge(chat)
+		j.SetModelPin(pin)
+		j.SetCallLog(log)
+		if _, err := j.JudgeChunk(context.Background(), pinNameChunk()); err != nil {
+			t.Fatal(err)
+		}
+		return chat
+	}
+	steps := []struct {
+		name      string
+		pin       ModelPin
+		wantCalls int
+		wantRows  int
+	}{
+		{"first call", ModelPin{Revision: "r1"}, 1, 1},
+		{"same identity is served", ModelPin{Revision: "r1"}, 0, 2}, // + the cache-hit row
+		{"revision bump misses", ModelPin{Revision: "r2"}, 1, 3},
+		{"expected model change misses", ModelPin{Revision: "r2", ExpectedModel: "fake-judge-2026"}, 1, 4},
+	}
+	for _, st := range steps {
+		chat := judge(st.pin)
+		if chat.calls != st.wantCalls || len(log.all()) != st.wantRows {
+			t.Fatalf("%s: %d calls, %d rows; want %d, %d", st.name, chat.calls, len(log.all()), st.wantCalls, st.wantRows)
+		}
+	}
+	var in judgeCallInput
+	if err := json.Unmarshal(log.all()[3].Input, &in); err != nil {
+		t.Fatal(err)
+	}
+	if in.ExpectedModel != "fake-judge-2026" || in.ModelRevision != "r2" || in.StepVersion != proposeStepVersion {
+		t.Errorf("input identity %+v", in)
+	}
+}
+
+// TestJudgeChunk_PaidCallNeverDropped: when another row already holds the
+// cache slot but does not serve (here: answered by another model), the paid
+// reply is still logged — as cache_slot_taken — and the findings point at it.
+func TestJudgeChunk_PaidCallNeverDropped(t *testing.T) {
+	log := &memCallLog{}
+	j := NewJudge(&fakeChat{resp: validReply})
+	j.SetCallLog(log)
+	if _, err := j.JudgeChunk(context.Background(), pinNameChunk()); err != nil {
+		t.Fatal(err)
+	}
+	log.mu.Lock()
+	log.rows[0].ModelResolved = "some-other-model" // holds the slot, never serves
+	log.mu.Unlock()
+
+	chat := &fakeChat{resp: validReply}
+	j2 := NewJudge(chat)
+	j2.SetCallLog(log)
+	res, err := j2.JudgeChunk(context.Background(), pinNameChunk())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := log.all()
+	if chat.calls != 1 || len(rows) != 2 || rows[1].ErrorClass != ErrorClassCacheSlotTaken || len(rows[1].Output) == 0 {
+		t.Fatalf("calls %d, rows %+v: want the paid reply logged as cache_slot_taken", chat.calls, rows)
+	}
+	if res.FnCallID == nil || *res.FnCallID != rows[1].ID || *res.Findings[0].FnCallID != rows[1].ID {
+		t.Errorf("findings not pointed at the logged paid call %d", rows[1].ID)
+	}
+}
+
+// TestTransient: which call failures are retried.
+func TestTransient(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want bool
+	}{
+		"attempt deadline":      {fmt.Errorf("chat request: %w", context.DeadlineExceeded), true},
+		"net timeout":           {&url.Error{Op: "Post", URL: "u", Err: timeoutErr{}}, true},
+		"connection reset":      {&url.Error{Op: "Post", URL: "u", Err: &net.OpError{Op: "read", Err: syscall.ECONNRESET}}, true},
+		"connection refused":    {&url.Error{Op: "Post", URL: "u", Err: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}}, true},
+		"EOF on request":        {&url.Error{Op: "Post", URL: "u", Err: io.EOF}, true},
+		"reset reading body":    {fmt.Errorf("read chat response: %w", io.ErrUnexpectedEOF), true},
+		"x509 unknown CA":       {&url.Error{Op: "Post", URL: "u", Err: x509.UnknownAuthorityError{}}, false},
+		"tls verify":            {&url.Error{Op: "Post", URL: "u", Err: &tls.CertificateVerificationError{Err: x509.HostnameError{}}}, false},
+		"bad URL":               {&url.Error{Op: "parse", URL: "::", Err: errors.New("missing protocol scheme")}, false},
+		"unmarshal of the body": {fmt.Errorf("unmarshal chat response: %w", errors.New("invalid character")), false},
+		"caller cancelled":      {context.Canceled, false},
+	}
+	for name, tc := range cases {
+		if got := transient(tc.err); got != tc.want {
+			t.Errorf("%s: transient = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+// reportedChat reports a resolved model (ModelReportingClient).
+type reportedChat struct{ resolved string }
+
+func (c reportedChat) Complete(context.Context, string, string) (string, error) {
+	return validReply, nil
+}
+func (c reportedChat) Model() string { return "fake-judge" }
+func (c reportedChat) CompleteWithModel(context.Context, string, string) (Completion, error) {
+	return Completion{Content: validReply, ResolvedModel: c.resolved}, nil
+}
+
+// TestFallbackIsCounted: a reply from another model than the recipe expects
+// is flagged and counted (RunStats.ChunksFallback), and its fn_calls row is
+// model_fallback — never served, so the next run pays again.
+func TestFallbackIsCounted(t *testing.T) {
+	log := &memCallLog{}
+	j := NewJudge(reportedChat{resolved: "fake-judge-2026-10-01"})
+	j.SetCallLog(log)
+	_, stats, err := JudgeChunks(context.Background(), j, []db.EvalChunk{pinNameChunk()}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ChunksFallback != 1 || log.all()[0].ErrorClass != db.ErrorClassModelFallback {
+		t.Fatalf("fallback %d, row %+v", stats.ChunksFallback, log.all()[0])
+	}
+	_, stats, _ = JudgeChunks(context.Background(), j, []db.EvalChunk{pinNameChunk()}, nil, nil)
+	if stats.ChunksCached != 0 || stats.ChunksFallback != 1 {
+		t.Errorf("a fallback reply was served from cache: %+v", stats)
+	}
+	// A reply by the expected model (route prefix aside) is no fallback.
+	_, stats, _ = JudgeChunks(context.Background(), NewJudge(reportedChat{resolved: "openrouter/fake-judge"}),
+		[]db.EvalChunk{pinNameChunk()}, nil, nil)
+	if stats.ChunksFallback != 0 {
+		t.Errorf("same model behind a route prefix counted as fallback")
 	}
 }

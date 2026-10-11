@@ -3,16 +3,19 @@ package eval
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
@@ -29,6 +32,15 @@ const JudgeChunkFn = "judge_chunk"
 // ErrorClassInvalidReply is the fn_calls.error_class (and error.type) of a
 // reply that has content but is not valid findings JSON.
 const ErrorClassInvalidReply = "invalid_reply"
+
+// ErrorClassCacheSlotTaken is the fn_calls.error_class of a successful, paid
+// reply whose cache slot another row already held when it was logged (two
+// identical calls in flight at once). The row keeps the reply and its cost;
+// it is never served.
+const ErrorClassCacheSlotTaken = "cache_slot_taken"
+
+// logCallTimeout bounds one fn_calls write of the judge.
+const logCallTimeout = 30 * time.Second
 
 // ErrInvalidReply means the reply had content that is not valid findings
 // JSON. The chunk FAILED: it is never read as "no findings" (that would be
@@ -120,15 +132,40 @@ func (j *Judge) retryDelay(ctx context.Context, err error, attempt int) (time.Du
 		}
 		return j.policy.backoff(attempt), true
 	}
-	if replyLevel(err) {
+	if replyLevel(err) || !transient(err) {
 		return 0, false
 	}
-	var ne net.Error
-	var ue *url.Error
-	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) || errors.As(err, &ue) {
-		return j.policy.backoff(attempt), true
+	return j.policy.backoff(attempt), true
+}
+
+// transient reports whether a call failure is worth another attempt: the
+// attempt's deadline, a network timeout, a connection refused or reset, or a
+// connection that closed mid-reply (EOF / unexpected EOF, also while reading
+// the body). Never a TLS certificate failure, nor a url.Error that wraps no
+// network failure (a bad URL, an unsupported scheme): those fail the same way
+// every time.
+func transient(err error) bool {
+	if certificateError(err) {
+		return false
 	}
-	return 0, false
+	var ne net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return true
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNREFUSED),
+		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		return true
+	}
+	return false
+}
+
+// certificateError reports a TLS certificate failure.
+func certificateError(err error) bool {
+	var unknown x509.UnknownAuthorityError
+	var invalid x509.CertificateInvalidError
+	var host x509.HostnameError
+	var verify *tls.CertificateVerificationError
+	return errors.As(err, &unknown) || errors.As(err, &invalid) || errors.As(err, &host) || errors.As(err, &verify)
 }
 
 // replyLevel reports whether err is about the reply itself, not getting one.
@@ -182,6 +219,14 @@ type RequestParamsReporter interface {
 // static prompt parts — and model_alias) do not already cover. The recipe's
 // params are not part of the key, so the request params are here.
 type judgeCallInput struct {
+	// ExpectedModel / ModelRevision / StepVersion: the key's model_alias is
+	// the requested id only, so the model the recipe expects to answer, its
+	// pinned revision and the judge's step version are part of the input —
+	// a revision bump or a new expected model on the same alias is a miss,
+	// never a reply of the old model served as the new one's.
+	ExpectedModel string               `json:"expected_model"`
+	ModelRevision string               `json:"model_revision,omitempty"`
+	StepVersion   int                  `json:"step_version"`
 	PromptVersion string               `json:"prompt_version"`
 	FilePath      string               `json:"file_path"`
 	StartSec      float64              `json:"start_sec"`
@@ -252,6 +297,9 @@ func (j *Judge) newCallRecord(c db.EvalChunk, bc BookContext) (*callRecord, erro
 		return nil, nil
 	}
 	in := judgeCallInput{
+		ExpectedModel: j.Recipe().ModelResolved,
+		ModelRevision: j.pin.Revision,
+		StepVersion:   proposeStepVersion,
 		PromptVersion: j.prompt.Version(),
 		FilePath:      c.FilePath,
 		StartSec:      c.StartSec,
@@ -366,7 +414,10 @@ func (j *Judge) logCall(ctx context.Context, call *callRecord, res Result, comp 
 	if call == nil {
 		return 0
 	}
-	ctx = context.WithoutCancel(ctx) // a stop must not lose the row of a paid call
+	// A stop must not lose the row of a paid call; bounded so a stuck
+	// database cannot hold the judge forever.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logCallTimeout)
+	defer cancel()
 	row := db.FnCall{
 		Fn: JudgeChunkFn, PromptVersion: j.prompt.Version(), PromptSHA256: call.key.PromptSHA256,
 		ModelAlias: call.key.ModelAlias, ModelRevision: j.pin.Revision,
@@ -428,9 +479,15 @@ func (j *Judge) logCall(ctx context.Context, call *callRecord, res Result, comp 
 		return 0
 	}
 	if !inserted {
-		// A concurrent identical call holds the cache row; point at it.
-		if src, hit, lerr := j.calls.LookupFnCache(ctx, call.key, expected); lerr == nil && hit {
-			return src.ID
+		// Another successful row already holds this key's cache slot (a
+		// concurrent identical call). This call was paid for and must still
+		// be logged: store it outside the cache index, as cache_slot_taken.
+		row.ErrorClass = ErrorClassCacheSlotTaken
+		id, _, ierr = j.calls.InsertFnCall(ctx, row)
+		if ierr != nil {
+			j.logger.WarnContext(ctx, "logging a judge call in fn_calls failed (continuing)",
+				"chunk_id", res.Chunk.ChunkID, "error", ierr)
+			return 0
 		}
 	}
 	return id
