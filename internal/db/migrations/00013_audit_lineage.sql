@@ -27,15 +27,24 @@
 --                            value is refused), so it survives requeue's
 --                            ON DELETE SET NULL of transcript_id and joins to
 --                            transcript_archive.transcript_id;
---       correction_key       md5 over (chunk_text_sha256, lower(btrim(original_text)),
---                            lower(btrim(suggested_correction))), generated. It
---                            does not include the recipe: two recipes proposing
---                            the same fix to the same chunk text share a key.
---                            Parts are joined with U+001F so ('ab','c') and
---                            ('a','bc') differ; a NULL correction counts as ''.
---                            NULL when the finding has no chunk hash (legacy
---                            rows), because without the chunk revision the text
---                            alone does not identify a fix;
+--       correction_key       md5 over (chunk_text_sha256, norm(original_text),
+--                            norm(suggested_correction)), generated. It does
+--                            not include the recipe: two recipes proposing the
+--                            same fix to the same chunk text share a key. norm
+--                            collapses every whitespace run (ASCII whitespace
+--                            plus NBSP and the other Unicode space separators)
+--                            to one space, trims, and lower-cases with the ICU
+--                            root collation ("und-x-icu"): the live cluster is
+--                            initdb'd LC_CTYPE=C, where plain lower() folds
+--                            ASCII only ('ÉMILE' would not equal 'émile'). No
+--                            accent folding: 'é' and 'e' are different
+--                            corrections. Parts are joined with U+001F so
+--                            ('ab','c') and ('a','bc') differ; a NULL
+--                            correction counts as ''. NULL when the finding has
+--                            no chunk hash (legacy rows), because without the
+--                            chunk revision the text alone does not identify a
+--                            fix. Code that needs the key reads this column; it
+--                            never recomputes it;
 --       duplicate_of         the representative a 'duplicate' finding agrees
 --                            with (ON DELETE SET NULL).
 --   * patch_state gains 'duplicate': a finding that proposes the same
@@ -47,7 +56,9 @@
 --   * finding_events gains anchor_offset, and a second trigger,
 --     transcript_findings_record_reanchor, appends a 'transition' with
 --     from_state = to_state = OLD.patch_state and reason 'reanchor_moved'
---     whenever chunk_text_sha256 or anchor_offset changes, recording the OLD
+--     ('reanchor_placed' when the finding had no anchor_offset yet — a legacy
+--     finding's first anchoring) whenever chunk_text_sha256 or anchor_offset
+--     changes, recording the OLD
 --     hash and offset (the new ones are on the row). When the same UPDATE also
 --     changes patch_state (a re-anchor returning an unanchorable finding to
 --     proposed) the transition trigger fires too: two events, the reanchor one
@@ -56,18 +67,26 @@
 --   * finding_events_record_transition fills reason from the transaction-local
 --     setting earmark.reason (db.SetEventContext), like earmark.actor. Requeue
 --     sets 'requeue', ClearFindings 'cleared'.
+--   * stale_work's propose arm skips 'duplicate' as well as 'superseded': a
+--     duplicate is re-proposed work only through its representative, so
+--     counting both would count one fix twice. Down restores 00009's view.
 --
 -- Backfill.
 --   judge_passes: one 'legacy' row per (transcript, recipe_id) among
 --   origin='judge' findings whose transcript still exists (recipe_id may be
 --   NULL: unstamped findings form their own group), findings_kept = its count,
 --   started/finished = the first/last finding's created_at. Plus one 'legacy'
---   row for every transcript latched as judged (run_metrics.eval_finished_at)
---   that has no judge finding at all, with chunks_total = eval_chunks and the
---   run's eval_started_at/eval_finished_at. Its recipe is resolved from
---   run_metrics.eval_model against the propose recipes' model_alias /
---   model_resolved only when exactly one recipe matches; otherwise recipe_id is
---   NULL — the model name alone cannot say which prompt or params judged it.
+--   row for the latest judge run of every transcript latched as judged
+--   (run_metrics.eval_finished_at) when that run left no finding, with
+--   chunks_total = eval_chunks and the run's eval_started_at/eval_finished_at.
+--   Its recipe is resolved from run_metrics.eval_model against the propose
+--   recipes' model_alias / model_resolved only when exactly one recipe matches
+--   (otherwise NULL — the model name alone cannot say which prompt or params
+--   judged it). A resolved recipe gets the row unless the transcript already
+--   has a pass for it — so a transcript whose older recipe left findings and
+--   whose newest recipe found nothing gets both. An unresolved latch gets a
+--   NULL-recipe row only when the transcript has no judge finding at all:
+--   otherwise the latch cannot be told apart from the run that left them.
 --   Counters, tokens, cost, latency and drop counts were never recorded and
 --   stay NULL on legacy rows. Judge runs older than the latest per transcript
 --   that found nothing left no trace and get no row.
@@ -76,18 +95,29 @@
 --   archived (transcript_id NULL) cannot be attributed: their transcript id
 --   was never kept, so origin_transcript_id and judge_pass_id stay NULL.
 --
--- Locks. The ALTER on transcript_findings (the generated column rewrites the
--- table) takes ACCESS EXCLUSIVE before any backfill read, so no finding can
--- land between the backfill and the triggers; the fn_call_id foreign key takes
--- SHARE ROW EXCLUSIVE on fn_calls (decide writers wait for the commit), and
--- finding_events gets a catalog-only ADD COLUMN. At live scale (~32k findings, ~4.3k transcripts) the
--- rewrite plus backfill is about a second. lock_timeout 5s: behind a long
--- reader the migration gives up and the next process start retries it.
--- run_metrics is read but not locked; a latch that commits mid-migration
--- simply gets no legacy row.
+-- Locks, and their order. Up takes, before anything else and under a 5s
+-- lock_timeout, SHARE ROW EXCLUSIVE on recipes and then ACCESS EXCLUSIVE on
+-- transcript_findings — the order a running judge takes them:
+-- db.InsertFindings registers its recipe (an INSERT into recipes) before it
+-- inserts the findings in the same transaction. Taking them the other way
+-- round could deadlock with an eval that holds recipes and waits for
+-- transcript_findings. SHARE ROW EXCLUSIVE is what the new recipe_id foreign
+-- keys need anyway; it blocks recipe registration but not the key-share row
+-- locks other writers' foreign-key checks take. Every later lock (finding_events,
+-- fn_calls for the fn_call_id foreign key) is taken after transcript_findings,
+-- matching the decide and review writers, which lock findings first. Holding
+-- transcript_findings exclusively for the whole transaction also means the
+-- backfill reads a frozen table and no finding lands between it and the new
+-- triggers. At live scale (~32k findings, ~4.3k transcripts) the table
+-- rewrite (the generated column) plus backfill is about a second. Behind a
+-- long reader the migration gives up after 5s and the next process start
+-- retries it. run_metrics is read but not locked; a latch that commits
+-- mid-migration simply gets no legacy row.
 
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
+LOCK TABLE recipes IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE transcript_findings IN ACCESS EXCLUSIVE MODE;
 
 CREATE TABLE judge_passes (
     id                  BIGSERIAL     PRIMARY KEY,
@@ -159,8 +189,13 @@ ALTER TABLE transcript_findings
     ADD COLUMN correction_key       TEXT GENERATED ALWAYS AS (
         CASE WHEN chunk_text_sha256 IS NULL THEN NULL
              ELSE md5(chunk_text_sha256 || E'\x1f'
-                      || lower(btrim(original_text)) || E'\x1f'
-                      || lower(btrim(COALESCE(suggested_correction, ''))))
+                      || lower(btrim(regexp_replace(original_text,
+                               E'[[:space:]\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+', ' ', 'g'))
+                               COLLATE "und-x-icu")
+                      || E'\x1f'
+                      || lower(btrim(regexp_replace(COALESCE(suggested_correction, ''),
+                               E'[[:space:]\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+', ' ', 'g'))
+                               COLLATE "und-x-icu"))
         END) STORED,
     ADD COLUMN duplicate_of         UUID REFERENCES transcript_findings (id) ON DELETE SET NULL;
 
@@ -211,7 +246,9 @@ SELECT f.transcript_id, t.job_id, t.file_path, f.recipe_id, 'legacy',
  GROUP BY f.transcript_id, t.job_id, t.file_path, f.recipe_id
  ORDER BY min(f.created_at), f.transcript_id;
 
--- Backfill: transcripts latched as judged that kept no judge finding.
+-- Backfill: the latest judge run of each latched transcript, when it left no
+-- finding: under its resolved recipe if that has no pass yet, or with a NULL
+-- recipe when unresolved and the transcript has no judge finding at all.
 INSERT INTO judge_passes (transcript_id, job_id, file_path, recipe_id, status,
                           chunks_total, findings_kept, started_at, finished_at)
 SELECT t.id, t.job_id, t.file_path, r.recipe_id, 'legacy',
@@ -224,8 +261,12 @@ SELECT t.id, t.job_id, t.file_path, r.recipe_id, 'legacy',
          WHERE p.step = 'propose'
            AND m.eval_model IN (p.model_alias, p.model_resolved)) r ON true
  WHERE m.eval_finished_at IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM transcript_findings f
-                    WHERE f.transcript_id = t.id AND f.origin = 'judge')
+   AND CASE WHEN r.recipe_id IS NOT NULL
+            THEN NOT EXISTS (SELECT 1 FROM judge_passes jp
+                              WHERE jp.transcript_id = t.id AND jp.recipe_id = r.recipe_id)
+            ELSE NOT EXISTS (SELECT 1 FROM transcript_findings f
+                              WHERE f.transcript_id = t.id AND f.origin = 'judge')
+       END
  ORDER BY m.eval_finished_at, t.id;
 
 UPDATE transcript_findings f
@@ -234,7 +275,8 @@ UPDATE transcript_findings f
            (SELECT p.id FROM judge_passes p
              WHERE p.transcript_id = f.transcript_id
                AND p.recipe_id IS NOT DISTINCT FROM f.recipe_id
-               AND p.status = 'legacy')
+               AND p.status = 'legacy'
+               AND p.findings_kept > 0)
        END
  WHERE f.transcript_id IS NOT NULL;
 
@@ -321,7 +363,9 @@ BEGIN
     INSERT INTO finding_events (finding_id, transcript_id, kind, from_state, to_state, reason,
                                 actor, recipe_id, chunk_text_sha256, anchor_offset, issue_type)
     VALUES (NEW.id, COALESCE(NEW.transcript_id, OLD.transcript_id), 'transition',
-            OLD.patch_state, OLD.patch_state, 'reanchor_moved', who, recipe,
+            OLD.patch_state, OLD.patch_state,
+            CASE WHEN OLD.anchor_offset IS NULL THEN 'reanchor_placed' ELSE 'reanchor_moved' END,
+            who, recipe,
             OLD.chunk_text_sha256, OLD.anchor_offset, NEW.issue_type);
     RETURN NULL;
 END $$;
@@ -334,6 +378,93 @@ CREATE TRIGGER transcript_findings_record_reanchor
        OR OLD.anchor_offset IS DISTINCT FROM NEW.anchor_offset)
     EXECUTE FUNCTION finding_events_record_reanchor();
 
+-- stale_work: the propose arm skips duplicates too (00009's view otherwise).
+CREATE OR REPLACE VIEW stale_work AS
+WITH cur AS (
+    SELECT cr.step, r.recipe_id, r.step_version, r.model_alias, r.model_resolved,
+           r.model_revision, r.prompt_version, r.prompt_sha256, r.params
+      FROM current_recipes cr
+      JOIN recipes r ON r.recipe_id = cr.recipe_id
+)
+SELECT 'asr'::text AS step, 'transcripts'::text AS source_table, t.id AS row_id,
+       t.recipe_id, cur.recipe_id AS current_recipe_id
+  FROM transcripts t
+  JOIN cur ON cur.step = 'asr'
+  LEFT JOIN recipes r ON r.recipe_id = t.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+SELECT 'propose', 'transcript_findings', f.id, f.recipe_id, cur.recipe_id
+  FROM transcript_findings f
+  JOIN cur ON cur.step = 'propose'
+  LEFT JOIN recipes r ON r.recipe_id = f.recipe_id
+ WHERE f.origin = 'judge'
+   AND f.patch_state NOT IN ('superseded', 'duplicate')
+   AND (r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params))
+UNION ALL
+SELECT 'embed', 'transcript_chunks', c.id, c.recipe_id, cur.recipe_id
+  FROM transcript_chunks c
+  JOIN cur ON cur.step = 'embed'
+  LEFT JOIN recipes r ON r.recipe_id = c.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+-- decide: a finding whose latest live (unrevoked) decision was made by a
+-- recipe that is not equivalent to the current decide recipe.
+SELECT 'decide', 'transcript_findings', d.finding_id, d.recipe_id, cur.recipe_id
+  FROM (SELECT DISTINCT ON (e.finding_id) e.finding_id, e.recipe_id
+          FROM finding_events e
+         WHERE e.kind = 'decision'
+           AND NOT EXISTS (SELECT 1 FROM finding_events v
+                            WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
+         ORDER BY e.finding_id, e.id DESC) d
+  JOIN transcript_findings f ON f.id = d.finding_id
+  JOIN cur ON cur.step = 'decide'
+  JOIN recipes r ON r.recipe_id = d.recipe_id
+ WHERE f.patch_state <> 'superseded'
+   AND (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+SELECT 'scan', 'transcript_chunks', c.id, ls.recipe_id, cur.recipe_id
+  FROM transcript_chunks c
+  JOIN cur ON cur.step = 'scan'
+  LEFT JOIN LATERAL (
+        SELECT s.recipe_id
+          FROM chunk_scan s
+         WHERE s.transcript_id = c.transcript_id
+           AND s.chunk_index   = c.chunk_index
+         ORDER BY s.created_at DESC, s.id DESC
+         LIMIT 1) ls ON true
+ WHERE NOT EXISTS (
+        SELECT 1
+          FROM chunk_scan s
+          JOIN recipes r ON r.recipe_id = s.recipe_id
+         WHERE s.transcript_id = c.transcript_id
+           AND s.chunk_index   = c.chunk_index
+           AND s.chunk_text_sha256 =
+               encode(sha256(convert_to(COALESCE(c.source_text, c.text), 'UTF8')), 'hex')
+           AND (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+                r.prompt_version, r.prompt_sha256, r.params)
+               IS NOT DISTINCT FROM
+               (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+                cur.prompt_version, cur.prompt_sha256, cur.params));
+
 -- +goose Down
 -- Lossy, like every Down here: judge_passes and transcript_archive are
 -- dropped with their rows, and so are the reanchor events' old offsets.
@@ -341,6 +472,95 @@ CREATE TRIGGER transcript_findings_record_reanchor
 -- exactly what undoing their grouping does — which the transition trigger
 -- records like any other move.
 SET LOCAL lock_timeout = '5s';
+LOCK TABLE recipes IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE transcript_findings IN ACCESS EXCLUSIVE MODE;
+
+-- 00009's stale_work.
+CREATE OR REPLACE VIEW stale_work AS
+WITH cur AS (
+    SELECT cr.step, r.recipe_id, r.step_version, r.model_alias, r.model_resolved,
+           r.model_revision, r.prompt_version, r.prompt_sha256, r.params
+      FROM current_recipes cr
+      JOIN recipes r ON r.recipe_id = cr.recipe_id
+)
+SELECT 'asr'::text AS step, 'transcripts'::text AS source_table, t.id AS row_id,
+       t.recipe_id, cur.recipe_id AS current_recipe_id
+  FROM transcripts t
+  JOIN cur ON cur.step = 'asr'
+  LEFT JOIN recipes r ON r.recipe_id = t.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+SELECT 'propose', 'transcript_findings', f.id, f.recipe_id, cur.recipe_id
+  FROM transcript_findings f
+  JOIN cur ON cur.step = 'propose'
+  LEFT JOIN recipes r ON r.recipe_id = f.recipe_id
+ WHERE f.origin = 'judge'
+   AND f.patch_state <> 'superseded'
+   AND (r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params))
+UNION ALL
+SELECT 'embed', 'transcript_chunks', c.id, c.recipe_id, cur.recipe_id
+  FROM transcript_chunks c
+  JOIN cur ON cur.step = 'embed'
+  LEFT JOIN recipes r ON r.recipe_id = c.recipe_id
+ WHERE r.recipe_id IS NULL
+    OR (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+-- decide: a finding whose latest live (unrevoked) decision was made by a
+-- recipe that is not equivalent to the current decide recipe.
+SELECT 'decide', 'transcript_findings', d.finding_id, d.recipe_id, cur.recipe_id
+  FROM (SELECT DISTINCT ON (e.finding_id) e.finding_id, e.recipe_id
+          FROM finding_events e
+         WHERE e.kind = 'decision'
+           AND NOT EXISTS (SELECT 1 FROM finding_events v
+                            WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
+         ORDER BY e.finding_id, e.id DESC) d
+  JOIN transcript_findings f ON f.id = d.finding_id
+  JOIN cur ON cur.step = 'decide'
+  JOIN recipes r ON r.recipe_id = d.recipe_id
+ WHERE f.patch_state <> 'superseded'
+   AND (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+        r.prompt_version, r.prompt_sha256, r.params)
+       IS DISTINCT FROM
+       (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+        cur.prompt_version, cur.prompt_sha256, cur.params)
+UNION ALL
+SELECT 'scan', 'transcript_chunks', c.id, ls.recipe_id, cur.recipe_id
+  FROM transcript_chunks c
+  JOIN cur ON cur.step = 'scan'
+  LEFT JOIN LATERAL (
+        SELECT s.recipe_id
+          FROM chunk_scan s
+         WHERE s.transcript_id = c.transcript_id
+           AND s.chunk_index   = c.chunk_index
+         ORDER BY s.created_at DESC, s.id DESC
+         LIMIT 1) ls ON true
+ WHERE NOT EXISTS (
+        SELECT 1
+          FROM chunk_scan s
+          JOIN recipes r ON r.recipe_id = s.recipe_id
+         WHERE s.transcript_id = c.transcript_id
+           AND s.chunk_index   = c.chunk_index
+           AND s.chunk_text_sha256 =
+               encode(sha256(convert_to(COALESCE(c.source_text, c.text), 'UTF8')), 'hex')
+           AND (r.step_version, r.model_alias, r.model_resolved, r.model_revision,
+                r.prompt_version, r.prompt_sha256, r.params)
+               IS NOT DISTINCT FROM
+               (cur.step_version, cur.model_alias, cur.model_resolved, cur.model_revision,
+                cur.prompt_version, cur.prompt_sha256, cur.params));
 
 DROP TRIGGER transcript_findings_record_reanchor ON transcript_findings;
 DROP FUNCTION finding_events_record_reanchor();

@@ -615,10 +615,12 @@ runner) and is transactional:
      column (metadata, `raw_text`, `segments`, the asr `recipe_id` and runner
      provenance), the transcript's `created_at`, and the job's whole
      `run_metrics` row as jsonb (`to_jsonb`, NULL when it has none);
-     `archived_reason = 'requeue'`, `archived_by` = `earmark.actor` when set.
-     The ASR pass being replaced is kept, not lost. Then
-     `db.SetEventContext(reason='requeue')`, so step 3's transitions carry
-     that reason in `finding_events`.
+     `archived_reason = 'requeue'`, `archived_by` = `earmark.actor`.
+     The ASR pass being replaced is kept, not lost. Before it, once,
+     `db.SetEventContext(actor, reason='requeue')` attributes the archive and
+     step 3's transitions: the actor is the caller's (`db.WithActor` —
+     `mcp:dashboard` for the buttons, `cli:requeue` for the CLI), else
+     `system`, so `archived_by` is never NULL.
   3. **Archive the findings**: every `transcript_findings` row of those jobs'
      transcripts moves to `patch_state='superseded'` with `superseded_at=now()`
      (§2.17). This includes human decisions — `accepted`, `applied`, `rejected`,
@@ -1145,6 +1147,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` — per-chunk System One quality scan results, unique per (transcript, chunk index, chunk text sha256, recipe), `ON DELETE CASCADE` with the transcript; the `scan` arm of `stale_work` (§1.9 "Chunk scan"). New table plus a view replacement; no ALTER. Its `stale_work` restates every earlier arm, 8's `decide` arm included. |
 | 10 | `00010_step_runs.sql` | `step_runs` — one row per ad-hoc step run (decide, decide revert, scan, eval) with its live progress and outcome (§1.10), a partial index on the open runs and a `started_at` index for the recent list. New table only; no ALTER, no lock on an existing table. |
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` — every (recipe, earmark build) pair, PK `(recipe_id, code_version)` plus `recipe_builds_code_version_idx`, backfilled with each existing recipe's registering build; a column comment marking `recipes.code_version` as the *first* build (§1.9 "Recipe ID format" / "Builds"). New table plus a `COMMENT` (SHARE UPDATE EXCLUSIVE, which writers' INSERTs do not wait on); no id is rewritten. |
+| 13 | `00013_audit_lineage.sql` | Audit lineage (§1.4, §2.15 "Lineage", §2.17): `judge_passes` (legacy rows backfilled) and `transcript_archive`; on `transcript_findings` `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (trigger-filled, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` state; `finding_events.anchor_offset` + the reanchor trigger; transitions read `earmark.reason`; `stale_work`'s propose arm skips duplicates. Locks `recipes` (SHARE ROW EXCLUSIVE) then `transcript_findings` (ACCESS EXCLUSIVE) first — a running judge's order — and rewrites `transcript_findings` (`lock_timeout` 5s). |
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
@@ -2493,7 +2496,7 @@ unchanged.):
 | `POST` | `/actions/run-clear` | htmx + token | clear the bounded run (`run_limit→NULL`) without touching the pause flag |
 | `POST` | `/actions/eval?dir=…` | htmx + token | run the LLM judge over one book (async, §2.15) |
 | `POST` | `/actions/eval-sample?n=N` | htmx + token | run the LLM judge over an N-chunk sample (async, §2.15) |
-| `POST` | `/actions/findings-clear[?dir=…]` | htmx + token | **archive** recorded findings as `superseded` (§2.15 "Clearing"; never deleted), then re-render the `/findings` fragment. Optional `dir` scopes the clear to one book; absent clears all. Writes only `transcript_findings` (and, through its trigger, `finding_events`) — transcripts are never modified, and re-running eval proposes the findings again. |
+| `POST` | `/actions/findings-clear[?dir=…]` | htmx + token | **archive** recorded findings as `superseded` (§2.15 "Clearing"; never deleted), then re-render the `/findings` fragment. Optional `dir` scopes the clear to one book; absent clears all. Writes `transcript_findings` (and, through its trigger, `finding_events`) plus the `embedding_stale` flag of chunks whose accepted/applied correction it withdrew — transcripts and chunk text are never modified, and re-running eval proposes the findings again. |
 
 #### 2.12.1 Dashboard page routes (HTML)
 
@@ -3265,9 +3268,14 @@ about where it came from:
   pass outlives the requeue that deletes its transcript. The judge does not
   write passes yet: only `legacy` rows exist, backfilled by migration 13 — one
   per (transcript, `recipe_id`) of `origin='judge'` findings with a live
-  transcript, and one per transcript latched by `run_metrics.eval_finished_at`
-  that kept no judge finding (recipe from `eval_model` when exactly one propose
-  recipe's `model_alias`/`model_resolved` matches, else NULL). Legacy counters,
+  transcript, and one for the latest judge run of each transcript latched by
+  `run_metrics.eval_finished_at` when that run left no finding: its recipe is
+  resolved from `eval_model` when exactly one propose recipe's
+  `model_alias`/`model_resolved` matches, and the row is added unless the
+  transcript already has a pass for that recipe — so a transcript whose older
+  recipe left findings and whose newest recipe found nothing has both. An
+  unresolved latch gets a NULL-recipe row only when the transcript has no judge
+  finding at all (it cannot be told apart from the run that left them). Legacy counters,
   tokens, cost, latency and drop counts were never recorded and are NULL.
 - **`fn_call_id`** — the judge call's `fn_calls` row. Not yet written by any
   path.
@@ -3278,12 +3286,19 @@ about where it came from:
   `transcript_id`, so the origin survives and joins to
   `transcript_archive.transcript_id` (§1.4). Findings a requeue archived before
   migration 13 keep it NULL: their transcript id was never recorded.
-- **`correction_key`** — `md5(chunk_text_sha256 ‖ U+001F ‖
-  lower(btrim(original_text)) ‖ U+001F ‖ lower(btrim(COALESCE(suggested_correction,''))))`,
-  generated and stored; NULL when `chunk_text_sha256` is. The separator keeps
-  `('ab','c')` and `('a','bc')` apart. It does **not** include the recipe: two
-  recipes proposing the same fix to the same chunk text share a key, which is
-  how agreement across models (and with earlier, decided findings) is found.
+- **`correction_key`** — `md5(chunk_text_sha256 ‖ U+001F ‖ norm(original_text) ‖
+  U+001F ‖ norm(COALESCE(suggested_correction,'')))`, generated and stored;
+  NULL when `chunk_text_sha256` is. `norm` collapses every whitespace run
+  (ASCII whitespace, NBSP and the other Unicode space separators) to one
+  space, trims, and lower-cases under the ICU root collation (`lower(x COLLATE
+  "und-x-icu")`): the live cluster is initdb'd with `LC_CTYPE=C`, where plain
+  `lower()` folds ASCII only, so `ÉMILE` and `émile` would otherwise differ.
+  Accents are **not** folded: `é` and `e` are different corrections. The
+  separator keeps `('ab','c')` and `('a','bc')` apart. It does **not** include
+  the recipe: two recipes proposing the same fix to the same chunk text share a
+  key, which is how agreement across models (and with earlier, decided
+  findings) is found. Code that needs a key reads this column; it never
+  recomputes it.
 - **`duplicate_of`** — see `duplicate` in §2.17.
 
 `issue_type` is a closed vocabulary the judge prompt advertises; an unknown value
@@ -3554,18 +3569,30 @@ join on `chunk_id` and the old build's raw output can be re-filtered offline.
 dashboard page exposes a token-gated **clear findings** button (and the
 `POST /actions/findings-clear` action, §2.12). A clear **archives, it does not
 delete** (`db.ClearFindings`): in one transaction it sets `earmark.actor =
-'mcp:dashboard'` and `earmark.reason = 'cleared'`, then moves every finding in
-scope that is not already `superseded` to `superseded`, stamping
-`superseded_at` (and clearing an `unanchorable_reason`). Each move is a
-`transition` in `finding_events`, so decisions and their history survive.
+<caller's actor>'` (`ClearFindings(ctx, dir, actor)`; the dashboard passes
+`mcp:dashboard`) and `earmark.reason = 'cleared'`, then — in one statement,
+findings locked in id order before any chunk — moves every finding in scope
+that is not already `superseded` to `superseded`, stamping `superseded_at`
+(and clearing an `unanchorable_reason`). Each move is a `transition` in
+`finding_events`, so decisions and their history survive. The book scope is
+`file_path LIKE likePrefix(dir) || '/%' ESCAPE '\' OR file_path = dir`: a `_`
+or `%` in a directory name is a literal, so clearing `Book_1` never reaches
+`BookX1`.
 Unlike a requeue's archive, a cleared finding keeps its `transcript_id` — the
 transcript still exists — so every reader of live findings filters on
 `patch_state <> 'superseded'`, not on `transcript_id`: the eval dedupe keys
 (`GetFindingKeys`) ignore superseded rows, so re-running eval after a clear
-proposes them again. Only `transcript_findings` is written, never the transcript
-tables, so the read-only-transcripts contract holds. A cleared
-`accepted`/`applied` finding leaves the overlay; its chunk is rebuilt without
-it the next time that chunk is re-embedded (a clear does not flag it).
+proposes them again. A cleared `accepted`/`applied` finding leaves the
+overlay, so the same statement flags its chunk `embedding_stale` (addressed
+like an accept) and the next rebuild drops the correction from the served
+and embedded text — they match the audit. After the commit those chunks are
+flagged again, as `earmark decide revert` does, because a rebuild that read
+the overlay before the clear could otherwise clear the flag afterwards (its
+watermark sees only `decided_at`, which a clear does not stamp); a failure
+there is logged, the clear stands. Beyond `transcript_findings` (and
+`finding_events`, by trigger) the clear writes only that flag — never the
+transcript tables or chunk text — so the read-only-transcripts contract
+holds.
 
 #### Dashboard surfaces (read-only)
 
@@ -3578,8 +3605,11 @@ exposes the scoped clear (`POST /actions/findings-clear?dir=…`, token-gated,
 re-renders the Book fragment). All of this is read-only/advisory surfacing — no
 new route, env var, or column; informational only. The rollups, worklists and
 the library's per-book findings count all **exclude `superseded`** findings
-(archived by a requeue, §1.4, or a clear), so a re-judged book is not counted twice; they
-stay readable through `list_transcript_corrections state=superseded`.
+(archived by a requeue, §1.4, or a clear), so a re-judged book is not counted
+twice, and **`duplicate`** findings (§2.17), whose representative is already
+counted; they stay readable through `list_transcript_corrections
+state=superseded` / `state=duplicate`. `stale_work`'s propose arm skips both
+for the same reason.
 
 #### Two payoffs
 
@@ -3893,7 +3923,9 @@ CREATE TABLE finding_events (
   `created_at` is when the transition ran (`clock_timestamp()`), not when its
   transaction committed.
 - **reanchor move** (migration 13) — a `transition` with `from_state =
-  to_state` (the state before the UPDATE) and reason `reanchor_moved`, appended
+  to_state` (the state before the UPDATE) and reason `reanchor_moved` —
+  `reanchor_placed` when the finding had no `anchor_offset` yet (a legacy
+  finding's first anchoring) — appended
   by the trigger `transcript_findings_record_reanchor` whenever an UPDATE
   changes a finding's `chunk_text_sha256` or `anchor_offset` (`earmark
   reanchor` is the only writer). It records the **old** hash and offset — the

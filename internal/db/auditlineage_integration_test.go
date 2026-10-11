@@ -8,10 +8,10 @@ package db
 
 import (
 	"context"
-	"crypto/md5" //nolint:gosec // G501: md5 mirrors the schema's correction_key, not a security use
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"strings"
+	"net/url"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -32,6 +32,9 @@ const (
 	alTranscript2 = "00000000-0000-0000-0000-0000000a1102"
 	alTranscript3 = "00000000-0000-0000-0000-0000000a1103"
 	alTranscript4 = "00000000-0000-0000-0000-0000000a1104"
+	alJob5        = "00000000-0000-0000-0000-0000000a1005"
+	alTranscript5 = "00000000-0000-0000-0000-0000000a1105"
+	alRecipeL     = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
 func providerFor(t *testing.T, dbURL string) *goose.Provider {
@@ -56,6 +59,8 @@ func providerFor(t *testing.T, dbURL string) *goose.Provider {
 //	transcript 2: latched, no findings, eval_model naming exactly one propose recipe (A);
 //	transcript 3: latched, no findings, eval_model naming two propose recipes (B, B2);
 //	transcript 4: neither findings nor a latch;
+//	transcript 5: findings from recipe A, then a latch by the newest recipe (L),
+//	              which found nothing;
 //	plus a finding a requeue already archived (transcript_id NULL).
 func seedAuditLineageAt12(t *testing.T, conn *pgx.Conn) {
 	t.Helper()
@@ -63,27 +68,32 @@ func seedAuditLineageAt12(t *testing.T, conn *pgx.Conn) {
 		INSERT INTO recipes (recipe_id, step, step_version, code_version, model_alias, model_resolved) VALUES
 		  ('`+alRecipeA+`',  'propose', 2, 'test', 'gemma3:12b', 'gemma3:12b-it-q4'),
 		  ('`+alRecipeB+`',  'propose', 2, 'test', 'qwen3:27b',  NULL),
-		  ('`+alRecipeB2+`', 'propose', 3, 'test', 'qwen3:27b',  NULL);
+		  ('`+alRecipeB2+`', 'propose', 3, 'test', 'qwen3:27b',  NULL),
+		  ('`+alRecipeL+`',  'propose', 3, 'test', 'llama4:17b', NULL);
 		INSERT INTO transcription_jobs (id, file_path, checksum, status) VALUES
 		  ('`+alJob1+`', '/b/AL/1.m4b', 'al1', 'done'),
 		  ('`+alJob2+`', '/b/AL/2.m4b', 'al2', 'done'),
 		  ('`+alJob3+`', '/b/AL/3.m4b', 'al3', 'done'),
-		  ('`+alJob4+`', '/b/AL/4.m4b', 'al4', 'done');
+		  ('`+alJob4+`', '/b/AL/4.m4b', 'al4', 'done'),
+		  ('`+alJob5+`', '/b/AL/5.m4b', 'al5', 'done');
 		INSERT INTO transcripts (id, job_id, file_path, checksum, language, duration_seconds, segments, raw_text, model_name) VALUES
 		  ('`+alTranscript1+`', '`+alJob1+`', '/b/AL/1.m4b', 'al1', 'en', 60, '[]', 'one', 'parakeet'),
 		  ('`+alTranscript2+`', '`+alJob2+`', '/b/AL/2.m4b', 'al2', 'en', 60, '[]', 'two', 'parakeet'),
 		  ('`+alTranscript3+`', '`+alJob3+`', '/b/AL/3.m4b', 'al3', 'en', 60, '[]', 'three', 'parakeet'),
-		  ('`+alTranscript4+`', '`+alJob4+`', '/b/AL/4.m4b', 'al4', 'en', 60, '[]', 'four', 'parakeet');
+		  ('`+alTranscript4+`', '`+alJob4+`', '/b/AL/4.m4b', 'al4', 'en', 60, '[]', 'four', 'parakeet'),
+		  ('`+alTranscript5+`', '`+alJob5+`', '/b/AL/5.m4b', 'al5', 'en', 60, '[]', 'five', 'parakeet');
 		INSERT INTO run_metrics (job_id, eval_started_at, eval_finished_at, eval_model, eval_chunks) VALUES
 		  ('`+alJob1+`', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'gemma3:12b', 10),
 		  ('`+alJob2+`', '2026-01-02T00:00:00Z', '2026-01-02T01:00:00Z', 'gemma3:12b-it-q4', 7),
-		  ('`+alJob3+`', NULL,                   '2026-01-03T01:00:00Z', 'qwen3:27b', 5);
+		  ('`+alJob3+`', NULL,                   '2026-01-03T01:00:00Z', 'qwen3:27b', 5),
+		  ('`+alJob5+`', '2026-01-04T00:00:00Z', '2026-01-04T01:00:00Z', 'llama4:17b', 9);
 		INSERT INTO transcript_findings (transcript_id, file_path, chunk_index, start_sec, end_sec, original_text,
 		       issue_type, suggested_correction, confidence, model, origin, patch_state, recipe_id, chunk_text_sha256, created_at) VALUES
 		  ('`+alTranscript1+`', '/b/AL/1.m4b', 0, 0, 30, 'ganema', 'misheard_proper_noun', 'Ghanima', 0.9, 'gemma3:12b', 'judge', 'proposed', '`+alRecipeA+`', 'h0', '2026-01-01T00:10:00Z'),
 		  ('`+alTranscript1+`', '/b/AL/1.m4b', 1, 30, 60, 'said',  'misheard_word',        'sad',     0.4, 'gemma3:12b', 'judge', 'rejected', '`+alRecipeA+`', 'h1', '2026-01-01T00:20:00Z'),
 		  ('`+alTranscript1+`', '/b/AL/1.m4b', 1, 30, 60, 'left',  'misheard_word',        'leapt',   0.4, 'old',        'judge', 'proposed', NULL,              NULL, '2025-12-01T00:00:00Z'),
-		  ('`+alTranscript1+`', '/b/AL/1.m4b', 1, 30, 60, 'left',  'misheard_word',        'lift',    1,   'manual',     'human', 'accepted', NULL,              NULL, '2026-01-05T00:00:00Z');
+		  ('`+alTranscript1+`', '/b/AL/1.m4b', 1, 30, 60, 'left',  'misheard_word',        'lift',    1,   'manual',     'human', 'accepted', NULL,              NULL, '2026-01-05T00:00:00Z'),
+		  ('`+alTranscript5+`', '/b/AL/5.m4b', 0, 0, 30, 'ganema', 'misheard_proper_noun', 'Ghanima', 0.9, 'gemma3:12b', 'judge', 'proposed', '`+alRecipeA+`', 'h5', '2025-11-01T00:00:00Z');
 		INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec, original_text, issue_type,
 		       confidence, model, origin, patch_state) VALUES
 		  (NULL, '/b/AL/gone.m4b', 0, 1, 'x', 'other', 0.5, 'm', 'judge', 'superseded');
@@ -136,6 +146,8 @@ func TestIntegrationAuditLineageMigration(t *testing.T) {
 		{alTranscript1, "", "legacy", 1, nil},
 		{alTranscript2, alRecipeA, "legacy", 0, ptr(7)},
 		{alTranscript3, "", "legacy", 0, ptr(5)}, // two qwen3:27b recipes: unattributable
+		{alTranscript5, alRecipeA, "legacy", 1, nil},
+		{alTranscript5, alRecipeL, "legacy", 0, ptr(9)}, // newest recipe found nothing
 	}
 	if len(passes) != len(want) {
 		t.Fatalf("judge_passes = %+v, want %d rows", passes, len(want))
@@ -162,8 +174,9 @@ func TestIntegrationAuditLineageMigration(t *testing.T) {
 	// recipe) pass; the human one and the archived orphan at none.
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings f
 		JOIN judge_passes p ON p.id = f.judge_pass_id
-		WHERE p.transcript_id = f.transcript_id AND p.recipe_id IS NOT DISTINCT FROM f.recipe_id`); n != 3 {
-		t.Errorf("%d findings linked to their legacy pass, want 3", n)
+		WHERE p.transcript_id = f.transcript_id AND p.recipe_id IS NOT DISTINCT FROM f.recipe_id
+		  AND p.findings_kept > 0`); n != 4 {
+		t.Errorf("%d findings linked to their legacy findings pass, want 4", n)
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings
 		WHERE judge_pass_id IS NOT NULL AND origin <> 'judge'`); n != 0 {
@@ -225,8 +238,8 @@ func TestIntegrationAuditLineageMigration(t *testing.T) {
 	if err := migrate(itCtx(t), dbURL, testLog()); err != nil {
 		t.Fatalf("re-migrate: %v", err)
 	}
-	if n := countRows(t, conn, `SELECT count(*) FROM judge_passes`); n != 4 {
-		t.Errorf("re-Up backfilled %d passes, want 4", n)
+	if n := countRows(t, conn, `SELECT count(*) FROM judge_passes`); n != 6 {
+		t.Errorf("re-Up backfilled %d passes, want 6", n)
 	}
 }
 
@@ -245,7 +258,7 @@ func TestIntegrationRequeueArchivesTranscript(t *testing.T) {
 		rqTranscriptA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.RequeueByID(ctx, rqJobA); err != nil {
+	if _, err := d.RequeueByID(WithActor(ctx, "mcp:dashboard"), rqJobA); err != nil {
 		t.Fatalf("requeue: %v", err)
 	}
 
@@ -267,6 +280,9 @@ func TestIntegrationRequeueArchivesTranscript(t *testing.T) {
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_archive`); n != 1 {
 		t.Errorf("%d archive rows, want only book A's", n)
 	}
+	if n := countRows(t, conn, `SELECT count(*) FROM transcript_archive WHERE archived_by = 'mcp:dashboard'`); n != 1 {
+		t.Error("archived_by must be the caller's actor")
+	}
 
 	// origin_transcript_id survives the FK's SET NULL and joins to the archive.
 	if n := countRows(t, conn, `SELECT count(*) FROM transcript_findings f
@@ -275,8 +291,9 @@ func TestIntegrationRequeueArchivesTranscript(t *testing.T) {
 		t.Errorf("%d archived findings join to the archived transcript by origin, want 7", n)
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM finding_events
-		WHERE kind = 'transition' AND to_state = 'superseded' AND reason = 'requeue' AND transcript_id = $1`, rqTranscriptA); n != 7 {
-		t.Errorf("%d supersede transitions carry reason 'requeue', want 7", n)
+		WHERE kind = 'transition' AND to_state = 'superseded' AND reason = 'requeue'
+		  AND actor = 'mcp:dashboard' AND transcript_id = $1`, rqTranscriptA); n != 7 {
+		t.Errorf("%d supersede transitions carry reason 'requeue' by the caller, want 7", n)
 	}
 
 	// The origin is frozen once set.
@@ -303,9 +320,17 @@ func TestIntegrationClearFindingsSupersedes(t *testing.T) {
 		        'gemma3:12b', 'judge', 'unanchorable', 'anchor_ambiguous')`, rqTranscriptA); err != nil {
 		t.Fatal(err)
 	}
+	// The applied correction sits on chunk 0; the projection is up to date.
+	if _, err := conn.Exec(ctx, `UPDATE transcript_findings SET chunk_index = 0
+		WHERE transcript_id = $1 AND patch_state = 'applied'`, rqTranscriptA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE transcript_chunks SET embedding_stale = false`); err != nil {
+		t.Fatal(err)
+	}
 	before := countRows(t, conn, `SELECT count(*) FROM transcript_findings`)
 
-	n, err := d.ClearFindings(ctx, "/b/Author/A/")
+	n, err := d.ClearFindings(ctx, "/b/Author/A/", testClearActor)
 	if err != nil {
 		t.Fatalf("clear: %v", err)
 	}
@@ -321,12 +346,29 @@ func TestIntegrationClearFindingsSupersedes(t *testing.T) {
 	}
 	if got := countRows(t, conn, `SELECT count(*) FROM finding_events WHERE transcript_id = $1
 		AND kind = 'transition' AND to_state = 'superseded' AND reason = 'cleared' AND actor = $2`,
-		rqTranscriptA, clearFindingsActor); got != 8 {
+		rqTranscriptA, testClearActor); got != 8 {
 		t.Errorf("%d 'cleared' transitions, want 8", got)
 	}
 	if got := countRows(t, conn, `SELECT count(*) FROM transcript_findings WHERE transcript_id = $1
 		AND patch_state = 'proposed'`, rqTranscriptB); got != 1 {
 		t.Error("a clear of book A touched book B")
+	}
+	// The withdrawn applied correction's chunk is flagged for rebuild; the
+	// others are not.
+	if got := countRows(t, conn, `SELECT count(*) FROM transcript_chunks WHERE embedding_stale`); got != 1 {
+		t.Errorf("%d chunks flagged, want only A's chunk 0", got)
+	}
+	if got := countRows(t, conn, `SELECT count(*) FROM transcript_chunks
+		WHERE transcript_id = $1 AND chunk_index = 0 AND embedding_stale`, rqTranscriptA); got != 1 {
+		t.Error("clearing an applied correction must flag its chunk embedding_stale")
+	}
+	// Cleared rows stay out of the live readers.
+	sum, err := d.GetFindingsSummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.TotalFindings != 1 {
+		t.Errorf("summary counts %d findings, want only book B's live one", sum.TotalFindings)
 	}
 
 	// Re-running eval after a clear proposes again: no dedupe keys left.
@@ -361,7 +403,7 @@ func TestIntegrationClearFindingsSupersedes(t *testing.T) {
 	}
 
 	// Idempotent: nothing left to clear in A except the fresh proposal.
-	if n, err := d.ClearFindings(ctx, "/b/Author/A"); err != nil || n != 1 {
+	if n, err := d.ClearFindings(ctx, "/b/Author/A", testClearActor); err != nil || n != 1 {
 		t.Errorf("second clear = %d, %v; want only the re-proposed finding", n, err)
 	}
 	// A requeue after a clear still archives the transcript and nulls the
@@ -384,8 +426,13 @@ func TestIntegrationReanchorEvents(t *testing.T) {
 	dbURL, d := migratedTestDB(t)
 	conn := connect(t, dbURL)
 	id := seedFindingEvents(t, conn, 1)[0]
+	// A legacy finding's first anchoring is a placement, not a move.
 	if _, err := conn.Exec(ctx, `UPDATE transcript_findings SET chunk_text_sha256 = 'h-old', anchor_offset = 3 WHERE id = $1`, id); err != nil {
 		t.Fatal(err)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM finding_events WHERE finding_id = $1
+		AND reason = 'reanchor_placed' AND anchor_offset IS NULL AND chunk_text_sha256 IS NULL`, id); n != 1 {
+		t.Error("first anchoring of an unanchored finding must be 'reanchor_placed'")
 	}
 	baseline := countRows(t, conn, `SELECT count(*) FROM finding_events WHERE finding_id = $1`, id)
 
@@ -463,18 +510,50 @@ func TestIntegrationReanchorEvents(t *testing.T) {
 	}
 }
 
+// testClearActor is the attribution the tests pass to ClearFindings.
+const testClearActor = "mcp:dashboard"
+
+// newTestDatabaseCLocale is newTestDatabase with LC_COLLATE/LC_CTYPE = C, the
+// way the live cluster was initdb'd.
+func newTestDatabaseCLocale(t *testing.T) string {
+	t.Helper()
+	admin := integrationServer(t)
+	ctx := context.Background()
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatal(err)
+	}
+	name := "earmark_itc_" + hex.EncodeToString(b[:])
+	conn, err := pgx.Connect(ctx, admin)
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name+
+		" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'"); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), admin)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close(context.Background()) }()
+		_, _ = c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+	})
+	u, err := url.Parse(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	return u.String()
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return "<nil>"
 	}
 	return *s
-}
-
-// correctionKeyOf is the schema's correction_key, computed client-side.
-func correctionKeyOf(hash, original, correction string) string {
-	sum := md5.Sum([]byte(hash + "\x1f" + strings.ToLower(strings.TrimSpace(original)) + "\x1f" + //nolint:gosec // G401: mirrors the schema
-		strings.ToLower(strings.TrimSpace(correction))))
-	return hex.EncodeToString(sum[:])
 }
 
 // TestIntegrationCorrectionKey: the key is recipe-independent and
@@ -483,8 +562,21 @@ func correctionKeyOf(hash, original, correction string) string {
 // correction as ”, and is NULL without a chunk hash.
 func TestIntegrationCorrectionKey(t *testing.T) {
 	ctx := context.Background()
-	dbURL, _ := migratedTestDB(t)
+	// The live cluster is initdb'd LC_CTYPE=C / LC_COLLATE=C: build the test
+	// database the same way, so plain lower() would fold ASCII only.
+	dbURL := newTestDatabaseCLocale(t)
+	if err := migrate(itCtx(t), dbURL, testLog()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 	conn := connect(t, dbURL)
+	var ctype, plain string
+	if err := conn.QueryRow(ctx, `SELECT datctype, lower('ÉMILE') FROM pg_database WHERE datname = current_database()`).
+		Scan(&ctype, &plain); err != nil {
+		t.Fatal(err)
+	}
+	if ctype != "C" || plain != "Émile" {
+		t.Fatalf("test database is not a C-locale database (ctype %q, lower('ÉMILE') = %q)", ctype, plain)
+	}
 	seedFindingEvents(t, conn, 0)
 	if _, err := conn.Exec(ctx, `INSERT INTO recipes (recipe_id, step, step_version, code_version) VALUES
 		('`+alRecipeA+`', 'propose', 1, 't'), ('`+alRecipeB+`', 'propose', 1, 't')`); err != nil {
@@ -509,9 +601,17 @@ func TestIntegrationCorrectionKey(t *testing.T) {
 	if k1 == nil || k2 == nil || *k1 != *k2 {
 		t.Errorf("two recipes, same fix on the same chunk: keys %s vs %s", deref(k1), deref(k2))
 	}
-	if want := correctionKeyOf(h, "ganema", fix); k1 == nil || *k1 != want {
-		t.Errorf("key = %s, want md5 over hash, original and correction joined by U+001F (%s)", deref(k1), want)
+	same := func(name, o1, c1, o2, c2 string, want bool) {
+		t.Helper()
+		x, y := key(&a, &h, o1, &c1), key(&b, &h, o2, &c2)
+		if x == nil || y == nil || (*x == *y) != want {
+			t.Errorf("%s: keys %s vs %s, want equal=%v", name, deref(x), deref(y), want)
+		}
 	}
+	same("non-ASCII case folds (ICU, not the C locale)", "ÉMILE", "ÉMILE ZOLA", "émile", "émile zola", true)
+	same("tabs, newlines and runs of spaces collapse", "the\tcat", "the  cat\n", "the cat", " the cat", true)
+	same("NBSP and other Unicode spaces collapse", "the\u00a0cat", "a\u2009b", "the cat", "a b", true)
+	same("accents are not folded", "emile", "Emile", "émile", "Émile", false)
 	c, bc := "c", "bc"
 	if x, y := key(&a, &h, "ab", &c), key(&a, &h, "a", &bc); *x == *y {
 		t.Error("('ab','c') and ('a','bc') must not share a key")
@@ -526,6 +626,9 @@ func TestIntegrationCorrectionKey(t *testing.T) {
 	}
 	if x := key(&a, nil, "ganema", &fix); x != nil {
 		t.Errorf("no chunk hash, key = %v, want NULL", *x)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM pg_collation WHERE collname = 'und-x-icu' AND collprovider = 'i'`); n != 1 {
+		t.Error("the ICU root collation und-x-icu is missing")
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM pg_indexes WHERE indexname = 'transcript_findings_correction_key_idx'`); n != 1 {
 		t.Error("correction_key is not indexed")
@@ -575,7 +678,7 @@ func TestIntegrationDuplicateState(t *testing.T) {
 	if err := exec(`UPDATE transcript_findings SET patch_state = 'duplicate', duplicate_of = $2 WHERE id = $1`, dup, rep); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := d.ClearFindings(ctx, "/b/FE"); err != nil || n != 3 {
+	if n, err := d.ClearFindings(ctx, "/b/FE", testClearActor); err != nil || n != 3 {
 		t.Fatalf("clear = %d, %v", n, err)
 	}
 	if got := countRows(t, conn, `SELECT count(*) FROM transcript_findings WHERE id = $1
@@ -585,5 +688,93 @@ func TestIntegrationDuplicateState(t *testing.T) {
 	if got := countRows(t, conn, `SELECT count(*) FROM finding_events WHERE finding_id = $1
 		AND from_state = 'proposed' AND to_state = 'duplicate'`, dup); got != 2 {
 		t.Errorf("%d proposed->duplicate transitions recorded, want 2", got)
+	}
+}
+
+// TestIntegrationClearFindingsEscapesBookDir: a book directory's '_' and '%'
+// are literals — clearing Book_1 must not reach BookX1 or Book%1.
+func TestIntegrationClearFindingsEscapesBookDir(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	for i, dir := range []string{"/b/A/Book_1", "/b/A/BookX1", "/b/A/Book_1x"} {
+		path := dir + "/01.m4b"
+		var tid string
+		if err := conn.QueryRow(ctx, `
+			WITH j AS (INSERT INTO transcription_jobs (file_path, checksum, status) VALUES ($1, $2, 'done') RETURNING id)
+			INSERT INTO transcripts (job_id, file_path, checksum, language, duration_seconds, segments, raw_text, model_name)
+			SELECT j.id, $1, $2, 'en', 1, '[]', 'x', 'm' FROM j RETURNING id::text`, path, "esc"+string(rune('0'+i))).Scan(&tid); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO transcript_findings (transcript_id, file_path, start_sec, end_sec,
+			original_text, issue_type, confidence, model) VALUES ($1, $2, 0, 1, 'x', 'other', 0.5, 'm')`, tid, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := d.ClearFindings(ctx, "/b/A/Book_1", testClearActor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("cleared %d findings, want only Book_1's", n)
+	}
+	if got := countRows(t, conn, `SELECT count(*) FROM transcript_findings
+		WHERE patch_state = 'superseded' AND file_path = '/b/A/Book_1/01.m4b'`); got != 1 {
+		t.Error("Book_1's finding was not cleared")
+	}
+	if got := countRows(t, conn, `SELECT count(*) FROM transcript_findings WHERE patch_state = 'proposed'`); got != 2 {
+		t.Errorf("%d other books' findings untouched, want 2 (BookX1, Book_1x)", got)
+	}
+}
+
+// TestIntegrationLiveReadersSkipClearedAndDuplicates: findings a clear
+// archived (transcript_id kept) and duplicates stay out of the findings
+// summary, the decide candidates and stale_work's propose arm.
+func TestIntegrationLiveReadersSkipClearedAndDuplicates(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	ids := seedFindingEvents(t, conn, 4)
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO recipes (recipe_id, step, step_version, code_version, model_alias) VALUES
+		  ('`+alRecipeA+`', 'propose', 1, 't', 'old'), ('`+alRecipeB+`', 'propose', 2, 't', 'new');
+		INSERT INTO current_recipes (step, recipe_id) VALUES ('propose', '`+alRecipeB+`');
+		UPDATE transcript_findings SET recipe_id = '`+alRecipeA+`', chunk_text_sha256 = 'h', anchor_offset = 0;`); err != nil {
+		t.Fatal(err)
+	}
+	// ids[0] stays live; ids[1] becomes a duplicate of it; ids[2..3] are
+	// archived the way a clear leaves them (superseded, transcript_id kept).
+	if _, err := conn.Exec(ctx, `UPDATE transcript_findings SET patch_state = 'duplicate', duplicate_of = $2 WHERE id = $1`,
+		ids[1], ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE transcript_findings SET patch_state = 'superseded', superseded_at = now()
+		WHERE id = ANY($1)`, []string{ids[2], ids[3]}); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := d.GetFindingsSummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.TotalFindings != 1 {
+		t.Errorf("summary counts %d, want 1 (cleared and duplicate excluded)", sum.TotalFindings)
+	}
+	counts, err := d.GetFindingsCountByBook(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts["/b/FE"] != 1 {
+		t.Errorf("per-book count = %v, want /b/FE: 1", counts)
+	}
+	sample, err := d.DecideSample(ctx, DecideScope{Sample: 50, Seed: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sample) != 1 || sample[0].ID != ids[0] {
+		t.Errorf("decide candidates = %d, want only the live proposed finding", len(sample))
+	}
+	if got := countRows(t, conn, `SELECT count(*) FROM stale_work WHERE step = 'propose'`); got != 1 {
+		t.Errorf("stale_work propose arm lists %d findings, want only the live one", got)
 	}
 }

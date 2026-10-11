@@ -24,7 +24,7 @@ version is in `goose_db_version`.
 | 10 | `00010_step_runs.sql` | `step_runs` (live progress of ad-hoc decide/scan/eval runs); partial `step_runs_running_idx`, `step_runs_started_at_idx` |
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` (every build that registered a recipe), `recipe_builds_code_version_idx`, backfilled from `recipes`; comment on `recipes.code_version` (first build) |
 | 12 | `00012_model_settings.sql` | `model_settings` (runtime per-step model overrides) and the append-only `model_setting_events` history + `model_setting_events_step_idx`; nothing backfilled |
-| 13 | `00013_audit_lineage.sql` | `judge_passes` (per transcript × judge recipe; `legacy` rows backfilled) and `transcript_archive` (a requeue's replaced transcript); on `transcript_findings`: `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (filled on insert, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` patch state; `finding_events.anchor_offset` + the `transcript_findings_record_reanchor` trigger; transitions read `earmark.reason` |
+| 13 | `00013_audit_lineage.sql` | `judge_passes` (per transcript × judge recipe; `legacy` rows backfilled) and `transcript_archive` (a requeue's replaced transcript); on `transcript_findings`: `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (filled on insert, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` patch state; `finding_events.anchor_offset` + the `transcript_findings_record_reanchor` trigger; transitions read `earmark.reason`; `stale_work` propose arm skips duplicates |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -420,8 +420,9 @@ fn_call_id           BIGINT REFERENCES fn_calls (id),                        -- 
 origin_transcript_id UUID,      -- the transcript it was proposed against; set on INSERT, frozen once set
 correction_key       TEXT GENERATED ALWAYS AS (
     CASE WHEN chunk_text_sha256 IS NULL THEN NULL
-         ELSE md5(chunk_text_sha256 || E'\x1f' || lower(btrim(original_text)) || E'\x1f'
-                  || lower(btrim(COALESCE(suggested_correction, '')))) END) STORED,
+         ELSE md5(chunk_text_sha256 || E'\x1f' || norm(original_text) || E'\x1f'
+                  || norm(COALESCE(suggested_correction, ''))) END) STORED,
+    -- norm(x) = lower(btrim(regexp_replace(x, '<ASCII + Unicode space>+', ' ', 'g')) COLLATE "und-x-icu")
 duplicate_of         UUID REFERENCES transcript_findings (id) ON DELETE SET NULL,
 -- CHECK patch_state IN (..., superseded, duplicate)
 -- CHECK (duplicate_of IS NULL OR patch_state IN ('duplicate', 'superseded'))
@@ -434,7 +435,10 @@ duplicate_of         UUID REFERENCES transcript_findings (id) ON DELETE SET NULL
 `transcript_id`; it joins to `transcript_archive.transcript_id`. Findings a
 requeue archived before migration 13 have it NULL (their transcript id was
 never kept). `correction_key` is recipe-independent: two recipes proposing the
-same fix to the same chunk text share it. A `duplicate` finding agrees with
+same fix to the same chunk text share it. Case is folded with the ICU root
+collation (the live cluster is `LC_CTYPE=C`, where `lower()` is ASCII-only),
+whitespace runs (incl. tabs, newlines, NBSP) collapse to one space, accents
+are kept (`é` ≠ `e`). Read the column; never recompute the key. A `duplicate` finding agrees with
 `duplicate_of` and is never replayed; a requeue or clear archives it with
 `duplicate_of` kept, and returning it to `proposed` clears `duplicate_of` in
 the same UPDATE.
@@ -599,7 +603,8 @@ A transition's `reason` is the transaction's `earmark.reason` setting
 (`db.SetEventContext`): `requeue` for a requeue's supersede, `cleared` for the
 dashboard clear, NULL when unset. The re-anchor trigger appends a `transition`
 with `from_state = to_state` (the state before the UPDATE), reason
-`reanchor_moved`, and the OLD `chunk_text_sha256` / `anchor_offset` whenever a
+`reanchor_moved` (`reanchor_placed` when it had no `anchor_offset` yet), and
+the OLD `chunk_text_sha256` / `anchor_offset` whenever a
 finding's hash or offset changes; the row holds the new ones. An UPDATE that
 also changes `patch_state` appends both, the reanchor event first.
 
@@ -641,11 +646,12 @@ CREATE TABLE judge_passes (
 Only `legacy` rows exist so far — the judge does not write passes yet.
 Migration 13 backfilled one per (transcript, `recipe_id`) of `origin='judge'`
 findings with a live transcript (`findings_kept` = their count, started/finished
-= first/last finding) and one per transcript latched by
-`run_metrics.eval_finished_at` with no judge finding (`chunks_total` =
-`eval_chunks`), its recipe resolved from `eval_model` against the propose
-recipes' `model_alias`/`model_resolved` only when exactly one matches, else
-NULL. Counters, tokens, cost, latency and drop counts were never recorded and
+= first/last finding), and one for the latest judge run of each transcript
+latched by `run_metrics.eval_finished_at` when that run left no finding
+(`chunks_total` = `eval_chunks`): its recipe resolved from `eval_model`
+against the propose recipes' `model_alias`/`model_resolved` when exactly one
+matches (added unless the transcript already has a pass for that recipe), else
+NULL (added only when the transcript has no judge finding at all). Counters, tokens, cost, latency and drop counts were never recorded and
 are NULL on legacy rows.
 
 ### 11b. `transcript_archive` — Replaced transcripts (CONTRACT §1.4)
@@ -675,7 +681,7 @@ CREATE TABLE transcript_archive (
     created_at         TIMESTAMPTZ NOT NULL,   -- the transcript's
     archived_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     archived_reason    TEXT        NOT NULL,   -- 'requeue'
-    archived_by        TEXT                    -- earmark.actor when set
+    archived_by        TEXT                    -- the requeue's actor (db.WithActor), else 'system'
 );
 -- index transcript_archive_transcript_idx: (transcript_id)
 -- index transcript_archive_file_path_idx:  (file_path, archived_at)

@@ -139,6 +139,7 @@ func run(ctx context.Context, out io.Writer, q Requeuer, substr string, o option
 	}
 
 	var affected []string
+	ctx = db.WithActor(ctx, "cli:requeue")
 	switch {
 	case o.reembed:
 		affected, err = q.ReembedJobs(ctx, substr)

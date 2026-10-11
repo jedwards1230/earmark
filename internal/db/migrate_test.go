@@ -341,11 +341,20 @@ func TestAuditLineageMigration(t *testing.T) {
 		t.Fatal("no Down section")
 	}
 	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	// Locks are taken first, under the timeout, in the order a running judge
+	// takes them (recipes, then transcript_findings), before any other DDL.
 	for name, part := range map[string]string{"Up": up, "Down": down} {
 		i := strings.Index(part, "SET LOCAL lock_timeout = '5s'")
-		j := strings.Index(part, "ALTER TABLE")
-		if i < 0 || j < 0 || i > j {
-			t.Errorf("%s: SET LOCAL lock_timeout must precede the first ALTER TABLE", name)
+		r := strings.Index(part, "LOCK TABLE recipes IN SHARE ROW EXCLUSIVE MODE;")
+		f := strings.Index(part, "LOCK TABLE transcript_findings IN ACCESS EXCLUSIVE MODE;")
+		first := len(part)
+		for _, ddl := range []string{"CREATE ", "ALTER TABLE", "DROP ", "UPDATE ", "INSERT "} {
+			if at := strings.Index(part, ddl); at >= 0 && at < first {
+				first = at
+			}
+		}
+		if i < 0 || r < i || f < r || first < f {
+			t.Errorf("%s: want lock_timeout, then LOCK recipes, then LOCK transcript_findings, before any DDL/DML", name)
 		}
 	}
 	for _, want := range []string{
@@ -358,8 +367,12 @@ func TestAuditLineageMigration(t *testing.T) {
 		"ADD COLUMN fn_call_id BIGINT REFERENCES fn_calls (id)",
 		"ADD COLUMN origin_transcript_id UUID",
 		"ADD COLUMN duplicate_of UUID REFERENCES transcript_findings (id) ON DELETE SET NULL",
-		"lower(btrim(original_text)) || E'\\x1f'",
-		"lower(btrim(COALESCE(suggested_correction, '')))",
+		"lower(btrim(regexp_replace(original_text, E'[[:space:]\\u00a0",
+		"lower(btrim(regexp_replace(COALESCE(suggested_correction, ''), E'[[:space:]\\u00a0",
+		"COLLATE \"und-x-icu\")",
+		"|| E'\\x1f' ||",
+		"CASE WHEN OLD.anchor_offset IS NULL THEN 'reanchor_placed' ELSE 'reanchor_moved' END",
+		"AND f.patch_state NOT IN ('superseded', 'duplicate')",
 		") STORED",
 		"SELECT pg_temp.set_patch_states('duplicate', NULL)",
 		"CHECK (duplicate_of IS NULL OR patch_state IN ('duplicate', 'superseded'))",

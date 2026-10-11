@@ -495,13 +495,19 @@ func (s *MCPServer) renderFindingsFragment(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+// dashboardActor attributes the audit records the dashboard's operator
+// actions write (finding_events transitions, transcript_archive.archived_by).
+// The dashboard has no per-user identity behind its control token.
+const dashboardActor = "mcp:dashboard"
+
 // handleFindingsClear archives recorded findings as superseded (POST
 // /actions/findings-clear) and re-renders the findings fragment. It mirrors
 // the eval-action gate: htmx origin + a configured CONTROL_API_TOKEN
 // (fail-closed). Unlike the eval actions it needs NO eval endpoint. An
 // optional ?dir= scopes the clear to one book; absent → clear all. A clear is
 // a supersede, never a delete (db.ClearFindings): the rows and their
-// finding_events history stay, and only transcript_findings is written, so the
+// finding_events history stay; besides transcript_findings it only flags the
+// chunks of withdrawn accepted/applied corrections for rebuild, so the
 // read-only-transcripts invariant (§2.15) holds and re-running eval proposes
 // the findings again.
 func (s *MCPServer) handleFindingsClear(w http.ResponseWriter, r *http.Request) {
@@ -516,7 +522,7 @@ func (s *MCPServer) handleFindingsClear(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	dir := r.URL.Query().Get("dir")
-	n, err := s.db.ClearFindings(r.Context(), dir)
+	n, err := s.db.ClearFindings(r.Context(), dir, dashboardActor)
 	if err != nil {
 		s.logger.Error("clear findings error", "dir", dir, "error", err)
 		writeActionError(w, "clear findings failed — see server logs")

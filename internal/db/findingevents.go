@@ -217,6 +217,27 @@ type EventContext struct {
 var setEventContextSQL = `SELECT set_config('earmark.actor', $1, true), set_config('earmark.recipe_id', $2, true),
 	       set_config('earmark.reason', $3, true)`
 
+// actorKey carries a caller's attribution through a context (WithActor).
+type actorKey struct{}
+
+// WithActor returns ctx carrying actor ("mcp:dashboard", "cli:requeue") as the
+// attribution of the audit records a db call writes on the caller's behalf —
+// finding_events transitions and transcript_archive.archived_by. It exists for
+// entry points shared by several surfaces (requeue: the CLI and the dashboard
+// buttons) whose signatures carry no actor; methods that take an actor
+// argument ignore it.
+func WithActor(ctx context.Context, actor string) context.Context {
+	return context.WithValue(ctx, actorKey{}, actor)
+}
+
+// actorFrom returns the actor WithActor attached to ctx, else fallback.
+func actorFrom(ctx context.Context, fallback string) string {
+	if a, ok := ctx.Value(actorKey{}).(string); ok && strings.TrimSpace(a) != "" {
+		return a
+	}
+	return fallback
+}
+
 // SetEventContext attributes the rest of tx's transitions. Call it inside the
 // transaction that changes the findings.
 func SetEventContext(ctx context.Context, tx execer, ec EventContext) error {

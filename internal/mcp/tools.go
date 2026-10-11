@@ -118,12 +118,14 @@ type DBInterface interface {
 	GetFindingsCountByBook(ctx context.Context) (map[string]int, error)
 	// ClearFindings archives recorded findings as superseded (never deletes
 	// them) and returns the rows moved, for the /findings "clear findings"
-	// button. It writes ONLY transcript_findings (and, through its trigger,
-	// finding_events) — never transcripts/segments/chunks — so the
-	// read-only-over-transcripts invariant holds (§2.15) and re-running eval
-	// proposes the findings again. An empty dir clears all findings; a
-	// non-empty dir scopes the clear to one book.
-	ClearFindings(ctx context.Context, dir string) (int64, error)
+	// button. It writes transcript_findings (and, through its trigger,
+	// finding_events) plus the embedding_stale flag of the chunks whose
+	// accepted/applied correction it withdrew — never transcripts, segments
+	// or chunk text — so the read-only-over-transcripts invariant holds
+	// (§2.15) and re-running eval proposes the findings again. An empty dir clears all findings; a
+	// non-empty dir scopes the clear to one book. actor attributes the
+	// transitions (finding_events).
+	ClearFindings(ctx context.Context, dir, actor string) (int64, error)
 	// GetEvalChunksForBook / SampleEvalChunks / InsertFindings back the on-demand
 	// "run eval" dashboard actions (CONTRACT §2.15). The first two are the
 	// read-only eval.ChunkReader; the third is the insert-only eval.FindingWriter.

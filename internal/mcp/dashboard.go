@@ -2840,7 +2840,7 @@ func (s *MCPServer) handleRequeueJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
 	}
-	if _, err := s.db.RequeueByID(r.Context(), id); err != nil {
+	if _, err := s.db.RequeueByID(db.WithActor(r.Context(), dashboardActor), id); err != nil {
 		s.logger.Error("requeue job error", "id", id, "error", err)
 		writeActionError(w, "requeue failed — see server logs")
 		return
@@ -2863,7 +2863,7 @@ func (s *MCPServer) handleRetryFailed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	paths, err := s.db.RequeueFailed(r.Context())
+	paths, err := s.db.RequeueFailed(db.WithActor(r.Context(), dashboardActor))
 	if err != nil {
 		s.logger.Error("retry failed error", "error", err)
 		writeActionError(w, "retry-all-failed failed — see server logs")
@@ -2885,7 +2885,7 @@ func (s *MCPServer) handleBookRequeue(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing dir", http.StatusBadRequest)
 		return
 	}
-	paths, err := s.db.RequeueByDir(r.Context(), dir)
+	paths, err := s.db.RequeueByDir(db.WithActor(r.Context(), dashboardActor), dir)
 	if err != nil {
 		s.logger.Error("book requeue error", "dir", dir, "error", err)
 		writeActionError(w, "requeue book failed — see server logs")

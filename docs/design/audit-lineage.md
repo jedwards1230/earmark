@@ -37,11 +37,14 @@ cost, latency p50/p95, the hash of the book context the judge saw, the
 its transcript. Each finding points at its pass (`judge_pass_id`).
 
 No writer exists yet: the only rows are `legacy` ones the migration
-backfilled — one per (transcript, recipe) of judge findings, and one per
-transcript latched as judged that kept no finding. A legacy row's recipe is
-the findings' `recipe_id`; for a zero-finding latch it is resolved from
-`run_metrics.eval_model` only when exactly one propose recipe matches by
-`model_alias`/`model_resolved`, else NULL. Legacy counters, tokens, cost,
+backfilled — one per (transcript, recipe) of judge findings, and one for the
+latest judge run of each latched transcript when that run found nothing. A
+legacy row's recipe is the findings' `recipe_id`; for the latest run it is
+resolved from `run_metrics.eval_model` only when exactly one propose recipe
+matches by `model_alias`/`model_resolved`. A resolved recipe gets its
+zero-finding row unless the transcript already has a pass for it (so an older
+recipe's findings and a newer recipe's empty run both show); an unresolved one
+gets a NULL-recipe row only when the transcript has no judge finding at all. Legacy counters, tokens, cost,
 latency and drop counts were never recorded and stay NULL; an older judge run
 that found nothing, and was then superseded by a later run, left no trace and
 has no row.
@@ -64,8 +67,13 @@ that described it.
   archived before this migration cannot be attributed: their transcript id was
   never kept.
 - `correction_key` is a generated md5 over the chunk text hash, the normalized
-  original span and the normalized correction (lower-cased, trimmed, joined by
-  U+001F so the parts cannot run into each other). It deliberately excludes the
+  original span and the normalized correction, joined by U+001F so the parts
+  cannot run into each other. Normalizing collapses every whitespace run
+  (tabs, newlines, NBSP and the other Unicode spaces included) to one space,
+  trims, and lower-cases under the ICU root collation — the live cluster is
+  `LC_CTYPE=C`, where plain `lower()` would leave `ÉMILE` unequal to `émile`.
+  Accents are not folded: `é` and `e` are different corrections. Code reads
+  the column rather than recomputing the key. It deliberately excludes the
   recipe: two recipes proposing the same fix to the same chunk text share a
   key. That is what turns cross-model agreement — and the link between a new
   proposal and an older, already-decided finding of the same fix — into a
@@ -89,8 +97,12 @@ No path groups findings into `duplicate` yet.
 ### Nothing is deleted — clear-as-supersede
 
 The dashboard's clear moves findings to `superseded` (stamped, attributed to
-`mcp:dashboard` with reason `cleared`) instead of deleting them, so decisions
-and their event history survive. A cleared finding keeps its `transcript_id`
+the caller's actor — `mcp:dashboard` — with reason `cleared`) instead of
+deleting them, so decisions and their event history survive. Withdrawing an
+accepted or applied correction flags its chunk for rebuild in the same
+statement (and again after commit, as a revert does), so the served and
+embedded text match the log. The book scope escapes `_` and `%` in the
+directory name. A cleared finding keeps its `transcript_id`
 (the transcript still exists), so "live" means `patch_state <> 'superseded'`
 for every reader, not a non-NULL transcript: in particular the eval dedupe
 ignores superseded rows, and re-running eval after a clear proposes again.
@@ -98,20 +110,32 @@ ignores superseded rows, and re-running eval after a clear proposes again.
 ### Every move is in the log — reanchor events and reasons
 
 - A second trigger on `transcript_findings` appends a `transition` with
-  `from_state = to_state` and reason `reanchor_moved` whenever a finding's
+  `from_state = to_state` and reason `reanchor_moved` (`reanchor_placed` for a
+  legacy finding's first anchoring) whenever a finding's
   `chunk_text_sha256` or `anchor_offset` changes, recording the **old** hash
   and offset (`finding_events.anchor_offset`). An UPDATE that also changes the
   state records both events, the reanchor one first.
 - Transitions take their `reason` from the transaction-local setting
   `earmark.reason` (`db.SetEventContext`), like `earmark.actor`: `requeue` for a
-  requeue's supersede, `cleared` for a clear.
+  requeue's supersede, `cleared` for a clear. A requeue sets both once, before
+  it writes anything, from the caller's actor (`db.WithActor`; `system` when
+  none), which is also the archive's `archived_by`.
+- Duplicates stay out of every live count — the findings summaries and
+  `stale_work`'s propose arm skip `duplicate` as well as `superseded` — so one
+  fix is never counted twice.
 
 ## Migration cost and locks
 
-The `transcript_findings` ALTER rewrites the table (the generated column) and
-holds ACCESS EXCLUSIVE until commit, so the backfill reads a frozen table and
-no finding lands between the backfill and the new triggers. At the live scale
-(~32k findings, ~4.3k transcripts) Up measures about one second on a local
-Postgres 16; the migration gives up after a 5 s lock wait and the next process
-start retries it. Down drops the new tables and columns (their contents are
-lost) and returns duplicates to `proposed`.
+Up first takes, under a 5 s lock timeout, SHARE ROW EXCLUSIVE on `recipes`
+and then ACCESS EXCLUSIVE on `transcript_findings` — the order a running judge
+takes them (`db.InsertFindings` registers its recipe before inserting
+findings in the same transaction), so the migration cannot deadlock with an
+eval in flight; every later lock is taken after `transcript_findings`, as the
+decide and review writers do. Holding `transcript_findings` for the whole
+transaction means the backfill reads a frozen table and no finding lands
+between the backfill and the new triggers. The table is rewritten (the
+generated column); at the live scale (~32k findings, ~4.3k transcripts) Up
+measures about one second on a local Postgres 16. Behind a long reader the
+migration gives up and the next process start retries it. Down drops the new
+tables and columns (their contents are lost), restores the previous
+`stale_work`, and returns duplicates to `proposed`.

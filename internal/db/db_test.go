@@ -1489,15 +1489,17 @@ func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 	mock.ExpectExec(requeueLockTranscriptsSQL).
 		WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	// 2a) copy the transcript (raw_text, segments, metadata, run_metrics as
+	// 2a) attribution, set once before anything is written: the archive's
+	//    archived_by and the supersede transitions read it (the caller's
+	//    WithActor actor, reason 'requeue')
+	mock.ExpectExec(setEventContextSQL).
+		WithArgs("mcp:dashboard", "", requeueReason).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// 2b) copy the transcript (raw_text, segments, metadata, run_metrics as
 	//    jsonb) into transcript_archive BEFORE anything is deleted
 	mock.ExpectExec(requeueArchiveTranscriptsSQL).
 		WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	// 2b) the supersede transitions carry reason 'requeue' in finding_events
-	mock.ExpectExec(setEventContextSQL).
-		WithArgs("", "", requeueReason).
-		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	// 2c) archive its transcript's findings — every state but superseded,
 	//    human decisions included
 	mock.ExpectExec(requeueSupersedeFindingsSQL).
@@ -1512,7 +1514,7 @@ func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 		WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 
-	_, paths, err := requeueTx(context.Background(), tx, requeueByID, id)
+	_, paths, err := requeueTx(WithActor(context.Background(), "mcp:dashboard"), tx, requeueByID, id)
 	if err != nil {
 		t.Fatalf("requeueTx: %v", err)
 	}
@@ -1567,6 +1569,8 @@ func TestRequeueTxArchiveFailureAborts(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, "/b/x.m4b"))
 	mock.ExpectExec(requeueLockTranscriptsSQL).WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(setEventContextSQL).WithArgs(requeueDefaultActor, "", requeueReason).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(requeueArchiveTranscriptsSQL).WithArgs([]string{id}).
 		WillReturnError(errors.New("boom"))
 
@@ -1599,10 +1603,10 @@ func TestRequeueTxSupersedeFailureAborts(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, "/b/x.m4b"))
 	mock.ExpectExec(requeueLockTranscriptsSQL).WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(setEventContextSQL).WithArgs(requeueDefaultActor, "", requeueReason).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(requeueArchiveTranscriptsSQL).WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectExec(setEventContextSQL).WithArgs("", "", requeueReason).
-		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(requeueSupersedeFindingsSQL).
 		WithArgs([]string{id}, supersedeFromStates).
 		WillReturnError(errors.New("boom"))
