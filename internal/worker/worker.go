@@ -84,8 +84,10 @@ type DBInterface interface {
 	MarkFindingsApplied(ctx context.Context, recs []db.AppliedFinding) error
 	MarkFindingsStale(ctx context.Context, ids []string, reason string) error
 	// ClearEmbeddingStale clears the rebuild flag for chunks this rebuild
-	// brought up to date, guarded by the overlay-read watermark.
-	ClearEmbeddingStale(ctx context.Context, transcriptID string, watermark time.Time) error
+	// brought up to date, guarded by the overlay-read watermark and by the ids
+	// of the corrections it replayed (a chunk whose replayed correction has
+	// left the overlay since stays flagged).
+	ClearEmbeddingStale(ctx context.Context, transcriptID string, watermark time.Time, replayed []string) error
 	// GetTranscriptsWithStaleChunks selects transcripts with at least one chunk
 	// flagged embedding_stale — the rebuild pass that closes the
 	// accept → replay → re-embed loop (CONTRACT §2.17).
@@ -1496,7 +1498,11 @@ func (w *Worker) persistReplay(t *db.Transcript, o replayOutcome) {
 	if o.readAt.IsZero() {
 		return
 	}
-	if err := w.db.ClearEmbeddingStale(w.ctx, t.ID, o.readAt); err != nil {
+	replayed := make([]string, len(o.applied))
+	for i, a := range o.applied {
+		replayed[i] = a.ID
+	}
+	if err := w.db.ClearEmbeddingStale(w.ctx, t.ID, o.readAt, replayed); err != nil {
 		w.log.Warn("clearing embedding_stale failed (chunk stays flagged; rebuilt again next cycle)",
 			"transcript_id", t.ID, "error", err)
 	}

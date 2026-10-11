@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -776,5 +777,113 @@ func TestIntegrationLiveReadersSkipClearedAndDuplicates(t *testing.T) {
 	}
 	if got := countRows(t, conn, `SELECT count(*) FROM stale_work WHERE step = 'propose'`); got != 1 {
 		t.Errorf("stale_work propose arm lists %d findings, want only the live one", got)
+	}
+}
+
+// TestIntegrationClearEmbeddingStaleKeepsWithdrawnCorrectionFlagged is the
+// rebuild/clear race made sequential: a rebuild reads the overlay (an accepted
+// correction X on chunk 0, decided long before), replays X, and only then — after a
+// clear has withdrawn X and committed — calls ClearEmbeddingStale with the
+// watermark of its read. X is no longer accepted and its decided_at is older
+// than the watermark, so a timestamp-only guard clears the flag and the chunk
+// keeps serving the withdrawn text. With the replayed set the flag stays set.
+func TestIntegrationClearEmbeddingStaleKeepsWithdrawnCorrectionFlagged(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	ids := seedFindingEvents(t, conn, 2) // ids[0] on chunk 0, ids[1] on chunk 1
+	x, other := ids[0], ids[1]
+	if _, err := conn.Exec(ctx, `UPDATE transcript_findings
+		SET patch_state = 'applied', decided_at = now() - interval '1 hour', decided_by = 'mcp:justin'
+		WHERE id = ANY($1)`, ids); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE transcript_chunks SET embedding_stale = true WHERE transcript_id = $1`, feTranscript); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rebuild reads the overlay at W and replays both corrections.
+	rows, w, err := d.GetCorrectionOverlay(ctx, feTranscript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("overlay has %d corrections, want 2", len(rows))
+	}
+	// A clear withdraws X (only) and commits after that read.
+	if _, err := conn.Exec(ctx, `UPDATE transcript_findings SET patch_state = 'superseded', superseded_at = now()
+		WHERE id = $1`, x); err != nil {
+		t.Fatal(err)
+	}
+	// The rebuild finishes.
+	if err := d.ClearEmbeddingStale(ctx, feTranscript, w, []string{x, other}); err != nil {
+		t.Fatal(err)
+	}
+	if !chunkStale(t, conn, feChunk0) {
+		t.Error("chunk 0 still embeds the withdrawn correction but its rebuild flag was cleared")
+	}
+	if chunkStale(t, conn, feChunk1) {
+		t.Error("chunk 1's replayed correction is still applied: its flag should clear")
+	}
+
+	// The same through ClearFindings, with the flag cleared in between.
+	if _, err := conn.Exec(ctx, `UPDATE transcript_chunks SET embedding_stale = true WHERE id = $1`, feChunk1); err != nil {
+		t.Fatal(err)
+	}
+	_, w2, err := d.GetCorrectionOverlay(ctx, feTranscript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := d.ClearFindings(ctx, "/b/FE", testClearActor); err != nil || n != 1 {
+		t.Fatalf("clear = %d, %v; want 1", n, err)
+	}
+	if err := d.ClearEmbeddingStale(ctx, feTranscript, w2, []string{other}); err != nil {
+		t.Fatal(err)
+	}
+	if !chunkStale(t, conn, feChunk1) {
+		t.Error("a correction cleared after the overlay read must keep its chunk flagged")
+	}
+}
+
+// TestIntegrationAuditLineageDownRefusesWithArchive: once a requeue has
+// archived a transcript, rolling migration 13 back refuses — the archive is
+// the only copy of that ASR pass — until the session opts in with
+// earmark.allow_data_loss = 'on'.
+func TestIntegrationAuditLineageDownRefusesWithArchive(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	seedRequeueRows(t, dbURL)
+	if _, err := d.RequeueByID(ctx, rqJobA); err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	conn := connect(t, dbURL)
+	if n := countRows(t, conn, `SELECT count(*) FROM transcript_archive`); n != 1 {
+		t.Fatalf("archive has %d rows, want 1", n)
+	}
+
+	_, err := providerFor(t, dbURL).DownTo(ctx, 12)
+	if err == nil || !strings.Contains(err.Error(), "refusing to roll back migration 13") {
+		t.Fatalf("Down with archived transcripts: err = %v, want a refusal", err)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM transcript_archive`); n != 1 {
+		t.Error("a refused Down must leave the archive intact")
+	}
+	if v := gooseVersion(t, dbURL); v != latestVersion(t) {
+		t.Errorf("goose version = %d after a refused Down, want %d", v, latestVersion(t))
+	}
+
+	// Opting in (new sessions pick the database default up).
+	var name string
+	if err := conn.QueryRow(ctx, `SELECT current_database()`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `ALTER DATABASE `+pgx.Identifier{name}.Sanitize()+` SET earmark.allow_data_loss = 'on'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providerFor(t, dbURL).DownTo(ctx, 12); err != nil {
+		t.Fatalf("Down with earmark.allow_data_loss = on: %v", err)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM pg_tables WHERE tablename = 'transcript_archive'`); n != 0 {
+		t.Error("the opted-in Down kept transcript_archive")
 	}
 }

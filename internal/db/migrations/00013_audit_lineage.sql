@@ -468,10 +468,30 @@ SELECT 'scan', 'transcript_chunks', c.id, ls.recipe_id, cur.recipe_id
 -- +goose Down
 -- Lossy, like every Down here: judge_passes and transcript_archive are
 -- dropped with their rows, and so are the reanchor events' old offsets.
+--
+-- transcript_archive holds the ONLY copy of every transcript a requeue
+-- replaced (raw_text, segments, run_metrics). Down therefore REFUSES while it
+-- has rows, unless the session sets earmark.allow_data_loss = 'on' — e.g.
+-- PGOPTIONS='-c earmark.allow_data_loss=on' for the process running the
+-- rollback, or ALTER DATABASE … SET earmark.allow_data_loss = 'on' before it
+-- and RESET after. Back the table up first.
 -- 'duplicate' did not exist before, so duplicates return to 'proposed' —
 -- exactly what undoing their grouping does — which the transition trigger
 -- records like any other move.
 SET LOCAL lock_timeout = '5s';
+
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM transcript_archive)
+       AND COALESCE(current_setting('earmark.allow_data_loss', true), '') <> 'on' THEN
+        RAISE EXCEPTION 'refusing to roll back migration 13: transcript_archive has % row(s), the only copy of the transcripts requeues replaced',
+            (SELECT count(*) FROM transcript_archive)
+            USING HINT = 'back the table up, then set earmark.allow_data_loss = ''on'' for the session running the rollback';
+    END IF;
+END $$;
+-- +goose StatementEnd
+
 LOCK TABLE recipes IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE transcript_findings IN ACCESS EXCLUSIVE MODE;
 

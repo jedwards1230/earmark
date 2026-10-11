@@ -3678,7 +3678,12 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 // so the decisions and their finding_events history survive (CONTRACT §2.15
 // "Clearing", §2.17). Package vars so a test can assert their shape.
 //
-// One statement, in the repo-wide lock order (findings, then chunks):
+// One statement. Lock order: the findings in scope (tgt, in id order), then
+// their chunks (flag). Every writer that locks several findings takes them in
+// id order and before any chunk — requeue too, after its transcript locks
+// (transcripts → findings in id order → chunks via the delete cascade) — so a
+// clear racing a requeue, a decide, a review or ClearEmbeddingStale queues
+// instead of deadlocking:
 //   - tgt locks the findings in scope that may still move ($1, every state but
 //     superseded, derived from patch.CanTransition like requeue's), in id
 //     order;
@@ -3752,12 +3757,14 @@ const clearFindingsReason = "cleared"
 // eval proposes them afresh. When dir is non-empty the clear is scoped to that
 // book directory (prefix match); empty dir clears all findings.
 //
-// After the commit the withdrawn corrections' chunks are flagged again, as
-// RevertDecisions does: a rebuild that read the overlay before the clear and
-// clears the flag after it would otherwise keep the cleared correction in the
-// projection (ClearEmbeddingStale's watermark only sees decided_at, which a
-// clear does not stamp). That costs at most one extra re-embed per chunk; a
-// failure there is logged, not returned — the clear itself committed.
+// A rebuild that read the overlay before the clear cannot clear the flag
+// afterwards: ClearEmbeddingStale takes the ids it replayed, locks them, and
+// keeps any chunk flagged whose replayed correction has since left the
+// overlay. After the commit the withdrawn corrections' chunks are flagged once
+// more, as RevertDecisions does — defence in depth for a rebuild still running
+// a build without that guard during a rollout. That pass runs detached from
+// the caller's cancellation with a short timeout; a failure is logged at
+// Error, not returned — the clear itself committed.
 func (db *DB) ClearFindings(ctx context.Context, dir, actor string) (int64, error) {
 	if strings.TrimSpace(actor) == "" {
 		return 0, errors.New("clear findings: actor is required")
@@ -3775,13 +3782,22 @@ func (db *DB) ClearFindings(ctx context.Context, dir, actor string) (int64, erro
 		return 0, fmt.Errorf("commit clear findings tx: %w", err)
 	}
 	if len(res.withdrawn) > 0 {
-		if _, err := db.pool.Exec(ctx, reflagChunksSQL, res.withdrawn); err != nil {
-			db.log.Warn("re-flag cleared corrections' chunks failed; the in-transaction flag stands",
+		// The clear has committed: finish this even if the caller (an htmx
+		// request) has gone away, but never hang on it.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clearReflagTimeout)
+		defer cancel()
+		if _, err := db.pool.Exec(rctx, reflagChunksSQL, res.withdrawn); err != nil {
+			db.log.Error("re-flag of cleared corrections' chunks failed after commit: a rebuild "+
+				"running a build without the replayed-set guard can clear the flag and keep the "+
+				"withdrawn correction embedded until that chunk is next rebuilt",
 				"findings", len(res.withdrawn), "error", err)
 		}
 	}
 	return res.moved, nil
 }
+
+// clearReflagTimeout bounds ClearFindings' post-commit re-flag.
+const clearReflagTimeout = 10 * time.Second
 
 // clearResult is what one clear did: findings moved, the ids of those that
 // were in the overlay, and the chunks flagged for rebuild in the transaction.
@@ -4374,10 +4390,24 @@ const requeueDefaultActor = "system"
 // Its unanchorable_reason is cleared because the database requires it to be
 // set exactly when patch_state = 'unanchorable'
 // (transcript_findings_unanchorable_reason_iff_state, migration 4).
-const requeueSupersedeFindingsSQL = `UPDATE transcript_findings
-	SET    patch_state = 'superseded', superseded_at = now(), unanchorable_reason = NULL
-	WHERE  transcript_id IN (SELECT id FROM transcripts WHERE job_id = ANY($1))
-	  AND  patch_state = ANY($2)`
+//
+// The findings are locked first, in id order (lk), then updated: every writer
+// that locks several findings takes them in id order (ClearFindings,
+// SetPatchStateBulk, ApplyDecisions), so a requeue racing a clear over the
+// same findings queues instead of deadlocking (40P01). A requeue's full lock
+// order is transcripts (requeueLockTranscriptsSQL) → findings in id order →
+// chunks (the transcript delete's cascade).
+const requeueSupersedeFindingsSQL = `WITH lk AS (
+	    SELECT id FROM transcript_findings
+	     WHERE transcript_id IN (SELECT id FROM transcripts WHERE job_id = ANY($1))
+	       AND patch_state = ANY($2)
+	     ORDER BY id
+	       FOR UPDATE
+	)
+	UPDATE transcript_findings f
+	   SET patch_state = 'superseded', superseded_at = now(), unanchorable_reason = NULL
+	  FROM lk
+	 WHERE f.id = lk.id`
 
 // requeueDeleteTranscriptsSQL deletes the requeued jobs' transcripts. Chunks
 // cascade; findings keep their row and get transcript_id = NULL (ON DELETE SET

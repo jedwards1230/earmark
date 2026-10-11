@@ -78,6 +78,8 @@ func TestProcessTranscript_ClearsStaleFlagWithOverlayWatermark(t *testing.T) {
 		require.Len(t, fdb.clearCalls, 1)
 		require.Equal(t, tr.ID, fdb.clearCalls[0].transcriptID)
 		require.Equal(t, watermark, fdb.clearCalls[0].watermark)
+		// The guard needs exactly the corrections that landed in the text.
+		require.Equal(t, []string{"f1"}, fdb.clearCalls[0].replayed)
 	})
 
 	// Zero corrections is NOT "nothing to do": a revert removes the last
@@ -91,6 +93,7 @@ func TestProcessTranscript_ClearsStaleFlagWithOverlayWatermark(t *testing.T) {
 		require.Len(t, fdb.clearCalls, 1,
 			"a rebuild with an empty overlay must still clear the flag")
 		require.Equal(t, watermark, fdb.clearCalls[0].watermark)
+		require.Empty(t, fdb.clearCalls[0].replayed)
 	})
 
 	t.Run("not cleared when the overlay could not be read", func(t *testing.T) {

@@ -261,9 +261,10 @@ var revokeScopeSQL = `
 // reflagChunksSQL marks the chunk of every listed finding embedding_stale
 // (addressed like markChunkStaleForFindingSQL). It runs after the revert
 // commits: a rebuild that read the overlay before the revert and clears the
-// flag after it would otherwise keep the undone fix in the projection
-// (ClearEmbeddingStale's watermark only sees decided_at). Costs at most one
-// extra re-embed per chunk.
+// flag after it would otherwise keep the undone fix in the projection.
+// ClearEmbeddingStale's replayed-set guard now closes that window on its own;
+// this sweep (shared with ClearFindings) stays as defence in depth for a
+// rebuild running an older build. Costs at most one extra re-embed per chunk.
 var reflagChunksSQL = `
 	UPDATE transcript_chunks c
 	   SET embedding_stale = true

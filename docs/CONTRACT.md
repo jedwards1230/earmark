@@ -667,6 +667,22 @@ worker has rebuilt the chunks (§2.17 "Re-anchoring"); until it runs, replaying
 an old finding retires it as `stale`. A re-transcribe needs no re-anchor: its
 findings are superseded and the new transcript is judged fresh.
 
+**Rolling back migration 13 refuses to destroy the archive.** Its Down drops
+`transcript_archive`, which after any requeue holds the only copy of the
+replaced transcripts' `raw_text`, `segments` and `run_metrics`. Down raises
+an exception while the table has rows, unless the session running it sets
+`earmark.allow_data_loss = 'on'` (e.g. `PGOPTIONS='-c
+earmark.allow_data_loss=on'`, or `ALTER DATABASE … SET` before and `RESET`
+after). Back the table up first.
+
+**Lock order.** A requeue locks the transcripts (step 2), then their findings
+in id order (step 3 is `WITH lk AS (SELECT id … ORDER BY id FOR UPDATE)
+UPDATE … FROM lk`), then the chunks through the delete's cascade. Every other
+multi-finding writer (the dashboard clear, `SetPatchStateBulk`,
+`ApplyDecisions`, `ClearEmbeddingStale`) also takes findings in id order and
+before chunks, so a requeue racing them queues instead of failing with a
+deadlock (40P01).
+
 **The `transcript_findings.transcript_id` foreign key** (migration 5).
 `REFERENCES transcripts(id) ON DELETE SET NULL`, so a finding can never point at a
 transcript that does not exist. Before it existed, requeue left findings
@@ -3585,11 +3601,14 @@ transcript still exists — so every reader of live findings filters on
 proposes them again. A cleared `accepted`/`applied` finding leaves the
 overlay, so the same statement flags its chunk `embedding_stale` (addressed
 like an accept) and the next rebuild drops the correction from the served
-and embedded text — they match the audit. After the commit those chunks are
-flagged again, as `earmark decide revert` does, because a rebuild that read
-the overlay before the clear could otherwise clear the flag afterwards (its
-watermark sees only `decided_at`, which a clear does not stamp); a failure
-there is logged, the clear stands. Beyond `transcript_findings` (and
+and embedded text — they match the audit. A rebuild that read the overlay
+before the clear cannot clear that flag afterwards: `ClearEmbeddingStale`
+keeps any chunk flagged whose replayed correction has left the overlay (§2.17
+"The watermark"). After the commit the chunks are flagged once more, as
+`earmark decide revert` does — defence in depth for a rebuild still running an
+older build during a rollout; it runs detached from the request's
+cancellation with a 10 s timeout, and a failure is logged at Error (the clear
+stands). Beyond `transcript_findings` (and
 `finding_events`, by trigger) the clear writes only that flag — never the
 transcript tables or chunk text — so the read-only-transcripts contract
 holds.
@@ -4264,13 +4283,27 @@ committing between the rebuild's overlay read and its insert sets the flag, and
 the clear would wipe it — that correction would never be replayed and never be
 re-flagged. Instead `GetCorrectionOverlay` returns the server-side timestamp its
 read was taken at, and the clear is guarded: a chunk is only unflagged when it
-carries no finding `decided_at` later than that watermark **and** no finding
-still sitting in `accepted`. A blocked chunk simply gets rebuilt again next
-cycle, so the failure mode is one redundant re-embed rather than a lost
-correction. (The second condition also makes a failed best-effort
+carries no finding `decided_at` later than that watermark, no finding
+still sitting in `accepted`, **and** no correction this rebuild *replayed*
+that has since left the overlay states. A blocked chunk simply gets rebuilt
+again next cycle, so the failure mode is one redundant re-embed rather than a
+lost correction. (The second condition also makes a failed best-effort
 `MarkFindingsApplied` self-healing.) Because the watermark is what protects a
 concurrent decision, **revert stamps `decided_at` too** — not only accept and
 reject.
+
+The third condition (migration 13 era) is what makes withdrawals exact.
+Timestamps cannot be: a clear (or revert) whose statement time precedes the
+watermark can still commit after the overlay read, and a clear stamps no
+`decided_at` at all. So the rebuild passes `ClearEmbeddingStale` the ids of
+the corrections it actually applied to the embedded text
+(`replayOutcome.applied`, not the quarantined ones), and the clear runs in its
+own transaction: it locks those findings `FOR SHARE` in id order, then unflags
+only chunks where none of them has moved out of `accepted`/`applied`
+(`f.id = ANY(replayed) AND f.patch_state <> ALL(overlay states)`). A writer
+already holding one of them (a clear, revert, reject — all lock findings
+first, in id order) is waited for and its committed state is then seen; one
+that comes later waits for this transaction and re-flags the chunk itself.
 
 Invalidation is **exactly one chunk**, and this is a property of the schema
 rather than a lucky accident: chunks store their text denormalized and carry no
@@ -4970,9 +5003,10 @@ one scope flag is required; together they narrow (AND). Dry-run unless
   that recipe decides those findings afresh.
 - **Re-flag sweep**: after each batch commits, every moved finding's chunk is
   flagged `embedding_stale`. This closes the window where a rebuild that read
-  the overlay before the revert clears the flag after it
-  (`ClearEmbeddingStale`'s watermark only sees `decided_at`); it costs at most
-  one extra re-embed per chunk.
+  the overlay before the revert clears the flag after it; since migration 13
+  `ClearEmbeddingStale`'s replayed-set guard closes that window by itself, and
+  the sweep remains as defence in depth. It costs at most one extra re-embed
+  per chunk.
 
 #### Runbook: deciding the backlog
 

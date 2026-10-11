@@ -100,8 +100,13 @@ The dashboard's clear moves findings to `superseded` (stamped, attributed to
 the caller's actor — `mcp:dashboard` — with reason `cleared`) instead of
 deleting them, so decisions and their event history survive. Withdrawing an
 accepted or applied correction flags its chunk for rebuild in the same
-statement (and again after commit, as a revert does), so the served and
-embedded text match the log. The book scope escapes `_` and `%` in the
+statement, and a rebuild that read the overlay before the clear cannot clear
+that flag afterwards: `ClearEmbeddingStale` takes the ids of the corrections
+the rebuild replayed, locks them, and keeps any chunk flagged whose replayed
+correction has since left the overlay — exact where a timestamp comparison
+cannot be (a clear stamps no `decided_at`, and its statement time can precede
+the rebuild's read while its commit follows it). The served and embedded text
+therefore match the log. The book scope escapes `_` and `%` in the
 directory name. A cleared finding keeps its `transcript_id`
 (the transcript still exists), so "live" means `patch_state <> 'superseded'`
 for every reader, not a non-NULL transcript: in particular the eval dedupe
@@ -137,5 +142,7 @@ between the backfill and the new triggers. The table is rewritten (the
 generated column); at the live scale (~32k findings, ~4.3k transcripts) Up
 measures about one second on a local Postgres 16. Behind a long reader the
 migration gives up and the next process start retries it. Down drops the new
-tables and columns (their contents are lost), restores the previous
-`stale_work`, and returns duplicates to `proposed`.
+tables and columns, restores the previous `stale_work`, and returns
+duplicates to `proposed` — but it refuses while `transcript_archive` has rows
+(the only copy of the replaced transcripts) unless the session sets
+`earmark.allow_data_loss = 'on'`.

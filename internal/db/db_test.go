@@ -1539,6 +1539,13 @@ func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 	if strings.Contains(strings.ToUpper(requeueSupersedeFindingsSQL), "DELETE") {
 		t.Error("superseding must UPDATE findings, never DELETE them")
 	}
+	// Findings are locked in id order before the UPDATE, like every other
+	// multi-finding writer (ClearFindings, SetPatchStateBulk), so a requeue
+	// racing a clear queues instead of deadlocking.
+	if n := norm(requeueSupersedeFindingsSQL); !strings.Contains(n, "ORDER BY id FOR UPDATE ) UPDATE transcript_findings f") ||
+		!strings.Contains(n, "FROM lk WHERE f.id = lk.id") {
+		t.Errorf("requeueSupersedeFindingsSQL must lock findings in id order, then update:\n%s", n)
+	}
 	// The archive keeps every transcripts column worth keeping, and the whole
 	// run_metrics row.
 	for _, col := range []string{"t.raw_text", "t.segments", "t.model_name", "t.recipe_id",

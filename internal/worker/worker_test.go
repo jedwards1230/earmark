@@ -114,6 +114,7 @@ type fakeDB struct {
 type clearCall struct {
 	transcriptID string
 	watermark    time.Time
+	replayed     []string
 }
 
 // staleMark is one MarkFindingsStale call, captured for assertions.
@@ -136,13 +137,13 @@ func (f *fakeDB) GetCorrectionOverlay(_ context.Context, _ string) ([]db.Correct
 	return f.overlay, readAt, nil
 }
 
-func (f *fakeDB) ClearEmbeddingStale(_ context.Context, transcriptID string, watermark time.Time) error {
+func (f *fakeDB) ClearEmbeddingStale(_ context.Context, transcriptID string, watermark time.Time, replayed []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.clearErr != nil {
 		return f.clearErr
 	}
-	f.clearCalls = append(f.clearCalls, clearCall{transcriptID: transcriptID, watermark: watermark})
+	f.clearCalls = append(f.clearCalls, clearCall{transcriptID: transcriptID, watermark: watermark, replayed: replayed})
 	return nil
 }
 
