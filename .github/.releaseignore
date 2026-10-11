@@ -1,0 +1,41 @@
+# .github/.releaseignore -- dev-only paths for the release gate (gitignore syntax).
+# A merged PR whose changed files ALL match here releases nothing, unless it carries a
+# semver:* label (an explicit label always wins). Anything not matched is product and
+# releases as a patch. Read by .github/workflows/release.yml.
+# NOTE git semantics: a file can't be re-included if a parent DIRECTORY is excluded.
+#   docs/**  +  !docs/user/**   does NOT work (docs/user/ itself is excluded);
+#   docs/**  +  !docs/user/  +  !docs/user/**   does. File-level `!docs/openapi.yaml` works.
+#
+# earmark specifics: the Dockerfile does `COPY . .` and .dockerignore drops docs/ and *.md
+# except docs/openapi.go + docs/openapi.yaml (embedded in the binary), so only the markdown
+# docs are dev-only. .dockerignore itself shapes the build context, so it is product.
+# README*, runner/ (deployed ASR worker), deploy/helm/ (published chart) are product.
+
+# CI, editor and agent config
+/.github/
+/.devcontainer/
+/.claude/
+/.vscode/
+/.mcp.json
+CLAUDE.md
+AGENTS.md
+/CONTRIBUTING*
+
+# Docs that are not embedded in the image (docs/openapi.{go,yaml} are product)
+/docs/*.md
+/docs/design/
+
+# Tests
+*_test.go
+/runner/test_*.py
+
+# Repo and linter config, local-only build files
+/.gitignore
+/.env.example
+/.editorconfig
+/.golangci*
+/.pre-commit-config.yaml
+/.markdownlint*
+/.yamllint*
+/Makefile
+/compose.yaml

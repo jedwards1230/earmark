@@ -30,12 +30,12 @@ The build target is **linux/amd64** only — earmark is a Linux container servic
 
 ### Release (`release.yml`)
 
-Triggers automatically on push to `main` (reads `semver:patch/minor/major` label from the merged PR; defaults to patch if no label) or manually via `workflow_dispatch`.
+Triggers automatically on push to `main` (reads the `semver:*` label from the merged PR: `major`/`minor`/`patch` set the bump, `none` skips the release; with no label it releases as patch unless every changed file matches `.github/.releaseignore`, in which case no release is cut) or manually via `workflow_dispatch`.
 
 Pipeline:
 
 1. **detect** — reads bump type from PR label or dispatch input; supports `dry_run` mode (previews version + notes without tagging)
-2. **prepare** — calls `jedwards1230/release-workflows/.github/workflows/ai-release.yml@v1`; bumps `deploy/helm/earmark/Chart.yaml`, pushes git tag, generates AI release notes (Claude Haiku for patch, Sonnet for minor/major)
+2. **prepare** (skipped when `detect` says no release; so are build, helm and release) — calls `jedwards1230/release-workflows/.github/workflows/ai-release.yml@v1`; bumps `deploy/helm/earmark/Chart.yaml`, pushes git tag, generates AI release notes (Claude Haiku for patch, Sonnet for minor/major)
 3. **build** — builds and pushes `ghcr.io/jedwards1230/earmark:{version}` and `:latest` to GHCR (`linux/amd64`, `CGO_ENABLED=0`, GHA layer cache)
 4. **helm** — packages and pushes the OCI Helm chart to `oci://ghcr.io/jedwards1230/charts/earmark`
 5. **release** — creates GitHub Release with Docker + Helm install snippets prepended to the AI-generated body
