@@ -138,7 +138,9 @@ func TestResolvePolicyFailsClosed(t *testing.T) {
 		{"row apply_p under the preset reject_p", []config.StepSetting{clefRow(map[string]any{config.ParamApplyP: 0.1})}, nil, "reject_p"},
 		{"row floor over reject_p", []config.StepSetting{clefRow(map[string]any{config.ParamRejectFloor: 0.5})}, nil, "reject_floor"},
 		{"row unknown evidence kind", []config.StepSetting{clefRow(map[string]any{config.ParamApplyEvidence: "asin"})}, nil, "not an evidence kind"},
-		{"override floor without the lowercase rule", nil, map[string]any{config.ParamRejectFloor: 0.1}, "needs reject_requires_lowercase"},
+		{"override floor without the lowercase rule", nil, map[string]any{config.ParamRejectFloor: 0.1}, "also set reject_floor=0"},
+		{"clef: turning the lowercase rule off names the floor", []config.StepSetting{clefRow(map[string]any{
+			config.ParamRejectRequiresLowercase: false})}, nil, "also set reject_floor=0"},
 		{"override wrong type", nil, map[string]any{config.ParamRejectRequiresLowercase: "yes"}, "true or false"},
 		{"override apply_p as text", nil, map[string]any{config.ParamApplyP: "high"}, "must be a number"},
 	}
@@ -152,6 +154,25 @@ func TestResolvePolicyFailsClosed(t *testing.T) {
 				t.Errorf("err %v, want one mentioning %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// Turning Clef's lowercase rule off works once the floor is cleared too.
+func TestResolvePolicyClefRuleOff(t *testing.T) {
+	cfg, err := policyBase(config.ModelPin{}).WithStepSettings(clefRow(map[string]any{
+		config.ParamRejectRequiresLowercase: false, config.ParamRejectFloor: 0}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := ResolvePolicy(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol.Params.RejectRequiresLowercase || pol.Params.RejectFloor != 0 {
+		t.Errorf("policy %+v", pol.Params)
+	}
+	if d, _ := pol.Params.Decide(0.15, EvidenceNone, IssueMisheardProperNoun, "Arecibo"); d != DecisionReject {
+		t.Errorf("a capitalised low-p replacement %s with the rule off", d)
 	}
 }
 

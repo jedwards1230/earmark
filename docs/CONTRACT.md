@@ -4613,7 +4613,10 @@ layer overriding the one below:
    wholesale (§2.20), so Jev's env policy keys never leak onto Clef;
 3. the built-in **preset** for the decide model id (provider prefix dropped):
    `jev-*` → `jev`, `clef*` → `clef` (source `preset`);
-4. the default above (source `default`).
+4. the default above (source `default`). The default was measured on Jev: a
+   model with no preset and no keys set decides under it, `earmark decide`
+   logs a warning saying so, and the source reads `default` everywhere the
+   policy is shown — set the model's policy before a `--yes` run.
 
 The presets, and the measurement behind them (2,000 held findings scored by
 both models, 446 of them labelled from context):

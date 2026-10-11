@@ -185,7 +185,8 @@ func (p ShouldApplyParams) Validate() error {
 	case !ok(p.RejectFloor) || p.RejectFloor > p.RejectP:
 		return fmt.Errorf("decide: need 0 ≤ reject_floor (%v) ≤ reject_p (%v)", p.RejectFloor, p.RejectP)
 	case p.RejectFloor != 0 && !p.RejectRequiresLowercase:
-		return fmt.Errorf("decide: reject_floor (%v) needs reject_requires_lowercase", p.RejectFloor)
+		return fmt.Errorf("decide: reject_floor (%v) only applies with reject_requires_lowercase=true; "+
+			"to turn the lowercase rule off, also set reject_floor=0", p.RejectFloor)
 	}
 	seen := map[string]bool{}
 	for _, k := range p.ApplyEvidence {

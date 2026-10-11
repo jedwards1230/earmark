@@ -238,6 +238,11 @@ func runDecide(cmd *cobra.Command, _ []string) {
 	}
 	log.Print(cfg.DescribeStep(recipe.StepDecide))
 	log.Printf("decide policy: %s (source %s)", opts.policy.Params.Describe(), opts.policy.SourceLabel())
+	if opts.policy.Preset == "" && len(opts.policy.Layers) == 0 {
+		log.Printf("WARNING: decide model %s has no built-in policy preset and no policy keys set; it decides under "+
+			"the default policy, which was measured on Jev — set one with 'earmark models set decide --param …' "+
+			"or --policy before a --yes run", modelOrDefault(opts.model))
+	}
 	// A rung-0 replay asks no model, so it needs no decide endpoint.
 	var asker decidepkg.Asker
 	if !opts.rung0Only {
@@ -301,6 +306,11 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 	if err := validate(o); err != nil {
 		return err
 	}
+	if o.policy.Source == "" {
+		// Only resolve builds a policy: a run must never fall back to some
+		// policy other than its model's (CONTRACT §2.19 "Decide policy").
+		return errors.New("decide: the decide policy is not resolved")
+	}
 	mode := db.StepRunDryRun
 	if o.yes {
 		mode = db.StepRunWrite
@@ -315,7 +325,7 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 		rep, err = decidepkg.Apply(ctx, store, asker, decidepkg.ApplyOptions{
 			Book: o.book, IssueType: o.issueType, Shard: shard, Shards: shards,
 			Limit: o.limit, Batch: o.batch, MaxAccepts: o.maxAccepts,
-			Concurrency: o.concurrency, Params: policyParams(o), PolicySource: o.policy.SourceLabel(),
+			Concurrency: o.concurrency, Params: o.policy.Params, PolicySource: o.policy.SourceLabel(),
 			Progress: rec, Model: o.model,
 		})
 	} else {
@@ -325,7 +335,7 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 				Calibrate: o.calibrate, HumanActors: o.human,
 			},
 			Concurrency:  o.concurrency,
-			Params:       policyParams(o),
+			Params:       o.policy.Params,
 			PolicySource: o.policy.SourceLabel(),
 			Rung0Only:    o.rung0Only,
 			Progress:     rec,
@@ -337,15 +347,6 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 		return err
 	}
 	return rep.Print(out, o.json)
-}
-
-// policyParams is the run's resolved decide policy (the default when none
-// was resolved, as in a test that sets no policy).
-func policyParams(o options) decidepkg.ShouldApplyParams {
-	if o.policy.Source == "" {
-		return decidepkg.DefaultShouldApplyParams()
-	}
-	return o.policy.Params
 }
 
 // modelOrDefault names the model a run asks.

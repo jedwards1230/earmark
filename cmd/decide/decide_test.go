@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -107,7 +108,7 @@ func TestRunPassesScope(t *testing.T) {
 	store := &emptyStore{}
 	var out bytes.Buffer
 	o := options{sample: 7, seed: "q4", book: "Dune", issueType: decidepkg.IssueHomophone, concurrency: 2, calibrate: true, human: []string{"mcp", "cli"}, batch: 20}
-	if err := run(context.Background(), &out, store, noAsker{}, o); err != nil {
+	if err := resolvedRun(context.Background(), &out, store, noAsker{}, o); err != nil {
 		t.Fatal(err)
 	}
 	want := db.DecideScope{Sample: 7, Seed: "q4", Book: "Dune", IssueType: decidepkg.IssueHomophone, Calibrate: true, HumanActors: []string{"mcp", "cli"}}
@@ -120,7 +121,7 @@ func TestRunPassesScope(t *testing.T) {
 
 	out.Reset()
 	o.json = true
-	if err := run(context.Background(), &out, store, noAsker{}, o); err != nil {
+	if err := resolvedRun(context.Background(), &out, store, noAsker{}, o); err != nil {
 		t.Fatal(err)
 	}
 	var rep decidepkg.Report
@@ -128,13 +129,13 @@ func TestRunPassesScope(t *testing.T) {
 		t.Errorf("json report %+v, err %v", rep, err)
 	}
 
-	if err := run(context.Background(), &out, store, noAsker{}, options{sample: 0, seed: "s", concurrency: 1, batch: 20}); err == nil {
+	if err := resolvedRun(context.Background(), &out, store, noAsker{}, options{sample: 0, seed: "s", concurrency: 1, batch: 20}); err == nil {
 		t.Error("invalid options ran")
 	}
 
 	// --yes walks the work list with the shard and filters.
 	out.Reset()
-	if err := run(context.Background(), &out, store, noAsker{}, options{sample: 100, seed: "s", concurrency: 1, batch: 20,
+	if err := resolvedRun(context.Background(), &out, store, noAsker{}, options{sample: 100, seed: "s", concurrency: 1, batch: 20,
 		yes: true, shard: "1/4", book: "Dune", issueType: decidepkg.IssueHomophone, limit: 10}); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +181,7 @@ func TestRunRung0OnlyDump(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "r0.jsonl")
 	var out bytes.Buffer
 	o := options{sample: 5, seed: "s", concurrency: 1, batch: 20, rung0Only: true, dump: path}
-	if err := run(context.Background(), &out, store, nil, o); err != nil {
+	if err := resolvedRun(context.Background(), &out, store, nil, o); err != nil {
 		t.Fatal(err)
 	}
 	if store.registered != 0 {
@@ -195,7 +196,7 @@ func TestRunRung0OnlyDump(t *testing.T) {
 
 	// A dump into a missing directory fails before any work.
 	o.dump = filepath.Join(t.TempDir(), "missing", "r0.jsonl")
-	if err := run(context.Background(), &out, store, nil, o); err == nil || !strings.Contains(err.Error(), "--dump") {
+	if err := resolvedRun(context.Background(), &out, store, nil, o); err == nil || !strings.Contains(err.Error(), "--dump") {
 		t.Errorf("bad dump path: %v", err)
 	}
 }
@@ -210,7 +211,7 @@ func (failingSample) DecideSample(context.Context, db.DecideScope) ([]db.DecideF
 func TestRunDumpRemovedOnError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "r0.jsonl")
 	o := options{sample: 5, seed: "s", concurrency: 1, batch: 20, rung0Only: true, dump: path}
-	if err := run(context.Background(), &bytes.Buffer{}, &failingSample{}, nil, o); err == nil {
+	if err := resolvedRun(context.Background(), &bytes.Buffer{}, &failingSample{}, nil, o); err == nil {
 		t.Fatal("store error swallowed")
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
@@ -243,7 +244,7 @@ func TestRunUsesResolvedModel(t *testing.T) {
 		store := &modelSpy{}
 		var out bytes.Buffer
 		o := options{sample: 5, seed: "s", concurrency: 1, batch: 20, json: true, model: tc.model}
-		if err := run(context.Background(), &out, store, noAsker{}, o); err != nil {
+		if err := resolvedRun(context.Background(), &out, store, noAsker{}, o); err != nil {
 			t.Fatal(err)
 		}
 		if len(store.recipes) != 1 || store.recipes[0].ModelAlias != tc.wantAlias {
@@ -283,7 +284,7 @@ func TestRunModelInEveryMode(t *testing.T) {
 			if o.rung0Only {
 				asker = nil
 			}
-			if err := run(context.Background(), &out, store, asker, o); err != nil {
+			if err := resolvedRun(context.Background(), &out, store, asker, o); err != nil {
 				t.Fatal(err)
 			}
 			var rep decidepkg.Report
@@ -347,7 +348,7 @@ func TestResolvePolicyInEveryMode(t *testing.T) {
 			if o.rung0Only {
 				asker = nil
 			}
-			if err := run(context.Background(), &out, store, asker, o); err != nil {
+			if err := resolvedRun(context.Background(), &out, store, asker, o); err != nil {
 				t.Fatal(err)
 			}
 			var rep decidepkg.Report
@@ -390,5 +391,27 @@ func TestResolvePolicyInEveryMode(t *testing.T) {
 		if _, _, err := resolve(context.Background(), rows, policyConfig(), o); err == nil {
 			t.Errorf("--policy %v accepted", flags)
 		}
+	}
+}
+
+// resolvedRun is run with the policy resolve would give the options' model
+// (its preset, else the default) when the test set none.
+func resolvedRun(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker decidepkg.Asker, o options) error {
+	if o.policy.Source == "" {
+		o.policy = decidepkg.Policy{Params: decidepkg.DefaultShouldApplyParams(), Source: decidepkg.PolicySourceDefault}
+		if name, p, ok := decidepkg.PresetFor(modelOrDefault(o.model)); ok {
+			o.policy = decidepkg.Policy{Params: p, Source: decidepkg.PolicySourcePreset, Preset: name}
+		}
+	}
+	return run(ctx, out, store, asker, o)
+}
+
+// run refuses options whose policy was never resolved, rather than falling
+// back to a policy other than the model's.
+func TestRunNeedsResolvedPolicy(t *testing.T) {
+	o := options{sample: 5, seed: "s", concurrency: 1, batch: 20, model: decidepkg.Model{Alias: "clef:27b"}}
+	err := run(context.Background(), &bytes.Buffer{}, &modelSpy{}, noAsker{}, o)
+	if err == nil || !strings.Contains(err.Error(), "not resolved") {
+		t.Errorf("unresolved policy: %v", err)
 	}
 }
