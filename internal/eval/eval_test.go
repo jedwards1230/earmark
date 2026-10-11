@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
 )
@@ -17,9 +18,11 @@ type fakeChat struct {
 	model   string
 	lastSys string
 	lastUsr string
+	calls   int
 }
 
 func (f *fakeChat) Complete(_ context.Context, system, user string) (string, error) {
+	f.calls++
 	f.lastSys, f.lastUsr = system, user
 	return f.resp, f.err
 }
@@ -88,16 +91,34 @@ func TestJudgeChunk_MapsFindings(t *testing.T) {
 	}
 }
 
-func TestJudgeChunk_MalformedResponseIsSoftFailure(t *testing.T) {
-	// A garbage response must NOT abort — it yields zero findings, no error.
+// TestJudgeChunk_InvalidReplyFailsTheChunk: a reply with content that is not
+// findings JSON is ErrInvalidReply — the chunk FAILED, never "no findings"
+// (which reads as a clean chunk and would latch the transcript, gap 5) — and
+// it is not retried even with retries configured.
+func TestJudgeChunk_InvalidReplyFailsTheChunk(t *testing.T) {
 	chat := &fakeChat{resp: "I cannot help with that."}
 	j := NewJudge(chat)
+	j.SetCallPolicy(CallPolicy{Retries: 3, BackoffBase: time.Millisecond})
 	res, err := j.JudgeChunk(context.Background(), sampleChunk())
-	if err != nil {
-		t.Fatalf("malformed response should be soft failure, got error: %v", err)
+	if !errors.Is(err, ErrInvalidReply) {
+		t.Fatalf("want ErrInvalidReply, got %v", err)
 	}
-	if len(res.Findings) != 0 {
-		t.Fatalf("want 0 findings for malformed response, got %d", len(res.Findings))
+	if errorClass(err) != ErrorClassInvalidReply {
+		t.Errorf("error class %q, want %q", errorClass(err), ErrorClassInvalidReply)
+	}
+	if len(res.Findings) != 0 || res.Attempts != 1 || chat.calls != 1 {
+		t.Fatalf("findings %d, attempts %d, calls %d; want 0, 1, 1 (never retried)", len(res.Findings), res.Attempts, chat.calls)
+	}
+
+	// Through Run: the chunk counts as skipped (failed), so the run is not
+	// Complete and nothing would latch.
+	_, stats, err := Run(context.Background(), fakeReader{chunks: []db.EvalChunk{sampleChunk()}}, j, &fakeWriter{},
+		RunOptions{Book: "Book"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ChunksEvaluated != 0 || stats.ChunksSkipped != 1 || stats.Complete() {
+		t.Errorf("stats %+v: an invalid reply must fail the chunk", stats)
 	}
 }
 

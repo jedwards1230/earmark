@@ -37,6 +37,11 @@ type dumpLine struct {
 	CompletionTokens *int     `json:"completion_tokens"`
 	CostUSD          *float64 `json:"cost_usd"`
 	LatencyMS        int64    `json:"latency_ms"`
+	// Cached is true when the reply was served from fn_calls (no call, no
+	// cost); FnCallID is the fn_calls row that produced it (CONTRACT §2.15
+	// "Judge calls").
+	Cached   bool   `json:"cached,omitempty"`
+	FnCallID *int64 `json:"fn_call_id,omitempty"`
 	// Error is set when the chunk was skipped (the call failed or the reply
 	// was unusable); Findings is then empty.
 	Error    string        `json:"error,omitempty"`
@@ -91,6 +96,8 @@ func (d *dumper) observe(res evalpkg.Result, jerr error) {
 		Model:             d.model,
 		ResolvedModel:     res.ResolvedModel,
 		LatencyMS:         res.Elapsed.Milliseconds(),
+		Cached:            res.Cached,
+		FnCallID:          res.FnCallID,
 		Findings:          []dumpFinding{},
 	}
 	if res.PromptVersion != "" {

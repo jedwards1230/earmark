@@ -145,7 +145,7 @@ func endChatSpan(ctx context.Context, span trace.Span, model, expected string, c
 
 // errorClass reduces a chat error to a bounded, content-free label for
 // error.type: the HTTP status code ("422"), one of the unusable-reply classes
-// ("thinking_only", "empty", "truncated", "refusal"), else the shared
+// ("thinking_only", "empty", "truncated", "refusal", "invalid_reply"), else the shared
 // classification (genai.ErrorClass): "timeout", "canceled" or semconv's
 // "_OTHER".
 func errorClass(err error) string {
@@ -161,6 +161,8 @@ func errorClass(err error) string {
 		return "truncated"
 	case errors.Is(err, ErrRefusalResponse):
 		return "refusal"
+	case errors.Is(err, ErrInvalidReply):
+		return ErrorClassInvalidReply
 	default:
 		return genai.ErrorClass(err)
 	}

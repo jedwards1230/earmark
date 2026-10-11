@@ -352,12 +352,11 @@ func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		model:   cfg.Model,
 		apiKey:  cfg.APIKey,
-		// Timeout is only a backstop for a hung endpoint (120s ≈ typical LLM
-		// latency ceiling). The caller's context takes precedence: Complete builds
-		// the request with http.NewRequestWithContext, so Do() returns the context
-		// error as soon as ctx is cancelled or its deadline passes, regardless of
-		// this timeout.
-		http: &http.Client{Timeout: 120 * time.Second},
+		// No client-level timeout: the judge bounds every call with its own
+		// per-call deadline (CallPolicy.Timeout, `earmark eval --call-timeout`,
+		// default DefaultCallTimeout) on the request context, so Do() returns
+		// as soon as that deadline passes or the caller cancels.
+		http: &http.Client{},
 
 		// Pin the reply shape server-side, and (per ResolveThinking) ask a
 		// local thinking-capable model to stop thinking. Both reasoning
@@ -377,6 +376,53 @@ func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {
 }
 
 func (c *openAIChatClient) Model() string { return c.model }
+
+// RequestParams reports every request field that shapes the reply besides the
+// prompt: temperature, top_p, max_tokens, the thinking knobs and the
+// forwarded endpoint options. Implements RequestParamsReporter; the judge
+// records them in each judge_chunk call's fn_calls input.
+func (c *openAIChatClient) RequestParams() map[string]any {
+	p := map[string]any{"max_tokens": c.maxTokens}
+	if c.temperature != nil {
+		p["temperature"] = *c.temperature
+	}
+	if c.topP != nil {
+		p["top_p"] = *c.topP
+	}
+	if c.thinking.ReasoningEffort != "" {
+		p["reasoning_effort"] = c.thinking.ReasoningEffort
+	}
+	if c.thinking.ChatTemplateKwargs != nil {
+		p["chat_template_kwargs"] = c.thinking.ChatTemplateKwargs
+	}
+	for k, v := range c.extra {
+		if _, set := p[k]; !set {
+			p[k] = v
+		}
+	}
+	return p
+}
+
+// retryAfter parses a Retry-After header value: delta-seconds, or an HTTP
+// date (the wait until then, from now). 0 when absent, unparseable or past.
+func retryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
 
 // Thinking reports the thinking knobs this client sends. Implements
 // ThinkingReporter.
@@ -525,6 +571,9 @@ func (c *openAIChatClient) Endpoint() Endpoint {
 type StatusError struct {
 	Code int
 	Body string
+	// RetryAfter is the wait the endpoint asked for in its Retry-After header
+	// (delta-seconds or an HTTP date); 0 when absent or unparseable.
+	RetryAfter time.Duration
 }
 
 func (e *StatusError) Error() string {
@@ -612,7 +661,8 @@ func (c *openAIChatClient) CompleteWithModel(ctx context.Context, system, user s
 		return Completion{}, fmt.Errorf("read chat response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Completion{}, &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(respBody))}
+		return Completion{}, &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(respBody)),
+			RetryAfter: retryAfter(resp.Header.Get("Retry-After"), time.Now())}
 	}
 
 	var parsed chatResponse
