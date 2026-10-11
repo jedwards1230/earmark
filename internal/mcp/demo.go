@@ -428,7 +428,7 @@ func (demoDB) InsertFindings(context.Context, []db.Finding) error { return nil }
 // reports a plausible row count so the "clear findings" button's confirm +
 // re-render path is exercisable with no database. The empty scenario has no
 // findings to clear, so it reports 0.
-func (d demoDB) ClearFindings(context.Context, string) (int64, error) {
+func (d demoDB) ClearFindings(context.Context, string, string) (int64, error) {
 	if d.scenario == "empty" {
 		return 0, nil
 	}

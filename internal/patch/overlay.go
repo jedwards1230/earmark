@@ -318,6 +318,7 @@ func AllStates() []string {
 		StateReverted,
 		StateUnanchorable,
 		StateSuperseded,
+		StateDuplicate,
 	}
 }
 
@@ -332,10 +333,14 @@ func isState(s string) bool { return slices.Contains(AllStates(), s) }
 //     an unanchorable finding would put a span with no anchor back in the
 //     review queue, and only `earmark reanchor` knows whether it can be placed;
 //   - into superseded — an operator requeue, which archives every finding of
-//     the transcript it replaces in the same transaction that deletes it. A
-//     reviewer cannot supersede one finding of a transcript that still exists.
+//     the transcript it replaces in the same transaction that deletes it, or
+//     a clear (db.ClearFindings). A reviewer cannot supersede one finding of a
+//     transcript that still exists;
+//   - into and out of duplicate — the grouping of findings that propose the
+//     same correction. The representative is what a reviewer decides.
 func IsMachineTransition(from, to string) bool {
-	return from == StateUnanchorable || to == StateUnanchorable || to == StateSuperseded
+	return from == StateUnanchorable || to == StateUnanchorable || to == StateSuperseded ||
+		from == StateDuplicate || to == StateDuplicate
 }
 
 // StatesAllowing returns every state that may legally transition to `to`,

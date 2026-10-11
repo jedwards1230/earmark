@@ -609,6 +609,18 @@ runner) and is transactional:
      blocks until the requeue commits and then fails with a foreign-key
      violation. Without it, a finding committed between steps 3 and 4 would
      survive as a live-looking row with no transcript.
+  2a. **Archive the transcripts** (migration 13): `INSERT INTO
+     transcript_archive … SELECT … FROM transcripts t LEFT JOIN run_metrics m
+     ON m.job_id = t.job_id WHERE t.job_id = ANY($1)` — every transcripts
+     column (metadata, `raw_text`, `segments`, the asr `recipe_id` and runner
+     provenance), the transcript's `created_at`, and the job's whole
+     `run_metrics` row as jsonb (`to_jsonb`, NULL when it has none);
+     `archived_reason = 'requeue'`, `archived_by` = `earmark.actor`.
+     The ASR pass being replaced is kept, not lost. Before it, once,
+     `db.SetEventContext(actor, reason='requeue')` attributes the archive and
+     step 3's transitions: the actor is the caller's (`db.WithActor` —
+     `mcp:dashboard` for the buttons, `cli:requeue` for the CLI), else
+     `system`, so `archived_by` is never NULL.
   3. **Archive the findings**: every `transcript_findings` row of those jobs'
      transcripts moves to `patch_state='superseded'` with `superseded_at=now()`
      (§2.17). This includes human decisions — `accepted`, `applied`, `rejected`,
@@ -617,7 +629,9 @@ runner) and is transactional:
   4. Delete the transcripts. `transcript_chunks` cascade; the findings keep
      their rows and get `transcript_id = NULL` through the foreign key's
      `ON DELETE SET NULL`. Step 3 must come first: afterwards the findings can no
-     longer be found by transcript.
+     longer be found by transcript. Their `origin_transcript_id` (migration 13,
+     never nulled) still names it, and joins to
+     `transcript_archive.transcript_id`.
   5. Delete the jobs' `run_metrics` rows. Required because requeue *updates* the
      job row rather than deleting it, so `run_metrics → transcription_jobs ON
      DELETE CASCADE` never fires; left in place, the row would describe the
@@ -625,7 +639,8 @@ runner) and is transactional:
 
   The runner then re-processes the job like any pending job, and the **new
   transcript is judged fresh**: it has a new id, so it has no findings (the eval
-  dedupe keys are per transcript), nothing to replay, and a clear eval latch.
+  dedupe keys are per transcript, live findings only), nothing to replay, and a
+  clear eval latch.
   Superseded findings stay readable for audit and the bench
   (`list_transcript_corrections state=superseded`). The CLI
   (`earmark requeue <substr>` / `--failed`), the dashboard buttons
@@ -651,6 +666,25 @@ the id, is what proves an anchor current). Run `earmark reanchor` once the
 worker has rebuilt the chunks (§2.17 "Re-anchoring"); until it runs, replaying
 an old finding retires it as `stale`. A re-transcribe needs no re-anchor: its
 findings are superseded and the new transcript is judged fresh.
+
+**Rolling back migration 13 refuses to destroy the archive.** Its Down drops
+`transcript_archive`, which after any requeue holds the only copy of the
+replaced transcripts' `raw_text`, `segments` and `run_metrics`. Down raises
+an exception while the table has rows, unless the session running it sets
+`earmark.allow_data_loss = 'on'` (e.g. `PGOPTIONS='-c
+earmark.allow_data_loss=on'`, or `ALTER DATABASE … SET` before and `RESET`
+after). Back the table up first.
+
+**Lock order.** A requeue locks the transcripts (step 2), then **every**
+finding of those transcripts in id order — superseded ones included, because
+`ClearEmbeddingStale` may hold any replayed id — (step 3 is `WITH lk AS
+(SELECT id … ORDER BY id FOR UPDATE) UPDATE … FROM lk WHERE … AND
+patch_state = ANY(from-states)`), then the chunks through the delete's
+cascade. Every other
+multi-finding writer (the dashboard clear, `SetPatchStateBulk`,
+`ApplyDecisions`, `ClearEmbeddingStale`) also takes findings in id order and
+before chunks, so a requeue racing them queues instead of failing with a
+deadlock (40P01).
 
 **The `transcript_findings.transcript_id` foreign key** (migration 5).
 `REFERENCES transcripts(id) ON DELETE SET NULL`, so a finding can never point at a
@@ -1134,6 +1168,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 9 | `00009_chunk_scan.sql` | `chunk_scan` — per-chunk System One quality scan results, unique per (transcript, chunk index, chunk text sha256, recipe), `ON DELETE CASCADE` with the transcript; the `scan` arm of `stale_work` (§1.9 "Chunk scan"). New table plus a view replacement; no ALTER. Its `stale_work` restates every earlier arm, 8's `decide` arm included. |
 | 10 | `00010_step_runs.sql` | `step_runs` — one row per ad-hoc step run (decide, decide revert, scan, eval) with its live progress and outcome (§1.10), a partial index on the open runs and a `started_at` index for the recent list. New table only; no ALTER, no lock on an existing table. |
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` — every (recipe, earmark build) pair, PK `(recipe_id, code_version)` plus `recipe_builds_code_version_idx`, backfilled with each existing recipe's registering build; a column comment marking `recipes.code_version` as the *first* build (§1.9 "Recipe ID format" / "Builds"). New table plus a `COMMENT` (SHARE UPDATE EXCLUSIVE, which writers' INSERTs do not wait on); no id is rewritten. |
+| 13 | `00013_audit_lineage.sql` | Audit lineage (§1.4, §2.15 "Lineage", §2.17): `judge_passes` (legacy rows backfilled) and `transcript_archive`; on `transcript_findings` `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (trigger-filled, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` state; `finding_events.anchor_offset` + the reanchor trigger; transitions read `earmark.reason`; `stale_work`'s propose arm skips duplicates. Locks `recipes` (SHARE ROW EXCLUSIVE) then `transcript_findings` (ACCESS EXCLUSIVE) first — a running judge's order — and rewrites `transcript_findings` (`lock_timeout` 5s). |
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
@@ -2494,7 +2529,7 @@ unchanged.):
 | `POST` | `/actions/run-clear` | htmx + token | clear the bounded run (`run_limit→NULL`) without touching the pause flag |
 | `POST` | `/actions/eval?dir=…` | htmx + token | run the LLM judge over one book (async, §2.15) |
 | `POST` | `/actions/eval-sample?n=N` | htmx + token | run the LLM judge over an N-chunk sample (async, §2.15) |
-| `POST` | `/actions/findings-clear[?dir=…]` | htmx + token | **delete** recorded findings (advisory metadata only; §2.15), then re-render the `/findings` fragment. Optional `dir` scopes the delete to one book; absent clears all. Touches only `transcript_findings` — transcripts are never modified, so a clear is always recoverable by re-running eval. |
+| `POST` | `/actions/findings-clear[?dir=…]` | htmx + token | **archive** recorded findings as `superseded` (§2.15 "Clearing"; never deleted), then re-render the `/findings` fragment. Optional `dir` scopes the clear to one book; absent clears all. Writes `transcript_findings` (and, through its trigger, `finding_events`) plus the `embedding_stale` flag of chunks whose accepted/applied correction it withdrew — transcripts and chunk text are never modified, and re-running eval proposes the findings again. |
 
 #### 2.12.1 Dashboard page routes (HTML)
 
@@ -3242,10 +3277,65 @@ CREATE TABLE transcript_findings (
     transcription_run_id UUID,                    -- transcription_jobs.id — per-backend/run attribution
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     recipe_id            TEXT REFERENCES recipes (recipe_id), -- propose recipe that made it (§1.9); NULL for origin='human'
-    superseded_at        TIMESTAMPTZ          -- when a requeue archived it (§2.17 superseded); NULL otherwise
+    superseded_at        TIMESTAMPTZ,         -- when a requeue or clear archived it (§2.17 superseded); NULL otherwise
+    -- migration 13 (lineage, below):
+    judge_pass_id        BIGINT REFERENCES judge_passes (id) ON DELETE SET NULL,
+    fn_call_id           BIGINT REFERENCES fn_calls (id),
+    origin_transcript_id UUID,                -- set on INSERT from transcript_id; never changed afterwards
+    correction_key       TEXT GENERATED ALWAYS AS (...) STORED,
+    duplicate_of         UUID REFERENCES transcript_findings (id) ON DELETE SET NULL
 );
--- indexes: file_path, transcript_id, transcription_run_id, issue_type, recipe_id
+-- indexes: file_path, transcript_id, transcription_run_id, issue_type, recipe_id,
+--          judge_pass_id, origin_transcript_id, correction_key, duplicate_of (partial)
 ```
+
+#### Lineage — `judge_passes`, `origin_transcript_id`, `correction_key`
+
+Migration 13 (design: `docs/design/audit-lineage.md`). What a finding records
+about where it came from:
+
+- **`judge_pass_id`** — the `judge_passes` row (one per transcript × judge
+  recipe: status `running`/`complete`/`partial`/`failed`/`legacy`, chunk
+  counters, `findings_kept`, `dropped` counts by reason, tokens, cost, latency
+  p50/p95, `book_context_sha256`, `step_run_id` (a plain column: nothing
+  references `step_runs`), started/finished, error). It is
+  the per-recipe "judged" record; `run_metrics.eval_*` stays the compatibility
+  "latest judge" summary. `judge_passes.transcript_id` is a plain column, so a
+  pass outlives the requeue that deletes its transcript. The judge does not
+  write passes yet: only `legacy` rows exist, backfilled by migration 13 — one
+  per (transcript, `recipe_id`) of `origin='judge'` findings with a live
+  transcript, and one for the latest judge run of each transcript latched by
+  `run_metrics.eval_finished_at` when that run left no finding: its recipe is
+  resolved from `eval_model` when exactly one propose recipe's
+  `model_alias`/`model_resolved` matches, and the row is added unless the
+  transcript already has a pass for that recipe — so a transcript whose older
+  recipe left findings and whose newest recipe found nothing has both. An
+  unresolved latch gets a NULL-recipe row only when the transcript has no judge
+  finding at all (it cannot be told apart from the run that left them). Legacy counters,
+  tokens, cost, latency and drop counts were never recorded and are NULL.
+- **`fn_call_id`** — the judge call's `fn_calls` row. Not yet written by any
+  path.
+- **`origin_transcript_id`** — the transcript the finding was proposed
+  against. A `BEFORE INSERT` trigger (`transcript_findings_keep_origin`) fills
+  it from `transcript_id` when NULL, and an UPDATE that changes it once set is
+  refused (`restrict_violation`). A requeue's `ON DELETE SET NULL` touches only
+  `transcript_id`, so the origin survives and joins to
+  `transcript_archive.transcript_id` (§1.4). Findings a requeue archived before
+  migration 13 keep it NULL: their transcript id was never recorded.
+- **`correction_key`** — `md5(chunk_text_sha256 ‖ U+001F ‖ norm(original_text) ‖
+  U+001F ‖ norm(COALESCE(suggested_correction,'')))`, generated and stored;
+  NULL when `chunk_text_sha256` is. `norm` collapses every whitespace run
+  (ASCII whitespace, NBSP and the other Unicode space separators) to one
+  space, trims, and lower-cases under the ICU root collation (`lower(x COLLATE
+  "und-x-icu")`): the live cluster is initdb'd with `LC_CTYPE=C`, where plain
+  `lower()` folds ASCII only, so `ÉMILE` and `émile` would otherwise differ.
+  Accents are **not** folded: `é` and `e` are different corrections. The
+  separator keeps `('ab','c')` and `('a','bc')` apart. It does **not** include
+  the recipe: two recipes proposing the same fix to the same chunk text share a
+  key, which is how agreement across models (and with earlier, decided
+  findings) is found. Code that needs a key reads this column; it never
+  recomputes it.
+- **`duplicate_of`** — see `duplicate` in §2.17.
 
 `issue_type` is a closed vocabulary the judge prompt advertises; an unknown value
 returned by the model is coerced to `other`:
@@ -3634,10 +3724,36 @@ earmark eval --seed q4 --sample 300 --dump /tmp/v3.jsonl --judge-prompt v3
 
 **Clearing.** Findings only accumulate (re-running eval appends); the `/findings`
 dashboard page exposes a token-gated **clear findings** button (and the
-`POST /actions/findings-clear` action, §2.12) that deletes recorded findings.
-This is the one place the findings subsystem `DELETE`s — and it deletes ONLY
-`transcript_findings`, never the transcript tables, so the read-only-transcripts
-contract holds and a clear is recoverable by re-running eval.
+`POST /actions/findings-clear` action, §2.12). A clear **archives, it does not
+delete** (`db.ClearFindings`): in one transaction it sets `earmark.actor =
+<caller's actor>'` (`ClearFindings(ctx, dir, actor)`; the dashboard passes
+`mcp:dashboard`) and `earmark.reason = 'cleared'`, then — in one statement,
+findings locked in id order before any chunk — moves every finding in scope
+that is not already `superseded` to `superseded` (the transaction waits at
+most 5 s for any lock, `SET LOCAL lock_timeout`), stamping `superseded_at`
+(and clearing an `unanchorable_reason`). Each move is a `transition` in
+`finding_events`, so decisions and their history survive. The book scope is
+`file_path LIKE likePrefix(dir) || '/%' ESCAPE '\' OR file_path = dir`: a `_`
+or `%` in a directory name is a literal, so clearing `Book_1` never reaches
+`BookX1`.
+Unlike a requeue's archive, a cleared finding keeps its `transcript_id` — the
+transcript still exists — so every reader of live findings filters on
+`patch_state <> 'superseded'`, not on `transcript_id`: the eval dedupe keys
+(`GetFindingKeys`) ignore superseded rows, so re-running eval after a clear
+proposes them again. A cleared `accepted`/`applied` finding leaves the
+overlay, so the same statement flags its chunk `embedding_stale` (addressed
+like an accept) and the next rebuild drops the correction from the served
+and embedded text — they match the audit. A rebuild that read the overlay
+before the clear cannot clear that flag afterwards: `ClearEmbeddingStale`
+keeps any chunk flagged whose replayed correction has left the overlay (§2.17
+"The watermark"). After the commit the chunks are flagged once more, as
+`earmark decide revert` does — defence in depth for a rebuild still running an
+older build during a rollout; it runs detached from the request's
+cancellation with a 10 s timeout, and a failure is logged at Error (the clear
+stands). Beyond `transcript_findings` (and
+`finding_events`, by trigger) the clear writes only that flag — never the
+transcript tables or chunk text — so the read-only-transcripts contract
+holds.
 
 #### Dashboard surfaces (read-only)
 
@@ -3650,8 +3766,11 @@ exposes the scoped clear (`POST /actions/findings-clear?dir=…`, token-gated,
 re-renders the Book fragment). All of this is read-only/advisory surfacing — no
 new route, env var, or column; informational only. The rollups, worklists and
 the library's per-book findings count all **exclude `superseded`** findings
-(archived by a requeue, §1.4), so a re-judged book is not counted twice; they
-stay readable through `list_transcript_corrections state=superseded`.
+(archived by a requeue, §1.4, or a clear), so a re-judged book is not counted
+twice, and **`duplicate`** findings (§2.17), whose representative is already
+counted; they stay readable through `list_transcript_corrections
+state=superseded` / `state=duplicate`. `stale_work`'s propose arm skips both
+for the same reason.
 
 #### Two payoffs
 
@@ -3820,9 +3939,11 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
     │               │                        │
     │               └──> proposed            └──> stale
     │
-    └──reanchor──> unanchorable ──reanchor──> proposed
+    ├──reanchor──> unanchorable ──reanchor──> proposed
+    │
+    └──group────> duplicate ──undo──> proposed
 
-(any state) ──requeue──> superseded            (terminal)
+(any state) ──requeue / clear──> superseded    (terminal)
 ```
 
 - **proposed** — the judge's output. Existing rows migrate here by default.
@@ -3848,19 +3969,30 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
   re-anchor pass, not to a reviewer: `patch.IsMachineTransition` marks them, and
   the review tool (`decide_transcript_correction`) offers no action on an
   unanchorable finding.
+- **duplicate** — the finding proposes the same correction as another finding,
+  named by `duplicate_of` (migration 13); typically the same `correction_key`
+  from another recipe. It is an agreement, not a rejection: the representative
+  carries the decision, and the duplicate is **never in the overlay** and never
+  replayed. Its only moves are back to `proposed` (the grouping was undone —
+  the same UPDATE must clear `duplicate_of`) or to `superseded`. Both moves into
+  and out of it are machine moves (`patch.IsMachineTransition`): no review
+  action applies to a duplicate. The database requires `duplicate_of IS NULL OR
+  patch_state IN ('duplicate', 'superseded')` — an archived duplicate keeps
+  which finding it agreed with. No path groups findings into `duplicate` yet.
 - **superseded** — the finding's transcript was replaced by an operator requeue
-  (§1.4). Set by requeue only, from **any** other state — human decisions and
-  `unanchorable` included — in the same transaction as the transcript delete,
-  stamped `superseded_at` (an `unanchorable` finding's `unanchorable_reason` is
-  cleared: the schema allows it only on `unanchorable` rows); `transcript_id`
-  then becomes NULL. `patch.IsMachineTransition` marks the move, so
+  (§1.4), or an operator cleared it (§2.15 "Clearing"). Set by requeue or clear
+  only, from **any** other state — human decisions, `unanchorable` and
+  `duplicate` included — stamped `superseded_at` (an `unanchorable` finding's
+  `unanchorable_reason` is cleared: the schema allows it only on
+  `unanchorable` rows). A requeue does it in the same transaction as the
+  transcript delete, after which `transcript_id` is NULL; a clear keeps
+  `transcript_id`. `patch.IsMachineTransition` marks the move, so
   `SetPatchState` refuses it. **Terminal**, and
   **excluded from the overlay** (`GetCorrectionOverlay` selects only
-  `accepted`/`applied`): the text it describes no longer exists, and the new
-  transcript is judged fresh. Kept for audit and the bench; never deleted, and
+  `accepted`/`applied`): the new transcript (or the re-run judge) proposes
+  afresh. Kept for audit and the bench; never deleted, and
   no review action (`accept`/`reject`/`revert`/`reconsider`) applies to it.
-  The re-anchor pass never reads a superseded finding (nor, equivalently, one
-  with a NULL `transcript_id`).
+  The re-anchor pass never reads a superseded finding.
 
 `proposed → applied` is deliberately **illegal**. Reaching `applied` requires
 passing through `accepted`, which is the decision gate; skipping it would be an
@@ -3929,7 +4061,8 @@ CREATE TABLE finding_events (
     chunk_text_sha256 TEXT,
     issue_type        TEXT,                    -- denormalized for reporting
     revokes_event_id  BIGINT      REFERENCES finding_events,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    anchor_offset     INTEGER                  -- migration 13: the OLD offset of a reanchor_moved transition
 );
 -- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at),
 --          UNIQUE (revokes_event_id) WHERE kind = 'revoke'
@@ -3944,9 +4077,25 @@ CREATE TABLE finding_events (
   `decided_by`; otherwise the transaction-local setting `earmark.actor`
   (`db.SetEventContext`; `SetPatchState` sets it to the reviewer for a
   reconsider), else `system`. `recipe_id` is the setting `earmark.recipe_id`
-  when set, else the recipe named by a `jev:`/`revert:jev:` actor.
+  when set, else the recipe named by a `jev:`/`revert:jev:` actor. `reason` is
+  the transaction-local setting `earmark.reason` (`db.SetEventContext`'s
+  `Reason`; migration 13) when set: `requeue` for a requeue's supersede,
+  `cleared` for a clear, NULL otherwise.
   `created_at` is when the transition ran (`clock_timestamp()`), not when its
   transaction committed.
+- **reanchor move** (migration 13) — a `transition` with `from_state =
+  to_state` (the state before the UPDATE) and reason `reanchor_moved` —
+  `reanchor_placed` when the finding had no `anchor_offset` yet (a legacy
+  finding's first anchoring) — appended
+  by the trigger `transcript_findings_record_reanchor` whenever an UPDATE
+  changes a finding's `chunk_text_sha256` or `anchor_offset` (`earmark
+  reanchor` is the only writer). It records the **old** hash and offset — the
+  row holds the new ones — so where the judge originally saw the span is never
+  lost. Attribution follows the transition rule. When the same UPDATE also
+  changes `patch_state` (a re-anchor returning an `unanchorable` finding to
+  `proposed`) both triggers fire: the reanchor event first (AFTER triggers run
+  in name order), then the state transition, so "latest transition at `t`"
+  still ends on the new state.
 - **decision** — a decide recipe's verdict (`db.InsertDecisionEvents`), see
   above. `actor` is `jev:<recipe_id>`.
 - **revoke** — withdraws one decision (`revokes_event_id`;
@@ -4276,13 +4425,30 @@ committing between the rebuild's overlay read and its insert sets the flag, and
 the clear would wipe it — that correction would never be replayed and never be
 re-flagged. Instead `GetCorrectionOverlay` returns the server-side timestamp its
 read was taken at, and the clear is guarded: a chunk is only unflagged when it
-carries no finding `decided_at` later than that watermark **and** no finding
-still sitting in `accepted`. A blocked chunk simply gets rebuilt again next
-cycle, so the failure mode is one redundant re-embed rather than a lost
-correction. (The second condition also makes a failed best-effort
+carries no finding `decided_at` later than that watermark, no finding
+still sitting in `accepted`, **and** no correction this rebuild *replayed*
+that has since left the overlay states. A blocked chunk simply gets rebuilt
+again next cycle, so the failure mode is one redundant re-embed rather than a
+lost correction. (The second condition also makes a failed best-effort
 `MarkFindingsApplied` self-healing.) Because the watermark is what protects a
 concurrent decision, **revert stamps `decided_at` too** — not only accept and
 reject.
+
+The third condition (migration 13 era) is what makes withdrawals exact.
+Timestamps cannot be: a clear (or revert) whose statement time precedes the
+watermark can still commit after the overlay read, and a clear stamps no
+`decided_at` at all. So the rebuild passes `ClearEmbeddingStale` the ids of
+the corrections it actually applied to the embedded text
+(`replayOutcome.applied`, not the quarantined ones), and the clear runs in its
+own transaction, bounded by `SET LOCAL lock_timeout = '5s'` (the worker's
+context has no deadline; on a timeout the chunk stays flagged, the worker
+logs it and the next rebuild clears it): it locks those findings `FOR SHARE`
+in id order, then unflags
+only chunks where none of them has moved out of `accepted`/`applied`
+(`f.id = ANY(replayed) AND f.patch_state <> ALL(overlay states)`). A writer
+already holding one of them (a clear, revert, reject — all lock findings
+first, in id order) is waited for and its committed state is then seen; one
+that comes later waits for this transaction and re-flags the chunk itself.
 
 Invalidation is **exactly one chunk**, and this is a property of the schema
 rather than a lucky accident: chunks store their text denormalized and carry no
@@ -4982,9 +5148,10 @@ one scope flag is required; together they narrow (AND). Dry-run unless
   that recipe decides those findings afresh.
 - **Re-flag sweep**: after each batch commits, every moved finding's chunk is
   flagged `embedding_stale`. This closes the window where a rebuild that read
-  the overlay before the revert clears the flag after it
-  (`ClearEmbeddingStale`'s watermark only sees `decided_at`); it costs at most
-  one extra re-embed per chunk.
+  the overlay before the revert clears the flag after it; since migration 13
+  `ClearEmbeddingStale`'s replayed-set guard closes that window by itself, and
+  the sweep remains as defence in depth. It costs at most one extra re-embed
+  per chunk.
 
 #### Runbook: deciding the backlog
 

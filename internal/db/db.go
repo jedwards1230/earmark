@@ -3476,18 +3476,23 @@ func KeyOf(f Finding) FindingKey {
 	return k
 }
 
-// findingKeysSQL reads the dedupe keys of a transcript's existing findings.
+// findingKeysSQL reads the dedupe keys of a transcript's live findings.
+// Superseded rows are not keys: a cleared finding (db.ClearFindings) keeps its
+// transcript_id, and a re-judge after a clear must propose it again.
 const findingKeysSQL = `
 	SELECT COALESCE(chunk_id::text, ''), original_text, issue_type,
 	       COALESCE(suggested_correction, '')
 	FROM transcript_findings
 	WHERE transcript_id = $1
+	  AND patch_state <> 'superseded'
 `
 
-// GetFindingKeys returns the de-duplication keys of every finding already
-// recorded for a transcript (any patch_state). Read-only. A re-judge of a
-// transcript whose earlier judge run partially succeeded uses it to skip the
-// findings that run already recorded, so retrying never doubles them up.
+// GetFindingKeys returns the de-duplication keys of every live finding already
+// recorded for a transcript (any patch_state but superseded). Read-only. A
+// re-judge of a transcript whose earlier judge run partially succeeded uses it
+// to skip the findings that run already recorded, so retrying never doubles
+// them up; findings an operator cleared are archived as superseded and do not
+// block re-proposing.
 func (db *DB) GetFindingKeys(ctx context.Context, transcriptID string) (map[FindingKey]bool, error) {
 	return getFindingKeys(ctx, db.pool, transcriptID)
 }
@@ -3669,36 +3674,176 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 	return tx.Commit(ctx)
 }
 
-// clearFindingsSQL deletes findings. Package var (like insertFindingSQL) so a
-// test can assert it touches ONLY transcript_findings — the read-only-over-
-// transcripts invariant (§2.15) holds: findings are advisory metadata, never
-// the transcripts/segments/transcript_chunks themselves. An optional book-dir
-// prefix scopes the delete; the unscoped form clears everything.
+// clearFindingsSQL archives findings: a clear is a supersede, never a DELETE,
+// so the decisions and their finding_events history survive (CONTRACT §2.15
+// "Clearing", §2.17). Package vars so a test can assert their shape.
+//
+// One statement. Lock order: the findings in scope (tgt, in id order), then
+// their chunks (flag). Every writer that locks several findings takes them in
+// id order and before any chunk — requeue too, after its transcript locks
+// (transcripts → findings in id order → chunks via the delete cascade) — so a
+// clear racing a requeue, a decide, a review or ClearEmbeddingStale queues
+// instead of deadlocking:
+//   - tgt locks the findings in scope that may still move ($1, every state but
+//     superseded, derived from patch.CanTransition like requeue's), in id
+//     order;
+//   - upd moves them to superseded, stamping superseded_at (a parked
+//     finding's unanchorable_reason is cleared: the schema allows it only on
+//     unanchorable rows), and returns each one's PREVIOUS state;
+//   - flag marks the chunk of every finding that was in the overlay ($2,
+//     accepted/applied) embedding_stale, addressed like
+//     markChunkStaleForFindingSQL, so the next rebuild replays the transcript
+//     without the cleared correction — the served and embedded text stay what
+//     the audit log says they are.
+//
+// It returns the number of findings moved and the ids of those that were in
+// the overlay (re-flagged again after commit, see ClearFindings). Unlike a
+// requeue's archive, a cleared finding keeps its transcript_id: the transcript
+// still exists. The scoped form ($3 = likePrefix(dir) + "/%", $4 = dir)
+// matches the book directory and everything beneath it, with LIKE wildcards in
+// the directory name escaped.
+const clearFindingsCTE = `
+	upd AS (
+	    UPDATE transcript_findings f
+	       SET patch_state = 'superseded', superseded_at = now(), unanchorable_reason = NULL
+	      FROM tgt
+	     WHERE f.id = tgt.id
+	    RETURNING f.id, f.transcript_id, f.chunk_index, f.chunk_id, tgt.patch_state AS was
+	), flag AS (
+	    UPDATE transcript_chunks c
+	       SET embedding_stale = true
+	      FROM upd f
+	     WHERE f.was = ANY($2)
+	       AND ((f.chunk_index IS NOT NULL
+	             AND c.transcript_id = f.transcript_id
+	             AND c.chunk_index = f.chunk_index)
+	            OR (f.chunk_index IS NULL AND c.id = f.chunk_id))
+	    RETURNING c.id
+	)
+	SELECT (SELECT count(*) FROM upd),
+	       ARRAY(SELECT id::text FROM upd WHERE was = ANY($2) ORDER BY id),
+	       (SELECT count(*) FROM flag)`
+
 var (
-	clearFindingsAllSQL = `DELETE FROM transcript_findings`
-	clearFindingsDirSQL = `DELETE FROM transcript_findings WHERE file_path LIKE $1 || '/%' OR file_path = $1`
+	clearFindingsAllSQL = `
+	WITH tgt AS (
+	    SELECT id, patch_state FROM transcript_findings
+	     WHERE patch_state = ANY($1)
+	     ORDER BY id
+	       FOR UPDATE
+	), ` + clearFindingsCTE
+	clearFindingsDirSQL = `
+	WITH tgt AS (
+	    SELECT id, patch_state FROM transcript_findings
+	     WHERE patch_state = ANY($1)
+	       AND (file_path LIKE $3 ESCAPE '\' OR file_path = $4)
+	     ORDER BY id
+	       FOR UPDATE
+	), ` + clearFindingsCTE
 )
 
-// ClearFindings deletes recorded findings and returns the number of rows
-// removed. It writes to NO table other than transcript_findings — it never
-// touches transcripts, segments, or transcript_chunks, so re-running eval
-// simply regenerates the advisory rows. When dir is non-empty the delete is
-// scoped to that book directory (prefix match); empty dir clears all findings.
-func (db *DB) ClearFindings(ctx context.Context, dir string) (int64, error) {
-	dir = strings.TrimRight(strings.TrimSpace(dir), "/")
-	var (
-		tag pgconn.CommandTag
-		err error
-	)
-	if dir == "" {
-		tag, err = db.pool.Exec(ctx, clearFindingsAllSQL)
-	} else {
-		tag, err = db.pool.Exec(ctx, clearFindingsDirSQL, dir)
+// setLocalLockTimeoutSQL bounds every lock wait of the transaction it runs in
+// (Postgres lock_timeout, transaction-local). ClearFindings and
+// ClearEmbeddingStale run it first: both lock findings a rebuild, a decide run
+// or a requeue may hold, and neither caller's context carries a deadline (the
+// worker's never does). A timeout aborts the transaction with SQLSTATE 55P03:
+// nothing is half-written, a clear can be retried, and a chunk whose flag was
+// not cleared stays flagged and is rebuilt again next cycle.
+const setLocalLockTimeoutSQL = `SET LOCAL lock_timeout = '5s'`
+
+// clearFindingsReason is the finding_events reason of a clear's transitions.
+const clearFindingsReason = "cleared"
+
+// ClearFindings archives recorded findings as superseded and returns the
+// number of rows moved. actor attributes the transitions in finding_events
+// (the caller's attribution, e.g. "mcp:dashboard"; required). It writes
+// transcript_findings (and, through the transition trigger, finding_events —
+// one 'transition' per finding, reason 'cleared') and the embedding_stale flag
+// of the chunks whose accepted/applied correction it withdrew. It never
+// touches transcripts, segments, or the text of transcript_chunks. The
+// archived rows stay readable for audit (list_transcript_corrections
+// state=superseded) and no longer count as eval dedupe keys, so re-running
+// eval proposes them afresh. When dir is non-empty the clear is scoped to that
+// book directory (prefix match); empty dir clears all findings.
+//
+// A rebuild that read the overlay before the clear cannot clear the flag
+// afterwards: ClearEmbeddingStale takes the ids it replayed, locks them, and
+// keeps any chunk flagged whose replayed correction has since left the
+// overlay. After the commit the withdrawn corrections' chunks are flagged once
+// more, as RevertDecisions does — defence in depth for a rebuild still running
+// a build without that guard during a rollout. That pass runs detached from
+// the caller's cancellation with a short timeout; a failure is logged at
+// Error, not returned — the clear itself committed.
+func (db *DB) ClearFindings(ctx context.Context, dir, actor string) (int64, error) {
+	if strings.TrimSpace(actor) == "" {
+		return 0, errors.New("clear findings: actor is required")
 	}
+	tx, err := db.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("clear findings: %w", err)
+		return 0, fmt.Errorf("begin clear findings tx: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	defer func() { _ = tx.Rollback(ctx) }()
+	res, err := clearFindingsTx(ctx, tx, dir, actor)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit clear findings tx: %w", err)
+	}
+	if len(res.withdrawn) > 0 {
+		// The clear has committed: finish this even if the caller (an htmx
+		// request) has gone away, but never hang on it.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clearReflagTimeout)
+		defer cancel()
+		if _, err := db.pool.Exec(rctx, reflagChunksSQL, res.withdrawn); err != nil {
+			db.log.Error("re-flag of cleared corrections' chunks failed after commit: a rebuild "+
+				"running a build without the replayed-set guard can clear the flag and keep the "+
+				"withdrawn correction embedded until that chunk is next rebuilt",
+				"findings", len(res.withdrawn), "error", err)
+		}
+	}
+	return res.moved, nil
+}
+
+// clearReflagTimeout bounds ClearFindings' post-commit re-flag.
+const clearReflagTimeout = 10 * time.Second
+
+// clearResult is what one clear did: findings moved, the ids of those that
+// were in the overlay, and the chunks flagged for rebuild in the transaction.
+type clearResult struct {
+	moved     int64
+	withdrawn []string
+	flagged   int64
+}
+
+// clearTx is the slice of pgx.Tx the clear needs.
+type clearTx interface {
+	execer
+	rowQueryer
+}
+
+// clearFindingsTx is ClearFindings' transaction body, split out so its
+// statement sequence is testable against a pgxmock transaction.
+func clearFindingsTx(ctx context.Context, tx clearTx, dir, actor string) (clearResult, error) {
+	var res clearResult
+	if _, err := tx.Exec(ctx, setLocalLockTimeoutSQL); err != nil {
+		return res, fmt.Errorf("clear findings: set lock_timeout: %w", err)
+	}
+	if err := SetEventContext(ctx, tx, EventContext{Actor: actor, Reason: clearFindingsReason}); err != nil {
+		return res, err
+	}
+	dir = strings.TrimRight(strings.TrimSpace(dir), "/")
+	var row pgx.Row
+	if dir == "" {
+		row = tx.QueryRow(ctx, clearFindingsAllSQL, supersedeFromStates, overlayStates)
+	} else {
+		row = tx.QueryRow(ctx, clearFindingsDirSQL, supersedeFromStates, overlayStates,
+			likePrefix(dir)+"/%", dir)
+	}
+	if err := row.Scan(&res.moved, &res.withdrawn, &res.flagged); err != nil {
+		return clearResult{}, fmt.Errorf("clear findings: %w", err)
+	}
+	return res, nil
 }
 
 // FindingsSummary is the dashboard's per-book + library findings rollup.
@@ -3727,12 +3872,14 @@ type BookFindings struct {
 	TopIssueType   string
 }
 
-// The /findings dashboard queries count LIVE findings only: superseded rows
-// (archived by a requeue, CONTRACT §1.4) describe a transcript that no longer
-// exists, so counting them next to the re-judged transcript's findings would
-// double a requeued book. They stay readable through
-// list_transcript_corrections state=superseded.
-const notSupersededSQL = `patch_state <> 'superseded'`
+// The /findings dashboard queries count LIVE findings only. Superseded rows
+// (archived by a requeue, CONTRACT §1.4, or a clear, §2.15) describe a
+// replaced transcript or a withdrawn judge run, so counting them next to the
+// re-judged findings would double a book. Duplicate rows (§2.17) agree with a
+// representative that is already counted, so counting them would count one
+// fix twice. Both stay readable through list_transcript_corrections
+// state=superseded / state=duplicate.
+const liveFindingsSQL = `patch_state NOT IN ('superseded', 'duplicate')`
 
 var (
 	findingsTotalsSQL = `
@@ -3742,11 +3889,11 @@ var (
 		       COUNT(*) FILTER (WHERE confidence >= 0.4 AND confidence < 0.8),
 		       COUNT(*) FILTER (WHERE confidence < 0.4)
 		FROM transcript_findings
-		WHERE ` + notSupersededSQL
+		WHERE ` + liveFindingsSQL
 	findingsByIssueTypeSQL = `
 		SELECT issue_type, COUNT(*) AS n
 		FROM transcript_findings
-		WHERE ` + notSupersededSQL + `
+		WHERE ` + liveFindingsSQL + `
 		GROUP BY issue_type
 		ORDER BY n DESC, issue_type`
 	findingsByBookSQL = `
@@ -3757,7 +3904,7 @@ var (
 			       AVG(confidence)       AS mean_conf,
 			       mode() WITHIN GROUP (ORDER BY issue_type) AS top_issue
 			FROM transcript_findings
-			WHERE ` + notSupersededSQL + `
+			WHERE ` + liveFindingsSQL + `
 			GROUP BY book_dir
 		)
 		SELECT book_dir, sample_path, n, mean_conf, top_issue
@@ -3839,9 +3986,12 @@ type FindingRow struct {
 // listFindingsSQL / listFindingsInBookSQL are the worklist queries, package-level
 // vars so a test can assert their shape (SELECT-only, scoped vs global). The
 // scoped form adds a single `file_path LIKE $2 ESCAPE '\'` clause; the prefix is
-// built with likePrefix EXACTLY as textSearchInBookSQL and the scoped clear path
-// do, so "show this book's findings" selects the identical set "search this book"
-// and "clear this book's findings" do. The LEFT JOIN to transcription_jobs lets a
+// built with likePrefix(dir) + "/%" EXACTLY as textSearchInBookSQL and the
+// scoped clear (clearFindingsDirSQL) build theirs, so "show this book's
+// findings" selects the same book set "search this book" and "clear this
+// book's findings" do — a '_' or '%' in the directory name is a literal, never
+// a wildcard. (The clear additionally matches file_path = dir exactly, so it
+// can be scoped to one track.) The LEFT JOIN to transcription_jobs lets a
 // finding still surface (with JobID nil) if its job row is gone.
 var (
 	listFindingsSQL = `
@@ -3852,7 +4002,7 @@ var (
 		       tf.issue_type, tf.suggested_correction, tf.confidence
 		FROM transcript_findings tf
 		LEFT JOIN transcription_jobs j ON j.file_path = tf.file_path
-		WHERE tf.` + notSupersededSQL + `
+		WHERE tf.` + liveFindingsSQL + `
 		ORDER BY tf.confidence DESC, tf.file_path, tf.start_sec
 		LIMIT $1
 	`
@@ -3865,7 +4015,7 @@ var (
 		FROM transcript_findings tf
 		LEFT JOIN transcription_jobs j ON j.file_path = tf.file_path
 		WHERE tf.file_path LIKE $2 ESCAPE '\'
-		  AND tf.` + notSupersededSQL + `
+		  AND tf.` + liveFindingsSQL + `
 		ORDER BY tf.confidence DESC, tf.file_path, tf.start_sec
 		LIMIT $1
 	`
@@ -3930,7 +4080,7 @@ func (db *DB) listFindings(ctx context.Context, q rowQuerier, dir string, limit 
 var findingsCountByBookSQL = `
 	SELECT regexp_replace(file_path, '/[^/]+$', '') AS book_dir, COUNT(*)
 	FROM transcript_findings
-	WHERE ` + notSupersededSQL + `
+	WHERE ` + liveFindingsSQL + `
 	GROUP BY book_dir
 `
 
@@ -4208,6 +4358,38 @@ var (
 // the requeue. $1 is the requeued job-id array.
 const requeueLockTranscriptsSQL = `SELECT 1 FROM transcripts WHERE job_id = ANY($1) FOR UPDATE`
 
+// requeueArchiveTranscriptsSQL copies the requeued jobs' transcripts into
+// transcript_archive before they are deleted (CONTRACT §1.4): every transcripts
+// column — metadata, raw_text, segments, the asr recipe and provenance — plus
+// the job's whole run_metrics row as jsonb (NULL when it has none), so the ASR
+// pass a requeue replaces is kept. It runs after the FOR UPDATE lock, so the
+// copy is of exactly the rows the delete removes. archived_by is the
+// transaction's earmark.actor, which requeueTx always sets. $1 is the
+// requeued job-id array.
+const requeueArchiveTranscriptsSQL = `INSERT INTO transcript_archive
+	       (transcript_id, job_id, file_path, checksum, language, duration_seconds,
+	        speaker_count, segments, raw_text, model_name, recipe_id, embedded_asin,
+	        asr_model_sha256, asr_runner_version, asr_params, run_metrics, created_at,
+	        archived_reason, archived_by)
+	SELECT t.id, t.job_id, t.file_path, t.checksum, t.language, t.duration_seconds,
+	       t.speaker_count, t.segments, t.raw_text, t.model_name, t.recipe_id, t.embedded_asin,
+	       t.asr_model_sha256, t.asr_runner_version, t.asr_params,
+	       CASE WHEN m.job_id IS NULL THEN NULL ELSE to_jsonb(m) END, t.created_at,
+	       'requeue', NULLIF(current_setting('earmark.actor', true), '')
+	FROM   transcripts t
+	LEFT JOIN run_metrics m ON m.job_id = t.job_id
+	WHERE  t.job_id = ANY($1)
+	ORDER BY t.id`
+
+// requeueReason is the finding_events reason of a requeue's supersede
+// transitions.
+const requeueReason = "requeue"
+
+// requeueDefaultActor attributes a requeue whose caller attached no actor
+// (WithActor): the archive's archived_by and the transitions' actor are never
+// NULL.
+const requeueDefaultActor = "system"
+
 // requeueSupersedeFindingsSQL archives the findings of the transcripts a
 // requeue is about to delete (CONTRACT §1.4, §2.17): they move to
 // 'superseded' and are stamped superseded_at. Human decisions (accepted,
@@ -4220,10 +4402,28 @@ const requeueLockTranscriptsSQL = `SELECT 1 FROM transcripts WHERE job_id = ANY(
 // Its unanchorable_reason is cleared because the database requires it to be
 // set exactly when patch_state = 'unanchorable'
 // (transcript_findings_unanchorable_reason_iff_state, migration 4).
-const requeueSupersedeFindingsSQL = `UPDATE transcript_findings
-	SET    patch_state = 'superseded', superseded_at = now(), unanchorable_reason = NULL
-	WHERE  transcript_id IN (SELECT id FROM transcripts WHERE job_id = ANY($1))
-	  AND  patch_state = ANY($2)`
+//
+// The findings are locked first, in id order (lk), then updated: every writer
+// that locks several findings takes them in id order (ClearFindings,
+// SetPatchStateBulk, ApplyDecisions, ClearEmbeddingStale), so a requeue racing
+// one of them over the same findings queues instead of deadlocking (40P01).
+// lk locks EVERY finding of the requeued transcripts, whatever its state:
+// ClearEmbeddingStale locks a rebuild's replayed ids FOR SHARE even when one
+// is already superseded, so a lock set narrowed by state would let the two
+// interleave out of id order. The state filter ($2) is on the UPDATE only. A requeue's full lock
+// order is transcripts (requeueLockTranscriptsSQL) → findings in id order →
+// chunks (the transcript delete's cascade).
+const requeueSupersedeFindingsSQL = `WITH lk AS (
+	    SELECT id FROM transcript_findings
+	     WHERE transcript_id IN (SELECT id FROM transcripts WHERE job_id = ANY($1))
+	     ORDER BY id
+	       FOR UPDATE
+	)
+	UPDATE transcript_findings f
+	   SET patch_state = 'superseded', superseded_at = now(), unanchorable_reason = NULL
+	  FROM lk
+	 WHERE f.id = lk.id
+	   AND f.patch_state = ANY($2)`
 
 // requeueDeleteTranscriptsSQL deletes the requeued jobs' transcripts. Chunks
 // cascade; findings keep their row and get transcript_id = NULL (ON DELETE SET
@@ -4248,7 +4448,8 @@ type txQuerier interface {
 }
 
 // requeue runs a requeue in one transaction: reset the selected jobs to pending,
-// archive their transcripts' findings as superseded, delete the transcripts
+// copy their transcripts into transcript_archive, archive their transcripts'
+// findings as superseded (finding_events reason 'requeue'), delete the transcripts
 // (chunks cascade), and clear the now-stale run_metrics rows. args are the bound
 // parameters for the selector's $N placeholders (one for by-path/by-id/by-dir,
 // none for failed).
@@ -4285,8 +4486,8 @@ func (db *DB) requeue(ctx context.Context, sel requeueSelector, args ...any) ([]
 }
 
 // requeueTx is the transaction-body core of requeue, split out so the
-// reset-jobs → lock-transcripts → supersede-findings → delete-transcripts →
-// clear-metrics sequence is testable against a pgxmock transaction. It does NOT begin/commit — the
+// reset-jobs → lock-transcripts → event-context → archive-transcripts →
+// supersede-findings → delete-transcripts → clear-metrics sequence is testable against a pgxmock transaction. It does NOT begin/commit — the
 // caller owns the tx lifecycle. Returns the reset jobs' ids and file paths
 // (parallel slices).
 //
@@ -4308,6 +4509,16 @@ func requeueTx(ctx context.Context, tx txQuerier, sel requeueSelector, args ...a
 
 	if _, err := tx.Exec(ctx, requeueLockTranscriptsSQL, ids); err != nil {
 		return nil, nil, fmt.Errorf("lock transcripts: %w", err)
+	}
+	// Set once, before anything is written: the archive reads earmark.actor
+	// for archived_by, and the supersede's transitions read both.
+	if err := SetEventContext(ctx, tx, EventContext{
+		Actor: actorFrom(ctx, requeueDefaultActor), Reason: requeueReason,
+	}); err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.Exec(ctx, requeueArchiveTranscriptsSQL, ids); err != nil {
+		return nil, nil, fmt.Errorf("archive transcripts: %w", err)
 	}
 	if _, err := tx.Exec(ctx, requeueSupersedeFindingsSQL, ids, supersedeFromStates); err != nil {
 		return nil, nil, fmt.Errorf("supersede findings: %w", err)
@@ -4395,6 +4606,8 @@ var resetSQL = `
 	DROP TABLE    IF EXISTS model_setting_events CASCADE;
 	DROP TABLE    IF EXISTS model_settings      CASCADE;
 	DROP TABLE    IF EXISTS step_runs           CASCADE;
+	DROP TABLE    IF EXISTS judge_passes        CASCADE;
+	DROP TABLE    IF EXISTS transcript_archive  CASCADE;
 	DROP TABLE    IF EXISTS recipe_builds       CASCADE;
 	DROP TABLE    IF EXISTS chunk_scan          CASCADE;
 	DROP TABLE    IF EXISTS finding_events      CASCADE;
@@ -4413,6 +4626,8 @@ var resetSQL = `
 	DROP FUNCTION IF EXISTS transcription_jobs_set_completed_at() CASCADE;
 	DROP FUNCTION IF EXISTS finding_events_record_transition()    CASCADE;
 	DROP FUNCTION IF EXISTS finding_events_append_only()          CASCADE;
+	DROP FUNCTION IF EXISTS finding_events_record_reanchor()      CASCADE;
+	DROP FUNCTION IF EXISTS transcript_findings_keep_origin()     CASCADE;
 	DROP FUNCTION IF EXISTS model_setting_events_append_only()    CASCADE;
 	DROP TABLE    IF EXISTS goose_db_version;
 `

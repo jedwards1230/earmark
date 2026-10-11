@@ -139,7 +139,7 @@ the undecided (`proposed`) queue.
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `state` | `proposed` | comma-separated patch states (`proposed`, `accepted`, `applied`, `rejected`, `reverted`, `stale`, `unanchorable`, `superseded`), or `all`/`any` for every state. `superseded` = archived by a requeue (its transcript was replaced; `transcriptId` is empty) |
+| `state` | `proposed` | comma-separated patch states (`proposed`, `accepted`, `applied`, `rejected`, `reverted`, `stale`, `unanchorable`, `superseded`, `duplicate`), or `all`/`any` for every state. `superseded` = archived by a requeue (its transcript was replaced; `transcriptId` is empty) or a clear (`transcriptId` kept); `duplicate` = agrees with another finding, which carries the decision |
 | `book` | — | resolved the same way the search tools resolve it; ignored when `path` is given |
 | `path` | — | exact book directory or track file path; matches that path and anything beneath it |
 | `id` | — | a single finding UUID — overrides the other filters in practice |

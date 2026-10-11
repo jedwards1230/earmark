@@ -78,6 +78,8 @@ func TestProcessTranscript_ClearsStaleFlagWithOverlayWatermark(t *testing.T) {
 		require.Len(t, fdb.clearCalls, 1)
 		require.Equal(t, tr.ID, fdb.clearCalls[0].transcriptID)
 		require.Equal(t, watermark, fdb.clearCalls[0].watermark)
+		// The guard needs exactly the corrections that landed in the text.
+		require.Equal(t, []string{"f1"}, fdb.clearCalls[0].replayed)
 	})
 
 	// Zero corrections is NOT "nothing to do": a revert removes the last
@@ -91,6 +93,17 @@ func TestProcessTranscript_ClearsStaleFlagWithOverlayWatermark(t *testing.T) {
 		require.Len(t, fdb.clearCalls, 1,
 			"a rebuild with an empty overlay must still clear the flag")
 		require.Equal(t, watermark, fdb.clearCalls[0].watermark)
+		require.Empty(t, fdb.clearCalls[0].replayed)
+	})
+
+	// A failed clear (e.g. its 5 s lock_timeout) is not fatal: the chunks are
+	// already rebuilt, the flag simply stays set for the next cycle.
+	t.Run("a failed clear does not fail the rebuild", func(t *testing.T) {
+		fdb := &fakeDB{overlayReadAt: watermark, clearErr: fmt.Errorf("canceling statement due to lock timeout (SQLSTATE 55P03)")}
+		w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test")}
+
+		require.NoError(t, w.processTranscript(cfg, overlayTranscript()))
+		require.Empty(t, fdb.clearCalls)
 	})
 
 	t.Run("not cleared when the overlay could not be read", func(t *testing.T) {

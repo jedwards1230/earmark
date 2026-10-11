@@ -40,16 +40,17 @@ var RequeueCmd = &cobra.Command{
 
 Modes:
   requeue <substr>            re-transcribe books whose path contains <substr>
-                              (deletes the transcript + its embeddings, resets
+                              (archives, then deletes the transcript + its embeddings, resets
                               the job to pending so the runner redoes it)
   requeue --failed            re-transcribe every job currently in 'failed'
   requeue --reembed <substr>  re-embed only: drop the embeddings and let the
                               worker rebuild them (keeps the transcript; use
                               after changing the embedding model or chunk size)
 
-Re-transcribing archives the old transcript's findings — judge proposals and
-human decisions alike — as 'superseded': kept for audit, never replayed, never
-deleted. The new transcript is judged fresh. --reembed keeps the transcript, so
+Re-transcribing first copies the old transcript — raw text, segments, ASR
+provenance and its run_metrics row — into transcript_archive, then archives its
+findings — judge proposals and human decisions alike — as 'superseded': kept
+for audit, never replayed, never deleted. The new transcript is judged fresh. --reembed keeps the transcript, so
 it leaves findings as they are: corrections replay onto the rebuilt chunks.
 
 All modes preview matches and do nothing unless you pass --yes.
@@ -138,6 +139,7 @@ func run(ctx context.Context, out io.Writer, q Requeuer, substr string, o option
 	}
 
 	var affected []string
+	ctx = db.WithActor(ctx, "cli:requeue")
 	switch {
 	case o.reembed:
 		affected, err = q.ReembedJobs(ctx, substr)

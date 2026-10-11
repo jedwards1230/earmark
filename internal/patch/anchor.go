@@ -37,7 +37,8 @@ import (
 //	proposed -> rejected
 //	(any)    -> stale        (the underlying chunk changed underneath us)
 //	proposed <-> unanchorable (earmark reanchor could not place the span)
-//	(any)    -> superseded   (requeue replaced the transcript; terminal archive)
+//	proposed <-> duplicate    (another finding carries the same correction)
+//	(any)    -> superseded   (requeue or clear replaced/retired it; terminal archive)
 const (
 	StateProposed = "proposed"
 	StateAccepted = "accepted"
@@ -52,9 +53,17 @@ const (
 	// never be accepted or applied — there is no text to apply it to.
 	StateUnanchorable = "unanchorable"
 	// StateSuperseded archives a finding whose transcript was replaced by an
-	// operator requeue (CONTRACT §1.4, §2.17). It is kept for audit and the
-	// bench, never replayed, and never leaves this state.
+	// operator requeue (CONTRACT §1.4, §2.17), or that an operator cleared
+	// (db.ClearFindings). It is kept for audit and the bench, never replayed,
+	// and never leaves this state.
 	StateSuperseded = "superseded"
+	// StateDuplicate marks a finding that proposes the same correction as
+	// another finding (transcript_findings.duplicate_of names that
+	// representative). It is never in the overlay and never replayed: the
+	// representative carries the decision. Like unanchorable it is a machine
+	// state — no reviewer moves into or out of it — and its only moves are
+	// back to proposed (the grouping was undone) or to superseded.
+	StateDuplicate = "duplicate"
 )
 
 var (
@@ -202,7 +211,8 @@ func CanTransition(from, to string) bool {
 	}
 	switch from {
 	case StateProposed:
-		return to == StateAccepted || to == StateRejected || to == StateStale || to == StateUnanchorable
+		return to == StateAccepted || to == StateRejected || to == StateStale ||
+			to == StateUnanchorable || to == StateDuplicate
 	case StateAccepted:
 		return to == StateApplied || to == StateRejected || to == StateStale
 	case StateApplied:
@@ -220,9 +230,14 @@ func CanTransition(from, to string) bool {
 		// Never to accepted/applied: there is no anchor to apply it at.
 		return to == StateProposed
 	case StateSuperseded:
-		// Terminal: its transcript no longer exists. The replacement transcript
-		// is judged fresh.
+		// Terminal: its transcript no longer exists (or its findings were
+		// cleared). The replacement transcript is judged fresh.
 		return false
+	case StateDuplicate:
+		// Only back to proposed, when the grouping that made it a duplicate is
+		// undone. Never accepted/applied directly: the representative carries
+		// the decision.
+		return to == StateProposed
 	default:
 		return false
 	}

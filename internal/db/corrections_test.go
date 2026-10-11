@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v5"
 
 	"github.com/jedwards1230/earmark/internal/patch"
@@ -257,33 +258,97 @@ func TestClearEmbeddingStaleSQL_IsWatermarkGuarded(t *testing.T) {
 		t.Errorf("clearEmbeddingStaleSQL must also block on a still-accepted "+
 			"correction:\n%s", clearEmbeddingStaleSQL)
 	}
+	// And so must a correction the rebuild replayed that has since left the
+	// overlay (a clear, revert or reject): timestamps cannot see a clear that
+	// committed after the overlay read.
+	if !strings.Contains(norm(clearEmbeddingStaleSQL), "OR (f.id = ANY($4::uuid[]) AND f.patch_state <> ALL($5))") {
+		t.Errorf("clearEmbeddingStaleSQL must block on a replayed correction that left the overlay:\n%s", clearEmbeddingStaleSQL)
+	}
+	if !strings.Contains(norm(lockReplayedFindingsSQL), "ORDER BY id FOR SHARE") {
+		t.Errorf("lockReplayedFindingsSQL must lock the replayed findings in id order:\n%s", lockReplayedFindingsSQL)
+	}
 	// Scoped to one transcript, and only ever touches flagged rows.
 	if !strings.Contains(clearEmbeddingStaleSQL, "c.transcript_id = $1") {
 		t.Errorf("clearEmbeddingStaleSQL must be scoped to one transcript:\n%s", clearEmbeddingStaleSQL)
 	}
 }
 
-// TestClearEmbeddingStale_BindsWatermarkAndAcceptedState drives the real Exec
-// against a mock pool: the guard's parameters must be the watermark and the
-// `accepted` state constant, not literals that could drift.
+// TestClearEmbeddingStale_BindsWatermarkAndAcceptedState drives the real
+// transaction against a mock pool: the replayed findings are locked first (id
+// order, FOR SHARE), then the guarded UPDATE binds the watermark, the
+// `accepted` constant, the replayed ids and the overlay states — not literals
+// that could drift.
 func TestClearEmbeddingStale_BindsWatermarkAndAcceptedState(t *testing.T) {
 	database := newTestDB()
-	mock, err := pgxmock.NewPool()
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
 	if err != nil {
 		t.Fatalf("new mock pool: %v", err)
 	}
 	defer mock.Close()
 
 	watermark := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
-	mock.ExpectExec("UPDATE transcript_chunks").
-		WithArgs("t-1", watermark, patch.StateAccepted).
+	replayed := []string{"f-1", "f-2"}
+	mock.ExpectBegin()
+	mock.ExpectExec(setLocalLockTimeoutSQL).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectExec(lockReplayedFindingsSQL).WithArgs(replayed).
+		WillReturnResult(pgxmock.NewResult("SELECT", 2))
+	mock.ExpectExec(clearEmbeddingStaleSQL).
+		WithArgs("t-1", watermark, patch.StateAccepted, replayed, overlayStates).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
 
-	if err := database.clearEmbeddingStale(context.Background(), mock, "t-1", watermark); err != nil {
+	if err := database.clearEmbeddingStale(context.Background(), mock, "t-1", watermark, replayed); err != nil {
 		t.Fatalf("clearEmbeddingStale: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+
+	// Nothing replayed (a revert emptied the chunk): no lock, an empty set.
+	mock2, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock2.Close()
+	mock2.ExpectBegin()
+	mock2.ExpectExec(setLocalLockTimeoutSQL).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock2.ExpectExec(clearEmbeddingStaleSQL).
+		WithArgs("t-1", watermark, patch.StateAccepted, []string{}, overlayStates).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock2.ExpectCommit()
+	mock2.ExpectRollback()
+	if err := database.clearEmbeddingStale(context.Background(), mock2, "t-1", watermark, nil); err != nil {
+		t.Fatalf("clearEmbeddingStale (nothing replayed): %v", err)
+	}
+	if err := mock2.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestClearEmbeddingStale_LockTimeoutLeavesChunkFlagged: the transaction
+// bounds its lock waits first; when a replayed finding stays locked past it
+// (SQLSTATE 55P03) the clear returns the error and never runs the UPDATE, so
+// the chunk stays flagged for the next rebuild.
+func TestClearEmbeddingStale_LockTimeoutLeavesChunkFlagged(t *testing.T) {
+	database := newTestDB()
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+	mock.ExpectBegin()
+	mock.ExpectExec(setLocalLockTimeoutSQL).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectExec(lockReplayedFindingsSQL).WithArgs([]string{"f-1"}).
+		WillReturnError(&pgconn.PgError{Code: "55P03", Message: "canceling statement due to lock timeout"})
+	mock.ExpectRollback()
+	err = database.clearEmbeddingStale(context.Background(), mock, "t-1", time.Now(), []string{"f-1"})
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("err = %v, want the lock timeout", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (the UPDATE must not run): %v", err)
 	}
 }
 

@@ -948,8 +948,8 @@ type findingsModelRow struct {
 
 // buildFindingsRows pivots (model, patch_state, decider) counts into one row
 // per model, sorted by total descending, plus the totals row. "Other" is
-// superseded plus the patch state 'stale' (a quarantined replay, not
-// stale_work).
+// superseded, duplicate, plus the patch state 'stale' (a quarantined replay,
+// not stale_work).
 func buildFindingsRows(fs []db.FindingsModelCount) ([]findingsModelRow, findingsModelRow) {
 	idx := map[string]int{}
 	var rows []findingsModelRow

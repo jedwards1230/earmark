@@ -43,6 +43,7 @@ type SimpleMockDB struct {
 
 	clearFindingsCalled bool   // ClearFindings was called
 	clearFindingsDir    string // last dir passed to ClearFindings
+	clearFindingsActor  string // last actor passed to ClearFindings
 	clearFindingsN      int64  // rows ClearFindings reports deleted
 	clearFindingsErr    error  // if set, ClearFindings returns it
 
@@ -234,8 +235,9 @@ func (m *SimpleMockDB) SampleEvalChunks(_ context.Context, _ int) ([]db.EvalChun
 
 func (m *SimpleMockDB) InsertFindings(_ context.Context, _ []db.Finding) error { return nil }
 
-func (m *SimpleMockDB) ClearFindings(_ context.Context, dir string) (int64, error) {
+func (m *SimpleMockDB) ClearFindings(_ context.Context, dir, actor string) (int64, error) {
 	m.clearFindingsCalled = true
+	m.clearFindingsActor = actor
 	m.clearFindingsDir = dir
 	if m.clearFindingsErr != nil {
 		return 0, m.clearFindingsErr
@@ -1471,6 +1473,9 @@ func TestFindingsClearAction(t *testing.T) {
 	}
 	if mock.clearFindingsDir != "" {
 		t.Errorf("unscoped clear should pass empty dir, got %q", mock.clearFindingsDir)
+	}
+	if mock.clearFindingsActor != dashboardActor {
+		t.Errorf("clear actor = %q, want %q", mock.clearFindingsActor, dashboardActor)
 	}
 	// Re-renders the findings fragment (the mock summary is empty → zero state).
 	if !strings.Contains(w.Body.String(), "updated ") {

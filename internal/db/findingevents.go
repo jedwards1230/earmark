@@ -202,20 +202,46 @@ func setPatchStateBulkTx(ctx context.Context, q rowQuerier, from, to, decidedBy 
 // decisions (CONTRACT §2.17 "Version history"): a stamped decision is
 // attributed to its decided_by, anything else to Actor, else 'system'.
 // RecipeID, when set, is recorded on every transition of the transaction.
+// Reason, when set, is the reason of every transition of the transaction
+// (e.g. "requeue", "cleared"); the re-anchor trigger writes its own
+// ("reanchor_moved").
 type EventContext struct {
 	Actor    string
 	RecipeID string
+	Reason   string
 }
 
 // setEventContextSQL sets the transaction-local settings the transition
 // trigger reads. is_local = true: they end with the transaction, so a pooled
 // connection never carries one transaction's attribution into the next.
-var setEventContextSQL = `SELECT set_config('earmark.actor', $1, true), set_config('earmark.recipe_id', $2, true)`
+var setEventContextSQL = `SELECT set_config('earmark.actor', $1, true), set_config('earmark.recipe_id', $2, true),
+	       set_config('earmark.reason', $3, true)`
+
+// actorKey carries a caller's attribution through a context (WithActor).
+type actorKey struct{}
+
+// WithActor returns ctx carrying actor ("mcp:dashboard", "cli:requeue") as the
+// attribution of the audit records a db call writes on the caller's behalf —
+// finding_events transitions and transcript_archive.archived_by. It exists for
+// entry points shared by several surfaces (requeue: the CLI and the dashboard
+// buttons) whose signatures carry no actor; methods that take an actor
+// argument ignore it.
+func WithActor(ctx context.Context, actor string) context.Context {
+	return context.WithValue(ctx, actorKey{}, actor)
+}
+
+// actorFrom returns the actor WithActor attached to ctx, else fallback.
+func actorFrom(ctx context.Context, fallback string) string {
+	if a, ok := ctx.Value(actorKey{}).(string); ok && strings.TrimSpace(a) != "" {
+		return a
+	}
+	return fallback
+}
 
 // SetEventContext attributes the rest of tx's transitions. Call it inside the
 // transaction that changes the findings.
 func SetEventContext(ctx context.Context, tx execer, ec EventContext) error {
-	if _, err := tx.Exec(ctx, setEventContextSQL, ec.Actor, ec.RecipeID); err != nil {
+	if _, err := tx.Exec(ctx, setEventContextSQL, ec.Actor, ec.RecipeID, ec.Reason); err != nil {
 		return fmt.Errorf("set finding event context: %w", err)
 	}
 	return nil

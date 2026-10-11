@@ -186,14 +186,34 @@ func (db *DB) getCorrectionOverlay(ctx context.Context, b txBeginner, transcript
 // the insert sets embedding_stale = true, the clear wipes it, and that accept
 // is never replayed and never re-flagged — silently dropped, forever.
 //
-// Two conditions block the clear, and both are needed:
+// Three conditions block the clear, and all are needed:
 //
 //   - decided_at > $2 — a decision recorded after the watermark. Catches an
 //     accept or a revert that raced this rebuild.
+//
 //   - patch_state = $3 ('accepted') — a correction still waiting to be
 //     replayed, whatever its timestamp. This also makes a failed (best-effort)
 //     MarkFindingsApplied self-healing: the finding stays `accepted`, the flag
 //     stays set, and the next rebuild pass retries.
+//
+//   - f.id = ANY($4) AND patch_state <> ALL($5) — a correction this rebuild
+//     REPLAYED into the text ($4, the ids it applied) that has since left the
+//     overlay states ($5: accepted/applied) — cleared, reverted, rejected,
+//     superseded by a requeue. Its chunk still carries the withdrawn text, so
+//     it must stay flagged. Timestamps cannot express this exactly: a clear
+//     whose statement time is before the watermark can commit after the
+//     overlay read, and a clear stamps no decided_at. Comparing the replayed
+//     set against the current states can.
+//
+// The replayed findings are locked FOR SHARE (in id order) before the UPDATE,
+// in its own transaction, which waits at most 5 s for any lock
+// (setLocalLockTimeoutSQL; the worker's context has no deadline). On a
+// timeout the transaction aborts, the chunk stays flagged and the worker logs
+// it and moves on — the next rebuild clears it: a clear, revert or review holding one of them is
+// waited for, and the UPDATE — a new statement under READ COMMITTED — then
+// sees its committed state; one that comes later waits for this transaction
+// and re-flags the chunk itself. Findings are locked before chunks, like every
+// other writer.
 //
 // A blocked chunk is simply rebuilt again next cycle, so the failure mode is
 // one redundant re-embed rather than a lost correction.
@@ -206,22 +226,53 @@ var clearEmbeddingStaleSQL = `
 	      SELECT 1 FROM transcript_findings f
 	      WHERE f.transcript_id = c.transcript_id
 	        AND f.chunk_index = c.chunk_index
-	        AND (f.decided_at > $2 OR f.patch_state = $3)
+	        AND (f.decided_at > $2 OR f.patch_state = $3
+	             OR (f.id = ANY($4::uuid[]) AND f.patch_state <> ALL($5)))
 	  )
+`
+
+// lockReplayedFindingsSQL locks the findings a rebuild replayed, in id order,
+// before ClearEmbeddingStale's guarded UPDATE (see clearEmbeddingStaleSQL).
+var lockReplayedFindingsSQL = `
+	SELECT id FROM transcript_findings
+	 WHERE id = ANY($1::uuid[])
+	 ORDER BY id
+	   FOR SHARE
 `
 
 // ClearEmbeddingStale clears the rebuild flag for the chunks of one transcript
 // that the rebuild is known to have brought up to date. Call it only AFTER the
 // rebuilt chunks have been successfully inserted — the flag is the only record
-// that a rebuild is owed.
-func (db *DB) ClearEmbeddingStale(ctx context.Context, transcriptID string, watermark time.Time) error {
-	return db.clearEmbeddingStale(ctx, db.pool, transcriptID, watermark)
+// that a rebuild is owed. replayed is the ids of the corrections the rebuild
+// actually applied to the text it embedded (not the ones it quarantined); a
+// chunk whose replayed correction has left the overlay since stays flagged.
+func (db *DB) ClearEmbeddingStale(ctx context.Context, transcriptID string, watermark time.Time, replayed []string) error {
+	return db.clearEmbeddingStale(ctx, db.pool, transcriptID, watermark, replayed)
 }
 
-func (db *DB) clearEmbeddingStale(ctx context.Context, e execer, transcriptID string, watermark time.Time) error {
-	if _, err := e.Exec(ctx, clearEmbeddingStaleSQL,
-		transcriptID, watermark, patch.StateAccepted); err != nil {
+func (db *DB) clearEmbeddingStale(ctx context.Context, b txBeginner, transcriptID string, watermark time.Time, replayed []string) error {
+	if replayed == nil {
+		replayed = []string{}
+	}
+	tx, err := b.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin clear embedding_stale tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, setLocalLockTimeoutSQL); err != nil {
+		return fmt.Errorf("clear embedding_stale: set lock_timeout: %w", err)
+	}
+	if len(replayed) > 0 {
+		if _, err := tx.Exec(ctx, lockReplayedFindingsSQL, replayed); err != nil {
+			return fmt.Errorf("lock replayed findings for transcript %s: %w", transcriptID, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, clearEmbeddingStaleSQL,
+		transcriptID, watermark, patch.StateAccepted, replayed, overlayStates); err != nil {
 		return fmt.Errorf("clear embedding_stale for transcript %s: %w", transcriptID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit clear embedding_stale for transcript %s: %w", transcriptID, err)
 	}
 	return nil
 }
