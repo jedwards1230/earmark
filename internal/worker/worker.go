@@ -763,10 +763,15 @@ func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 	}
 
 	judged := w.judgeChunks(t, chunks)
-	defer w.abandonPass(t, judged, "stopped by shutdown; findings not stored")
+	// Safety net: any return below that leaves the pass open closes it failed.
+	defer w.abandonPass(t, judged, "the eval pass ended before its outcome was recorded")
 	if judged.stopped() {
-		// Shutdown mid-judge: record nothing. The job stays unlatched AND
-		// unfailed, so the eval pass simply re-selects it after restart.
+		// Shutdown mid-judge: no latch and no failure record, so the job stays
+		// unlatched AND unfailed and the eval pass re-selects it after
+		// restart. The judge pass is closed partial/failed with the findings
+		// of the chunks judged so far (CONTRACT §2.15 "Lineage"), exactly as
+		// persistJudged does for a stopped run on the embed path.
+		w.closeStoppedPass(t, judged)
 		return judged.err
 	}
 
@@ -1015,7 +1020,9 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) *judgeOutcome 
 // re-judged. The re-judge paths (`earmark eval --backfill-*`) skip findings
 // already recorded for the transcript, so a retry never doubles them up.
 //
-// A stopped run (shutdown) records nothing. Best-effort: nothing here fails
+// A stopped run (shutdown) writes no latch and no failure record; its judge
+// pass, if any, is closed partial/failed with the findings of the chunks
+// judged so far (closeStoppedPass). Best-effort: nothing here fails
 // the embed (eval is advisory). It returns an error only when the run_metrics
 // outcome itself (latch or failure record) could not be written — the job is
 // then still "unattempted" in the DB, which the gated loop must back off on.

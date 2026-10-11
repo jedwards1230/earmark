@@ -23,6 +23,10 @@ type fakeRejudgeDB struct {
 	opened   []db.JudgePassOpen
 	commits  []db.JudgePassCommit
 	selected int
+	queries  []db.RejudgeQuery
+	// commitErr fails every CommitJudgePass.
+	commitErr error
+	keys      map[string]map[db.FindingKey]bool // per recipe id
 }
 
 func newFakeRejudgeDB(n, k int) *fakeRejudgeDB {
@@ -45,6 +49,7 @@ func (f *fakeRejudgeDB) RejudgeTargets(_ context.Context, q db.RejudgeQuery) ([]
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.selected++
+	f.queries = append(f.queries, q)
 	var out []db.RejudgeTarget
 	for _, t := range f.targets {
 		if q.After.ID != "" && !t.CreatedAt.After(q.After.CreatedAt) {
@@ -62,8 +67,8 @@ func (f *fakeRejudgeDB) GetEvalChunksForTranscript(_ context.Context, id string)
 	return f.chunks[id], nil
 }
 
-func (f *fakeRejudgeDB) GetRecipeFindingKeys(context.Context, string, string) (map[db.FindingKey]bool, error) {
-	return nil, nil
+func (f *fakeRejudgeDB) GetRecipeFindingKeys(_ context.Context, _, rid string) (map[db.FindingKey]bool, error) {
+	return f.keys[rid], nil
 }
 
 func (f *fakeRejudgeDB) RegisterRecipe(_ context.Context, r recipe.Recipe) (string, error) {
@@ -85,6 +90,9 @@ func (f *fakeRejudgeDB) CommitJudgePass(_ context.Context, c db.JudgePassCommit)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commits = append(f.commits, c)
+	if f.commitErr != nil {
+		return db.JudgePassResult{}, f.commitErr
+	}
 	return db.JudgePassResult{Inserted: len(c.Findings)}, nil
 }
 
@@ -277,5 +285,137 @@ func TestRejudgeOptionsFrom(t *testing.T) {
 	}
 	if validateCallFlags(options{callTimeout: 0}) == nil || validateCallFlags(options{callTimeout: time.Second, retries: -1}) == nil {
 		t.Error("bad call flags accepted")
+	}
+}
+
+// TestRejudge_PassesSelectionFlags: --shard, --book and the page size reach
+// every RejudgeQuery the run issues, with the current recipe.
+func TestRejudge_PassesSelectionFlags(t *testing.T) {
+	fdb := newFakeRejudgeDB(5, 1)
+	j := evalpkg.NewJudge(&gaugeChat{})
+	rid, _ := j.Recipe().ID()
+	ro, err := rejudgeOptionsFrom(options{concurrency: 2, shard: "3/7"}, "Dune")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ro.pageSize = 2
+	var out strings.Builder
+	if err := runRejudge(context.Background(), &out, fdb, j, ro); err != nil {
+		t.Fatal(err)
+	}
+	if len(fdb.queries) < 2 {
+		t.Fatalf("%d queries, want several pages", len(fdb.queries))
+	}
+	for _, q := range fdb.queries {
+		if q.Shard != 3 || q.Shards != 7 || q.Book != "Dune" || q.RecipeID != rid || q.Limit != 2 {
+			t.Errorf("query %+v lost a selection flag", q)
+		}
+	}
+}
+
+// reportingGauge answers through CompleteWithModel with another model id.
+type reportingGauge struct{ gaugeChat }
+
+func (r *reportingGauge) CompleteWithModel(ctx context.Context, s, u string) (evalpkg.Completion, error) {
+	c, err := r.Complete(ctx, s, u)
+	return evalpkg.Completion{Content: c, ResolvedModel: "gauge-judge-2026-10-01", CostUSD: 0.25, HasCost: true}, err
+}
+
+// TestRejudge_WarnsOnFallback: replies from a model other than the recipe
+// expects are counted and warned about (they never serve from cache).
+func TestRejudge_WarnsOnFallback(t *testing.T) {
+	fdb := newFakeRejudgeDB(2, 2)
+	var out strings.Builder
+	if err := runRejudge(context.Background(), &out, fdb, evalpkg.NewJudge(&reportingGauge{}),
+		rejudgeOptions{concurrency: 2}); err != nil {
+		t.Fatal(err)
+	}
+	s := out.String()
+	if strings.Count(s, "answered with a model other than the recipe expects") != 1 ||
+		!strings.Contains(s, "WARNING: 4 chunk(s) were answered by a model other than the recipe expects") {
+		t.Errorf("fallback not surfaced once per run plus in the summary:\n%s", s)
+	}
+}
+
+// TestRejudge_BookContextErrorLeavesMetrics: a judge@v3 book record that
+// cannot be read judges nothing: the pass is closed failed, run_metrics is
+// left alone (no failure record for an unjudged transcript), the run stops.
+func TestRejudge_BookContextErrorLeavesMetrics(t *testing.T) {
+	fdb := newFakeRejudgeDB(1, 2)
+	chat := &gaugeChat{}
+	j := evalpkg.NewJudge(chat)
+	if err := j.SetPrompt(evalpkg.JudgePromptV3); err != nil {
+		t.Fatal(err)
+	}
+	j.SetBookRecords(failingRecords{})
+	var out strings.Builder
+	err := runRejudge(context.Background(), &out, fdb, j, rejudgeOptions{write: true, concurrency: 1})
+	if !errors.Is(err, evalpkg.ErrBookContext) {
+		t.Fatalf("want ErrBookContext, got %v", err)
+	}
+	if chat.calls.Load() != 0 || len(fdb.commits) != 1 {
+		t.Fatalf("%d calls, %d commits", chat.calls.Load(), len(fdb.commits))
+	}
+	if c := fdb.commits[0]; c.Close.Status != db.JudgePassFailed || c.Metrics != nil {
+		t.Errorf("commit %+v metrics %v: want failed pass, no run_metrics write", c.Close, c.Metrics)
+	}
+}
+
+type failingRecords struct{}
+
+func (failingRecords) GetBookRecords(context.Context, []string) (map[string]db.BookRecord, error) {
+	return nil, errors.New("book_metadata unreadable")
+}
+
+// TestDryRunDedupePerRecipe: a dry run counts duplicates per finding's own
+// recipe, as the commit does — a fallback answer is checked against the
+// fallback's recipe, not the run's.
+func TestDryRunDedupePerRecipe(t *testing.T) {
+	cur := recipe.Recipe{Step: recipe.StepPropose, StepVersion: 2, ModelAlias: "a", ModelResolved: "a", PromptVersion: "judge@v2", PromptSHA256: "p"}
+	fb := cur
+	fb.ModelResolved = "b"
+	ridCur, _ := cur.ID()
+	ridFB, _ := fb.ID()
+	chunk, corr := "c1", "pen name"
+	f := func(r *recipe.Recipe) db.Finding {
+		return db.Finding{ChunkID: &chunk, OriginalText: "pin name", IssueType: "homophone", SuggestedCorrection: &corr, Recipe: r}
+	}
+	key := db.KeyOf(f(&cur))
+	fdb := &fakeRejudgeDB{keys: map[string]map[db.FindingKey]bool{ridFB: {key: true}}}
+	res := dryRunDedupe(context.Background(), fdb, "t", []db.Finding{f(&cur), f(&fb), f(&cur)})
+	if res.Inserted != 1 || res.Duplicates != 2 {
+		t.Errorf("%+v: want the current-recipe finding new once (its repeat a duplicate) and the fallback's a duplicate (rids %s / %s)",
+			res, ridCur, ridFB)
+	}
+	// The fallback's finding alone: a duplicate only when looked up under the
+	// fallback's own recipe (under the run's recipe it would count as new).
+	if res := dryRunDedupe(context.Background(), fdb, "t", []db.Finding{f(&fb)}); res.Duplicates != 1 || res.Inserted != 0 {
+		t.Errorf("fallback-only %+v: want 1 duplicate", res)
+	}
+}
+
+// TestRejudge_CommitFailureStillTallied: when a pass's commit fails nothing
+// is stored, but its calls were made and paid for — the summary still counts
+// the chunks, the cost and the fallbacks.
+func TestRejudge_CommitFailureStillTallied(t *testing.T) {
+	fdb := newFakeRejudgeDB(2, 2)
+	fdb.commitErr = errors.New("tx aborted")
+	var out strings.Builder
+	err := runRejudge(context.Background(), &out, fdb, evalpkg.NewJudge(&reportingGauge{}),
+		rejudgeOptions{write: true, concurrency: 2})
+	if err == nil {
+		t.Fatal("a run whose commits all failed must fail")
+	}
+	s := out.String()
+	for _, want := range []string{
+		"2 transcript(s) attempted — 0 complete, 0 partial, 2 failed",
+		"4 chunk(s) judged",
+		"$1.0000",
+		"answered with a model other than the recipe expects",
+		"WARNING: 4 chunk(s) were answered by a model other than the recipe expects",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary lacks %q:\n%s", want, s)
+		}
 	}
 }

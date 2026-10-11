@@ -71,6 +71,11 @@ type RunStats struct {
 	// ChunksCached counts the evaluated chunks served from fn_calls (no
 	// model call, no cost).
 	ChunksCached int
+	// ChunksFallback counts the evaluated chunks answered by a model other
+	// than the recipe's expected one (Result.Fallback). Their replies are
+	// never served from cache, so a run where this is high pays every time —
+	// pin the propose step's expected_model.
+	ChunksFallback int
 	// InputTokens / OutputTokens / CostUSD sum every model call's accounting
 	// as the endpoint reported it (failed calls included; HasUsage / HasCost
 	// false when no call reported any).
@@ -267,6 +272,9 @@ func runChunks(ctx context.Context, judge *Judge, records BookRecordReader, writ
 			return
 		}
 		stats.ChunksEvaluated++
+		if res.Fallback {
+			stats.ChunksFallback++
+		}
 		if res.Cached {
 			stats.ChunksCached++
 		} else {

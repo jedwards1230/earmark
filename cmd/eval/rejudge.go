@@ -125,10 +125,12 @@ func (o rejudgeOptions) summary() string {
 type rejudgeTally struct {
 	mu                                            sync.Mutex
 	attempted, complete, partial, failed, skipped int
-	chunks, cached, chunkErrors                   int
+	chunks, cached, chunkErrors, fallback         int
 	findings, dupes                               int
 	costUSD                                       float64
 	hasCost                                       bool
+	// warnedFallback: the first fallback reply was reported.
+	warnedFallback bool
 }
 
 // runRejudge runs `earmark eval --rejudge`. It returns an error — a non-zero
@@ -305,7 +307,8 @@ func rejudgeOne(ctx context.Context, p func(string, ...any), rdb rejudgeDB, judg
 	})
 	finished := time.Now()
 	stopped := jerr != nil && ctx.Err() != nil
-	if jerr != nil && !stopped && errors.Is(jerr, evalpkg.ErrBookContext) {
+	bookErr := jerr != nil && !stopped && errors.Is(jerr, evalpkg.ErrBookContext)
+	if bookErr {
 		// The book record could not be read: nothing was judged, and judging
 		// path-only under this recipe would misstate what the judge saw.
 		setFatal(fmt.Errorf("%s: %w", name, jerr))
@@ -316,42 +319,32 @@ func rejudgeOne(ctx context.Context, p func(string, ...any), rdb rejudgeDB, judg
 	if write {
 		m := evalMetricsFor(t.JobID, judge.Model(), stats, cl, len(chunks), started, finished)
 		c := db.JudgePassCommit{PassID: passID, TranscriptID: t.TranscriptID, Findings: findings, Close: cl}
-		if !stopped {
-			c.Metrics = &m // a stop is not a judge failure: leave the latch as it was
+		if !stopped && !bookErr {
+			// A stop is not a judge failure, and a book record that could not
+			// be read judged nothing: leave run_metrics as it was for both.
+			c.Metrics = &m
 		}
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 		res, err = rdb.CommitJudgePass(cctx, c)
 		cancel()
 		if err != nil {
-			tl.add(func(tl *rejudgeTally) { tl.attempted++; tl.failed++ })
+			// Nothing was stored, but the calls were made (and logged in
+			// fn_calls): count them, their cost and any fallback.
+			tallyRejudge(p, tl, name, stats, cl, db.JudgePassFailed, db.JudgePassResult{})
 			rec.Count("transcripts_failed", 1)
-			p("  FAIL %s: commit failed (%v); pass %d left running\n", name, err, passID)
+			rec.Count("fallback", int64(stats.ChunksFallback))
+			p("  FAIL %s: commit failed (%v); pass %d left running — %d/%d chunks judged, %s\n",
+				name, err, passID, cl.ChunksJudged, cl.ChunksTotal, costLabel(stats))
 			return
 		}
 	} else {
-		res = dryRunDedupe(ctx, rdb, t.TranscriptID, rid, findings)
+		res = dryRunDedupe(ctx, rdb, t.TranscriptID, findings)
 	}
 
-	tl.add(func(tl *rejudgeTally) {
-		tl.attempted++
-		switch cl.Status {
-		case db.JudgePassComplete:
-			tl.complete++
-		case db.JudgePassPartial:
-			tl.partial++
-		default:
-			tl.failed++
-		}
-		tl.chunks += stats.ChunksEvaluated
-		tl.cached += stats.ChunksCached
-		tl.chunkErrors += cl.ChunksFailed
-		tl.findings += res.Inserted
-		tl.dupes += res.Duplicates
-		tl.costUSD += stats.CostUSD
-		tl.hasCost = tl.hasCost || stats.HasCost
-	})
+	tallyRejudge(p, tl, name, stats, cl, cl.Status, res)
 	rec.Count("transcripts_"+cl.Status, 1)
 	rec.Count("findings", int64(res.Inserted))
+	rec.Count("fallback", int64(stats.ChunksFallback))
 
 	verb, tail := "", ""
 	if write {
@@ -385,27 +378,36 @@ func evalMetricsFor(jobID, model string, stats evalpkg.RunStats, cl db.JudgePass
 	return m
 }
 
-// dryRunDedupe reports what a commit would insert: findings of the current
-// recipe already recorded for the transcript are duplicates (best-effort — a
-// read error counts everything as new).
-func dryRunDedupe(ctx context.Context, rdb rejudgeDB, transcriptID, rid string, findings []db.Finding) db.JudgePassResult {
+// dryRunDedupe reports what a commit would insert: a finding already
+// recorded for the transcript by its OWN recipe (or one equivalent to it) is a
+// duplicate, as in db.CommitJudgePass — a fallback answer's findings are
+// checked against the fallback's recipe. Best-effort: a read error counts that
+// recipe's findings as new.
+func dryRunDedupe(ctx context.Context, rdb rejudgeDB, transcriptID string, findings []db.Finding) db.JudgePassResult {
 	var res db.JudgePassResult
-	if len(findings) == 0 {
-		return res
-	}
-	keys, err := rdb.GetRecipeFindingKeys(ctx, transcriptID, rid)
-	if err != nil {
-		res.Inserted = len(findings)
-		return res
-	}
-	seen := map[db.FindingKey]bool{}
+	keys := map[string]map[db.FindingKey]bool{}
 	for _, f := range findings {
-		k := db.KeyOf(f)
-		if keys[k] || seen[k] {
+		rid := ""
+		if f.Recipe != nil {
+			rid, _ = f.Recipe.ID()
+		}
+		if rid == "" {
+			res.Inserted++
+			continue
+		}
+		if _, ok := keys[rid]; !ok {
+			k, err := rdb.GetRecipeFindingKeys(ctx, transcriptID, rid)
+			if err != nil || k == nil {
+				k = map[db.FindingKey]bool{}
+			}
+			keys[rid] = k
+		}
+		key := db.KeyOf(f)
+		if keys[rid][key] {
 			res.Duplicates++
 			continue
 		}
-		seen[k] = true
+		keys[rid][key] = true
 		res.Inserted++
 	}
 	return res
@@ -416,6 +418,39 @@ func costLabel(s evalpkg.RunStats) string {
 		return "cost not reported"
 	}
 	return fmt.Sprintf("$%.4f", s.CostUSD)
+}
+
+// tallyRejudge folds one attempted transcript into the run's tally: its
+// outcome (status), chunks, cache hits, failures, findings, cost and
+// fallbacks — warning once per run on the first fallback.
+func tallyRejudge(p func(string, ...any), tl *rejudgeTally, name string, stats evalpkg.RunStats,
+	cl db.JudgePassClose, status string, res db.JudgePassResult) {
+	tl.add(func(tl *rejudgeTally) {
+		tl.attempted++
+		switch status {
+		case db.JudgePassComplete:
+			tl.complete++
+		case db.JudgePassPartial:
+			tl.partial++
+		default:
+			tl.failed++
+		}
+		tl.chunks += stats.ChunksEvaluated
+		tl.cached += stats.ChunksCached
+		tl.chunkErrors += cl.ChunksFailed
+		tl.findings += res.Inserted
+		tl.dupes += res.Duplicates
+		tl.fallback += stats.ChunksFallback
+		if stats.ChunksFallback > 0 && !tl.warnedFallback {
+			tl.warnedFallback = true
+			p("WARNING: %s answered with a model other than the recipe expects (%s); those replies are stored as\n"+
+				"model_fallback and NEVER served from cache, so every run pays for them again. If this is the normal\n"+
+				"answer for the alias (a dated snapshot id), pin the propose step's expected_model (CONTRACT §2.18).\n",
+				name, stats.ResolvedModel)
+		}
+		tl.costUSD += stats.CostUSD
+		tl.hasCost = tl.hasCost || stats.HasCost
+	})
 }
 
 func (tl *rejudgeTally) add(f func(*rejudgeTally)) {
@@ -439,6 +474,10 @@ func printRejudgeSummary(p func(string, ...any), o rejudgeOptions, tl *rejudgeTa
 		tl.attempted, tl.complete, tl.partial, tl.failed, tl.skipped)
 	p("%d chunk(s) judged (%d served from fn_calls), %d failed; %d new finding(s), %d already recorded by this recipe; %s.\n",
 		tl.chunks, tl.cached, tl.chunkErrors, tl.findings, tl.dupes, cost)
+	if tl.fallback > 0 {
+		p("WARNING: %d chunk(s) were answered by a model other than the recipe expects (model_fallback: stored, never cached).\n",
+			tl.fallback)
+	}
 	if o.limit > 0 && tl.attempted+tl.skipped >= o.limit {
 		p("Stopped at --limit %d.\n", o.limit)
 	}

@@ -157,8 +157,8 @@ Re-judge (CONTRACT §2.15 "Re-judge"): --rejudge judges every done transcript
 that has stored chunks and no 'complete' judge pass under the CURRENT judge
 recipe (or one equivalent to it), in keyset pages, with --concurrency judge
 calls in flight across all transcripts (default 16). --limit N caps the
-transcripts attempted; --book narrows by path; --shard i/N runs one of N
-disjoint partitions (decide --shard's). --expect-recipe <id> refuses to start
+transcripts dispatched; --book narrows by path; --shard i/N runs one of N
+disjoint partitions (decide --shard's) — concurrent runs need disjoint shards. --expect-recipe <id> refuses to start
 unless the current judge recipe is <id> — pin it so a resumed run cannot
 silently judge under a changed model or prompt. Each chunk is looked up in
 fn_calls first, so a killed run resumes without paying again. With --write each

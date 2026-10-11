@@ -772,7 +772,12 @@ row has a non-NULL `eval_finished_at`. Eval coverage is thus a real ratio
 (`COUNT(eval_finished_at) / COUNT(done jobs)`) rather than a findings-row count
 (a clean job has 0 findings but is still "evaluated"). `eval_model` is the judge
 model id; `eval_chunks`/`eval_skipped`/`eval_findings` are the run's
-`ChunksEvaluated`/`ChunksSkipped`/`FindingsFound`. The eval slice is written
+`ChunksEvaluated`/`ChunksSkipped`/`FindingsFound` — except under a judge pass
+(`--backfill-* --write`, `--rejudge --write`, the worker against the real
+database), where `eval_findings` is the number of rows THIS run inserted: a
+resumed or repeated run whose findings were already stored by the same recipe
+writes `0`. The full count is on the pass: `judge_passes.findings_kept` plus
+`dropped->'already_recorded'` (§2.15 "Lineage"). The eval slice is written
 **only by the per-job paths** — the in-pipeline judge (`EVAL_IN_PIPELINE`) and
 the `earmark eval --backfill-*` sweeps — where the chunk set maps cleanly to one
 job (`job_id`).
@@ -3547,7 +3552,18 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
 - **Retries.** `earmark eval --retries N` (default **4**; the worker's judge
   retries nothing — a failed chunk is recorded and re-judged by a later run)
   retries an attempt that failed **transiently**: an HTTP 429 or 5xx, an
-  attempt that hit its own deadline, or a transport error. The wait is the
+  attempt that hit its own deadline or another network timeout, a connection
+  refused or reset, or a connection that closed before the reply arrived
+  (`EOF` / unexpected `EOF` from the transport — a bare `EOF` is kept because
+  net/http returns it when a server closes a reused keep-alive connection
+  before answering; no reply exists, so nothing was billed), a DNS failure
+  other than "no such host", or an HTTP/2 stream reset, GOAWAY or lost
+  connection. **Never retried:** a failure reading the body of a reply that
+  did arrive (`error_class` `body_read`) — the call may have been billed, and
+  its usage and cost are lost with the body, so a retry would pay again
+  unseen. A TLS certificate failure
+  and a `url.Error` that wraps no network failure (a bad URL, an unsupported
+  scheme) fail the same way every time and are not retried. The wait is the
   endpoint's `Retry-After` (delta-seconds or an HTTP date, capped at 5 min)
   when a 429/5xx sends one, else exponential backoff with equal jitter (2 s ·
   2^attempt, capped at 1 min, half fixed and half random). Never retried: a
@@ -3562,7 +3578,17 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
   `model_resolved` the model the endpoint reported (the expected model when it
   reports none), `recipe_id` the propose recipe of the reply. Because the cache
   key does not include recipe params, **`input`** carries everything else the
-  reply depends on: `chunk_text`, `file_path`, `start_sec`/`end_sec`, the
+  reply depends on: the model identity the key's `model_alias` (the requested
+  id) does not pin — `expected_model` (the recipe's expected model),
+  `model_revision` (the pin's revision) and the judge's `step_version` — so a
+  revision bump or a new expected model on the same alias is a cache miss,
+  never the old model's reply served as the new one's. **Deploy note:** this
+  changed the input, so `judge_chunk` rows written before it never hit under
+  the new key — the first `--rejudge` (or any judge run) after deploying it
+  pays for every chunk once, including the chunks a run killed before the
+  deploy had already paid for and a resume after the deploy would otherwise
+  have served. Then `chunk_text`,
+  `file_path`, `start_sec`/`end_sec`, the
   `prompt_version`, `book_context` (`source`, `sha256`, and the rendered
   `block`) and `request` — every output-affecting request field the client
   sends: `temperature`, `top_p`, `max_tokens`, `reasoning_effort`,
@@ -3579,9 +3605,18 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
   `EVAL_MAX_FINDINGS_PER_CHUNK`), so its findings carry the current recipe; a
   finding's `fn_call_id` is the original paid row. This is what makes a killed
   run resumable without paying twice. Rows that never serve: `invalid_reply`,
-  any failure, and a reply from a model other than the expected one
+  any failure, a reply from a model other than the expected one
   (`model_fallback` — its findings are still kept, stamped with the fallback's
-  recipe, as before).
+  recipe, as before), and `cache_slot_taken`: a successful paid reply whose
+  key's cache slot another row already held when it was logged (two identical
+  calls in flight) — it is still stored, with its cost, because a paid call is
+  never dropped from the log; its findings point at it. Each fn_calls write is
+  bounded (30 s) and survives the run's cancellation. **Fallbacks defeat the
+  cache:** when the propose step has no pinned `expected_model` and the
+  endpoint reports a dated snapshot id for the alias, every reply is a
+  `model_fallback` and every run pays again. Runs count them
+  (`RunStats.ChunksFallback`); `--rejudge` warns on the first and in its
+  summary — pin `steps.propose.expected_model` (§2.18).
 - **`invalid_reply`.** A reply with content that is not valid findings JSON
   fails its chunk (`ErrInvalidReply`): it is logged with `error_class =
   'invalid_reply'` and its `output` (the raw content and `parse_error`), the
@@ -3607,7 +3642,7 @@ local binary against the database without loading the library.
 | `--expect-recipe <id>` | — | refuse to start unless the current judge recipe is `<id>` or equivalent to it — checked before any model call, pass or step run. Pin it for a long run so a restart under a changed model setting or prompt cannot silently judge under another recipe |
 | `--concurrency N` | 16 | judge calls in flight, as ONE bound shared by every chunk of every transcript the run has in flight (`eval.Limiter`); also the cap on transcripts in flight |
 | `--call-timeout` / `--retries` | 180 s / 4 | "Judge calls" above |
-| `--limit N` | 0 = all | transcripts attempted |
+| `--limit N` | 0 = all | transcripts dispatched (skipped ones included) — not `--backfill-*`'s "latched" count |
 | `--book <substr>` | — | only transcripts whose path contains it (case-insensitive) |
 | `--shard i/N` | — | only transcripts with `hashtext(transcript_id) mod N = i` (folded non-negative) — `earmark decide --shard`'s partition, so N runners cover the selection disjointly |
 
@@ -3626,6 +3661,11 @@ recipe on purpose:** a finding identical to one from a *different* recipe is
 inserted, so two models agreeing on a fix is recorded as two rows sharing a
 `correction_key` (deciding them is §2.19's job).
 
+**Concurrent runs need disjoint `--shard` values.** Two unsharded runs (or
+two runs on the same shard) select the same transcripts and pay for them
+twice: a `running` pass does not exclude a transcript, because a killed run
+leaves one behind and its transcript must stay selectable.
+
 Stop and resume: SIGINT/SIGTERM closes in-flight passes `partial`/`failed`
 with the findings judged so far (`run_metrics` untouched) and exits non-zero;
 a hard kill leaves the open passes `running`. Either way the transcript has no
@@ -3633,7 +3673,9 @@ complete pass and is selected again; the chunks already answered are served
 from `fn_calls` (no second payment) and their findings, if already inserted,
 count as `already_recorded`. **Exit status** is non-zero when the recipe check
 fails, the run is stopped, a judge@v3 book record cannot be read (the run
-stops: never judge path-only under a v3 recipe), or transcripts were attempted
+stops: never judge path-only under a v3 recipe; that transcript's pass is
+closed `failed` and its `run_metrics` is left alone, since nothing was
+judged), or transcripts were attempted
 and none completed. The run is recorded in `step_runs` as `eval_rejudge`
 (§1.10).
 
