@@ -546,7 +546,7 @@ func TestJudgeRecipe_TemperatureOnlyWhenSent(t *testing.T) {
 	t.Setenv(envReasoningEffort, "")
 	t.Setenv(envChatTemplateKwargs, "")
 	resolved := func(model string) Thinking {
-		th, err := ResolveThinking(model, ThinkingSetting{})
+		th, err := ResolveThinking(model, JudgeSetting{})
 		if err != nil {
 			t.Fatal(err)
 		}

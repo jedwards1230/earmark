@@ -44,21 +44,26 @@ const (
 	ThinkingFromAuto    = "auto"    // nothing set: the route default
 )
 
-// ThinkingSetting is the propose step's per-model thinking params, as text:
-// "" (not set — fall through to the env var), "auto", "omit", or the value
-// (an effort token; a JSON object for the kwargs).
-type ThinkingSetting struct {
+// JudgeSetting is the propose step's per-model request params. The thinking
+// knobs are text: "" (not set — fall through to the env var), "auto", "omit",
+// or the value (an effort token; a JSON object for the kwargs).
+type JudgeSetting struct {
 	ReasoningEffort    string
 	ChatTemplateKwargs string
+	// Temperature, when non-nil, is the sampling temperature to send. It
+	// outranks the endpoint's temperature option and the route default (0
+	// locally, omitted on hosted routes), so a model tuned at temperature 0 on
+	// a hosted route keeps it. nil = not set.
+	Temperature *float64
 }
 
-// ThinkingSettingSource is an optional EvalEndpointSource extension that
-// supplies the propose model setting's thinking params. A source without it
+// JudgeSettingSource is an optional EvalEndpointSource extension that
+// supplies the propose model setting's request params. A source without it
 // (or a nil source) has no setting layer: the env vars and the route default
 // apply. An error means a stored param is invalid, which fails the judge's
 // construction rather than silently dropping the knob.
-type ThinkingSettingSource interface {
-	JudgeThinking() (ThinkingSetting, error)
+type JudgeSettingSource interface {
+	JudgeSetting() (JudgeSetting, error)
 }
 
 // Thinking is the resolved pair of thinking knobs one judge sends.
@@ -88,7 +93,7 @@ func autoThinking(hosted bool) (string, map[string]any) {
 // ResolveThinking resolves the thinking knobs for model from the setting
 // layer s, then the env vars, then the route default. Invalid values in any
 // layer are a configuration error naming where they came from.
-func ResolveThinking(model string, s ThinkingSetting) (Thinking, error) {
+func ResolveThinking(model string, s JudgeSetting) (Thinking, error) {
 	t := Thinking{Hosted: isHostedRoute(model)}
 	autoEffort, autoKwargs := autoThinking(t.Hosted)
 
@@ -217,9 +222,9 @@ func JudgeThinkingFor(src EvalEndpointSource, model string) (Thinking, error) {
 }
 
 // thinkingSetting reads the setting layer from src when it provides one.
-func thinkingSetting(src EvalEndpointSource) (ThinkingSetting, error) {
-	if ts, ok := src.(ThinkingSettingSource); ok {
-		return ts.JudgeThinking()
+func thinkingSetting(src EvalEndpointSource) (JudgeSetting, error) {
+	if ts, ok := src.(JudgeSettingSource); ok {
+		return ts.JudgeSetting()
 	}
-	return ThinkingSetting{}, nil
+	return JudgeSetting{}, nil
 }

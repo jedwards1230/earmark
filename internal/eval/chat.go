@@ -282,16 +282,28 @@ func ResolveChatClient(src EvalEndpointSource) (ChatClient, error) {
 	return withThinkingControls(cfg, src)
 }
 
-// withThinkingControls resolves the thinking knobs into cfg — src's propose
-// model setting params (when it has a setting layer), then the env vars, then
-// the route default — and builds the client. Applies to both the registry and
-// the EVAL_CHAT_* path.
+// withThinkingControls applies src's propose model setting (when it has a
+// setting layer) to cfg and builds the client: the thinking knobs resolve
+// setting > env vars > route default (ResolveThinking), and a setting
+// temperature replaces the endpoint option and the route default. Applies to
+// both the registry and the EVAL_CHAT_* path.
 func withThinkingControls(cfg chatConfig, src EvalEndpointSource) (ChatClient, error) {
-	t, err := JudgeThinkingFor(src, cfg.Model)
+	setting, err := thinkingSetting(src)
+	if err != nil {
+		return nil, err
+	}
+	t, err := ResolveThinking(cfg.Model, setting)
 	if err != nil {
 		return nil, err
 	}
 	cfg.Thinking = t
+	if tp := setting.Temperature; tp != nil {
+		if *tp < 0 || math.IsNaN(*tp) || math.IsInf(*tp, 0) {
+			return nil, fmt.Errorf("propose model setting param temperature must be a non-negative number, got %v", *tp)
+		}
+		temp := *tp
+		cfg.Params.Temperature = &temp
+	}
 	return newOpenAIChatClient(cfg), nil
 }
 

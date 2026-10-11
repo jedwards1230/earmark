@@ -20,7 +20,7 @@ func TestResolveThinking_Precedence(t *testing.T) {
 	cases := []struct {
 		name                     string
 		model                    string
-		setting                  ThinkingSetting
+		setting                  JudgeSetting
 		effortEnv, kwargsEnv     string
 		wantEffort               string
 		wantKwargs               map[string]any
@@ -33,16 +33,16 @@ func TestResolveThinking_Precedence(t *testing.T) {
 		{name: "env beats default", model: lunaModel, effortEnv: "medium", kwargsEnv: `{"x":1}`,
 			wantEffort: "medium", wantKwargs: map[string]any{"x": float64(1)}, wantEffortSrc: ThinkingFromEnv, wantKwSrc: ThinkingFromEnv},
 		{name: "setting beats env", model: lunaModel, effortEnv: "none", kwargsEnv: `{"enable_thinking":false}`,
-			setting:    ThinkingSetting{ReasoningEffort: "low", ChatTemplateKwargs: "omit"},
+			setting:    JudgeSetting{ReasoningEffort: "low", ChatTemplateKwargs: "omit"},
 			wantEffort: "low", wantEffortSrc: ThinkingFromSetting, wantKwSrc: ThinkingFromSetting},
 		{name: "setting auto beats env, means route default", model: "qwen3:8b", effortEnv: "omit", kwargsEnv: "omit",
-			setting:    ThinkingSetting{ReasoningEffort: "auto", ChatTemplateKwargs: "AUTO"},
+			setting:    JudgeSetting{ReasoningEffort: "auto", ChatTemplateKwargs: "AUTO"},
 			wantEffort: "none", wantKwargs: localKwargs, wantEffortSrc: ThinkingFromSetting, wantKwSrc: ThinkingFromSetting},
 		{name: "per field: setting effort, env kwargs", model: "qwen3:8b", kwargsEnv: "omit",
-			setting:    ThinkingSetting{ReasoningEffort: "high"},
+			setting:    JudgeSetting{ReasoningEffort: "high"},
 			wantEffort: "high", wantEffortSrc: ThinkingFromSetting, wantKwSrc: ThinkingFromEnv},
 		{name: "setting kwargs object", model: "qwen3:8b",
-			setting:    ThinkingSetting{ChatTemplateKwargs: `{"enable_thinking":true}`},
+			setting:    JudgeSetting{ChatTemplateKwargs: `{"enable_thinking":true}`},
 			wantEffort: "none", wantKwargs: map[string]any{"enable_thinking": true}, wantEffortSrc: ThinkingFromAuto, wantKwSrc: ThinkingFromSetting},
 		{name: "env omit on local", model: "qwen3:8b", effortEnv: "omit", kwargsEnv: "omit",
 			wantEffortSrc: ThinkingFromEnv, wantKwSrc: ThinkingFromEnv},
@@ -70,18 +70,18 @@ func TestResolveThinking_Precedence(t *testing.T) {
 func TestResolveThinking_Invalid(t *testing.T) {
 	cases := []struct {
 		name                 string
-		setting              ThinkingSetting
+		setting              JudgeSetting
 		effortEnv, kwargsEnv string
 		wantErr              string // "" = no error
 	}{
-		{name: "setting effort with whitespace", setting: ThinkingSetting{ReasoningEffort: "lo w"}, wantErr: "propose model setting param reasoning_effort"},
-		{name: "setting kwargs array", setting: ThinkingSetting{ChatTemplateKwargs: "[1]"}, wantErr: "propose model setting param chat_template_kwargs"},
-		{name: "setting kwargs null", setting: ThinkingSetting{ChatTemplateKwargs: "null"}, wantErr: "chat_template_kwargs"},
-		{name: "setting kwargs empty object", setting: ThinkingSetting{ChatTemplateKwargs: "{}"}, wantErr: "non-empty JSON object"},
+		{name: "setting effort with whitespace", setting: JudgeSetting{ReasoningEffort: "lo w"}, wantErr: "propose model setting param reasoning_effort"},
+		{name: "setting kwargs array", setting: JudgeSetting{ChatTemplateKwargs: "[1]"}, wantErr: "propose model setting param chat_template_kwargs"},
+		{name: "setting kwargs null", setting: JudgeSetting{ChatTemplateKwargs: "null"}, wantErr: "chat_template_kwargs"},
+		{name: "setting kwargs empty object", setting: JudgeSetting{ChatTemplateKwargs: "{}"}, wantErr: "non-empty JSON object"},
 		{name: "env kwargs empty object", kwargsEnv: " {} ", wantErr: envChatTemplateKwargs},
 		{name: "env kwargs not JSON", kwargsEnv: "{nope", wantErr: envChatTemplateKwargs},
 		{name: "env effort with whitespace", effortEnv: "very low", wantErr: envReasoningEffort},
-		{name: "setting shadows a bad env", setting: ThinkingSetting{ChatTemplateKwargs: "omit"}, kwargsEnv: "{nope"},
+		{name: "setting shadows a bad env", setting: JudgeSetting{ChatTemplateKwargs: "omit"}, kwargsEnv: "{nope"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -105,23 +105,25 @@ func TestResolveThinking_Invalid(t *testing.T) {
 // params, as ConfigSource reports them.
 type lunaSource struct {
 	fakeSource
-	setting ThinkingSetting
+	setting JudgeSetting
 	err     error
 }
 
-func (s lunaSource) JudgeThinking() (ThinkingSetting, error) { return s.setting, s.err }
+func (s lunaSource) JudgeSetting() (JudgeSetting, error) { return s.setting, s.err }
 
 // TestChatClient_LunaSettingRequestBody: the bake-off switch — GPT-6 Luna via
-// OpenRouter with reasoning_effort=low, chat_template_kwargs=omit — sends
-// reasoning_effort "low", no chat_template_kwargs and no temperature, even
-// with a deployment env that says otherwise.
+// OpenRouter with reasoning_effort=low, chat_template_kwargs=omit,
+// temperature=0 — reproduces the request the bake-off ran (pre-#189 code,
+// where openrouter/ was not a hosted route): reasoning_effort "low",
+// temperature 0, no chat_template_kwargs, even with a deployment env that
+// says otherwise.
 func TestChatClient_LunaSettingRequestBody(t *testing.T) {
 	cs := newCaptureServer(t, "openai/gpt-6-luna")
 	t.Setenv(envReasoningEffort, "none")
 	t.Setenv(envChatTemplateKwargs, `{"enable_thinking":false}`)
 	c, err := ResolveChatClient(lunaSource{
 		fakeSource: fakeSource{ok: true, ep: EvalEndpoint{BaseURL: cs.srv.URL + "/v1", Model: lunaModel}},
-		setting:    ThinkingSetting{ReasoningEffort: "low", ChatTemplateKwargs: "omit"},
+		setting:    JudgeSetting{ReasoningEffort: "low", ChatTemplateKwargs: "omit", Temperature: ptr(0.0)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +133,50 @@ func TestChatClient_LunaSettingRequestBody(t *testing.T) {
 	}
 	assertKey(t, cs.body, "reasoning_effort", "low")
 	assertKey(t, cs.body, "chat_template_kwargs", nil)
-	assertKey(t, cs.body, "temperature", nil)
+	assertKey(t, cs.body, "temperature", 0)
+	assertKey(t, cs.body, "max_tokens", defaultJudgeMaxTokens)
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// The setting temperature outranks the endpoint's temperature option and the
+// route default; without it the hosted route sends none, and the endpoint
+// option still applies. A negative setting temperature fails closed.
+func TestChatClient_SettingTemperature(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    map[string]string
+		setting *float64
+		want    any // nil = omitted
+	}{
+		{name: "hosted default omits", want: nil},
+		{name: "setting 0 on a hosted route", setting: ptr(0.0), want: 0},
+		{name: "setting beats endpoint option", opts: map[string]string{"temperature": "0.7"}, setting: ptr(0.2), want: 0.2},
+		{name: "endpoint option without setting", opts: map[string]string{"temperature": "0.7"}, want: 0.7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newCaptureServer(t, "")
+			c, err := ResolveChatClient(lunaSource{
+				fakeSource: fakeSource{ok: true, ep: EvalEndpoint{BaseURL: cs.srv.URL + "/v1", Model: lunaModel, Options: tc.opts}},
+				setting:    JudgeSetting{Temperature: tc.setting},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Complete(context.Background(), "s", "u"); err != nil {
+				t.Fatal(err)
+			}
+			assertKey(t, cs.body, "temperature", tc.want)
+		})
+	}
+	_, err := ResolveChatClient(lunaSource{
+		fakeSource: fakeSource{ok: true, ep: EvalEndpoint{BaseURL: "http://gw:4000/v1", Model: lunaModel}},
+		setting:    JudgeSetting{Temperature: ptr(-1.0)},
+	})
+	if err == nil || !strings.Contains(err.Error(), "temperature") {
+		t.Fatalf("negative setting temperature: want a config error, got %v", err)
+	}
 }
 
 // With no setting and no env, a hosted OpenRouter/OpenAI route gets neither
@@ -160,7 +205,7 @@ func TestChatClient_OpenRouterDefaultOmitsBoth(t *testing.T) {
 func TestResolveChatClient_SettingErrorFailsClosed(t *testing.T) {
 	_, err := ResolveChatClient(lunaSource{
 		fakeSource: fakeSource{ok: true, ep: EvalEndpoint{BaseURL: "http://gw:4000/v1", Model: lunaModel}},
-		setting:    ThinkingSetting{ChatTemplateKwargs: "[1]"},
+		setting:    JudgeSetting{ChatTemplateKwargs: "[1]"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "chat_template_kwargs") {
 		t.Fatalf("want a config error naming chat_template_kwargs, got %v", err)
@@ -190,7 +235,8 @@ func TestModelSettingParamsReachTheJudge(t *testing.T) {
 
 	luna, err := base.WithStepSettings(config.StepSetting{
 		Step: recipe.StepPropose, EndpointID: "litellm-judge", Model: lunaModel,
-		Params: map[string]any{config.ParamReasoningEffort: "low", config.ParamChatTemplateKwargs: "omit"},
+		Params: map[string]any{config.ParamReasoningEffort: "low", config.ParamChatTemplateKwargs: "omit",
+			config.ParamTemperature: 0.0},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -205,13 +251,14 @@ func TestModelSettingParamsReachTheJudge(t *testing.T) {
 	assertKey(t, cs.body, "model", lunaModel)
 	assertKey(t, cs.body, "reasoning_effort", "low")
 	assertKey(t, cs.body, "chat_template_kwargs", nil)
+	assertKey(t, cs.body, "temperature", 0)
 
 	r, ok, err := CurrentRecipe(luna)
 	if err != nil || !ok {
 		t.Fatalf("CurrentRecipe: ok=%v err=%v", ok, err)
 	}
-	if r.Params["reasoning_effort"] != "low" {
-		t.Errorf("recipe params = %v, want reasoning_effort low", r.Params)
+	if r.Params["reasoning_effort"] != "low" || r.Params["temperature"] != 0.0 {
+		t.Errorf("recipe params = %v, want reasoning_effort low and temperature 0", r.Params)
 	}
 	if _, ok := r.Params["chat_template_kwargs"]; ok {
 		t.Errorf("omit on a hosted route is the route default, so not a recipe param: %v", r.Params)
@@ -257,7 +304,7 @@ func TestModelSettingParamsReachTheJudge(t *testing.T) {
 // TestJudgeRecipe_ThinkingParams: only a knob that differs from the route
 // default is a recipe param, so every default judge keeps its recipe id.
 func TestJudgeRecipe_ThinkingParams(t *testing.T) {
-	recipeFor := func(model string, s ThinkingSetting) map[string]any {
+	recipeFor := func(model string, s JudgeSetting) map[string]any {
 		t.Helper()
 		th, err := ResolveThinking(model, s)
 		if err != nil {
@@ -270,18 +317,18 @@ func TestJudgeRecipe_ThinkingParams(t *testing.T) {
 	cases := []struct {
 		name       string
 		model      string
-		setting    ThinkingSetting
+		setting    JudgeSetting
 		wantEffort any // nil = not a param
 		wantKwargs any
 	}{
 		{name: "local default", model: "qwen3:8b"},
 		{name: "hosted default", model: lunaModel},
-		{name: "hosted explicit omit equals default", model: lunaModel, setting: ThinkingSetting{ReasoningEffort: "omit", ChatTemplateKwargs: "omit"}},
-		{name: "local explicit none equals default", model: "qwen3:8b", setting: ThinkingSetting{ReasoningEffort: "none"}},
-		{name: "hosted low", model: lunaModel, setting: ThinkingSetting{ReasoningEffort: "low"}, wantEffort: "low"},
-		{name: "local omit both", model: "qwen3:8b", setting: ThinkingSetting{ReasoningEffort: "omit", ChatTemplateKwargs: "omit"},
+		{name: "hosted explicit omit equals default", model: lunaModel, setting: JudgeSetting{ReasoningEffort: "omit", ChatTemplateKwargs: "omit"}},
+		{name: "local explicit none equals default", model: "qwen3:8b", setting: JudgeSetting{ReasoningEffort: "none"}},
+		{name: "hosted low", model: lunaModel, setting: JudgeSetting{ReasoningEffort: "low"}, wantEffort: "low"},
+		{name: "local omit both", model: "qwen3:8b", setting: JudgeSetting{ReasoningEffort: "omit", ChatTemplateKwargs: "omit"},
 			wantEffort: "omit", wantKwargs: "omit"},
-		{name: "hosted kwargs object", model: lunaModel, setting: ThinkingSetting{ChatTemplateKwargs: `{"a":1}`},
+		{name: "hosted kwargs object", model: lunaModel, setting: JudgeSetting{ChatTemplateKwargs: `{"a":1}`},
 			wantKwargs: map[string]any{"a": float64(1)}},
 	}
 	for _, tc := range cases {
@@ -315,14 +362,14 @@ func TestJudgeRecipe_ThinkingParams(t *testing.T) {
 func TestThinkingDescribe(t *testing.T) {
 	t.Setenv(envReasoningEffort, "")
 	t.Setenv(envChatTemplateKwargs, "")
-	th, err := ResolveThinking(lunaModel, ThinkingSetting{ReasoningEffort: "low"})
+	th, err := ResolveThinking(lunaModel, JudgeSetting{ReasoningEffort: "low"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := th.Describe(), `reasoning_effort "low" (model setting) · chat_template_kwargs omitted (auto: hosted route)`; got != want {
 		t.Errorf("Describe() = %q, want %q", got, want)
 	}
-	th, _ = ResolveThinking("qwen3:8b", ThinkingSetting{})
+	th, _ = ResolveThinking("qwen3:8b", JudgeSetting{})
 	if got, want := th.Describe(), `reasoning_effort "none" (auto: local model) · chat_template_kwargs {"enable_thinking":false} (auto: local model)`; got != want {
 		t.Errorf("Describe() = %q, want %q", got, want)
 	}

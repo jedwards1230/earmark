@@ -29,27 +29,34 @@ func (s configSource) EvalEndpoint() (EvalEndpoint, bool) {
 	}, true
 }
 
-// JudgeThinking is the setting layer of the judge's thinking knobs: the
+// JudgeSetting is the setting layer of the judge's request params: the
 // propose step's effective pin params (a model_settings row, or MODELS_FILE
 // steps.propose.params — CONTRACT §2.20). Values were validated when the
 // setting was applied; they are re-read with the same parsers so a value that
 // slipped past (a hand-built config) still fails closed.
-func (s configSource) JudgeThinking() (ThinkingSetting, error) {
-	var out ThinkingSetting
+func (s configSource) JudgeSetting() (JudgeSetting, error) {
+	var out JudgeSetting
 	params := s.cfg.ModelPin(recipe.StepPropose).Params
 	if v, ok := params[config.ParamReasoningEffort]; ok {
 		effort, err := config.ReasoningEffortParam(v)
 		if err != nil {
-			return ThinkingSetting{}, fmt.Errorf("propose params.%s %w", config.ParamReasoningEffort, err)
+			return JudgeSetting{}, fmt.Errorf("propose params.%s %w", config.ParamReasoningEffort, err)
 		}
 		out.ReasoningEffort = effort
 	}
 	if v, ok := params[config.ParamChatTemplateKwargs]; ok {
 		kwargs, err := config.ChatTemplateKwargsParam(v)
 		if err != nil {
-			return ThinkingSetting{}, fmt.Errorf("propose params.%s %w", config.ParamChatTemplateKwargs, err)
+			return JudgeSetting{}, fmt.Errorf("propose params.%s %w", config.ParamChatTemplateKwargs, err)
 		}
 		out.ChatTemplateKwargs = kwargs
+	}
+	if v, ok := params[config.ParamTemperature]; ok {
+		temp, err := config.TemperatureParam(v)
+		if err != nil {
+			return JudgeSetting{}, fmt.Errorf("propose params.%s %w", config.ParamTemperature, err)
+		}
+		out.Temperature = &temp
 	}
 	return out, nil
 }

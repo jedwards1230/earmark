@@ -66,8 +66,8 @@ type ModelPin struct {
 	PromptVersion string `yaml:"prompt_version"`
 	// Params are step-specific settings. ParseModelRegistry accepts only
 	// known keys (knownPinParams): usd_per_mtok_in (decide, scan), a
-	// non-negative number, and on the propose step the judge thinking params
-	// reasoning_effort / chat_template_kwargs.
+	// non-negative number, and on the propose step the judge request params
+	// reasoning_effort / chat_template_kwargs / temperature.
 	Params map[string]any `yaml:"params"`
 }
 
@@ -161,13 +161,17 @@ const (
 	// ParamChatTemplateKwargs is the judge request's chat_template_kwargs:
 	// "auto", "omit", or a JSON object (an object value, or its JSON text).
 	ParamChatTemplateKwargs = "chat_template_kwargs"
+	// ParamTemperature is the judge request's temperature, a non-negative
+	// number. It outranks the endpoint's temperature option and the route
+	// default (0 locally, omitted on hosted routes; CONTRACT §2.15).
+	ParamTemperature = "temperature"
 )
 
 // knownPinParams are the param keys a step accepts: usd_per_mtok_in on any
 // step, plus the step's own keys.
 func knownPinParams(step string) []string {
 	if step == recipe.StepPropose {
-		return []string{ParamUSDPerMTokIn, ParamReasoningEffort, ParamChatTemplateKwargs}
+		return []string{ParamUSDPerMTokIn, ParamReasoningEffort, ParamChatTemplateKwargs, ParamTemperature}
 	}
 	return []string{ParamUSDPerMTokIn}
 }
@@ -201,9 +205,24 @@ func validatePinParams(step string, params map[string]any) error {
 			if _, err := ChatTemplateKwargsParam(v); err != nil {
 				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
 			}
+		case ParamTemperature:
+			if _, err := TemperatureParam(v); err != nil {
+				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
+			}
 		}
 	}
 	return nil
+}
+
+// TemperatureParam reads a temperature param: a finite non-negative number
+// (an int from YAML, a float64 from JSON or a --param flag). A string such as
+// "zero" is refused rather than silently leaving the route default.
+func TemperatureParam(v any) (float64, error) {
+	f, ok := toFloat(v)
+	if !ok || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("must be a non-negative number, got %v", v)
+	}
+	return f, nil
 }
 
 // ReasoningEffortParam reads a reasoning_effort param: a non-empty string

@@ -98,7 +98,7 @@ Examples:
   earmark models set propose --model ollama/qwen3.8:27b-q8_0 --note "bake-off arm B"
   earmark models set decide --endpoint litellm-s1 --model clef:27b
   earmark models set decide --endpoint litellm-jev --model jev-1.13.0 --param usd_per_mtok_in=0.042
-  earmark models set propose --model openrouter/openai/gpt-6-luna --param reasoning_effort=low --param chat_template_kwargs=omit
+  earmark models set propose --model openrouter/openai/gpt-6-luna --param reasoning_effort=low --param chat_template_kwargs=omit --param temperature=0
   earmark models unset decide --note "back to Jev"
   earmark models history decide --limit 20`,
 	Args: cobra.NoArgs,
@@ -128,7 +128,7 @@ TypeSafe, so such a model is refused there.
 
 Pins: --expected-model (the model that should ANSWER — the recipe's
 model_resolved), --revision and --param key=value (known: usd_per_mtok_in;
-propose also reasoning_effort and chat_template_kwargs — see below)
+propose also reasoning_effort, chat_template_kwargs and temperature — see below)
 replace the step's MODELS_FILE pin wholesale whenever the row changes the
 endpoint or model, or sets any pin; unset pin fields are then unpinned
 (answers are expected from the requested model). A row equal to the env
@@ -136,9 +136,11 @@ endpoint and model with no pins keeps the env pin.
 
 propose: --param reasoning_effort=<auto|omit|none|low|medium|high|…> and
 --param chat_template_kwargs=<auto|omit|JSON object> set the judge's thinking
-knobs for this model. They outrank EVAL_REASONING_EFFORT /
-EVAL_CHAT_TEMPLATE_KWARGS and change the propose recipe; switching the model
-again drops them with the rest of the pin.
+knobs for this model, and --param temperature=<n> its sampling temperature
+(hosted routes otherwise send none). They outrank EVAL_REASONING_EFFORT /
+EVAL_CHAT_TEMPLATE_KWARGS and the endpoint's temperature option, and change
+the propose recipe; switching the model again drops them with the rest of
+the pin.
 
 embed: the model must produce 768-dimension vectors (transcript_chunks is
 vector(768)). set embeds one probe string through the endpoint and refuses
@@ -174,7 +176,7 @@ func init() {
 	f.StringVar(&setOpts.model, "model", "", "model id to request (default: the endpoint's model)")
 	f.StringVar(&setOpts.expectedModel, "expected-model", "", "pin: the model that should answer (default: the requested model)")
 	f.StringVar(&setOpts.revision, "revision", "", "pin: weights revision (HF commit, Ollama digest, provider snapshot)")
-	f.StringArrayVar(&setOpts.params, "param", nil, "pin param key=value (known: usd_per_mtok_in; propose: reasoning_effort, chat_template_kwargs); repeatable")
+	f.StringArrayVar(&setOpts.params, "param", nil, "pin param key=value (known: usd_per_mtok_in; propose: reasoning_effort, chat_template_kwargs, temperature); repeatable")
 	f.StringVar(&setOpts.note, "note", "", "why, recorded in the history")
 	f.BoolVar(&setOpts.noProbe, "no-probe", false, "embed only: store without embedding a probe string to check the vector dimension (running processes still probe before switching)")
 	unsetCmd.Flags().StringVar(&unsetNote, "note", "", "why, recorded in the history")

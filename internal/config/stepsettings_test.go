@@ -120,6 +120,12 @@ func TestStepSettingsValidation(t *testing.T) {
 			Params: map[string]any{ParamChatTemplateKwargs: "[1]"}}, `chat_template_kwargs must be "auto", "omit" or a non-empty JSON object`},
 		{"kwargs a number", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
 			Params: map[string]any{ParamChatTemplateKwargs: 3.0}}, "chat_template_kwargs must be"},
+		{"negative temperature", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamTemperature: -0.5}}, "temperature must be a non-negative number"},
+		{"string temperature", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamTemperature: "zero"}}, "temperature must be a non-negative number"},
+		{"temperature on decide", StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
+			Params: map[string]any{ParamTemperature: 0.0}}, `unknown key "temperature"`},
 		{"kwargs empty object", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
 			Params: map[string]any{ParamChatTemplateKwargs: "{}"}}, "non-empty JSON object"},
 	}
@@ -398,6 +404,7 @@ func TestStepSettingsJudgeThinkingParams(t *testing.T) {
 		"kwargs object": {ParamChatTemplateKwargs: map[string]any{"enable_thinking": false}},
 		"auto":          {ParamReasoningEffort: "auto", ParamChatTemplateKwargs: "AUTO"},
 		"with price":    {ParamReasoningEffort: "high", ParamUSDPerMTokIn: 0.1},
+		"temperature 0": {ParamTemperature: 0.0, ParamReasoningEffort: "low"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			eff, err := settingsBase().WithStepSettings(StepSetting{Step: recipe.StepPropose, EndpointID: "judge",

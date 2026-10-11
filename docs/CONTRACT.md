@@ -3119,17 +3119,28 @@ or `"omit"`. Every judge on the defaults therefore keeps its recipe id, while
 any change to what is sent (a setting's `reasoning_effort: "low"`) is a new
 recipe, and its findings are stamped and tracked in `stale_work` accordingly.
 
-Example — the GPT-6 Luna judge via OpenRouter (bake-off: `reasoning_effort`
-`low` gave 0 failures over 450 chunks; at the provider default 25 % of chunks
-hit `max_tokens` 8192):
+**Temperature.** The propose setting also accepts `temperature` (a
+non-negative number). It outranks the endpoint's `temperature` option and the
+route default ("Request parameters" below), so a hosted model that was
+measured at a given temperature keeps it. It is a recipe param whenever it is
+sent, like any temperature.
+
+Example — the GPT-6 Luna judge via OpenRouter. The bake-off ran it on code
+where `openrouter/` was not yet a hosted route, so it was sent
+`temperature: 0`, `reasoning_effort: "low"` (`EVAL_REASONING_EFFORT=low`) and
+no `chat_template_kwargs` (`EVAL_CHAT_TEMPLATE_KWARGS=omit`): 0 failures over
+450 chunks, while at the provider default reasoning 25 % of chunks hit
+`max_tokens` 8192. This row reproduces that request byte for byte:
 
 ```bash
 earmark models set propose --model openrouter/openai/gpt-6-luna \
-  --param reasoning_effort=low --param chat_template_kwargs=omit
+  --param reasoning_effort=low --param chat_template_kwargs=omit --param temperature=0
 ```
 
 (`chat_template_kwargs=omit` equals the hosted-route default; stating it keeps
-the row independent of the route rules.)
+the row independent of the route rules. Without `temperature=0` the hosted
+route would send no temperature — the provider default, which was not
+measured.)
 
 Route-independent: `response_format` (JSON schema) and the bearer token from
 the endpoint's `apiKeyEnv` (§2.14).
@@ -3141,7 +3152,7 @@ always gets the defaults):
 | Field | Default | Why |
 |---|---|---|
 | `max_tokens` | `8192` (`defaultJudgeMaxTokens`) | The reply itself is small, but on hosted reasoning models (Claude Haiku 5.5 thinks adaptively by default) the output budget is **shared with thinking** — a tight cap gets spent thinking and the answer is truncated. 8192 leaves room for that and is still a ceiling on a runaway generation. Ollama maps it onto `num_predict`. |
-| `temperature` | `0` for local models; **omitted** for hosted routes | Local judges need determinism (the same span should flag the same way run to run). Hosted routes (`isHostedRoute`: `anthropic/`, `openrouter/` or `openai/` anywhere in the model id — "Thinking controls" above) are sent no temperature, because newer Claude models reject any non-default sampling parameter (`temperature`/`top_p`/`top_k` → 400), and so do OpenAI reasoning models. An explicit `temperature` option is always sent, on any route. |
+| `temperature` | `0` for local models; **omitted** for hosted routes | Local judges need determinism (the same span should flag the same way run to run). Hosted routes (`isHostedRoute`: `anthropic/`, `openrouter/` or `openai/` anywhere in the model id — "Thinking controls" above) are sent no temperature by default, because newer Claude models reject any non-default sampling parameter (`temperature`/`top_p`/`top_k` → 400) and the provider default is the safe choice for an unknown hosted model. An explicit `temperature` option is always sent, on any route; the propose model setting's `temperature` param outranks both ("Thinking controls" above). |
 | `top_p` | omitted | Sent only when configured. |
 
 The judge's `propose` recipe params (§1.9) and the span's
@@ -4325,7 +4336,7 @@ steps:
 | `expected_model` | the model the endpoint should report serving; the current recipe's `model_resolved`. Unset → the requested model |
 | `revision` | HF commit / `.nemo` sha256 / Ollama digest / provider snapshot |
 | `prompt_version` | the prompt version this deployment expects; the code's own version is authoritative, a mismatch is logged |
-| `params` | optional step settings. Known keys: `usd_per_mtok_in` (decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14); `reasoning_effort` and `chat_template_kwargs` (propose only) — the judge's per-model thinking knobs (§2.15 "Thinking controls"). An unknown key, a key the step does not accept, or a bad value is a startup error |
+| `params` | optional step settings. Known keys: `usd_per_mtok_in` (decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14); `reasoning_effort`, `chat_template_kwargs` and `temperature` (propose only) — the judge's per-model request knobs (§2.15 "Thinking controls"). An unknown key, a key the step does not accept, or a bad value is a startup error |
 
 Because `expected_model` becomes the current recipe's `model_resolved`, a
 response served by any other model (a LiteLLM fallback, or an alias silently
@@ -4814,7 +4825,7 @@ step is off). An override never writes `model_settings`.
 **What a setting is.** An `AI_ENDPOINTS` id and a model id to request from
 it, plus optional pins with `MODELS_FILE` semantics (§2.18):
 `expected_model`, `revision`, `params` (known: `usd_per_mtok_in`; on
-`propose` also `reasoning_effort` and `chat_template_kwargs`, §2.15 "Thinking
+`propose` also `reasoning_effort`, `chat_template_kwargs` and `temperature`, §2.15 "Thinking
 controls"). URLs and
 keys are never stored: where to connect and with which credential stays in
 the env registry, so a setting can only choose among endpoints the deployment
