@@ -41,7 +41,13 @@ type Report struct {
 	Rung0Only bool   `json:"rung0_only,omitempty"`
 	RecipeID  string `json:"recipe_id"`
 	Model     string `json:"model"`
-	Seed      string `json:"seed"`
+	// Policy is the decide policy the run decided under (CONTRACT §2.19
+	// "Decide policy") and PolicySource where it came from.
+	Policy       map[string]any `json:"policy,omitempty"`
+	PolicySource string         `json:"policy_source,omitempty"`
+	// policyLine is Policy in one line, for the text report.
+	policyLine string
+	Seed       string `json:"seed"`
 	// Requested is --sample; Findings is how many the scope held (≤ Requested).
 	Requested int `json:"requested"`
 	Findings  int `json:"findings"`
@@ -128,6 +134,9 @@ func buildReport(o RunOptions, recipeID string, items []*item, backlog map[strin
 		Outcomes: map[string]int{}, Reasons: map[string]int{}, Rung0Rejects: map[string]int{},
 		Reanchor: map[string]int{}, PHistogram: make([]int, pBuckets),
 		Jev: JevStats{Errors: map[string]int{}},
+	}
+	if o.Params.Validate() == nil {
+		rep.Policy, rep.PolicySource, rep.policyLine = o.Params.PolicyParams(), o.PolicySource, o.Params.Describe()
 	}
 	cells := map[Cell]int{}
 	type issueTally struct {
@@ -280,6 +289,13 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 		p(" · seed %q", r.Seed)
 	}
 	p("\n")
+	if r.policyLine != "" {
+		p("policy: %s", r.policyLine)
+		if r.PolicySource != "" {
+			p(" (source %s)", r.PolicySource)
+		}
+		p("\n")
+	}
 	if r.Write != nil {
 		p("decided %d findings", r.Findings)
 		if r.Requested > 0 {

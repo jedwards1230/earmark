@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	decidepkg "github.com/jedwards1230/earmark/internal/decide"
 	"github.com/jedwards1230/earmark/internal/recipe"
@@ -301,5 +302,93 @@ func TestRunModelInEveryMode(t *testing.T) {
 				t.Errorf("registered %d recipes (rung0-only %v)", len(store.recipes), o.rung0Only)
 			}
 		})
+	}
+}
+
+// settingsRows is a model_settings reader serving fixed rows.
+type settingsRows []db.ModelSetting
+
+func (r settingsRows) ListModelSettings(context.Context) ([]db.ModelSetting, error) { return r, nil }
+
+func policyConfig() *config.Config {
+	return &config.Config{
+		AIEndpoints: []config.AIEndpoint{
+			{ID: "litellm-jev", Type: config.AIEndpointTypeSystemOne, BaseURL: "http://litellm:4000/typesafe", Model: "jev-1.13.0"},
+			{ID: "litellm-s1", Type: config.AIEndpointTypeSystemOne, BaseURL: "http://litellm:4000", Model: "clef:27b"},
+		},
+		AIRoles: &config.AIRoles{Decide: "litellm-jev"},
+		Models:  &config.ModelRegistry{Steps: map[string]config.ModelPin{}},
+	}
+}
+
+// `decide --model clef:27b` decides under Clef's policy in every mode — the
+// dry runs and --yes resolve alike, so a dry run's outcomes are the write's —
+// and --policy layers over it for the run.
+func TestResolvePolicyInEveryMode(t *testing.T) {
+	modes := map[string]options{
+		"sample":     {sample: 84, seed: "bake", concurrency: 1, batch: 20, json: true},
+		"calibrate":  {sample: 84, seed: "bake", concurrency: 1, batch: 20, json: true, calibrate: true},
+		"rung0-only": {sample: 84, seed: "bake", concurrency: 1, batch: 20, json: true, rung0Only: true},
+		"yes":        {sample: 100, seed: "s", concurrency: 1, batch: 20, json: true, yes: true, limit: 10},
+	}
+	for name, o := range modes {
+		t.Run(name, func(t *testing.T) {
+			o.overrideEndpoint, o.overrideModel = "litellm-s1", "clef:27b"
+			_, o, err := resolve(context.Background(), settingsRows(nil), policyConfig(), o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if o.model.Alias != "clef:27b" || o.policy.Preset != decidepkg.PresetClef {
+				t.Fatalf("resolved model %+v policy %+v", o.model, o.policy)
+			}
+			store := &modelSpy{}
+			var out bytes.Buffer
+			var asker decidepkg.Asker = noAsker{}
+			if o.rung0Only {
+				asker = nil
+			}
+			if err := run(context.Background(), &out, store, asker, o); err != nil {
+				t.Fatal(err)
+			}
+			var rep decidepkg.Report
+			if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+				t.Fatalf("report: %v\n%s", err, out.String())
+			}
+			if rep.PolicySource != "preset clef" || rep.Policy[config.ParamRejectRequiresLowercase] != true ||
+				rep.Policy[config.ParamRejectFloor] != 0.1 {
+				t.Errorf("report policy %v (%s)", rep.Policy, rep.PolicySource)
+			}
+			for _, r := range store.recipes {
+				if ev, _ := r.Params["apply_evidence"].([]string); len(ev) != 1 || ev[0] != decidepkg.EvidenceASINVerbatim {
+					t.Errorf("registered recipe apply_evidence %v", r.Params["apply_evidence"])
+				}
+			}
+		})
+	}
+
+	// A model_settings row's params, then --policy, layer over the preset.
+	rows := settingsRows{{Step: recipe.StepDecide, EndpointID: "litellm-s1", Model: "clef:27b",
+		Params: map[string]any{config.ParamRejectFloor: 0.05}}}
+	o := options{sample: 5, seed: "s", concurrency: 1, batch: 20}
+	_, got, err := resolve(context.Background(), rows, policyConfig(), o)
+	if err != nil || got.policy.Params.RejectFloor != 0.05 || got.policy.Source != decidepkg.PolicySourceDB {
+		t.Fatalf("row policy %+v, %v", got.policy, err)
+	}
+	o.policyFlags = []string{"apply_p=0.9"}
+	_, got, err = resolve(context.Background(), rows, policyConfig(), o)
+	if err != nil || got.policy.Params.ApplyP != 0.9 || got.policy.Params.RejectFloor != 0.05 ||
+		got.policy.SourceLabel() != "override (apply_p) + db (reject_floor) over preset clef" {
+		t.Fatalf("override policy %+v (%s), %v", got.policy, got.policy.SourceLabel(), err)
+	}
+	if !strings.Contains(argsSummary(o), "--policy apply_p=0.9") {
+		t.Errorf("args %q do not record --policy", argsSummary(o))
+	}
+
+	// Bad values fail before anything runs.
+	for _, flags := range [][]string{{"apply_p=0.1"}, {"bogus=1"}, {"reject_floor=0.5"}} {
+		o.policyFlags = flags
+		if _, _, err := resolve(context.Background(), rows, policyConfig(), o); err == nil {
+			t.Errorf("--policy %v accepted", flags)
+		}
 	}
 }

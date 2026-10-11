@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -127,8 +128,8 @@ func TestDecideBoundaries(t *testing.T) {
 		evidence, issue  string
 		decision, reason string
 	}{
-		{0.95, EvidenceASINVerbatim, IssueMisheardProperNoun, DecisionApply, ReasonConfident},
-		{0.9499999, EvidenceASINVerbatim, IssueMisheardProperNoun, DecisionHold, ReasonUncertain},
+		{0.85, EvidenceASINVerbatim, IssueMisheardProperNoun, DecisionApply, ReasonConfident},
+		{0.8499999, EvidenceASINVerbatim, IssueMisheardProperNoun, DecisionHold, ReasonUncertain},
 		{1, EvidenceExactRepeat, IssueRepeatedText, DecisionApply, ReasonConfident},
 		{0.99, EvidenceNone, IssueMisheardWord, DecisionHold, ReasonNoEvidence},
 		{0.99, EvidenceASINVerbatim, IssueDroppedWord, DecisionHold, ReasonTypeCapped},
@@ -143,31 +144,136 @@ func TestDecideBoundaries(t *testing.T) {
 		{math.Inf(1), EvidenceASINVerbatim, IssueHomophone, DecisionHold, ReasonJevUnavailable},
 	}
 	for _, tc := range tests {
-		d, r := p.Decide(tc.prob, tc.evidence, tc.issue)
+		d, r := p.Decide(tc.prob, tc.evidence, tc.issue, "Arecibo")
 		if d != tc.decision || r != tc.reason {
 			t.Errorf("Decide(%v, %s, %s) = %s/%s, want %s/%s", tc.prob, tc.evidence, tc.issue, d, r, tc.decision, tc.reason)
 		}
 	}
 }
 
-func TestShouldApplyParams(t *testing.T) {
-	for _, p := range []ShouldApplyParams{
-		{ApplyP: 0.2, RejectP: 0.2, PhoneticMinSim: 0.67},
-		{ApplyP: 1.1, RejectP: 0.2, PhoneticMinSim: 0.67},
-		{ApplyP: 0.95, RejectP: math.NaN(), PhoneticMinSim: 0.67},
-		{ApplyP: 0.95, RejectP: 0.2, PhoneticMinSim: 0},
+// TestPresetDecisions pins the two built-in policies (CONTRACT §2.19 "Decide
+// policy") to the measured evidence: Jev applies at p ≥ 0.85 with either
+// evidence kind and rejects at p ≤ 0.20 whatever the case; Clef applies only
+// on asin_verbatim and rejects at p ≤ 0.20 only a lowercase replacement or
+// p < 0.10.
+func TestPresetDecisions(t *testing.T) {
+	presets := map[string]string{PresetJev: "jev-1.13.0", PresetClef: "clef:27b"}
+	tests := []struct {
+		name, preset     string
+		prob             float64
+		evidence, issue  string
+		replacement      string
+		decision, reason string
+	}{
+		// Jev.
+		{"jev asin_verbatim at 0.85 applies", PresetJev, 0.85, EvidenceASINVerbatim, IssueMisheardProperNoun, "Arecibo", DecisionApply, ReasonConfident},
+		{"jev exact_repeat at 0.85 applies", PresetJev, 0.85, EvidenceExactRepeat, IssueRepeatedText, "the cat", DecisionApply, ReasonConfident},
+		{"jev just under 0.85 holds", PresetJev, 0.849, EvidenceASINVerbatim, IssueMisheardProperNoun, "Arecibo", DecisionHold, ReasonUncertain},
+		{"jev no evidence holds", PresetJev, 0.99, EvidenceNone, IssueMisheardWord, "cat", DecisionHold, ReasonNoEvidence},
+		{"jev capitalised reject still rejects", PresetJev, 0.15, EvidenceNone, IssueMisheardProperNoun, "Arecibo", DecisionReject, ReasonJevReject},
+		{"jev lowercase reject rejects", PresetJev, 0.20, EvidenceNone, IssueMisheardWord, "cat", DecisionReject, ReasonJevReject},
+		{"jev capped type holds", PresetJev, 0.99, EvidenceASINVerbatim, IssueDroppedWord, "the", DecisionHold, ReasonTypeCapped},
+		// Clef.
+		{"clef asin_verbatim at 0.85 applies", PresetClef, 0.85, EvidenceASINVerbatim, IssueMisheardProperNoun, "Arecibo", DecisionApply, ReasonConfident},
+		{"clef exact_repeat excluded", PresetClef, 0.99, EvidenceExactRepeat, IssueRepeatedText, "the cat", DecisionHold, ReasonEvidenceExcluded},
+		{"clef no evidence holds", PresetClef, 0.99, EvidenceNone, IssueMisheardWord, "cat", DecisionHold, ReasonNoEvidence},
+		{"clef capped beats evidence", PresetClef, 0.99, EvidenceASINVerbatim, IssueNumberArtifact, "1937", DecisionHold, ReasonTypeCapped},
+		{"clef lowercase reject at 0.20 rejects", PresetClef, 0.20, EvidenceNone, IssueMisheardWord, "cat", DecisionReject, ReasonJevReject},
+		{"clef empty replacement counts as lowercase", PresetClef, 0.15, EvidenceNone, IssueRepeatedText, "", DecisionReject, ReasonJevReject},
+		{"clef capitalised reject at 0.15 holds", PresetClef, 0.15, EvidenceNone, IssueMisheardProperNoun, "Arecibo", DecisionHold, ReasonCapitalised},
+		{"clef capitalised at the floor holds", PresetClef, 0.10, EvidenceASINVerbatim, IssueMisheardProperNoun, "von Braun", DecisionHold, ReasonCapitalised},
+		{"clef capitalised under the floor rejects", PresetClef, 0.0999, EvidenceNone, IssueMisheardProperNoun, "Arecibo", DecisionReject, ReasonJevReject},
+		{"clef non-ASCII capital holds", PresetClef, 0.15, EvidenceNone, IssueMisheardProperNoun, "Éowyn", DecisionHold, ReasonCapitalised},
+		{"clef uncertain band holds", PresetClef, 0.5, EvidenceASINVerbatim, IssueMisheardProperNoun, "Arecibo", DecisionHold, ReasonUncertain},
+		{"clef unusable p holds", PresetClef, math.NaN(), EvidenceASINVerbatim, IssueMisheardProperNoun, "arecibo", DecisionHold, ReasonJevUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			name, p, ok := PresetFor(presets[tc.preset])
+			if !ok || name != tc.preset {
+				t.Fatalf("PresetFor(%s) = %s, %v", presets[tc.preset], name, ok)
+			}
+			if err := p.Validate(); err != nil {
+				t.Fatalf("preset %s invalid: %v", name, err)
+			}
+			d, r := p.Decide(tc.prob, tc.evidence, tc.issue, tc.replacement)
+			if d != tc.decision || r != tc.reason {
+				t.Errorf("Decide(%v, %s, %s, %q) = %s/%s, want %s/%s", tc.prob, tc.evidence, tc.issue, tc.replacement,
+					d, r, tc.decision, tc.reason)
+			}
+		})
+	}
+}
+
+func TestPresetFor(t *testing.T) {
+	for model, want := range map[string]string{
+		"jev-1.13.0": PresetJev, "typesafe/jev-1.13.0": PresetJev, "JEV-1.14.0": PresetJev,
+		"clef:27b": PresetClef, "ollama/clef:27b": PresetClef, "clef-1.0.0": PresetClef,
+		"other-1.0.0": "", "jevons-1.0": "", "": "",
 	} {
-		if _, err := ShouldApplyFn(p); err == nil {
-			t.Errorf("%+v accepted", p)
+		name, _, ok := PresetFor(model)
+		if name != want || ok != (want != "") {
+			t.Errorf("PresetFor(%q) = %q, %v; want %q", model, name, ok, want)
 		}
 	}
+	// The Jev preset is the default policy.
+	_, jev, _ := PresetFor("jev-1.13.0")
+	if !reflect.DeepEqual(jev, DefaultShouldApplyParams()) {
+		t.Errorf("jev preset %+v differs from the default %+v", jev, DefaultShouldApplyParams())
+	}
+}
+
+func TestShouldApplyParamsValidate(t *testing.T) {
+	ok := DefaultShouldApplyParams()
+	tests := map[string]func(*ShouldApplyParams){
+		"reject_p = apply_p":      func(p *ShouldApplyParams) { p.ApplyP, p.RejectP = 0.2, 0.2 },
+		"apply_p > 1":             func(p *ShouldApplyParams) { p.ApplyP = 1.1 },
+		"reject_p NaN":            func(p *ShouldApplyParams) { p.RejectP = math.NaN() },
+		"reject_p < 0":            func(p *ShouldApplyParams) { p.RejectP = -0.1 },
+		"phonetic 0":              func(p *ShouldApplyParams) { p.PhoneticMinSim = 0 },
+		"no evidence kinds":       func(p *ShouldApplyParams) { p.ApplyEvidence = nil },
+		"unknown evidence kind":   func(p *ShouldApplyParams) { p.ApplyEvidence = []string{"asin"} },
+		"evidence none":           func(p *ShouldApplyParams) { p.ApplyEvidence = []string{EvidenceNone} },
+		"evidence twice":          func(p *ShouldApplyParams) { p.ApplyEvidence = []string{EvidenceExactRepeat, EvidenceExactRepeat} },
+		"floor without lowercase": func(p *ShouldApplyParams) { p.RejectFloor = 0.1 },
+		"floor above reject_p":    func(p *ShouldApplyParams) { p.RejectRequiresLowercase, p.RejectFloor = true, 0.25 },
+		"floor negative":          func(p *ShouldApplyParams) { p.RejectRequiresLowercase, p.RejectFloor = true, -0.01 },
+		"floor NaN":               func(p *ShouldApplyParams) { p.RejectRequiresLowercase, p.RejectFloor = true, math.NaN() },
+	}
+	for name, mut := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := DefaultShouldApplyParams()
+			mut(&p)
+			if err := p.Validate(); err == nil {
+				t.Errorf("%+v validated", p)
+			}
+			if _, err := ShouldApplyFn(p); err == nil {
+				t.Errorf("ShouldApplyFn accepted %+v", p)
+			}
+		})
+	}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("default policy invalid: %v", err)
+	}
+	ok.RejectRequiresLowercase = true
+	if err := ok.Validate(); err != nil {
+		t.Errorf("lowercase rule without a floor should validate: %v", err)
+	}
+}
+
+func TestShouldApplyParams(t *testing.T) {
 	// Every threshold is a recipe param: changing one changes the recipe.
 	base, _ := ShouldApplyFn(DefaultShouldApplyParams())
 	baseID := recipeID(t, base.Recipe(""))
 	for name, mut := range map[string]func(*ShouldApplyParams){
-		"apply_p":          func(p *ShouldApplyParams) { p.ApplyP = 0.96 },
-		"reject_p":         func(p *ShouldApplyParams) { p.RejectP = 0.1 },
-		"phonetic_min_sim": func(p *ShouldApplyParams) { p.PhoneticMinSim = 0.7 },
+		"apply_p":                   func(p *ShouldApplyParams) { p.ApplyP = 0.96 },
+		"reject_p":                  func(p *ShouldApplyParams) { p.RejectP = 0.1 },
+		"phonetic_min_sim":          func(p *ShouldApplyParams) { p.PhoneticMinSim = 0.7 },
+		"apply_evidence":            func(p *ShouldApplyParams) { p.ApplyEvidence = []string{EvidenceASINVerbatim} },
+		"reject_requires_lowercase": func(p *ShouldApplyParams) { p.RejectRequiresLowercase = true },
+		"reject_floor": func(p *ShouldApplyParams) {
+			p.RejectRequiresLowercase, p.RejectFloor = true, 0.1
+		},
 	} {
 		p := DefaultShouldApplyParams()
 		mut(&p)
@@ -179,7 +285,21 @@ func TestShouldApplyParams(t *testing.T) {
 			t.Errorf("%s change kept recipe %s", name, baseID)
 		}
 	}
+	// The order apply_evidence lists its kinds in is not a policy change.
+	p := DefaultShouldApplyParams()
+	p.ApplyEvidence = []string{EvidenceExactRepeat, EvidenceASINVerbatim}
+	if f, _ := ShouldApplyFn(p); recipeID(t, f.Recipe("")) != baseID {
+		t.Error("reordering apply_evidence changed the recipe")
+	}
+	// The two presets are two recipes on one model.
+	_, clef, _ := PresetFor("clef:27b")
+	fc, _ := ShouldApplyFnFor(clef, Model{Alias: "clef:27b"})
+	fd, _ := ShouldApplyFnFor(DefaultShouldApplyParams(), Model{Alias: "clef:27b"})
+	if recipeID(t, fc.Recipe("")) == recipeID(t, fd.Recipe("")) {
+		t.Error("the clef preset and the default policy share a recipe on clef:27b")
+	}
 	for _, k := range []string{"evidence_rule", "rung0_version", "apply_p", "reject_p", "phonetic_min_sim",
+		"apply_evidence", "reject_requires_lowercase", "reject_floor",
 		"context_words", "neighbour_words", "fallback_words", "max_relevant_sentences", "max_relevant_runes",
 		"max_sentence_runes", "clip_words"} {
 		if _, ok := base.Params[k]; !ok {
@@ -455,7 +575,7 @@ func TestEvaluatorRecipe(t *testing.T) {
 	e, _ := newTestEvaluator(t, &fakeJev{reply: noul(0.5, "jev-1.13.0")})
 	r := e.Recipe()
 	if r.Step != recipe.StepDecide || r.ModelAlias != ShouldApplyModel || r.ModelResolved != ShouldApplyModel ||
-		r.PromptSHA256 != ShouldApplyPromptSHA256 || r.Params["fn"] != ShouldApplyName || r.Params["apply_p"] != 0.95 {
+		r.PromptSHA256 != ShouldApplyPromptSHA256 || r.Params["fn"] != ShouldApplyName || r.Params["apply_p"] != 0.85 {
 		t.Errorf("recipe %+v", r)
 	}
 	if err := r.Validate(); err != nil {

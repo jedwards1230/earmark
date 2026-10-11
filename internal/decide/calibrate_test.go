@@ -31,7 +31,7 @@ func calItem(t *testing.T, id, state, issue, text, original, replacement string,
 	default:
 		o.Evidence = TextEvidence(it.input.Candidate, v, it.sentences)
 		o.P = p
-		o.Decision, o.Reason = params.Decide(*p, o.Evidence, issue)
+		o.Decision, o.Reason = params.Decide(*p, o.Evidence, issue, "")
 	}
 	it.outcome = o
 	return it

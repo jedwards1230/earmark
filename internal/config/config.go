@@ -605,6 +605,10 @@ type Config struct {
 	// stepSources records, per step, where WithStepSettings took the step's
 	// model from (SourceDB / SourceOverride). Absent = the env default.
 	stepSources map[string]string
+	// pinSources records, per step, which layer the step's pin (ModelPin)
+	// came from: SourceDB / SourceOverride when a setting replaced it,
+	// SourceEnv when one restored the MODELS_FILE pin. Absent = env.
+	pinSources map[string]string
 	// env is the env binding and pins of every setting step, captured by the
 	// first Clone of the env config (nil on the env config itself).
 	env *envSnapshot

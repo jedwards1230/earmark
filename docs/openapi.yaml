@@ -632,6 +632,12 @@ components:
         countsError:
           description: True when the most recent aggregate-snapshot refresh failed; the last good snapshot (if any, see `countsAsOf`) is still served.
           type: boolean
+        decidePolicy:
+          description: 'Decide only: the effective decide policy in one line (e.g. `apply p ≥ 0.85 with asin_verbatim · reject p ≤ 0.20 if the replacement is lowercase or p < 0.10`). Omitted for other roles and when the policy is invalid (see `settingError`). CONTRACT §2.19 "Decide policy".'
+          type: string
+        decidePolicySource:
+          description: 'Decide only: where the policy came from — `default`, `preset <name>`, or the layers that set keys over it (e.g. `db (reject_floor) over preset clef`). CONTRACT §2.19 "Decide policy".'
+          type: string
         endpoint:
           description: AI_ENDPOINTS id serving the role, or `EVAL_CHAT_*` for an env-configured judge. Omitted for ASR and unconfigured roles.
           type: string
@@ -694,7 +700,7 @@ components:
             - format
           type: string
         settingError:
-          description: Set when the step's model_settings row is invalid against this deployment's AI_ENDPOINTS (e.g. its endpoint was removed); the role is then `failing` and the step's runs fail until the row is fixed (`earmark models unset <step>`). CONTRACT §2.20.
+          description: Set when the step's model_settings row is invalid against this deployment's AI_ENDPOINTS (e.g. its endpoint was removed), or (decide) when the merged decide policy is invalid; the role is then `failing` and the step's runs fail until the row is fixed (`earmark models unset <step>`). CONTRACT §2.19, §2.20.
           type: string
         settingUpdatedAt:
           description: RFC 3339 time the step's model_settings row was last set; omitted without a row.

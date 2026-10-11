@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/user"
 	"sort"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -27,6 +26,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/decide"
 	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/recipe"
@@ -90,6 +90,12 @@ A different model is a different recipe (CONTRACT §1.9): findings, decisions,
 scans and chunks made under it are told apart from the env model's, and
 unsetting returns the step to the env recipe.
 
+The decide step also shows its effective decide policy (CONTRACT §2.19
+"Decide policy") and where it came from: the row's (or MODELS_FILE's) policy
+params, over the built-in preset for the model (jev-*, clef*), over the
+default. Set policy keys with --param on the decide row; they are part of the
+decide recipe.
+
 Steps: ` + stepsHelp + `.
 
 Examples:
@@ -99,6 +105,7 @@ Examples:
   earmark models set decide --endpoint litellm-s1 --model clef:27b
   earmark models set decide --endpoint litellm-jev --model jev-1.13.0 --param usd_per_mtok_in=0.042
   earmark models set propose --model openrouter/openai/gpt-6-luna --param reasoning_effort=low --param chat_template_kwargs=omit --param temperature=0
+  earmark models set decide --endpoint litellm-s1 --model clef:27b --param reject_floor=0.05
   earmark models unset decide --note "back to Jev"
   earmark models history decide --limit 20`,
 	Args: cobra.NoArgs,
@@ -142,6 +149,14 @@ EVAL_CHAT_TEMPLATE_KWARGS and the endpoint's temperature option, and change
 the propose recipe; switching the model again drops them with the rest of
 the pin.
 
+Decide policy (decide only; CONTRACT §2.19 "Decide policy"): --param
+apply_p=<0..1>, reject_p=<0..1>, apply_evidence=asin_verbatim[,exact_repeat],
+reject_requires_lowercase=true|false, reject_floor=<0..reject_p>. Each key
+overrides the model's built-in preset (jev-*, clef*) or the default; keys not
+given keep it. The merged policy is validated before anything is stored
+(reject_p < apply_p, known evidence kinds, reject_floor only with
+reject_requires_lowercase). A policy change is a new decide recipe.
+
 embed: the model must produce 768-dimension vectors (transcript_chunks is
 vector(768)). set embeds one probe string through the endpoint and refuses
 any other size (or an unreachable endpoint; --no-probe skips this when the
@@ -176,7 +191,7 @@ func init() {
 	f.StringVar(&setOpts.model, "model", "", "model id to request (default: the endpoint's model)")
 	f.StringVar(&setOpts.expectedModel, "expected-model", "", "pin: the model that should answer (default: the requested model)")
 	f.StringVar(&setOpts.revision, "revision", "", "pin: weights revision (HF commit, Ollama digest, provider snapshot)")
-	f.StringArrayVar(&setOpts.params, "param", nil, "pin param key=value (known: usd_per_mtok_in; propose: reasoning_effort, chat_template_kwargs, temperature); repeatable")
+	f.StringArrayVar(&setOpts.params, "param", nil, "pin param key=value (known: usd_per_mtok_in; propose: reasoning_effort, chat_template_kwargs, temperature; decide policy: apply_p, reject_p, apply_evidence, reject_requires_lowercase, reject_floor); repeatable")
 	f.StringVar(&setOpts.note, "note", "", "why, recorded in the history")
 	f.BoolVar(&setOpts.noProbe, "no-probe", false, "embed only: store without embedding a probe string to check the vector dimension (running processes still probe before switching)")
 	unsetCmd.Flags().StringVar(&unsetNote, "note", "", "why, recorded in the history")
@@ -301,6 +316,8 @@ type StepView struct {
 	// Thinking (propose only, when the step has a model) is the judge's
 	// effective thinking knobs and where each came from (CONTRACT §2.15).
 	Thinking *ThinkingView `json:"thinking,omitempty"`
+	// Policy is the decide step's effective decide policy (decide only).
+	Policy *PolicyView `json:"policy,omitempty"`
 }
 
 // ThinkingView is the judge's resolved reasoning_effort / chat_template_kwargs
@@ -341,6 +358,33 @@ func thinkingView(eff *config.Config, model string) *ThinkingView {
 	return v
 }
 
+// PolicyView is the decide step's effective decide policy (CONTRACT §2.19
+// "Decide policy") and where it came from.
+type PolicyView struct {
+	Params  map[string]any `json:"params,omitempty"`
+	Summary string         `json:"summary,omitempty"`
+	// Source is the highest layer that set any key: db, env, preset or
+	// default; SourceLabel spells it out ("db (apply_p) over preset clef").
+	Source      string               `json:"source"`
+	SourceLabel string               `json:"source_label"`
+	Preset      string               `json:"preset,omitempty"`
+	Layers      []decide.PolicyLayer `json:"layers,omitempty"`
+	// Error is set when the merged policy is invalid: decide runs fail.
+	Error string `json:"error,omitempty"`
+}
+
+// policyView resolves cfg's decide policy for display.
+func policyView(cfg *config.Config) *PolicyView {
+	pol, err := decide.ResolvePolicy(cfg, nil)
+	if err != nil {
+		return &PolicyView{Source: "invalid", SourceLabel: "invalid", Error: err.Error()}
+	}
+	return &PolicyView{
+		Params: pol.Params.PolicyParams(), Summary: pol.Params.Describe(),
+		Source: pol.Source, SourceLabel: pol.SourceLabel(), Preset: pol.Preset, Layers: pol.Layers,
+	}
+}
+
 // View computes every settable step's effective model from the env config
 // and the model_settings rows.
 func View(base *config.Config, rows []db.ModelSetting) []StepView {
@@ -371,6 +415,9 @@ func View(base *config.Config, rows []db.ModelSetting) []StepView {
 		v.ExpectedModel, v.Revision, v.Params = pin.ExpectedModel, pin.Revision, pin.Params
 		if step == recipe.StepPropose && v.Model != "" {
 			v.Thinking = thinkingView(eff, v.Model)
+		}
+		if step == recipe.StepDecide && v.Model != "" {
+			v.Policy = policyView(eff)
 		}
 		out = append(out, v)
 	}
@@ -418,7 +465,7 @@ func Show(out io.Writer, base *config.Config, rows []db.ModelSetting, asJSON boo
 			setBy = v.UpdatedBy + " " + v.UpdatedAt.Local().Format("2006-01-02 15:04")
 		}
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", v.Step, src, dash(v.Endpoint), dash(v.Model),
-			pinLine(v.ExpectedModel, v.Revision, v.Params), env, setBy)
+			pinLine(v.ExpectedModel, v.Revision, withoutPolicy(v.Params)), env, setBy)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
@@ -432,6 +479,15 @@ func Show(out io.Writer, base *config.Config, rows []db.ModelSetting, asJSON boo
 			_, _ = fmt.Fprintf(out, "\n%s thinking: %s\n", v.Step, v.Thinking.Summary)
 		}
 	}
+	for _, v := range views {
+		switch {
+		case v.Policy == nil:
+		case v.Policy.Error != "":
+			_, _ = fmt.Fprintf(out, "\ndecide policy INVALID — decide runs fail until fixed:\n  %s\n", v.Policy.Error)
+		default:
+			_, _ = fmt.Fprintf(out, "\ndecide policy: %s\n  source %s\n", v.Policy.Summary, v.Policy.SourceLabel)
+		}
+	}
 	if len(errs) > 0 {
 		_, _ = fmt.Fprintf(out, "\nINVALID model_settings rows — these steps fail until fixed:\n%s\n", strings.Join(errs, "\n"))
 	}
@@ -443,6 +499,18 @@ func dash(s string) string {
 		return "—"
 	}
 	return s
+}
+
+// withoutPolicy drops the decide policy keys (shown on their own line) from
+// pin params.
+func withoutPolicy(params map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range params {
+		if !config.IsDecidePolicyParam(k) {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // pinLine renders a pin compactly ("—" when unpinned).
@@ -468,7 +536,8 @@ func pinLine(expected, revision string, params map[string]any) string {
 	return strings.Join(parts, " · ")
 }
 
-// parseParams parses --param key=value pairs; a numeric value is a number.
+// parseParams parses --param key=value pairs; a numeric value is a number,
+// true/false a boolean.
 func parseParams(kvs []string) (map[string]any, error) {
 	if len(kvs) == 0 {
 		return nil, nil
@@ -480,11 +549,7 @@ func parseParams(kvs []string) (map[string]any, error) {
 		if !ok || k == "" {
 			return nil, fmt.Errorf("--param %q must be key=value", kv)
 		}
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			out[k] = f
-		} else {
-			out[k] = v
-		}
+		out[k] = config.ParseParamValue(v)
 	}
 	return out, nil
 }
@@ -528,6 +593,17 @@ func Set(ctx context.Context, out io.Writer, store Store, base *config.Config, s
 	s, err := BuildSetting(base, step, o)
 	if err != nil {
 		return err
+	}
+	if step == recipe.StepDecide {
+		// The decide policy the row would run under — its params over the
+		// model's preset — must be valid before it is stored.
+		eff, err := base.WithStepSettings(s)
+		if err != nil {
+			return err
+		}
+		if _, err := decide.ResolvePolicy(eff, nil); err != nil {
+			return fmt.Errorf("models set decide refused (nothing stored): %w", err)
+		}
 	}
 	if step == recipe.StepEmbed && !o.noProbe {
 		eff, err := base.WithStepSettings(s)

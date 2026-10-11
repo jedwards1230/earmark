@@ -299,3 +299,79 @@ func TestHistory(t *testing.T) {
 	assert.Contains(t, buf.String(), "clef-1.0.0 @ clef (rev r1)")
 	assert.Contains(t, buf.String(), "env default")
 }
+
+// The decide step shows its effective decide policy and source (CONTRACT
+// §2.19 "Decide policy"); set validates the merged policy before storing.
+func TestDecidePolicy(t *testing.T) {
+	ctx := context.Background()
+	views := View(baseCfg(), nil)
+	var d StepView
+	for _, v := range views {
+		if v.Step == recipe.StepDecide {
+			d = v
+		} else {
+			assert.Nil(t, v.Policy, "only decide has a policy (%s)", v.Step)
+		}
+	}
+	require.NotNil(t, d.Policy)
+	assert.Equal(t, "preset", d.Policy.Source)
+	assert.Equal(t, "preset jev", d.Policy.SourceLabel)
+	assert.Equal(t, 0.85, d.Policy.Params[config.ParamApplyP])
+
+	st := newFakeStore()
+	var buf bytes.Buffer
+	require.NoError(t, Set(ctx, &buf, st, baseCfg(), "decide", setOptions{endpoint: "clef",
+		params: []string{"reject_floor=0.05", "usd_per_mtok_in=0.01"}}, "cli:justin"))
+	assert.Equal(t, 0.05, st.rows["decide"].Params[config.ParamRejectFloor])
+	out := buf.String()
+	assert.Contains(t, out, "decide policy: apply p ≥ 0.85 with asin_verbatim · reject p ≤ 0.20 if the replacement is lowercase or p < 0.05")
+	assert.Contains(t, out, "source db (reject_floor) over preset clef")
+	assert.Contains(t, out, "usd_per_mtok_in=0.01")
+	assert.NotContains(t, out, "reject_floor=0.05", "policy keys are not shown as pins")
+
+	buf.Reset()
+	require.NoError(t, Show(&buf, baseCfg(), mustRows(t, st), true))
+	var js []StepView
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &js))
+	for _, v := range js {
+		if v.Step == recipe.StepDecide {
+			require.NotNil(t, v.Policy)
+			assert.Equal(t, "db", v.Policy.Source)
+			assert.Equal(t, "clef", v.Policy.Preset)
+		}
+	}
+
+	// Invalid policies are refused and nothing is stored.
+	for _, params := range [][]string{
+		{"apply_p=0.1"},                     // below the preset's reject_p
+		{"reject_floor=0.5"},                // above reject_p
+		{"apply_evidence=asin"},             // not an evidence kind
+		{"reject_requires_lowercase=maybe"}, // not a boolean
+		{"apply_p=2"},                       // out of range
+		{"reject_requires_lowercase=false", "reject_floor=0.1"}, // floor without the rule
+	} {
+		events := len(st.events)
+		err := Set(ctx, &buf, st, baseCfg(), "decide", setOptions{endpoint: "clef", params: params}, "cli:justin")
+		require.Error(t, err, "%v", params)
+		assert.Len(t, st.events, events, "%v stored", params)
+	}
+	// Policy keys belong to decide only.
+	err := Set(ctx, &buf, st, baseCfg(), "scan", setOptions{params: []string{"apply_p=0.9"}}, "cli:justin")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unknown key "apply_p"`)
+
+	// A row the policy check would refuse (stored before, or by hand) shows
+	// as invalid rather than as a working policy.
+	bad := []db.ModelSetting{{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
+		Params: map[string]any{config.ParamApplyP: 0.1}}}
+	buf.Reset()
+	require.NoError(t, Show(&buf, baseCfg(), bad, false))
+	assert.Contains(t, buf.String(), "decide policy INVALID")
+}
+
+func mustRows(t *testing.T, st *fakeStore) []db.ModelSetting {
+	t.Helper()
+	rows, err := st.ListModelSettings(context.Background())
+	require.NoError(t, err)
+	return rows
+}

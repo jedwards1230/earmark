@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -88,6 +89,52 @@ func TestApplySettingStateReadError(t *testing.T) {
 			assert.Equal(t, "unknown", c.ModelSource, "a failed read never claims env")
 		}
 	}
+}
+
+// The Decide card shows the effective decide policy and its source (CONTRACT
+// §2.19 "Decide policy"); an invalid merged policy fails the card, and a
+// failed settings read shows no policy rather than the env one.
+func TestDecidePolicyOnCard(t *testing.T) {
+	cfg := func() *config.Config {
+		c := settingsCfg()
+		c.AIEndpoints = append(c.AIEndpoints, config.AIEndpoint{ID: "litellm-s1", Type: config.AIEndpointTypeSystemOne,
+			BaseURL: "http://litellm:4000", Model: "clef:27b"})
+		return c
+	}
+	decideCard := func(em effectiveModels) roleCard {
+		t.Helper()
+		for _, c := range buildRoleCards(roleInputs{Cfg: em.Cfg, Settings: em, Now: time.Now(), ServersKnown: true}) {
+			if c.Key == "decide" {
+				return c
+			}
+		}
+		t.Fatal("no decide card")
+		return roleCard{}
+	}
+
+	d := decideCard(applyModelSettings(cfg(), nil))
+	assert.Equal(t, "apply p ≥ 0.85 with asin_verbatim or exact_repeat · reject p ≤ 0.20", d.DecidePolicy)
+	assert.Equal(t, "preset jev", d.DecidePolicySource)
+
+	d = decideCard(applyModelSettings(cfg(), []db.ModelSetting{{Step: recipe.StepDecide, EndpointID: "litellm-s1",
+		Model: "clef:27b", Params: map[string]any{config.ParamRejectFloor: 0.05}}}))
+	assert.Contains(t, d.DecidePolicy, "with asin_verbatim · reject p ≤ 0.20 if the replacement is lowercase or p < 0.05")
+	assert.Equal(t, "db (reject_floor) over preset clef", d.DecidePolicySource)
+	assert.Empty(t, d.DecidePolicyError)
+	html := renderRoleCard(t, d)
+	assert.Contains(t, html, "db (reject_floor) over preset clef")
+
+	d = decideCard(applyModelSettings(cfg(), []db.ModelSetting{{Step: recipe.StepDecide, EndpointID: "litellm-s1",
+		Model: "clef:27b", Params: map[string]any{config.ParamApplyP: 0.1}}}))
+	assert.Equal(t, roleFailing, d.Health.Token)
+	assert.Contains(t, d.DecidePolicyError, "reject_p")
+	assert.Empty(t, d.DecidePolicy)
+	api := apiRolesFrom([]roleCard{d}, modelsEvidence{})
+	require.NotNil(t, api[0].SettingError)
+	assert.Contains(t, *api[0].SettingError, "reject_p")
+
+	d = decideCard(effectiveModels{Cfg: cfg(), Err: errors.New("down")})
+	assert.Empty(t, d.DecidePolicy, "a failed settings read shows no policy")
 }
 
 // The demo's model-settings scenario serves rows; the others none.
@@ -185,4 +232,11 @@ func TestJudgeCardThinking(t *testing.T) {
 	c = judgeCard()
 	assert.Empty(t, c.Thinking)
 	assert.Contains(t, c.ThinkingError, "EVAL_CHAT_TEMPLATE_KWARGS")
+}
+
+func renderRoleCard(t *testing.T, c roleCard) string {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, serversFragmentTmpl.Execute(&buf, modelsData{RoleCards: []roleCard{c}}))
+	return buf.String()
 }

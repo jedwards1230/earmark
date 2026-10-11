@@ -38,7 +38,10 @@ var DefaultSweep = []float64{0.55, 0.60, 0.67, 0.75, 0.85}
 type RunOptions struct {
 	Scope       db.DecideScope
 	Concurrency int
-	Params      ShouldApplyParams
+	// Params is the decide policy (+ rung 0's threshold); PolicySource names
+	// where the policy came from (Policy.SourceLabel), for the report.
+	Params       ShouldApplyParams
+	PolicySource string
 	// Sweep is the thresholds calibration re-runs rung 0 at (nil = DefaultSweep).
 	Sweep []float64
 	// Rung0Only stops after rung 0 and text evidence: no model call, no

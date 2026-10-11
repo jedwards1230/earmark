@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -43,6 +44,7 @@ import (
 //	    alias: jev-1.13.0
 //	    params:
 //	      usd_per_mtok_in: 0.042     # cost estimate when the gateway reports none
+//	      apply_p: 0.85              # decide policy (CONTRACT §2.19); optional
 //
 // Unset → no pins: recipes are still stamped, with the requested model as the
 // expected one and no revision. A file that is unreadable, malformed, names an
@@ -66,8 +68,9 @@ type ModelPin struct {
 	PromptVersion string `yaml:"prompt_version"`
 	// Params are step-specific settings. ParseModelRegistry accepts only
 	// known keys (knownPinParams): usd_per_mtok_in (decide, scan), a
-	// non-negative number, and on the propose step the judge request params
-	// reasoning_effort / chat_template_kwargs / temperature.
+	// non-negative number; on the propose step the judge request params
+	// reasoning_effort / chat_template_kwargs / temperature; and on the
+	// decide step the decide policy keys (DecidePolicyParams).
 	Params map[string]any `yaml:"params"`
 }
 
@@ -83,6 +86,22 @@ func (p ModelPin) FloatParam(key string) (float64, bool) {
 	}
 	f, ok := toFloat(v)
 	return f, ok
+}
+
+// ParamFloat reads a numeric param value (an int from YAML, a float64 from
+// JSON or a flag); ok=false for anything else.
+func ParamFloat(v any) (float64, bool) { return toFloat(v) }
+
+// ParseParamValue types a --param / --policy flag value: a number is a
+// float64, true/false a bool, anything else the string.
+func ParseParamValue(v string) any {
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return f
+	}
+	if b, err := strconv.ParseBool(v); err == nil && (v == "true" || v == "false") {
+		return b
+	}
+	return v
 }
 
 func toFloat(v any) (float64, bool) {
@@ -141,6 +160,78 @@ func ParseModelRegistry(r io.Reader) (*ModelRegistry, error) {
 	return &reg, nil
 }
 
+// Decide policy params (CONTRACT §2.19 "Decide policy"): the decide step's
+// apply/reject rule, settable per model on the decide step only (a
+// model_settings row's params, or MODELS_FILE steps.decide.params). This
+// package checks each key's type and range; internal/decide checks the
+// policy as a whole (known evidence kinds, reject_p < apply_p once merged with
+// the model's preset) before any run, and `earmark models set` before storing.
+const (
+	// ParamApplyP: p at or above it may apply (with allowed evidence); [0, 1].
+	ParamApplyP = "apply_p"
+	// ParamRejectP: p at or below it rejects; [0, 1].
+	ParamRejectP = "reject_p"
+	// ParamApplyEvidence: the text-evidence kinds an apply needs — a list, or
+	// a comma-separated string ("asin_verbatim,exact_repeat").
+	ParamApplyEvidence = "apply_evidence"
+	// ParamRejectRequiresLowercase: a reject also needs an all-lowercase
+	// replacement (or p < reject_floor); otherwise it holds. A boolean.
+	ParamRejectRequiresLowercase = "reject_requires_lowercase"
+	// ParamRejectFloor: with reject_requires_lowercase, p below it rejects
+	// whatever the case; [0, 1].
+	ParamRejectFloor = "reject_floor"
+)
+
+// DecidePolicyParams are the decide policy keys, in display order.
+var DecidePolicyParams = []string{
+	ParamApplyP, ParamRejectP, ParamApplyEvidence, ParamRejectRequiresLowercase, ParamRejectFloor,
+}
+
+// IsDecidePolicyParam reports whether key is a decide policy key.
+func IsDecidePolicyParam(key string) bool {
+	for _, k := range DecidePolicyParams {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// StringList reads a list-valued param: a list of strings (YAML/JSON) or a
+// comma-separated string (a --param flag). Elements are trimmed; an empty
+// element, a non-string element or an empty list is an error.
+func StringList(v any) ([]string, error) {
+	var raw []string
+	switch t := v.(type) {
+	case string:
+		raw = strings.Split(t, ",")
+	case []string:
+		raw = t
+	case []any:
+		for _, e := range t {
+			s, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("must be a list of strings, got element %v", e)
+			}
+			raw = append(raw, s)
+		}
+	default:
+		return nil, fmt.Errorf("must be a list of strings or a comma-separated string, got %v", v)
+	}
+	out := make([]string, 0, len(raw))
+	for _, s := range raw {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.ContainsAny(s, " \t\r\n") {
+			return nil, fmt.Errorf("has an empty or blank-containing element in %v", v)
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("must not be empty")
+	}
+	return out, nil
+}
+
 // pinParamError is a params validation failure. Its message starts with the
 // key path suffix (": unknown key …" or ".<key> must be …") so callers can
 // prefix the location ("steps.decide.params", "--param").
@@ -170,8 +261,11 @@ const (
 // knownPinParams are the param keys a step accepts: usd_per_mtok_in on any
 // step, plus the step's own keys.
 func knownPinParams(step string) []string {
-	if step == recipe.StepPropose {
+	switch step {
+	case recipe.StepPropose:
 		return []string{ParamUSDPerMTokIn, ParamReasoningEffort, ParamChatTemplateKwargs, ParamTemperature}
+	case recipe.StepDecide:
+		return append([]string{ParamUSDPerMTokIn}, DecidePolicyParams...)
 	}
 	return []string{ParamUSDPerMTokIn}
 }
@@ -207,6 +301,18 @@ func validatePinParams(step string, params map[string]any) error {
 			}
 		case ParamTemperature:
 			if _, err := TemperatureParam(v); err != nil {
+				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
+			}
+		case ParamApplyP, ParamRejectP, ParamRejectFloor:
+			if f, ok := toFloat(v); !ok || f < 0 || f > 1 || math.IsNaN(f) {
+				return &pinParamError{fmt.Sprintf(".%s must be a number in [0, 1], got %v", k, v)}
+			}
+		case ParamRejectRequiresLowercase:
+			if _, ok := v.(bool); !ok {
+				return &pinParamError{fmt.Sprintf(".%s must be true or false, got %v", k, v)}
+			}
+		case ParamApplyEvidence:
+			if _, err := StringList(v); err != nil {
 				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
 			}
 		}

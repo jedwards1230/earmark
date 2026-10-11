@@ -187,6 +187,7 @@ func (c *Config) Clone() *Config {
 		maps.Copy(n.Models.Steps, c.Models.Steps)
 	}
 	n.stepSources = maps.Clone(c.stepSources)
+	n.pinSources = maps.Clone(c.pinSources)
 	if n.env == nil {
 		// c is the env config itself (no setting applied yet): remember its
 		// binding and pins, so a later setting equal to env restores them.
@@ -311,6 +312,7 @@ func (c *Config) applyStepSetting(s StepSetting) error {
 		// or a row equal to env): the env MODELS_FILE pin describes it again,
 		// so the recipe is the env recipe.
 		c.Models.Steps[s.Step] = env.pin
+		c.setPinSource(s.Step, SourceEnv)
 		c.setStepSource(s.Step, s.source())
 		return nil
 	}
@@ -325,6 +327,7 @@ func (c *Config) applyStepSetting(s StepSetting) error {
 		PromptVersion: prev.PromptVersion,
 		Params:        maps.Clone(s.Params),
 	}
+	c.setPinSource(s.Step, s.source())
 	c.setStepSource(s.Step, s.source())
 	return nil
 }
@@ -360,6 +363,27 @@ func (c *Config) setStepSource(step, source string) {
 		c.stepSources = map[string]string{}
 	}
 	c.stepSources[step] = source
+}
+
+func (c *Config) setPinSource(step, source string) {
+	if c.pinSources == nil {
+		c.pinSources = map[string]string{}
+	}
+	c.pinSources[step] = source
+}
+
+// PinSource reports which layer a step's pin (ModelPin, incl. its params)
+// came from: SourceDB (a model_settings row), SourceOverride (a per-run
+// setting, which carries no params), or SourceEnv (MODELS_FILE, also when no
+// setting touched the pin). The decide policy uses it to name where a policy
+// param was set (CONTRACT §2.19 "Decide policy").
+func (c *Config) PinSource(step string) string {
+	if c != nil {
+		if s, ok := c.pinSources[step]; ok {
+			return s
+		}
+	}
+	return SourceEnv
 }
 
 // StepSource reports where a step's effective model comes from: SourceOverride,

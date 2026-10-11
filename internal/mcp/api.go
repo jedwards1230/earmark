@@ -151,6 +151,11 @@ type apiRole struct {
 	SettingUpdatedBy string  `json:"settingUpdatedBy,omitempty"`
 	SettingUpdatedAt *string `json:"settingUpdatedAt,omitempty"`
 	SettingError     *string `json:"settingError,omitempty"`
+	// Decide only (§2.19 "Decide policy"): the effective decide policy in
+	// one line and where it came from; omitted for other roles, and when the
+	// policy is invalid (settingError then says why).
+	DecidePolicy       string `json:"decidePolicy,omitempty"`
+	DecidePolicySource string `json:"decidePolicySource,omitempty"`
 }
 
 // apiGateway is one LiteLLM gateway as seen through earmark's virtual key
@@ -227,7 +232,8 @@ func apiRolesFrom(cards []roleCard, ev modelsEvidence) []apiRole {
 			Stale: c.Stale, CountsAsOf: asOf, CountsError: ev.SnapErr != nil, StaleAsOf: staleAsOf,
 		}
 		r.ModelSource, r.SettingUpdatedBy, r.SettingUpdatedAt = c.ModelSource, c.SettingBy, rfc3339Ptr(c.SettingAt)
-		if msg := cmp.Or(c.SettingError, c.SearchEmbedError); msg != "" {
+		r.DecidePolicy, r.DecidePolicySource = c.DecidePolicy, c.DecidePolicySource
+		if msg := cmp.Or(c.SettingError, c.DecidePolicyError, c.SearchEmbedError); msg != "" {
 			e := truncateRunes(msg, maxAPIErrorLen)
 			r.SettingError = &e
 		}

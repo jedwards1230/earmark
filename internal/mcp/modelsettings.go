@@ -6,6 +6,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/decide"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
@@ -138,6 +139,25 @@ func applySettingState(c *roleCard, em effectiveModels) {
 		// the registered endpoint on the card.
 		c.EndpointLabel = ep.BaseID
 	}
+}
+
+// applyDecidePolicy shows the decide card's effective decide policy and its
+// source (CONTRACT §2.19 "Decide policy"): the model's preset or the default,
+// with the decide step's pin params over it. Nothing is shown when the step
+// is off, its row is invalid (the row error says why), or the settings could
+// not be read (the policy depends on the row). An invalid policy makes the
+// card FAILING: every decide run refuses it.
+func applyDecidePolicy(c *roleCard, in roleInputs) {
+	if !c.Configured || c.SettingError != "" || in.Settings.Err != nil || in.Cfg == nil {
+		return
+	}
+	pol, err := decide.ResolvePolicy(in.Cfg, nil)
+	if err != nil {
+		c.DecidePolicyError = err.Error()
+		c.Health = health(roleFailing, "decide policy is invalid — decide runs fail until it is fixed (earmark models set decide --param …)")
+		return
+	}
+	c.DecidePolicy, c.DecidePolicySource = pol.Params.Describe(), pol.SourceLabel()
 }
 
 // effectiveStep is base with the step's model_settings row applied, strictly

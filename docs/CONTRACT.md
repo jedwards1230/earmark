@@ -2393,7 +2393,9 @@ ready` and `roles[judge].state = failing`.
   "modelSource": "db",          // §2.20: db | env | unset | unknown (settings unreadable); omitted for asr, format
   "settingUpdatedBy": "cli:justin",            // the model_settings row's updated_by; omitted without a row
   "settingUpdatedAt": "2026-10-10T09:00:00Z",  // its updated_at; omitted without a row
-  "settingError": "model_settings row for step decide is invalid …"  // set only for an invalid row (state failing)
+  "settingError": "model_settings row for step decide is invalid …", // set only for an invalid row or decide policy (state failing)
+  "decidePolicy": "apply p ≥ 0.85 with asin_verbatim · reject p ≤ 0.20 if the replacement is lowercase or p < 0.10", // decide only, §2.19 "Decide policy"
+  "decidePolicySource": "preset clef"  // default | preset <name> | "<layer> (<keys>) over …"
 }
 ```
 
@@ -4325,6 +4327,7 @@ steps:
     alias: jev-1.13.0
     params:
       usd_per_mtok_in: 0.042     # cost estimate when the gateway reports none
+      apply_p: 0.85              # optional decide policy keys (§2.19 "Decide policy")
   scan:                          # AI_ROLES.scan — `earmark scan` (§1.9 "Chunk scan")
     alias: jev-1.13.0
 ```
@@ -4336,7 +4339,7 @@ steps:
 | `expected_model` | the model the endpoint should report serving; the current recipe's `model_resolved`. Unset → the requested model |
 | `revision` | HF commit / `.nemo` sha256 / Ollama digest / provider snapshot |
 | `prompt_version` | the prompt version this deployment expects; the code's own version is authoritative, a mismatch is logged |
-| `params` | optional step settings. Known keys: `usd_per_mtok_in` (decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14); `reasoning_effort`, `chat_template_kwargs` and `temperature` (propose only) — the judge's per-model request knobs (§2.15 "Thinking controls"). An unknown key, a key the step does not accept, or a bad value is a startup error |
+| `params` | optional step settings. Known keys: `usd_per_mtok_in` (any step; used by decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14); `reasoning_effort`, `chat_template_kwargs` and `temperature` (propose only) — the judge's per-model request knobs (§2.15 "Thinking controls"); on `decide` only, the decide policy keys `apply_p`, `reject_p`, `reject_floor` (numbers in [0, 1]), `reject_requires_lowercase` (boolean) and `apply_evidence` (a list, or a comma-separated string, of evidence kinds) — §2.19 "Decide policy". An unknown key, a key the step does not accept, or a bad value is a startup error; a decide policy that is invalid once merged (e.g. `reject_p ≥ apply_p`) fails every decide run |
 
 Because `expected_model` becomes the current recipe's `model_resolved`, a
 response served by any other model (a LiteLLM fallback, or an alias silently
@@ -4564,28 +4567,83 @@ an error: every failure after rung 0 is a retryable `hold`.
    a variant adding rung 0's sound-alike score to the state (AUC 0.821, more
    tokens) were measured and not shipped.
 
-6. **Decision rule** — with `p` the `should_apply` `noul`:
+6. **Decision rule** — with `p` the `should_apply` `noul`, under the decide
+   model's policy (below, "Decide policy"):
 
    | Condition | Decision | Reason |
    |---|---|---|
    | no usable answer: transport error, timeout, 4xx/5xx, a reply that fails strict decoding, an answer from a model other than the expected one (`jev-1.13.0` by default; fallback), `p` NaN or outside [0, 1], a cancelled context | `hold` (retryable) | `jev_unavailable` |
    | `p ≥ apply_p`, issue type `dropped_word` or `number_artifact` | `hold` | `issue_type_capped` |
-   | `p ≥ apply_p`, evidence `asin_verbatim` or `exact_repeat` | `apply` | `confident_with_evidence` |
+   | `p ≥ apply_p`, evidence in `apply_evidence` | `apply` | `confident_with_evidence` |
+   | `p ≥ apply_p`, evidence `asin_verbatim`/`exact_repeat` not in `apply_evidence` | `hold` | `evidence_excluded` |
    | `p ≥ apply_p`, evidence `none` | `hold` | `no_evidence` |
    | `reject_p < p < apply_p` | `hold` | `uncertain` |
+   | `p ≤ reject_p`, `reject_requires_lowercase`, the replacement has an uppercase letter, `p ≥ reject_floor` | `hold` | `capitalised_replacement` |
    | `p ≤ reject_p` | `reject` | `jev_reject` |
 
    **Fail-closed rule:** nothing but a decoded, in-range answer from the pinned
    model can produce `apply`. `dropped_word` and `number_artifact` can never be
    applied by machine — their best outcome is `hold`.
 
-**Recipe params.** `apply_p` (0.95), `reject_p` (0.20), `phonetic_min_sim`
-(rung 0's sound-alike threshold, 0.67), `evidence_rule`, `rung0_version`, the
-context sizes (`context_words` 25, `neighbour_words` 20, `fallback_words` 25)
-and the relevance caps (`max_relevant_sentences` 4, `max_relevant_runes` 600,
-`max_sentence_runes` 200, `clip_words` 12) are all params of the
-decide recipe (§1.9), so changing any of them yields a new recipe. Params must
-satisfy `0 ≤ reject_p < apply_p ≤ 1` and `0 < phonetic_min_sim ≤ 1`.
+**Decide policy.** The decision rule's knobs are the decide policy, and each
+decide model has its own — models calibrate differently, so one threshold
+cannot serve them all:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `apply_p` | 0.85 | `p` at or above it may apply (with allowed evidence) |
+| `reject_p` | 0.20 | `p` at or below it rejects |
+| `apply_evidence` | `[asin_verbatim, exact_repeat]` | the evidence kinds an apply may rest on; a non-empty subset, recorded in canonical order |
+| `reject_requires_lowercase` | false | a reject also needs a replacement with no uppercase letter, or `p < reject_floor`; otherwise `hold` (`capitalised_replacement`) |
+| `reject_floor` | 0 | with `reject_requires_lowercase`, `p` below it rejects whatever the case |
+
+Validation (fail closed, `decide.ShouldApplyParams.Validate`):
+`0 ≤ reject_p < apply_p ≤ 1`; `apply_evidence` non-empty, known kinds, no
+repeats; `0 ≤ reject_floor ≤ reject_p`, and `reject_floor` is 0 unless
+`reject_requires_lowercase`. Key types and ranges are also checked when a
+setting is stored or `MODELS_FILE` is loaded (§2.18, §2.20).
+
+The effective policy (`decide.ResolvePolicy`) is resolved **per key**, each
+layer overriding the one below:
+
+1. `earmark decide --policy key=value` — this run only (source `override`);
+2. the decide step's pin params — a `model_settings` row's `params` (source
+   `db`), or `MODELS_FILE` `steps.decide.params` while no row replaces the
+   env pin (source `env`). A row that changes the model replaces the pin
+   wholesale (§2.20), so Jev's env policy keys never leak onto Clef;
+3. the built-in **preset** for the decide model id (provider prefix dropped):
+   `jev-*` → `jev`, `clef*` → `clef` (source `preset`);
+4. the default above (source `default`).
+
+The presets, and the measurement behind them (2,000 held findings scored by
+both models, 446 of them labelled from context):
+
+| Preset | Policy | Evidence |
+|---|---|---|
+| `jev` | the default: `apply_p` 0.85 with either evidence kind, `reject_p` 0.20 | at `p ≥ 0.85` with evidence Jev made 27 applies over the 2,000, 100% precision (the old 0.95 threshold left them held). Jev never rejects usefully below its minimum `p` of 0.20, so `reject_p` stays 0.20 |
+| `clef` | `apply_p` 0.85 with `asin_verbatim` only; `reject_p` 0.20 with `reject_requires_lowercase` and `reject_floor` 0.10 | on `asin_verbatim` alone 26/26 applies at `p ≥ 0.85` were good; Clef over-scores `exact_repeat` (intentional repetition), so that kind is excluded. Its rejects are safe only for an all-lowercase replacement or `p < 0.10` (55 such rejects, 96% junk); a capitalised low-`p` replacement — usually a name Clef does not know — holds |
+
+The policy is part of the decide recipe's params, so a policy change is a new
+recipe, and `current_recipes` follows the resolved policy (`decide.CurrentRecipe`).
+The `fn_calls` cache is keyed by function, prompt, model and input — not
+params — so re-deciding under a new policy is served from the cached answers
+(only failed calls are asked again). A dry run resolves exactly like `--yes`,
+so `earmark decide --model clef:27b --sample N --dump F` reports Clef's
+outcomes under Clef's policy. The report prints a `policy:` line (JSON
+`policy`, `policy_source`); `earmark models` and the Models page show the
+effective policy and its source (e.g. `db (reject_floor) over preset clef`).
+
+**Recipe params.** The decide policy (`apply_p`, `reject_p`,
+`apply_evidence`, `reject_requires_lowercase`, `reject_floor`),
+`phonetic_min_sim` (rung 0's sound-alike threshold, 0.67), `evidence_rule`,
+`rung0_version`, the context sizes (`context_words` 25, `neighbour_words` 20,
+`fallback_words` 25) and the relevance caps (`max_relevant_sentences` 4,
+`max_relevant_runes` 600, `max_sentence_runes` 200, `clip_words` 12) are all
+params of the decide recipe (§1.9), so changing any of them yields a new
+recipe. Params must satisfy the policy rules above and
+`0 < phonetic_min_sim ≤ 1`. *History:* `apply_p` was 0.95 until the
+per-model policy; the new default re-decides the held backlog under a new
+recipe.
 
 **Outcome** (what a decision record persists): finding id, decision, reason,
 retryable flag, `p` (absent when the model was not asked or gave no usable
@@ -4826,7 +4884,7 @@ step is off). An override never writes `model_settings`.
 it, plus optional pins with `MODELS_FILE` semantics (§2.18):
 `expected_model`, `revision`, `params` (known: `usd_per_mtok_in`; on
 `propose` also `reasoning_effort`, `chat_template_kwargs` and `temperature`, §2.15 "Thinking
-controls"). URLs and
+controls"; on `decide` also the decide policy keys, §2.19 "Decide policy"). URLs and
 keys are never stored: where to connect and with which credential stays in
 the env registry, so a setting can only choose among endpoints the deployment
 already declares. Applying it (`config.(*Config).WithStepSettings`) returns a
@@ -4863,7 +4921,9 @@ needs; the model is non-empty without whitespace and, for `systemone`, a
 pinned version (`config.PinnedModel`); params are known keys with valid
 values (the `MODELS_FILE` rule); `expected_model` and `revision` hold no
 whitespace; a `systemone` model on the TypeSafe pass-through must be `jev-*`
-(§2.14). `earmark models set` refuses invalid input before writing, and
+(§2.14). `earmark models set` refuses invalid input before writing; `set
+decide` also refuses a row whose decide policy, merged over the model's
+preset, does not validate (§2.19 "Decide policy"), and
 `set embed` also embeds one probe string through the endpoint and refuses a
 model whose vectors are not 768-dimension (or an unreachable endpoint;
 `--no-probe` stores without the check). Setting the stored value again writes
@@ -4949,12 +5009,23 @@ delete, and its event with the value it replaced (`db.SetModelSetting`,
 **CLI.**
 
 ```bash
-earmark models [--json]                      # per step: source, endpoint, model, pin, env default, who set it; invalid rows
+earmark models [--json]                      # per step: source, endpoint, model, pin, env default, who set it; invalid rows;
+                                             # decide: its effective decide policy and source (§2.19 "Decide policy")
 earmark models set <step> [--endpoint <id>] [--model <id>] [--expected-model <id>] [--revision <r>] \
                           [--param key=value ...] [--note "why"] [--no-probe]
 earmark models unset <step> [--note "why"]   # back to the env default
 earmark models history [step] [--limit 50] [--json]
 earmark eval|decide|scan ... --endpoint <id> --model <id>   # this run only
+earmark decide ... --policy key=value                         # this run only: a decide policy key (§2.19)
+```
+
+Decide policy keys go on the decide row as `--param` (validated merged over
+the model's preset before anything is stored):
+
+```bash
+earmark models set decide --endpoint litellm-s1 --model clef:27b                         # Clef, under the clef preset
+earmark models set decide --endpoint litellm-s1 --model clef:27b --param reject_floor=0.05
+earmark models set decide --param apply_p=0.9 --param apply_evidence=asin_verbatim        # Jev (env endpoint), tighter
 ```
 
 `set`: `--endpoint` defaults to the step's env endpoint, `--model` to the

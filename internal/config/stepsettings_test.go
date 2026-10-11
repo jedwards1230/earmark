@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -111,7 +112,7 @@ func TestStepSettingsValidation(t *testing.T) {
 			Params: map[string]any{ParamUSDPerMTokIn: "cheap"}}, "non-negative number"},
 		{"synthesized endpoint", StepSetting{Step: recipe.StepScan, EndpointID: "jev@decide", Model: "jev-1.13.0"}, `not in AI_ENDPOINTS`},
 		{"thinking param on decide", StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
-			Params: map[string]any{ParamReasoningEffort: "low"}}, `unknown key "reasoning_effort" (known for decide: usd_per_mtok_in)`},
+			Params: map[string]any{ParamReasoningEffort: "low"}}, `unknown key "reasoning_effort" (known for decide: usd_per_mtok_in, apply_p,`},
 		{"numeric reasoning_effort", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
 			Params: map[string]any{ParamReasoningEffort: 1.0}}, "reasoning_effort must be a string"},
 		{"blank reasoning_effort", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
@@ -430,4 +431,76 @@ func TestChatTemplateKwargsParam(t *testing.T) {
 		_, err := ChatTemplateKwargsParam(bad)
 		assert.Error(t, err, "%v", bad)
 	}
+}
+
+// Decide policy keys are pin params of the decide step only, type- and
+// range-checked here (internal/decide validates the merged policy).
+func TestDecidePolicyParams(t *testing.T) {
+	ok := map[string]any{
+		ParamApplyP: 0.85, ParamRejectP: 0, ParamRejectFloor: 1, ParamRejectRequiresLowercase: true,
+		ParamApplyEvidence: []any{"asin_verbatim", "exact_repeat"}, ParamUSDPerMTokIn: 0.01,
+	}
+	require.NoError(t, validatePinParams(recipe.StepDecide, ok))
+	require.NoError(t, validatePinParams(recipe.StepDecide, map[string]any{ParamApplyEvidence: "asin_verbatim, exact_repeat"}))
+	for name, tc := range map[string]struct {
+		step   string
+		params map[string]any
+		want   string
+	}{
+		"policy key on scan":    {recipe.StepScan, map[string]any{ParamApplyP: 0.9}, `unknown key "apply_p"`},
+		"policy key on propose": {recipe.StepPropose, map[string]any{ParamRejectFloor: 0.1}, `unknown key "reject_floor"`},
+		"apply_p over 1":        {recipe.StepDecide, map[string]any{ParamApplyP: 1.5}, "in [0, 1]"},
+		"reject_p negative":     {recipe.StepDecide, map[string]any{ParamRejectP: -0.1}, "in [0, 1]"},
+		"reject_floor text":     {recipe.StepDecide, map[string]any{ParamRejectFloor: "low"}, "in [0, 1]"},
+		"lowercase as number":   {recipe.StepDecide, map[string]any{ParamRejectRequiresLowercase: 1.0}, "true or false"},
+		"evidence empty":        {recipe.StepDecide, map[string]any{ParamApplyEvidence: ""}, "apply_evidence"},
+		"evidence non-string":   {recipe.StepDecide, map[string]any{ParamApplyEvidence: []any{1.0}}, "list of strings"},
+		"evidence number":       {recipe.StepDecide, map[string]any{ParamApplyEvidence: 2.0}, "list of strings"},
+		"typo":                  {recipe.StepDecide, map[string]any{"apply_pp": 0.9}, `unknown key "apply_pp"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validatePinParams(tc.step, tc.params)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+
+	// MODELS_FILE: the same rule, per step.
+	_, err := ParseModelRegistry(strings.NewReader("steps:\n  decide:\n    params:\n      apply_p: 0.9\n      apply_evidence: [asin_verbatim]\n      reject_requires_lowercase: true\n"))
+	require.NoError(t, err)
+	_, err = ParseModelRegistry(strings.NewReader("steps:\n  scan:\n    params:\n      apply_p: 0.9\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "steps.scan.params")
+}
+
+// PinSource names the layer the decide pin (and so its policy params) came
+// from.
+func TestPinSource(t *testing.T) {
+	base := settingsBase()
+	assert.Equal(t, SourceEnv, base.PinSource(recipe.StepDecide))
+	row := StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0", Params: map[string]any{ParamApplyP: 0.9}}
+	c, err := base.WithStepSettings(row)
+	require.NoError(t, err)
+	assert.Equal(t, SourceDB, c.PinSource(recipe.StepDecide))
+	assert.Equal(t, 0.9, c.ModelPin(recipe.StepDecide).Params[ParamApplyP])
+	// An override back to the env model restores the env pin.
+	c2, err := c.WithStepSettings(StepSetting{Step: recipe.StepDecide, EndpointID: "jev", Model: "jev-1.13.0", Source: SourceOverride})
+	require.NoError(t, err)
+	assert.Equal(t, SourceEnv, c2.PinSource(recipe.StepDecide))
+	assert.Equal(t, SourceOverride, c2.StepSource(recipe.StepDecide))
+	// An override equal to the row keeps the row's pin.
+	c3, err := c.WithStepSettings(StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0", Source: SourceOverride})
+	require.NoError(t, err)
+	assert.Equal(t, SourceDB, c3.PinSource(recipe.StepDecide))
+	assert.Equal(t, 0.9, c3.ModelPin(recipe.StepDecide).Params[ParamApplyP])
+	// The base config is never touched.
+	assert.Equal(t, SourceEnv, base.PinSource(recipe.StepDecide))
+}
+
+func TestParseParamValue(t *testing.T) {
+	assert.Equal(t, 0.5, ParseParamValue("0.5"))
+	assert.Equal(t, true, ParseParamValue("true"))
+	assert.Equal(t, false, ParseParamValue("false"))
+	assert.Equal(t, "TRUE", ParseParamValue("TRUE"), "only lowercase true/false are booleans")
+	assert.Equal(t, "asin_verbatim", ParseParamValue("asin_verbatim"))
 }

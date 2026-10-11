@@ -51,8 +51,13 @@ type options struct {
 	// (CONTRACT §2.20).
 	overrideEndpoint string
 	overrideModel    string
+	// --policy key=value: the decide policy for this run only (CONTRACT
+	// §2.19 "Decide policy").
+	policyFlags []string
 	// model is the resolved decision model (not a flag; zero = default).
 	model decidepkg.Model
+	// policy is the resolved decide policy (not a flag; zero = default).
+	policy decidepkg.Policy
 }
 
 var opts options
@@ -79,6 +84,18 @@ Model: should_apply asks the decide step's effective model (CONTRACT §2.20):
 models set decide ...'), else AI_ROLES.decide. Any pinned System One model
 works; a different model is a different decide recipe, so its decisions are
 never confused with another model's. Neither flag writes model_settings.
+
+Policy: each decide model has its own apply/reject rule (CONTRACT §2.19
+"Decide policy") — apply_p, reject_p, apply_evidence,
+reject_requires_lowercase, reject_floor — resolved per key: --policy
+key=value for this run, else the decide step's model_settings params
+('earmark models set decide --param apply_p=0.9'), else MODELS_FILE
+steps.decide.params, else the built-in preset for the model (jev-*, clef*),
+else the default (apply p >= 0.85 with text evidence, reject p <= 0.20). The
+policy is part of the decide recipe, so a dry run reports outcomes under
+exactly the policy a --yes run with the same flags would use, and a new
+policy re-decides from cached model answers. The report's "policy:" line
+names it and its source.
 
 --calibrate samples findings a person already decided through the review
 surface (accepted/applied vs rejected) instead, and reports how often the
@@ -122,7 +139,8 @@ Examples:
   earmark decide --yes --shard 0/4               # one of four parallel runners
   earmark decide revert --recipe <id>            # preview the undo
   earmark decide revert --recipe <id> --yes
-  earmark decide --sample 200 --seed q4 --endpoint litellm-s1 --model clef:27b`,
+  earmark decide --sample 200 --seed q4 --endpoint litellm-s1 --model clef:27b
+  earmark decide --sample 200 --seed q4 --policy apply_p=0.9 --dump /tmp/d.jsonl`,
 	Run: runDecide,
 }
 
@@ -145,6 +163,7 @@ func init() {
 	f.IntVar(&opts.maxAccepts, "max-accepts", 0, "with --yes: stop after N accepts (bounds the re-embed; 0 = no cap)")
 	f.StringVar(&opts.overrideEndpoint, "endpoint", "", "this run only: the AI_ENDPOINTS id (a systemone endpoint) to ask (default: the decide step's effective endpoint)")
 	f.StringVar(&opts.overrideModel, "model", "", "this run only: the pinned System One model id to ask (default: the decide step's effective model)")
+	f.StringArrayVar(&opts.policyFlags, "policy", nil, "this run only: a decide policy key=value (apply_p, reject_p, apply_evidence, reject_requires_lowercase, reject_floor) over the model's policy; repeatable")
 	DecideCmd.AddCommand(RevertCmd)
 }
 
@@ -212,17 +231,13 @@ func runDecide(cmd *cobra.Command, _ []string) {
 		os.Exit(1)
 	}
 	defer database.Close()
-	// The decide step's effective model (CONTRACT §2.20): --endpoint/--model,
-	// else its model_settings row, else AI_ROLES.decide. An invalid row fails
-	// the run (even a rung-0 replay, whose recipe id names the model).
-	cfg, err = db.ResolveStep(context.Background(), database, cfg, recipe.StepDecide,
-		opts.overrideEndpoint, opts.overrideModel)
+	cfg, opts, err = resolve(context.Background(), database, cfg, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
 	}
 	log.Print(cfg.DescribeStep(recipe.StepDecide))
-	opts.model, _ = decidepkg.ModelFromConfig(cfg)
+	log.Printf("decide policy: %s (source %s)", opts.policy.Params.Describe(), opts.policy.SourceLabel())
 	// A rung-0 replay asks no model, so it needs no decide endpoint.
 	var asker decidepkg.Asker
 	if !opts.rung0Only {
@@ -256,6 +271,30 @@ func runDecide(cmd *cobra.Command, _ []string) {
 	}
 }
 
+// resolve is the decide step's effective model and policy for this run.
+// Model (CONTRACT §2.20): --endpoint/--model, else its model_settings row,
+// else AI_ROLES.decide; an invalid row fails the run (even a rung-0 replay,
+// whose recipe id names the model). Policy (CONTRACT §2.19 "Decide policy"),
+// for that model: --policy, else the step's pin params, else the model's
+// preset, else the default; a bad value fails the run before anything is
+// decided. Dry runs and --yes resolve alike, so a dry run reports outcomes
+// under exactly the policy the write would use.
+func resolve(ctx context.Context, settings db.SettingsReader, base *config.Config, o options) (*config.Config, options, error) {
+	cfg, err := db.ResolveStep(ctx, settings, base, recipe.StepDecide, o.overrideEndpoint, o.overrideModel)
+	if err != nil {
+		return nil, o, err
+	}
+	o.model, _ = decidepkg.ModelFromConfig(cfg)
+	override, err := decidepkg.ParsePolicyFlags(o.policyFlags)
+	if err != nil {
+		return nil, o, err
+	}
+	if o.policy, err = decidepkg.ResolvePolicy(cfg, override); err != nil {
+		return nil, o, err
+	}
+	return cfg, o, nil
+}
+
 // run is the testable core. The run is recorded in step_runs (CONTRACT
 // §1.10) when store is the real database; recording never fails the run.
 func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker decidepkg.Asker, o options) (err error) {
@@ -276,7 +315,7 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 		rep, err = decidepkg.Apply(ctx, store, asker, decidepkg.ApplyOptions{
 			Book: o.book, IssueType: o.issueType, Shard: shard, Shards: shards,
 			Limit: o.limit, Batch: o.batch, MaxAccepts: o.maxAccepts,
-			Concurrency: o.concurrency, Params: decidepkg.DefaultShouldApplyParams(),
+			Concurrency: o.concurrency, Params: policyParams(o), PolicySource: o.policy.SourceLabel(),
 			Progress: rec, Model: o.model,
 		})
 	} else {
@@ -285,11 +324,12 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 				Sample: o.sample, Seed: o.seed, Book: o.book, IssueType: o.issueType,
 				Calibrate: o.calibrate, HumanActors: o.human,
 			},
-			Concurrency: o.concurrency,
-			Params:      decidepkg.DefaultShouldApplyParams(),
-			Rung0Only:   o.rung0Only,
-			Progress:    rec,
-			Model:       o.model,
+			Concurrency:  o.concurrency,
+			Params:       policyParams(o),
+			PolicySource: o.policy.SourceLabel(),
+			Rung0Only:    o.rung0Only,
+			Progress:     rec,
+			Model:        o.model,
 		}
 		rep, err = dryRun(ctx, store, asker, ro, o.dump)
 	}
@@ -297,6 +337,15 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 		return err
 	}
 	return rep.Print(out, o.json)
+}
+
+// policyParams is the run's resolved decide policy (the default when none
+// was resolved, as in a test that sets no policy).
+func policyParams(o options) decidepkg.ShouldApplyParams {
+	if o.policy.Source == "" {
+		return decidepkg.DefaultShouldApplyParams()
+	}
+	return o.policy.Params
 }
 
 // modelOrDefault names the model a run asks.
@@ -347,6 +396,9 @@ func argsSummary(o options) string {
 	}
 	if o.overrideModel != "" {
 		add("--model %s", o.overrideModel)
+	}
+	for _, kv := range o.policyFlags {
+		add("--policy %s", kv)
 	}
 	return b.String()
 }
