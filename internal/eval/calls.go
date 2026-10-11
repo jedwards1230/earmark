@@ -116,11 +116,14 @@ func (j *Judge) CallPolicy() CallPolicy { return j.policy }
 // first. Retried: a 429 or 5xx (waiting the Retry-After the endpoint asked
 // for, else the backoff), and the transient transport failures transient()
 // lists — the attempt's deadline or another network timeout, a refused or
-// reset connection, a connection closed mid-reply (EOF / unexpected EOF), a
+// reset connection, a connection closed before the reply (EOF / unexpected
+// EOF from the transport), a
 // temporary DNS failure, an HTTP/2 stream reset, GOAWAY or lost connection —
 // each after the backoff. Never retried: a reply-level failure
 // (invalid_reply, an empty/thinking-only/truncated/refused reply), any other
-// status, a TLS certificate failure, a bad URL or any other non-transient
+// status, a body-read failure after the endpoint answered (BodyReadError —
+// possibly billed, cost unknown), a TLS certificate failure, a bad URL or any
+// other non-transient
 // error, nor anything once the caller's context is done or the retries are
 // spent.
 func (j *Judge) retryDelay(ctx context.Context, err error, attempt int) (time.Duration, bool) {
@@ -145,8 +148,8 @@ func (j *Judge) retryDelay(ctx context.Context, err error, attempt int) (time.Du
 
 // transient reports whether a call failure is worth another attempt: the
 // attempt's deadline, a network timeout, a connection refused or reset, a
-// connection that closed mid-reply (EOF / unexpected EOF, also while reading
-// the body), a DNS failure other than "no such host" (a temporary resolver
+// connection that closed before the reply's headers (EOF / unexpected EOF
+// from the transport), a DNS failure other than "no such host" (a temporary resolver
 // failure clears; NXDOMAIN does not), or an HTTP/2 stream reset, GOAWAY or
 // lost connection. Never a TLS certificate failure, nor a url.Error that
 // wraps no network failure (a bad URL, an unsupported scheme): those fail
@@ -154,10 +157,15 @@ func (j *Judge) retryDelay(ctx context.Context, err error, attempt int) (time.Du
 //
 // A bare io.EOF stays retryable: net/http returns it (inside a url.Error)
 // when the server closes a reused keep-alive connection before answering —
-// the classic stale-connection race, which a fresh connection fixes. The
-// cost of being wrong is one extra paid call, which is logged like any other.
+// the classic stale-connection race, which a fresh connection fixes; no reply
+// exists yet, so nothing was billed for it. A failure reading the body of a
+// reply that did arrive (BodyReadError) is never retried: that call may be
+// billed, and its usage and cost are lost with the body.
 func transient(err error) bool {
-	if certificateError(err) {
+	var body *BodyReadError
+	if errors.As(err, &body) || certificateError(err) {
+		// A body-read failure came after the endpoint answered: the call may
+		// be billed and its cost is lost, so a retry would pay again unseen.
 		return false
 	}
 	var ne net.Error

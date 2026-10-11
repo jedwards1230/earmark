@@ -294,3 +294,60 @@ func TestIntegrationRejudgeTargetsEquivalentRecipe(t *testing.T) {
 		t.Errorf("selected %+v; want only %s (the other is complete under an equivalent recipe)", page, ids[1])
 	}
 }
+
+// TestIntegrationRejudgeShardEqualsDecideShard: over the same transcripts,
+// RejudgeTargets and DecideWork with --shard i/N select exactly the same
+// transcripts for every i — the whole path, Go argument order included, not
+// just the SQL text (TestRejudgeShardMatchesDecide).
+func TestIntegrationRejudgeShardEqualsDecideShard(t *testing.T) {
+	d := integrationDB(t, newTestDatabase(t))
+	ctx := context.Background()
+	rid, err := d.RegisterRecipe(ctx, proposeRecipe("model-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 40 {
+		tID, path := seedTranscript(t, d)
+		if _, err := d.pool.Exec(ctx, `INSERT INTO transcript_chunks (transcript_id, file_path, chunk_index,
+			start_sec, end_sec, text, embedding) VALUES ($1, $2, 0, 0, 1, 'x', array_fill(0.1, ARRAY[768])::vector)`,
+			tID, path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.pool.Exec(ctx, `INSERT INTO transcript_findings (transcript_id, file_path, chunk_index,
+			start_sec, end_sec, original_text, issue_type, suggested_correction, confidence, model,
+			anchor_offset, chunk_text_sha256)
+			VALUES ($1, $2, 0, 0, 1, 'pin name', 'homophone', 'pen name', 0.9, 'm', 0, 'sha')`, tID, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decideRecipe := strings.Repeat("de", 32)
+	const shards = 4
+	covered := 0
+	for i := range shards {
+		targets, err := d.RejudgeTargets(ctx, RejudgeQuery{RecipeID: rid, Shard: i, Shards: shards, Limit: 1000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		work, err := d.DecideWork(ctx, DecideWorkScope{RecipeID: decideRecipe, RetryReason: "jev_unavailable",
+			Shard: i, Shards: shards, Limit: MaxDecideWorkPage})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var a, b []string
+		for _, x := range targets {
+			a = append(a, x.TranscriptID)
+		}
+		for _, f := range work {
+			b = append(b, f.TranscriptID)
+		}
+		slices.Sort(a)
+		slices.Sort(b)
+		if !slices.Equal(a, b) {
+			t.Errorf("shard %d/%d: rejudge selects %v, decide %v", i, shards, a, b)
+		}
+		covered += len(a)
+	}
+	if covered != 40 {
+		t.Errorf("shards covered %d transcripts, want 40", covered)
+	}
+}

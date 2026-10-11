@@ -24,7 +24,9 @@ type fakeRejudgeDB struct {
 	commits  []db.JudgePassCommit
 	selected int
 	queries  []db.RejudgeQuery
-	keys     map[string]map[db.FindingKey]bool // per recipe id
+	// commitErr fails every CommitJudgePass.
+	commitErr error
+	keys      map[string]map[db.FindingKey]bool // per recipe id
 }
 
 func newFakeRejudgeDB(n, k int) *fakeRejudgeDB {
@@ -88,6 +90,9 @@ func (f *fakeRejudgeDB) CommitJudgePass(_ context.Context, c db.JudgePassCommit)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commits = append(f.commits, c)
+	if f.commitErr != nil {
+		return db.JudgePassResult{}, f.commitErr
+	}
 	return db.JudgePassResult{Inserted: len(c.Findings)}, nil
 }
 
@@ -313,7 +318,7 @@ type reportingGauge struct{ gaugeChat }
 
 func (r *reportingGauge) CompleteWithModel(ctx context.Context, s, u string) (evalpkg.Completion, error) {
 	c, err := r.Complete(ctx, s, u)
-	return evalpkg.Completion{Content: c, ResolvedModel: "gauge-judge-2026-10-01"}, err
+	return evalpkg.Completion{Content: c, ResolvedModel: "gauge-judge-2026-10-01", CostUSD: 0.25, HasCost: true}, err
 }
 
 // TestRejudge_WarnsOnFallback: replies from a model other than the recipe
@@ -386,5 +391,31 @@ func TestDryRunDedupePerRecipe(t *testing.T) {
 	// fallback's own recipe (under the run's recipe it would count as new).
 	if res := dryRunDedupe(context.Background(), fdb, "t", []db.Finding{f(&fb)}); res.Duplicates != 1 || res.Inserted != 0 {
 		t.Errorf("fallback-only %+v: want 1 duplicate", res)
+	}
+}
+
+// TestRejudge_CommitFailureStillTallied: when a pass's commit fails nothing
+// is stored, but its calls were made and paid for — the summary still counts
+// the chunks, the cost and the fallbacks.
+func TestRejudge_CommitFailureStillTallied(t *testing.T) {
+	fdb := newFakeRejudgeDB(2, 2)
+	fdb.commitErr = errors.New("tx aborted")
+	var out strings.Builder
+	err := runRejudge(context.Background(), &out, fdb, evalpkg.NewJudge(&reportingGauge{}),
+		rejudgeOptions{write: true, concurrency: 2})
+	if err == nil {
+		t.Fatal("a run whose commits all failed must fail")
+	}
+	s := out.String()
+	for _, want := range []string{
+		"2 transcript(s) attempted — 0 complete, 0 partial, 2 failed",
+		"4 chunk(s) judged",
+		"$1.0000",
+		"answered with a model other than the recipe expects",
+		"WARNING: 4 chunk(s) were answered by a model other than the recipe expects",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary lacks %q:\n%s", want, s)
+		}
 	}
 }

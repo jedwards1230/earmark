@@ -3553,12 +3553,15 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
   retries nothing — a failed chunk is recorded and re-judged by a later run)
   retries an attempt that failed **transiently**: an HTTP 429 or 5xx, an
   attempt that hit its own deadline or another network timeout, a connection
-  refused or reset, or a connection that closed mid-reply (`EOF` /
-  unexpected `EOF`, also while reading the body — a bare `EOF` is kept
-  because net/http returns it when a server closes a reused keep-alive
-  connection before answering; the worst case is one extra, logged, paid
-  call), a DNS failure other than "no such host", or an HTTP/2 stream reset,
-  GOAWAY or lost connection. A TLS certificate failure
+  refused or reset, or a connection that closed before the reply arrived
+  (`EOF` / unexpected `EOF` from the transport — a bare `EOF` is kept because
+  net/http returns it when a server closes a reused keep-alive connection
+  before answering; no reply exists, so nothing was billed), a DNS failure
+  other than "no such host", or an HTTP/2 stream reset, GOAWAY or lost
+  connection. **Never retried:** a failure reading the body of a reply that
+  did arrive (`error_class` `body_read`) — the call may have been billed, and
+  its usage and cost are lost with the body, so a retry would pay again
+  unseen. A TLS certificate failure
   and a `url.Error` that wraps no network failure (a bad URL, an unsupported
   scheme) fail the same way every time and are not retried. The wait is the
   endpoint's `Retry-After` (delta-seconds or an HTTP date, capped at 5 min)

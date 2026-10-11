@@ -5,9 +5,11 @@ import (
 	"testing"
 )
 
-// TestRejudgeShardMatchesDecide pins the re-judge partition to decide's:
-// both selections use shardClause, so `--shard i/N` names the same
-// transcripts in `earmark decide` and `earmark eval --rejudge`.
+// TestRejudgeShardMatchesDecide checks the SQL text only: both selections
+// contain shardClause with their own placeholders. That the Go callers bind
+// those placeholders the same way (shard vs shards) — so `--shard i/N` names
+// the same transcripts in `earmark decide` and `earmark eval --rejudge` — is
+// proved end to end by TestIntegrationRejudgeShardEqualsDecideShard.
 func TestRejudgeShardMatchesDecide(t *testing.T) {
 	if want := shardClause("f.transcript_id", "$4", "$5"); !strings.Contains(decideWorkSQL, want) {
 		t.Errorf("decideWorkSQL no longer uses shardClause:\nwant %s", want)

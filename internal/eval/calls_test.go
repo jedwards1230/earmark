@@ -507,7 +507,8 @@ func TestTransient(t *testing.T) {
 		"connection reset":      {&url.Error{Op: "Post", URL: "u", Err: &net.OpError{Op: "read", Err: syscall.ECONNRESET}}, true},
 		"connection refused":    {&url.Error{Op: "Post", URL: "u", Err: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}}, true},
 		"EOF on request":        {&url.Error{Op: "Post", URL: "u", Err: io.EOF}, true},
-		"reset reading body":    {fmt.Errorf("read chat response: %w", io.ErrUnexpectedEOF), true},
+		"reset reading body":    {&BodyReadError{Err: io.ErrUnexpectedEOF}, false},
+		"body reset, wrapped":   {fmt.Errorf("judge chunk c: %w", &BodyReadError{Err: syscall.ECONNRESET}), false},
 		"x509 unknown CA":       {&url.Error{Op: "Post", URL: "u", Err: x509.UnknownAuthorityError{}}, false},
 		"tls verify":            {&url.Error{Op: "Post", URL: "u", Err: &tls.CertificateVerificationError{Err: x509.HostnameError{}}}, false},
 		"bad URL":               {&url.Error{Op: "parse", URL: "::", Err: errors.New("missing protocol scheme")}, false},
@@ -568,5 +569,31 @@ func TestFallbackIsCounted(t *testing.T) {
 		[]db.EvalChunk{pinNameChunk()}, nil, nil)
 	if stats.ChunksFallback != 0 {
 		t.Errorf("same model behind a route prefix counted as fallback")
+	}
+}
+
+// TestJudgeChunk_BodyReadFailureNotRetried: the endpoint answers 200 and the
+// connection drops mid-body. That call may be billed with its cost lost, so
+// it is not retried (a retry would pay again unseen); the error class says why.
+func TestJudgeChunk_BodyReadFailureNotRetried(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Length", "4096")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"m","choi`)) // then the handler returns: short body
+	}))
+	t.Cleanup(srv.Close)
+	j, waits := judgeFor(srv, CallPolicy{Retries: 4, BackoffBase: time.Millisecond})
+	_, err := j.JudgeChunk(context.Background(), pinNameChunk())
+	var bre *BodyReadError
+	if !errors.As(err, &bre) {
+		t.Fatalf("want a BodyReadError, got %v", err)
+	}
+	if calls.Load() != 1 || len(*waits) != 0 {
+		t.Errorf("%d calls, %d waits: a body-read failure must not be retried", calls.Load(), len(*waits))
+	}
+	if errorClass(err) != "body_read" {
+		t.Errorf("error class %q, want body_read", errorClass(err))
 	}
 }

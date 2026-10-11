@@ -580,6 +580,18 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("chat endpoint returned %d: %s", e.Code, e.Body)
 }
 
+// BodyReadError is a failure to read a reply's body after the endpoint
+// answered. The call may have been billed while its usage and cost are lost
+// with the body, so the judge never retries it (transient() refuses it).
+type BodyReadError struct{ Err error }
+
+func (e *BodyReadError) Error() string { return "read chat response: " + e.Err.Error() }
+func (e *BodyReadError) Unwrap() error { return e.Err }
+
+// ErrorClass is "body_read" (genai.Classifier), so fn_calls and the span say
+// why this call was not retried.
+func (e *BodyReadError) ErrorClass() string { return "body_read" }
+
 // ErrChatNotConfigured: no eval chat endpoint is configured at all (as opposed
 // to one that is configured but invalid).
 var ErrChatNotConfigured = errors.New("eval chat endpoint not configured")
@@ -658,7 +670,10 @@ func (c *openAIChatClient) CompleteWithModel(ctx context.Context, system, user s
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return Completion{}, fmt.Errorf("read chat response: %w", err)
+		// The request reached the endpoint and may have been billed, but the
+		// usage and cost are in the body we failed to read: never retried
+		// (a retry would pay again, invisibly) — see transient().
+		return Completion{}, &BodyReadError{Err: err}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Completion{}, &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(respBody)),
