@@ -382,4 +382,9 @@ func TestDryRunDedupePerRecipe(t *testing.T) {
 		t.Errorf("%+v: want the current-recipe finding new once (its repeat a duplicate) and the fallback's a duplicate (rids %s / %s)",
 			res, ridCur, ridFB)
 	}
+	// The fallback's finding alone: a duplicate only when looked up under the
+	// fallback's own recipe (under the run's recipe it would count as new).
+	if res := dryRunDedupe(context.Background(), fdb, "t", []db.Finding{f(&fb)}); res.Duplicates != 1 || res.Inserted != 0 {
+		t.Errorf("fallback-only %+v: want 1 duplicate", res)
+	}
 }

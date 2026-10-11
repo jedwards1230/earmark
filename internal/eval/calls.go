@@ -113,11 +113,16 @@ func (j *Judge) SetCallPolicy(p CallPolicy) { j.policy = p }
 func (j *Judge) CallPolicy() CallPolicy { return j.policy }
 
 // retryDelay decides whether a failed attempt is retried and how long to wait
-// first. Only transient failures are: a 429 or 5xx (waiting the Retry-After
-// the endpoint asked for, else the backoff), an attempt that hit its own
-// deadline, or a transport error. Never a reply-level failure — invalid_reply,
-// an empty/thinking-only/truncated/refused reply — nor any other status, nor
-// anything once the caller's context is done.
+// first. Retried: a 429 or 5xx (waiting the Retry-After the endpoint asked
+// for, else the backoff), and the transient transport failures transient()
+// lists — the attempt's deadline or another network timeout, a refused or
+// reset connection, a connection closed mid-reply (EOF / unexpected EOF), a
+// temporary DNS failure, an HTTP/2 stream reset, GOAWAY or lost connection —
+// each after the backoff. Never retried: a reply-level failure
+// (invalid_reply, an empty/thinking-only/truncated/refused reply), any other
+// status, a TLS certificate failure, a bad URL or any other non-transient
+// error, nor anything once the caller's context is done or the retries are
+// spent.
 func (j *Judge) retryDelay(ctx context.Context, err error, attempt int) (time.Duration, bool) {
 	if ctx.Err() != nil || attempt >= j.policy.Retries {
 		return 0, false
@@ -139,22 +144,49 @@ func (j *Judge) retryDelay(ctx context.Context, err error, attempt int) (time.Du
 }
 
 // transient reports whether a call failure is worth another attempt: the
-// attempt's deadline, a network timeout, a connection refused or reset, or a
+// attempt's deadline, a network timeout, a connection refused or reset, a
 // connection that closed mid-reply (EOF / unexpected EOF, also while reading
-// the body). Never a TLS certificate failure, nor a url.Error that wraps no
-// network failure (a bad URL, an unsupported scheme): those fail the same way
-// every time.
+// the body), a DNS failure other than "no such host" (a temporary resolver
+// failure clears; NXDOMAIN does not), or an HTTP/2 stream reset, GOAWAY or
+// lost connection. Never a TLS certificate failure, nor a url.Error that
+// wraps no network failure (a bad URL, an unsupported scheme): those fail
+// the same way every time.
+//
+// A bare io.EOF stays retryable: net/http returns it (inside a url.Error)
+// when the server closes a reused keep-alive connection before answering —
+// the classic stale-connection race, which a fresh connection fixes. The
+// cost of being wrong is one extra paid call, which is logged like any other.
 func transient(err error) bool {
 	if certificateError(err) {
 		return false
 	}
 	var ne net.Error
+	var dns *net.DNSError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
 		return true
 	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNREFUSED),
 		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
 		return true
+	case errors.As(err, &dns):
+		return dns.IsTemporary || !dns.IsNotFound
+	}
+	return http2Transient(err)
+}
+
+// http2Markers identify the HTTP/2 transport failures net/http's bundled
+// http2 client reports only as unexported types or plain errors: a stream
+// reset by the server (RST_STREAM: "stream error: …"), a GOAWAY, and a
+// connection lost under an in-flight request. The server or a proxy between
+// dropped the request; a new stream or connection may succeed.
+var http2Markers = []string{"stream error:", "server sent GOAWAY", "client connection lost", "http2: client connection force closed"}
+
+func http2Transient(err error) bool {
+	msg := err.Error()
+	for _, m := range http2Markers {
+		if strings.Contains(msg, m) {
+			return true
+		}
 	}
 	return false
 }

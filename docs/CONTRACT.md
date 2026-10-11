@@ -3554,7 +3554,11 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
   retries an attempt that failed **transiently**: an HTTP 429 or 5xx, an
   attempt that hit its own deadline or another network timeout, a connection
   refused or reset, or a connection that closed mid-reply (`EOF` /
-  unexpected `EOF`, also while reading the body). A TLS certificate failure
+  unexpected `EOF`, also while reading the body — a bare `EOF` is kept
+  because net/http returns it when a server closes a reused keep-alive
+  connection before answering; the worst case is one extra, logged, paid
+  call), a DNS failure other than "no such host", or an HTTP/2 stream reset,
+  GOAWAY or lost connection. A TLS certificate failure
   and a `url.Error` that wraps no network failure (a bad URL, an unsupported
   scheme) fail the same way every time and are not retried. The wait is the
   endpoint's `Retry-After` (delta-seconds or an HTTP date, capped at 5 min)
@@ -3575,7 +3579,12 @@ Every judge model call, in every path (book, `--sample`, `--backfill-*`,
   id) does not pin — `expected_model` (the recipe's expected model),
   `model_revision` (the pin's revision) and the judge's `step_version` — so a
   revision bump or a new expected model on the same alias is a cache miss,
-  never the old model's reply served as the new one's; then `chunk_text`,
+  never the old model's reply served as the new one's. **Deploy note:** this
+  changed the input, so `judge_chunk` rows written before it never hit under
+  the new key — the first `--rejudge` (or any judge run) after deploying it
+  pays for every chunk once, including the chunks a run killed before the
+  deploy had already paid for and a resume after the deploy would otherwise
+  have served. Then `chunk_text`,
   `file_path`, `start_sec`/`end_sec`, the
   `prompt_version`, `book_context` (`source`, `sha256`, and the rendered
   `block`) and `request` — every output-affecting request field the client

@@ -513,6 +513,13 @@ func TestTransient(t *testing.T) {
 		"bad URL":               {&url.Error{Op: "parse", URL: "::", Err: errors.New("missing protocol scheme")}, false},
 		"unmarshal of the body": {fmt.Errorf("unmarshal chat response: %w", errors.New("invalid character")), false},
 		"caller cancelled":      {context.Canceled, false},
+		"temporary DNS failure": {&url.Error{Op: "Post", URL: "u", Err: &net.OpError{Op: "dial",
+			Err: &net.DNSError{Err: "server misbehaving", Name: "judge", IsTemporary: true}}}, true},
+		"DNS lookup error":   {&url.Error{Op: "Post", URL: "u", Err: &net.DNSError{Err: "read udp: connection refused", Name: "judge"}}, true},
+		"DNS no such host":   {&url.Error{Op: "Post", URL: "u", Err: &net.DNSError{Err: "no such host", Name: "judge", IsNotFound: true}}, false},
+		"h2 stream reset":    {&url.Error{Op: "Post", URL: "u", Err: errors.New("stream error: stream ID 3; INTERNAL_ERROR; received from peer")}, true},
+		"h2 GOAWAY":          {&url.Error{Op: "Post", URL: "u", Err: errors.New(`http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR, debug=""`)}, true},
+		"h2 connection lost": {&url.Error{Op: "Post", URL: "u", Err: errors.New("http2: client connection lost")}, true},
 	}
 	for name, tc := range cases {
 		if got := transient(tc.err); got != tc.want {
