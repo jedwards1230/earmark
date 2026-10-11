@@ -779,15 +779,17 @@ job (`job_id`).
 
 **Latch only on success.** `eval_finished_at` is written **only when the judge
 evaluated every chunk of the transcript AND its findings were stored**. A run
-that skipped any chunk (endpoint error, a single request hitting the chat
-client's 120 s timeout, …) or failed to store its findings does **not** latch:
+that skipped any chunk (endpoint error, a single request hitting the judge's
+per-call deadline — `--call-timeout`, default 180 s —, a reply that is not
+valid findings JSON, …) or failed to store its findings does **not** latch:
 it records `eval_failed_at` (when), `eval_failed_chunks` (how many chunks it
 could not judge — all of them when the findings write failed) and `eval_error`
 (the first judge error / the persist error, ≤500 chars) and leaves the eval
 success columns alone, so a failed re-judge of an already-latched job never
 erases that job's earlier successful run. Its partial findings are still
 inserted (advisory signal is not discarded); the re-judge paths skip findings
-already recorded for the transcript, so a retry never doubles them. A shutdown
+the same judge recipe already recorded for the transcript, so a retry never
+doubles them (§2.15 "Re-judge"). A shutdown
 mid-judge records nothing. The next successful run latches and clears the three
 failure columns. Rationale: a latched job is never re-judged, so a failure
 latched as done (the pre-fix behavior) was lost for good.
@@ -1565,7 +1567,10 @@ endpoint answers), and an info line at startup when no pin is set.
 #### Pure-function calls — `fn_calls`
 
 Every call a pure function (`internal/fn`) makes to a decision model — today
-TypeSafe System One (`jev-*`) — is one row. The log doubles as the cache.
+TypeSafe System One (`jev-*`) — is one row. The log doubles as the cache. The
+judge logs its calls here too, as fn `judge_chunk`, writing `db.InsertFnCall`
+/ `db.LookupFnCache` directly rather than through `internal/fn` (whose
+pinned-model rule would refuse a hosted judge model): §2.15 "Judge calls".
 
 ```sql
 CREATE TABLE fn_calls (
@@ -1767,6 +1772,7 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 | `scan` | `write` with `--yes` | `--sample N`; NULL otherwise | `scanned`, `cached`, `fallback`, `errors`, `written` | `selecting chunks`, `asking <model>`, `writing chunk_scan` |
 | `eval_sample` / `eval_book` | `write` with `--write` | `--sample N` / NULL | `evaluated`, `errors`, `findings` | `asking <model>` |
 | `eval_backfill` | `write` with `--write` | NULL (`--limit` counts latched transcripts, not visited ones) | one per visited transcript: `latched`, `failed`, `not_embedded`, `skipped`; plus `chunks`, `chunk_errors`, `findings` | `judging <file> · asking <model>` |
+| `eval_rejudge` | `write` with `--write` | NULL | one per judge call (chunk): `judged`, `cached`, `failed`, each tick adding the call's reported cost; per transcript `transcripts_complete` / `transcripts_partial` / `transcripts_failed` / `transcripts_skipped`, plus `findings` (rows inserted) | `asking <model>` |
 
 `done` counts finished items; `cost_usd` sums the calls' reported cost
 (cached calls are free).
@@ -2089,7 +2095,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `EVAL_REASONING_EFFORT` | no | `auto`. The judge request's `reasoning_effort`, for every judge model. `auto`: `"none"` for local models, omitted when the model id contains `anthropic/`, `openrouter/` or `openai/` (aliases that hide the provider need `omit`); `omit`: never sent; any other value is sent verbatim. A propose model setting's `reasoning_effort` param outranks it. See §2.15. |
 | `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto`. The judge request's `chat_template_kwargs`, for every judge model. `auto`: `{"enable_thinking": false}` for local models, omitted when the model id contains `anthropic/`, `openrouter/` or `openai/` (aliases that hide the provider need `omit`); `omit`: never sent; a JSON object is sent verbatim. Anything else is a configuration error (the eval client fails to resolve). A propose model setting's `chat_template_kwargs` param outranks it. See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
-| `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval) — each chunk can then hold the embed for up to the chat client's 120 s request timeout. When false (**decoupled mode**) the worker builds no judge and makes **no judge call** on the embed path, so embedding never waits on the judge; judging runs as its own pass, `earmark eval --backfill-unevaluated --write` (§2.15), which picks up every done transcript without an `eval_finished_at` latch, embedded or not. (Decoupled mode implies `EVAL_GATES_EMBED=false` — the gate is fatal without `EVAL_IN_PIPELINE=true`.) Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
+| `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval) — each chunk can then hold the embed for up to the judge's per-call deadline (180 s, §2.15 "Judge calls"). When false (**decoupled mode**) the worker builds no judge and makes **no judge call** on the embed path, so embedding never waits on the judge; judging runs as its own pass, `earmark eval --backfill-unevaluated --write` (§2.15), which picks up every done transcript without an `eval_finished_at` latch, embedded or not. (Decoupled mode implies `EVAL_GATES_EMBED=false` — the gate is fatal without `EVAL_IN_PIPELINE=true`.) Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
 | `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-yet-attempted, not-embedded transcripts and judges them (writing `eval_finished_at` on a complete run, the `eval_failed_*` record otherwise); an **embed pass** then selects done, eval'd-or-failed, not-embedded transcripts and embeds them. The `eval_finished_at` latch / `eval_failed_at` record (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ judge attempted` (a judge failure fails open; it is retried by `earmark eval --backfill-*`, never in a hot loop). **Fail-closed** (two conditions, both fatal at startup): (1) if no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`); and (2) if `EVAL_IN_PIPELINE` is not also `true`. The gate makes eval a strict prerequisite for embedding, and the eval judge is only built when `EVAL_IN_PIPELINE=true`; so `EVAL_GATES_EMBED=true` **requires** `EVAL_IN_PIPELINE=true` (and a resolvable judge) — otherwise the worker would run gated with a nil judge, stalling the corpus (or risking a nil-judge deref). Both failures fail at startup, never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
 | `GPU_ARBITER_URL` | no | gpu-arbiter `/status` URL (e.g. `http://gpu-host:48750/status`) read by the `earmark batch` coordinator (§1.4) to yield the GPU to games. **Read-only** — the coordinator only `GET`s it, never `POST`s. Unset or unreachable → the coordinator logs it and proceeds (degrades gracefully). The `batch --gpu-arbiter-url` flag overrides it. |
 | `ARBITER_WAIT_CMD` | no | Explicit path to a gpu-arbiter binary the `earmark batch` coordinator should delegate waits to (§1.4). Lower precedence than the `batch --arbiter-wait-cmd` flag, higher than `gpu-arbiter` auto-detected on `PATH`. Unset → the coordinator auto-detects on `PATH`, falling back to its built-in HTTP poll loop if nothing resolves. Purely an optimization — never required. |
@@ -3234,9 +3240,11 @@ Each goes through the existing per-chunk failure path: the chunk is counted
 skipped (not evaluated), the run is not complete, and the transcript gets a
 failure record (`eval_failed_at`, `eval_error`) instead of `eval_finished_at`
 — so `earmark eval --backfill-eval-errors` re-judges it. The content is
-dropped; the reported model and usage are still recorded. (A reply that has
-content but is not valid findings JSON is still the advisory soft-fail of
-`JudgeChunk`; a reply cut off by `max_tokens` never reaches it.)
+dropped; the reported model and usage are still recorded. A reply that has
+content but is **not valid findings JSON** fails the chunk the same way
+(`ErrInvalidReply`, `error.type` and `fn_calls.error_class` `invalid_reply`)
+— it used to be read as "no findings", which counted an unparseable reply as a
+clean chunk. None of these is retried ("Judge calls" below).
 
 **Resolved model.** The judge records the model the endpoint **reports** serving
 each request (the response's `model` field) next to the requested id, because a
@@ -3302,8 +3310,30 @@ about where it came from:
   references `step_runs`), started/finished, error). It is
   the per-recipe "judged" record; `run_metrics.eval_*` stays the compatibility
   "latest judge" summary. `judge_passes.transcript_id` is a plain column, so a
-  pass outlives the requeue that deletes its transcript. The judge does not
-  write passes yet: only `legacy` rows exist, backfilled by migration 13 — one
+  pass outlives the requeue that deletes its transcript. **Writers:** every
+  path that judges a whole transcript — `earmark eval --rejudge --write`, the
+  `--backfill-*` modes with `--write`, and the in-pipeline worker — opens a
+  pass as `running` (registering the judge's current recipe) **before its
+  first model call**, so a killed run leaves the row as evidence, and closes it
+  in ONE transaction (`db.CommitJudgePass`) together with its findings and the
+  `run_metrics` eval slice: `complete` when every chunk was judged, `partial`
+  when some were, `failed` when none were (a chunk counts as failed whether its
+  call failed, its reply was invalid, or the run stopped before reaching it);
+  `chunks_judged` includes `chunks_cached` (served from `fn_calls`);
+  `findings_kept` is the number of rows the pass inserted; `dropped` counts
+  every finding the judge returned that did not become a row of this pass, by
+  reason — the pre-filter/floor/cap reasons ("Pre-filters") plus
+  `already_recorded` (the same finding is already stored by this recipe or an
+  equivalent one, below); tokens and `cost_usd` sum every call the endpoint
+  reported them for (failed attempts included); latency p50/p95 are
+  nearest-rank over the paid calls (cache hits excluded); `book_context_sha256`
+  is the transcript's judge@v3 Book record hash (NULL for path_only). A run
+  stopped by SIGINT/SIGTERM closes its in-flight passes `partial`/`failed` with
+  the findings of the chunks judged so far and leaves `run_metrics` alone; an
+  in-pipeline run whose embed then fails closes its pass `failed` (its findings
+  were never stored). Book and `--sample` runs judge a selection of chunks,
+  not a transcript, and record no pass. Rows the migration backfilled are
+  `legacy` — one
   per (transcript, `recipe_id`) of `origin='judge'` findings with a live
   transcript, and one for the latest judge run of each transcript latched by
   `run_metrics.eval_finished_at` when that run left no finding: its recipe is
@@ -3314,8 +3344,11 @@ about where it came from:
   unresolved latch gets a NULL-recipe row only when the transcript has no judge
   finding at all (it cannot be told apart from the run that left them). Legacy counters,
   tokens, cost, latency and drop counts were never recorded and are NULL.
-- **`fn_call_id`** — the judge call's `fn_calls` row. Not yet written by any
-  path.
+- **`fn_call_id`** — the `fn_calls` row of the judge call that produced the
+  finding (fn `judge_chunk`; for a finding served from cache, the original
+  paid row, not the cache-hit row). Written by every judge path whose judge
+  logs calls (all of them in `earmark eval` and the worker against the real
+  database); NULL for findings from before this change.
 - **`origin_transcript_id`** — the transcript the finding was proposed
   against. A `BEFORE INSERT` trigger (`transcript_findings_keep_origin`) fills
   it from `transcript_id` when NULL, and an UPDATE that changes it once set is
@@ -3487,8 +3520,11 @@ A job is selected when any of these holds:
    detected by this rule — the set it judged is gone from the count. Re-judge
    such a book explicitly (`earmark eval <book> --write`) if needed.
 
-Findings already recorded for a transcript (same chunk, span, issue type and
-correction) are not inserted again. A successful re-judge writes a new
+A finding the **same judge recipe** (or one equivalent to it, §1.9) already
+recorded for the transcript (same chunk, span, issue type and correction) is
+not inserted again; an identical finding from **another** recipe is inserted
+— the two rows share a `correction_key`, which is how agreement between models
+is recorded ("Re-judge" below). A successful re-judge writes a new
 `eval_started_at`, `eval_skipped = 0`, `eval_chunks` = every chunk, and clears
 the failure record, so the job leaves all four conditions. Same `--write` / dry-run / `--limit` semantics as
 `--backfill-unevaluated`; the two flags are mutually exclusive.
@@ -3497,6 +3533,116 @@ the failure record, so the job leaves all four conditions. Same `--write` / dry-
 earmark eval --backfill-eval-errors --limit 10           # preview the first 10
 earmark eval --backfill-eval-errors --limit 10 --write   # re-judge them
 earmark eval --backfill-eval-errors --write              # all of them
+```
+
+#### Judge calls — deadline, retries, `fn_calls`
+
+Every judge model call, in every path (book, `--sample`, `--backfill-*`,
+`--rejudge`, the in-pipeline worker):
+
+- **Deadline.** Each attempt runs under a per-call deadline:
+  `earmark eval --call-timeout` (default **180 s**, `eval.DefaultCallTimeout`;
+  the worker always uses the default). It replaces the chat client's former
+  fixed 120 s `http.Client` timeout — the client no longer has one; the
+  deadline is on the request context.
+- **Retries.** `earmark eval --retries N` (default **4**; the worker's judge
+  retries nothing — a failed chunk is recorded and re-judged by a later run)
+  retries an attempt that failed **transiently**: an HTTP 429 or 5xx, an
+  attempt that hit its own deadline, or a transport error. The wait is the
+  endpoint's `Retry-After` (delta-seconds or an HTTP date, capped at 5 min)
+  when a 429/5xx sends one, else exponential backoff with equal jitter (2 s ·
+  2^attempt, capped at 1 min, half fixed and half random). Never retried: a
+  reply-level failure — `invalid_reply`, `empty`, `thinking_only`,
+  `truncated`, `refusal` —, any other status, or anything once the caller has
+  stopped.
+- **`fn_calls`.** Every attempt is one `fn_calls` row with `fn =
+  'judge_chunk'`, written with `db.InsertFnCall` directly (not through
+  `internal/fn`, whose pinned-model rule is for System One). `prompt_version`
+  / `prompt_sha256` are the judge prompt's (`judge@v2` / `judge@v3`, the hash
+  of every static prompt part), `model_alias` the requested model,
+  `model_resolved` the model the endpoint reported (the expected model when it
+  reports none), `recipe_id` the propose recipe of the reply. Because the cache
+  key does not include recipe params, **`input`** carries everything else the
+  reply depends on: `chunk_text`, `file_path`, `start_sec`/`end_sec`, the
+  `prompt_version`, `book_context` (`source`, `sha256`, and the rendered
+  `block`) and `request` — every output-affecting request field the client
+  sends: `temperature`, `top_p`, `max_tokens`, `reasoning_effort`,
+  `chat_template_kwargs` and the forwarded endpoint options. **`output`** is
+  `{content, reported_model, kept, dropped, parse_error}`: the reply exactly as
+  received, and how the judge read it at call time — the findings it kept and
+  every finding it dropped with the reason (the pre-filter, floor and cap
+  reasons).
+- **Cache.** Before calling, the judge looks the chunk up
+  (`db.LookupFnCache`, expected model = the propose recipe's): a successful row
+  for the same key is **served** — no model call, no cost — and logged as its
+  own `cache_hit` row (`cached_from` = the served row). A served reply is
+  re-read under the serving judge's own filters (`EVAL_MIN_CONFIDENCE`,
+  `EVAL_MAX_FINDINGS_PER_CHUNK`), so its findings carry the current recipe; a
+  finding's `fn_call_id` is the original paid row. This is what makes a killed
+  run resumable without paying twice. Rows that never serve: `invalid_reply`,
+  any failure, and a reply from a model other than the expected one
+  (`model_fallback` — its findings are still kept, stamped with the fallback's
+  recipe, as before).
+- **`invalid_reply`.** A reply with content that is not valid findings JSON
+  fails its chunk (`ErrInvalidReply`): it is logged with `error_class =
+  'invalid_reply'` and its `output` (the raw content and `parse_error`), the
+  chunk counts as failed — `ChunksSkipped`, the run is not complete, nothing
+  latches, a judge pass is `partial`/`failed` — and it is never retried or
+  served.
+
+#### Re-judge — `earmark eval --rejudge`
+
+Judges, under the **current** judge recipe (the propose step's effective
+model, §2.20, and prompt), every done transcript that has stored chunks and
+**no `complete` `judge_passes` row under that recipe or one equivalent to it**
+(§1.9 `equivalentRecipesCTE`) — partial, failed, running (killed) and legacy
+passes do not count. It reads only `transcript_chunks` (per transcript,
+`GetEvalChunksForTranscript`) and never the transcripts' text; the selection
+is keyset-paged over transcript ids (64 per page), and at most
+`--concurrency` transcripts' chunks are in memory at once, so it runs from a
+local binary against the database without loading the library.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--write` (`--yes`) | off | record passes, findings and the `run_metrics` latch. **Without it the run still makes PAID model calls**: only `fn_calls` (and `recipes`, `step_runs`) are written — the replies are cached, so the `--write` run that follows serves them without paying again |
+| `--expect-recipe <id>` | — | refuse to start unless the current judge recipe is `<id>` or equivalent to it — checked before any model call, pass or step run. Pin it for a long run so a restart under a changed model setting or prompt cannot silently judge under another recipe |
+| `--concurrency N` | 16 | judge calls in flight, as ONE bound shared by every chunk of every transcript the run has in flight (`eval.Limiter`); also the cap on transcripts in flight |
+| `--call-timeout` / `--retries` | 180 s / 4 | "Judge calls" above |
+| `--limit N` | 0 = all | transcripts attempted |
+| `--book <substr>` | — | only transcripts whose path contains it (case-insensitive) |
+| `--shard i/N` | — | only transcripts with `hashtext(transcript_id) mod N = i` (folded non-negative) — `earmark decide --shard`'s partition, so N runners cover the selection disjointly |
+
+Not combinable with `--sample`, `--seed`, `--dump`, `--max-attempts` or the
+`--backfill-*` modes.
+
+Per transcript under `--write`: the pass is opened `running`; each chunk is
+served from `fn_calls` or called (and logged); then **one transaction** inserts
+the findings — stamped with `judge_pass_id` and `fn_call_id`, skipping those
+the same recipe (or an equivalent one) already recorded for the transcript
+(recipe-scoped dedupe on chunk, span, issue type and correction, under a
+transaction-scoped advisory lock per transcript) — closes the pass with its
+counters, and writes the `run_metrics` eval slice: the latch when the pass is
+complete, the failure record otherwise (§1.5). **Dedupe is scoped to the
+recipe on purpose:** a finding identical to one from a *different* recipe is
+inserted, so two models agreeing on a fix is recorded as two rows sharing a
+`correction_key` (deciding them is §2.19's job).
+
+Stop and resume: SIGINT/SIGTERM closes in-flight passes `partial`/`failed`
+with the findings judged so far (`run_metrics` untouched) and exits non-zero;
+a hard kill leaves the open passes `running`. Either way the transcript has no
+complete pass and is selected again; the chunks already answered are served
+from `fn_calls` (no second payment) and their findings, if already inserted,
+count as `already_recorded`. **Exit status** is non-zero when the recipe check
+fails, the run is stopped, a judge@v3 book record cannot be read (the run
+stops: never judge path-only under a v3 recipe), or transcripts were attempted
+and none completed. The run is recorded in `step_runs` as `eval_rejudge`
+(§1.10).
+
+```bash
+earmark models                                              # the propose step's effective model
+earmark eval --rejudge --limit 5                            # preview 5 transcripts (PAID, cached)
+earmark eval --rejudge --write --expect-recipe <id>         # the full re-judge
+earmark eval --rejudge --write --expect-recipe <id> --shard 0/2   # one of two runners
 ```
 
 #### Judge prompt (`judge@v2` default; `judge@v3` opt-in)
@@ -3691,8 +3837,8 @@ its reason (`below_min_confidence`, `over_cap` for these two): the run report's
 
 #### Measuring a prompt change
 
-Prompt changes are compared on the **same chunks**, in a dry run (paid calls,
-nothing written):
+Prompt changes are compared on the **same chunks**, in a dry run (paid calls;
+nothing written but the `fn_calls` log of each call, "Judge calls"):
 
 ```bash
 earmark eval --sample 200 --seed q4 --dump /tmp/judge-v2.jsonl
@@ -3710,7 +3856,9 @@ writes one JSON line per judged chunk: `chunk_id`, `transcript_id`,
 `model`, `resolved_model`, `prompt_tokens` /
 `completion_tokens` (the response `usage`; `null` when unreported), `cost_usd`
 (LiteLLM's `x-litellm-response-cost` header; `null` when absent), `latency_ms`,
-`error` (a skipped chunk, ≤300 runes), `findings` and `dropped` (each
+`cached` (the reply was served from `fn_calls` — an identical earlier request
+under the same prompt, model and request params: no call, no cost) and
+`fn_call_id`, `error` (a skipped chunk, ≤300 runes), `findings` and `dropped` (each
 `original`, `correction`, `issue_type`, `confidence`; dropped ones with their
 `reason`). Kept plus dropped is everything the judge returned, so two dumps
 join on `chunk_id` and the old build's raw output can be re-filtered offline.
@@ -3872,7 +4020,7 @@ judge's bounded drop `reason` and the three-value quality scope (`library` · `a
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
 | `earmark_decisions` | gauge | `outcome` (`apply` · `hold` · `reject` · `duplicate`), `issue_type`, `evidence` (`asin_verbatim` · `exact_repeat` · `none`), `recipe` (full decide recipe id) | Findings counted by their **latest unrevoked** decide-recipe `decision` event (§2.17 "Version history", §2.19); findings a requeue superseded excluded. Ingest pod; one aggregate over `finding_events`, refreshed every 5 min. No series until a decision is written. |
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
-| `earmark_step_run_active` | gauge | `step` (`decide` · `decide_revert` · `scan` · `eval_sample` · `eval_book` · `eval_backfill`), `mode` (`dry_run` · `write`) | Step runs (§1.10) open with a live heartbeat (≤ 2 min old); a stale run is not counted. Ingest pod; read from `step_runs` every 15 s. No series while nothing runs. |
+| `earmark_step_run_active` | gauge | `step` (`decide` · `decide_revert` · `scan` · `eval_sample` · `eval_book` · `eval_backfill` · `eval_rejudge`), `mode` (`dry_run` · `write`) | Step runs (§1.10) open with a live heartbeat (≤ 2 min old); a stale run is not counted. Ingest pod; read from `step_runs` every 15 s. No series while nothing runs. |
 | `earmark_step_run_progress_ratio` | gauge | `step` | `done / total` (0..1) of the step's newest live run that knows its total. No series without one. Ingest pod, every 15 s. |
 | `earmark_step_run_items_total` | counter | `step`, `outcome` (the run counters of §1.10: `apply`, `hold`, `reject`, `reanchor`, `cached`, `errors`, `scanned`, `written`, `evaluated`, `latched`, …) | Every counter summed over every recorded run in `step_runs` (an observable counter read from the table, so it survives pod restarts). Ingest pod, every 15 s. **No run id is ever a label.** |
 | `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
 )
@@ -63,8 +65,36 @@ type RunStats struct {
 	// with, keyed by transcript id: source (asin_record / path_only /
 	// record_error) and
 	// book_context_sha256 (CONTRACT §2.15 "Book context"). Every transcript
-	// the run selected is present, judged or not. Not persisted yet.
+	// the run selected is present, judged or not. A judge pass records it as
+	// judge_passes.book_context_sha256.
 	BookContexts map[string]BookContext
+	// ChunksCached counts the evaluated chunks served from fn_calls (no
+	// model call, no cost).
+	ChunksCached int
+	// InputTokens / OutputTokens / CostUSD sum every model call's accounting
+	// as the endpoint reported it (failed calls included; HasUsage / HasCost
+	// false when no call reported any).
+	InputTokens  int64
+	OutputTokens int64
+	HasUsage     bool
+	CostUSD      float64
+	HasCost      bool
+	// Latencies are the evaluated chunks' model-call latencies (served from
+	// cache excluded), in chunk order.
+	Latencies []time.Duration
+}
+
+// addCall folds one chunk's call accounting into s (judged or failed).
+func (s *RunStats) addCall(res Result) {
+	if res.Usage.HasUsage {
+		s.InputTokens += int64(res.Usage.InputTokens)
+		s.OutputTokens += int64(res.Usage.OutputTokens)
+		s.HasUsage = true
+	}
+	if res.Usage.HasCost {
+		s.CostUSD += res.Usage.CostUSD
+		s.HasCost = true
+	}
 }
 
 // addDropped folds one chunk's drops into s.Dropped.
@@ -132,7 +162,7 @@ func Run(ctx context.Context, reader ChunkReader, judge *Judge, writer FindingWr
 		// the run's chunk reader.
 		records, _ = reader.(BookRecordReader)
 	}
-	return runChunks(ctx, judge, records, writer, chunks, opts.Write, opts.Observe)
+	return runChunks(ctx, judge, records, writer, chunks, opts.Write, opts.Observe, nil)
 }
 
 // RunOnChunks judges an already-resolved set of chunks (e.g. the in-memory
@@ -146,8 +176,45 @@ func Run(ctx context.Context, reader ChunkReader, judge *Judge, writer FindingWr
 // A book-context prompt reads the chunks' book records through the judge's
 // record source (SetBookRecords).
 func RunOnChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks []db.EvalChunk, write bool) ([]db.Finding, RunStats, error) {
-	return runChunks(ctx, judge, judge.records, writer, chunks, write, nil)
+	return runChunks(ctx, judge, judge.records, writer, chunks, write, nil, nil)
 }
+
+// JudgeChunks judges chunks without persisting anything, like RunOnChunks
+// with write=false, but CONCURRENTLY under lim: each chunk's model call
+// holds one of lim's slots, and lim may be shared by any number of
+// concurrent JudgeChunks calls (one bound over every transcript a run has in
+// flight). A nil lim judges serially. observe, when set, is called once per
+// chunk (serialized, in completion order). The findings and stats come back
+// in chunk order whatever the completion order. A cancelled ctx returns the
+// findings of the chunks judged so far with the error.
+func JudgeChunks(ctx context.Context, judge *Judge, chunks []db.EvalChunk, lim *Limiter,
+	observe func(Result, error)) ([]db.Finding, RunStats, error) {
+	return runChunks(ctx, judge, judge.records, nil, chunks, false, observe, lim)
+}
+
+// Limiter bounds concurrent judge calls. One Limiter shared by every
+// JudgeChunks call of a run is the run's global concurrency bound.
+type Limiter struct{ slots chan struct{} }
+
+// NewLimiter returns a limiter admitting n concurrent calls (n < 1 → 1).
+func NewLimiter(n int) *Limiter {
+	return &Limiter{slots: make(chan struct{}, max(n, 1))}
+}
+
+// acquire takes a slot, or returns ctx's error once it is done.
+func (l *Limiter) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case l.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *Limiter) release() { <-l.slots }
 
 // runChunks is the shared judge-collect-persist core behind Run and RunOnChunks.
 // A transient per-chunk judge error skips that chunk (logged) and the run
@@ -162,7 +229,7 @@ func RunOnChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks
 // of its chunks is skipped with the reason, like a failed judge call, so only
 // that book's transcripts record an eval failure.
 func runChunks(ctx context.Context, judge *Judge, records BookRecordReader, writer FindingWriter, chunks []db.EvalChunk, write bool,
-	observe func(Result, error)) ([]db.Finding, RunStats, error) {
+	observe func(Result, error), lim *Limiter) ([]db.Finding, RunStats, error) {
 	var all []db.Finding
 	stats := RunStats{PromptVersion: judge.prompt.Version()}
 	contexts, err := judge.bookContextsFor(ctx, records, chunks)
@@ -179,39 +246,91 @@ func runChunks(ctx context.Context, judge *Judge, records BookRecordReader, writ
 		}
 		stats.BookContexts[c.TranscriptID] = bc
 	}
-	for _, c := range chunks {
+	judgeOne := func(c db.EvalChunk) (Result, error) {
 		bc := stats.BookContexts[c.TranscriptID]
-		var res Result
-		var jerr error
 		if bc.err != nil {
-			res, jerr = Result{Chunk: c, PromptVersion: judge.prompt.Version(), BookContext: bc}, bc.err
-		} else {
-			res, jerr = judge.JudgeChunkWithBook(ctx, c, bc)
+			return Result{Chunk: c, PromptVersion: judge.prompt.Version(), BookContext: bc}, bc.err
 		}
-		if observe != nil {
-			observe(res, jerr)
-		}
+		return judge.JudgeChunkWithBook(ctx, c, bc)
+	}
+	fold := func(res Result, jerr error) {
+		stats.addCall(res)
 		if jerr != nil {
-			// The caller cancelled (or its deadline passed): a deliberate stop.
-			// Abort, but return the findings gathered so far.
-			if ctx.Err() != nil {
-				stats.FindingsFound = len(all)
-				return all, stats, fmt.Errorf("judge run stopped: %w", errors.Join(ctx.Err(), jerr))
-			}
 			// A transient per-chunk judge error (network glitch, single-request
-			// client timeout): skip this chunk and keep going.
+			// client timeout, an invalid reply): skip this chunk and keep going.
 			judge.logger.Warn("skipping chunk due to judge error",
-				"chunk_id", c.ChunkID, "error", jerr)
+				"chunk_id", res.Chunk.ChunkID, "error", jerr)
 			stats.ChunksSkipped++
 			if stats.FirstError == "" {
 				stats.FirstError = jerr.Error()
 			}
-			continue
+			return
 		}
 		stats.ChunksEvaluated++
+		if res.Cached {
+			stats.ChunksCached++
+		} else {
+			stats.Latencies = append(stats.Latencies, res.Elapsed)
+		}
 		stats.addResolved(res.ResolvedModel)
 		stats.addDropped(res.Dropped)
 		all = append(all, res.Findings...)
+	}
+
+	if lim == nil {
+		for _, c := range chunks {
+			res, jerr := judgeOne(c)
+			if observe != nil {
+				observe(res, jerr)
+			}
+			if jerr != nil && ctx.Err() != nil {
+				// The caller cancelled (or its deadline passed): a deliberate stop.
+				// Abort, but return the findings gathered so far.
+				stats.FindingsFound = len(all)
+				return all, stats, fmt.Errorf("judge run stopped: %w", errors.Join(ctx.Err(), jerr))
+			}
+			fold(res, jerr)
+		}
+	} else {
+		results := make([]Result, len(chunks))
+		errs := make([]error, len(chunks))
+		started := make([]bool, len(chunks))
+		var wg sync.WaitGroup
+		var obsMu sync.Mutex
+		for i, c := range chunks {
+			if lim.acquire(ctx) != nil {
+				break
+			}
+			started[i] = true
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer lim.release()
+				res, jerr := judgeOne(c)
+				results[i], errs[i] = res, jerr
+				if observe != nil {
+					obsMu.Lock()
+					observe(res, jerr)
+					obsMu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+		stopped := ctx.Err()
+		for i := range chunks {
+			if !started[i] {
+				continue
+			}
+			if errs[i] != nil && stopped != nil {
+				stats.addCall(results[i])
+				continue // stopped mid-call: neither judged nor a judge failure
+			}
+			fold(results[i], errs[i])
+		}
+		if stopped != nil {
+			stats.FindingsFound = len(all)
+			return all, stats, fmt.Errorf("judge run stopped: %w", stopped)
+		}
 	}
 
 	stats.FindingsFound = len(all)

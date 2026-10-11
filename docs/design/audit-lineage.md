@@ -38,8 +38,18 @@ cost, latency p50/p95, the hash of the book context the judge saw, the
 `transcript_id` is a plain column, so a pass outlives the requeue that deletes
 its transcript. Each finding points at its pass (`judge_pass_id`).
 
-No writer exists yet: the only rows are `legacy` ones the migration
-backfilled — one per (transcript, recipe) of judge findings, and one for the
+Writers (CONTRACT §2.15 "Lineage", "Re-judge"): every path that judges a
+whole transcript — `earmark eval --rejudge --write`, `--backfill-* --write`,
+the in-pipeline worker — opens a pass as `running` before its first model
+call and closes it with its findings and the `run_metrics` eval slice in one
+transaction, so a killed run leaves the `running` row behind as evidence and
+the re-judge selects the transcript again. Findings are deduplicated only
+against the same recipe (or an equivalent one): another recipe proposing the
+same fix is stored, which is what records agreement. Book and `--sample` runs
+record no pass.
+
+The migration backfilled `legacy` rows — one per (transcript, recipe) of
+judge findings, and one for the
 latest judge run of each latched transcript when that run found nothing. A
 legacy row's recipe is the findings' `recipe_id`; for the latest run it is
 resolved from `run_metrics.eval_model` only when exactly one propose recipe
@@ -81,8 +91,10 @@ that described it.
   proposal and an older, already-decided finding of the same fix — into a
   join. NULL when the finding has no chunk hash (legacy rows), because the text
   alone does not identify a fix.
-- `fn_call_id` points at the judge call's `fn_calls` row. Not yet written by
-  any path.
+- `fn_call_id` points at the judge call's `fn_calls` row (fn `judge_chunk`,
+  CONTRACT §2.15 "Judge calls"): the paid call that produced the reply, also
+  for a finding served from the `fn_calls` cache. Written by every judge path
+  since the re-judge change; NULL on older findings.
 
 ### Agreement is not rejection — the `duplicate` state
 
