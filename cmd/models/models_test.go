@@ -120,6 +120,17 @@ func TestBuildSetting(t *testing.T) {
 		{name: "bad param key", step: "scan", o: setOptions{params: []string{"usd=1"}}, wantErr: `unknown key "usd"`},
 		{name: "bad param value", step: "scan", o: setOptions{params: []string{"usd_per_mtok_in=cheap"}}, wantErr: "non-negative number"},
 		{name: "malformed param", step: "scan", o: setOptions{params: []string{"usd_per_mtok_in"}}, wantErr: "key=value"},
+		{name: "judge thinking params", step: "propose",
+			o: setOptions{model: "openrouter/openai/gpt-6-luna", params: []string{"reasoning_effort=low", "chat_template_kwargs=omit"}},
+			want: config.StepSetting{Step: "propose", EndpointID: "judge", Model: "openrouter/openai/gpt-6-luna",
+				Params: map[string]any{"reasoning_effort": "low", "chat_template_kwargs": "omit"}, Source: config.SourceDB}},
+		{name: "judge kwargs JSON", step: "propose",
+			o: setOptions{params: []string{`chat_template_kwargs={"enable_thinking":false}`}},
+			want: config.StepSetting{Step: "propose", EndpointID: "judge", Model: "anthropic/claude-haiku-5-5",
+				Params: map[string]any{"chat_template_kwargs": `{"enable_thinking":false}`}, Source: config.SourceDB}},
+		{name: "numeric reasoning_effort", step: "propose", o: setOptions{params: []string{"reasoning_effort=1"}}, wantErr: "reasoning_effort must be a string"},
+		{name: "bad kwargs", step: "propose", o: setOptions{params: []string{"chat_template_kwargs=yes"}}, wantErr: "chat_template_kwargs must be"},
+		{name: "thinking param on decide", step: "decide", o: setOptions{params: []string{"reasoning_effort=low"}}, wantErr: `unknown key "reasoning_effort"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -191,6 +202,43 @@ func TestView(t *testing.T) {
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &js))
 	require.Len(t, js, 4)
 	assert.Equal(t, "propose", js[0].Step)
+}
+
+// The judge's effective thinking knobs are shown with their sources: the
+// propose setting's params win over the env vars, and the route default
+// fills the rest.
+func TestViewJudgeThinking(t *testing.T) {
+	t.Setenv("EVAL_REASONING_EFFORT", "none")
+	t.Setenv("EVAL_CHAT_TEMPLATE_KWARGS", "")
+	rows := []db.ModelSetting{{Step: "propose", EndpointID: "judge", Model: "openrouter/openai/gpt-6-luna",
+		Params: map[string]any{"reasoning_effort": "low", "chat_template_kwargs": "omit"}}}
+	views := View(baseCfg(), rows)
+	p := views[0]
+	require.Equal(t, "propose", p.Step)
+	require.NotNil(t, p.Thinking)
+	assert.Equal(t, "low", p.Thinking.ReasoningEffort)
+	assert.Equal(t, "setting", p.Thinking.ReasoningEffortSource)
+	assert.Equal(t, "omit", p.Thinking.ChatTemplateKwargs)
+	assert.Equal(t, "setting", p.Thinking.ChatTemplateKwargsSource)
+	for _, v := range views[1:] {
+		assert.Nil(t, v.Thinking, "only the judge has thinking knobs (%s)", v.Step)
+	}
+
+	var buf bytes.Buffer
+	require.NoError(t, Show(&buf, baseCfg(), rows, false))
+	assert.Contains(t, buf.String(), `propose thinking: reasoning_effort "low" (model setting) · chat_template_kwargs omitted (model setting)`)
+	assert.Contains(t, buf.String(), "reasoning_effort=low")
+
+	// No row: the env model, the env var's effort, the route's kwargs.
+	buf.Reset()
+	require.NoError(t, Show(&buf, baseCfg(), nil, false))
+	assert.Contains(t, buf.String(), `propose thinking: reasoning_effort "none" (EVAL_REASONING_EFFORT) · chat_template_kwargs omitted (auto: hosted route)`)
+
+	// An invalid env value is shown, not hidden.
+	t.Setenv("EVAL_CHAT_TEMPLATE_KWARGS", "[1]")
+	buf.Reset()
+	require.NoError(t, Show(&buf, baseCfg(), nil, false))
+	assert.Contains(t, buf.String(), "propose thinking: INVALID — EVAL_CHAT_TEMPLATE_KWARGS")
 }
 
 func TestSetUnset(t *testing.T) {

@@ -160,6 +160,8 @@ steps:
 		"negative price":           {"steps:\n  decide:\n    params:\n      usd_per_mtok_in: -1\n", "non-negative number"},
 		"string price":             {"steps:\n  decide:\n    params:\n      usd_per_mtok_in: cheap\n", "non-negative number"},
 		"unknown param":            {"steps:\n  decide:\n    params:\n      usd_per_mtok: 1\n", `unknown key "usd_per_mtok"`},
+		"thinking param on scan":   {"steps:\n  scan:\n    params:\n      reasoning_effort: low\n", `unknown key "reasoning_effort"`},
+		"propose kwargs a list":    {"steps:\n  propose:\n    params:\n      chat_template_kwargs: [1]\n", "chat_template_kwargs must be"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			systemOneEnv(t)

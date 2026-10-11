@@ -29,12 +29,11 @@ type openAIChatClient struct {
 	http    *http.Client
 
 	// responseFormat, when non-nil, pins replies to a JSON schema server-side.
-	// reasoningEffort / chatTemplateKwargs suppress extended thinking on models
-	// that support either spelling. All three are set at construction because
-	// this client serves exactly one caller (the judge) with one output shape.
-	responseFormat     *responseFormat
-	reasoningEffort    string
-	chatTemplateKwargs map[string]any
+	// thinking holds the reasoning_effort / chat_template_kwargs to send
+	// (ResolveThinking). Both are set at construction because this client
+	// serves exactly one caller (the judge) with one output shape.
+	responseFormat *responseFormat
+	thinking       Thinking
 
 	// Sampling and budget fields resolved from the endpoint options (see
 	// newOpenAIChatClient for the per-route defaults). temperature/topP nil →
@@ -52,10 +51,9 @@ type chatConfig struct {
 	BaseURL string
 	Model   string
 	APIKey  string
-	// ReasoningEffort / ChatTemplateKwargs are the thinking-suppression fields
-	// to send; "" / nil omits them. Resolved by thinkingControls.
-	ReasoningEffort    string
-	ChatTemplateKwargs map[string]any
+	// Thinking is the reasoning_effort / chat_template_kwargs to send,
+	// resolved by ResolveThinking.
+	Thinking Thinking
 	// Params are the request knobs parsed from the endpoint's options
 	// (parseChatOptions). The zero value means "all defaults".
 	Params chatParams
@@ -97,14 +95,15 @@ const (
 // reservedRequestKeys are request-body fields earmark sets itself. An option
 // with one of these keys would silently fight the judge's contract (the reply
 // schema, the thinking controls, the prompt), so it is a configuration error
-// rather than an override. Thinking controls have their own env vars.
+// rather than an override. Thinking controls have their own layers
+// (ResolveThinking): the propose model setting's params, then env vars.
 var reservedRequestKeys = map[string]string{
 	"model":                "set the endpoint's model field",
 	"messages":             "the judge builds the prompt",
 	"stream":               "the judge needs a single non-streamed reply",
 	"response_format":      "the judge pins its own JSON schema",
-	"reasoning_effort":     "use " + envReasoningEffort,
-	"chat_template_kwargs": "use " + envChatTemplateKwargs,
+	"reasoning_effort":     "use the propose model setting's reasoning_effort param, or " + envReasoningEffort,
+	"chat_template_kwargs": "use the propose model setting's chat_template_kwargs param, or " + envChatTemplateKwargs,
 }
 
 // parseChatOptions turns an endpoint's string-valued options into request
@@ -165,32 +164,26 @@ func optionValue(raw string) any {
 	return raw
 }
 
-// Thinking-control env vars (CONTRACT §2.15). Both default to "auto".
-const (
-	// envReasoningEffort overrides the reasoning_effort request field:
-	// unset/"auto" → per-route default, "omit" → never sent, any other value →
-	// sent verbatim (e.g. "none", "low").
-	envReasoningEffort = "EVAL_REASONING_EFFORT"
-	// envChatTemplateKwargs overrides chat_template_kwargs: unset/"auto" →
-	// per-route default, "omit" → never sent, a JSON object → sent verbatim.
-	envChatTemplateKwargs = "EVAL_CHAT_TEMPLATE_KWARGS"
-
-	thinkingAuto = "auto"
-	thinkingOmit = "omit"
-)
-
 // hostedRouteMarkers are model-id segments that name a hosted provider route
 // (LiteLLM's "<provider>/<model>" convention) rather than a local Ollama/vLLM
 // model. They match ANYWHERE in the id, so nested routes such as
-// "bedrock/anthropic/claude-…" or "openrouter/anthropic/…" count too. Hosted
+// "bedrock/anthropic/claude-…" or "openrouter/openai/…" count too. Hosted
 // APIs reject or mis-map the local thinking knobs — Anthropic has no
-// reasoning_effort "none" and no chat_template_kwargs — so by default neither
-// is sent to them.
+// reasoning_effort "none", and no hosted API has a chat-template passthrough —
+// so by default neither is sent to them (autoThinking), and neither is a
+// temperature (newOpenAIChatClient).
+//
+//   - "anthropic/": Anthropic, direct or through Bedrock/OpenRouter.
+//   - "openrouter/": every OpenRouter route, whatever model it serves.
+//   - "openai/": OpenAI's hosted API (and openrouter/openai/…). A local
+//     OpenAI-compatible server registered in LiteLLM as "openai/<model>"
+//     is caught too: set its reasoning params explicitly (CONTRACT §2.15).
 //
 // A LiteLLM alias that hides the provider (e.g. model "judge" mapped to an
 // Anthropic model in the proxy config) cannot be detected from the id: set
-// EVAL_REASONING_EFFORT=omit and EVAL_CHAT_TEMPLATE_KWARGS=omit for it.
-var hostedRouteMarkers = []string{"anthropic/"}
+// the propose model setting's reasoning_effort / chat_template_kwargs params
+// (or EVAL_REASONING_EFFORT / EVAL_CHAT_TEMPLATE_KWARGS) to "omit" for it.
+var hostedRouteMarkers = []string{"anthropic/", "openrouter/", "openai/"}
 
 // isHostedRoute reports whether model names a hosted provider route.
 func isHostedRoute(model string) bool {
@@ -201,43 +194,6 @@ func isHostedRoute(model string) bool {
 		}
 	}
 	return false
-}
-
-// thinkingControls resolves the reasoning_effort / chat_template_kwargs to send
-// for model. Default ("auto"): keep today's local-model behavior —
-// reasoning_effort "none" plus {"enable_thinking": false}, which is what stops
-// Qwen-family models on Ollama from spending the reply on chain-of-thought —
-// except for hosted routes (isHostedRoute), where both are omitted. Either can
-// be forced per deployment through EVAL_REASONING_EFFORT /
-// EVAL_CHAT_TEMPLATE_KWARGS. An unparseable kwargs value is a configuration
-// error (fail loud rather than silently drop the knob).
-func thinkingControls(model string) (string, map[string]any, error) {
-	hosted := isHostedRoute(model)
-
-	effort := ""
-	switch v := strings.TrimSpace(os.Getenv(envReasoningEffort)); strings.ToLower(v) {
-	case "", thinkingAuto:
-		if !hosted {
-			effort = "none"
-		}
-	case thinkingOmit:
-	default:
-		effort = v
-	}
-
-	var kwargs map[string]any
-	switch v := strings.TrimSpace(os.Getenv(envChatTemplateKwargs)); strings.ToLower(v) {
-	case "", thinkingAuto:
-		if !hosted {
-			kwargs = map[string]any{"enable_thinking": false}
-		}
-	case thinkingOmit:
-	default:
-		if err := json.Unmarshal([]byte(v), &kwargs); err != nil || kwargs == nil {
-			return "", nil, fmt.Errorf("%s must be \"auto\", \"omit\" or a JSON object: %q", envChatTemplateKwargs, v)
-		}
-	}
-	return effort, kwargs, nil
 }
 
 // EvalEndpointSource is the minimal slice of the parsed config the eval layer
@@ -308,7 +264,7 @@ func ResolveChatClient(src EvalEndpointSource) (ChatClient, error) {
 			if err := validateBaseURL(cfg.BaseURL); err != nil {
 				return nil, fmt.Errorf("invalid eval endpoint baseURL: %w", err)
 			}
-			return withThinkingControls(cfg)
+			return withThinkingControls(cfg, src)
 		}
 	}
 
@@ -323,18 +279,19 @@ func ResolveChatClient(src EvalEndpointSource) (ChatClient, error) {
 	if err := validateBaseURL(cfg.BaseURL); err != nil {
 		return nil, fmt.Errorf("invalid EVAL_CHAT_BASE_URL: %w", err)
 	}
-	return withThinkingControls(cfg)
+	return withThinkingControls(cfg, src)
 }
 
-// withThinkingControls resolves the per-route thinking knobs into cfg and
-// builds the client.
-func withThinkingControls(cfg chatConfig) (ChatClient, error) {
-	effort, kwargs, err := thinkingControls(cfg.Model)
+// withThinkingControls resolves the thinking knobs into cfg — src's propose
+// model setting params (when it has a setting layer), then the env vars, then
+// the route default — and builds the client. Applies to both the registry and
+// the EVAL_CHAT_* path.
+func withThinkingControls(cfg chatConfig, src EvalEndpointSource) (ChatClient, error) {
+	t, err := JudgeThinkingFor(src, cfg.Model)
 	if err != nil {
 		return nil, err
 	}
-	cfg.ReasoningEffort = effort
-	cfg.ChatTemplateKwargs = kwargs
+	cfg.Thinking = t
 	return newOpenAIChatClient(cfg), nil
 }
 
@@ -390,16 +347,15 @@ func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {
 		// this timeout.
 		http: &http.Client{Timeout: 120 * time.Second},
 
-		// Pin the reply shape server-side, and (per thinkingControls) ask a
+		// Pin the reply shape server-side, and (per ResolveThinking) ask a
 		// local thinking-capable model to stop thinking. Both reasoning
 		// spellings are sent by default: local endpoints that do not recognise
 		// a field ignore it, and the two model families disagree on which one
 		// to honour. Hosted routes get neither by default — they reject them.
 		// If a reasoning model ignores both, Complete fails with
 		// ErrThinkingOnlyResponse rather than reporting a clean transcript.
-		responseFormat:     findingsResponseFormat,
-		reasoningEffort:    cfg.ReasoningEffort,
-		chatTemplateKwargs: cfg.ChatTemplateKwargs,
+		responseFormat: findingsResponseFormat,
+		thinking:       cfg.Thinking,
 
 		temperature: temperature,
 		topP:        cfg.Params.TopP,
@@ -409,6 +365,10 @@ func newOpenAIChatClient(cfg chatConfig) *openAIChatClient {
 }
 
 func (c *openAIChatClient) Model() string { return c.model }
+
+// Thinking reports the thinking knobs this client sends. Implements
+// ThinkingReporter.
+func (c *openAIChatClient) Thinking() Thinking { return c.thinking }
 
 // Temperature reports the temperature this client sends; nil when the field
 // is omitted (the provider's default applies). Implements TemperatureReporter.
@@ -683,8 +643,8 @@ func (c *openAIChatClient) requestBody(system, user string) ([]byte, error) {
 		TopP:               c.topP,
 		MaxTokens:          c.maxTokens,
 		ResponseFormat:     c.responseFormat,
-		ReasoningEffort:    c.reasoningEffort,
-		ChatTemplateKwargs: c.chatTemplateKwargs,
+		ReasoningEffort:    c.thinking.ReasoningEffort,
+		ChatTemplateKwargs: c.thinking.ChatTemplateKwargs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal chat request: %w", err)

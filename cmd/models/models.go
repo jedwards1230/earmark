@@ -27,6 +27,7 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/openai"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
@@ -97,6 +98,7 @@ Examples:
   earmark models set propose --model ollama/qwen3.8:27b-q8_0 --note "bake-off arm B"
   earmark models set decide --endpoint litellm-s1 --model clef:27b
   earmark models set decide --endpoint litellm-jev --model jev-1.13.0 --param usd_per_mtok_in=0.042
+  earmark models set propose --model openrouter/openai/gpt-6-luna --param reasoning_effort=low --param chat_template_kwargs=omit
   earmark models unset decide --note "back to Jev"
   earmark models history decide --limit 20`,
 	Args: cobra.NoArgs,
@@ -125,11 +127,18 @@ non-jev model needs a systemone endpoint whose baseURL is the LiteLLM root
 TypeSafe, so such a model is refused there.
 
 Pins: --expected-model (the model that should ANSWER — the recipe's
-model_resolved), --revision and --param key=value (known: usd_per_mtok_in)
+model_resolved), --revision and --param key=value (known: usd_per_mtok_in;
+propose also reasoning_effort and chat_template_kwargs — see below)
 replace the step's MODELS_FILE pin wholesale whenever the row changes the
 endpoint or model, or sets any pin; unset pin fields are then unpinned
 (answers are expected from the requested model). A row equal to the env
 endpoint and model with no pins keeps the env pin.
+
+propose: --param reasoning_effort=<auto|omit|none|low|medium|high|…> and
+--param chat_template_kwargs=<auto|omit|JSON object> set the judge's thinking
+knobs for this model. They outrank EVAL_REASONING_EFFORT /
+EVAL_CHAT_TEMPLATE_KWARGS and change the propose recipe; switching the model
+again drops them with the rest of the pin.
 
 embed: the model must produce 768-dimension vectors (transcript_chunks is
 vector(768)). set embeds one probe string through the endpoint and refuses
@@ -165,7 +174,7 @@ func init() {
 	f.StringVar(&setOpts.model, "model", "", "model id to request (default: the endpoint's model)")
 	f.StringVar(&setOpts.expectedModel, "expected-model", "", "pin: the model that should answer (default: the requested model)")
 	f.StringVar(&setOpts.revision, "revision", "", "pin: weights revision (HF commit, Ollama digest, provider snapshot)")
-	f.StringArrayVar(&setOpts.params, "param", nil, "pin param key=value (known: usd_per_mtok_in); repeatable")
+	f.StringArrayVar(&setOpts.params, "param", nil, "pin param key=value (known: usd_per_mtok_in; propose: reasoning_effort, chat_template_kwargs); repeatable")
 	f.StringVar(&setOpts.note, "note", "", "why, recorded in the history")
 	f.BoolVar(&setOpts.noProbe, "no-probe", false, "embed only: store without embedding a probe string to check the vector dimension (running processes still probe before switching)")
 	unsetCmd.Flags().StringVar(&unsetNote, "note", "", "why, recorded in the history")
@@ -287,6 +296,47 @@ type StepView struct {
 	// Error is set when the step's model_settings row is invalid against
 	// this deployment's AI_ENDPOINTS; the fields above are then the row's.
 	Error string `json:"error,omitempty"`
+	// Thinking (propose only, when the step has a model) is the judge's
+	// effective thinking knobs and where each came from (CONTRACT §2.15).
+	Thinking *ThinkingView `json:"thinking,omitempty"`
+}
+
+// ThinkingView is the judge's resolved reasoning_effort / chat_template_kwargs
+// for `earmark models`: the propose model setting's params > the EVAL_* env
+// vars > the route default.
+type ThinkingView struct {
+	// ReasoningEffort is the value sent, "omit" when the field is not sent.
+	ReasoningEffort string `json:"reasoning_effort"`
+	// ChatTemplateKwargs is the object sent, or "omit".
+	ChatTemplateKwargs any `json:"chat_template_kwargs"`
+	// The sources are "setting" (the model setting's params), "env" or "auto".
+	ReasoningEffortSource    string `json:"reasoning_effort_source"`
+	ChatTemplateKwargsSource string `json:"chat_template_kwargs_source"`
+	// Summary is the one-line form the table prints.
+	Summary string `json:"summary"`
+	// Error is set when a layer holds an invalid value: the judge refuses to
+	// start until it is fixed.
+	Error string `json:"error,omitempty"`
+}
+
+// thinkingView resolves the judge's thinking knobs on the effective config.
+func thinkingView(eff *config.Config, model string) *ThinkingView {
+	t, err := eval.JudgeThinkingFor(eval.ConfigSource(eff), model)
+	if err != nil {
+		return &ThinkingView{Error: err.Error()}
+	}
+	v := &ThinkingView{
+		ReasoningEffort: t.ReasoningEffort, ChatTemplateKwargs: t.ChatTemplateKwargs,
+		ReasoningEffortSource: t.EffortSource, ChatTemplateKwargsSource: t.KwargsSource,
+		Summary: t.Describe(),
+	}
+	if v.ReasoningEffort == "" {
+		v.ReasoningEffort = "omit"
+	}
+	if t.ChatTemplateKwargs == nil {
+		v.ChatTemplateKwargs = "omit"
+	}
+	return v
 }
 
 // View computes every settable step's effective model from the env config
@@ -317,6 +367,9 @@ func View(base *config.Config, rows []db.ModelSetting) []StepView {
 		v.Endpoint, v.Model = endpointAndModel(eff, step)
 		pin := eff.ModelPin(step)
 		v.ExpectedModel, v.Revision, v.Params = pin.ExpectedModel, pin.Revision, pin.Params
+		if step == recipe.StepPropose && v.Model != "" {
+			v.Thinking = thinkingView(eff, v.Model)
+		}
 		out = append(out, v)
 	}
 	return out
@@ -367,6 +420,15 @@ func Show(out io.Writer, base *config.Config, rows []db.ModelSetting, asJSON boo
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	for _, v := range views {
+		switch {
+		case v.Thinking == nil:
+		case v.Thinking.Error != "":
+			_, _ = fmt.Fprintf(out, "\n%s thinking: INVALID — %s\n", v.Step, v.Thinking.Error)
+		default:
+			_, _ = fmt.Fprintf(out, "\n%s thinking: %s\n", v.Step, v.Thinking.Summary)
+		}
 	}
 	if len(errs) > 0 {
 		_, _ = fmt.Fprintf(out, "\nINVALID model_settings rows — these steps fail until fixed:\n%s\n", strings.Join(errs, "\n"))

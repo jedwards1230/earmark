@@ -194,3 +194,20 @@ func TestCycleConfigUnsetProposeWithoutEnvJudge(t *testing.T) {
 	_, ok = w.cycleConfig(base)
 	require.True(t, ok, "a resolvable row judge runs")
 }
+
+// A propose row that changes only the judge's thinking params is a new
+// judge: the key covers the pin params.
+func TestJudgeKeyCoversPinParams(t *testing.T) {
+	base := settingsWorkerCfg()
+	set := func(params map[string]any) string {
+		t.Helper()
+		eff, err := base.WithStepSettings(config.StepSetting{Step: recipe.StepPropose, EndpointID: "judge",
+			Model: "openrouter/openai/gpt-6-luna", Params: params})
+		require.NoError(t, err)
+		return judgeKey(eff)
+	}
+	low := set(map[string]any{config.ParamReasoningEffort: "low"})
+	require.NotEqual(t, low, set(map[string]any{config.ParamReasoningEffort: "medium"}))
+	require.NotEqual(t, low, set(nil))
+	require.Equal(t, low, set(map[string]any{config.ParamReasoningEffort: "low"}))
+}

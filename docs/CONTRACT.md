@@ -1417,7 +1417,9 @@ function's recipe (§1.9 "Chunk scan") with the expected model answering.
 `propose`: `step_version` 2 (1 before the pre-filters, §2.15 "Noise filters"), prompt `judge@v2` + sha256 of
 (system prompt, user template, response JSON schema), params `temperature`
 (**only when it is sent** — omitted for hosted routes unless configured, §2.15
-"Request parameters"), `min_confidence`, `max_findings_per_chunk`. `max_tokens`
+"Request parameters"), `min_confidence`, `max_findings_per_chunk`, and
+`reasoning_effort` / `chat_template_kwargs` **only when they differ from the
+route default** (§2.15 "Thinking controls"). `max_tokens`
 is deliberately not a param: a reply that hits it is an error, never findings. `embed`: `step_version` 1, params
 `chunk_size`, `dimensions`, `document_prefix`. Both take `expected_model` /
 `revision` from the model registry (§2.18).
@@ -2034,8 +2036,8 @@ All env var names are fixed. No synonyms, no alternatives.
 | `LIBRARY_COLLECTIONS` | no | JSON array describing each library root's shape, for the dashboard's author/title labels (see below). Empty → generic fallback. |
 | `CONTROL_API_TOKEN` | no | Bearer token required on the mutating control-API endpoints (§2.7). Empty → those endpoints fail closed (`503`); read endpoints are always open. |
 | `EVAL_MAX_FINDINGS_PER_CHUNK` | no | `12`. Cap on findings kept per chunk by the eval judge (highest-confidence retained; the judge over-flags). `<= 0` disables the cap. See §2.15. |
-| `EVAL_REASONING_EFFORT` | no | `auto`. The judge request's `reasoning_effort`. `auto`: `"none"` for local models, omitted when the model id contains `anthropic/` (aliases that hide the provider need `omit`); `omit`: never sent; any other value is sent verbatim. See §2.15. |
-| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto`. The judge request's `chat_template_kwargs`. `auto`: `{"enable_thinking": false}` for local models, omitted when the model id contains `anthropic/` (aliases that hide the provider need `omit`); `omit`: never sent; a JSON object is sent verbatim. Anything else is a configuration error (the eval client fails to resolve). See §2.15. |
+| `EVAL_REASONING_EFFORT` | no | `auto`. The judge request's `reasoning_effort`, for every judge model. `auto`: `"none"` for local models, omitted when the model id contains `anthropic/`, `openrouter/` or `openai/` (aliases that hide the provider need `omit`); `omit`: never sent; any other value is sent verbatim. A propose model setting's `reasoning_effort` param outranks it. See §2.15. |
+| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto`. The judge request's `chat_template_kwargs`, for every judge model. `auto`: `{"enable_thinking": false}` for local models, omitted when the model id contains `anthropic/`, `openrouter/` or `openai/` (aliases that hide the provider need `omit`); `omit`: never sent; a JSON object is sent verbatim. Anything else is a configuration error (the eval client fails to resolve). A propose model setting's `chat_template_kwargs` param outranks it. See §2.15. |
 | `EVAL_MIN_CONFIDENCE` | no | `0.6`. Confidence floor — findings below it are dropped before the cap. `<= 0` disables the floor. See §2.15. |
 | `EVAL_IN_PIPELINE` | no | `false`. When true, the embed worker runs the eval judge on each transcript's chunks **before embedding** (the repositioned, in-pipeline eval) — each chunk can then hold the embed for up to the chat client's 120 s request timeout. When false (**decoupled mode**) the worker builds no judge and makes **no judge call** on the embed path, so embedding never waits on the judge; judging runs as its own pass, `earmark eval --backfill-unevaluated --write` (§2.15), which picks up every done transcript without an `eval_finished_at` latch, embedded or not. (Decoupled mode implies `EVAL_GATES_EMBED=false` — the gate is fatal without `EVAL_IN_PIPELINE=true`.) Requires an eval chat endpoint (`AI_ROLES.eval` / `EVAL_CHAT_*`); if none resolves, inline eval is logged-skipped, not fatal. See also `EVAL_GATES_EMBED`. |
 | `EVAL_GATES_EMBED` | no | `false`. When true, the pipeline becomes strictly linear — a transcript is NOT embedded (not searchable) until it has been judged. Implements the **two-pass gated flow**: an **eval pass** selects done, not-yet-attempted, not-embedded transcripts and judges them (writing `eval_finished_at` on a complete run, the `eval_failed_*` record otherwise); an **embed pass** then selects done, eval'd-or-failed, not-embedded transcripts and embeds them. The `eval_finished_at` latch / `eval_failed_at` record (CONTRACT §1.5) is the hand-off between the two passes. **Invariant**: under this gate, `embedded ⟹ judge attempted` (a judge failure fails open; it is retried by `earmark eval --backfill-*`, never in a hot loop). **Fail-closed** (two conditions, both fatal at startup): (1) if no eval judge endpoint resolves (`AI_ROLES["eval"]` / `EVAL_CHAT_*`); and (2) if `EVAL_IN_PIPELINE` is not also `true`. The gate makes eval a strict prerequisite for embedding, and the eval judge is only built when `EVAL_IN_PIPELINE=true`; so `EVAL_GATES_EMBED=true` **requires** `EVAL_IN_PIPELINE=true` (and a resolvable judge) — otherwise the worker would run gated with a nil judge, stalling the corpus (or risking a nil-judge deref). Both failures fail at startup, never silently stalling the corpus (mirror of the §2.14 malformed-registry fail-closed). Default `false` → behavior is identical to the pre-gate deployment (no behavior change for unconfigured deployments). **Chunk UUIDs**: under this gate, chunk UUIDs are derived deterministically as UUIDv5 over `(transcript_id, chunk_index)`, so the eval pass (which chunks to judge) and the embed pass (which chunks to insert) produce identical IDs without coordination — findings written in the eval pass reference the same chunk rows the embed pass inserts. |
@@ -3055,25 +3057,81 @@ The call uses the OpenAI-compatible `POST {base}/chat/completions` shape.
 | `EVAL_CHAT_BASE_URL` | if no `eval` role in `AI_ROLES` | OpenAI-compatible base URL, e.g. `http://vllm:8000/v1` |
 | `EVAL_CHAT_MODEL` | if no `eval` role in `AI_ROLES` | judge model id |
 | `EVAL_CHAT_API_KEY` | no | bearer token if the endpoint requires one |
-| `EVAL_REASONING_EFFORT` | no | `auto` \| `omit` \| a literal value — see "Thinking controls" below |
-| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto` \| `omit` \| a JSON object — see "Thinking controls" below |
+| `EVAL_REASONING_EFFORT` | no | `auto` \| `omit` \| a literal value — the deployment-wide default; see "Thinking controls" below |
+| `EVAL_CHAT_TEMPLATE_KWARGS` | no | `auto` \| `omit` \| a JSON object — the deployment-wide default; see "Thinking controls" below |
 
 **Thinking controls.** Local reasoning models (Qwen-family on Ollama) must be
 told not to think, or they spend the reply on chain-of-thought and return empty
 content (`ErrThinkingOnlyResponse`). The two families spell it differently, so by
 default (`auto`) the judge sends both `reasoning_effort: "none"` and
 `chat_template_kwargs: {"enable_thinking": false}`. Hosted provider routes reject
-or mis-map those fields (Anthropic has no `"none"` effort and no chat-template
-passthrough), so for a model id containing `anthropic/` anywhere (LiteLLM's
-provider route convention, case-insensitive — so nested routes like
-`bedrock/anthropic/…` match too) `auto` omits **both**. A LiteLLM **alias** that
-hides the provider (e.g. model `judge` mapped to Claude in the proxy config)
-cannot be detected from the id: set `EVAL_REASONING_EFFORT=omit` and
-`EVAL_CHAT_TEMPLATE_KWARGS=omit` for it. Either field can be
-forced per deployment: `omit` never sends it; any other value is sent verbatim
-(`EVAL_CHAT_TEMPLATE_KWARGS` must then be a JSON object). Route-independent:
-`response_format` (JSON schema) and the bearer token from the endpoint's
-`apiKeyEnv` (§2.14).
+or mis-map those fields, so for a **hosted route** `auto` omits **both** (and
+the temperature, "Request parameters" below). A model id is a hosted route when
+it contains, anywhere and case-insensitively (LiteLLM's `<provider>/<model>`
+convention, so nested routes match too):
+
+| Marker | Why it is hosted |
+|---|---|
+| `anthropic/` | Anthropic, direct or via `bedrock/anthropic/…` / `openrouter/anthropic/…`: no `"none"` effort, no chat-template passthrough. |
+| `openrouter/` | Every OpenRouter route, whatever model it serves (`openrouter/openai/gpt-6-luna`, `openrouter/qwen/…`): OpenRouter normalizes reasoning itself and has no chat-template passthrough. |
+| `openai/` | OpenAI's hosted API (and `openrouter/openai/…`): reasoning models take `reasoning_effort` but no `chat_template_kwargs`, and their effort scale is the provider's, not Qwen's. |
+
+`chat_template_kwargs` is an Ollama/vLLM passthrough into a local chat
+template; **no hosted API has one**, so it is never sent to a hosted route by
+default. `reasoning_effort` is omitted rather than defaulted to `"none"` there
+because the right effort is per model and per provider — it is set per model
+instead (below). Local behaviour is unchanged: any other id (`qwen3.8`,
+`ollama/qwen3.8:27b-q8_0`, an Ollama tag) still gets both suppression fields.
+Two ids the markers cannot judge: a LiteLLM **alias** that hides the provider
+(e.g. model `judge` mapped to Claude in the proxy config) is treated as local,
+and a local OpenAI-compatible server registered in LiteLLM as `openai/<model>`
+is treated as hosted — set the knobs explicitly for either.
+
+Each field is resolved independently from three layers; the first that sets
+it wins:
+
+1. **The propose model setting's params** (§2.20): `reasoning_effort`
+   (`auto` | `omit` | any token sent verbatim — `none`, `low`, `medium`,
+   `high`, …; a string) and `chat_template_kwargs` (`auto` | `omit` | a JSON
+   object). They live in the propose step's pin, so they travel with the model
+   they were tuned for: `earmark models set propose --model … --param
+   reasoning_effort=low` sets them, and switching the judge to another model
+   without them drops them (the pin is replaced wholesale). `MODELS_FILE`
+   `steps.propose.params` is the env form of the same layer. Only the propose
+   step accepts these keys.
+2. **`EVAL_REASONING_EFFORT` / `EVAL_CHAT_TEMPLATE_KWARGS`**: the
+   deployment-wide default for every judge model.
+3. **`auto`**: the route default above.
+
+`auto` in a layer means the route default (it does not fall through to the
+next layer); `omit` never sends the field. An invalid value in any layer — an
+effort with whitespace or of another type, kwargs that are not a JSON object —
+is a configuration error naming the layer: `earmark models set` refuses it,
+and the judge refuses to start (never a silent fallback to the next layer).
+`earmark models` and the Models page's Judge card show the knobs the judge
+sends and where each came from.
+
+**Recipe consequence.** A knob is a `propose` recipe param (§1.9) only when it
+differs from the route default — `reasoning_effort` as sent, or `"omit"` when
+a default-sent field is suppressed; `chat_template_kwargs` as the object sent,
+or `"omit"`. Every judge on the defaults therefore keeps its recipe id, while
+any change to what is sent (a setting's `reasoning_effort: "low"`) is a new
+recipe, and its findings are stamped and tracked in `stale_work` accordingly.
+
+Example — the GPT-6 Luna judge via OpenRouter (bake-off: `reasoning_effort`
+`low` gave 0 failures over 450 chunks; at the provider default 25 % of chunks
+hit `max_tokens` 8192):
+
+```bash
+earmark models set propose --model openrouter/openai/gpt-6-luna \
+  --param reasoning_effort=low --param chat_template_kwargs=omit
+```
+
+(`chat_template_kwargs=omit` equals the hosted-route default; stating it keeps
+the row independent of the route rules.)
+
+Route-independent: `response_format` (JSON schema) and the bearer token from
+the endpoint's `apiKeyEnv` (§2.14).
 
 **Request parameters.** From the eval endpoint's `options` (§2.14), with these
 defaults when a key is unset (the `EVAL_CHAT_*` fallback has no options, so it
@@ -3082,7 +3140,7 @@ always gets the defaults):
 | Field | Default | Why |
 |---|---|---|
 | `max_tokens` | `8192` (`defaultJudgeMaxTokens`) | The reply itself is small, but on hosted reasoning models (Claude Haiku 5.5 thinks adaptively by default) the output budget is **shared with thinking** — a tight cap gets spent thinking and the answer is truncated. 8192 leaves room for that and is still a ceiling on a runaway generation. Ollama maps it onto `num_predict`. |
-| `temperature` | `0` for local models; **omitted** for hosted routes | Local judges need determinism (the same span should flag the same way run to run). Hosted routes (`isHostedRoute`: `anthropic/` anywhere in the model id) are sent no temperature, because newer Claude models reject any non-default sampling parameter (`temperature`/`top_p`/`top_k` → 400). An explicit `temperature` option is always sent, on any route. |
+| `temperature` | `0` for local models; **omitted** for hosted routes | Local judges need determinism (the same span should flag the same way run to run). Hosted routes (`isHostedRoute`: `anthropic/`, `openrouter/` or `openai/` anywhere in the model id — "Thinking controls" above) are sent no temperature, because newer Claude models reject any non-default sampling parameter (`temperature`/`top_p`/`top_k` → 400), and so do OpenAI reasoning models. An explicit `temperature` option is always sent, on any route. |
 | `top_p` | omitted | Sent only when configured. |
 
 The judge's `propose` recipe params (§1.9) and the span's
@@ -4266,7 +4324,7 @@ steps:
 | `expected_model` | the model the endpoint should report serving; the current recipe's `model_resolved`. Unset → the requested model |
 | `revision` | HF commit / `.nemo` sha256 / Ollama digest / provider snapshot |
 | `prompt_version` | the prompt version this deployment expects; the code's own version is authoritative, a mismatch is logged |
-| `params` | optional step settings. Known key: `usd_per_mtok_in` (decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14). An unknown key or a bad value is a startup error |
+| `params` | optional step settings. Known keys: `usd_per_mtok_in` (decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14); `reasoning_effort` and `chat_template_kwargs` (propose only) — the judge's per-model thinking knobs (§2.15 "Thinking controls"). An unknown key, a key the step does not accept, or a bad value is a startup error |
 
 Because `expected_model` becomes the current recipe's `model_resolved`, a
 response served by any other model (a LiteLLM fallback, or an alias silently
@@ -4754,7 +4812,9 @@ step is off). An override never writes `model_settings`.
 
 **What a setting is.** An `AI_ENDPOINTS` id and a model id to request from
 it, plus optional pins with `MODELS_FILE` semantics (§2.18):
-`expected_model`, `revision`, `params` (known: `usd_per_mtok_in`). URLs and
+`expected_model`, `revision`, `params` (known: `usd_per_mtok_in`; on
+`propose` also `reasoning_effort` and `chat_template_kwargs`, §2.15 "Thinking
+controls"). URLs and
 keys are never stored: where to connect and with which credential stays in
 the env registry, so a setting can only choose among endpoints the deployment
 already declares. Applying it (`config.(*Config).WithStepSettings`) returns a

@@ -110,6 +110,16 @@ func TestStepSettingsValidation(t *testing.T) {
 		{"string param", StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
 			Params: map[string]any{ParamUSDPerMTokIn: "cheap"}}, "non-negative number"},
 		{"synthesized endpoint", StepSetting{Step: recipe.StepScan, EndpointID: "jev@decide", Model: "jev-1.13.0"}, `not in AI_ENDPOINTS`},
+		{"thinking param on decide", StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
+			Params: map[string]any{ParamReasoningEffort: "low"}}, `unknown key "reasoning_effort" (known for decide: usd_per_mtok_in)`},
+		{"numeric reasoning_effort", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamReasoningEffort: 1.0}}, "reasoning_effort must be a string"},
+		{"blank reasoning_effort", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamReasoningEffort: " "}}, "reasoning_effort must be a non-empty token"},
+		{"kwargs not an object", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamChatTemplateKwargs: "[1]"}}, `chat_template_kwargs must be "auto", "omit" or a JSON object`},
+		{"kwargs a number", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamChatTemplateKwargs: 3.0}}, "chat_template_kwargs must be"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -375,4 +385,40 @@ func TestStepSettingsPinWhitespaceAndRoute(t *testing.T) {
 	assert.Equal(t, "clef:27b", ep.Model)
 	assert.Equal(t, "http://litellm:4000", ep.BaseURL, "the unified route: the client posts {base}/v1/systemone")
 	assert.Equal(t, "e", c.ModelPin(recipe.StepPropose).ExpectedModel)
+}
+
+// The propose step accepts the judge thinking params, as strings or (for the
+// kwargs) an object, and they become the step's pin params.
+func TestStepSettingsJudgeThinkingParams(t *testing.T) {
+	for name, params := range map[string]map[string]any{
+		"flag strings":  {ParamReasoningEffort: "low", ParamChatTemplateKwargs: "omit"},
+		"kwargs json":   {ParamChatTemplateKwargs: `{"enable_thinking":false}`},
+		"kwargs object": {ParamChatTemplateKwargs: map[string]any{"enable_thinking": false}},
+		"auto":          {ParamReasoningEffort: "auto", ParamChatTemplateKwargs: "AUTO"},
+		"with price":    {ParamReasoningEffort: "high", ParamUSDPerMTokIn: 0.1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			eff, err := settingsBase().WithStepSettings(StepSetting{Step: recipe.StepPropose, EndpointID: "judge",
+				Model: "openrouter/openai/gpt-6-luna", Params: params})
+			require.NoError(t, err)
+			assert.Equal(t, params, eff.ModelPin(recipe.StepPropose).Params)
+		})
+	}
+}
+
+func TestChatTemplateKwargsParam(t *testing.T) {
+	for in, want := range map[any]string{
+		"omit": "omit", " OMIT ": "omit", "auto": "auto", `{"a":1}`: `{"a":1}`,
+	} {
+		got, err := ChatTemplateKwargsParam(in)
+		require.NoError(t, err, "%v", in)
+		assert.Equal(t, want, got)
+	}
+	got, err := ChatTemplateKwargsParam(map[string]any{"b": true, "a": 1})
+	require.NoError(t, err)
+	assert.Equal(t, `{"a":1,"b":true}`, got)
+	for _, bad := range []any{"", "null", "[]", "{", 1.0, true, []any{"x"}} {
+		_, err := ChatTemplateKwargsParam(bad)
+		assert.Error(t, err, "%v", bad)
+	}
 }

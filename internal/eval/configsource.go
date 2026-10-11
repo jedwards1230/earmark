@@ -2,6 +2,8 @@ package eval
 
 import (
 	"errors"
+	"fmt"
+
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
@@ -25,6 +27,31 @@ func (s configSource) EvalEndpoint() (EvalEndpoint, bool) {
 		APIKey:  ep.APIKey,
 		Options: ep.Options,
 	}, true
+}
+
+// JudgeThinking is the setting layer of the judge's thinking knobs: the
+// propose step's effective pin params (a model_settings row, or MODELS_FILE
+// steps.propose.params — CONTRACT §2.20). Values were validated when the
+// setting was applied; they are re-read with the same parsers so a value that
+// slipped past (a hand-built config) still fails closed.
+func (s configSource) JudgeThinking() (ThinkingSetting, error) {
+	var out ThinkingSetting
+	params := s.cfg.ModelPin(recipe.StepPropose).Params
+	if v, ok := params[config.ParamReasoningEffort]; ok {
+		effort, err := config.ReasoningEffortParam(v)
+		if err != nil {
+			return ThinkingSetting{}, fmt.Errorf("propose params.%s %w", config.ParamReasoningEffort, err)
+		}
+		out.ReasoningEffort = effort
+	}
+	if v, ok := params[config.ParamChatTemplateKwargs]; ok {
+		kwargs, err := config.ChatTemplateKwargsParam(v)
+		if err != nil {
+			return ThinkingSetting{}, fmt.Errorf("propose params.%s %w", config.ParamChatTemplateKwargs, err)
+		}
+		out.ChatTemplateKwargs = kwargs
+	}
+	return out, nil
 }
 
 // ConfigSource wraps a parsed *config.Config as an EvalEndpointSource for
