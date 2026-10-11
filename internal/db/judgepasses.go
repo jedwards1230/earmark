@@ -43,6 +43,7 @@ type JudgePassOpen struct {
 	ChunksTotal int
 }
 
+// #nosec G101 -- SQL text, not a credential
 const openJudgePassSQL = `
 	INSERT INTO judge_passes (transcript_id, job_id, file_path, recipe_id, step_run_id,
 	                          status, chunks_total)
@@ -109,6 +110,7 @@ type JudgePassResult struct {
 // the commit's dedupe read → insert (a transaction-scoped advisory lock;
 // concurrent rejudge shards are disjoint by transcript, so it never waits in
 // the normal case).
+// #nosec G101 -- SQL text, not a credential
 const judgePassLockSQL = `SELECT pg_advisory_xact_lock(hashtext('earmark.judge_pass'), hashtext($1))`
 
 // recipeFindingKeysSQL reads the dedupe keys of a transcript's live findings
@@ -127,6 +129,7 @@ const recipeFindingKeysSQL = `
 
 // closeJudgePassSQL closes a running pass. The status guard makes a second
 // close (or closing a pass someone else closed) an error, never a rewrite.
+// #nosec G101 -- SQL text, not a credential
 const closeJudgePassSQL = `
 	UPDATE judge_passes
 	   SET status = $2, chunks_total = $3, chunks_judged = $4, chunks_failed = $5,
