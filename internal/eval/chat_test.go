@@ -552,12 +552,16 @@ func TestJudgeRecipe_TemperatureOnlyWhenSent(t *testing.T) {
 		}
 		return th
 	}
+	// judge@v2: the historical recipes predate judge@v3's book_context param,
+	// and selecting v2 must reproduce them exactly.
 	local := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: "http://ollama:11434/v1", Model: "qwen3.8", Thinking: resolved("qwen3.8")}))
+	mustSetPrompt(t, local, JudgePromptV2)
 	if got, want := mustRecipeID(t, local.Recipe()), legacyID(local); got != want {
 		t.Errorf("local recipe id changed: %s, want the historical %s", got, want)
 	}
 	hosted := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: "http://litellm:4000/v1", Model: "anthropic/claude-haiku-5-5",
 		Thinking: resolved("anthropic/claude-haiku-5-5")}))
+	mustSetPrompt(t, hosted, JudgePromptV2)
 	if _, ok := hosted.Recipe().Params["temperature"]; ok {
 		t.Error("hosted recipe must not record a temperature that is not sent")
 	}

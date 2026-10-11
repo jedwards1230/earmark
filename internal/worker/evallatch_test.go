@@ -16,6 +16,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/eval"
 	"github.com/jedwards1230/earmark/internal/log"
+	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
 // errChat fails every Complete call with err — a judge endpoint that is down,
@@ -263,3 +264,111 @@ func TestStart_GatedBacksOffWhenOutcomeNotRecorded(t *testing.T) {
 	require.LessOrEqual(t, fdb.evalCallCount(), 2,
 		"an unrecorded eval outcome must back off for the poll interval, not re-judge in a hot loop")
 }
+
+// recordsDB is a fakeDB that also serves book records (as db.DB does), so
+// the worker's judge reads judge@v3's book context through it.
+type recordsDB struct {
+	*fakeDB
+	err   error
+	calls int
+}
+
+func (r *recordsDB) GetBookRecords(_ context.Context, dirs []string) (map[string]db.BookRecord, error) {
+	r.calls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	return map[string]db.BookRecord{}, nil
+}
+
+// v3Config opts the propose step in to judge@v3 through the pin param.
+func v3Config(gated bool) *config.Config {
+	return &config.Config{ChunkSize: 8, EvalGatesEmbed: gated, Models: &config.ModelRegistry{Steps: map[string]config.ModelPin{
+		recipe.StepPropose: {Params: map[string]any{config.ParamJudgePrompt: "v3"}},
+	}}}
+}
+
+// TestEvalTranscript_BookRecordReadError: by default the in-pipeline judge
+// is judge@v2 and reads no records. Opted in to judge@v3 through the propose
+// pin's judge_prompt param, it reads book records through the worker's
+// database; a failed read makes no judge call and is RECORDED as an eval
+// failure (eval_failed_at + eval_error, no latch) — so the job leaves the
+// gated eval pass's selection instead of being retried in a loop, and stays
+// re-judgeable by --backfill-eval-errors.
+func TestEvalTranscript_BookRecordReadError(t *testing.T) {
+	tr := &db.Transcript{ID: "tid-rec", JobID: "job-rec", FilePath: "/b/a/t/ch.mp3", RawText: longTranscript}
+
+	def := &recordsDB{fakeDB: &fakeDB{}, err: errors.New("db down")}
+	dw := &Worker{ctx: context.Background(), db: def, log: log.NewLogger("worker-test"), evalGatesEmbed: true}
+	dw.judge = dw.newJudge(&countingChat{resp: `{"findings":[]}`}, &config.Config{})
+	require.Equal(t, eval.JudgePromptV2, dw.judge.Prompt(), "the worker's default judge is judge@v2")
+	require.NoError(t, dw.evalTranscript(&config.Config{ChunkSize: 8, EvalGatesEmbed: true}, tr))
+	require.Zero(t, def.calls, "judge@v2 reads no book records")
+
+	rdb := &recordsDB{fakeDB: &fakeDB{}, err: errors.New("db down")}
+	chat := &countingChat{resp: `{"findings":[]}`}
+	w := &Worker{ctx: context.Background(), db: rdb, log: log.NewLogger("worker-test"), evalGatesEmbed: true}
+	w.judge = w.newJudge(chat, v3Config(true))
+	require.Equal(t, eval.JudgePromptV3, w.judge.Prompt())
+
+	require.NoError(t, w.evalTranscript(v3Config(true), tr))
+	require.Equal(t, 1, rdb.calls, "the worker's judge reads records through the worker's database")
+	require.Zero(t, chat.calls, "no paid call after a failed record read")
+	require.Len(t, rdb.evalMetrics, 1)
+	m := rdb.evalMetrics[0]
+	require.True(t, m.Failed() && m.FinishedAt.IsZero(), "recorded as a failure, never latched")
+	require.Contains(t, m.Error, "db down")
+	require.Positive(t, m.FailedChunks)
+
+	rdb.err, rdb.evalMetrics = nil, nil
+	require.NoError(t, w.evalTranscript(v3Config(true), tr))
+	require.Positive(t, chat.calls)
+	require.Len(t, rdb.evalMetrics, 1)
+	require.False(t, rdb.evalMetrics[0].Failed())
+}
+
+// TestProcessTranscript_BookRecordReadErrorRecorded: on the ungated path
+// (EVAL_GATES_EMBED=false) a failed record read still embeds, and the
+// transcript gets a failure record carrying the reason — not silence.
+func TestProcessTranscript_BookRecordReadErrorRecorded(t *testing.T) {
+	rdb := &recordsDB{fakeDB: &fakeDB{}, err: errors.New("db down")}
+	chat := &countingChat{resp: `{"findings":[]}`}
+	w := &Worker{ctx: context.Background(), db: rdb, log: log.NewLogger("worker-test")}
+	w.judge = w.newJudge(chat, v3Config(false))
+	tr := &db.Transcript{ID: "tid-ug-rec", JobID: "job-ug-rec", FilePath: "/b/a/t/ch.mp3", RawText: longTranscript}
+
+	require.NoError(t, w.processTranscript(v3Config(false), tr))
+	require.NotEmpty(t, rdb.chunks, "a record read failure must not block the embed")
+	require.Zero(t, chat.calls)
+	require.Len(t, rdb.evalMetrics, 1)
+	require.True(t, rdb.evalMetrics[0].Failed())
+	require.Contains(t, rdb.evalMetrics[0].Error, "db down")
+	require.Equal(t, len(rdb.chunks), rdb.evalMetrics[0].FailedChunks)
+}
+
+// TestNewJudge_V3WithoutRecordSourceFails: a judge@v3 worker whose database
+// cannot serve records records a failure instead of judging path-only.
+func TestNewJudge_V3WithoutRecordSourceFails(t *testing.T) {
+	fdb := &fakeDB{}
+	chat := &countingChat{resp: `{"findings":[]}`}
+	w := &Worker{ctx: context.Background(), db: fdb, log: log.NewLogger("worker-test"), evalGatesEmbed: true}
+	w.judge = w.newJudge(chat, v3Config(true))
+	tr := &db.Transcript{ID: "tid-nosrc", JobID: "job-nosrc", FilePath: "/b/a/t/ch.mp3", RawText: longTranscript}
+	require.NoError(t, w.evalTranscript(v3Config(true), tr))
+	require.Zero(t, chat.calls)
+	require.Len(t, fdb.evalMetrics, 1)
+	require.True(t, fdb.evalMetrics[0].Failed())
+	require.Contains(t, fdb.evalMetrics[0].Error, "no record source")
+}
+
+// countingChat counts judge calls.
+type countingChat struct {
+	resp  string
+	calls int
+}
+
+func (c *countingChat) Complete(context.Context, string, string) (string, error) {
+	c.calls++
+	return c.resp, nil
+}
+func (c *countingChat) Model() string { return "counting-judge" }

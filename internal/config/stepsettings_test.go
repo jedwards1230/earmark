@@ -127,6 +127,12 @@ func TestStepSettingsValidation(t *testing.T) {
 			Params: map[string]any{ParamTemperature: "zero"}}, "temperature must be a non-negative number"},
 		{"temperature on decide", StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
 			Params: map[string]any{ParamTemperature: 0.0}}, `unknown key "temperature"`},
+		{"unknown judge prompt", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamJudgePrompt: "v4"}}, `judge_prompt must be "v2" or "v3"`},
+		{"numeric judge prompt", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
+			Params: map[string]any{ParamJudgePrompt: 3}}, `judge_prompt must be "v2" or "v3"`},
+		{"judge prompt on decide", StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
+			Params: map[string]any{ParamJudgePrompt: "v3"}}, `unknown key "judge_prompt"`},
 		{"kwargs empty object", StepSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "x",
 			Params: map[string]any{ParamChatTemplateKwargs: "{}"}}, "non-empty JSON object"},
 	}
@@ -406,6 +412,8 @@ func TestStepSettingsJudgeThinkingParams(t *testing.T) {
 		"auto":          {ParamReasoningEffort: "auto", ParamChatTemplateKwargs: "AUTO"},
 		"with price":    {ParamReasoningEffort: "high", ParamUSDPerMTokIn: 0.1},
 		"temperature 0": {ParamTemperature: 0.0, ParamReasoningEffort: "low"},
+		"judge prompt":  {ParamJudgePrompt: "v3"},
+		"judge@ prompt": {ParamJudgePrompt: "judge@V2"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			eff, err := settingsBase().WithStepSettings(StepSetting{Step: recipe.StepPropose, EndpointID: "judge",
@@ -413,6 +421,18 @@ func TestStepSettingsJudgeThinkingParams(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, params, eff.ModelPin(recipe.StepPropose).Params)
 		})
+	}
+}
+
+func TestJudgePromptParam(t *testing.T) {
+	for in, want := range map[any]string{"v2": "v2", " V3 ": "v3", "judge@v3": "v3"} {
+		got, err := JudgePromptParam(in)
+		require.NoError(t, err, "%v", in)
+		assert.Equal(t, want, got)
+	}
+	for _, in := range []any{"", "v1", "v4", 3, nil} {
+		_, err := JudgePromptParam(in)
+		assert.Error(t, err, "%v", in)
 	}
 }
 
