@@ -241,6 +241,13 @@ func (w *Worker) newJudge(chat eval.ChatClient, cfg *config.Config) *eval.Judge 
 	if br, ok := w.db.(eval.BookRecordReader); ok {
 		j.SetBookRecords(br)
 	}
+	// Every in-pipeline judge call is logged in fn_calls and an answered
+	// chunk is served from there (CONTRACT §2.15 "Judge calls"). The worker
+	// keeps the default call policy: the per-call deadline, no retries — a
+	// failed chunk is recorded and re-judged by a later backfill.
+	if cl, ok := w.db.(eval.CallLog); ok {
+		j.SetCallLog(cl)
+	}
 	return j
 }
 
@@ -623,6 +630,9 @@ func (w *Worker) processTranscript(cfg *config.Config, t *db.Transcript) error {
 	var judged *judgeOutcome
 	if w.judge != nil {
 		judged = w.judgeChunks(t, pristine)
+		// A return before persistJudged (the embed failed) stores none of
+		// the findings: close the pass as failed, never leave it running.
+		defer w.abandonPass(t, judged, "the embed failed before the findings were stored")
 	}
 
 	// EMBED PATH — replay the accepted corrections onto a COPY of the pristine
@@ -753,6 +763,7 @@ func (w *Worker) evalTranscript(cfg *config.Config, t *db.Transcript) error {
 	}
 
 	judged := w.judgeChunks(t, chunks)
+	defer w.abandonPass(t, judged, "stopped by shutdown; findings not stored")
 	if judged.stopped() {
 		// Shutdown mid-judge: record nothing. The job stays unlatched AND
 		// unfailed, so the eval pass simply re-selects it after restart.
@@ -869,6 +880,9 @@ type judgeOutcome struct {
 	started    time.Time
 	finished   time.Time
 	persistErr error // set by persistJudged when InsertFindings fails
+	// passID is the judge_passes row opened for this run (0 when the
+	// database records no passes or the open failed).
+	passID int64
 }
 
 // stopped reports whether the run was aborted by shutdown (nothing to record).
@@ -908,6 +922,18 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) *judgeOutcome 
 	evalChunks := EvalChunksFor(t, chunks)
 
 	o := &judgeOutcome{chunks: len(evalChunks), started: time.Now()}
+	if ps := w.passStore(); ps != nil {
+		// Open the pass before the first call, so a killed worker leaves a
+		// 'running' row as evidence (CONTRACT §2.15 "Lineage"). Best-effort:
+		// eval is advisory and never blocks the embed.
+		id, err := w.judge.OpenPass(w.ctx, ps, eval.PassTarget{TranscriptID: t.ID, JobID: t.JobID,
+			FilePath: t.FilePath}, len(evalChunks), 0)
+		if err != nil {
+			w.log.Warn("opening the judge pass failed (judging without one)",
+				"transcript_id", t.ID, "error", err)
+		}
+		o.passID = id
+	}
 	w.appendEvent(db.PipelineEvent{
 		JobID:      t.JobID,
 		FilePath:   t.FilePath,
@@ -995,7 +1021,13 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) *judgeOutcome 
 // then still "unattempted" in the DB, which the gated loop must back off on.
 func (w *Worker) persistJudged(t *db.Transcript, o *judgeOutcome) error {
 	if o.stopped() {
+		w.closeStoppedPass(t, o)
 		return nil
+	}
+	if o.passID != 0 {
+		if done, err := w.commitPass(t, o); done {
+			return err
+		}
 	}
 	if len(o.findings) > 0 {
 		if err := w.db.InsertFindings(w.ctx, o.findings); err != nil {
@@ -1031,6 +1063,90 @@ func (w *Worker) persistJudged(t *db.Transcript, o *judgeOutcome) error {
 		return fmt.Errorf("record eval failure: %w", err)
 	}
 	return nil
+}
+
+// passStore is the worker database's judge-pass writer, nil when it records
+// no passes (test fakes) or no judge runs.
+func (w *Worker) passStore() eval.PassStore {
+	if w.judge == nil {
+		return nil
+	}
+	ps, _ := w.db.(eval.PassStore)
+	return ps
+}
+
+// commitPass stores a judged run through its judge pass: the findings not
+// already recorded by this recipe, the pass's closing record and the
+// run_metrics latch (complete) or failure record, in one transaction. done is
+// false when the commit failed: the caller then falls back to the plain
+// writes (findings, failure record) and the pass is closed as failed.
+func (w *Worker) commitPass(t *db.Transcript, o *judgeOutcome) (done bool, err error) {
+	ps := w.passStore()
+	cl := eval.PassClose(o.stats, o.chunks, nil)
+	m := db.EvalMetrics{JobID: t.JobID, StartedAt: o.started, Model: w.judgeModel(),
+		ResolvedModel: o.stats.ResolvedModel, Chunks: o.stats.ChunksEvaluated, Skipped: o.stats.ChunksSkipped}
+	if cl.Status == db.JudgePassComplete {
+		m.FinishedAt = o.finished
+	} else {
+		m.FailedAt, m.FailedChunks, m.Error = o.finished, o.stats.ChunksSkipped, o.failureReason()
+	}
+	res, cerr := ps.CommitJudgePass(w.ctx, db.JudgePassCommit{PassID: o.passID, TranscriptID: t.ID,
+		Findings: o.findings, Close: cl, Metrics: &m})
+	if cerr != nil {
+		w.log.Warn("recording the judge pass failed (falling back to plain writes)",
+			"transcript_id", t.ID, "pass_id", o.passID, "error", cerr)
+		w.closePass(t, o.passID, db.JudgePassClose{Status: db.JudgePassFailed, ChunksTotal: o.chunks,
+			ChunksJudged: o.stats.ChunksEvaluated, ChunksFailed: o.stats.ChunksSkipped,
+			ChunksCached: o.stats.ChunksCached, Error: "recording the pass failed: " + cerr.Error()}, nil)
+		o.passID = 0
+		return false, nil
+	}
+	w.log.Info("in-pipeline judge pass recorded", "transcript_id", t.ID, "pass_id", o.passID,
+		"status", cl.Status, "findings", res.Inserted, "already_recorded", res.Duplicates)
+	o.passID = 0
+	return true, nil
+}
+
+// abandonPass closes, as failed, a pass whose findings were never stored (an
+// embed failure, a shutdown on the gated eval pass). A no-op once the pass
+// was committed or closed.
+func (w *Worker) abandonPass(t *db.Transcript, o *judgeOutcome, why string) {
+	if o == nil || o.passID == 0 {
+		return
+	}
+	cl := eval.PassClose(o.stats, o.chunks, o.err)
+	cl.Status = db.JudgePassFailed
+	if cl.Error != "" {
+		why += "; " + cl.Error
+	}
+	cl.Error = why
+	w.closePass(t, o.passID, cl, nil)
+	o.passID = 0
+}
+
+// closeStoppedPass closes the pass of a run stopped by shutdown as partial or
+// failed with the findings judged so far (detached from the stopping
+// context); the latch is untouched.
+func (w *Worker) closeStoppedPass(t *db.Transcript, o *judgeOutcome) {
+	if o.passID == 0 {
+		return
+	}
+	w.closePass(t, o.passID, eval.PassClose(o.stats, o.chunks, o.err), o.findings)
+	o.passID = 0
+}
+
+// closePass closes pass id best-effort (bounded, detached from shutdown).
+func (w *Worker) closePass(t *db.Transcript, id int64, cl db.JudgePassClose, findings []db.Finding) {
+	ps := w.passStore()
+	if ps == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 30*time.Second)
+	defer cancel()
+	if _, err := ps.CommitJudgePass(ctx, db.JudgePassCommit{PassID: id, TranscriptID: t.ID,
+		Findings: findings, Close: cl}); err != nil {
+		w.log.Warn("closing the judge pass failed", "transcript_id", t.ID, "pass_id", id, "error", err)
+	}
 }
 
 // errEvalOutcomeNotRecorded marks an eval-pass error where the judge outcome

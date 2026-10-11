@@ -24,9 +24,11 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
@@ -68,6 +70,16 @@ type options struct {
 	// "" = the propose pin's judge_prompt param, else the default v2).
 	// CONTRACT §2.15 "Book context".
 	judgePrompt string
+	// callTimeout / retries are the judge's call policy, every mode
+	// (CONTRACT §2.15 "Judge calls").
+	callTimeout time.Duration
+	retries     int
+	// rejudge mode (CONTRACT §2.15 "Re-judge").
+	rejudge      bool
+	expectRecipe string
+	concurrency  int
+	book         string // --book: same as the positional book substring
+	shard        string // "i/N"
 }
 
 var opts options
@@ -97,8 +109,10 @@ EVAL_IN_PIPELINE=false keeps the judge out of the embed path (CONTRACT §2.15, �
 with a recorded failure (run_metrics.eval_failed_at), and LEGACY ones the old
 pipeline latched as done despite a judge error (eval_skipped > 0, an eval error
 event in pipeline_events, or a legacy run that judged fewer chunks than are
-stored, with no chunk added since the run). Findings already recorded for a
-transcript are not inserted twice.
+stored, with no chunk added since the run). A finding the same judge recipe
+already recorded for the transcript is not inserted twice; an identical finding
+from another recipe is (that agreement is recorded). Under --write each
+transcript is recorded as a judge pass (judge_passes).
 
 In both backfill modes eval_finished_at is written only when EVERY chunk was
 judged; otherwise the failure is recorded and the transcript stays eligible for
@@ -139,6 +153,34 @@ endpoint; --endpoint alone uses that endpoint's own model. A different model
 is a different propose recipe. Neither flag writes model_settings.
   earmark eval --sample 200 --seed q4 --dump /tmp/qwen.jsonl --model ollama/qwen3.8:27b-q8_0
 
+Re-judge (CONTRACT §2.15 "Re-judge"): --rejudge judges every done transcript
+that has stored chunks and no 'complete' judge pass under the CURRENT judge
+recipe (or one equivalent to it), in keyset pages, with --concurrency judge
+calls in flight across all transcripts (default 16). --limit N caps the
+transcripts attempted; --book narrows by path; --shard i/N runs one of N
+disjoint partitions (decide --shard's). --expect-recipe <id> refuses to start
+unless the current judge recipe is <id> — pin it so a resumed run cannot
+silently judge under a changed model or prompt. Each chunk is looked up in
+fn_calls first, so a killed run resumes without paying again. With --write each
+transcript gets a judge_passes row (opened 'running', closed complete/partial/
+failed with its findings and the run_metrics latch in one transaction).
+WITHOUT --write it still makes PAID model calls: nothing but fn_calls is
+written (the replies are cached there, so the --write run that follows serves
+them without paying again). Stop with Ctrl-C: in-flight passes are closed as
+partial with what was judged. Runs from a local binary against the database;
+memory holds at most --concurrency transcripts' chunks.
+  earmark eval --rejudge --limit 5                         # preview 5 transcripts (paid, cached)
+  earmark eval --rejudge --write --expect-recipe <id>      # the full re-judge
+  earmark eval --rejudge --write --expect-recipe <id> --shard 0/2
+
+Judge calls (every mode): --call-timeout bounds each model call (default 3m),
+--retries retries a call that failed transiently — 429/5xx (honouring
+Retry-After), a timeout, a transport error — with exponential backoff (default
+4). A reply that is not valid findings JSON is never retried: that chunk FAILS
+(error_class invalid_reply) and the transcript is not latched. Every call is
+logged in fn_calls (fn judge_chunk) and a chunk this judge already answered is
+served from there.
+
 Prompt: --judge-prompt selects the judge prompt version for this run (CONTRACT
 §2.15 "Book context"); without it the propose pin's judge_prompt param decides
 ('earmark models set propose ... --param judge_prompt=v3'), else v2. v2 (the
@@ -173,13 +215,39 @@ func init() {
 		"this run only: the model id the judge requests (default: the propose step's effective model)")
 	EvalCmd.Flags().StringVar(&opts.judgePrompt, "judge-prompt", "",
 		"judge prompt version for this run: v2 (default; path only) or v3 (opt-in; adds the book's catalogue record). Default: the propose pin's judge_prompt param, else v2")
-	EvalCmd.MarkFlagsMutuallyExclusive("backfill-unevaluated", "backfill-eval-errors")
+	EvalCmd.Flags().DurationVar(&opts.callTimeout, "call-timeout", evalpkg.DefaultCallTimeout,
+		"deadline of one judge model call (every mode)")
+	EvalCmd.Flags().IntVar(&opts.retries, "retries", evalpkg.DefaultRetries,
+		"retries of a judge call that failed transiently (429/5xx honouring Retry-After, timeout, transport error); never an invalid reply (every mode)")
+	EvalCmd.Flags().BoolVar(&opts.rejudge, "rejudge", false,
+		"judge every done transcript with chunks that has no complete judge pass under the current judge recipe (PAID model calls even without --write)")
+	EvalCmd.Flags().StringVar(&opts.expectRecipe, "expect-recipe", "",
+		"with --rejudge: refuse to start unless the current judge recipe is this id (or equivalent to it)")
+	EvalCmd.Flags().IntVar(&opts.concurrency, "concurrency", 16,
+		"with --rejudge: max judge calls in flight, across every transcript of the run")
+	EvalCmd.Flags().StringVar(&opts.book, "book", "",
+		"only transcripts/chunks whose path contains this (case-insensitive); same as the positional book substring")
+	EvalCmd.Flags().StringVar(&opts.shard, "shard", "",
+		"with --rejudge: i/N — only transcripts with hashtext(transcript_id) mod N = i (decide --shard's partition)")
+	EvalCmd.MarkFlagsMutuallyExclusive("backfill-unevaluated", "backfill-eval-errors", "rejudge")
+	EvalCmd.MarkFlagsMutuallyExclusive("rejudge", "sample")
+	EvalCmd.MarkFlagsMutuallyExclusive("rejudge", "dump")
+	EvalCmd.MarkFlagsMutuallyExclusive("rejudge", "seed")
+	EvalCmd.MarkFlagsMutuallyExclusive("rejudge", "max-attempts")
 }
 
 func runEval(cmd *cobra.Command, args []string) {
-	book := ""
+	book := opts.book
 	if len(args) > 0 {
+		if book != "" && book != args[0] {
+			fmt.Fprintln(os.Stderr, "Error: pass the book either as --book or as the argument, not both")
+			os.Exit(2)
+		}
 		book = args[0]
+	}
+	if err := validateCallFlags(opts); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
 	}
 
 	cfg, err := config.LoadConfig()
@@ -228,6 +296,10 @@ func runEval(cmd *cobra.Command, args []string) {
 	// judge@v3 reads each book's catalogue record (book_metadata) for its
 	// book context; a read error fails the run rather than judging path-only.
 	judge.SetBookRecords(database)
+	// Every judge call is logged in fn_calls (fn judge_chunk) and an answered
+	// chunk is served from there, in every mode (CONTRACT §2.15 "Judge calls").
+	judge.SetCallLog(database)
+	judge.SetCallPolicy(evalpkg.CallPolicy{Timeout: opts.callTimeout, Retries: opts.retries})
 	log.Printf("judge prompt %s", judge.Prompt().Version())
 
 	// OpenTelemetry (CONTRACT §2.16): judge calls emit gen_ai spans when an
@@ -250,6 +322,24 @@ func runEval(cmd *cobra.Command, args []string) {
 
 // runJudge runs the selected eval mode and returns the process exit code.
 func runJudge(database *db.DB, judge *evalpkg.Judge, cfg *config.Config, book string) int {
+	if opts.rejudge {
+		ro, err := rejudgeOptionsFrom(opts, book)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 2
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := runRejudge(ctx, os.Stdout, database, judge, ro); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if opts.expectRecipe != "" || opts.shard != "" {
+		fmt.Fprintln(os.Stderr, "Error: --expect-recipe and --shard apply to --rejudge only")
+		return 2
+	}
 	// --backfill-unevaluated: a separate execution path that judges done transcripts
 	// with eval_finished_at IS NULL (regardless of embed state). This is an offline
 	// sweep over raw transcript text, not over transcript_chunks, so it uses a
@@ -545,7 +635,7 @@ walk:
 			tl.seen++
 			cursor = db.CursorAfter(t) // advance past every row, whatever its outcome
 			rec.Phase(fmt.Sprintf("judging %s · asking %s", filepath.Base(t.FilePath), judge.Model()))
-			res, err := backfillOne(ctx, p, bdb, judge, chunkSize, cfg.EvalGatesEmbed, t, o.write)
+			res, err := backfillOne(ctx, p, bdb, judge, chunkSize, cfg.EvalGatesEmbed, t, o.write, rec.ID())
 			if err != nil {
 				return err
 			}
@@ -694,7 +784,7 @@ type backfillResult struct {
 // Such a transcript is skipped and left unlatched; the next backfill run judges
 // it once it has been embedded.
 func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, judge *evalpkg.Judge,
-	chunkSize int, gated bool, t *db.Transcript, write bool) (backfillResult, error) {
+	chunkSize int, gated bool, t *db.Transcript, write bool, stepRunID int64) (backfillResult, error) {
 	var res backfillResult
 	name := filepath.Base(t.FilePath)
 	if t.RawText == "" {
@@ -736,6 +826,22 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 		evalChunks = worker.EvalChunksFor(t, chunks)
 	}
 
+	// Under --write against a store that records judge passes (the real
+	// database), the pass is opened as 'running' before the first call and
+	// closed with the findings and the latch in one transaction
+	// (backfillCommit) — CONTRACT §2.15 "Lineage".
+	passes, _ := bdb.(evalpkg.PassStore)
+	var passID int64
+	if write && passes != nil {
+		var perr error
+		passID, perr = judge.OpenPass(ctx, passes, evalpkg.PassTarget{TranscriptID: t.ID, JobID: t.JobID,
+			FilePath: t.FilePath}, len(evalChunks), stepRunID)
+		if perr != nil {
+			p("  warn %s: open judge pass failed (%v); skipping (will retry next backfill)\n", name, perr)
+			return res, nil
+		}
+	}
+
 	started := time.Now()
 	findings, stats, jerr := evalpkg.RunOnChunks(ctx, judge, nil, evalChunks, false)
 	finished := time.Now()
@@ -744,8 +850,15 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	if jerr != nil {
 		// RunOnChunks errors when ctx was cancelled, or when the book record
 		// read behind judge@v3's book context failed (before any judge call):
-		// stop, record nothing — never judge path-only on a broken read.
+		// stop, record nothing — never judge path-only on a broken read. An
+		// open pass is closed as failed (detached: the run may be stopping).
+		if passID != 0 {
+			closeStoppedPass(ctx, p, passes, passID, t.ID, name, findings, stats, len(evalChunks), jerr)
+		}
 		return res, jerr
+	}
+	if passID != 0 {
+		return backfillCommit(ctx, p, passes, judge, t, passID, findings, stats, len(evalChunks), started, finished, res)
 	}
 
 	// Drop findings an earlier (partial) judge run already recorded.
@@ -832,6 +945,50 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	p("  done %s: %d chunks, %d new finding(s) (%d already recorded), eval_finished_at written\n",
 		name, stats.ChunksEvaluated, len(fresh), res.dupes)
 	return res, nil
+}
+
+// backfillCommit closes a backfill transcript's judge pass: the findings not
+// already recorded by this recipe, the pass's closing record and the
+// run_metrics latch (or failure record), in one transaction.
+func backfillCommit(ctx context.Context, p func(string, ...any), passes evalpkg.PassStore, judge *evalpkg.Judge,
+	t *db.Transcript, passID int64, findings []db.Finding, stats evalpkg.RunStats, total int,
+	started, finished time.Time, res backfillResult) (backfillResult, error) {
+	name := filepath.Base(t.FilePath)
+	cl := evalpkg.PassClose(stats, total, nil)
+	m := evalMetricsFor(t.JobID, judge.Model(), stats, cl, total, started, finished)
+	stored, err := passes.CommitJudgePass(ctx, db.JudgePassCommit{PassID: passID, TranscriptID: t.ID,
+		Findings: findings, Close: cl, Metrics: &m})
+	if err != nil {
+		p("  warn %s: recording the judge pass failed (%v); pass %d left running, transcript will be re-judged on next backfill\n",
+			name, err, passID)
+		res.failed = true
+		return res, nil
+	}
+	res.newFindings, res.dupes = stored.Inserted, stored.Duplicates
+	if cl.Status != db.JudgePassComplete {
+		res.failed = true
+		p("  FAIL %s: %d/%d chunks judged, %d new finding(s) — pass %d %s, left unlatched (%s)\n",
+			name, stats.ChunksEvaluated, total, stored.Inserted, passID, cl.Status, cl.Error)
+		return res, nil
+	}
+	res.latched = true
+	p("  done %s: %d chunks (%d cached), %d new finding(s) (%d already recorded), pass %d complete, eval_finished_at written\n",
+		name, stats.ChunksEvaluated, stats.ChunksCached, stored.Inserted, stored.Duplicates, passID)
+	return res, nil
+}
+
+// closeStoppedPass closes a pass whose judging stopped early (a cancelled run,
+// an unreadable book record): partial or failed, with the findings of the
+// chunks judged so far, the latch untouched. Detached from ctx so a stopping run still records
+// it.
+func closeStoppedPass(ctx context.Context, p func(string, ...any), passes evalpkg.PassStore, passID int64,
+	transcriptID, name string, findings []db.Finding, stats evalpkg.RunStats, total int, stop error) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+	defer cancel()
+	if _, err := passes.CommitJudgePass(cctx, db.JudgePassCommit{PassID: passID, TranscriptID: transcriptID,
+		Findings: findings, Close: evalpkg.PassClose(stats, total, stop)}); err != nil {
+		p("  warn %s: closing judge pass %d failed (%v)\n", name, passID, err)
+	}
 }
 
 // bookContextLabel describes the prompt and book context a transcript was

@@ -1083,7 +1083,7 @@ components:
           type: string
         step:
           description: |
-            The step token: decide, decide_revert, scan, eval_sample, eval_book, eval_backfill.
+            The step token: decide, decide_revert, scan, eval_sample, eval_book, eval_backfill, eval_rejudge.
           type: string
         total:
           description: |

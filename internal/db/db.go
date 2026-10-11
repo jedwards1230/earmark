@@ -3621,6 +3621,12 @@ type Finding struct {
 	// Recipe is how the finding was made (CONTRACT §1.9): InsertFindings
 	// registers it and stamps its ID into recipe_id. nil → recipe_id NULL.
 	Recipe *recipe.Recipe
+	// FnCallID is the fn_calls row of the judge call that proposed it
+	// (CONTRACT §2.15 "Judge calls"); nil → NULL.
+	FnCallID *int64
+	// JudgePassID is the judge_passes row it was proposed in. Set by
+	// CommitJudgePass; nil → NULL.
+	JudgePassID *int64
 }
 
 // insertFindingSQL is the INSERT for one finding. Package var so a test can
@@ -3631,8 +3637,8 @@ var insertFindingSQL = `
 	       (transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
 	        original_text, issue_type, suggested_correction, confidence, model,
 	        transcription_run_id, anchor_offset, anchor_occurrence,
-	        chunk_text_sha256, resolved_model, recipe_id)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+	        chunk_text_sha256, resolved_model, recipe_id, fn_call_id, judge_pass_id)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 `
 
 // InsertFindings stores judge findings in one transaction. Insert-only: it never
@@ -3651,27 +3657,49 @@ func (db *DB) InsertFindings(ctx context.Context, findings []Finding) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	ids, err := registerFindingRecipes(ctx, tx, findings)
+	if err != nil {
+		return err
+	}
+	if err := insertFindingRows(ctx, tx, findings, ids); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// registerFindingRecipes registers (insert-if-absent) each finding's recipe
+// once and returns its id per finding (nil for a nil recipe).
+func registerFindingRecipes(ctx context.Context, ex execer, findings []Finding) ([]*string, error) {
 	registered := map[*recipe.Recipe]*string{}
+	out := make([]*string, len(findings))
 	for i, f := range findings {
 		recipeID, ok := registered[f.Recipe]
 		if !ok && f.Recipe != nil {
-			id, err := registerRecipe(ctx, tx, *f.Recipe)
+			id, err := registerRecipe(ctx, ex, *f.Recipe)
 			if err != nil {
-				return fmt.Errorf("finding %d: %w", i, err)
+				return nil, fmt.Errorf("finding %d: %w", i, err)
 			}
 			recipeID = &id
 			registered[f.Recipe] = recipeID
 		}
-		if _, err := tx.Exec(ctx, insertFindingSQL,
+		out[i] = recipeID
+	}
+	return out, nil
+}
+
+// insertFindingRows inserts findings, recipeIDs[i] stamping finding i.
+func insertFindingRows(ctx context.Context, ex execer, findings []Finding, recipeIDs []*string) error {
+	for i, f := range findings {
+		if _, err := ex.Exec(ctx, insertFindingSQL,
 			f.TranscriptID, f.FilePath, f.ChunkID, f.ChunkIndex, f.StartSec, f.EndSec,
 			f.OriginalText, f.IssueType, f.SuggestedCorrection, f.Confidence, f.Model,
 			f.TranscriptionRunID, f.AnchorOffset, f.AnchorOccurrence, f.ChunkTextSHA256,
-			f.ResolvedModel, recipeID,
+			f.ResolvedModel, recipeIDs[i], f.FnCallID, f.JudgePassID,
 		); err != nil {
 			return fmt.Errorf("insert finding %d: %w", i, err)
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // clearFindingsSQL archives findings: a clear is a supersede, never a DELETE,

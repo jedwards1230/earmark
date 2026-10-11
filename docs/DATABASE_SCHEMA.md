@@ -417,7 +417,7 @@ Migration 13 adds the lineage columns (CONTRACT §2.15 "Lineage",
 
 ```sql
 judge_pass_id        BIGINT REFERENCES judge_passes (id) ON DELETE SET NULL, -- the pass that proposed it
-fn_call_id           BIGINT REFERENCES fn_calls (id),                        -- the judge call; not yet written by any path
+fn_call_id           BIGINT REFERENCES fn_calls (id),                        -- the judge call (fn judge_chunk; CONTRACT §2.15 "Judge calls")
 origin_transcript_id UUID,      -- the transcript it was proposed against; set on INSERT, frozen once set
 correction_key       TEXT GENERATED ALWAYS AS (
     CASE WHEN chunk_text_sha256 IS NULL THEN NULL
@@ -644,7 +644,15 @@ CREATE TABLE judge_passes (
 -- index judge_passes_recipe_idx:            (recipe_id, started_at)
 ```
 
-Only `legacy` rows exist so far — the judge does not write passes yet.
+Written by every path that judges a whole transcript — `earmark eval
+--rejudge --write`, `--backfill-* --write` and the in-pipeline worker: opened
+`running` before the first model call, closed `complete`/`partial`/`failed`
+together with the pass's findings and the `run_metrics` eval slice in one
+transaction (`db.CommitJudgePass`; CONTRACT §2.15 "Lineage", "Re-judge").
+`findings_kept` counts the rows the pass inserted; `dropped` adds
+`already_recorded` (same finding already stored by an equivalent recipe) to
+the judge's filter reasons.
+
 Migration 13 backfilled one per (transcript, `recipe_id`) of `origin='judge'`
 findings with a live transcript (`findings_kept` = their count, started/finished
 = first/last finding), and one for the latest judge run of each transcript
@@ -732,7 +740,7 @@ a closing status). Read by the "Running now" panel, `GET /api/v1/runs` and the
 ```sql
 CREATE TABLE step_runs (
     id           BIGSERIAL   PRIMARY KEY,
-    step         TEXT        NOT NULL,              -- decide | decide_revert | scan | eval_sample | eval_book | eval_backfill
+    step         TEXT        NOT NULL,              -- decide | decide_revert | scan | eval_sample | eval_book | eval_backfill | eval_rejudge
     mode         TEXT        NOT NULL,              -- dry_run | write
     recipe_id    TEXT,                              -- no FK (a rung-0 replay never registers its recipe)
     model        TEXT,
