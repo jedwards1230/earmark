@@ -20,6 +20,7 @@ package eval
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -165,6 +166,15 @@ type Judge struct {
 	// warnedPrompt is the running version warnPinnedPrompt last warned
 	// about ("" none), so the same mismatch is logged once.
 	warnedPrompt string
+	// policy bounds and retries each model call (SetCallPolicy).
+	policy CallPolicy
+	// sleep waits between attempts (a test seam; sleepCtx by default).
+	sleep func(ctx context.Context, d time.Duration) error
+	// calls logs every model call in fn_calls and serves answered chunks
+	// from there (SetCallLog); nil logs nothing.
+	calls CallLog
+	// registered memoizes the recipes registered through calls.
+	registered recipeIDs
 }
 
 // ModelPin is the model registry's pin for the judge: the model expected to
@@ -191,6 +201,7 @@ func NewJudge(chat ChatClient) *Judge {
 		maxPerChunk: maxFindingsPerChunk(),
 		minConf:     minConfidence(),
 		prompt:      DefaultJudgePrompt,
+		sleep:       sleepCtx,
 	}
 }
 
@@ -342,6 +353,13 @@ type Result struct {
 	// BookContext is the book context the prompt carried (path_only for
 	// judge@v2 and for books without a usable record).
 	BookContext BookContext
+	// Cached is true when the reply was served from fn_calls (no model call,
+	// no cost); FnCallID is the fn_calls row that produced the reply (nil when
+	// the judge logs no calls or the log write failed).
+	Cached   bool
+	FnCallID *int64
+	// Attempts is the number of model calls made (0 when served from cache).
+	Attempts int
 }
 
 // Usage is one judge call's accounting: token counts from the response's
@@ -352,6 +370,12 @@ type Usage struct {
 	HasUsage     bool
 	CostUSD      float64
 	HasCost      bool
+}
+
+// add sums two attempts' accounting.
+func (u Usage) add(o Usage) Usage {
+	return Usage{InputTokens: u.InputTokens + o.InputTokens, OutputTokens: u.OutputTokens + o.OutputTokens,
+		HasUsage: u.HasUsage || o.HasUsage, CostUSD: u.CostUSD + o.CostUSD, HasCost: u.HasCost || o.HasCost}
 }
 
 func usageOf(c Completion) Usage {
@@ -369,35 +393,99 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 // chunk's book context, when the prompt version carries one), call the model,
 // parse the response, and map suspected errors into db.Finding rows
 // (attributed to the chunk, its transcript, and its run). It performs NO
-// database writes — the caller persists via FindingWriter only when not in
+// finding writes — the caller persists via FindingWriter only when not in
 // dry-run.
+//
+// With a call log (SetCallLog) the chunk is first looked up in fn_calls: a
+// reply this judge already got for the same input is served from there (no
+// model call, no cost) and re-read under the judge's current filters.
+// Otherwise every attempt is logged as its own fn_calls row (fn judge_chunk).
+//
+// Each attempt runs under the call policy's deadline; a retryable failure
+// (429/5xx — honouring Retry-After —, a timeout, a transport error) is retried
+// up to CallPolicy.Retries times with exponential backoff. A reply that does
+// not parse is ErrInvalidReply: the chunk failed, and it is never retried.
 func (j *Judge) JudgeChunkWithBook(ctx context.Context, c db.EvalChunk, bc BookContext) (Result, error) {
 	if !j.prompt.usesBookContext() {
 		bc = pathOnlyContext
 	}
+	base := Result{Chunk: c, PromptVersion: j.prompt.Version(), BookContext: bc}
 	if bc.err != nil {
-		return Result{Chunk: c, PromptVersion: j.prompt.Version(), BookContext: bc}, bc.err
+		return base, bc.err
+	}
+	call, err := j.newCallRecord(c, bc)
+	if err != nil {
+		return base, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
+	}
+	if call != nil {
+		res, ok, err := j.serveCached(ctx, call, base)
+		if err != nil || ok {
+			return res, err
+		}
 	}
 	system, user := buildPrompt(j.prompt, c, bc)
-	base := Result{Chunk: c, PromptVersion: j.prompt.Version(), BookContext: bc}
+	var usage Usage
+	for attempt := 0; ; attempt++ {
+		comp, elapsed, err := j.attempt(ctx, c, system, user)
+		usage = usage.add(usageOf(comp))
+		res := base
+		res.Attempts, res.ResolvedModel, res.Usage, res.Elapsed = attempt+1, comp.ResolvedModel, usage, elapsed
+		if err == nil {
+			content := comp.Content
+			res, err = j.readReply(ctx, res, content, comp.ResolvedModel)
+			if err != nil {
+				// Paid for, and unusable: the chunk FAILED. Never "no
+				// findings" — that reads as a clean chunk and latches the
+				// transcript — and never retried.
+				j.logger.WarnContext(ctx, "judge reply does not parse (chunk failed)",
+					"chunk_id", c.ChunkID, "error", err)
+			}
+			res.setFnCall(j.logCall(ctx, call, res, comp, elapsed, content, err))
+			if err != nil {
+				return res, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
+			}
+			return res, nil
+		}
+		j.logCall(ctx, call, res, comp, elapsed, "", err)
+		wait, retry := j.retryDelay(ctx, err, attempt)
+		if !retry {
+			return res, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
+		}
+		j.logger.WarnContext(ctx, "judge call failed; retrying",
+			"chunk_id", c.ChunkID, "attempt", attempt+1, "of", j.policy.Retries+1,
+			"wait", wait.String(), "error_class", errorClass(err))
+		if serr := j.sleep(ctx, wait); serr != nil {
+			return res, fmt.Errorf("judge chunk %s: %w", c.ChunkID, errors.Join(err, serr))
+		}
+	}
+}
+
+// attempt makes one model call under the call policy's deadline, with its
+// gen_ai span.
+func (j *Judge) attempt(ctx context.Context, c db.EvalChunk, system, user string) (Completion, time.Duration, error) {
 	var ep Endpoint
 	if er, ok := j.chat.(EndpointReporter); ok {
 		ep = er.Endpoint()
 	}
 	ctx, span := startChatSpan(ctx, j.chat.Model(), j.sentTemperature(), ep, chunkRef{transcriptID: c.TranscriptID, chunkID: c.ChunkID})
+	callCtx, cancel := context.WithTimeout(ctx, j.policy.timeout())
+	defer cancel()
 	callStart := time.Now()
-	comp, err := j.complete(ctx, system, user)
+	comp, err := j.complete(callCtx, system, user)
 	elapsed := time.Since(callStart)
-	resolved := comp.ResolvedModel
 	var recipeID string
 	if err == nil {
-		recipeID, _ = j.recipeFor(resolved).ID()
+		recipeID, _ = j.recipeFor(comp.ResolvedModel).ID()
 	}
 	endChatSpan(ctx, span, j.chat.Model(), j.pin.ExpectedModel, comp, recipeID, err)
-	if err != nil {
-		base.Usage, base.Elapsed = usageOf(comp), elapsed
-		return base, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
-	}
+	return comp, elapsed, err
+}
+
+// readReply parses a reply's content into res's findings and drops: parse,
+// the shape pre-filters, the confidence floor, then the cap. A reply that
+// does not parse is ErrInvalidReply (res keeps no findings).
+func (j *Judge) readReply(ctx context.Context, res Result, content, resolved string) (Result, error) {
+	c := res.Chunk
 	if resolved != "" && resolved != j.chat.Model() {
 		j.logger.DebugContext(ctx, "judge request served by a different model id",
 			"chunk_id", c.ChunkID, "requested", j.chat.Model(), "resolved", resolved)
@@ -413,16 +501,9 @@ func (j *Judge) JudgeChunkWithBook(ctx context.Context, c db.EvalChunk, bc BookC
 		})
 	}
 
-	res := base
-	res.ResolvedModel, res.Usage, res.Elapsed = resolved, usageOf(comp), elapsed
-	parsed, dropped, perr := parseFindings(comp.Content)
+	parsed, dropped, perr := parseFindings(content)
 	if perr != nil {
-		// A malformed judge response is a soft failure: log and treat the chunk
-		// as "no findings" rather than aborting the whole run. The judge is
-		// advisory; a parse miss costs nothing.
-		j.logger.WarnContext(ctx, "dropping unparseable judge response",
-			"chunk_id", c.ChunkID, "recipe_id", recipeID, "error", perr)
-		return res, nil
+		return res, fmt.Errorf("%w: %v", ErrInvalidReply, perr)
 	}
 
 	// Shape checks first, so junk never takes one of the capped slots.

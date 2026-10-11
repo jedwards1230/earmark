@@ -50,6 +50,7 @@ const (
 	StepEvalSample   = "eval_sample"
 	StepEvalBook     = "eval_book"
 	StepEvalBackfill = "eval_backfill"
+	StepEvalRejudge  = "eval_rejudge"
 )
 
 // Store is the slice of the database a Run writes (*db.DB implements it).
