@@ -63,9 +63,35 @@ type StepSetting struct {
 	Source string
 }
 
-// HasPin reports whether the setting sets any pin field.
+// HasPin reports whether the setting sets any pin field. Decide policy keys
+// in Params are not pin fields (they say how to decide, not which model
+// answers), so a policy-only setting keeps the step's pin.
 func (s StepSetting) HasPin() bool {
-	return s.ExpectedModel != "" || s.Revision != "" || len(s.Params) > 0
+	if s.ExpectedModel != "" || s.Revision != "" {
+		return true
+	}
+	for k := range s.Params {
+		if !IsDecidePolicyParam(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitPolicyParams separates the decide policy keys of params from the pin
+// params (nil when there are none of either).
+func splitPolicyParams(params map[string]any) (pin, policy map[string]any) {
+	for k, v := range params {
+		m := &pin
+		if IsDecidePolicyParam(k) {
+			m = &policy
+		}
+		if *m == nil {
+			*m = map[string]any{}
+		}
+		(*m)[k] = v
+	}
+	return pin, policy
 }
 
 func (s StepSetting) source() string {
@@ -187,7 +213,7 @@ func (c *Config) Clone() *Config {
 		maps.Copy(n.Models.Steps, c.Models.Steps)
 	}
 	n.stepSources = maps.Clone(c.stepSources)
-	n.pinSources = maps.Clone(c.pinSources)
+	n.policySources = maps.Clone(c.policySources)
 	if n.env == nil {
 		// c is the env config itself (no setting applied yet): remember its
 		// binding and pins, so a later setting equal to env restores them.
@@ -264,11 +290,16 @@ func (c *Config) WithValidStepSettings(settings ...StepSetting) (*Config, map[st
 }
 
 // applyStepSetting applies one validated setting to n in place (n is a clone).
+// The decide policy keys among its params are laid over whatever pin results
+// (applyPolicyParams); every other field follows the pin rules below.
 func (c *Config) applyStepSetting(s StepSetting) error {
 	s.EndpointID, s.Model = strings.TrimSpace(s.EndpointID), strings.TrimSpace(s.Model)
 	if err := c.ValidateStepSetting(s); err != nil {
 		return &StepSettingError{Step: s.Step, Source: s.source(), Err: err}
 	}
+	var policy map[string]any
+	s.Params, policy = splitPolicyParams(s.Params)
+	defer c.applyPolicyParams(s.Step, policy, s.source())
 	role := stepRole[s.Step]
 	base, _ := c.registeredEndpoint(s.EndpointID)
 
@@ -312,7 +343,7 @@ func (c *Config) applyStepSetting(s StepSetting) error {
 		// or a row equal to env): the env MODELS_FILE pin describes it again,
 		// so the recipe is the env recipe.
 		c.Models.Steps[s.Step] = env.pin
-		c.setPinSource(s.Step, SourceEnv)
+		c.setPolicySource(s.Step, SourceEnv)
 		c.setStepSource(s.Step, s.source())
 		return nil
 	}
@@ -327,9 +358,28 @@ func (c *Config) applyStepSetting(s StepSetting) error {
 		PromptVersion: prev.PromptVersion,
 		Params:        maps.Clone(s.Params),
 	}
-	c.setPinSource(s.Step, s.source())
+	c.setPolicySource(s.Step, s.source())
 	c.setStepSource(s.Step, s.source())
 	return nil
+}
+
+// applyPolicyParams lays a setting's decide policy keys over the step's
+// resulting pin: they replace any policy keys the pin had (the env
+// MODELS_FILE ones, or a lower setting's) and keep its other fields. None →
+// the pin's policy keys stand.
+func (c *Config) applyPolicyParams(step string, policy map[string]any, source string) {
+	if len(policy) == 0 {
+		return
+	}
+	pin := c.Models.Steps[step]
+	params, _ := splitPolicyParams(pin.Params)
+	if params == nil {
+		params = map[string]any{}
+	}
+	maps.Copy(params, policy)
+	pin.Params = params
+	c.Models.Steps[step] = pin
+	c.setPolicySource(step, source)
 }
 
 // derivedEndpointID names a synthesized endpoint "<base>@<step>", suffixed
@@ -365,21 +415,21 @@ func (c *Config) setStepSource(step, source string) {
 	c.stepSources[step] = source
 }
 
-func (c *Config) setPinSource(step, source string) {
-	if c.pinSources == nil {
-		c.pinSources = map[string]string{}
+func (c *Config) setPolicySource(step, source string) {
+	if c.policySources == nil {
+		c.policySources = map[string]string{}
 	}
-	c.pinSources[step] = source
+	c.policySources[step] = source
 }
 
-// PinSource reports which layer a step's pin (ModelPin, incl. its params)
-// came from: SourceDB (a model_settings row), SourceOverride (a per-run
-// setting, which carries no params), or SourceEnv (MODELS_FILE, also when no
-// setting touched the pin). The decide policy uses it to name where a policy
-// param was set (CONTRACT §2.19 "Decide policy").
-func (c *Config) PinSource(step string) string {
+// PolicySource reports which layer the decide policy keys in a step's pin
+// params (ModelPin) came from: SourceDB (a model_settings row), SourceOverride
+// (a per-run setting, which carries no params), or SourceEnv (MODELS_FILE,
+// also when no setting touched the pin). internal/decide uses it to name where
+// a policy key was set (CONTRACT §2.19 "Decide policy").
+func (c *Config) PolicySource(step string) string {
 	if c != nil {
-		if s, ok := c.pinSources[step]; ok {
+		if s, ok := c.policySources[step]; ok {
 			return s
 		}
 	}

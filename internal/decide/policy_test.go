@@ -230,6 +230,8 @@ func TestPolicyDescribe(t *testing.T) {
 	for p, want := range map[*ShouldApplyParams]string{
 		ptr(DefaultShouldApplyParams()): "apply p ≥ 0.85 with asin_verbatim or exact_repeat · reject p ≤ 0.20",
 		&clef:                           "apply p ≥ 0.85 with asin_verbatim · reject p ≤ 0.20 if the replacement is lowercase or p < 0.10",
+		{ApplyP: 0.855, RejectP: 0.2, ApplyEvidence: []string{EvidenceExactRepeat}, RejectRequiresLowercase: true, RejectFloor: 0.005}: "apply p ≥ 0.855 with exact_repeat · reject p ≤ 0.20 if the replacement is lowercase or p < 0.005",
+		{ApplyP: 1, RejectP: 0, ApplyEvidence: []string{EvidenceASINVerbatim}}:                                                         "apply p ≥ 1.00 with asin_verbatim · reject p ≤ 0.00",
 	} {
 		if got := p.Describe(); got != want {
 			t.Errorf("Describe() = %q, want %q", got, want)

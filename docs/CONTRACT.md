@@ -4607,10 +4607,11 @@ The effective policy (`decide.ResolvePolicy`) is resolved **per key**, each
 layer overriding the one below:
 
 1. `earmark decide --policy key=value` — this run only (source `override`);
-2. the decide step's pin params — a `model_settings` row's `params` (source
-   `db`), or `MODELS_FILE` `steps.decide.params` while no row replaces the
-   env pin (source `env`). A row that changes the model replaces the pin
-   wholesale (§2.20), so Jev's env policy keys never leak onto Clef;
+2. the decide step's pin params — a `model_settings` row's policy keys
+   (source `db`), else `MODELS_FILE` `steps.decide.params` (source `env`).
+   A row's policy keys replace the env pin's as a set; a row that changes
+   the model replaces the pin wholesale (§2.20), so Jev's env policy keys
+   never leak onto Clef;
 3. the built-in **preset** for the decide model id (provider prefix dropped):
    `jev-*` → `jev`, `clef*` → `clef` (source `preset`);
 4. the default above (source `default`). The default was measured on Jev: a
@@ -4903,7 +4904,11 @@ sees the effective model unchanged:
   pin field, its pin fields replace the step's env pin wholesale — unset
   fields are unpinned (answers are expected from the requested model), exactly
   like an unpinned env step; `prompt_version` stays. A setting equal to the
-  env endpoint and model with no pins keeps the env pin.
+  env endpoint and model with no pins keeps the env pin. Decide policy keys
+  (§2.19 "Decide policy") are not pin fields: a policy-only decide row on the
+  env endpoint and model keeps the env pin (expected model, revision,
+  `usd_per_mtok_in`) and its keys replace the env pin's policy keys; on
+  another model they ride along with the row's own pin.
 - **Back to env.** Whenever a setting — a row, or an override undoing a row —
   resolves to exactly the env endpoint and model with no pins of its own, the
   env `MODELS_FILE` pin (expected model, revision, `usd_per_mtok_in`) is

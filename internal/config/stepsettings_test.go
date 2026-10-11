@@ -473,28 +473,27 @@ func TestDecidePolicyParams(t *testing.T) {
 	assert.Contains(t, err.Error(), "steps.scan.params")
 }
 
-// PinSource names the layer the decide pin (and so its policy params) came
-// from.
-func TestPinSource(t *testing.T) {
+// PolicySource names the layer the decide policy keys came from.
+func TestPolicySource(t *testing.T) {
 	base := settingsBase()
-	assert.Equal(t, SourceEnv, base.PinSource(recipe.StepDecide))
+	assert.Equal(t, SourceEnv, base.PolicySource(recipe.StepDecide))
 	row := StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0", Params: map[string]any{ParamApplyP: 0.9}}
 	c, err := base.WithStepSettings(row)
 	require.NoError(t, err)
-	assert.Equal(t, SourceDB, c.PinSource(recipe.StepDecide))
+	assert.Equal(t, SourceDB, c.PolicySource(recipe.StepDecide))
 	assert.Equal(t, 0.9, c.ModelPin(recipe.StepDecide).Params[ParamApplyP])
 	// An override back to the env model restores the env pin.
 	c2, err := c.WithStepSettings(StepSetting{Step: recipe.StepDecide, EndpointID: "jev", Model: "jev-1.13.0", Source: SourceOverride})
 	require.NoError(t, err)
-	assert.Equal(t, SourceEnv, c2.PinSource(recipe.StepDecide))
+	assert.Equal(t, SourceEnv, c2.PolicySource(recipe.StepDecide))
 	assert.Equal(t, SourceOverride, c2.StepSource(recipe.StepDecide))
 	// An override equal to the row keeps the row's pin.
 	c3, err := c.WithStepSettings(StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0", Source: SourceOverride})
 	require.NoError(t, err)
-	assert.Equal(t, SourceDB, c3.PinSource(recipe.StepDecide))
+	assert.Equal(t, SourceDB, c3.PolicySource(recipe.StepDecide))
 	assert.Equal(t, 0.9, c3.ModelPin(recipe.StepDecide).Params[ParamApplyP])
 	// The base config is never touched.
-	assert.Equal(t, SourceEnv, base.PinSource(recipe.StepDecide))
+	assert.Equal(t, SourceEnv, base.PolicySource(recipe.StepDecide))
 }
 
 func TestParseParamValue(t *testing.T) {
@@ -503,4 +502,44 @@ func TestParseParamValue(t *testing.T) {
 	assert.Equal(t, false, ParseParamValue("false"))
 	assert.Equal(t, "TRUE", ParseParamValue("TRUE"), "only lowercase true/false are booleans")
 	assert.Equal(t, "asin_verbatim", ParseParamValue("asin_verbatim"))
+}
+
+// A policy-only decide row on the env endpoint and model keeps the env pin
+// (expected model, revision, usd_per_mtok_in) and lays its policy keys over
+// the env's; one that changes the model replaces the pin as before.
+func TestPolicyOnlyRowKeepsEnvPin(t *testing.T) {
+	base := settingsBase()
+	base.Models.Steps[recipe.StepDecide] = ModelPin{ExpectedModel: "jev-1.13.0", Revision: "r9",
+		Params: map[string]any{ParamUSDPerMTokIn: 0.042, ParamApplyP: 0.9, ParamRejectP: 0.1}}
+	row := StepSetting{Step: recipe.StepDecide, EndpointID: "jev", Model: "jev-1.13.0",
+		Params: map[string]any{ParamRejectP: 0.15}}
+	assert.False(t, row.HasPin(), "policy keys are not pin fields")
+
+	c, err := base.WithStepSettings(row)
+	require.NoError(t, err)
+	pin := c.ModelPin(recipe.StepDecide)
+	assert.Equal(t, "jev-1.13.0", pin.ExpectedModel)
+	assert.Equal(t, "r9", pin.Revision)
+	assert.Equal(t, map[string]any{ParamUSDPerMTokIn: 0.042, ParamRejectP: 0.15}, pin.Params,
+		"the row's policy keys replace the env's; the price stays")
+	assert.Equal(t, SourceDB, c.PolicySource(recipe.StepDecide))
+	assert.Equal(t, SourceDB, c.StepSource(recipe.StepDecide))
+
+	// With no policy keys the row keeps the env pin and its policy.
+	c, err = base.WithStepSettings(StepSetting{Step: recipe.StepDecide, EndpointID: "jev", Model: "jev-1.13.0"})
+	require.NoError(t, err)
+	assert.Equal(t, 0.9, c.ModelPin(recipe.StepDecide).Params[ParamApplyP])
+	assert.Equal(t, SourceEnv, c.PolicySource(recipe.StepDecide))
+
+	// Another model replaces the pin wholesale; only the row's keys remain.
+	c, err = base.WithStepSettings(StepSetting{Step: recipe.StepDecide, EndpointID: "clef", Model: "clef-1.0.0",
+		Params: map[string]any{ParamRejectFloor: 0.0}})
+	require.NoError(t, err)
+	pin = c.ModelPin(recipe.StepDecide)
+	assert.Empty(t, pin.ExpectedModel)
+	assert.Equal(t, map[string]any{ParamRejectFloor: 0.0}, pin.Params)
+	assert.Equal(t, SourceDB, c.PolicySource(recipe.StepDecide))
+
+	// The base is never touched.
+	assert.Equal(t, 0.1, base.ModelPin(recipe.StepDecide).Params[ParamRejectP])
 }

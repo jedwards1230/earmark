@@ -135,7 +135,7 @@ func ResolvePolicy(cfg *config.Config, override map[string]any) (Policy, error) 
 		}
 		return nil
 	}
-	if err := layer(cfg.ModelPin(recipe.StepDecide).Params, cfg.PinSource(recipe.StepDecide)); err != nil {
+	if err := layer(cfg.ModelPin(recipe.StepDecide).Params, cfg.PolicySource(recipe.StepDecide)); err != nil {
 		return Policy{}, err
 	}
 	if err := layer(override, PolicySourceOverride); err != nil {

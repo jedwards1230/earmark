@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -226,17 +227,28 @@ func (p ShouldApplyParams) PolicyParams() map[string]any {
 }
 
 // Describe is the policy in one line: "apply p ≥ 0.85 with asin_verbatim or
-// exact_repeat · reject p ≤ 0.20".
+// exact_repeat · reject p ≤ 0.20". Thresholds print exactly (at least two
+// decimals, more when the value has them: 0.855 is never shown as 0.85), so
+// the line a reviewer gates a run on is the policy the recipe holds.
 func (p ShouldApplyParams) Describe() string {
-	s := fmt.Sprintf("apply p ≥ %.2f with %s · reject p ≤ %.2f", p.ApplyP, strings.Join(p.applyEvidence(), " or "), p.RejectP)
+	s := fmt.Sprintf("apply p ≥ %s with %s · reject p ≤ %s", fmtP(p.ApplyP), strings.Join(p.applyEvidence(), " or "), fmtP(p.RejectP))
 	if p.RejectRequiresLowercase {
 		if p.RejectFloor > 0 {
-			s += fmt.Sprintf(" if the replacement is lowercase or p < %.2f", p.RejectFloor)
+			s += fmt.Sprintf(" if the replacement is lowercase or p < %s", fmtP(p.RejectFloor))
 		} else {
 			s += " if the replacement is lowercase"
 		}
 	}
 	return s
+}
+
+// fmtP formats a threshold exactly, with at least two decimals.
+func fmtP(v float64) string {
+	exact := strconv.FormatFloat(v, 'f', -1, 64)
+	if _, dec, _ := strings.Cut(exact, "."); len(dec) >= 2 {
+		return exact
+	}
+	return strconv.FormatFloat(v, 'f', 2, 64)
 }
 
 // recipeParams is every knob that changes an outcome, as recorded in the
