@@ -482,7 +482,8 @@ func (g Grouping) print(p func(string, ...any)) {
 	for _, l := range g.GroupLines {
 		p("  %s\n", l)
 	}
-	p("conflicts ranked by p: %d set(s) · %d finding(s) · %d overlap_dup", g.Conflicts, g.Ranked, g.Losers)
+	p("conflicts ranked by p: %d set(s) · %d finding(s) · %d overlap_dup · %d overlap_pending (winner held)",
+		g.Conflicts, g.Ranked, g.Losers, g.Pending)
 	if g.Unranked > 0 {
 		p(" · %d unranked (a member had no p; nothing in them applied)", g.Unranked)
 	}

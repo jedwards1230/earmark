@@ -79,10 +79,10 @@ func groupable(v Verdict) bool {
 
 // repTiers are the representative criteria, best first, as booleans
 // (true is better), in the order of tierNames.
-func repTiers(m groupMember, runRecipe string) [4]bool {
+func repTiers(m groupMember) [4]bool {
 	return [4]bool{
 		m.overlay,
-		m.f.HasDuplicates || (runRecipe != "" && m.f.LastDecisionRecipe == runRecipe),
+		m.f.HasDuplicates || m.f.DecidedHere,
 		m.pass,
 		m.f.CurrentPropose,
 	}
@@ -92,8 +92,8 @@ var tierNames = [4]string{TierApplied, TierExisting, TierRung0, TierCurrentRecip
 
 // betterRep orders two members for representative: the criteria of
 // repTiers in order, then the newest, then the lowest id.
-func betterRep(a, b groupMember, runRecipe string) bool {
-	ta, tb := repTiers(a, runRecipe), repTiers(b, runRecipe)
+func betterRep(a, b groupMember) bool {
+	ta, tb := repTiers(a), repTiers(b)
 	for i := range ta {
 		if ta[i] != tb[i] {
 			return ta[i]
@@ -108,8 +108,8 @@ func betterRep(a, b groupMember, runRecipe string) bool {
 // tierOf names the criterion that made rep the representative over the
 // runner-up (the best of the rest): the first one they differ on, else
 // TierNewest (by time, then id).
-func tierOf(rep, runnerUp groupMember, runRecipe string) string {
-	tr, tu := repTiers(rep, runRecipe), repTiers(runnerUp, runRecipe)
+func tierOf(rep, runnerUp groupMember) string {
+	tr, tu := repTiers(rep), repTiers(runnerUp)
 	for i := range tr {
 		if tr[i] != tu[i] {
 			return tierNames[i]
@@ -131,7 +131,7 @@ func tierOf(rep, runnerUp groupMember, runRecipe string) string {
 // member → representative). Overlay members are never moved. Groups are
 // returned in representative-id order, members sorted. Pure.
 func groupChunk(text string, cands []db.DecideFinding, verdicts map[string]Verdict,
-	overlay []db.DecideFinding, runRecipe string) (dupOf map[string]string, groups []DupGroup) {
+	overlay []db.DecideFinding) (dupOf map[string]string, groups []DupGroup) {
 	type key struct {
 		ck         string
 		start, end int
@@ -173,18 +173,18 @@ func groupChunk(text string, cands []db.DecideFinding, verdicts map[string]Verdi
 		}
 		best := 0
 		for i := 1; i < len(ms); i++ {
-			if betterRep(ms[i], ms[best], runRecipe) {
+			if betterRep(ms[i], ms[best]) {
 				best = i
 			}
 		}
 		rep := ms[best]
 		runnerUp := -1
 		for i := range ms {
-			if i != best && (runnerUp < 0 || betterRep(ms[i], ms[runnerUp], runRecipe)) {
+			if i != best && (runnerUp < 0 || betterRep(ms[i], ms[runnerUp])) {
 				runnerUp = i
 			}
 		}
-		tier := tierOf(rep, ms[runnerUp], runRecipe)
+		tier := tierOf(rep, ms[runnerUp])
 		g := DupGroup{Rep: rep.f.ID, RepState: rep.f.PatchState, Tier: tier,
 			Original: rep.f.Original, Replacement: rep.f.Replacement}
 		for i, m := range ms {
@@ -220,12 +220,15 @@ type Grouping struct {
 	Duplicates int `json:"duplicates"`
 	// Conflicts counts sets of overlapping, different fixes the model ranked;
 	// Ranked their members (each asked); Losers the members rejected
-	// overlap_dup; Unranked the sets left unranked because a member got no
+	// overlap_dup (their winner applies); Unranked the sets left unranked because a member got no
 	// usable p (nothing in them is applied; they are decided again).
 	Conflicts int `json:"conflicts"`
 	Ranked    int `json:"ranked"`
 	Losers    int `json:"losers"`
-	Unranked  int `json:"unranked"`
+	// Pending counts losers held overlap_pending because their winner is
+	// held, not applied.
+	Pending  int `json:"pending"`
+	Unranked int `json:"unranked"`
 	// GroupLines and ConflictLines describe each group and each ranked set,
 	// one line apiece (dry run only).
 	GroupLines    []string `json:"group_lines,omitempty"`
@@ -250,8 +253,10 @@ func (g *Grouping) addGroups(gs []DupGroup, lines bool) {
 
 // resolveConflicts ranks every conflict among items by p (RankConflicts),
 // after evaluation. Each set is the connected component of Verdict.Conflicts.
-// A loser's outcome becomes reject overlap_dup naming its winner (its p,
-// evidence and call stay on the record). A set with a member that got no
+// A loser's outcome follows its winner's (CONTRACT §2.19): reject overlap_dup
+// naming the winner when the winner applies; hold overlap_pending naming it
+// while the winner is held; its own verdict when the winner is rejected. Its
+// p, evidence and call stay on the record. A set with a member that got no
 // usable p is unranked: any apply in it becomes a retryable hold. Items not
 // in a conflict are untouched; so are rung-0-only runs (no p), which the
 // caller does not pass here.
@@ -315,11 +320,32 @@ func resolveConflicts(items []*item, g *Grouping, lines bool) {
 			}
 			continue
 		}
+		winners := map[string]*item{}
 		for _, it := range set {
-			if w, lost := losers[it.finding.ID]; lost {
+			winners[it.finding.ID] = it
+		}
+		for _, it := range set {
+			w, lost := losers[it.finding.ID]
+			if !lost {
+				continue
+			}
+			switch winners[w].outcome.Decision {
+			case DecisionApply:
+				// The winner's fix goes in: the loser is rejected for it.
 				it.outcome.Decision, it.outcome.Reason, it.outcome.Retryable = DecisionReject, ReasonOverlapDup, false
 				it.outcome.Related = w
 				g.Losers++
+			case DecisionHold:
+				// The winner is held: nothing is applied over the loser yet,
+				// and rejecting it now would lose it if the winner never
+				// applies. Held, naming the winner; decided again once the
+				// winner leaves proposed (decideWorkSQL).
+				it.outcome.Decision, it.outcome.Reason, it.outcome.Retryable = DecisionHold, ReasonOverlapPending, false
+				it.outcome.Related = w
+				g.Pending++
+			default:
+				// The winner is rejected on its own p: the loser, ranked
+				// lower, keeps its own verdict.
 			}
 		}
 		if lines {
@@ -357,8 +383,10 @@ func conflictLine(set []*item, losers map[string]string, ranked bool) string {
 		switch {
 		case !ranked:
 			verdict = "unranked"
+		case losers[it.finding.ID] != "" && (it.outcome.Reason == ReasonOverlapDup || it.outcome.Reason == ReasonOverlapPending):
+			verdict = it.outcome.Reason + " → " + shortID(losers[it.finding.ID])
 		case losers[it.finding.ID] != "":
-			verdict = ReasonOverlapDup + " → " + shortID(losers[it.finding.ID])
+			verdict = "lost to " + shortID(losers[it.finding.ID]) + ", decided on its own p"
 		}
 		parts[i] = fmt.Sprintf("%s %q → %q %s %s", shortID(it.finding.ID), it.finding.Original, it.finding.Replacement, p, verdict)
 	}

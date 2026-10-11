@@ -133,8 +133,8 @@ recipes) form a group; one representative is decided (accepted/applied first,
 then an existing representative, then one rung 0 can vet, then the current
 propose recipe's, then the newest) and the others are recorded as duplicates
 of it — never rejected, never applied. Different fixes to overlapping text are
-all asked and ranked by the model's p; the losers are rejected overlap_dup,
-naming the winner. A dry run lists each group and each ranked conflict. Each accept re-embeds its whole transcript on the next rebuild:
+all asked and ranked by the model's p; a loser is rejected overlap_dup when
+the winner applies and held overlap_pending while the winner is held. A dry run lists each group and each ranked conflict. Each accept re-embeds its whole transcript on the next rebuild:
 bound a run with --limit and --max-accepts. Undo with 'earmark decide revert'.
 
 Examples:

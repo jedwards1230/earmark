@@ -17,7 +17,7 @@ rung-0 rejects:   not_soundalike 1
 reanchor needed:  anchor_missing 1
 
 duplicates grouped: 1 group(s) · 1 duplicate(s) (agreeing findings: one representative decided, the rest recorded as duplicates)
-conflicts ranked by p: 1 set(s) · 2 finding(s) · 1 overlap_dup
+conflicts ranked by p: 1 set(s) · 2 finding(s) · 1 overlap_dup · 0 overlap_pending (winner held)
 
 p histogram (answered 6):
   [0.0,0.1)     1 ##########

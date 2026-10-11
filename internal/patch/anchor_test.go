@@ -270,7 +270,8 @@ func TestUnanchorableAndSupersededCompose(t *testing.T) {
 }
 
 // TestDuplicateState pins the duplicate state: entered only from proposed,
-// left only back to proposed (the grouping was undone) or to superseded,
+// left only back to proposed (the grouping was undone), to rejected (the
+// undo of its representative took the fix out of the overlay) or to superseded,
 // never accepted/applied/retired by a rebuild, and never a reviewer's move.
 func TestDuplicateState(t *testing.T) {
 	if !slices.Contains(AllStates(), StateDuplicate) {
@@ -285,8 +286,8 @@ func TestDuplicateState(t *testing.T) {
 			next = append(next, s)
 		}
 	}
-	if !slices.Equal(next, []string{StateProposed, StateSuperseded}) {
-		t.Errorf("duplicate may move to %v, want only [proposed superseded]", next)
+	if !slices.Equal(next, []string{StateProposed, StateRejected, StateSuperseded}) {
+		t.Errorf("duplicate may move to %v, want only [proposed rejected superseded]", next)
 	}
 	for _, to := range []string{StateAccepted, StateApplied, StateStale} {
 		if slices.Contains(StatesAllowing(to), StateDuplicate) {
@@ -294,7 +295,8 @@ func TestDuplicateState(t *testing.T) {
 		}
 	}
 	for _, tc := range [][2]string{
-		{StateProposed, StateDuplicate}, {StateDuplicate, StateProposed}, {StateDuplicate, StateSuperseded},
+		{StateProposed, StateDuplicate}, {StateDuplicate, StateProposed}, {StateDuplicate, StateRejected},
+		{StateDuplicate, StateSuperseded},
 	} {
 		if !IsMachineTransition(tc[0], tc[1]) {
 			t.Errorf("%s -> %s must be a machine transition (no review action)", tc[0], tc[1])

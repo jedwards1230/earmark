@@ -25,7 +25,7 @@ version is in `goose_db_version`.
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` (every build that registered a recipe), `recipe_builds_code_version_idx`, backfilled from `recipes`; comment on `recipes.code_version` (first build) |
 | 12 | `00012_model_settings.sql` | `model_settings` (runtime per-step model overrides) and the append-only `model_setting_events` history + `model_setting_events_step_idx`; nothing backfilled |
 | 13 | `00013_audit_lineage.sql` | `judge_passes` (per transcript × judge recipe; `legacy` rows backfilled) and `transcript_archive` (a requeue's replaced transcript); on `transcript_findings`: `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (filled on insert, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` patch state; `finding_events.anchor_offset` + the `transcript_findings_record_reanchor` trigger; transitions read `earmark.reason`; `stale_work` propose arm skips duplicates |
-| 16 | `00016_decide_duplicates.sql` | `finding_events.outcome` gains `duplicate` (CHECK: a duplicate decision names its representative); `finding_events.related_finding_id` (plain UUID, no FK) + partial index `finding_events_related_idx`. Locks `finding_events` only. 14 and 15 are concurrent changes and merge first |
+| 15 | `00015_decide_duplicates.sql` | `finding_events.outcome` gains `duplicate` (CHECK: a duplicate decision names its representative); `finding_events.related_finding_id` (plain UUID, no FK) + partial index `finding_events_related_idx`. Locks `finding_events` only; Down takes the lock before its refusal check. Merges after 14 (jedwards1230/earmark#193) |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -445,8 +445,10 @@ are kept (`é` ≠ `e`). Read the column; never recompute the key. A `duplicate`
 the same UPDATE. The decide step (CONTRACT §2.19 "Agreeing and conflicting
 findings") groups proposed findings of one chunk with the same span and
 `correction_key`, decides one representative and moves the rest to
-`duplicate` (a `duplicate` decision event naming it); `earmark decide revert`
-of the representative returns them to `proposed`.
+`duplicate` (a `duplicate` decision event naming it). Duplicates follow their
+representative on `earmark decide revert`: rejected with it (reason
+`duplicate_of_reverted`) when the undo takes it out of the overlay, back to
+`proposed` when the undo returns it there.
 
 A re-anchor rewrites the existing anchor columns in place — `chunk_id`,
 `chunk_index` (from the chunk row), `chunk_text_sha256`, `anchor_offset`,
@@ -583,7 +585,7 @@ CREATE TABLE finding_events (
     kind              TEXT        NOT NULL,   -- transition | decision | revoke
     from_state        TEXT,
     to_state          TEXT,
-    outcome           TEXT,                   -- apply | hold | reject | duplicate (migration 16)
+    outcome           TEXT,                   -- apply | hold | reject | duplicate (migration 15)
     reason            TEXT,
     actor             TEXT        NOT NULL,   -- decided_by, earmark.actor setting, or 'system'
     recipe_id         TEXT        REFERENCES recipes (recipe_id),
@@ -595,7 +597,7 @@ CREATE TABLE finding_events (
     revokes_event_id  BIGINT      REFERENCES finding_events (id),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     anchor_offset     INTEGER,                -- migration 13: the OLD offset on a reanchor_moved row
-    related_finding_id UUID                   -- migration 16: a duplicate's representative / an overlap_dup's winner (no FK)
+    related_finding_id UUID                   -- migration 15: a duplicate's representative / an overlap_dup's winner (no FK)
 );
 -- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at),
 --          finding_events_related_idx: (related_finding_id) WHERE related_finding_id IS NOT NULL
@@ -608,8 +610,9 @@ CREATE TABLE finding_events (
 
 A transition's `reason` is the transaction's `earmark.reason` setting
 (`db.SetEventContext`): `requeue` for a requeue's supersede, `cleared` for the
-dashboard clear, `duplicate` / `duplicate_released` for the decide step's
-grouping and its undo, NULL when unset. The re-anchor trigger appends a `transition`
+dashboard clear, `duplicate` for the decide step's grouping,
+`duplicate_of_reverted` / `duplicate_released` when an undo rejects a
+duplicate with its representative or returns it to proposed, NULL when unset. The re-anchor trigger appends a `transition`
 with `from_state = to_state` (the state before the UPDATE), reason
 `reanchor_moved` (`reanchor_placed` when it had no `anchor_offset` yet), and
 the OLD `chunk_text_sha256` / `anchor_offset` whenever a

@@ -444,13 +444,13 @@ func TestAuditLineageMigration(t *testing.T) {
 	}
 }
 
-// TestDecideDuplicatesMigration pins 00016: lock timeout, then the one lock
+// TestDecideDuplicatesMigration pins 00015: lock timeout, then the one lock
 // (finding_events), before any DDL; the duplicate outcome and its
 // representative guard; a plain related_finding_id (no foreign key on the
 // append-only log); and a Down that refuses to drop pointers unless
 // earmark.allow_data_loss is on and restores the old CHECK NOT VALID.
 func TestDecideDuplicatesMigration(t *testing.T) {
-	b, err := migrationFiles.ReadFile("migrations/00016_decide_duplicates.sql")
+	b, err := migrationFiles.ReadFile("migrations/00015_decide_duplicates.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,11 +459,18 @@ func TestDecideDuplicatesMigration(t *testing.T) {
 		t.Fatal("no Down section")
 	}
 	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
-	i := strings.Index(up, "SET LOCAL lock_timeout = '5s'")
-	l := strings.Index(up, "LOCK TABLE finding_events IN ACCESS EXCLUSIVE MODE;")
-	a := strings.Index(up, "ALTER TABLE")
-	if i < 0 || l < i || a < l {
-		t.Error("Up: want lock_timeout, then LOCK finding_events, before any DDL")
+	for name, part := range map[string]string{"Up": up, "Down": down} {
+		i := strings.Index(part, "SET LOCAL lock_timeout = '5s'")
+		l := strings.Index(part, "LOCK TABLE finding_events IN ACCESS EXCLUSIVE MODE;")
+		first := len(part)
+		for _, stmt := range []string{"ALTER TABLE", "DROP ", "CREATE ", "DO $$"} {
+			if at := strings.Index(part, stmt); at >= 0 && at < first {
+				first = at
+			}
+		}
+		if i < 0 || l < i || first < l {
+			t.Errorf("%s: want lock_timeout, then LOCK finding_events, before the refusal check and any DDL", name)
+		}
 	}
 	for _, want := range []string{
 		"ADD COLUMN related_finding_id UUID;",

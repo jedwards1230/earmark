@@ -17,8 +17,9 @@ import (
 // DefaultWriteBatch is how many transcripts one --yes write transaction covers.
 const DefaultWriteBatch = 20
 
-// workPage is how many findings one compute phase decides before writing.
-const workPage = 500
+// workPage is how many findings one compute phase decides before writing (a
+// var so a test can page small).
+var workPage = 500
 
 // WriteStore is what a --yes run needs (*db.DB implements it): the dry run's
 // reads, the work list, and the two decision writes.

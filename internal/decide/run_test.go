@@ -53,7 +53,7 @@ func (s *fakeRunStore) DecideBacklog(context.Context, db.DecideScope) (map[strin
 	return s.backlog, nil
 }
 
-func (s *fakeRunStore) DecideChunks(_ context.Context, keys []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error) {
+func (s *fakeRunStore) DecideChunks(_ context.Context, _ string, keys []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error) {
 	if len(keys) > db.MaxDecideChunkBatch {
 		return nil, errors.New("over cap")
 	}
@@ -257,9 +257,10 @@ func TestDryRun(t *testing.T) {
 	if asker.calls != 7 {
 		t.Errorf("%d model calls, want 7 (rung-0 failures make none)", asker.calls)
 	}
-	if g := rep.Grouping; g.Conflicts != 1 || g.Ranked != 2 || g.Losers != 1 || g.Unranked != 0 || len(g.ConflictLines) != 1 ||
+	// f-dup wins on p but is only held: the competitor is held pending it.
+	if g := rep.Grouping; g.Conflicts != 1 || g.Ranked != 2 || g.Losers != 0 || g.Pending != 1 || g.Unranked != 0 || len(g.ConflictLines) != 1 ||
 		!strings.Contains(g.ConflictLines[0], `"walked" → "woked" p 0.60 kept`) ||
-		!strings.Contains(g.ConflictLines[0], `"walked" → "worked" p 0.30 overlap_dup → f-dup`) {
+		!strings.Contains(g.ConflictLines[0], `"walked" → "worked" p 0.30 overlap_pending → f-dup`) {
 		t.Errorf("grouping %+v", g)
 	}
 

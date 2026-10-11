@@ -1170,7 +1170,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` — every (recipe, earmark build) pair, PK `(recipe_id, code_version)` plus `recipe_builds_code_version_idx`, backfilled with each existing recipe's registering build; a column comment marking `recipes.code_version` as the *first* build (§1.9 "Recipe ID format" / "Builds"). New table plus a `COMMENT` (SHARE UPDATE EXCLUSIVE, which writers' INSERTs do not wait on); no id is rewritten. |
 | 13 | `00013_audit_lineage.sql` | Audit lineage (§1.4, §2.15 "Lineage", §2.17): `judge_passes` (legacy rows backfilled) and `transcript_archive`; on `transcript_findings` `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (trigger-filled, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` state; `finding_events.anchor_offset` + the reanchor trigger; transitions read `earmark.reason`; `stale_work`'s propose arm skips duplicates. Locks `recipes` (SHARE ROW EXCLUSIVE) then `transcript_findings` (ACCESS EXCLUSIVE) first — a running judge's order — and rewrites `transcript_findings` (`lock_timeout` 5s). |
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
-| 16 | `00016_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). 14 and 15 belong to concurrent changes and must be merged first (versions are applied strictly in order). |
+| 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -3984,8 +3984,10 @@ proposed ──accept──> accepted ──apply──> applied ──revert─
   findings of a chunk that resolve to the same span with the same
   `correction_key`, decides one representative, and records the others as
   duplicates of it (a `duplicate` decision, `decided_by` `jev:<recipe_id>`).
-  Undoing the representative (`earmark decide revert`) returns its duplicates
-  to `proposed`. A reviewer's move of a representative does not cascade.
+  Duplicates follow their representative on `earmark decide revert`: rejected
+  with it when the undo takes it out of the overlay, back to `proposed` when
+  the undo returns it there. A reviewer's move of a representative does not
+  cascade.
 - **superseded** — the finding's transcript was replaced by an operator requeue
   (§1.4), or an operator cleared it (§2.15 "Clearing"). Set by requeue or clear
   only, from **any** other state — human decisions, `unanchorable` and
@@ -4060,7 +4062,7 @@ CREATE TABLE finding_events (
     kind              TEXT        NOT NULL,    -- transition | decision | revoke
     from_state        TEXT,                    -- transition: NULL for an insert
     to_state          TEXT,                    -- transition
-    outcome           TEXT,                    -- decision: apply | hold | reject | duplicate (migration 16)
+    outcome           TEXT,                    -- decision: apply | hold | reject | duplicate (migration 15)
     reason            TEXT,
     actor             TEXT        NOT NULL,    -- mcp:<who> | jev:<recipe> | revert:jev:<recipe> | cli:<who> | system
     recipe_id         TEXT        REFERENCES recipes,
@@ -4072,7 +4074,7 @@ CREATE TABLE finding_events (
     revokes_event_id  BIGINT      REFERENCES finding_events,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     anchor_offset     INTEGER,                 -- migration 13: the OLD offset of a reanchor_moved transition
-    related_finding_id UUID                    -- migration 16: a duplicate's representative, an overlap_dup's winner
+    related_finding_id UUID                    -- migration 15: a duplicate's representative, an overlap_dup's winner
 );
 -- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at),
 --          UNIQUE (revokes_event_id) WHERE kind = 'revoke',
@@ -4092,7 +4094,8 @@ CREATE TABLE finding_events (
   the transaction-local setting `earmark.reason` (`db.SetEventContext`'s
   `Reason`; migration 13) when set: `requeue` for a requeue's supersede,
   `cleared` for a clear, `duplicate` for the decide step's grouping into
-  `duplicate`, `duplicate_released` for a duplicate an undo returned to
+  `duplicate`, `duplicate_of_reverted` for a duplicate an undo rejected with
+  its representative, `duplicate_released` for a follower an undo returned to
   `proposed`, NULL otherwise.
   `created_at` is when the transition ran (`clock_timestamp()`), not when its
   transaction committed.
@@ -4110,11 +4113,13 @@ CREATE TABLE finding_events (
   in name order), then the state transition, so "latest transition at `t`"
   still ends on the new state.
 - **decision** — a decide recipe's verdict (`db.InsertDecisionEvents`), see
-  above. `actor` is `jev:<recipe_id>`. Since migration 16 the outcome may be
+  above. `actor` is `jev:<recipe_id>`. Since migration 15 the outcome may be
   `duplicate` (reason `duplicate`, no `p`, no evidence) and
   `related_finding_id` names the other finding a decision is about: a
-  duplicate's representative (required) or the winner an `overlap_dup` reject
-  lost to.
+  duplicate's representative (required), the winner an `overlap_dup` reject or
+  an `overlap_pending` hold lost to, or — on an undo's `duplicate_of_reverted`
+  reject (actor `revert:jev:<recipe>`) — the representative whose undo it
+  followed.
 - **revoke** — withdraws one decision (`revokes_event_id`;
   `db.RevokeEvents` revokes every live decision of a recipe). A decision is
   revoked at most once; undo appends, it never edits.
@@ -4135,8 +4140,8 @@ What the log answers:
 - **Undo scopes** — a single finding (a reviewer's revert or reconsider), a
   whole decide recipe (revoke its decisions and move its findings back with a
   `revert:jev:<recipe_id>` decider: applied → reverted, accepted → rejected,
-  rejected → proposed, duplicate → proposed — and every duplicate of a moved
-  finding back to proposed), or everything since a time (the transitions
+  rejected → proposed, duplicate → proposed — each moved finding's
+  duplicates following it), or everything since a time (the transitions
   after `t`).
   The CLI for recipe, finding and time undo is `earmark decide revert`
   (§2.19), built on these helpers (`db.RevertDecisions`).
@@ -5091,8 +5096,9 @@ in scope and writes the decisions (`decide.Apply`). `--sample`, `--seed` and
   500 per page): anchored judge findings that are `proposed`, or
   `accepted`/`applied` by **another** decide recipe (`decided_by` `jev:<other>`
   — the re-check below; a person's accept is never re-checked), whose latest
-  **unrevoked** `decision` event is absent, by another recipe, or this
-  recipe's `jev_unavailable` hold. Every other verdict of this recipe is final:
+  **unrevoked** `decision` event is absent, by another recipe, this
+  recipe's `jev_unavailable` hold, or this recipe's `overlap_pending` hold
+  whose winner has left `proposed`. Every other verdict of this recipe is final:
   **a re-run asks nothing again** except holds where the model was
   unavailable. `--book` / `--issue-type` narrow it; `--shard i/N` keeps
   transcripts with `hashtext(transcript_id) mod N = i` (folded non-negative),
@@ -5111,8 +5117,11 @@ in scope and writes the decisions (`decide.Apply`). `--sample`, `--seed` and
   `p`, evidence, `fn_call_id`, chunk hash, related finding). apply → `accepted` (its chunk
   flagged `embedding_stale`; the next rebuild replays it and marks it
   `applied`), reject → `rejected` (rung-0 rejects and `overlap_dup` losers
-  included), hold → stays `proposed`, duplicate → `duplicate` of its
-  representative. A rung-0 `chunk_changed` / `anchor_missing` is **not written**
+  included), hold → stays `proposed` (`overlap_pending` losers included),
+  duplicate → `duplicate` of its representative — written only with the
+  representative locked `FOR SHARE` (`SKIP LOCKED`: a representative another
+  writer holds, e.g. an undo, makes its duplicates *skipped*, grouped again
+  next run). A rung-0 `chunk_changed` / `anchor_missing` is **not written**
   (re-anchoring's job). `proposed → applied` stays illegal: only a rebuild
   applies.
 - **`--limit N`** stops after N findings; **`--max-accepts N`** stops after N
@@ -5173,7 +5182,8 @@ after rung 0's per-candidate checks and before its dedupe (`decide.groupChunk`,
 - **Representative**, by the first criterion the members differ on:
   accepted/applied (the fix is already in the overlay) › an **existing
   representative** — some finding is already its duplicate, or its latest live
-  decision is by this run's recipe (so a re-run never flip-flops) › passes rung
+  decision is by this run's recipe or one equivalent to it (§1.9; so a re-run
+  never flip-flops) › passes rung
   0 (the same fix labelled with an issue type rung 0 cannot vet loses to one it
   can) › proposed by the **current propose recipe** (`current_recipes`, or an
   equivalent recipe) › newest (`created_at`) › lowest id. The report names the
@@ -5191,22 +5201,51 @@ after rung 0's per-candidate checks and before its dedupe (`decide.groupChunk`,
   are not duplicates and not refused `overlaps_overlay`) are **all asked**,
   including competitors outside the run, and ranked by the decide model's `p`
   (Clef is local and free) — then judge confidence, then finding id. The
-  highest is kept; one that overlaps a kept fix is rejected `overlap_dup` with
-  its own `p` and `related_finding_id` = the winner. A competitor outside the
-  run is asked only to rank (counted in the report's model calls as
-  `conflict_asks`) and decided on its own page. If any member got no usable
-  `p` the set is **unranked**: no member is applied (an apply becomes a
-  retryable `jev_unavailable` hold) and the set is ranked again next run. A
-  `--rung0-only` replay ranks nothing: conflicting candidates stay rung-0
-  passes. The calibration sweep re-runs grouping and dedupe at each threshold
-  but does not re-rank conflicts.
-- **Undo.** `earmark decide revert` returns a reverted recipe's duplicates to
-  `proposed` and, whatever recipe grouped them, the duplicates of every
-  finding it moves (`duplicate_of` cleared, reason `duplicate_released`, their
-  `duplicate` decisions revoked), so they are decided again.
+  highest is kept (decided on its own `p`); a candidate that overlaps a kept
+  one **follows its winner's decision**:
+  - winner **applies** → the loser is rejected `overlap_dup`, with its own `p`
+    and `related_finding_id` = the winner;
+  - winner **held** → the loser is held too, reason `overlap_pending`,
+    `related_finding_id` = the winner — never rejected for a fix that is not
+    in. The work list decides it again once the winner leaves `proposed`
+    (applied, rejected, archived); while the winner stays held, a re-run does
+    not touch it (no flip-flop);
+  - winner **rejected** on its own `p` → the loser keeps its own verdict.
+
+  A competitor outside the run is asked only to rank (counted in the report's
+  model calls as `conflict_asks`) and decided on its own page. If any member
+  got no usable `p` the set is **unranked**: no member is applied (an apply
+  becomes a retryable `jev_unavailable` hold) and the set is ranked again next
+  run. A member whose call keeps failing therefore keeps its set unranked and
+  is re-asked every run, like any `jev_unavailable` hold (errored calls are
+  never cached); nothing in the set is applied meanwhile. A `--rung0-only`
+  replay ranks nothing: conflicting candidates stay rung-0 passes. The
+  calibration sweep re-runs grouping and dedupe at each threshold but does
+  not re-rank conflicts.
+- **Undo: duplicates follow their representative.** `earmark decide revert`
+  moves each representative's duplicates with it, whichever recipe grouped
+  them, attributed to the undo of the recipe being reverted
+  (`revert:jev:<recipe>`):
+  - representative taken **out of the overlay** (`accepted → rejected`,
+    `applied → reverted`) → its duplicates are **rejected** (`duplicate_of`
+    cleared, transition reason `duplicate_of_reverted`, their `duplicate`
+    decisions revoked, and a `reject` decision, reason
+    `duplicate_of_reverted`, `related_finding_id` = the representative). The
+    undo sticks: re-running the recipe does not bring the fix back through a
+    duplicate;
+  - representative **returned to proposed** (`rejected → proposed`,
+    `reverted → proposed`) → its duplicates, and the findings an earlier undo
+    rejected `duplicate_of_reverted` naming it, return to `proposed` (reason
+    `duplicate_released`, their decisions revoked), so they are decided again;
+  - a duplicate the reverted recipe grouped whose representative the undo
+    does not move returns to `proposed`.
+
+  Representatives are undone before duplicates, so this holds across revert
+  batches. Undoing again never undoes the undo's own decisions.
 - **Report.** The class `duplicate` sits beside apply/hold/reject/reanchor
   (and is projected); `grouping` counts groups, duplicates, conflict sets,
-  ranked members, `overlap_dup` losers and unranked sets. A dry run also lists
+  ranked members, `overlap_dup` losers, `overlap_pending` losers and unranked
+  sets. A dry run also lists
   each group (representative, its state and criterion, the fix, the
   duplicates) and each ranked set (each fix with its `p`, kept or
   `overlap_dup → winner`) — the only finding ids in the report. `--dump` adds
@@ -5230,19 +5269,23 @@ one scope flag is required; together they narrow (AND). Dry-run unless
   transactions of ≤ 500 findings, `decided_by` = `revert:jev:<recipe>`):
   `applied → reverted`, `accepted → rejected`, `rejected → proposed`, a
   re-check's `reverted → proposed`, and `duplicate → proposed` with
-  `duplicate_of` cleared (a machine move, `releaseDuplicatesSQL`, reason
-  `duplicate_released`). In the same transaction every **duplicate of a
-  finding it moved** returns to `proposed` too (the **cascade**, whichever
-  recipe grouped it; decider `revert:` + its grouping decider) and those
-  duplicates' live `duplicate` decisions are revoked, so the next run decides
-  them again. The report counts the cascade as `cascaded` (and in
-  `duplicate->proposed`). `proposed → applied` being illegal, an
+  `duplicate_of` cleared (machine moves outside the bulk path). In the same
+  transaction each moved finding's **followers** move with it ("Undo:
+  duplicates follow their representative" above): rejected with a
+  representative leaving the overlay, returned to `proposed` with one
+  returning there. Candidates are listed representatives first, so a
+  duplicate in a later batch was already moved by its representative's batch
+  and is neither moved again nor counted skipped. The report counts follower
+  moves as `cascaded` (and per transition). `proposed → applied` being illegal, an
   older recipe's fix undone by a re-check is not restored directly: the
   finding goes back to `proposed` and is decided again. Every move is a
   `transition` event.
-- **Revoke**: every live `decision` event in scope gets a `revoke` event
-  (actor `revert:jev:<recipe>`) — holds included — so the next `--yes` run of
-  that recipe decides those findings afresh.
+- **Revoke**: every live `decision` event the recipe made in scope (actor
+  `jev:<recipe>`) gets a `revoke` event (actor `revert:jev:<recipe>`) — holds
+  included — so the next `--yes` run of that recipe decides those findings
+  afresh; so does every moved follower's live `duplicate` (or earlier
+  `duplicate_of_reverted`) decision, whatever its recipe. The dry run counts
+  both, so its preview matches what `--yes` revokes.
 - **Re-flag sweep**: after each batch commits, every moved finding's chunk is
   flagged `embedding_stale`. This closes the window where a rebuild that read
   the overlay before the revert clears the flag after it; since migration 13

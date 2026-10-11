@@ -63,8 +63,11 @@ func (s DecideWorkScope) validate() error {
 //     never re-checked;
 //
 // and whose latest live (unrevoked) decision is absent, is by another recipe,
-// or is this recipe's retryable hold ($8, jev_unavailable). Every other
-// verdict of this recipe is final, so a re-run does not ask again.
+// or is this recipe's retryable hold ($8, jev_unavailable), or its
+// overlap_pending hold whose winner (related_finding_id) has left proposed —
+// applied, rejected, archived — so the conflict is re-ranked. Every other
+// verdict of this recipe is final, so a re-run does not ask again (a loser
+// pending on a winner that is still held stays put: no flip-flop).
 //
 // "This recipe" is the recipe and every recipe equivalent to it
 // (equivalentRecipesCTE): a format-1 recipe id that differs from the run's
@@ -81,10 +84,10 @@ var decideWorkSQL = `
 	SELECT f.id::text, f.transcript_id::text, f.file_path, f.issue_type, f.original_text,
 	       COALESCE(f.suggested_correction, ''), f.confidence, f.chunk_index,
 	       f.anchor_offset, COALESCE(f.anchor_occurrence, -1), f.chunk_text_sha256,
-	       f.patch_state, COALESCE(f.decided_by, '')` + decideGroupingCols + `
+	       f.patch_state, COALESCE(f.decided_by, '')
 	  FROM transcript_findings f
 	  LEFT JOIN LATERAL (
-	        SELECT e.recipe_id, e.outcome, e.reason
+	        SELECT e.recipe_id, e.outcome, e.reason, e.related_finding_id
 	          FROM finding_events e
 	         WHERE e.finding_id = f.id AND e.kind = 'decision'
 	           AND NOT EXISTS (SELECT 1 FROM finding_events v
@@ -101,7 +104,10 @@ var decideWorkSQL = `
 	            AND f.decided_by ~ '^jev:[0-9a-f]{64}$'
 	            AND f.decided_by NOT IN (SELECT 'jev:' || eq.recipe_id FROM eq)))
 	   AND (d.recipe_id IS NULL OR d.recipe_id NOT IN (SELECT eq.recipe_id FROM eq)
-	        OR (d.outcome = 'hold' AND d.reason = $8))
+	        OR (d.outcome = 'hold' AND d.reason = $8)
+	        OR (d.outcome = 'hold' AND d.reason = '` + ReasonOverlapPending + `'
+	            AND NOT EXISTS (SELECT 1 FROM transcript_findings w
+	                             WHERE w.id = d.related_finding_id AND w.patch_state = 'proposed')))
 	   AND ($2 = '' OR f.file_path ILIKE $2)
 	   AND ($3 = '' OR f.issue_type = $3)
 	   AND ($4 = 0 OR mod(mod(hashtext(f.transcript_id::text)::bigint, $4) + $4, $4) = $5)
@@ -207,13 +213,18 @@ func (s RevertScope) args() []any {
 // replayed is rejected, a reject goes back to proposed, and a re-check's
 // revert (applied → reverted by a newer recipe) goes back to proposed too —
 // proposed → applied is illegal, so the older recipe's fix is not restored
-// directly; the finding is decided again.
+// directly; the finding is decided again. A duplicate the recipe grouped goes
+// back to proposed (its grouping undone), unless its representative follows
+// below.
 //
-// A duplicate the recipe grouped goes back to proposed with duplicate_of
-// cleared (releaseDuplicatesSQL: a machine move the bulk path refuses), and
-// so does every duplicate of a finding the undo moves — undoing a
-// representative undoes its grouping (CONTRACT §2.19 "Agreeing and
-// conflicting findings").
+// Duplicates follow their representative (CONTRACT §2.19 "Agreeing and
+// conflicting findings"): when the undo takes a representative out of the
+// overlay (accepted → rejected, applied → reverted) its duplicates are
+// rejected too (reason duplicate_of_reverted, a decision naming the
+// representative), so the undone fix cannot come back through a duplicate;
+// when it returns a representative to proposed, its duplicates — and the
+// findings an earlier undo rejected as duplicate_of_reverted — return to
+// proposed with it.
 var revertTransitions = map[string]string{
 	patch.StateApplied:   patch.StateReverted,
 	patch.StateAccepted:  patch.StateRejected,
@@ -222,10 +233,23 @@ var revertTransitions = map[string]string{
 	patch.StateDuplicate: patch.StateProposed,
 }
 
-// revertCandidatesSQL lists the findings a decide recipe last moved, in id
-// order: decided_by 'jev:<recipe>' (a person's decision, or an undo already
-// done — 'revert:jev:…' — never matches, which is what makes revert
-// idempotent).
+// followsOut reports whether undoing a finding in state takes it out of the
+// overlay (its duplicates are rejected); otherwise the undo returns it to
+// proposed (its duplicates return too).
+func followsOut(state string) bool {
+	return state == patch.StateApplied || state == patch.StateAccepted
+}
+
+// ReasonDuplicateOfReverted is the reason of a duplicate rejected because the
+// undo of its representative took the fix out of the overlay.
+const ReasonDuplicateOfReverted = "duplicate_of_reverted"
+
+// revertCandidatesSQL lists the findings a decide recipe last moved:
+// decided_by 'jev:<recipe>' (a person's decision, or an undo already done —
+// 'revert:jev:…' — never matches, which is what makes revert idempotent).
+// Representatives first, duplicates last (then id order), so every
+// representative a duplicate follows has moved before the duplicate's own
+// batch, whatever the batching.
 //
 //	$1 recipe ('' = any)  $2 finding (NULL = any)  $3 since (NULL = any)
 var revertCandidatesSQL = `
@@ -236,17 +260,23 @@ var revertCandidatesSQL = `
 	   AND ($1 = '' OR f.decided_by = 'jev:' || $1)
 	   AND ($2::uuid IS NULL OR f.id = $2::uuid)
 	   AND ($3::timestamptz IS NULL OR f.decided_at >= $3::timestamptz)
-	 ORDER BY f.id`
+	 ORDER BY f.patch_state = 'duplicate', f.id`
 
-// revertDecisionsCountSQL counts the live decisions the scope would revoke.
-var revertDecisionsCountSQL = `
-	SELECT count(*) FROM finding_events e
+// revertScopeDecisions is the filter of the live decisions a revert revokes:
+// decisions the recipe itself made (actor jev:<recipe>; the decisions an undo
+// writes — duplicate_of_reverted — are not undone by undoing again), in scope.
+const revertScopeDecisions = `
 	 WHERE e.kind = 'decision'
+	   AND e.actor = 'jev:' || e.recipe_id
 	   AND ($1 = '' OR e.recipe_id = $1)
 	   AND ($2::uuid IS NULL OR e.finding_id = $2::uuid)
 	   AND ($3::timestamptz IS NULL OR e.created_at >= $3::timestamptz)
 	   AND NOT EXISTS (SELECT 1 FROM finding_events v
 	                    WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)`
+
+// revertDecisionsCountSQL counts the live decisions the scope would revoke.
+var revertDecisionsCountSQL = `
+	SELECT count(*) FROM finding_events e` + revertScopeDecisions
 
 // revokeScopeSQL appends one revoke per live decision in scope, attributed to
 // the undo of the decision's own recipe. The unique index on
@@ -255,13 +285,7 @@ var revokeScopeSQL = `
 	INSERT INTO finding_events (finding_id, transcript_id, kind, reason, actor, recipe_id, revokes_event_id)
 	SELECT e.finding_id, e.transcript_id, 'revoke', 'decide revert', 'revert:jev:' || e.recipe_id,
 	       e.recipe_id, e.id
-	  FROM finding_events e
-	 WHERE e.kind = 'decision'
-	   AND ($1 = '' OR e.recipe_id = $1)
-	   AND ($2::uuid IS NULL OR e.finding_id = $2::uuid)
-	   AND ($3::timestamptz IS NULL OR e.created_at >= $3::timestamptz)
-	   AND NOT EXISTS (SELECT 1 FROM finding_events v
-	                    WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
+	  FROM finding_events e` + revertScopeDecisions + `
 	 ORDER BY e.id
 	ON CONFLICT (revokes_event_id) WHERE kind = 'revoke' DO NOTHING`
 
@@ -280,61 +304,164 @@ var reflagChunksSQL = `
 	   AND ((f.chunk_index IS NOT NULL AND c.transcript_id = f.transcript_id AND c.chunk_index = f.chunk_index)
 	        OR (f.chunk_index IS NULL AND c.id = f.chunk_id))`
 
+// followerDecisions is the filter of a follower's live decisions an undo
+// revokes when it moves the follower: its duplicate decision, and an earlier
+// undo's duplicate_of_reverted reject.
+const followerDecisions = `e.kind = 'decision'
+	   AND (e.outcome = 'duplicate' OR e.reason = '` + ReasonDuplicateOfReverted + `')
+	   AND NOT EXISTS (SELECT 1 FROM finding_events v
+	                    WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)`
+
+// revertFollowersSQL lists, for the representatives $1, the findings that
+// follow them: their duplicates, and the findings an earlier undo rejected as
+// duplicate_of_reverted naming them (still rejected, the decision live). It
+// is the dry run's view of what the apply's follower moves will touch.
+var revertFollowersSQL = `
+	SELECT d.id::text, d.duplicate_of::text, d.patch_state
+	  FROM transcript_findings d
+	 WHERE d.patch_state = 'duplicate' AND d.duplicate_of = ANY($1)
+	UNION
+	SELECT f.id::text, e.related_finding_id::text, f.patch_state
+	  FROM finding_events e
+	  JOIN transcript_findings f ON f.id = e.finding_id
+	 WHERE e.reason = '` + ReasonDuplicateOfReverted + `' AND e.related_finding_id = ANY($1)
+	   AND f.patch_state = 'rejected' AND ` + followerDecisions
+
+// followerRevokesCountSQL counts the live follower decisions of the findings
+// $1 that the scope ($2 recipe, $3 finding, $4 since) does not already count,
+// so a dry run's revoke total matches what --yes revokes.
+var followerRevokesCountSQL = `
+	SELECT count(*) FROM finding_events e
+	 WHERE e.finding_id = ANY($1) AND ` + followerDecisions + `
+	   AND NOT (e.actor = 'jev:' || e.recipe_id
+	            AND ($2 = '' OR e.recipe_id = $2)
+	            AND ($3::uuid IS NULL OR e.finding_id = $3::uuid)
+	            AND ($4::timestamptz IS NULL OR e.created_at >= $4::timestamptz))`
+
+// rejectFollowersSQL rejects the duplicates of representatives the undo took
+// out of the overlay: $1 representatives, $2 the decider each move is
+// attributed to (revert:jev:<recipe being reverted>), index-aligned.
+// duplicate_of is cleared (the 00013 CHECK); the representative is named by
+// the duplicate_of_reverted decision written next. Locks in id order.
+var rejectFollowersSQL = `
+	WITH w AS (
+	    SELECT * FROM unnest($1::uuid[], $2::text[]) AS w(rep, decider)
+	), lk AS (
+	    SELECT f.id, w.rep, w.decider
+	      FROM transcript_findings f JOIN w ON f.duplicate_of = w.rep
+	     WHERE f.patch_state = 'duplicate'
+	     ORDER BY f.id
+	       FOR UPDATE OF f
+	)
+	UPDATE transcript_findings f
+	   SET patch_state  = 'rejected',
+	       duplicate_of = NULL,
+	       decided_at   = clock_timestamp(),
+	       decided_by   = lk.decider
+	  FROM lk
+	 WHERE f.id = lk.id AND f.patch_state = 'duplicate'
+	RETURNING f.id::text, lk.rep::text, lk.decider`
+
 // releaseDuplicatesSQL returns duplicates to proposed: the listed ones ($1,
-// duplicates a reverted recipe grouped) and every duplicate of the listed
-// representatives ($2, findings the revert moved). duplicate_of is cleared in
-// the same UPDATE (the 00013 CHECK); the decider becomes revert:<decider>, so
-// the move is attributed to the undo of the recipe that grouped it and is
-// never a revert candidate again. Locks in id order, like every bulk writer.
+// duplicates the reverted recipe grouped, deciders $2) and every duplicate of
+// the representatives the undo returned to proposed ($3, deciders $4). A
+// listed duplicate whose representative moved is reported as following it
+// (listed false), as the dry run counts it.
+// duplicate_of is cleared in the same UPDATE (the 00013 CHECK); the decider is
+// revert:jev:<the recipe being reverted>, so the move is never a revert
+// candidate again. Locks in id order.
 var releaseDuplicatesSQL = `
-	WITH lk AS (
-	    SELECT id FROM transcript_findings
-	     WHERE (id = ANY($1) OR duplicate_of = ANY($2)) AND patch_state = 'duplicate'
-	     ORDER BY id
-	       FOR UPDATE
+	WITH w AS (
+	    SELECT f.id, x.decider, true AS listed
+	      FROM unnest($1::uuid[], $2::text[]) AS x(id, decider)
+	      JOIN transcript_findings f ON f.id = x.id
+	    UNION ALL
+	    SELECT f.id, x.decider, false
+	      FROM unnest($3::uuid[], $4::text[]) AS x(rep, decider)
+	      JOIN transcript_findings f ON f.duplicate_of = x.rep
+	), pick AS (
+	    SELECT DISTINCT ON (id) id, decider, listed FROM w ORDER BY id, listed
+	), lk AS (
+	    SELECT f.id, pick.decider, pick.listed
+	      FROM transcript_findings f JOIN pick ON pick.id = f.id
+	     WHERE f.patch_state = 'duplicate'
+	     ORDER BY f.id
+	       FOR UPDATE OF f
 	)
 	UPDATE transcript_findings f
 	   SET patch_state  = 'proposed',
 	       duplicate_of = NULL,
 	       decided_at   = clock_timestamp(),
-	       decided_by   = CASE WHEN f.decided_by ~ '^jev:' THEN 'revert:' || f.decided_by
-	                           ELSE f.decided_by END
+	       decided_by   = lk.decider
 	  FROM lk
 	 WHERE f.id = lk.id AND f.patch_state = 'duplicate'
-	RETURNING f.id::text, f.id = ANY($1)`
+	RETURNING f.id::text, lk.listed, lk.decider`
 
-// revokeDuplicateDecisionsSQL revokes the live duplicate decisions of the
-// released findings, so the work list (decideWorkSQL) decides them again even
-// under the recipe that grouped them.
-var revokeDuplicateDecisionsSQL = `
+// restoreFollowersSQL returns to proposed the findings an earlier undo
+// rejected as duplicate_of_reverted naming a representative the undo now
+// returns to proposed ($1, deciders $2).
+var restoreFollowersSQL = `
+	WITH x AS (
+	    SELECT * FROM unnest($1::uuid[], $2::text[]) AS x(rep, decider)
+	), w AS (
+	    SELECT DISTINCT ON (e.finding_id) e.finding_id AS id, x.decider
+	      FROM finding_events e JOIN x ON e.related_finding_id = x.rep
+	     WHERE e.reason = '` + ReasonDuplicateOfReverted + `' AND ` + followerDecisions + `
+	     ORDER BY e.finding_id, e.id DESC
+	), lk AS (
+	    SELECT f.id, w.decider
+	      FROM transcript_findings f JOIN w ON w.id = f.id
+	     WHERE f.patch_state = 'rejected'
+	     ORDER BY f.id
+	       FOR UPDATE OF f
+	)
+	UPDATE transcript_findings f
+	   SET patch_state = 'proposed',
+	       decided_at  = clock_timestamp(),
+	       decided_by  = lk.decider
+	  FROM lk
+	 WHERE f.id = lk.id AND f.patch_state = 'rejected'
+	RETURNING f.id::text, lk.decider`
+
+// revokeFollowerDecisionsSQL revokes the live follower decisions of the moved
+// followers ($1, actors $2 index-aligned), reason $3, so the work list decides
+// a returned follower again and a rejected one carries only the undo's
+// decision.
+var revokeFollowerDecisionsSQL = `
 	INSERT INTO finding_events (finding_id, transcript_id, kind, reason, actor, recipe_id, revokes_event_id)
-	SELECT e.finding_id, e.transcript_id, 'revoke', '` + ReasonDuplicateReleased + `', 'revert:jev:' || e.recipe_id,
-	       e.recipe_id, e.id
-	  FROM finding_events e
-	 WHERE e.kind = 'decision' AND e.outcome = 'duplicate'
-	   AND e.finding_id = ANY($1)
-	   AND NOT EXISTS (SELECT 1 FROM finding_events v
-	                    WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
+	SELECT e.finding_id, e.transcript_id, 'revoke', $3, x.actor, e.recipe_id, e.id
+	  FROM unnest($1::uuid[], $2::text[]) AS x(id, actor)
+	  JOIN finding_events e ON e.finding_id = x.id
+	 WHERE ` + followerDecisions + `
 	 ORDER BY e.id
 	ON CONFLICT (revokes_event_id) WHERE kind = 'revoke' DO NOTHING`
 
-// revertCascadeCountSQL counts, for a dry run, the duplicates of the listed
-// representatives ($1) that are not themselves candidates ($2).
-var revertCascadeCountSQL = `
-	SELECT count(*) FROM transcript_findings d
-	 WHERE d.patch_state = 'duplicate' AND d.duplicate_of = ANY($1) AND NOT d.id = ANY($2)`
+// insertFollowerRejectsSQL records the undo's verdict on a rejected follower:
+// a reject decision, reason duplicate_of_reverted, naming the representative,
+// attributed to the undo (actor revert:jev:<recipe>, recipe_id that recipe).
+var insertFollowerRejectsSQL = `
+	INSERT INTO finding_events (finding_id, transcript_id, kind, outcome, reason, actor, recipe_id,
+	                            chunk_text_sha256, issue_type, related_finding_id)
+	SELECT f.id, f.transcript_id, 'decision', 'reject', '` + ReasonDuplicateOfReverted + `', x.actor,
+	       substring(x.actor FROM '[0-9a-f]{64}$'), f.chunk_text_sha256, f.issue_type, x.rep
+	  FROM unnest($1::uuid[], $2::uuid[], $3::text[]) WITH ORDINALITY AS x(id, rep, actor, ord)
+	  JOIN transcript_findings f ON f.id = x.id
+	 ORDER BY x.ord`
 
-// maxRevertBatch caps the findings one revert transaction moves.
-const maxRevertBatch = 500
+// maxRevertBatch caps the findings one revert transaction moves (a var so a
+// test can force several batches).
+var maxRevertBatch = 500
 
 // RevertReport counts an undo. Transitions is keyed "from->to".
 type RevertReport struct {
 	DryRun      bool           `json:"dry_run"`
 	Transitions map[string]int `json:"transitions"`
-	// Moved counts findings moved (apply) or that would move (dry run).
+	// Moved counts candidates moved in their own right (apply) or that would
+	// move (dry run).
 	Moved int `json:"moved"`
-	// Cascaded counts duplicates returned to proposed because the undo moved
-	// their representative (also in Transitions as duplicate->proposed).
+	// Cascaded counts followers moved with their representative: duplicates
+	// rejected with it or returned to proposed with it, and earlier
+	// duplicate_of_reverted rejects restored (also in Transitions).
 	Cascaded int `json:"cascaded"`
 	// Skipped counts candidates another writer changed first (apply only).
 	Skipped int `json:"skipped"`
@@ -346,16 +473,16 @@ type RevertReport struct {
 
 // RevertDecisions undoes automated decisions in scope (CONTRACT §2.19
 // "earmark decide revert"). Dry run unless apply: it counts the transitions
-// and the decisions it would revoke. With apply, in batches of at most
-// maxRevertBatch findings, it moves applied → reverted, accepted → rejected,
-// rejected → proposed, (re-check) reverted → proposed and duplicate →
-// proposed with decided_by 'revert:jev:<recipe>' — each a transition event —
-// and returns every duplicate of a finding it moved to proposed too (the
-// cascade: undoing a representative undoes its grouping), revoking those
-// duplicates' live duplicate decisions; then it revokes every live decision
-// in scope, then re-flags the moved findings' chunks. Idempotent: an undone
-// finding no longer carries a jev decider, and a revoked decision is not
-// revoked twice. A person's decision is never touched.
+// and the decisions it would revoke, the followers included. With apply, in
+// batches of at most maxRevertBatch findings (representatives first), it
+// moves applied → reverted, accepted → rejected, rejected → proposed,
+// (re-check) reverted → proposed and duplicate → proposed with decided_by
+// 'revert:jev:<recipe>' — each a transition event — and moves each moved
+// representative's followers with it (revertTransitions); then it revokes
+// every live decision the recipe made in scope, then re-flags the moved
+// findings' chunks. Idempotent: an undone finding no longer carries a jev
+// decider, and a revoked decision is not revoked twice. A person's decision is
+// never touched.
 func (db *DB) RevertDecisions(ctx context.Context, s RevertScope, apply bool) (RevertReport, error) {
 	return revertDecisions(ctx, db.pool, s, apply)
 }
@@ -390,42 +517,24 @@ func revertDecisions(ctx context.Context, b revertPool, s RevertScope, apply boo
 		return rep, fmt.Errorf("revert candidates: %w", err)
 	}
 	if !apply {
-		var reps, all []string
-		for _, c := range cands {
-			rep.Transitions[c.state+"->"+revertTransitions[c.state]]++
-			all = append(all, c.id)
-			if c.state != patch.StateDuplicate {
-				reps = append(reps, c.id)
-			}
-		}
-		rep.Moved = len(cands)
-		if len(reps) > 0 {
-			if err := b.QueryRow(ctx, revertCascadeCountSQL, reps, all).Scan(&rep.Cascaded); err != nil {
-				return rep, fmt.Errorf("count duplicates to release: %w", err)
-			}
-			if rep.Cascaded > 0 {
-				rep.Transitions[patch.StateDuplicate+"->"+patch.StateProposed] += rep.Cascaded
-			}
-		}
-		if err := b.QueryRow(ctx, revertDecisionsCountSQL, s.args()...).Scan(&rep.Revoked); err != nil {
-			return rep, fmt.Errorf("count decisions to revoke: %w", err)
-		}
-		return rep, nil
+		return rep, previewRevert(ctx, b, s, cands, &rep)
 	}
 
+	// done: every follower an earlier batch moved, so a later batch's
+	// candidate duplicate is neither moved again nor counted as skipped.
+	done := map[string]bool{}
 	for start := 0; start < len(cands); start += maxRevertBatch {
 		batch := cands[start:min(start+maxRevertBatch, len(cands))]
-		br, err := revertBatch(ctx, b, batch, rep.Transitions)
+		br, err := revertBatch(ctx, b, batch, rep.Transitions, done)
 		if err != nil {
 			return rep, err
 		}
-		moved := br.moved
 		rep.Moved += len(br.moved) + br.released
 		rep.Cascaded += br.cascaded
 		rep.Skipped += br.skipped
 		rep.Revoked += br.revoked
-		if len(moved) > 0 {
-			tag, err := b.Exec(ctx, reflagChunksSQL, moved)
+		if len(br.moved) > 0 {
+			tag, err := b.Exec(ctx, reflagChunksSQL, br.moved)
 			if err != nil {
 				return rep, fmt.Errorf("re-flag reverted chunks: %w", err)
 			}
@@ -440,10 +549,74 @@ func revertDecisions(ctx context.Context, b revertPool, s RevertScope, apply boo
 	return rep, nil
 }
 
-// revertBatchResult is one revert transaction: the representatives (and
-// other non-duplicates) it moved, how many in-scope duplicates it released
-// and how many duplicates the cascade released, candidates another writer
-// moved first, and the duplicate decisions revoked with the release.
+// previewRevert is the dry run: the candidates' own transitions, their
+// followers' (revertFollowersSQL, judged the way revertBatch moves them), and
+// the decisions --yes would revoke — the scope's plus the followers' outside
+// it.
+func previewRevert(ctx context.Context, b revertPool, s RevertScope, cands []revertCandidate, rep *RevertReport) error {
+	var reps []string
+	out := map[string]bool{} // representative → its undo takes it out of the overlay
+	for _, c := range cands {
+		if c.state != patch.StateDuplicate {
+			reps = append(reps, c.id)
+			out[c.id] = followsOut(c.state)
+		}
+	}
+	followers := map[string]bool{}
+	var moved []string
+	if len(reps) > 0 {
+		rows, err := b.Query(ctx, revertFollowersSQL, reps)
+		if err != nil {
+			return fmt.Errorf("revert followers: %w", err)
+		}
+		var id, of, state string
+		if _, err := pgx.ForEachRow(rows, []any{&id, &of, &state}, func() error {
+			if followers[id] {
+				return nil
+			}
+			to := patch.StateProposed
+			if state == patch.StateDuplicate && out[of] {
+				to = patch.StateRejected
+			}
+			if state == patch.StateRejected && out[of] {
+				return nil // already rejected with it
+			}
+			followers[id] = true
+			moved = append(moved, id)
+			rep.Transitions[state+"->"+to]++
+			rep.Cascaded++
+			return nil
+		}); err != nil {
+			return fmt.Errorf("revert followers: %w", err)
+		}
+	}
+	for _, c := range cands {
+		if followers[c.id] {
+			continue
+		}
+		rep.Transitions[c.state+"->"+revertTransitions[c.state]]++
+		rep.Moved++
+		if c.state == patch.StateDuplicate {
+			moved = append(moved, c.id)
+		}
+	}
+	if err := b.QueryRow(ctx, revertDecisionsCountSQL, s.args()...).Scan(&rep.Revoked); err != nil {
+		return fmt.Errorf("count decisions to revoke: %w", err)
+	}
+	if len(moved) > 0 {
+		var extra int64
+		if err := b.QueryRow(ctx, followerRevokesCountSQL, append([]any{moved}, s.args()...)...).Scan(&extra); err != nil {
+			return fmt.Errorf("count follower decisions to revoke: %w", err)
+		}
+		rep.Revoked += extra
+	}
+	return nil
+}
+
+// revertBatchResult is one revert transaction: the non-duplicates it moved,
+// how many listed duplicates it released in their own right and how many
+// followers it moved, candidates another writer moved first, and the
+// decisions revoked with the followers.
 type revertBatchResult struct {
 	moved                       []string
 	released, cascaded, skipped int
@@ -452,16 +625,20 @@ type revertBatchResult struct {
 
 // revertBatch moves one batch in one transaction, grouped by (state, recipe):
 // each group is one guarded bulk change that skips rows another writer moved
-// since they were listed. Duplicates in the batch, and every duplicate of a
-// finding the batch moved, return to proposed in the same transaction
-// (reason duplicate_released), and their live duplicate decisions are revoked.
-func revertBatch(ctx context.Context, b txBeginner, batch []revertCandidate, tally map[string]int) (revertBatchResult, error) {
+// since they were listed. Then, in the same transaction, each moved
+// representative's followers move with it — rejected when it left the
+// overlay, returned to proposed when it returned there — and the batch's
+// remaining duplicates return to proposed. done holds the followers earlier
+// batches moved; they are left out, and the ones this batch moves are added.
+func revertBatch(ctx context.Context, b txBeginner, batch []revertCandidate, tally map[string]int, done map[string]bool) (revertBatchResult, error) {
 	type group struct{ state, recipe string }
 	groups := map[group][]string{}
-	var dups []string
+	var dups, dupDeciders []string
 	for _, c := range batch {
 		if c.state == patch.StateDuplicate {
-			dups = append(dups, c.id)
+			if !done[c.id] {
+				dups, dupDeciders = append(dups, c.id), append(dupDeciders, "revert:jev:"+c.recipe)
+			}
 			continue
 		}
 		g := group{c.state, c.recipe}
@@ -485,27 +662,39 @@ func revertBatch(ctx context.Context, b txBeginner, batch []revertCandidate, tal
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	counts := map[string]int{}
+	var outReps, outDeciders, inReps, inDeciders []string
 	for _, g := range keys {
 		to := revertTransitions[g.state]
-		br, err := setPatchStateBulkTx(ctx, tx, g.state, to, "revert:jev:"+g.recipe, groups[g])
+		decider := "revert:jev:" + g.recipe
+		br, err := setPatchStateBulkTx(ctx, tx, g.state, to, decider, groups[g])
 		if err != nil {
 			return res, err
 		}
 		res.moved = append(res.moved, br.Changed...)
 		res.skipped += len(br.Skipped)
 		counts[g.state+"->"+to] += len(br.Changed)
-	}
-	if len(dups) > 0 || len(res.moved) > 0 {
-		released, cascaded, revoked, err := releaseDuplicatesTx(ctx, tx, dups, res.moved)
-		if err != nil {
-			return res, err
+		for _, id := range br.Changed {
+			if followsOut(g.state) {
+				outReps, outDeciders = append(outReps, id), append(outDeciders, decider)
+			} else {
+				inReps, inDeciders = append(inReps, id), append(inDeciders, decider)
+			}
 		}
-		res.released, res.cascaded, res.revoked = len(released), cascaded, revoked
-		res.skipped += len(dups) - len(released)
-		counts[patch.StateDuplicate+"->"+patch.StateProposed] += len(released) + cascaded
+	}
+	fr, err := moveFollowersTx(ctx, tx, outReps, outDeciders, inReps, inDeciders, dups, dupDeciders, done)
+	if err != nil {
+		return res, err
+	}
+	res.released, res.cascaded, res.revoked = fr.released, fr.cascaded, fr.revoked
+	res.skipped += len(dups) - fr.released - fr.listedCascaded
+	for k, n := range fr.counts {
+		counts[k] += n
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return res, fmt.Errorf("commit revert: %w", err)
+	}
+	for _, id := range fr.ids {
+		done[id] = true
 	}
 	for k, n := range counts {
 		if n > 0 {
@@ -515,50 +704,149 @@ func revertBatch(ctx context.Context, b txBeginner, batch []revertCandidate, tal
 	return res, nil
 }
 
-// releaseDuplicatesTx returns the listed duplicates and every duplicate of
-// reps to proposed (releaseDuplicatesSQL), attributing the transitions to
-// reason duplicate_released, then revokes the released findings' live
-// duplicate decisions. released are the listed ids that moved; cascaded
-// counts the others.
-func releaseDuplicatesTx(ctx context.Context, tx pgx.Tx, ids, reps []string) (released []string, cascaded int, revoked int64, err error) {
-	if ids == nil {
-		ids = []string{}
+// followerMoves is what moveFollowersTx did.
+type followerMoves struct {
+	released       int // listed duplicates returned to proposed in their own right
+	cascaded       int // followers moved with their representative
+	listedCascaded int // of those, listed duplicates
+	revoked        int64
+	counts         map[string]int
+	ids            []string // every finding moved
+}
+
+// moveFollowersTx moves, inside the revert's transaction: the duplicates of
+// representatives that left the overlay (out) to rejected, each with a
+// duplicate_of_reverted decision naming its representative; the duplicates of
+// representatives returned to proposed (in) and the listed duplicates
+// (dups) to proposed; and the earlier duplicate_of_reverted rejects of the in
+// representatives back to proposed. Each follower's live duplicate (and
+// duplicate_of_reverted) decisions are revoked by the same actor. Rows in
+// done are already handled.
+func moveFollowersTx(ctx context.Context, tx pgx.Tx, out, outDeciders, in, inDeciders, dups, dupDeciders []string,
+	done map[string]bool) (followerMoves, error) {
+	fm := followerMoves{counts: map[string]int{}}
+	listed := map[string]bool{}
+	for _, d := range dups {
+		listed[d] = true
 	}
-	if reps == nil {
-		reps = []string{}
-	}
-	if err := SetEventContext(ctx, tx, EventContext{Reason: ReasonDuplicateReleased}); err != nil {
-		return nil, 0, 0, err
-	}
-	rows, err := tx.Query(ctx, releaseDuplicatesSQL, ids, reps)
-	if err != nil {
-		return nil, 0, 0, fmt.Errorf("release duplicates: %w", err)
-	}
-	var all []string
-	var id string
-	var listed bool
-	if _, err := pgx.ForEachRow(rows, []any{&id, &listed}, func() error {
-		all = append(all, id)
-		if listed {
-			released = append(released, id)
-		} else {
-			cascaded++
+	revoke := func(ids, actors []string, reason string) error {
+		if len(ids) == 0 {
+			return nil
 		}
-		return nil
-	}); err != nil {
-		return nil, 0, 0, fmt.Errorf("release duplicates: %w", err)
-	}
-	if err := SetEventContext(ctx, tx, EventContext{}); err != nil {
-		return nil, 0, 0, err
-	}
-	if len(all) > 0 {
-		tag, err := tx.Exec(ctx, revokeDuplicateDecisionsSQL, all)
+		tag, err := tx.Exec(ctx, revokeFollowerDecisionsSQL, ids, actors, reason)
 		if err != nil {
-			return nil, 0, 0, fmt.Errorf("revoke released duplicates' decisions: %w", err)
+			return fmt.Errorf("revoke follower decisions: %w", err)
 		}
-		revoked = tag.RowsAffected()
+		fm.revoked += tag.RowsAffected()
+		return nil
 	}
-	return released, cascaded, revoked, nil
+	note := func(id, from, to string) {
+		fm.ids = append(fm.ids, id)
+		fm.counts[from+"->"+to]++
+	}
+
+	if len(out) > 0 {
+		if err := SetEventContext(ctx, tx, EventContext{Reason: ReasonDuplicateOfReverted}); err != nil {
+			return fm, err
+		}
+		rows, err := tx.Query(ctx, rejectFollowersSQL, out, outDeciders)
+		if err != nil {
+			return fm, fmt.Errorf("reject duplicates of reverted representatives: %w", err)
+		}
+		var ids, reps, actors []string
+		var id, rep, actor string
+		if _, err := pgx.ForEachRow(rows, []any{&id, &rep, &actor}, func() error {
+			ids, reps, actors = append(ids, id), append(reps, rep), append(actors, actor)
+			return nil
+		}); err != nil {
+			return fm, fmt.Errorf("reject duplicates of reverted representatives: %w", err)
+		}
+		if err := revoke(ids, actors, ReasonDuplicateOfReverted); err != nil {
+			return fm, err
+		}
+		if len(ids) > 0 {
+			if _, err := tx.Exec(ctx, insertFollowerRejectsSQL, ids, reps, actors); err != nil {
+				return fm, fmt.Errorf("record duplicate_of_reverted decisions: %w", err)
+			}
+		}
+		for _, id := range ids {
+			note(id, patch.StateDuplicate, patch.StateRejected)
+			fm.cascaded++
+			if listed[id] {
+				fm.listedCascaded++
+			}
+		}
+	}
+
+	var relIDs, relDeciders []string
+	for i, d := range dups {
+		if !slices.Contains(fm.ids, d) && !done[d] {
+			relIDs, relDeciders = append(relIDs, d), append(relDeciders, dupDeciders[i])
+		}
+	}
+	if len(relIDs) > 0 || len(in) > 0 {
+		if err := SetEventContext(ctx, tx, EventContext{Reason: ReasonDuplicateReleased}); err != nil {
+			return fm, err
+		}
+		if relIDs == nil {
+			relIDs, relDeciders = []string{}, []string{}
+		}
+		inArg, inDec := in, inDeciders
+		if inArg == nil {
+			inArg, inDec = []string{}, []string{}
+		}
+		rows, err := tx.Query(ctx, releaseDuplicatesSQL, relIDs, relDeciders, inArg, inDec)
+		if err != nil {
+			return fm, fmt.Errorf("release duplicates: %w", err)
+		}
+		var ids, actors []string
+		var id, actor string
+		var isListed bool
+		if _, err := pgx.ForEachRow(rows, []any{&id, &isListed, &actor}, func() error {
+			ids, actors = append(ids, id), append(actors, actor)
+			note(id, patch.StateDuplicate, patch.StateProposed)
+			switch {
+			case isListed:
+				fm.released++
+			case listed[id]:
+				fm.cascaded++
+				fm.listedCascaded++
+			default:
+				fm.cascaded++
+			}
+			return nil
+		}); err != nil {
+			return fm, fmt.Errorf("release duplicates: %w", err)
+		}
+		if err := revoke(ids, actors, ReasonDuplicateReleased); err != nil {
+			return fm, err
+		}
+	}
+	if len(in) > 0 {
+		rows, err := tx.Query(ctx, restoreFollowersSQL, in, inDeciders)
+		if err != nil {
+			return fm, fmt.Errorf("restore duplicate_of_reverted rejects: %w", err)
+		}
+		var ids, actors []string
+		var id, actor string
+		if _, err := pgx.ForEachRow(rows, []any{&id, &actor}, func() error {
+			ids, actors = append(ids, id), append(actors, actor)
+			note(id, patch.StateRejected, patch.StateProposed)
+			fm.cascaded++
+			return nil
+		}); err != nil {
+			return fm, fmt.Errorf("restore duplicate_of_reverted rejects: %w", err)
+		}
+		if err := revoke(ids, actors, ReasonDuplicateReleased); err != nil {
+			return fm, err
+		}
+	}
+	if len(fm.ids) > 0 || len(out) > 0 {
+		if err := SetEventContext(ctx, tx, EventContext{}); err != nil {
+			return fm, err
+		}
+	}
+	return fm, nil
 }
 
 // ─── Metric ──────────────────────────────────────────────────────────────────

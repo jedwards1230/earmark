@@ -1,4 +1,4 @@
--- 00016_decide_duplicates.sql — the decide step records agreement and
+-- 00015_decide_duplicates.sql — the decide step records agreement and
 -- conflict (CONTRACT §2.17 "Version history", §2.19 "Agreeing and conflicting
 -- findings"; docs/design/audit-lineage.md "Agreement is not rejection").
 --
@@ -53,20 +53,21 @@ CREATE INDEX finding_events_related_idx ON finding_events (related_finding_id)
 -- finding_events is append-only — so the restored outcome CHECK is added NOT
 -- VALID: it binds every new row and leaves the recorded ones as they are.
 SET LOCAL lock_timeout = '5s';
+-- Locked before the check, so no event naming a related finding can land
+-- between the check and the DROP COLUMN.
+LOCK TABLE finding_events IN ACCESS EXCLUSIVE MODE;
 
 -- +goose StatementBegin
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM finding_events WHERE related_finding_id IS NOT NULL)
        AND COALESCE(current_setting('earmark.allow_data_loss', true), '') <> 'on' THEN
-        RAISE EXCEPTION 'refusing to roll back migration 16: % finding event(s) name a related finding',
+        RAISE EXCEPTION 'refusing to roll back migration 15: % finding event(s) name a related finding',
             (SELECT count(*) FROM finding_events WHERE related_finding_id IS NOT NULL)
             USING HINT = 'back the table up, then set earmark.allow_data_loss = ''on'' for the session running the rollback';
     END IF;
 END $$;
 -- +goose StatementEnd
-
-LOCK TABLE finding_events IN ACCESS EXCLUSIVE MODE;
 
 DROP INDEX finding_events_related_idx;
 ALTER TABLE finding_events DROP CONSTRAINT finding_events_duplicate_names_representative;

@@ -38,6 +38,7 @@ import (
 //	(any)    -> stale        (the underlying chunk changed underneath us)
 //	proposed <-> unanchorable (earmark reanchor could not place the span)
 //	proposed <-> duplicate    (another finding carries the same correction)
+//	duplicate -> rejected     (its representative's fix was undone)
 //	(any)    -> superseded   (requeue or clear replaced/retired it; terminal archive)
 const (
 	StateProposed = "proposed"
@@ -62,7 +63,8 @@ const (
 	// representative). It is never in the overlay and never replayed: the
 	// representative carries the decision. Like unanchorable it is a machine
 	// state — no reviewer moves into or out of it — and its only moves are
-	// back to proposed (the grouping was undone) or to superseded.
+	// back to proposed (the grouping was undone), to rejected (its
+	// representative's fix was undone) or to superseded.
 	StateDuplicate = "duplicate"
 )
 
@@ -234,10 +236,12 @@ func CanTransition(from, to string) bool {
 		// cleared). The replacement transcript is judged fresh.
 		return false
 	case StateDuplicate:
-		// Only back to proposed, when the grouping that made it a duplicate is
-		// undone. Never accepted/applied directly: the representative carries
-		// the decision.
-		return to == StateProposed
+		// Back to proposed, when the grouping that made it a duplicate is
+		// undone with its representative; or to rejected, when the undo of its
+		// representative took the fix out of the overlay (duplicates follow
+		// their representative). Never accepted/applied directly: the
+		// representative carries the decision.
+		return to == StateProposed || to == StateRejected
 	default:
 		return false
 	}

@@ -78,6 +78,10 @@ const (
 	ReasonJevReject = "jev_reject"
 	// ReasonDuplicate — grouped as a duplicate of the representative.
 	ReasonDuplicate = db.ReasonDuplicate
+	// ReasonOverlapPending — lost a conflict to a fix that is held, not
+	// applied: held too, naming the winner, and decided again once the winner
+	// leaves proposed.
+	ReasonOverlapPending = db.ReasonOverlapPending
 	// ReasonJevUnavailable — the model could not give a usable answer (error,
 	// timeout, 4xx/5xx, a reply that does not decode, a fallback model, or a
 	// probability outside [0, 1]): held, retryable. NEVER applied.

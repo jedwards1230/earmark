@@ -27,7 +27,7 @@ type RunStore interface {
 	fn.Store
 	DecideSample(ctx context.Context, s db.DecideScope) ([]db.DecideFinding, error)
 	DecideBacklog(ctx context.Context, s db.DecideScope) (map[string]int, error)
-	DecideChunks(ctx context.Context, keys []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error)
+	DecideChunks(ctx context.Context, recipeID string, keys []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error)
 	GetTranscriptSegments(ctx context.Context, ids []string) (map[string][]db.Segment, error)
 	GetBookRecords(ctx context.Context, bookDirs []string) (map[string]db.BookRecord, error)
 }
@@ -228,8 +228,8 @@ type prepared struct {
 // records in bounded batches, and runs rung 0 per chunk (Check, grouping of
 // agreeing findings, then Dedupe over the chunk's sampled findings, its other
 // proposed findings, and its accepted/applied overlay). runRecipe is the
-// decide recipe the run decides under ("" = none: no member is an existing
-// representative by decision).
+// decide recipe the run decides under: db.DecideChunks marks the findings
+// already decided under it or a recipe equivalent to it ("" = none).
 func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p ShouldApplyParams, runRecipe string) (*prepared, error) {
 	byTranscript := map[string][]db.DecideFinding{}
 	for _, f := range sample {
@@ -263,7 +263,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		}
 		chunks := map[db.ChunkKey]*db.DecideChunk{}
 		for k0 := 0; k0 < len(keys); k0 += db.MaxDecideChunkBatch {
-			part, err := store.DecideChunks(ctx, keys[k0:min(k0+db.MaxDecideChunkBatch, len(keys))])
+			part, err := store.DecideChunks(ctx, runRecipe, keys[k0:min(k0+db.MaxDecideChunkBatch, len(keys))])
 			if err != nil {
 				return nil, fmt.Errorf("load chunks %d-%d of %d: %w", k0, min(k0+db.MaxDecideChunkBatch, len(keys)), len(keys), err)
 			}
@@ -288,7 +288,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		}
 
 		for _, t := range batch {
-			items, groups := prepareTranscript(byTranscript[t], chunks, segs[t], records, p, runRecipe)
+			items, groups := prepareTranscript(byTranscript[t], chunks, segs[t], records, p)
 			out.items = append(out.items, items...)
 			out.groups = append(out.groups, groups...)
 		}
@@ -297,7 +297,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 }
 
 func prepareTranscript(fs []db.DecideFinding, chunks map[db.ChunkKey]*db.DecideChunk,
-	segs []db.Segment, records map[string]db.BookRecord, p ShouldApplyParams, runRecipe string) ([]*item, []DupGroup) {
+	segs []db.Segment, records map[string]db.BookRecord, p ShouldApplyParams) ([]*item, []DupGroup) {
 	byChunk := map[db.ChunkKey][]db.DecideFinding{}
 	var order []db.ChunkKey
 	for _, f := range fs {
@@ -313,7 +313,7 @@ func prepareTranscript(fs []db.DecideFinding, chunks map[db.ChunkKey]*db.DecideC
 	var groups []DupGroup
 	for _, k := range order {
 		chunk := chunks[k]
-		plan := planChunk(byChunk[k], chunk, p.PhoneticMinSim, runRecipe)
+		plan := planChunk(byChunk[k], chunk, p.PhoneticMinSim)
 		mk := func(f db.DecideFinding, shadow bool) *item {
 			var rec *db.BookRecord
 			if r, ok := records[filepath.Dir(f.FilePath)]; ok {
@@ -408,7 +408,7 @@ func (cp chunkPlan) touching(inRun map[string]bool) map[string]bool {
 // grouping of agreeing findings (groupChunk, with the chunk's overlay), then
 // Dedupe over everything not grouped as a duplicate. A missing chunk fails
 // every sampled finding chunk_changed.
-func planChunk(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold float64, runRecipe string) chunkPlan {
+func planChunk(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold float64) chunkPlan {
 	plan := chunkPlan{verdicts: map[string]Verdict{}, dupOf: map[string]string{}}
 	if chunk == nil {
 		for _, f := range sampled {
@@ -416,9 +416,22 @@ func planChunk(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold floa
 		}
 		return plan
 	}
+	// The chunk's view of each finding carries the grouping fields
+	// (db.DecideChunks); a sampled finding takes them from there.
+	view := map[string]db.DecideFinding{}
+	for _, f := range chunk.Competitors {
+		view[f.ID] = f
+	}
+	for _, f := range chunk.OverlayFindings {
+		view[f.ID] = f
+	}
 	fs := make([]db.DecideFinding, 0, len(sampled)+len(chunk.Competitors))
 	seen := map[string]bool{}
 	for _, f := range sampled {
+		if v, ok := view[f.ID]; ok {
+			f.CorrectionKey, f.CurrentPropose, f.CreatedAt = v.CorrectionKey, v.CurrentPropose, v.CreatedAt
+			f.HasDuplicates, f.DecidedHere = v.HasDuplicates, v.DecidedHere
+		}
 		fs = append(fs, f)
 		seen[f.ID] = true
 	}
@@ -431,7 +444,7 @@ func planChunk(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold floa
 	for _, f := range fs {
 		plan.verdicts[f.ID] = Check(candidateOf(f, chunk), rp)
 	}
-	plan.dupOf, plan.groups = groupChunk(chunk.Text, fs, plan.verdicts, chunk.OverlayFindings, runRecipe)
+	plan.dupOf, plan.groups = groupChunk(chunk.Text, fs, plan.verdicts, chunk.OverlayFindings)
 
 	var cands []Candidate
 	var vs []Verdict
@@ -451,7 +464,7 @@ func planChunk(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold floa
 // chunkVerdicts is planChunk's verdicts for the sampled findings alone (the
 // calibration sweep's view).
 func chunkVerdicts(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold float64) map[string]Verdict {
-	plan := planChunk(sampled, chunk, threshold, "")
+	plan := planChunk(sampled, chunk, threshold)
 	out := make(map[string]Verdict, len(sampled))
 	for _, f := range sampled {
 		out[f.ID] = plan.verdicts[f.ID]

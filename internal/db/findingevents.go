@@ -36,7 +36,7 @@ const (
 	OutcomeApply  = "apply"
 	OutcomeHold   = "hold"
 	OutcomeReject = "reject"
-	// OutcomeDuplicate (migration 16) — the finding proposes the same fix as
+	// OutcomeDuplicate (migration 15) — the finding proposes the same fix as
 	// its representative (DecisionEvent.RelatedFindingID), which carries the
 	// decision: proposed → duplicate, duplicate_of = the representative.
 	// Agreement, never a rejection (CONTRACT §2.19 "Agreeing and conflicting
@@ -47,6 +47,11 @@ const (
 // ReasonDuplicate is the reason of a duplicate decision, and of the
 // transition that moves its finding into duplicate.
 const ReasonDuplicate = "duplicate"
+
+// ReasonOverlapPending is the reason of a hold on a conflict's loser whose
+// winner is held: the work list decides it again once the winner leaves
+// proposed (decideWorkSQL).
+const ReasonOverlapPending = "overlap_pending"
 
 // ReasonDuplicateReleased is the transition reason when a duplicate returns to
 // proposed because its grouping was undone (`earmark decide revert` of the
@@ -577,6 +582,22 @@ var applyDecisionsChunksSQL = `
 	   FOR SHARE OF c
 `
 
+// lockRepresentativesSQL locks the representatives duplicates are about to
+// name, FOR SHARE in id order, SKIP LOCKED: a representative another writer
+// holds right now — an undo releasing its duplicates, a reviewer — is not
+// waited on (no deadlock with the findings → chunks order); its duplicates
+// are skipped and grouped again next run. A representative that is itself a
+// duplicate, or archived, stale or unanchorable, cannot represent anything.
+// Held until commit, so an undo that releases a representative's duplicates
+// sees every duplicate this write records.
+var lockRepresentativesSQL = `
+	SELECT id::text FROM transcript_findings
+	 WHERE id = ANY($1)
+	   AND patch_state NOT IN ('duplicate', 'superseded', 'stale', 'unanchorable')
+	 ORDER BY id
+	   FOR SHARE SKIP LOCKED
+`
+
 // markDuplicatesSQL moves locked proposed findings to duplicate, each naming
 // its representative ($2, index-aligned with $1), stamped as the decide
 // recipe ($3). The rows are already locked by the caller's transaction; the
@@ -601,7 +622,9 @@ var markDuplicatesSQL = `
 // and moves apply → accepted and reject → rejected as "jev:<recipeID>". Holds
 // are recorded and stay proposed. A duplicate moves proposed → duplicate with
 // duplicate_of = its RelatedFindingID, its transition carrying reason
-// "duplicate" (CONTRACT §2.19 "Agreeing and conflicting findings"). Model
+// "duplicate" (CONTRACT §2.19 "Agreeing and conflicting findings"); its
+// representative is locked FOR SHARE first (lockRepresentativesSQL) and a
+// duplicate whose representative cannot be locked is skipped. Model
 // calls belong before this call, never inside it.
 //
 // Every event must belong to recipeID, the recipe must be registered, and a
@@ -696,6 +719,30 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 	}); err != nil {
 		return ApplyResult{}, fmt.Errorf("lock decided findings: %w", err)
 	}
+	var reps []string
+	for _, e := range evs {
+		if e.Outcome == OutcomeDuplicate {
+			if _, ok := state[e.FindingID]; ok {
+				reps = append(reps, e.RelatedFindingID)
+			}
+		}
+	}
+	repOK := map[string]bool{}
+	if len(reps) > 0 {
+		slices.Sort(reps)
+		reps = slices.Compact(reps)
+		rows, err := tx.Query(ctx, lockRepresentativesSQL, reps)
+		if err != nil {
+			return ApplyResult{}, fmt.Errorf("lock representatives: %w", err)
+		}
+		got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return ApplyResult{}, fmt.Errorf("lock representatives: %w", err)
+		}
+		for _, id := range got {
+			repOK[id] = true
+		}
+	}
 	locked := make([]string, 0, len(state))
 	for id := range state {
 		locked = append(locked, id)
@@ -727,7 +774,8 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 		cur, hasChunk := chunkSHA[e.FindingID]
 		// A decision about text the chunk no longer holds is not written; an
 		// event that names no hash still needs the chunk to exist.
-		if !isLocked || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) {
+		if !isLocked || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) ||
+			(e.Outcome == OutcomeDuplicate && !repOK[e.RelatedFindingID]) {
 			res.Skipped = append(res.Skipped, e.FindingID)
 			continue
 		}

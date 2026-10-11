@@ -78,7 +78,7 @@ func (s *emptyStore) DecideSample(_ context.Context, sc db.DecideScope) ([]db.De
 func (s *emptyStore) DecideBacklog(context.Context, db.DecideScope) (map[string]int, error) {
 	return map[string]int{}, nil
 }
-func (s *emptyStore) DecideChunks(context.Context, []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error) {
+func (s *emptyStore) DecideChunks(context.Context, string, []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error) {
 	return nil, nil
 }
 func (s *emptyStore) GetTranscriptSegments(context.Context, []string) (map[string][]db.Segment, error) {

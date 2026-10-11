@@ -29,6 +29,7 @@
     "conflicts": 1,
     "ranked": 2,
     "losers": 1,
+    "pending": 0,
     "unranked": 0,
     "group_lines": [
       "0b5c11aa [accepted · accepted/applied] \"auto sebo\" → \"Arecibo\" · duplicates: 7d2e90f1"

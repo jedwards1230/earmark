@@ -180,13 +180,14 @@ func TestIntegrationDecideDuplicatesAndConflicts(t *testing.T) {
 	if s[gRej].state != "rejected" || s[gRej].dupOf != "" {
 		t.Errorf("an already-rejected finding left its state: %+v", s[gRej])
 	}
-	// The conflict: the more confident fix has the lower p and loses.
-	if s[gConf].state != "rejected" || s[gLikly].state != "proposed" {
+	// The conflict: the more confident fix has the lower p and loses; its
+	// winner is only held (uncertain), so it is held too, pending the winner.
+	if s[gConf].state != "proposed" || s[gLikly].state != "proposed" {
 		t.Errorf("conflict: confident %+v, likely %+v", s[gConf], s[gLikly])
 	}
 	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE finding_id = $1 AND kind = 'decision'
-		AND outcome = 'reject' AND reason = 'overlap_dup' AND related_finding_id = $2 AND p = 0.3`, gConf, gLikly); n != 1 {
-		t.Errorf("the overlap loser's decision must name its winner and keep its p (%d)", n)
+		AND outcome = 'hold' AND reason = 'overlap_pending' AND related_finding_id = $2 AND p = 0.3`, gConf, gLikly); n != 1 {
+		t.Errorf("the overlap loser's hold must name its winner and keep its p (%d)", n)
 	}
 	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'decision' AND outcome = 'duplicate'
 		AND reason = 'duplicate' AND related_finding_id = $1 AND actor = $2`, gLuna, actor); n != 2 {
@@ -199,7 +200,7 @@ func TestIntegrationDecideDuplicatesAndConflicts(t *testing.T) {
 	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'transition' AND to_state = 'accepted' AND reason IS NOT NULL`); n != 0 {
 		t.Error("the duplicate reason leaked onto another transition of the transaction")
 	}
-	if asker.calls != 3 || rep.Write.Duplicates != 2 || rep.Grouping.Groups != 1 || rep.Grouping.Losers != 1 {
+	if asker.calls != 3 || rep.Write.Duplicates != 2 || rep.Grouping.Groups != 1 || rep.Grouping.Pending != 1 {
 		t.Errorf("calls %d write %+v grouping %+v (duplicates are never asked)", asker.calls, rep.Write, rep.Grouping)
 	}
 
@@ -232,39 +233,49 @@ func TestIntegrationDecideDuplicatesAndConflicts(t *testing.T) {
 		t.Errorf("late %+v rep %+v write %+v calls %d", s[gLate], s[gLuna], late.Write, asker.calls)
 	}
 
-	// Undoing the representative returns its duplicates to proposed.
+	// The winner leaves proposed (a person accepts it): the pending loser is
+	// decided again — now refused, the winner's fix being in the overlay.
+	if err := d.SetPatchState(ctx, gLikly, "proposed", "accepted", "mcp:alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(ctx, d, asker, opts); err != nil {
+		t.Fatal(err)
+	}
+	if s = groupStates(t, conn); s[gConf].state != "rejected" {
+		t.Errorf("pending loser after its winner was accepted: %+v", s[gConf])
+	}
+
+	// Undoing the representative takes its duplicates out with it.
 	rr, err := d.RevertDecisions(ctx, db.RevertScope{FindingID: gLuna}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rr.Moved != 1 || rr.Cascaded != 3 || rr.Transitions["duplicate->proposed"] != 3 || rr.Transitions["accepted->rejected"] != 1 {
+	if rr.Moved != 1 || rr.Cascaded != 3 || rr.Transitions["duplicate->rejected"] != 3 || rr.Transitions["accepted->rejected"] != 1 {
 		t.Errorf("revert %+v", rr)
 	}
 	s = groupStates(t, conn)
 	for _, id := range []string{gGemma, gNewer, gLate} {
-		if s[id] != (findingRow{"proposed", "revert:" + actor, ""}) {
+		if s[id] != (findingRow{"rejected", "revert:" + actor, ""}) {
 			t.Errorf("%s after the representative's undo: %+v", id, s[id])
 		}
-	}
-	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE kind = 'transition' AND from_state = 'duplicate'
-		AND to_state = 'proposed' AND reason = 'duplicate_released' AND actor = $1`, "revert:"+actor); n != 3 {
-		t.Errorf("%d release transitions, want 3", n)
+		if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE finding_id = $1 AND kind = 'decision'
+			AND outcome = 'reject' AND reason = 'duplicate_of_reverted' AND related_finding_id = $2 AND actor = $3`,
+			id, gLuna, "revert:"+actor); n != 1 {
+			t.Errorf("%s: %d duplicate_of_reverted decisions naming the representative", id, n)
+		}
 	}
 	if n := countOf(t, conn, `SELECT count(*) FROM finding_events e WHERE e.kind = 'decision' AND e.outcome = 'duplicate'
 		AND NOT EXISTS (SELECT 1 FROM finding_events v WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)`); n != 0 {
 		t.Errorf("%d duplicate decisions still live after the cascade", n)
 	}
-	// Released, they are this recipe's work again; a second undo is a no-op.
-	work, err := d.DecideWork(ctx, db.DecideWorkScope{RecipeID: rep.RecipeID, RetryReason: ReasonJevUnavailable, Limit: 100})
+	// The undo sticks: re-running the recipe brings the fix back through no
+	// duplicate, and a second undo is a no-op.
+	redo, err := Apply(ctx, d, asker, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := map[string]bool{}
-	for _, f := range work {
-		got[f.ID] = true
-	}
-	if !got[gGemma] || !got[gNewer] || !got[gLate] || got[gLuna] || got[gRej] {
-		t.Errorf("work after the undo %v", got)
+	if redo.Write.Accepted != 0 || redo.Findings != 0 {
+		t.Errorf("re-run after the undo: %+v (%d findings)", redo.Write, redo.Findings)
 	}
 	if again, err := d.RevertDecisions(ctx, db.RevertScope{FindingID: gLuna}, true); err != nil || again.Moved != 0 || again.Cascaded != 0 {
 		t.Errorf("second undo %+v, %v", again, err)
@@ -280,9 +291,10 @@ func mustGemma(t *testing.T, conn *pgx.Conn) string {
 	return id
 }
 
-// `decide revert --recipe` undoes the recipe's grouping with its decisions:
-// duplicates it made return to proposed, in scope rather than by cascade.
-func TestIntegrationRevertRecipeReleasesDuplicates(t *testing.T) {
+// `decide revert --recipe` then `decide --yes` again: the recipe's duplicates
+// follow its reverted accept to rejected, so the re-run does not re-apply the
+// fix through any of them; the dry run previews exactly what --yes does.
+func TestIntegrationRevertRecipeThenReapply(t *testing.T) {
 	d, conn := integrationDB(t)
 	ctx := context.Background()
 	seedGroups(t, d, conn)
@@ -294,23 +306,37 @@ func TestIntegrationRevertRecipeReleasesDuplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dry.Transitions["duplicate->proposed"] != 2 || dry.Cascaded != 0 {
-		t.Errorf("dry run %+v", dry)
-	}
 	rr, err := d.RevertDecisions(ctx, db.RevertScope{RecipeID: rep.RecipeID}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rr.Transitions["duplicate->proposed"] != 2 || rr.Transitions["accepted->rejected"] != 1 || rr.Transitions["rejected->proposed"] != 1 {
-		t.Errorf("revert %+v", rr)
+	for name, r := range map[string]db.RevertReport{"dry run": dry, "apply": rr} {
+		if r.Moved != 1 || r.Cascaded != 2 || r.Transitions["accepted->rejected"] != 1 || r.Transitions["duplicate->rejected"] != 2 ||
+			r.Transitions["duplicate->proposed"] != 0 || r.Revoked != 5 {
+			t.Errorf("%s %+v", name, r)
+		}
+	}
+	if rr.Skipped != 0 {
+		t.Errorf("skipped %d", rr.Skipped)
 	}
 	s := groupStates(t, conn)
-	if s[gGemma].state != "proposed" || s[gGemma].dupOf != "" || s[gNewer].state != "proposed" || s[gLuna].state != "rejected" {
+	if s[gGemma].state != "rejected" || s[gGemma].dupOf != "" || s[gNewer].state != "rejected" || s[gLuna].state != "rejected" {
 		t.Errorf("states %+v", s)
 	}
-	if n := countOf(t, conn, `SELECT count(*) FROM finding_events e WHERE e.kind = 'decision' AND e.recipe_id = $1
+	if n := countOf(t, conn, `SELECT count(*) FROM finding_events e WHERE e.kind = 'decision' AND e.actor = 'jev:' || e.recipe_id
+		AND e.recipe_id = $1
 		AND NOT EXISTS (SELECT 1 FROM finding_events v WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)`, rep.RecipeID); n != 0 {
-		t.Errorf("%d live decisions of the reverted recipe", n)
+		t.Errorf("%d live decisions the reverted recipe made", n)
+	}
+	redo, err := Apply(ctx, d, groupAsker(), ApplyOptions{Concurrency: 2, Params: DefaultShouldApplyParams()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redo.Write.Accepted != 0 {
+		t.Errorf("re-run after revert re-applied the undone fix: %+v", redo.Write)
+	}
+	if s := groupStates(t, conn); s[gLuna].state != "rejected" || s[gGemma].state != "rejected" || s[gNewer].state != "rejected" {
+		t.Errorf("states after re-run %+v", s)
 	}
 }
 

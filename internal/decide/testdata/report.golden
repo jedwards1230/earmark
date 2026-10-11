@@ -19,7 +19,7 @@ reanchor needed:  anchor_missing 1
 
 duplicates grouped: 1 group(s) · 1 duplicate(s) (agreeing findings: one representative decided, the rest recorded as duplicates)
   0b5c11aa [accepted · accepted/applied] "auto sebo" → "Arecibo" · duplicates: 7d2e90f1
-conflicts ranked by p: 1 set(s) · 2 finding(s) · 1 overlap_dup
+conflicts ranked by p: 1 set(s) · 2 finding(s) · 1 overlap_dup · 0 overlap_pending (winner held)
   1a2b3c4d "walked" → "woked" p 0.60 kept · 5e6f7a8b "walked" → "worked" p 0.40 overlap_dup → 1a2b3c4d
 
 p histogram (answered 7):
