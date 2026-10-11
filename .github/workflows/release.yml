@@ -111,7 +111,6 @@ jobs:
             '*_test.go'
             'runner/test_*.py'
             '.gitignore'
-            '.dockerignore'
             '.env.example'
             '.editorconfig'
             '.golangci*'
