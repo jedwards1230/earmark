@@ -326,9 +326,12 @@ type RejudgeQuery struct {
 // rejudgeTargetsSQL is the --rejudge selection: done transcripts that have
 // stored chunks and no complete judge pass under the current recipe (or an
 // equivalent one), in keyset order. $1 recipe, $2 book pattern (” = all),
-// $3/$4 shard/shards, $5/$6 cursor, $7 limit. The shard folds hashtext (a
-// signed int4) to be non-negative, as decide's does.
-const rejudgeTargetsSQL = `
+// $3/$4 shard/shards, $5/$6 cursor, $7 limit. The shard is shardClause —
+// decide --shard's partition (TestRejudgeShardMatchesDecide).
+//
+// Two unsharded runs at once would select (and pay for) the same
+// transcripts: run concurrent re-judges with disjoint --shard values.
+var rejudgeTargetsSQL = `
 	WITH` + equivalentRecipesCTE + `
 	SELECT t.id, t.job_id, t.file_path, t.created_at
 	  FROM transcripts t
@@ -341,10 +344,20 @@ const rejudgeTargetsSQL = `
 	            AND p.status = 'complete'
 	            AND p.recipe_id IN (SELECT recipe_id FROM eq))
 	   AND ($2 = '' OR t.file_path ILIKE $2)
-	   AND ($4 = 0 OR mod(mod(hashtext(t.id::text)::bigint, $4) + $4, $4) = $3)
+	   AND ` + shardClause("t.id", "$4", "$3") + `
 	   AND ($5::timestamptz IS NULL OR (t.created_at, t.id) > ($5::timestamptz, $6::uuid))
 	 ORDER BY t.created_at ASC, t.id ASC
 	 LIMIT $7`
+
+// shardClause is the transcript partition shared by `earmark decide --shard`
+// and `earmark eval --rejudge --shard`: hashtext(id) mod shards = shard,
+// folded to be non-negative (hashtext is a signed int4; abs() would overflow
+// on its minimum); shards 0 = unsharded. Both must use the same function so
+// shard i of one covers exactly shard i of the other.
+func shardClause(idExpr, shards, shard string) string {
+	return fmt.Sprintf("(%[2]s = 0 OR mod(mod(hashtext(%[1]s::text)::bigint, %[2]s) + %[2]s, %[2]s) = %[3]s)",
+		idExpr, shards, shard)
+}
 
 // RejudgeTargets returns one page of transcripts the current judge recipe has
 // not completely judged (see rejudgeTargetsSQL). Read-only.

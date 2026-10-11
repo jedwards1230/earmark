@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -244,5 +245,52 @@ func TestIntegrationRejudgeTargets(t *testing.T) {
 	other, _ := proposeRecipe("model-z").ID()
 	if got := walk(RejudgeQuery{RecipeID: other}); len(got) != len(all) {
 		t.Errorf("another recipe selects %d, want %d", len(got), len(all))
+	}
+}
+
+// TestIntegrationRejudgeTargetsEquivalentRecipe: a complete pass under a
+// recipe EQUIVALENT to the current one (a format-1 id that differs only in
+// the build that registered it) counts as done; the transcript is not
+// selected again.
+func TestIntegrationRejudgeTargetsEquivalentRecipe(t *testing.T) {
+	d := integrationDB(t, newTestDatabase(t))
+	ctx := context.Background()
+	r := proposeRecipe("model-a")
+	rid, err := d.RegisterRecipe(ctx, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Repeat("f1", 32) // a format-1 id (hashed the build)
+	if _, err := d.pool.Exec(ctx, `INSERT INTO recipes (recipe_id, step, step_version, code_version, model_alias,
+		model_resolved, model_revision, prompt_version, prompt_sha256, params)
+		SELECT $2, step, step_version, 'old-build', model_alias, model_resolved, model_revision,
+		       prompt_version, prompt_sha256, params FROM recipes WHERE recipe_id = $1`, rid, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := d.RecipesEquivalent(ctx, legacy, rid); err != nil || !ok {
+		t.Fatalf("setup: %s not equivalent to %s (%v)", legacy, rid, err)
+	}
+	var ids []string
+	for range 2 {
+		tID, path := seedTranscript(t, d)
+		if _, err := d.pool.Exec(ctx, `INSERT INTO transcript_chunks (transcript_id, file_path, chunk_index,
+			start_sec, end_sec, text, embedding) VALUES ($1, $2, 0, 0, 1, 'x', array_fill(0.1, ARRAY[768])::vector)`,
+			tID, path); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, tID)
+	}
+	// ids[0]: complete under the legacy (equivalent) recipe, inserted directly
+	// as an old build would have.
+	if _, err := d.pool.Exec(ctx, `INSERT INTO judge_passes (transcript_id, job_id, file_path, recipe_id, status, finished_at)
+		VALUES ($1, $2, 'p', $3, 'complete', now())`, ids[0], jobOf(t, d, ids[0]), legacy); err != nil {
+		t.Fatal(err)
+	}
+	page, err := d.RejudgeTargets(ctx, RejudgeQuery{RecipeID: rid, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].TranscriptID != ids[1] {
+		t.Errorf("selected %+v; want only %s (the other is complete under an equivalent recipe)", page, ids[1])
 	}
 }
