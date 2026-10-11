@@ -13,25 +13,26 @@
 --     transcript_findings.correction_key (13) — over the chunk revision,
 --     original and correction the label is about, so a label joins every
 --     finding of every recipe that proposed that fix to that chunk text,
---     past or future. A finding without a chunk hash (legacy) has no key;
---     its label is pinned to finding_id instead. finding_id and chunk_id are
---     plain columns (no foreign key): chunks are a disposable projection and
---     a label must outlive any finding or chunk it was resolved through.
---     UPDATE, DELETE and TRUNCATE are refused; a correction is a new row
---     (see finding_labels_effective). DEBUG_DB_RESET drops the table, which
---     no row trigger sees.
---     Idempotency: dedupe_key, generated, md5 over (label_set, labeler,
---     target, label, reason) and UNIQUE, where the target is the
---     correction_key (or, keyless, the finding_id): the same verdict on the
---     same fix reached through a finding or through its chunk is one row.
---     Re-importing a file inserts nothing; changing a label or its reason
---     inserts a new row. labelled_at (when the label was made — the source's
---     date), finding_id on a keyed label, and how the item was resolved are
---     deliberately not part of it.
---   * finding_labels_effective — the label in force per target (a
---     correction_key, or a keyless finding_id): human labelers ('human:…')
---     outrank every other labeler; among equals the latest labelled_at wins,
---     then the latest row. An 'unsure' in force means unlabelled for
+--     past or future. A label resolved through a finding also keeps its
+--     finding_id; a finding without a chunk hash (legacy) gives no key, and
+--     its label is pinned to finding_id alone. target (generated) is the
+--     correction_key, else 'finding:<finding_id>'. finding_id and chunk_id
+--     are plain columns (no foreign key): chunks are a disposable projection
+--     and a label must outlive any finding or chunk it was resolved through.
+--     UPDATE, DELETE and TRUNCATE are refused; a change of mind is a new
+--     row. DEBUG_DB_RESET drops the table, which no row trigger sees.
+--     Re-import idempotency is the importer's (db.ImportLabels): under a
+--     per-(set, labeler) advisory lock it skips an item only when the
+--     latest row of its (label_set, labeler, target) already has the same
+--     label and reason — so re-importing a file is a no-op, while a
+--     good → junk → good revert inserts the third row.
+--   * finding_label_current — the label in force per finding. A label
+--     applies to a finding when its correction_key is the finding's current
+--     key, or a key the finding had before a re-anchor moved it
+--     (finding_events reanchor_moved / reanchor_placed keep the old hash),
+--     or it was resolved through that finding (finding_id). Human labelers
+--     ('human:…') outrank every other; among equals the latest labelled_at
+--     wins, then the latest row. An 'unsure' in force means unlabelled for
 --     precision.
 --   * recipe_scorecard — one row per propose recipe that left a finding or a
 --     judge pass (plus one NULL-recipe row for unattributed legacy findings).
@@ -40,19 +41,29 @@
 --
 -- Precision = good / (good + junk + partial): 'partial' (right target, still
 -- misspelt) is NOT a usable patch, so it counts against, as the bake-off
--- verdicts scored it; 'unsure' is excluded. Each counts distinct labelled
--- targets, never label rows.
+-- verdicts scored it; 'unsure' is excluded. Both scorecards count distinct
+-- labelled fixes (correction_key, else the finding) per recipe, never label
+-- rows or decisions; duplicates (patch_state 'duplicate') are left out of
+-- the decide label counts.
 --
--- Additive: one new table, three views, three functions. No ALTER and no
+-- judge_passes semantics are the writer's (CONTRACT §2.15 "Lineage"):
+-- chunks_judged includes chunks_cached and excludes chunks_failed;
+-- findings_kept counts the rows the pass inserted; dropped counts the rest by
+-- reason, 'already_recorded' being findings the recipe (or an equivalent)
+-- had already stored. Findings per 1k chunks therefore counts
+-- findings_kept + already_recorded.
+--
+-- Additive: one new table, three views, two functions. No ALTER and no
 -- backfill; CREATE VIEW takes only ACCESS SHARE on the tables it reads.
 
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
 
 -- The 13 correction_key expression, verbatim, as a function: callable by
--- the label import and by the finding_labels generated column. It must stay
--- byte-for-byte equal to transcript_findings.correction_key's expression;
--- TestIntegrationFindingCorrectionKeyMatchesFindings pins that.
+-- the label import, the finding_labels generated column and the reanchor
+-- link below. It must stay byte-for-byte equal to
+-- transcript_findings.correction_key's expression; TestFindingLabelsMigration
+-- and TestIntegrationFindingCorrectionKeyMatchesFindings pin that.
 -- +goose StatementBegin
 CREATE FUNCTION finding_correction_key(chunk_text_sha256 TEXT, original_text TEXT, suggested_correction TEXT)
 RETURNS TEXT LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
@@ -66,16 +77,6 @@ RETURNS TEXT LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
                                   E'[[:space:]\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+', ' ', 'g'))
                                   COLLATE "und-x-icu"))
            END
-$$;
--- +goose StatementEnd
-
--- +goose StatementBegin
-CREATE FUNCTION finding_labels_dedupe_key(label_set TEXT, labeler TEXT, correction_key TEXT,
-                                          finding_id UUID, label TEXT, reason TEXT)
-RETURNS TEXT LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
-    SELECT md5(label_set || E'\x1f' || labeler
-               || E'\x1f' || COALESCE(correction_key, 'finding:' || finding_id::text, '')
-               || E'\x1f' || label || E'\x1f' || COALESCE(reason, ''))
 $$;
 -- +goose StatementEnd
 
@@ -98,10 +99,11 @@ CREATE TABLE finding_labels (
     correction        TEXT        NOT NULL,
     issue_type        TEXT,
     finding_id        UUID,
-    -- How the import tied the item to a chunk revision: 'finding' (via a
-    -- finding's recorded hash), 'hash' (the item named the hash) or 'chunk'
-    -- (the current chunk, with the item's span — and context, when given —
-    -- found in its text).
+    -- How the import tied the item to a chunk revision: 'finding' (a
+    -- finding's recorded hash — the named finding's, or the one hash every
+    -- finding proposing the same fix on the chunk recorded), 'hash' (the item
+    -- named the hash) or 'chunk' (opt-in: the current chunk, its text
+    -- containing the item's span and context).
     resolved_by       TEXT        NOT NULL
                       CONSTRAINT finding_labels_resolved_by_valid CHECK (resolved_by IN ('finding', 'hash', 'chunk')),
     source_ref        TEXT,
@@ -109,19 +111,18 @@ CREATE TABLE finding_labels (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     correction_key    TEXT        GENERATED ALWAYS AS
                       (finding_correction_key(chunk_text_sha256, original, correction)) STORED,
-    dedupe_key        TEXT        GENERATED ALWAYS AS
-                      (finding_labels_dedupe_key(label_set, labeler,
-                           finding_correction_key(chunk_text_sha256, original, correction),
-                           finding_id, label, reason)) STORED,
+    target            TEXT        GENERATED ALWAYS AS
+                      (COALESCE(finding_correction_key(chunk_text_sha256, original, correction),
+                                'finding:' || finding_id::text)) STORED,
     -- A label is about a chunk revision, or (legacy, no hash) one finding.
     CONSTRAINT finding_labels_target CHECK (chunk_text_sha256 IS NOT NULL OR finding_id IS NOT NULL)
 );
 
-CREATE UNIQUE INDEX finding_labels_dedupe_idx ON finding_labels (dedupe_key);
--- The scorecard joins: labels by fix, and keyless labels by finding.
-CREATE INDEX finding_labels_correction_key_idx ON finding_labels (correction_key, labelled_at DESC, id DESC);
-CREATE INDEX finding_labels_finding_idx ON finding_labels (finding_id) WHERE correction_key IS NULL;
-CREATE INDEX finding_labels_set_idx ON finding_labels (label_set, labeler);
+-- The importer's "latest row of (set, labeler, target)".
+CREATE INDEX finding_labels_set_target_idx ON finding_labels (label_set, labeler, target, id DESC);
+-- The scorecard joins: labels by fix, and labels by finding.
+CREATE INDEX finding_labels_correction_key_idx ON finding_labels (correction_key);
+CREATE INDEX finding_labels_finding_idx ON finding_labels (finding_id) WHERE finding_id IS NOT NULL;
 
 -- +goose StatementBegin
 CREATE FUNCTION finding_labels_append_only() RETURNS TRIGGER
@@ -141,32 +142,53 @@ CREATE TRIGGER finding_labels_no_truncate
     BEFORE TRUNCATE ON finding_labels
     FOR EACH STATEMENT EXECUTE FUNCTION finding_labels_append_only();
 
--- The label in force per target. finding_id is set only for keyless
--- (legacy, no chunk hash) labels; a keyed label applies to its fix.
-CREATE VIEW finding_labels_effective AS
-SELECT DISTINCT ON (COALESCE(l.correction_key, l.finding_id::text))
-       l.correction_key,
-       CASE WHEN l.correction_key IS NULL THEN l.finding_id END AS finding_id,
-       l.label, l.labeler, l.label_set, l.labelled_at, l.id AS label_id
-  FROM finding_labels l
- ORDER BY COALESCE(l.correction_key, l.finding_id::text),
-          (l.labeler LIKE 'human:%') DESC, l.labelled_at DESC, l.id DESC;
+-- The label in force per finding (see the header for the three links).
+CREATE VIEW finding_label_current AS
+WITH links AS (
+    SELECT f.id AS finding_id, l.id, l.label, l.labeler, l.label_set, l.labelled_at
+      FROM transcript_findings f
+      JOIN finding_labels l ON l.correction_key = f.correction_key
+    UNION
+    SELECT l.finding_id, l.id, l.label, l.labeler, l.label_set, l.labelled_at
+      FROM finding_labels l
+     WHERE l.finding_id IS NOT NULL
+    UNION
+    SELECT f.id, l.id, l.label, l.labeler, l.label_set, l.labelled_at
+      FROM finding_events e
+      JOIN transcript_findings f ON f.id = e.finding_id
+      JOIN finding_labels l
+        ON l.correction_key = finding_correction_key(e.chunk_text_sha256, f.original_text, f.suggested_correction)
+     WHERE e.kind = 'transition'
+       AND e.reason IN ('reanchor_moved', 'reanchor_placed')
+       AND e.chunk_text_sha256 IS NOT NULL
+)
+SELECT DISTINCT ON (finding_id)
+       finding_id, label, labeler, label_set, labelled_at, id AS label_id
+  FROM links
+ ORDER BY finding_id, (labeler LIKE 'human:%') DESC, labelled_at DESC, id DESC;
 
 -- One row per propose recipe. Columns that only a recorded (non-legacy)
 -- judge pass or a logged judge call can fill — chunk counters, cost,
 -- latency, drop counts, parse failures — are NULL for a recipe that has
 -- neither (legacy = true): gemma/haiku/qwen-era recipes never recorded them.
+-- A recipe with both recorded and legacy passes is mixed = true: those
+-- columns then cover its recorded passes only.
 --
 --   decisions: per decide recipe, the outcome of that recipe's latest live
 --   (unrevoked) decision on each of this recipe's findings.
 --   applied_ever / reverted: findings with a transition to applied or
 --   reverted (a reverted finding was applied first) / those reverted.
---   agreement: share of this recipe's correction_keys that a recipe of
---   another configuration (not equivalent, §1.9) also proposed.
---   Unattributed (NULL-recipe) findings never count as a partner.
+--   agreement: of this recipe's comparable fixes — correction keys on a
+--   transcript that a recipe of another configuration (not equivalent,
+--   §1.9) also judged (a judge pass, or a finding of its own there) — the
+--   share that configuration also proposed. Unattributed (NULL-recipe)
+--   findings never count as a partner.
+--   last_activity_at: the latest finding, judge pass, judge call or
+--   finding event (decision, transition) on the recipe's findings.
 CREATE VIEW recipe_scorecard AS
 WITH f AS MATERIALIZED (
-    SELECT f.id, f.recipe_id, f.issue_type, f.patch_state, f.correction_key, f.created_at
+    SELECT f.id, f.recipe_id, f.issue_type, f.patch_state, f.correction_key, f.created_at,
+           f.origin_transcript_id
       FROM transcript_findings f
      WHERE f.origin = 'judge'
 ),
@@ -206,7 +228,11 @@ jp AS (
            sum(p.chunks_judged) FILTER (WHERE p.status <> 'legacy') AS chunks_judged,
            sum(p.chunks_cached) FILTER (WHERE p.status <> 'legacy') AS chunks_cached,
            sum(p.chunks_failed) FILTER (WHERE p.status <> 'legacy') AS chunks_failed,
-           sum(p.findings_kept) FILTER (WHERE p.status <> 'legacy' AND p.chunks_judged IS NOT NULL) AS findings_kept,
+           sum(p.findings_kept
+               + CASE WHEN jsonb_typeof(p.dropped -> 'already_recorded') = 'number'
+                      THEN (p.dropped ->> 'already_recorded')::numeric ELSE 0 END)
+               FILTER (WHERE p.status <> 'legacy' AND p.chunks_judged IS NOT NULL) AS findings_found,
+           sum(p.chunks_judged) FILTER (WHERE p.status <> 'legacy' AND p.findings_kept IS NOT NULL) AS counted_chunks,
            sum(p.cost_usd) FILTER (WHERE p.status <> 'legacy') AS cost_usd,
            sum(p.chunks_judged) FILTER (WHERE p.status <> 'legacy' AND p.cost_usd IS NOT NULL) AS costed_chunks,
            sum(p.latency_ms_p50::float8 * p.chunks_judged)
@@ -225,10 +251,10 @@ jp AS (
 ),
 drops AS (
     SELECT recipe_id, jsonb_object_agg(reason, n) AS drops
-      FROM (SELECT p.recipe_id, d.key AS reason, sum(d.value::numeric)::bigint AS n
+      FROM (SELECT p.recipe_id, d.key AS reason, sum((d.value #>> '{}')::numeric)::bigint AS n
               FROM judge_passes p
-              CROSS JOIN LATERAL jsonb_each_text(p.dropped) d
-             WHERE p.status <> 'legacy'
+              CROSS JOIN LATERAL jsonb_each(p.dropped) d
+             WHERE p.status <> 'legacy' AND jsonb_typeof(d.value) = 'number'
              GROUP BY 1, 2) x
      GROUP BY recipe_id
 ),
@@ -238,10 +264,16 @@ calls AS (
            percentile_cont(0.5) WITHIN GROUP (ORDER BY c.latency_ms)
                FILTER (WHERE NOT c.cache_hit AND c.error_class IS NULL) AS call_latency_ms_p50,
            percentile_cont(0.95) WITHIN GROUP (ORDER BY c.latency_ms)
-               FILTER (WHERE NOT c.cache_hit AND c.error_class IS NULL) AS call_latency_ms_p95
+               FILTER (WHERE NOT c.cache_hit AND c.error_class IS NULL) AS call_latency_ms_p95,
+           max(c.created_at) AS last_call_at
       FROM fn_calls c
      WHERE c.fn = 'judge_chunk'
      GROUP BY c.recipe_id
+),
+act AS (
+    SELECT f.recipe_id, max(e.created_at) AS last_event_at
+      FROM finding_events e JOIN f ON f.id = e.finding_id
+     GROUP BY f.recipe_id
 ),
 dec AS (
     SELECT DISTINCT ON (e.finding_id, e.recipe_id)
@@ -289,30 +321,43 @@ rv AS (
       FROM tr JOIN f ON f.id = tr.finding_id
      GROUP BY f.recipe_id
 ),
+-- Which configurations judged each transcript: a judge pass, or a finding.
+tj AS (
+    SELECT p.transcript_id, rc.cls
+      FROM judge_passes p JOIN rc ON rc.recipe_id = p.recipe_id
+     WHERE p.status IN ('complete', 'partial', 'legacy')
+    UNION
+    SELECT f.origin_transcript_id, rc.cls
+      FROM f JOIN rc ON rc.recipe_id = f.recipe_id
+     WHERE f.origin_transcript_id IS NOT NULL
+),
+tc AS (
+    SELECT transcript_id, count(DISTINCT cls) AS classes FROM tj GROUP BY transcript_id
+),
 kr AS (
-    SELECT DISTINCT f.correction_key, f.recipe_id, rc.cls
-      FROM f LEFT JOIN rc ON rc.recipe_id = f.recipe_id
+    SELECT f.correction_key, f.recipe_id, rc.cls,
+           bool_or(COALESCE(tc.classes, 0) > CASE WHEN rc.cls IS NULL THEN 0 ELSE 1 END) AS comparable
+      FROM f
+      LEFT JOIN rc ON rc.recipe_id = f.recipe_id
+      LEFT JOIN tc ON tc.transcript_id = f.origin_transcript_id
      WHERE f.correction_key IS NOT NULL
+     GROUP BY 1, 2, 3
 ),
 kc AS (
     SELECT correction_key, count(DISTINCT cls) AS classes FROM kr GROUP BY correction_key
 ),
 agree AS (
     SELECT kr.recipe_id, count(*) AS correction_keys,
+           count(*) FILTER (WHERE kr.comparable) AS comparable_keys,
            count(*) FILTER (WHERE kc.classes > CASE WHEN kr.cls IS NULL THEN 0 ELSE 1 END) AS agreed_keys
       FROM kr JOIN kc ON kc.correction_key = kr.correction_key
      GROUP BY kr.recipe_id
 ),
 fl AS (
-    SELECT * FROM (
-        SELECT DISTINCT ON (f.recipe_id, f.correction_key) f.recipe_id, f.issue_type, el.label
-          FROM f JOIN finding_labels_effective el ON el.correction_key = f.correction_key
-         ORDER BY f.recipe_id, f.correction_key, f.created_at, f.id
-    ) k
-    UNION ALL
-    SELECT f.recipe_id, f.issue_type, el.label
-      FROM f JOIN finding_labels_effective el ON el.finding_id = f.id
-     WHERE f.correction_key IS NULL
+    SELECT DISTINCT ON (f.recipe_id, COALESCE(f.correction_key, f.id::text))
+           f.recipe_id, f.issue_type, lc.label
+      FROM f JOIN finding_label_current lc ON lc.finding_id = f.id
+     ORDER BY f.recipe_id, COALESCE(f.correction_key, f.id::text), f.created_at, f.id
 ),
 lab AS (
     SELECT recipe_id,
@@ -335,6 +380,7 @@ SELECT p.recipe_id,
        r.model_alias, r.model_resolved, r.prompt_version, r.step_version,
        r.created_at AS recipe_created_at,
        NOT COALESCE(jp.recorded, false) AND calls.recipe_id IS NULL AS legacy,
+       COALESCE(jp.recorded, false) AND COALESCE(jp.passes_legacy, 0) > 0 AS mixed,
        COALESCE(jp.passes, 0)::bigint AS passes,
        COALESCE(jp.passes_complete, 0)::bigint AS passes_complete,
        COALESCE(jp.passes_legacy, 0)::bigint AS passes_legacy,
@@ -347,7 +393,7 @@ SELECT p.recipe_id,
        (jp.chunks_cached::float8 / NULLIF(jp.chunks_judged, 0)) AS cached_share,
        COALESCE(fs.findings_total, 0)::bigint AS findings_total,
        COALESCE(fs.findings_live, 0)::bigint AS findings_live,
-       (jp.findings_kept * 1000.0 / NULLIF(jp.chunks_judged, 0))::float8 AS findings_per_1k_chunks,
+       (jp.findings_found * 1000.0 / NULLIF(jp.counted_chunks, 0))::float8 AS findings_per_1k_chunks,
        COALESCE(issue.issue_mix, '{}'::jsonb) AS issue_mix,
        COALESCE(states.state_mix, '{}'::jsonb) AS state_mix,
        CASE WHEN jp.drops_recorded THEN COALESCE(drops.drops, '{}'::jsonb) END AS drops,
@@ -357,8 +403,9 @@ SELECT p.recipe_id,
        COALESCE(rv.reverted, 0)::bigint AS reverted,
        (rv.reverted::float8 / NULLIF(rv.applied_ever, 0)) AS revert_rate,
        COALESCE(agree.correction_keys, 0)::bigint AS correction_keys,
+       COALESCE(agree.comparable_keys, 0)::bigint AS comparable_keys,
        COALESCE(agree.agreed_keys, 0)::bigint AS agreed_keys,
-       (agree.agreed_keys::float8 / NULLIF(agree.correction_keys, 0)) AS agreement_rate,
+       (agree.agreed_keys::float8 / NULLIF(agree.comparable_keys, 0)) AS agreement_rate,
        COALESCE(lab.good, 0)::bigint AS labelled_good,
        COALESCE(lab.junk, 0)::bigint AS labelled_junk,
        COALESCE(lab.partial, 0)::bigint AS labelled_partial,
@@ -376,7 +423,7 @@ SELECT p.recipe_id,
        CASE WHEN calls.call_latency_ms_p50 IS NOT NULL THEN 'calls'
             WHEN jp.pass_latency_ms_p50 IS NOT NULL THEN 'passes' END AS latency_source,
        LEAST(fs.first_finding_at, jp.first_pass_at) AS first_activity_at,
-       GREATEST(fs.last_finding_at, jp.last_pass_at) AS last_activity_at
+       GREATEST(fs.last_finding_at, jp.last_pass_at, calls.last_call_at, act.last_event_at) AS last_activity_at
   FROM props p
   LEFT JOIN recipes r     ON r.recipe_id = p.recipe_id
   LEFT JOIN fs            ON fs.recipe_id IS NOT DISTINCT FROM p.recipe_id
@@ -385,6 +432,7 @@ SELECT p.recipe_id,
   LEFT JOIN jp            ON jp.recipe_id IS NOT DISTINCT FROM p.recipe_id
   LEFT JOIN drops         ON drops.recipe_id IS NOT DISTINCT FROM p.recipe_id
   LEFT JOIN calls         ON calls.recipe_id IS NOT DISTINCT FROM p.recipe_id
+  LEFT JOIN act           ON act.recipe_id IS NOT DISTINCT FROM p.recipe_id
   LEFT JOIN decs          ON decs.recipe_id IS NOT DISTINCT FROM p.recipe_id
   LEFT JOIN rv            ON rv.recipe_id IS NOT DISTINCT FROM p.recipe_id
   LEFT JOIN agree         ON agree.recipe_id IS NOT DISTINCT FROM p.recipe_id
@@ -393,12 +441,14 @@ SELECT p.recipe_id,
 -- One row per decide recipe.
 --
 --   live: each finding's latest unrevoked decision by this recipe. Outcome ×
---   evidence, reasons, the label and human comparisons read it.
---   label_calibration / human_calibration: live decisions with a p, in five
---   p buckets of 0.2 (bucket 1 = [0, 0.2) … bucket 5 = [0.8, 1]), against the
---   label in force and against the human decision on the finding
---   (decided_by 'mcp:…': accepted/applied = accept, rejected/reverted =
---   reject).
+--   evidence and reasons count it per decision.
+--   label_outcomes / label_calibration: per distinct labelled fix
+--   (correction_key, else the finding), duplicates excluded — the live
+--   decision on the fix's first finding — against the label in force; p in
+--   five buckets of 0.2 (bucket 1 = [0, 0.2) … bucket 5 = [0.8, 1]).
+--   human_calibration: live decisions with a p against the human decision on
+--   the finding (decided_by 'mcp:…': accepted/applied = accept,
+--   rejected/reverted = reject).
 --   human_agree: live apply decisions a human accepted plus live rejects a
 --   human rejected, of human_decided (live applies and rejects with a human
 --   decision).
@@ -406,7 +456,9 @@ SELECT p.recipe_id,
 --   decided (each recipe's latest decision, revoked or not), how many got a
 --   different outcome. "Previous" is the non-equivalent decide recipe whose
 --   first decision is the latest before this recipe's first.
---   calls / cost / latency: this recipe's fn_calls rows (dry runs included).
+--   calls / cost / latency: this recipe's fn_calls rows (dry runs included);
+--   cost_per_call_usd divides the cost of the answered calls (not cached, no
+--   error) by their number.
 CREATE VIEW decide_scorecard AS
 WITH rvk AS (
     SELECT revokes_event_id FROM finding_events WHERE kind = 'revoke'
@@ -465,12 +517,12 @@ rs AS (
      GROUP BY recipe_id
 ),
 ll AS (
-    SELECT l.recipe_id, l.outcome, l.p, el.label
-      FROM live l JOIN finding_labels_effective el ON el.correction_key = l.correction_key
-    UNION ALL
-    SELECT l.recipe_id, l.outcome, l.p, el.label
-      FROM live l JOIN finding_labels_effective el ON el.finding_id = l.finding_id
-     WHERE l.correction_key IS NULL
+    SELECT DISTINCT ON (l.recipe_id, COALESCE(l.correction_key, l.finding_id::text))
+           l.recipe_id, l.outcome, l.p, lc.label
+      FROM live l
+      JOIN finding_label_current lc ON lc.finding_id = l.finding_id
+     WHERE l.patch_state <> 'duplicate'
+     ORDER BY l.recipe_id, COALESCE(l.correction_key, l.finding_id::text), l.finding_id
 ),
 lo AS (
     SELECT recipe_id, jsonb_object_agg(outcome, jsonb_build_object(
@@ -541,6 +593,7 @@ calls AS (
            count(*) FILTER (WHERE c.cache_hit) AS calls_cached,
            count(*) FILTER (WHERE c.error_class IS NOT NULL) AS call_errors,
            sum(c.cost_usd) FILTER (WHERE NOT c.cache_hit) AS cost_usd,
+           sum(c.cost_usd) FILTER (WHERE NOT c.cache_hit AND c.error_class IS NULL) AS answered_cost_usd,
            percentile_cont(0.5) WITHIN GROUP (ORDER BY c.latency_ms)
                FILTER (WHERE NOT c.cache_hit AND c.error_class IS NULL) AS latency_ms_p50,
            percentile_cont(0.95) WITHIN GROUP (ORDER BY c.latency_ms)
@@ -582,7 +635,7 @@ SELECT d.recipe_id,
        COALESCE(calls.calls_cached, 0)::bigint AS calls_cached,
        COALESCE(calls.call_errors, 0)::bigint AS call_errors,
        calls.cost_usd::float8 AS cost_usd,
-       (calls.cost_usd / NULLIF(calls.calls, 0))::float8 AS cost_per_call_usd,
+       (calls.answered_cost_usd / NULLIF(calls.calls, 0))::float8 AS cost_per_call_usd,
        calls.latency_ms_p50,
        calls.latency_ms_p95,
        ds.first_decision_at,
@@ -602,13 +655,29 @@ SELECT d.recipe_id,
   LEFT JOIN calls    ON calls.recipe_id = d.recipe_id;
 
 -- +goose Down
--- Lossy: the labels are dropped with their table. Back finding_labels up
--- first if they were not imported from files you still have.
+-- finding_labels may hold the ONLY copy of labels (a human's review, or a
+-- source file since lost). Down therefore REFUSES while it has rows, unless
+-- the session sets earmark.allow_data_loss = 'on' — e.g.
+-- PGOPTIONS='-c earmark.allow_data_loss=on' for the process running the
+-- rollback, or ALTER DATABASE … SET earmark.allow_data_loss = 'on' before it
+-- and RESET after (13's guard). Back the table up first.
 SET LOCAL lock_timeout = '5s';
+
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM finding_labels)
+       AND COALESCE(current_setting('earmark.allow_data_loss', true), '') <> 'on' THEN
+        RAISE EXCEPTION 'refusing to roll back migration 14: finding_labels has % row(s), possibly the only copy of those labels',
+            (SELECT count(*) FROM finding_labels)
+            USING HINT = 'back the table up, then set earmark.allow_data_loss = ''on'' for the session running the rollback';
+    END IF;
+END $$;
+-- +goose StatementEnd
+
 DROP VIEW decide_scorecard;
 DROP VIEW recipe_scorecard;
-DROP VIEW finding_labels_effective;
+DROP VIEW finding_label_current;
 DROP TABLE finding_labels;
 DROP FUNCTION finding_labels_append_only();
-DROP FUNCTION finding_labels_dedupe_key(TEXT, TEXT, TEXT, UUID, TEXT, TEXT);
 DROP FUNCTION finding_correction_key(TEXT, TEXT, TEXT);

@@ -4605,7 +4605,7 @@ var resetSQL = `
 	DROP VIEW     IF EXISTS stale_work;
 	DROP VIEW     IF EXISTS decide_scorecard;
 	DROP VIEW     IF EXISTS recipe_scorecard;
-	DROP VIEW     IF EXISTS finding_labels_effective;
+	DROP VIEW     IF EXISTS finding_label_current;
 	DROP TABLE    IF EXISTS finding_labels      CASCADE;
 	DROP TABLE    IF EXISTS model_setting_events CASCADE;
 	DROP TABLE    IF EXISTS model_settings      CASCADE;
@@ -4634,7 +4634,6 @@ var resetSQL = `
 	DROP FUNCTION IF EXISTS transcript_findings_keep_origin()     CASCADE;
 	DROP FUNCTION IF EXISTS model_setting_events_append_only()    CASCADE;
 	DROP FUNCTION IF EXISTS finding_labels_append_only()          CASCADE;
-	DROP FUNCTION IF EXISTS finding_labels_dedupe_key(TEXT, TEXT, TEXT, UUID, TEXT, TEXT) CASCADE;
 	DROP FUNCTION IF EXISTS finding_correction_key(TEXT, TEXT, TEXT) CASCADE;
 	DROP TABLE    IF EXISTS goose_db_version;
 `

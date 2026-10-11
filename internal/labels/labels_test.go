@@ -98,6 +98,8 @@ func TestParseLabelMap(t *testing.T) {
 	m, err = parseLabelMap([]byte(`{"J1": ["B", "why"], "J2": ["U"]}`))
 	require.NoError(t, err)
 	assert.Equal(t, [2]string{"U", ""}, m["J2"])
+	_, err = parseLabelMap([]byte(`{"J1": ["B", "why"],}`))
+	assert.ErrorContains(t, err, "JSON object", "a file starting with { is JSON: its error is reported, not a .py parse error")
 	_, err = parseLabelMap([]byte("LAB = {\nJ1: G\n}"))
 	assert.ErrorContains(t, err, "line 2", "a line that is not an entry is an error, not skipped")
 	_, err = parseLabelMap([]byte("\"J1\":(\"G\",\"a\"),\n\"J1\":(\"B\",\"b\"),"))

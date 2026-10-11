@@ -25,7 +25,7 @@ version is in `goose_db_version`.
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` (every build that registered a recipe), `recipe_builds_code_version_idx`, backfilled from `recipes`; comment on `recipes.code_version` (first build) |
 | 12 | `00012_model_settings.sql` | `model_settings` (runtime per-step model overrides) and the append-only `model_setting_events` history + `model_setting_events_step_idx`; nothing backfilled |
 | 13 | `00013_audit_lineage.sql` | `judge_passes` (per transcript × judge recipe; `legacy` rows backfilled) and `transcript_archive` (a requeue's replaced transcript); on `transcript_findings`: `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (filled on insert, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` patch state; `finding_events.anchor_offset` + the `transcript_findings_record_reanchor` trigger; transitions read `earmark.reason`; `stale_work` propose arm skips duplicates |
-| 14 | `00014_finding_labels_scorecard.sql` | `finding_labels` (append-only quality labels; generated `correction_key` via `finding_correction_key()` and UNIQUE `dedupe_key`); views `finding_labels_effective`, `recipe_scorecard`, `decide_scorecard` |
+| 14 | `00014_finding_labels_scorecard.sql` | `finding_labels` (append-only quality labels; generated `correction_key` via `finding_correction_key()` and `target`); views `finding_label_current`, `recipe_scorecard`, `decide_scorecard`; Down refuses while labels exist unless `earmark.allow_data_loss = 'on'` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -812,42 +812,46 @@ CREATE TABLE finding_labels (                             -- append-only: UPDATE
     original          TEXT        NOT NULL,
     correction        TEXT        NOT NULL,
     issue_type        TEXT,                               -- as the source stated it
-    finding_id        UUID,                               -- plain column; the target when there is no hash
+    finding_id        UUID,                               -- plain column; the finding it was resolved through
     resolved_by       TEXT        NOT NULL,               -- finding | hash | chunk
     source_ref        TEXT,                               -- the item's id in its file (J003, Q120)
     labelled_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     correction_key    TEXT GENERATED ALWAYS AS
                       (finding_correction_key(chunk_text_sha256, original, correction)) STORED,
-    dedupe_key        TEXT GENERATED ALWAYS AS (…) STORED, -- md5(set, labeler, target, label, reason); UNIQUE
+    target            TEXT GENERATED ALWAYS AS            -- correction_key, else 'finding:<finding_id>'
+                      (COALESCE(finding_correction_key(…), 'finding:' || finding_id::text)) STORED,
     CHECK (chunk_text_sha256 IS NOT NULL OR finding_id IS NOT NULL)
 );
--- indexes: finding_labels_dedupe_idx UNIQUE (dedupe_key);
---   finding_labels_correction_key_idx (correction_key, labelled_at DESC, id DESC);
---   finding_labels_finding_idx (finding_id) WHERE correction_key IS NULL;
---   finding_labels_set_idx (label_set, labeler)
+-- indexes: finding_labels_set_target_idx (label_set, labeler, target, id DESC);
+--   finding_labels_correction_key_idx (correction_key);
+--   finding_labels_finding_idx (finding_id) WHERE finding_id IS NOT NULL
 ```
 
 `finding_correction_key(sha, original, correction)` is the
 `transcript_findings.correction_key` expression (migration 13) as an
 IMMUTABLE function, so a label keys exactly like every finding of the same fix
-on the same chunk text. Views:
+on the same chunk text. Re-import idempotency is the importer's: an item is
+skipped when the latest row of its (set, labeler, target) has the same label
+and reason. Views:
 
-- `finding_labels_effective` — the label in force per target (`human:` first,
-  then latest `labelled_at`, then latest row).
+- `finding_label_current` — the label in force per finding: labels on its
+  current key, on a key it had before a re-anchor, or resolved through it
+  (`finding_id`); `human:` first, then latest `labelled_at`, then latest row.
 - `recipe_scorecard` — one row per propose recipe (plus a NULL-recipe row):
   coverage, findings per 1k chunks, issue/state mix, drops, parse failures,
-  decide outcomes per decide recipe, revert rate, cross-recipe agreement,
-  labelled precision (overall and `misheard_proper_noun`), cost and latency.
-  `legacy = true` when the recipe has no recorded judge pass and no logged
-  judge call; the per-chunk columns are then NULL.
+  decide outcomes per decide recipe, revert rate, agreement over comparable
+  fixes, labelled precision (overall and `misheard_proper_noun`), cost and
+  latency. `legacy = true` when the recipe has no recorded judge pass and no
+  logged judge call (the per-chunk columns are then NULL); `mixed = true` when
+  it has both kinds of pass (they cover the recorded ones).
 - `decide_scorecard` — one row per decide recipe: outcome × evidence,
-  reasons, labels per outcome, p calibration against labels and human
-  decisions, human agreement, flip rate against the previous decide recipe,
-  calls/cost/latency from `fn_calls`.
+  reasons, labels per outcome and p calibration per distinct fix, calibration
+  against human decisions, human agreement, flip rate against the previous
+  decide recipe, calls/cost/latency from `fn_calls`.
 
 Read them with `SET LOCAL jit = off` (CONTRACT §2.15): JIT compilation
-otherwise costs about a second per read.
+otherwise costs over a second per read.
 
 ## Relationships
 

@@ -57,7 +57,7 @@ func TestImportParseOnly(t *testing.T) {
 
 func TestImportDryRunReport(t *testing.T) {
 	o := baseOpts()
-	o.DryRun = true
+	o.DryRun, o.MatchCurrent = true, true
 	p, err := Parse(keyFile, o)
 	require.NoError(t, err)
 	store := &fakeImporter{rep: db.LabelImportReport{DryRun: true, Items: 4, Inserted: 1, Skipped: 1, Unresolved: 2,
@@ -69,6 +69,7 @@ func TestImportDryRunReport(t *testing.T) {
 	var out bytes.Buffer
 	require.NoError(t, Import(context.Background(), &out, store, keyFile, p, o))
 	assert.True(t, store.got.DryRun)
+	assert.True(t, store.got.MatchCurrentChunk, "--match-current-chunk reaches the import")
 	assert.Equal(t, "bakeoff-2026-10-qw1", store.got.Set)
 	assert.Len(t, store.got.Items, 4)
 	got := out.String()

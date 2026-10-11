@@ -33,9 +33,15 @@ var Labels = []string{LabelGood, LabelJunk, LabelPartial, LabelUnsure}
 
 // How an imported label was tied to a chunk revision (finding_labels.resolved_by).
 const (
-	LabelResolvedFinding = "finding" // the named finding's recorded chunk hash
-	LabelResolvedHash    = "hash"    // the item's own chunk_text_sha256
-	LabelResolvedChunk   = "chunk"   // the current chunk; the span (and context) found in its text
+	// LabelResolvedFinding: a finding's recorded chunk hash — the named
+	// finding's, or the current chunk's hash when findings proposing the same
+	// fix on the chunk recorded it.
+	LabelResolvedFinding = "finding"
+	// LabelResolvedHash: the item's own chunk_text_sha256.
+	LabelResolvedHash = "hash"
+	// LabelResolvedChunk: opt-in (LabelImport.MatchCurrentChunk) — the
+	// current chunk, its text containing the item's span and context.
+	LabelResolvedChunk = "chunk"
 )
 
 // Reasons an item is not imported (LabelUnresolved.Reason).
@@ -46,20 +52,23 @@ const (
 	UnresolvedHashMismatch        = "hash_mismatch"
 	UnresolvedNoTarget            = "no_target"
 	UnresolvedChunkNotFound       = "chunk_not_found"
+	UnresolvedChunkChanged        = "chunk_changed"
 	UnresolvedUnknownRevision     = "unknown_revision"
-	UnresolvedNoHash              = "no_hash"
+	UnresolvedNoRecordedRevision  = "no_recorded_revision"
 	UnresolvedSpanNotInChunk      = "span_not_in_chunk"
 	UnresolvedContextNotInChunk   = "context_not_in_chunk"
+	UnresolvedConflicting         = "conflicting_labels"
 )
 
 // MaxLabelImport caps the items of one import (one transaction).
 const MaxLabelImport = 50000
 
 var (
-	// labelSetRe and labelerRe mirror finding_labels' CHECKs, so a bad flag
-	// fails before anything is read.
+	// labelSetRe and labelerRe mirror finding_labels' CHECKs (POSIX
+	// [:space:] includes \v, which Go's \s does not), so a bad flag fails
+	// before anything is read.
 	labelSetRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*$`)
-	labelerRe  = regexp.MustCompile(`^[a-z][a-z0-9_-]*:\S+$`)
+	labelerRe  = regexp.MustCompile(`^[a-z][a-z0-9_-]*:[^\s\v]+$`)
 	anyUUIDRe  = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
 
@@ -75,8 +84,8 @@ type LabelItem struct {
 	Original        string
 	Correction      string
 	IssueType       string
-	// Context is a snippet of the chunk text the labeller saw; when set, a
-	// chunk-resolved item must find it in the current chunk.
+	// Context is a snippet of the chunk text the labeller saw; when set, an
+	// item resolved by chunk must find it in the current chunk.
 	Context string
 	Label   string
 	Reason  string
@@ -91,9 +100,11 @@ type LabelImport struct {
 	Items   []LabelItem
 	// DryRun resolves and counts in a read-only transaction; nothing is written.
 	DryRun bool
-	// RequireHash refuses items that would resolve by span alone: each must
-	// name a finding or a chunk_text_sha256.
-	RequireHash bool
+	// MatchCurrentChunk lets an item that names no finding and no hash, and
+	// whose fix no finding on the chunk proposed, resolve to the CURRENT
+	// chunk when its text contains the item's span (and context). Off by
+	// default: the chunk may have been re-chunked since the label was made.
+	MatchCurrentChunk bool
 }
 
 // Validate checks the set and labeler names.
@@ -123,7 +134,8 @@ type LabelImportReport struct {
 	Items  int  `json:"items"`
 	// Inserted are new rows (in a dry run: rows that would be inserted).
 	Inserted int `json:"inserted"`
-	// Skipped are identical to a stored label or to an earlier item.
+	// Skipped repeat the label in force for their (set, labeler, target), or
+	// an earlier identical item of the same import.
 	Skipped    int `json:"skipped"`
 	Unresolved int `json:"unresolved"`
 	// ByResolution and ByLabel count the resolved items (inserted + skipped).
@@ -141,7 +153,7 @@ type resolvedLabel struct {
 	original, correctn string
 	issueType          string
 	by                 string
-	dedupeKey          string
+	target             string
 }
 
 // labelTargetsSQL fetches, per item, the named finding and the chunk it
@@ -153,32 +165,38 @@ var labelTargetsSQL = `
 	       COALESCE(f.suggested_correction, ''), f.issue_type,
 	       c.id::text, encode(sha256(convert_to(COALESCE(c.source_text, c.text), 'UTF8')), 'hex'),
 	       COALESCE(c.source_text, c.text), c.text
-	  FROM unnest($1::int[], $2::uuid[], $3::uuid[]) AS it(ord, finding_id, chunk_id)
+	  FROM unnest($1::int8[], $2::uuid[], $3::uuid[]) AS it(ord, finding_id, chunk_id)
 	  LEFT JOIN transcript_findings f ON f.id = it.finding_id
 	  LEFT JOIN transcript_chunks c ON c.id = COALESCE(it.chunk_id, f.chunk_id)`
 
-// labelKnownRevisionsSQL: which (chunk, hash) pairs some finding — live or
-// archived — recorded, i.e. a chunk revision earmark has seen.
-var labelKnownRevisionsSQL = `
-	SELECT p.ord
-	  FROM unnest($1::int[], $2::uuid[], $3::text[]) AS p(ord, chunk_id, sha)
-	 WHERE EXISTS (SELECT 1 FROM transcript_findings f
-	                WHERE f.chunk_id = p.chunk_id AND f.chunk_text_sha256 = p.sha)`
+// labelChunkFindingsSQL lists, per chunk-addressed item, the findings —
+// live or archived — recorded against that chunk id with a hash: the
+// revisions earmark has seen, and which fixes were proposed on each.
+var labelChunkFindingsSQL = `
+	SELECT p.ord, f.id::text, f.chunk_text_sha256, f.original_text, COALESCE(f.suggested_correction, '')
+	  FROM unnest($1::int8[], $2::uuid[]) AS p(ord, chunk_id)
+	  JOIN transcript_findings f ON f.chunk_id = p.chunk_id AND f.chunk_text_sha256 IS NOT NULL`
 
-// labelDedupeSQL computes each resolved item's dedupe key with the table's
-// own functions and whether a stored label already has it.
-var labelDedupeSQL = `
-	SELECT it.ord, k.dedupe_key,
-	       EXISTS (SELECT 1 FROM finding_labels l WHERE l.dedupe_key = k.dedupe_key)
-	  FROM unnest($3::int[], $4::text[], $5::text[], $6::text[], $7::uuid[], $8::text[], $9::text[])
-	       AS it(ord, sha, original, correction, finding_id, label, reason)
-	 CROSS JOIN LATERAL (
-	       SELECT finding_labels_dedupe_key($1, $2,
-	                  finding_correction_key(it.sha, it.original, it.correction),
-	                  it.finding_id, it.label, NULLIF(it.reason, '')) AS dedupe_key) k`
+// labelTargetSQL computes each resolved item's target with the table's own
+// expression: the correction key, else 'finding:<id>'.
+var labelTargetSQL = `
+	SELECT it.ord, COALESCE(finding_correction_key(it.sha, it.original, it.correction),
+	                        'finding:' || it.finding_id::text)
+	  FROM unnest($1::int8[], $2::text[], $3::text[], $4::text[], $5::uuid[])
+	       AS it(ord, sha, original, correction, finding_id)`
 
-// insertLabelsSQL appends the labels; an identical label (dedupe_key)
-// already stored — e.g. by a concurrent import — is skipped.
+// labelLatestSQL is the latest row per target of one (set, labeler).
+var labelLatestSQL = `
+	SELECT DISTINCT ON (target) target, label, COALESCE(reason, '')
+	  FROM finding_labels
+	 WHERE label_set = $1 AND labeler = $2 AND target = ANY($3::text[])
+	 ORDER BY target, id DESC`
+
+// labelImportLockSQL serializes imports of one (set, labeler): the "is the
+// latest row the same?" check and the insert must not interleave.
+var labelImportLockSQL = `SELECT pg_advisory_xact_lock(hashtext('finding_labels' || chr(31) || $1 || chr(31) || $2))`
+
+// insertLabelsSQL appends the labels, in input order.
 var insertLabelsSQL = `
 	INSERT INTO finding_labels (label_set, labeler, label, reason, chunk_id, chunk_text_sha256,
 	                            original, correction, issue_type, finding_id, resolved_by,
@@ -191,13 +209,17 @@ var insertLabelsSQL = `
 	       WITH ORDINALITY AS it(label, reason, chunk_id, sha, original, correction, issue_type,
 	                             finding_id, resolved_by, source_ref, labelled_at, ord)
 	 ORDER BY it.ord
-	ON CONFLICT (dedupe_key) DO NOTHING
 	RETURNING id`
 
 // labelTarget is one labelTargetsSQL row.
 type labelTarget struct {
 	findingID, findingChunk, findingSHA, findingOrig, findingCorr, findingIssue *string
 	chunkID, chunkSHA, chunkSource, chunkText                                   *string
+}
+
+// chunkFinding is one labelChunkFindingsSQL row.
+type chunkFinding struct {
+	id, sha, original, correction string
 }
 
 // ImportLabels resolves and appends labels (CONTRACT §2.15 "Labels and
@@ -218,6 +240,9 @@ func (db *DB) ImportLabels(ctx context.Context, imp LabelImport) (LabelImportRep
 		return rep, fmt.Errorf("begin label import: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, labelImportLockSQL, imp.Set, imp.Labeler); err != nil {
+		return rep, fmt.Errorf("lock label set: %w", err)
+	}
 
 	resolved, err := resolveLabels(ctx, tx, imp, &rep)
 	if err != nil {
@@ -236,7 +261,6 @@ func (db *DB) ImportLabels(ctx context.Context, imp LabelImport) (LabelImportRep
 		return rep, err
 	}
 	rep.Inserted = n
-	rep.Skipped += len(fresh) - n // stored concurrently
 	if err := tx.Commit(ctx); err != nil {
 		return rep, fmt.Errorf("commit label import: %w", err)
 	}
@@ -267,7 +291,7 @@ func validLabelItem(it LabelItem) error {
 
 func resolveLabels(ctx context.Context, tx pgx.Tx, imp LabelImport, rep *LabelImportReport) ([]resolvedLabel, error) {
 	var (
-		ords             []int32
+		ords             []int64
 		findings, chunks []*string
 		valid            = make([]bool, len(imp.Items))
 	)
@@ -277,7 +301,7 @@ func resolveLabels(ctx context.Context, tx pgx.Tx, imp LabelImport, rep *LabelIm
 			continue
 		}
 		valid[i] = true
-		ords = append(ords, int32(i)) //nolint:gosec // i < MaxLabelImport
+		ords = append(ords, int64(i))
 		findings = append(findings, optUUID(it.FindingID))
 		chunks = append(chunks, optUUID(it.ChunkID))
 	}
@@ -288,7 +312,7 @@ func resolveLabels(ctx context.Context, tx pgx.Tx, imp LabelImport, rep *LabelIm
 			return nil, fmt.Errorf("label targets: %w", err)
 		}
 		for rows.Next() {
-			var ord int32
+			var ord int64
 			var t labelTarget
 			if err := rows.Scan(&ord, &t.findingID, &t.findingChunk, &t.findingSHA, &t.findingOrig,
 				&t.findingCorr, &t.findingIssue, &t.chunkID, &t.chunkSHA, &t.chunkSource, &t.chunkText); err != nil {
@@ -303,34 +327,33 @@ func resolveLabels(ctx context.Context, tx pgx.Tx, imp LabelImport, rep *LabelIm
 		}
 	}
 
-	// Items whose hash is not the current chunk's: is it a revision some
-	// finding recorded?
-	var kOrds []int32
-	var kChunks []*string
-	var kSHAs []string
+	// The findings on each chunk-addressed item's chunk.
+	var cOrds []int64
+	var cChunks []*string
 	for i, it := range imp.Items {
-		t, ok := targets[i]
-		if !valid[i] || !ok || it.ChunkTextSHA256 == "" || it.ChunkID == "" {
-			continue
-		}
-		if t.chunkSHA == nil || *t.chunkSHA != it.ChunkTextSHA256 {
-			kOrds = append(kOrds, int32(i)) //nolint:gosec // i < MaxLabelImport
-			kChunks = append(kChunks, optUUID(it.ChunkID))
-			kSHAs = append(kSHAs, it.ChunkTextSHA256)
+		if valid[i] && it.ChunkID != "" && (it.FindingID == "" || targets[i].findingID == nil) {
+			cOrds = append(cOrds, int64(i))
+			cChunks = append(cChunks, optUUID(it.ChunkID))
 		}
 	}
-	known := map[int]bool{}
-	if len(kOrds) > 0 {
-		rows, err := tx.Query(ctx, labelKnownRevisionsSQL, kOrds, kChunks, kSHAs)
+	onChunk := map[int][]chunkFinding{}
+	if len(cOrds) > 0 {
+		rows, err := tx.Query(ctx, labelChunkFindingsSQL, cOrds, cChunks)
 		if err != nil {
-			return nil, fmt.Errorf("label revisions: %w", err)
+			return nil, fmt.Errorf("label chunk findings: %w", err)
 		}
-		ks, err := pgx.CollectRows(rows, pgx.RowTo[int32])
-		if err != nil {
-			return nil, fmt.Errorf("label revisions: %w", err)
+		for rows.Next() {
+			var ord int64
+			var cf chunkFinding
+			if err := rows.Scan(&ord, &cf.id, &cf.sha, &cf.original, &cf.correction); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("label chunk findings: %w", err)
+			}
+			onChunk[int(ord)] = append(onChunk[int(ord)], cf)
 		}
-		for _, k := range ks {
-			known[int(k)] = true
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("label chunk findings: %w", err)
 		}
 	}
 
@@ -339,7 +362,7 @@ func resolveLabels(ctx context.Context, tx pgx.Tx, imp LabelImport, rep *LabelIm
 		if !valid[i] {
 			continue
 		}
-		r, reason, detail := resolveLabel(it, targets[i], known[i], imp.RequireHash)
+		r, reason, detail := resolveLabel(it, targets[i], onChunk[i], imp.MatchCurrentChunk)
 		if reason != "" {
 			rep.unresolved(i, it, reason, detail)
 			continue
@@ -352,8 +375,8 @@ func resolveLabels(ctx context.Context, tx pgx.Tx, imp LabelImport, rep *LabelIm
 
 // resolveLabel ties one item to a chunk revision (see LabelResolved*) or
 // says why it cannot. Pure: t is what the database holds for the item, and
-// knownRevision whether a finding recorded the item's (chunk, hash).
-func resolveLabel(it LabelItem, t labelTarget, knownRevision, requireHash bool) (resolvedLabel, string, string) {
+// onChunk the findings recorded against the item's chunk id.
+func resolveLabel(it LabelItem, t labelTarget, onChunk []chunkFinding, matchCurrent bool) (resolvedLabel, string, string) {
 	r := resolvedLabel{item: it, issueType: it.IssueType}
 	if it.FindingID != "" && t.findingID != nil {
 		switch {
@@ -386,79 +409,177 @@ func resolveLabel(it LabelItem, t labelTarget, knownRevision, requireHash bool) 
 	}
 	chunk := strings.ToLower(it.ChunkID)
 	r.chunkID, r.original, r.correctn = &chunk, it.Original, it.Correction
-	if it.ChunkTextSHA256 != "" {
-		if (t.chunkSHA != nil && *t.chunkSHA == it.ChunkTextSHA256) || knownRevision {
-			sha := it.ChunkTextSHA256
-			r.sha, r.by = &sha, LabelResolvedHash
-			return r, "", ""
+	current := t.chunkID != nil
+	spanOK := func() (string, string) {
+		if !strings.Contains(normSpan(strOr(t.chunkSource)), normSpan(it.Original)) {
+			return UnresolvedSpanNotInChunk, "the current chunk text does not contain the original span"
 		}
-		if t.chunkID == nil {
+		if it.Context != "" {
+			c := normSpan(it.Context)
+			if !strings.Contains(normSpan(strOr(t.chunkSource)), c) && !strings.Contains(normSpan(strOr(t.chunkText)), c) {
+				return UnresolvedContextNotInChunk, "the current chunk text does not contain the labelled context"
+			}
+		}
+		return "", ""
+	}
+
+	if it.ChunkTextSHA256 != "" {
+		switch {
+		case current && strOr(t.chunkSHA) == it.ChunkTextSHA256:
+			if reason, detail := spanOK(); reason != "" {
+				return r, reason, detail
+			}
+		case slices.ContainsFunc(onChunk, func(cf chunkFinding) bool { return cf.sha == it.ChunkTextSHA256 }):
+			// An older revision a finding recorded: its text is gone, so the
+			// span cannot be checked; the hash pins it.
+		case !current:
+			return r, UnresolvedChunkNotFound, it.ChunkID
+		default:
+			return r, UnresolvedUnknownRevision, "neither the current chunk nor any finding has this chunk_text_sha256"
+		}
+		sha := it.ChunkTextSHA256
+		r.sha, r.by = &sha, LabelResolvedHash
+		return r, "", ""
+	}
+
+	// No hash: the revision the findings proposing this fix recorded.
+	var same []chunkFinding
+	for _, cf := range onChunk {
+		if normSpan(cf.original) == normSpan(it.Original) && normSpan(cf.correction) == normSpan(it.Correction) {
+			same = append(same, cf)
+		}
+	}
+	if len(same) > 0 {
+		if !current {
 			return r, UnresolvedChunkNotFound, it.ChunkID
 		}
-		return r, UnresolvedUnknownRevision, "neither the current chunk nor any finding has this chunk_text_sha256"
+		var atCurrent []chunkFinding
+		for _, cf := range same {
+			if cf.sha == strOr(t.chunkSHA) {
+				atCurrent = append(atCurrent, cf)
+			}
+		}
+		if len(atCurrent) == 0 {
+			return r, UnresolvedChunkChanged, "the findings proposing this fix saw another revision of the chunk than its current text; name the chunk_text_sha256 the label is about"
+		}
+		if reason, detail := spanOK(); reason != "" {
+			return r, reason, detail
+		}
+		if len(atCurrent) == 1 {
+			id := atCurrent[0].id
+			r.findingID = &id
+		}
+		r.sha, r.by = t.chunkSHA, LabelResolvedFinding
+		return r, "", ""
 	}
-	if t.chunkID == nil {
+	if !current {
 		return r, UnresolvedChunkNotFound, it.ChunkID
 	}
-	if requireHash {
-		return r, UnresolvedNoHash, "--require-hash: the item names no chunk_text_sha256"
+	if !matchCurrent {
+		return r, UnresolvedNoRecordedRevision, "no finding proposed this fix on this chunk; --match-current-chunk matches the current chunk text by span"
 	}
-	if !strings.Contains(normSpan(strOr(t.chunkSource)), normSpan(it.Original)) {
-		return r, UnresolvedSpanNotInChunk, "the current chunk text does not contain the original span"
-	}
-	if it.Context != "" {
-		ctxN := normSpan(it.Context)
-		if !strings.Contains(normSpan(strOr(t.chunkSource)), ctxN) && !strings.Contains(normSpan(strOr(t.chunkText)), ctxN) {
-			return r, UnresolvedContextNotInChunk, "the current chunk text does not contain the labelled context"
-		}
+	if reason, detail := spanOK(); reason != "" {
+		return r, reason, detail
 	}
 	r.sha, r.by = t.chunkSHA, LabelResolvedChunk
 	return r, "", ""
 }
 
+// dedupeLabels decides, per resolved item, insert or skip: items of one
+// import that give one target different labels (or reasons) are all
+// unresolved (conflicting_labels); an identical repeat is skipped; an item
+// whose label and reason equal the latest stored row of its (set, labeler,
+// target) is skipped — so re-importing is a no-op, but a changed mind (good
+// → junk → good) is recorded each time.
 func dedupeLabels(ctx context.Context, tx pgx.Tx, imp LabelImport, resolved []resolvedLabel, rep *LabelImportReport) ([]resolvedLabel, error) {
 	if len(resolved) == 0 {
 		return nil, nil
 	}
 	n := len(resolved)
-	ords := make([]int32, n)
+	ords := make([]int64, n)
 	shas, findings := make([]*string, n), make([]*string, n)
-	origs, corrs, labels, reasons := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
+	origs, corrs := make([]string, n), make([]string, n)
 	for i, r := range resolved {
-		ords[i] = int32(i) //nolint:gosec // n ≤ MaxLabelImport
+		ords[i] = int64(i)
 		shas[i], findings[i] = r.sha, r.findingID
-		origs[i], corrs[i], labels[i], reasons[i] = r.original, r.correctn, r.item.Label, strings.TrimSpace(r.item.Reason)
+		origs[i], corrs[i] = r.original, r.correctn
 	}
-	rows, err := tx.Query(ctx, labelDedupeSQL, imp.Set, imp.Labeler, ords, shas, origs, corrs, findings, labels, reasons)
+	rows, err := tx.Query(ctx, labelTargetSQL, ords, shas, origs, corrs, findings)
 	if err != nil {
-		return nil, fmt.Errorf("label dedupe: %w", err)
+		return nil, fmt.Errorf("label targets: %w", err)
 	}
-	exists := make([]bool, n)
 	for rows.Next() {
-		var ord int32
-		var key string
-		var ex bool
-		if err := rows.Scan(&ord, &key, &ex); err != nil {
+		var ord int64
+		var target string
+		if err := rows.Scan(&ord, &target); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("label dedupe: %w", err)
+			return nil, fmt.Errorf("label targets: %w", err)
 		}
-		resolved[ord].dedupeKey, exists[ord] = key, ex
+		resolved[ord].target = target
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("label dedupe: %w", err)
+		return nil, fmt.Errorf("label targets: %w", err)
 	}
-	seen := map[string]bool{}
-	var fresh []resolvedLabel
+
+	type verdict struct{ label, reason string }
+	byTarget := map[string][]int{}
+	var order []string
 	for i, r := range resolved {
-		rep.ByResolution[r.by]++
-		rep.ByLabel[r.item.Label]++
-		if exists[i] || seen[r.dedupeKey] {
+		if _, ok := byTarget[r.target]; !ok {
+			order = append(order, r.target)
+		}
+		byTarget[r.target] = append(byTarget[r.target], i)
+	}
+	latest := map[string]verdict{}
+	lrows, err := tx.Query(ctx, labelLatestSQL, imp.Set, imp.Labeler, order)
+	if err != nil {
+		return nil, fmt.Errorf("latest labels: %w", err)
+	}
+	for lrows.Next() {
+		var target string
+		var v verdict
+		if err := lrows.Scan(&target, &v.label, &v.reason); err != nil {
+			lrows.Close()
+			return nil, fmt.Errorf("latest labels: %w", err)
+		}
+		latest[target] = v
+	}
+	lrows.Close()
+	if err := lrows.Err(); err != nil {
+		return nil, fmt.Errorf("latest labels: %w", err)
+	}
+
+	var fresh []resolvedLabel
+	for _, target := range order {
+		idx := byTarget[target]
+		first := resolved[idx[0]]
+		want := verdict{first.item.Label, strings.TrimSpace(first.item.Reason)}
+		conflict := false
+		for _, i := range idx[1:] {
+			if (verdict{resolved[i].item.Label, strings.TrimSpace(resolved[i].item.Reason)}) != want {
+				conflict = true
+			}
+		}
+		if conflict {
+			for _, i := range idx {
+				rep.unresolved(resolved[i].idx, resolved[i].item, UnresolvedConflicting,
+					"items of this import give the same fix different labels or reasons")
+			}
+			continue
+		}
+		for k, i := range idx {
+			rep.ByResolution[resolved[i].by]++
+			rep.ByLabel[resolved[i].item.Label]++
+			if k > 0 {
+				rep.Skipped++
+			}
+		}
+		if prev, ok := latest[target]; ok && prev == want {
 			rep.Skipped++
 			continue
 		}
-		seen[r.dedupeKey] = true
-		fresh = append(fresh, r)
+		fresh = append(fresh, first)
 	}
 	return fresh, nil
 }
@@ -511,8 +632,8 @@ func strOr(s *string) string {
 // normSpan is the span comparison the import uses to check an item against
 // a chunk or a finding: Unicode lower case, every whitespace run (NBSP and
 // the other Unicode spaces included) collapsed to one space, trimmed. It is
-// a containment check, not the correction key — the key is always computed
-// by the database.
+// a comparison, not the correction key — the key is always computed by the
+// database.
 func normSpan(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))

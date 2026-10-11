@@ -446,8 +446,9 @@ func TestAuditLineageMigration(t *testing.T) {
 
 // TestFindingLabelsMigration pins 00014: the correction-key function is the
 // 13 column expression verbatim, finding_labels refuses UPDATE, DELETE and
-// TRUNCATE, its keys are generated, Down drops everything, and resetSQL drops
-// the new objects.
+// TRUNCATE, its key and target are generated, labels follow a re-anchor,
+// Down refuses to drop labels without earmark.allow_data_loss and then drops
+// everything, and resetSQL drops the new objects.
 func TestFindingLabelsMigration(t *testing.T) {
 	b, err := migrationFiles.ReadFile("migrations/00014_finding_labels_scorecard.sql")
 	if err != nil {
@@ -483,11 +484,13 @@ func TestFindingLabelsMigration(t *testing.T) {
 		"CREATE TABLE finding_labels",
 		"CHECK (label IN ('good', 'junk', 'partial', 'unsure'))",
 		"GENERATED ALWAYS AS (finding_correction_key(chunk_text_sha256, original, correction)) STORED",
-		"CREATE UNIQUE INDEX finding_labels_dedupe_idx ON finding_labels (dedupe_key)",
+		"(COALESCE(finding_correction_key(chunk_text_sha256, original, correction), 'finding:' || finding_id::text)) STORED",
+		"CREATE INDEX finding_labels_set_target_idx ON finding_labels (label_set, labeler, target, id DESC)",
 		"BEFORE UPDATE OR DELETE ON finding_labels FOR EACH ROW",
 		"BEFORE TRUNCATE ON finding_labels FOR EACH STATEMENT",
-		"CREATE VIEW finding_labels_effective",
-		"(l.labeler LIKE 'human:%') DESC, l.labelled_at DESC, l.id DESC",
+		"CREATE VIEW finding_label_current",
+		"e.reason IN ('reanchor_moved', 'reanchor_placed')",
+		"ORDER BY finding_id, (labeler LIKE 'human:%') DESC, labelled_at DESC, id DESC",
 		"CREATE VIEW recipe_scorecard",
 		"CREATE VIEW decide_scorecard",
 	} {
@@ -499,9 +502,10 @@ func TestFindingLabelsMigration(t *testing.T) {
 		t.Error("00014 must not alter an existing table")
 	}
 	for _, want := range []string{
-		"DROP VIEW decide_scorecard", "DROP VIEW recipe_scorecard", "DROP VIEW finding_labels_effective",
+		"refusing to roll back migration 14",
+		"current_setting('earmark.allow_data_loss', true)",
+		"DROP VIEW decide_scorecard", "DROP VIEW recipe_scorecard", "DROP VIEW finding_label_current",
 		"DROP TABLE finding_labels", "DROP FUNCTION finding_labels_append_only()",
-		"DROP FUNCTION finding_labels_dedupe_key(TEXT, TEXT, TEXT, UUID, TEXT, TEXT)",
 		"DROP FUNCTION finding_correction_key(TEXT, TEXT, TEXT)",
 	} {
 		if !strings.Contains(down, want) {
@@ -512,7 +516,7 @@ func TestFindingLabelsMigration(t *testing.T) {
 		"DROP TABLE    IF EXISTS finding_labels",
 		"DROP VIEW     IF EXISTS recipe_scorecard",
 		"DROP VIEW     IF EXISTS decide_scorecard",
-		"DROP VIEW     IF EXISTS finding_labels_effective",
+		"DROP VIEW     IF EXISTS finding_label_current",
 		"DROP FUNCTION IF EXISTS finding_labels_append_only()",
 		"DROP FUNCTION IF EXISTS finding_correction_key(TEXT, TEXT, TEXT)",
 	} {

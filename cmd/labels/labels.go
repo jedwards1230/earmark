@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"sort"
 	"strings"
@@ -34,7 +33,7 @@ type Options struct {
 	LabelledAt   string
 	DryRun       bool
 	ParseOnly    bool
-	RequireHash  bool
+	MatchCurrent bool
 	JSON         bool
 	// ShowUnresolved caps the unresolved items listed (text output).
 	ShowUnresolved int
@@ -60,19 +59,23 @@ Each item names its target either by finding_id, or by chunk_id + original +
 correction. A label is stored against a chunk REVISION, so it scores every
 recipe that proposes that fix to that text — before or after the label:
 
-  finding  a finding_id: the finding's recorded chunk hash and texts
-  hash     the item's chunk_text_sha256, if it is the current chunk's or one
-           a finding recorded
-  chunk    no hash: the current chunk, only if its text contains the
-           original span (and the item's context, when given)
+  finding  a finding_id: the finding's recorded chunk hash and texts; or no
+           hash: findings that proposed the same fix on the chunk recorded
+           the chunk's current revision
+  hash     the item's chunk_text_sha256, if it is the current chunk's (whose
+           text must contain the span) or one a finding recorded
+  chunk    --match-current-chunk only: no finding proposed the fix, and the
+           current chunk text contains the span (and the item's context)
 
-Anything else — a chunk that is gone, changed text, a finding whose texts
-disagree with the item — is reported unresolved and never stored.
---require-hash also refuses span-only matches.
+Anything else — a chunk that is gone or changed since the findings saw it, a
+fix no finding proposed (without --match-current-chunk), a finding whose
+texts disagree with the item, items of one file that label the same fix
+differently — is reported unresolved and never stored.
 
-Re-importing is a no-op: an identical (set, labeler, fix, label, reason) is
-skipped — the fix being the correction key, or a keyless finding's id. A changed label is a new row; the label in force is the
-newest (human:… labelers outrank all others).
+Re-importing is a no-op: an item is skipped when the latest stored row of its
+(set, labeler, fix) has the same label and reason. A changed label is a new
+row, even back to an earlier one (good → junk → good); the label in force is
+the newest by labelled_at (human:… labelers outrank all others).
 
 Formats (--format, default auto by extension):
   jsonl        canonical: one {"id","finding_id","chunk_id","chunk_text_sha256",
@@ -86,7 +89,7 @@ reports what would be stored; --parse-only reads the file without connecting.
 (Like every command, connecting applies pending schema migrations.)
 
 Examples:
-  earmark labels import --set bakeoff-2026-10-qw2 --labeler opus:bakeoff-2026-10 --dry-run verdict-judges-qw2.md
+  earmark labels import --set bakeoff-2026-10-qw2 --labeler opus:bakeoff-2026-10 --match-current-chunk --dry-run verdict-judges-qw2.md
   earmark labels import --set bakeoff-2026-10-qw1 --labeler opus:bakeoff-2026-10 \
       --format bakeoff-key --labels jlabels.py judge_items_key.json
   earmark labels import --set review-2026-11 --labeler human:justin labels.jsonl`,
@@ -103,7 +106,7 @@ func init() {
 	f.StringVar(&opts.LabelledAt, "labelled-at", "", "labelled_at for items without one (RFC 3339 or YYYY-MM-DD; default: the file's Date:, else now)")
 	f.BoolVar(&opts.DryRun, "dry-run", false, "resolve and count without writing (read-only transaction)")
 	f.BoolVar(&opts.ParseOnly, "parse-only", false, "parse the file and count; no database connection")
-	f.BoolVar(&opts.RequireHash, "require-hash", false, "refuse items that would match the current chunk by span alone")
+	f.BoolVar(&opts.MatchCurrent, "match-current-chunk", false, "let an item no finding proposed (no finding_id, no hash) match the CURRENT chunk when its text contains the span and context")
 	f.BoolVar(&opts.JSON, "json", false, "print JSON")
 	f.IntVar(&opts.ShowUnresolved, "show-unresolved", 20, "list at most N unresolved items")
 	LabelsCmd.AddCommand(importCmd)
@@ -114,29 +117,32 @@ func runImport(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
 	}
-	parsed, err := Parse(args[0], opts)
+	if err := importFile(cmd.Context(), args[0], opts); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// importFile parses path and, unless --parse-only, imports it; the database
+// is closed before it returns.
+func importFile(ctx context.Context, path string, o Options) error {
+	parsed, err := Parse(path, o)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	var store Importer
-	if !opts.ParseOnly {
-		cfg, err := config.LoadConfig()
-		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
-		}
-		database, err := db.New(cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
-			os.Exit(1)
-		}
-		defer database.Close()
-		store = database
+	if o.ParseOnly {
+		return Import(ctx, os.Stdout, nil, path, parsed, o)
 	}
-	if err := Import(cmd.Context(), os.Stdout, store, args[0], parsed, opts); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
 	}
+	database, err := db.New(cfg)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer database.Close()
+	return Import(ctx, os.Stdout, database, path, parsed, o)
 }
 
 func (o Options) validate() error {
@@ -219,7 +225,7 @@ func Import(ctx context.Context, out io.Writer, store Importer, path string, par
 		return nil
 	}
 	rep, err := store.ImportLabels(ctx, db.LabelImport{
-		Set: o.Set, Labeler: o.Labeler, Items: parsed.Items, DryRun: o.DryRun, RequireHash: o.RequireHash,
+		Set: o.Set, Labeler: o.Labeler, Items: parsed.Items, DryRun: o.DryRun, MatchCurrentChunk: o.MatchCurrent,
 	})
 	if err != nil {
 		return err

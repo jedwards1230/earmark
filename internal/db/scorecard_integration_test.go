@@ -15,15 +15,18 @@ import (
 
 // Scorecard fixture recipes.
 const (
-	scGemma = "a000000000000000000000000000000000000000000000000000000000000001" // propose, legacy
-	scLuna  = "a000000000000000000000000000000000000000000000000000000000000002" // propose, recorded
-	scJev   = "d000000000000000000000000000000000000000000000000000000000000001" // decide, first
-	scClef  = "d000000000000000000000000000000000000000000000000000000000000002" // decide, later
+	scJob2        = "00000000-0000-0000-0000-00000000c002"
+	scTranscript2 = "00000000-0000-0000-0000-00000000c102"
+	scChunkT2     = "00000000-0000-0000-0000-00000000c200"
+	scGemma       = "a000000000000000000000000000000000000000000000000000000000000001" // propose, legacy
+	scLuna        = "a000000000000000000000000000000000000000000000000000000000000002" // propose, recorded
+	scJev         = "d000000000000000000000000000000000000000000000000000000000000001" // decide, first
+	scClef        = "d000000000000000000000000000000000000000000000000000000000000002" // decide, later
 )
 
 // scorecardFixture names the seeded findings.
 type scorecardFixture struct {
-	gemmaName, gemmaWord, gemmaRevert, lunaName, lunaHold, legacy string
+	gemmaName, gemmaWord, gemmaRevert, gemmaAlone, lunaName, lunaHold, legacy, unattributed string
 }
 
 // seedScorecard builds, on one transcript with two chunks:
@@ -75,21 +78,45 @@ func seedScorecard(t *testing.T, conn *pgx.Conn, d *DB) scorecardFixture {
 		lunaName:    ins(&l, lbChunk0, 0, &h0, " Ganema", "GHANIMA", "misheard_proper_noun", "2026-10-03"),
 		lunaHold:    ins(&l, lbChunk1, 1, &h1, "hall", "haul", "homophone", "2026-10-03"),
 	}
+	// A second transcript only gemma judged: its fix is not comparable
+	// for agreement (no other configuration looked at it).
+	exec(`INSERT INTO transcription_jobs (id, file_path, checksum, status) VALUES ($1, '/b/LB/02.m4b', 'lb2', 'done')`, scJob2)
+	exec(`INSERT INTO transcripts (id, job_id, file_path, checksum, language, duration_seconds, segments, raw_text, model_name)
+		VALUES ($1, $2, '/b/LB/02.m4b', 'lb2', 'en', 60, '[]', 'x', 'parakeet')`, scTranscript2, scJob2)
+	if err := conn.QueryRow(ctx, `
+		INSERT INTO transcript_findings (transcript_id, file_path, chunk_id, chunk_index, start_sec, end_sec,
+		       original_text, issue_type, suggested_correction, confidence, model, chunk_text_sha256, recipe_id, created_at)
+		VALUES ($1, '/b/LB/02.m4b', $2, 0, 0, 30, 'tullah', 'misheard_proper_noun', 'Tleilax', 0.9, 'm', $3, $4, '2026-06-03')
+		RETURNING id`, scTranscript2, scChunkT2, sha("only gemma judged this"), scGemma).Scan(&f.gemmaAlone); err != nil {
+		t.Fatal(err)
+	}
 	// seedLabelChunks' finding with no chunk hash, labelled by id below.
 	if err := conn.QueryRow(ctx, `SELECT id FROM transcript_findings WHERE recipe_id IS NULL AND chunk_text_sha256 IS NULL`).
 		Scan(&f.legacy); err != nil {
 		t.Fatal(err)
 	}
 
-	// Judge passes: gemma legacy, luna recorded.
+	if err := conn.QueryRow(ctx, `SELECT id FROM transcript_findings WHERE recipe_id IS NULL AND chunk_text_sha256 = $1`, h0).
+		Scan(&f.unattributed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Judge passes: gemma legacy on both transcripts; luna recorded on the
+	// first, plus a legacy pass there (a mixed recipe). Values deliberately
+	// unequal: 5 chunks, 4 judged (1 cached, 1 failed), 2 kept + 1 already
+	// recorded, $0.006; a non-number drop value is ignored.
 	exec(`INSERT INTO judge_passes (transcript_id, job_id, file_path, recipe_id, status, findings_kept, started_at, finished_at)
-		VALUES ($1, $2, '/b/LB/01.m4b', $3, 'legacy', 3, '2026-06-02', '2026-06-03')`, lbTranscript, lbJob, scGemma)
+		VALUES ($1, $2, '/b/LB/01.m4b', $3, 'legacy', 3, '2026-06-02', '2026-06-03'),
+		       ($4, $5, '/b/LB/02.m4b', $3, 'legacy', 1, '2026-06-03', '2026-06-03'),
+		       ($1, $2, '/b/LB/01.m4b', $6, 'legacy', 0, '2026-10-02', '2026-10-02')`,
+		lbTranscript, lbJob, scGemma, scTranscript2, scJob2, scLuna)
 	exec(`INSERT INTO judge_passes (transcript_id, job_id, file_path, recipe_id, status, chunks_total, chunks_judged,
 		       chunks_failed, chunks_cached, findings_kept, dropped, cost_usd, latency_ms_p50, latency_ms_p95,
 		       started_at, finished_at)
-		VALUES ($1, $2, '/b/LB/01.m4b', $3, 'complete', 2, 2, 0, 1, 2, '{"cosmetic_only": 3, "over_cap": 1}',
-		        0.002, 1000, 3000, '2026-10-03', '2026-10-03 00:10')`, lbTranscript, lbJob, scLuna)
-	// Luna's judge calls: one answered, one cached, one unparseable.
+		VALUES ($1, $2, '/b/LB/01.m4b', $3, 'complete', 5, 4, 1, 1, 2,
+		        '{"cosmetic_only": 3, "over_cap": 1, "already_recorded": 1, "note": "x"}',
+		        0.006, 1000, 3000, '2026-10-03', '2026-10-03 00:10')`, lbTranscript, lbJob, scLuna)
+	// Luna's judge calls: two answered, one cached, one unparseable.
 	call := func(recipe string, fn, inHash string, latency int, cost float64, cache bool, errClass *string, at string) {
 		exec(`INSERT INTO fn_calls (fn, prompt_version, prompt_sha256, model_alias, recipe_id, input_sha256, input,
 		       latency_ms, cost_usd, cache_hit, error_class, created_at)
@@ -98,10 +125,14 @@ func seedScorecard(t *testing.T, conn *pgx.Conn, d *DB) scorecardFixture {
 	}
 	invalid := "invalid_reply"
 	call(scLuna, "judge_chunk", "c0", 1200, 0.001, false, nil, "2026-10-03")
+	call(scLuna, "judge_chunk", "c3", 2000, 0.001, false, nil, "2026-10-03")
 	call(scLuna, "judge_chunk", "c1", 0, 0, true, nil, "2026-10-03")
 	call(scLuna, "judge_chunk", "c2", 900, 0.001, false, &invalid, "2026-10-03")
+	// Jev: two answered calls ($0.0001, $0.0003) and one failed ($0.0005).
+	timeout := "timeout"
 	call(scJev, "should_apply", "j1", 800, 0.0001, false, nil, "2026-09-01")
-	call(scJev, "should_apply", "j2", 1200, 0.0001, false, nil, "2026-09-01")
+	call(scJev, "should_apply", "j2", 1200, 0.0003, false, nil, "2026-09-01")
+	call(scJev, "should_apply", "j3", 9000, 0.0005, false, &timeout, "2026-09-01")
 	call(scClef, "should_apply", "k1", 400, 0, false, nil, "2026-10-05")
 
 	// Decisions.
@@ -134,7 +165,13 @@ func seedScorecard(t *testing.T, conn *pgx.Conn, d *DB) scorecardFixture {
 	decide(f.lunaHold, scJev, "hold", "uncertain", 0.5, "none", "2026-10-04")
 	move(f.lunaHold, "rejected", "mcp:agent") // a human rejects the held finding
 	exec(`UPDATE transcript_findings SET patch_state = 'duplicate', duplicate_of = $2 WHERE id = $1`, f.lunaName, f.gemmaName)
+	// Jev holds the duplicate: its fix (G1's) must not count twice in
+	// Jev's label outcomes.
+	decide(f.lunaName, scJev, "hold", "uncertain", 0.55, "none", "2026-10-04")
 	decide(f.gemmaName, scClef, "apply", "confident_with_evidence", 0.97, "asin_verbatim", "2026-10-05")
+	// Clef also applies the unattributed finding of G1's fix: one fix, one
+	// label count.
+	decide(f.unattributed, scClef, "apply", "confident_with_evidence", 0.9, "asin_verbatim", "2026-10-05")
 	decide(f.gemmaWord, scClef, "apply", "confident_with_evidence", 0.8, "asin_verbatim", "2026-10-05")
 
 	// Labels.
@@ -189,25 +226,27 @@ func TestIntegrationScorecards(t *testing.T) {
 	}
 
 	gm := by[scGemma]
-	if !gm.Legacy || gm.ChunksJudged != nil || gm.CostPerChunkUSD != nil || gm.LatencyMsP50 != nil ||
+	if !gm.Legacy || gm.Mixed || gm.ChunksJudged != nil || gm.CostPerChunkUSD != nil || gm.LatencyMsP50 != nil ||
 		gm.Drops != nil || gm.ParseFailures != nil || gm.FindingsPer1kChunks != nil {
 		t.Errorf("gemma must be legacy with nothing per-chunk recorded: %+v", gm)
 	}
-	if gm.FindingsTotal != 3 || gm.PassesLegacy != 1 || gm.TranscriptsJudged != 1 {
+	if gm.FindingsTotal != 4 || gm.PassesLegacy != 2 || gm.TranscriptsJudged != 2 {
 		t.Errorf("gemma findings %d, legacy passes %d, transcripts %d", gm.FindingsTotal, gm.PassesLegacy, gm.TranscriptsJudged)
 	}
-	if gm.IssueMix["misheard_proper_noun"] != 1 || gm.IssueMix["misheard_word"] != 1 || gm.IssueMix["repeated_text"] != 1 {
+	if gm.IssueMix["misheard_proper_noun"] != 2 || gm.IssueMix["misheard_word"] != 1 || gm.IssueMix["repeated_text"] != 1 {
 		t.Errorf("gemma issue mix %v", gm.IssueMix)
 	}
-	if gm.StateMix["applied"] != 1 || gm.StateMix["rejected"] != 1 || gm.StateMix["reverted"] != 1 {
+	if gm.StateMix["applied"] != 1 || gm.StateMix["rejected"] != 1 || gm.StateMix["reverted"] != 1 || gm.StateMix["proposed"] != 1 {
 		t.Errorf("gemma state mix %v", gm.StateMix)
 	}
 	if gm.AppliedEver != 2 || gm.Reverted != 1 {
 		t.Errorf("gemma applied %d reverted %d, want 2/1", gm.AppliedEver, gm.Reverted)
 	}
 	approx(t, "gemma revert rate", gm.RevertRate, 0.5)
-	if gm.CorrectionKeys != 3 || gm.AgreedKeys != 1 {
-		t.Errorf("gemma keys %d agreed %d, want 3/1", gm.CorrectionKeys, gm.AgreedKeys)
+	// 4 fixes, 3 on the transcript luna also judged, 1 of them agreed: the
+	// fix on the transcript only gemma judged is not in the denominator.
+	if gm.CorrectionKeys != 4 || gm.ComparableKeys != 3 || gm.AgreedKeys != 1 {
+		t.Errorf("gemma keys %d comparable %d agreed %d, want 4/3/1", gm.CorrectionKeys, gm.ComparableKeys, gm.AgreedKeys)
 	}
 	approx(t, "gemma agreement", gm.AgreementRate, 1.0/3)
 	if gm.Labels.Good != 1 || gm.Labels.Junk != 1 || gm.Labels.Partial != 1 || gm.Labels.Unsure != 0 {
@@ -218,37 +257,42 @@ func TestIntegrationScorecards(t *testing.T) {
 	if len(gm.Decisions) != 2 {
 		t.Fatalf("gemma decisions %+v, want Jev and Clef", gm.Decisions)
 	}
-	jev, clef := gm.Decisions[1], gm.Decisions[0] // ordered by recipe id: clef's d…2 > jev's d…1
-	if jev.DecideRecipeID != scJev {
-		jev, clef = clef, jev
-	}
+	jev, clef := gm.Decisions[0], gm.Decisions[1] // ordered by recipe id: jev's d…1 < clef's d…2
 	// G3's Jev apply was revoked: Jev's live decisions are G1 apply, G2 reject.
-	if jev.Decided != 2 || jev.Apply != 1 || jev.Reject != 1 || jev.Reasons["reject:jev_reject"] != 1 || jev.DecideModel != "jev-1.13.0" {
+	if jev.DecideRecipeID != scJev || jev.Decided != 2 || jev.Apply != 1 || jev.Reject != 1 ||
+		jev.Reasons["reject:jev_reject"] != 1 || jev.DecideModel != "jev-1.13.0" {
 		t.Errorf("Jev on gemma %+v", jev)
 	}
-	if clef.Decided != 2 || clef.Apply != 2 {
+	if clef.DecideRecipeID != scClef || clef.Decided != 2 || clef.Apply != 2 {
 		t.Errorf("Clef on gemma %+v", clef)
 	}
 
 	ln := by[scLuna]
-	if ln.Legacy || ln.ChunksJudged == nil || *ln.ChunksJudged != 2 || ln.ChunksCached == nil || *ln.ChunksCached != 1 {
-		t.Errorf("luna coverage %+v", ln)
+	if ln.Legacy || !ln.Mixed || ln.PassesComplete != 1 || ln.PassesLegacy != 1 {
+		t.Errorf("luna must be recorded and mixed: %+v", ln)
 	}
-	approx(t, "luna cached share", ln.CachedShare, 0.5)
-	approx(t, "luna findings per 1k", ln.FindingsPer1kChunks, 1000)
-	approx(t, "luna cost per chunk", ln.CostPerChunkUSD, 0.001)
-	approx(t, "luna latency p50 (calls)", ln.LatencyMsP50, 1200)
+	if ln.ChunksJudged == nil || *ln.ChunksJudged != 4 || ln.ChunksCached == nil || *ln.ChunksCached != 1 ||
+		ln.ChunksFailed == nil || *ln.ChunksFailed != 1 {
+		t.Errorf("luna chunks %v/%v/%v, want 4 judged, 1 cached, 1 failed", ln.ChunksJudged, ln.ChunksCached, ln.ChunksFailed)
+	}
+	approx(t, "luna cached share", ln.CachedShare, 0.25)
+	approx(t, "luna findings per 1k (kept + already recorded)", ln.FindingsPer1kChunks, 750)
+	approx(t, "luna cost per chunk", ln.CostPerChunkUSD, 0.0015)
+	approx(t, "luna latency p50 (answered calls)", ln.LatencyMsP50, 1600)
 	if ln.LatencySource != "calls" {
 		t.Errorf("luna latency source %q", ln.LatencySource)
 	}
-	if ln.Drops["cosmetic_only"] != 3 || ln.Drops["over_cap"] != 1 {
-		t.Errorf("luna drops %v", ln.Drops)
+	if len(ln.Drops) != 3 || ln.Drops["cosmetic_only"] != 3 || ln.Drops["over_cap"] != 1 || ln.Drops["already_recorded"] != 1 {
+		t.Errorf("luna drops %v (a non-number value must be ignored)", ln.Drops)
 	}
 	if ln.ParseFailures == nil || *ln.ParseFailures != 1 {
 		t.Errorf("luna parse failures %v", ln.ParseFailures)
 	}
 	if ln.StateMix["duplicate"] != 1 {
 		t.Errorf("luna state mix %v, want the duplicate", ln.StateMix)
+	}
+	if ln.CorrectionKeys != 2 || ln.ComparableKeys != 2 || ln.AgreedKeys != 1 {
+		t.Errorf("luna keys %d comparable %d agreed %d", ln.CorrectionKeys, ln.ComparableKeys, ln.AgreedKeys)
 	}
 	approx(t, "luna agreement", ln.AgreementRate, 0.5)
 	// L1 shares G1's key → good; L2 unsure.
@@ -270,18 +314,23 @@ func TestIntegrationScorecards(t *testing.T) {
 		t.Fatalf("decide rows %+v, want Jev then Clef", decs)
 	}
 	j, c := decs[0], decs[1]
-	if j.Decisions != 4 || j.Revoked != 1 || j.Live != 3 || j.Apply != 1 || j.Hold != 1 || j.Reject != 1 {
+	if j.Decisions != 5 || j.Revoked != 1 || j.Live != 4 || j.Apply != 1 || j.Hold != 2 || j.Reject != 1 {
 		t.Errorf("Jev counts %+v", j)
 	}
-	approx(t, "Jev revoke rate", j.RevokeRate, 0.25)
-	if j.OutcomeEvidence["apply"]["asin_verbatim"] != 1 || j.OutcomeEvidence["hold"]["none"] != 1 {
+	approx(t, "Jev revoke rate", j.RevokeRate, 0.2)
+	if j.OutcomeEvidence["apply"]["asin_verbatim"] != 1 || j.OutcomeEvidence["hold"]["none"] != 2 {
 		t.Errorf("Jev outcome × evidence %v", j.OutcomeEvidence)
 	}
-	if lo := j.LabelOutcomes["apply"]; lo.Good != 1 {
+	if lo := j.LabelOutcomes["apply"]; lo.Good != 1 || lo.Decided() != 1 {
 		t.Errorf("Jev apply labels %+v", lo)
 	}
 	if lo := j.LabelOutcomes["reject"]; lo.Junk != 1 {
 		t.Errorf("Jev reject labels %+v", lo)
+	}
+	// The held duplicate L1 shares G1's (good) fix: per fix it is not
+	// counted again under hold.
+	if lo := j.LabelOutcomes["hold"]; lo.Good != 0 || lo.Unsure != 1 {
+		t.Errorf("Jev hold labels %+v, want only L2's unsure", lo)
 	}
 	if b := j.LabelCalibration[4]; b.Good != 1 || b.Rate == nil || *b.Rate != 1 {
 		t.Errorf("Jev p bucket 5 %+v", b)
@@ -295,26 +344,46 @@ func TestIntegrationScorecards(t *testing.T) {
 	if j.HumanDecided != 0 || j.PrevRecipeID != "" {
 		t.Errorf("Jev human_decided %d prev %q (a hold is not an apply/reject; Jev is first)", j.HumanDecided, j.PrevRecipeID)
 	}
-	if j.Calls != 2 {
-		t.Errorf("Jev calls %d", j.Calls)
+	if j.Calls != 2 || j.CallErrors != 1 {
+		t.Errorf("Jev calls %d errors %d", j.Calls, j.CallErrors)
 	}
-	approx(t, "Jev cost per call", j.CostPerCallUSD, 0.0001)
+	approx(t, "Jev cost (all non-cached calls)", j.CostUSD, 0.0009)
+	approx(t, "Jev cost per answered call", j.CostPerCallUSD, 0.0002)
 	approx(t, "Jev latency p50", j.LatencyMsP50, 1000)
 
+	if c.Live != 3 || c.Apply != 3 {
+		t.Errorf("Clef counts %+v", c)
+	}
 	if c.PrevRecipeID != scJev || c.FlipOverlap != 2 || c.Flips != 1 {
 		t.Errorf("Clef flips vs %q: %d of %d, want 1 of 2 vs Jev", c.PrevRecipeID, c.Flips, c.FlipOverlap)
 	}
 	approx(t, "Clef flip rate", c.FlipRate, 0.5)
+	// Clef applied G1 and the unattributed finding of the same fix: one
+	// good fix, one junk (G2) — 1/2, not 2/3.
+	if lo := c.LabelOutcomes["apply"]; lo.Good != 1 || lo.Junk != 1 {
+		t.Errorf("Clef apply labels %+v", lo)
+	}
 	approx(t, "Clef apply precision", c.LabelOutcomes["apply"].Precision, 0.5)
 
-	// --since keeps recent activity only.
-	recent, err := d.RecipeScorecard(ctx, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	// --since: gemma's findings are from June, but Clef decided on them in
+	// October, so it is still active then; Jev last decided on 10-04.
+	since := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	recent, err := d.RecipeScorecard(ctx, since)
 	if err != nil {
 		t.Fatal(err)
 	}
+	found := false
 	for _, p := range recent {
-		if p.RecipeID == scGemma {
-			t.Error("--since 2026-09-01 must drop gemma (last active 2026-06)")
-		}
+		found = found || p.RecipeID == scGemma
+	}
+	if !found {
+		t.Error("--since 2026-10-05 must keep gemma: decisions on its findings are activity")
+	}
+	recentDec, err := d.DecideScorecard(ctx, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recentDec) != 1 || recentDec[0].RecipeID != scClef {
+		t.Errorf("--since 2026-10-05 decide rows %+v, want Clef only", recentDec)
 	}
 }

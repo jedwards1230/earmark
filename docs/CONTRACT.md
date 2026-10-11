@@ -1170,7 +1170,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` — every (recipe, earmark build) pair, PK `(recipe_id, code_version)` plus `recipe_builds_code_version_idx`, backfilled with each existing recipe's registering build; a column comment marking `recipes.code_version` as the *first* build (§1.9 "Recipe ID format" / "Builds"). New table plus a `COMMENT` (SHARE UPDATE EXCLUSIVE, which writers' INSERTs do not wait on); no id is rewritten. |
 | 13 | `00013_audit_lineage.sql` | Audit lineage (§1.4, §2.15 "Lineage", §2.17): `judge_passes` (legacy rows backfilled) and `transcript_archive`; on `transcript_findings` `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (trigger-filled, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` state; `finding_events.anchor_offset` + the reanchor trigger; transitions read `earmark.reason`; `stale_work`'s propose arm skips duplicates. Locks `recipes` (SHARE ROW EXCLUSIVE) then `transcript_findings` (ACCESS EXCLUSIVE) first — a running judge's order — and rewrites `transcript_findings` (`lock_timeout` 5s). |
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
-| 14 | `00014_finding_labels_scorecard.sql` | Model quality over time (§2.15 "Labels and scorecards"): the append-only `finding_labels` table (UPDATE/DELETE refused by a row trigger, TRUNCATE by a statement trigger; generated `correction_key` and `dedupe_key`), the `finding_correction_key()` function (13's `correction_key` expression verbatim) and `finding_labels_dedupe_key()`, and the read-only views `finding_labels_effective`, `recipe_scorecard` and `decide_scorecard`. One new table, three views, three functions; no ALTER, no backfill, no lock beyond the ACCESS SHARE a view takes (`lock_timeout` 5s). Down drops the labels. |
+| 14 | `00014_finding_labels_scorecard.sql` | Model quality over time (§2.15 "Labels and scorecards"): the append-only `finding_labels` table (UPDATE/DELETE refused by a row trigger, TRUNCATE by a statement trigger; generated `correction_key` and `target`), the `finding_correction_key()` function (13's `correction_key` expression verbatim), and the read-only views `finding_label_current`, `recipe_scorecard` and `decide_scorecard`. One new table, three views, two functions; no ALTER, no backfill, no lock beyond the ACCESS SHARE a view takes (`lock_timeout` 5s). Down refuses while `finding_labels` has rows unless the session sets `earmark.allow_data_loss = 'on'`. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -3771,33 +3771,56 @@ spreadsheet kept beside the bake-off.
 | `label_set` | the import it came from (`bakeoff-2026-10-qw2`, …) |
 | `reason` | free text (≤ 2000) |
 | `chunk_id`, `chunk_text_sha256`, `original`, `correction` | the fix and the chunk **revision** it is about |
-| `correction_key` | generated: `finding_correction_key(chunk_text_sha256, original, correction)` — the §2.15 "Lineage" expression verbatim, so a label joins every finding of every recipe that proposed that fix to that chunk text, before or after the label. NULL for a legacy finding with no chunk hash; such a label is pinned to `finding_id` |
-| `finding_id` | the finding it was resolved through, if any (plain column, no FK) |
+| `correction_key` | generated: `finding_correction_key(chunk_text_sha256, original, correction)` — the §2.15 "Lineage" expression verbatim, so a label joins every finding of every recipe that proposed that fix to that chunk text, before or after the label. NULL for a legacy finding with no chunk hash |
+| `finding_id` | the finding it was resolved through, if any (plain column, no FK); the target of a keyless label |
+| `target` | generated: `correction_key`, else `'finding:' ‖ finding_id` |
 | `issue_type` | as the source stated it (informational; scorecards use the finding's) |
-| `resolved_by` | `finding` (the finding's recorded hash) · `hash` (the item's own `chunk_text_sha256`) · `chunk` (the current chunk, its text containing the item's span — and context, when given) |
+| `resolved_by` | `finding` · `hash` · `chunk` (below) |
 | `source_ref` | the item's id in its source file (`J003`, `Q120`, …) |
 | `labelled_at` | when the label was made (the source's date; default the import time) |
-| `dedupe_key` | generated, UNIQUE: md5 of (set, labeler, target, label, reason), target = `correction_key`, else the keyless `finding_id` |
 
-UPDATE, DELETE and TRUNCATE are refused (`restrict_violation`); a correction
-is a newer row. `DEBUG_DB_RESET` drops the table. `finding_id`/`chunk_id` carry
-no foreign key: chunks are a disposable projection, and a label outlives what
-it was resolved through.
+UPDATE, DELETE and TRUNCATE are refused (`restrict_violation`); a change of
+mind is a newer row. `DEBUG_DB_RESET` drops the table; migration 14's Down
+refuses while it has rows unless the session sets
+`earmark.allow_data_loss = 'on'` (as 13's Down does for
+`transcript_archive`). `finding_id`/`chunk_id` carry no foreign key: chunks
+are a disposable projection, and a label outlives what it was resolved
+through.
 
-**`finding_labels_effective`** — the label in force per target: `human:`
-labelers first, then the latest `labelled_at`, then the latest row.
+**`finding_label_current`** — the label in force per finding. A label
+applies to a finding when its `correction_key` is the finding's current key,
+**or a key the finding had before a re-anchor moved it** (the
+`reanchor_moved` / `reanchor_placed` transitions keep the old hash, §2.17),
+or it was resolved through that finding (`finding_id` — so a legacy
+finding's pinned label survives its first anchoring). `human:` labelers
+first, then the latest `labelled_at`, then the latest row.
 
 **`earmark labels import --set <name> --labeler <kind:name> [flags] <file>`**
 appends a file's labels in one transaction. Each item names a finding
 (`finding_id`) or a fix (`chunk_id` + `original` + `correction`, optionally
-`chunk_text_sha256`, optionally `context`). Resolution never guesses: a
-finding whose texts (normalised: Unicode lower case, whitespace runs
-collapsed) differ from the item's, a hash that is neither the current
-chunk's nor one any finding recorded, a chunk that is gone, a span (or
-context) the current chunk text does not contain — each is **unresolved**,
-reported with its reason, and not stored. An item with no hash is matched by
-span (and context) against the current chunk; `--require-hash` refuses those.
-Re-importing is a no-op (`dedupe_key`). `--dry-run` resolves in a read-only
+`chunk_text_sha256`, optionally `context`). Resolution never guesses:
+
+| `resolved_by` | When |
+|---|---|
+| `finding` | `finding_id` names a finding whose texts match the item's (normalised: Unicode lower case, whitespace runs collapsed) — its recorded hash is used; or the item names no hash and findings proposing the same fix on the chunk recorded the chunk's **current** revision (and the item's context, if any, is in it) |
+| `hash` | `chunk_text_sha256` is the current chunk's (whose text must contain the span and context) or one any finding — live or archived — recorded for that chunk |
+| `chunk` | only with `--match-current-chunk`: no finding proposed the fix and no hash is given, and the current chunk text contains the span (and context) |
+
+Unresolved, reported with the reason and never stored: `invalid`,
+`finding_not_found`, `finding_text_mismatch`, `hash_mismatch`, `no_target`,
+`chunk_not_found`, `chunk_changed` (the findings proposing the fix saw
+another revision than the chunk's current text — the chunk was re-chunked
+since), `unknown_revision`, `no_recorded_revision` (no finding proposed the
+fix and `--match-current-chunk` is off), `span_not_in_chunk`,
+`context_not_in_chunk`, `conflicting_labels` (items of one file give one fix
+different labels or reasons — all of them are refused).
+
+Idempotency: under a per-(set, labeler) advisory lock, an item is skipped
+when the latest stored row of its (set, labeler, `target`) has the same
+label and reason, or it repeats an earlier item of the same file. So
+re-importing a file inserts nothing, while a change of mind — including a
+revert, good → junk → good — inserts a row each time (and, with a later
+`labelled_at`, is in force). `--dry-run` resolves in a read-only
 transaction; `--parse-only` never connects. `--json` prints the report.
 Formats (`--format`, default by extension):
 
@@ -3813,60 +3836,76 @@ Formats (`--format`, default by extension):
   `issue_type` a string or a per-arm map, kept only when the arms agree). The
   report's `Date:` is the default `labelled_at`.
 - `bakeoff-key` — `judge_items_key.json` with `--labels jlabels.py` (the
-  `"J000":("B","reason"),` dict) or a JSON object `{"J000": ["B", "reason"]}`.
+  `"J000":("B","reason"),` dict) or a JSON object `{"J000": ["B", "reason"]}`
+  (a file starting with `{` must be valid JSON).
 
 `--labelled-at` overrides the file's date for items without their own.
 
 **`recipe_scorecard`** — one row per propose recipe that left a finding or
-a judge pass, plus one NULL-recipe row for unattributed legacy findings:
-pass counts by status, transcripts judged (`complete` or `legacy` passes),
-chunks judged/cached/failed and the cached share, findings (all, and not
-superseded), findings per 1k chunks judged, `issue_mix` and `state_mix`
-(jsonb), `drops` (summed `judge_passes.dropped`), `parse_failures`
-(`fn_calls` `judge_chunk` rows with `error_class = 'invalid_reply'`),
-`decisions` (jsonb: per decide recipe, the outcome of **that recipe's latest
-live — unrevoked — decision** on each of the recipe's findings, with
-`outcome:reason` counts), `applied_ever` / `reverted` / `revert_rate` (from
-`finding_events` transitions to `applied` / `reverted`), `correction_keys` /
-`agreed_keys` / `agreement_rate` (share of the recipe's fixes that a recipe
-of **another configuration** — not equivalent, §1.9 — also proposed;
-unattributed findings never count as a partner), labelled good / junk /
-partial / unsure and `label_precision` over the recipe's distinct labelled
-targets, the same for its `misheard_proper_noun` findings, cost, cost per
-chunk judged, latency p50/p95 (`fn_calls` when the judge logged calls, else
-`judge_passes` p50/p95 weighted by chunks; `latency_source` says which), and
-first/last activity. A recipe with no recorded (non-`legacy`) pass and no
-logged judge call is `legacy = true`: its chunk counts, cost, latency, drops
-and parse failures were never recorded and are NULL — `earmark models
-report` prints `n/a (legacy)`, never 0.
+a judge pass, plus one NULL-recipe row for unattributed legacy findings.
+`judge_passes` columns mean what their writer records (§2.15 "Lineage"):
+`chunks_judged` includes `chunks_cached` and excludes `chunks_failed`;
+`findings_kept` is the rows the pass inserted; `dropped` counts the rest by
+reason (only numeric values are summed). Columns: pass counts by status,
+transcripts judged (`complete` or `legacy` passes), chunks judged / cached /
+failed and the cached share (cached ÷ judged), findings (all, and not
+superseded), findings per 1k chunks judged (`findings_kept` +
+`dropped.already_recorded`, ÷ `chunks_judged`), `issue_mix` and `state_mix`
+(jsonb), `drops`, `parse_failures` (`fn_calls` `judge_chunk` rows with
+`error_class = 'invalid_reply'`), `decisions` (jsonb: per decide recipe, the
+outcome of **that recipe's latest live — unrevoked — decision** on each of
+the recipe's findings, with `outcome:reason` counts), `applied_ever` /
+`reverted` / `revert_rate` (from `finding_events` transitions to `applied` /
+`reverted`), `correction_keys`, `comparable_keys`, `agreed_keys`,
+`agreement_rate` = agreed ÷ comparable: a fix is **comparable** when its
+transcript was also judged by a recipe of **another configuration** (not
+equivalent, §1.9) — a judge pass or a finding of its own there — and
+**agreed** when such a configuration proposed the same key (unattributed
+findings never count as a partner), labelled good / junk / partial / unsure
+and `label_precision` over the recipe's distinct labelled fixes (the label
+in force on the fix's first finding), the same for its
+`misheard_proper_noun` findings, cost, cost per chunk judged, latency
+p50/p95 (`fn_calls` answered calls when the judge logged calls, else
+`judge_passes` p50/p95 weighted by chunks; `latency_source` says which),
+and first/last activity (last: the latest finding, judge pass, judge call
+or `finding_events` row on its findings). A recipe with no recorded
+(non-`legacy`) pass and no logged judge call is `legacy = true`: its chunk
+counts, cost, latency, drops and parse failures were never recorded and are
+NULL — `earmark models report` prints `n/a (legacy)`, never 0. A recipe with
+both recorded and legacy passes is `mixed = true`: those columns cover its
+recorded passes only, and the report marks them `*`.
 
 **`decide_scorecard`** — one row per decide recipe with a decision or an
 `fn_calls` row: decisions, revoked and the revoke rate, findings decided,
-the live outcome counts, `outcome_evidence` (outcome → evidence → count),
-`reasons`, `label_outcomes` (outcome → label counts), `label_calibration`
-and `human_calibration` (five p buckets of 0.2, the top one closed at 1: the
-labels in force, and human decisions — a finding `decided_by` `mcp:…` in
-`accepted`/`applied` is an accept, in `rejected`/`reverted` a reject),
-`human_decided` / `human_agree` (live applies a human accepted plus live
-rejects a human rejected), `prev_recipe_id` / `flips` / `flip_rate` against
-the previous decide recipe (the latest non-equivalent one to start deciding
-before this one; each recipe's latest decision per finding, revoked or not),
-and calls / cached / errors / cost / cost per call / latency p50/p95 from
-the recipe's `fn_calls` rows (dry runs included).
+the live outcome counts, `outcome_evidence` (outcome → evidence → count, per
+live decision), `reasons`, `label_outcomes` (outcome → label counts) and
+`label_calibration` **per distinct labelled fix** (correction key, else the
+finding; `duplicate` findings excluded; the live decision on the fix's first
+finding), `human_calibration` (five p buckets of 0.2, the top one closed at
+1; a finding `decided_by` `mcp:…` in `accepted`/`applied` is an accept, in
+`rejected`/`reverted` a reject), `human_decided` / `human_agree` (live
+applies a human accepted plus live rejects a human rejected),
+`prev_recipe_id` / `flips` / `flip_rate` against the previous decide recipe
+(the latest non-equivalent one to start deciding before this one; each
+recipe's latest decision per finding, revoked or not), and from the
+recipe's `fn_calls` rows (dry runs included): answered calls (not cached,
+no error), cached, errors, `cost_usd` (every non-cached call, failed
+attempts included), `cost_per_call_usd` (the answered calls' cost ÷ their
+number), latency p50/p95 over the answered calls; last activity is the
+latest decision or call.
 
 Readers query the views with **JIT off** (`SET LOCAL jit = off` in a
 read-only transaction): their CTE row estimates push the planner's cost
 over `jit_above_cost`, and LLVM compilation then dominates. Measured on a
 synthetic dataset of the live scale (33k findings, 4.3k transcripts, 67k
 finding events, 135k `fn_calls`, 15.6k judge passes, 1.5k labels; local
-Postgres 16): `recipe_scorecard` 0.25 s without JIT (1.3 s with),
-`decide_scorecard` 0.28 s.
+Postgres 16): see `docs/design/audit-lineage.md` "Cost".
 
 **`earmark models report [--since <date>] [--step propose|decide] [--json]`**
 prints both scorecards — a summary table and one block per recipe, oldest
-first; `--since` keeps recipes with activity at or after the date; `--json`
-is the rows as the views return them (precision and calibration rates
-filled in).
+first; `--since` keeps recipes whose last activity (as defined above) is at
+or after the date; `--json` is the rows as the views return them (precision
+and calibration rates filled in).
 
 #### Dashboard surfaces (read-only)
 

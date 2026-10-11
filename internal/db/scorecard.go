@@ -61,6 +61,9 @@ type ProposeScore struct {
 	StepVersion   *int       `json:"step_version,omitempty"`
 	RecipeCreated *time.Time `json:"recipe_created_at,omitempty"`
 	Legacy        bool       `json:"legacy"`
+	// Mixed: both recorded and legacy passes; the pass- and call-derived
+	// columns then cover the recorded passes only.
+	Mixed bool `json:"mixed"`
 
 	Passes            int64    `json:"passes"`
 	PassesComplete    int64    `json:"passes_complete"`
@@ -87,7 +90,10 @@ type ProposeScore struct {
 	Reverted    int64         `json:"reverted"`
 	RevertRate  *float64      `json:"revert_rate"`
 
-	CorrectionKeys int64    `json:"correction_keys"`
+	CorrectionKeys int64 `json:"correction_keys"`
+	// ComparableKeys are the keys on transcripts another configuration
+	// also judged — the agreement denominator.
+	ComparableKeys int64    `json:"comparable_keys"`
 	AgreedKeys     int64    `json:"agreed_keys"`
 	AgreementRate  *float64 `json:"agreement_rate"`
 
@@ -174,12 +180,12 @@ type DecideScore struct {
 // at or after it.
 var recipeScorecardSQL = `
 	SELECT COALESCE(recipe_id, ''), COALESCE(model_alias, ''), COALESCE(model_resolved, ''),
-	       COALESCE(prompt_version, ''), step_version, recipe_created_at, legacy,
+	       COALESCE(prompt_version, ''), step_version, recipe_created_at, legacy, mixed,
 	       passes, passes_complete, passes_legacy, passes_incomplete, passes_running,
 	       transcripts_judged, chunks_judged, chunks_cached, chunks_failed, cached_share,
 	       findings_total, findings_live, findings_per_1k_chunks, issue_mix, state_mix, drops,
 	       parse_failures, decisions, applied_ever, reverted, revert_rate,
-	       correction_keys, agreed_keys, agreement_rate,
+	       correction_keys, comparable_keys, agreed_keys, agreement_rate,
 	       labelled_good, labelled_junk, labelled_partial, labelled_unsure,
 	       proper_noun_good, proper_noun_junk, proper_noun_partial, proper_noun_unsure,
 	       cost_usd, cost_per_chunk_usd, latency_ms_p50, latency_ms_p95, COALESCE(latency_source, ''),
@@ -262,12 +268,12 @@ func scanProposeScore(row pgx.CollectableRow) (ProposeScore, error) {
 	var issue, states, drops, decisions []byte
 	var stepVersion *int32
 	if err := row.Scan(&s.RecipeID, &s.ModelAlias, &s.ModelResolved, &s.PromptVersion, &stepVersion,
-		&s.RecipeCreated, &s.Legacy,
+		&s.RecipeCreated, &s.Legacy, &s.Mixed,
 		&s.Passes, &s.PassesComplete, &s.PassesLegacy, &s.PassesIncomplete, &s.PassesRunning,
 		&s.TranscriptsJudged, &s.ChunksJudged, &s.ChunksCached, &s.ChunksFailed, &s.CachedShare,
 		&s.FindingsTotal, &s.FindingsLive, &s.FindingsPer1kChunks, &issue, &states, &drops,
 		&s.ParseFailures, &decisions, &s.AppliedEver, &s.Reverted, &s.RevertRate,
-		&s.CorrectionKeys, &s.AgreedKeys, &s.AgreementRate,
+		&s.CorrectionKeys, &s.ComparableKeys, &s.AgreedKeys, &s.AgreementRate,
 		&s.Labels.Good, &s.Labels.Junk, &s.Labels.Partial, &s.Labels.Unsure,
 		&s.ProperNounLabels.Good, &s.ProperNounLabels.Junk, &s.ProperNounLabels.Partial, &s.ProperNounLabels.Unsure,
 		&s.CostUSD, &s.CostPerChunkUSD, &s.LatencyMsP50, &s.LatencyMsP95, &s.LatencySource,

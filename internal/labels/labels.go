@@ -130,7 +130,7 @@ func DetectFormat(path, labelsFile string) (string, error) {
 
 // ParseFile reads and parses path.
 func ParseFile(path string, opts Options) (Parsed, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // the operator names the file to import
+	data, err := os.ReadFile(filepath.Clean(path)) // #nosec G304 -- operator-supplied import path
 	if err != nil {
 		return Parsed{}, err
 	}
@@ -145,7 +145,7 @@ func ParseFile(path string, opts Options) (Parsed, error) {
 		if opts.LabelsFile == "" {
 			return Parsed{}, errors.New("bakeoff-key needs --labels <file> (jlabels.py or a JSON object)")
 		}
-		if labelsData, err = os.ReadFile(opts.LabelsFile); err != nil {
+		if labelsData, err = os.ReadFile(filepath.Clean(opts.LabelsFile)); err != nil { // #nosec G304 -- operator-supplied --labels path
 			return Parsed{}, err
 		}
 	}
@@ -385,19 +385,20 @@ func parseLabelMap(data []byte) (map[string][2]string, error) {
 	out := map[string][2]string{}
 	if t := bytes.TrimSpace(data); len(t) > 0 && t[0] == '{' {
 		var m map[string][]string
-		if err := json.Unmarshal(t, &m); err == nil {
-			for id, v := range m {
-				if len(v) == 0 || len(v) > 2 {
-					return nil, fmt.Errorf("labels %s: want [label, reason]", id)
-				}
-				reason := ""
-				if len(v) == 2 {
-					reason = v[1]
-				}
-				out[id] = [2]string{v[0], reason}
-			}
-			return out, nil
+		if err := json.Unmarshal(t, &m); err != nil {
+			return nil, fmt.Errorf("labels file: want a JSON object of id → [label, reason]: %w", err)
 		}
+		for id, v := range m {
+			if len(v) == 0 || len(v) > 2 {
+				return nil, fmt.Errorf("labels %s: want [label, reason]", id)
+			}
+			reason := ""
+			if len(v) == 2 {
+				reason = v[1]
+			}
+			out[id] = [2]string{v[0], reason}
+		}
+		return out, nil
 	}
 	for n, line := range strings.Split(string(data), "\n") {
 		l := strings.TrimSpace(line)

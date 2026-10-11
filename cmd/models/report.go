@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/labels"
 	"github.com/jedwards1230/earmark/internal/recipe"
@@ -63,8 +64,9 @@ Recipes from before judge passes were recorded (gemma, haiku, qwen eras)
 show "n/a (legacy)" for what they never recorded — per-chunk cost and
 latency, chunk counts, drop counts, parse failures — never 0.
 
---since keeps recipes with activity (a finding, a pass, a decision or a
-call) at or after the date.
+--since keeps recipes with activity at or after the date: for a propose
+recipe a finding, a judge pass, a judge call or any event (decision,
+transition) on its findings; for a decide recipe a decision or a call.
 
 Examples:
   earmark models report
@@ -105,9 +107,22 @@ func ParseReportOptions(since, step string, asJSON bool) (ReportOptions, error) 
 func runReport(cmd *cobra.Command, _ []string) {
 	o, err := ParseReportOptions(reportSince, reportStep, jsonOut)
 	exitOn(err, 2)
-	_, database := open()
+	exitOn(report(cmd.Context(), o), 1)
+}
+
+// report opens the database, prints the report and closes the database
+// before it returns.
+func report(ctx context.Context, o ReportOptions) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	database, err := db.New(cfg)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
 	defer database.Close()
-	exitOn(Report(cmd.Context(), os.Stdout, database, o), 1)
+	return Report(ctx, os.Stdout, database, o)
 }
 
 // ScorecardReport is the --json shape.
@@ -185,13 +200,19 @@ func renderPropose(out io.Writer, rows []db.ProposeScore) error {
 	for _, s := range rows {
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			shortID(s.RecipeID), dash(modelName(s.ModelAlias, s.ModelResolved)), dash(s.PromptVersion),
-			num(s.FindingsTotal), legacyOr(s.Legacy, fltOr(s.FindingsPer1kChunks, "%.1f")),
+			num(s.FindingsTotal), recorded(s, fltOr(s.FindingsPer1kChunks, "%.1f")),
 			precision(s.Labels), precision(s.ProperNounLabels), pctOr(s.AgreementRate),
 			fmt.Sprintf("%s/%s", num(s.Reverted), num(s.AppliedEver)),
-			legacyOr(s.Legacy, usdOr(s.CostPerChunkUSD)), activeRange(s.FirstActivityAt, s.LastActivityAt))
+			recorded(s, usdOr(s.CostPerChunkUSD)), activeRange(s.FirstActivityAt, s.LastActivityAt))
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	for _, s := range rows {
+		if s.Mixed {
+			_, _ = fmt.Fprintf(out, "%s %s\n", mixedMark, "per-chunk numbers cover recorded judge passes only; legacy passes recorded none")
+			break
+		}
 	}
 	for _, s := range rows {
 		renderProposeBlock(out, s)
@@ -201,8 +222,11 @@ func renderPropose(out io.Writer, rows []db.ProposeScore) error {
 
 func renderProposeBlock(out io.Writer, s db.ProposeScore) {
 	era := "recorded"
-	if s.Legacy {
+	switch {
+	case s.Legacy:
 		era = "legacy"
+	case s.Mixed:
+		era = "recorded + legacy (mixed)"
 	}
 	head := []string{dash(modelName(s.ModelAlias, s.ModelResolved))}
 	if s.PromptVersion != "" {
@@ -219,21 +243,18 @@ func renderProposeBlock(out io.Writer, s db.ProposeScore) {
 		num(s.TranscriptsJudged), num(s.Passes), num(s.PassesComplete), num(s.PassesLegacy),
 		num(s.PassesIncomplete), num(s.PassesRunning))
 	line("coverage", cov)
-	line("chunks", legacyOr(s.Legacy, fmt.Sprintf("judged %s · cached %s (%s) · failed %s",
+	line("chunks", recorded(s, fmt.Sprintf("judged %s · cached %s (%s) · failed %s",
 		numOr(s.ChunksJudged), numOr(s.ChunksCached), pctOr(s.CachedShare), numOr(s.ChunksFailed))))
 	line("findings", fmt.Sprintf("%s (live %s) · per 1k chunks judged %s", num(s.FindingsTotal), num(s.FindingsLive),
-		legacyOr(s.Legacy, fltOr(s.FindingsPer1kChunks, "%.1f"))))
+		recorded(s, fltOr(s.FindingsPer1kChunks, "%.1f"))))
 	line("issues", mix(s.IssueMix, 0))
 	line("states", mix(s.StateMix, 0))
-	drops := naLegacy
-	if !s.Legacy {
-		drops = "—"
-		if s.Drops != nil {
-			drops = mix(s.Drops, 0)
-		}
+	drops := "—"
+	if s.Drops != nil {
+		drops = mix(s.Drops, 0)
 	}
-	line("drops", drops)
-	line("parse fail", legacyOr(s.Legacy, numOr(s.ParseFailures)))
+	line("drops", recorded(s, drops))
+	line("parse fail", recorded(s, numOr(s.ParseFailures)))
 	if len(s.Decisions) == 0 {
 		line("decided", "— (no decide recipe has decided these findings)")
 	}
@@ -247,14 +268,14 @@ func renderProposeBlock(out io.Writer, s db.ProposeScore) {
 			mix(d.Reasons, 6)))
 	}
 	line("reverts", fmt.Sprintf("%s of %s applied (%s)", num(s.Reverted), num(s.AppliedEver), pctOr(s.RevertRate)))
-	line("agreement", fmt.Sprintf("%s of %s fixes also proposed by another recipe (%s)",
-		num(s.AgreedKeys), num(s.CorrectionKeys), pctOr(s.AgreementRate)))
+	line("agreement", fmt.Sprintf("%s of %s comparable fixes (%s) also proposed by another configuration · %s fixes in all",
+		num(s.AgreedKeys), num(s.ComparableKeys), pctOr(s.AgreementRate), num(s.CorrectionKeys)))
 	line("labels", fmt.Sprintf("%s · proper nouns %s", tally(s.Labels), tally(s.ProperNounLabels)))
 	lat := "—"
 	if s.LatencyMsP50 != nil {
 		lat = fmt.Sprintf("p50 %s ms · p95 %s ms (%s)", fltOr(s.LatencyMsP50, "%.0f"), fltOr(s.LatencyMsP95, "%.0f"), s.LatencySource)
 	}
-	line("cost", legacyOr(s.Legacy, fmt.Sprintf("%s total · %s per chunk · latency %s",
+	line("cost", recorded(s, fmt.Sprintf("%s total · %s per chunk · latency %s",
 		usdOr(s.CostUSD), usdOr(s.CostPerChunkUSD), lat)))
 }
 
@@ -353,11 +374,19 @@ func modelName(alias, resolved string) string {
 	return resolved
 }
 
-func legacyOr(legacy bool, s string) string {
-	if legacy {
+// mixedMark flags a number that covers a mixed recipe's recorded passes only.
+const mixedMark = "*"
+
+// recorded renders a pass- or call-derived number: n/a for a legacy recipe,
+// marked for a mixed one.
+func recorded(s db.ProposeScore, v string) string {
+	switch {
+	case s.Legacy:
 		return naLegacy
+	case s.Mixed:
+		return v + " " + mixedMark
 	}
-	return s
+	return v
 }
 
 // num renders an integer with thousands separators.

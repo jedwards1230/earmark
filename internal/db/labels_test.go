@@ -33,6 +33,7 @@ func TestLabelImportValidate(t *testing.T) {
 		{Set: "s", Labeler: "justin"},
 		{Set: "s", Labeler: "Human:j"},
 		{Set: "s", Labeler: "human:"},
+		{Set: "s", Labeler: "human:a\vb"},
 		{Set: strings.Repeat("s", 129), Labeler: "human:j"},
 	} {
 		if err := bad.Validate(); err == nil {
@@ -50,49 +51,58 @@ func TestResolveLabel(t *testing.T) {
 		findingOrig: s("ganema"), findingCorr: s("Ghanima"), findingIssue: s("misheard_proper_noun"),
 		chunkID: s("c1"), chunkSHA: s(hash), chunkSource: s("then ganema said"), chunkText: s("then Ghanima said")}
 	chunk := labelTarget{chunkID: s("c1"), chunkSHA: s(hash), chunkSource: s("then ganema said"), chunkText: s("then Ghanima said")}
+	atCurrent := []chunkFinding{{id: "f1", sha: hash, original: "ganema", correction: "Ghanima"}}
+	atOther := []chunkFinding{{id: "f2", sha: other, original: "ganema", correction: "Ghanima"}}
+	twoAtCurrent := []chunkFinding{atCurrent[0], {id: "f3", sha: hash, original: "Ganema", correction: "ghanima"}}
 	tests := []struct {
 		name        string
 		it          LabelItem
 		t           labelTarget
-		known, req  bool
+		onChunk     []chunkFinding
+		match       bool
 		wantBy      string
 		wantReason  string
 		wantSHA     string
-		wantFinding bool
+		wantFinding string
 	}{
-		{"by finding", LabelItem{FindingID: "f1"}, finding, false, false, LabelResolvedFinding, "", hash, true},
-		{"by finding, texts agree modulo case/space", LabelItem{FindingID: "f1", Original: " GANEMA", Correction: "ghanima "}, finding, false, false, LabelResolvedFinding, "", hash, true},
-		{"finding text mismatch", LabelItem{FindingID: "f1", Original: "gamma"}, finding, false, false, "", UnresolvedFindingTextMismatch, "", false},
-		{"finding hash mismatch", LabelItem{FindingID: "f1", ChunkTextSHA256: other}, finding, false, false, "", UnresolvedHashMismatch, "", false},
-		{"finding missing, no chunk", LabelItem{FindingID: "f9"}, labelTarget{}, false, false, "", UnresolvedFindingNotFound, "", false},
-		{"finding missing, falls back to chunk", LabelItem{FindingID: "f9", ChunkID: "c1", Original: "ganema", Correction: "x"}, chunk, false, false, LabelResolvedChunk, "", hash, false},
-		{"no target", LabelItem{Original: "x"}, labelTarget{}, false, false, "", UnresolvedNoTarget, "", false},
-		{"chunk span", LabelItem{ChunkID: "c1", Original: "Ganema", Correction: "Ghanima"}, chunk, false, false, LabelResolvedChunk, "", hash, false},
-		{"span only in the corrected text", LabelItem{ChunkID: "c1", Original: "Ghanima", Correction: "x"}, chunk, false, false, "", UnresolvedSpanNotInChunk, "", false},
-		{"context in the corrected text", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "x", Context: "then Ghanima"}, chunk, false, false, LabelResolvedChunk, "", hash, false},
-		{"context missing", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "x", Context: "now ganema"}, chunk, false, false, "", UnresolvedContextNotInChunk, "", false},
-		{"require hash", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "x"}, chunk, false, true, "", UnresolvedNoHash, "", false},
-		{"current hash", LabelItem{ChunkID: "c1", ChunkTextSHA256: hash, Original: "nowhere", Correction: "x"}, chunk, false, true, LabelResolvedHash, "", hash, false},
-		{"known older hash", LabelItem{ChunkID: "c1", ChunkTextSHA256: other, Original: "x", Correction: "y"}, chunk, true, false, LabelResolvedHash, "", other, false},
-		{"known hash, chunk gone", LabelItem{ChunkID: "c1", ChunkTextSHA256: other, Original: "x", Correction: "y"}, labelTarget{}, true, false, LabelResolvedHash, "", other, false},
-		{"unknown hash", LabelItem{ChunkID: "c1", ChunkTextSHA256: other, Original: "x", Correction: "y"}, chunk, false, false, "", UnresolvedUnknownRevision, "", false},
-		{"chunk gone", LabelItem{ChunkID: "c1", Original: "x", Correction: "y"}, labelTarget{}, false, false, "", UnresolvedChunkNotFound, "", false},
-		{"empty original", LabelItem{ChunkID: "c1", Original: " ", Correction: "y"}, chunk, false, false, "", UnresolvedInvalid, "", false},
+		{"by finding", LabelItem{FindingID: "f1"}, finding, nil, false, LabelResolvedFinding, "", hash, "f1"},
+		{"by finding, texts agree modulo case/space", LabelItem{FindingID: "f1", Original: " GANEMA", Correction: "ghanima "}, finding, nil, false, LabelResolvedFinding, "", hash, "f1"},
+		{"finding text mismatch", LabelItem{FindingID: "f1", Original: "gamma"}, finding, nil, false, "", UnresolvedFindingTextMismatch, "", ""},
+		{"finding hash mismatch", LabelItem{FindingID: "f1", ChunkTextSHA256: other}, finding, nil, false, "", UnresolvedHashMismatch, "", ""},
+		{"finding missing, no chunk", LabelItem{FindingID: "f9"}, labelTarget{}, nil, false, "", UnresolvedFindingNotFound, "", ""},
+		{"finding missing, falls back to the chunk's findings", LabelItem{FindingID: "f9", ChunkID: "c1", Original: "ganema", Correction: "Ghanima"}, chunk, atCurrent, false, LabelResolvedFinding, "", hash, "f1"},
+		{"no target", LabelItem{Original: "x"}, labelTarget{}, nil, false, "", UnresolvedNoTarget, "", ""},
+		{"no hash: the findings' current revision", LabelItem{ChunkID: "c1", Original: "Ganema", Correction: "ghanima"}, chunk, atCurrent, false, LabelResolvedFinding, "", hash, "f1"},
+		{"no hash: several findings, no single finding id", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "Ghanima"}, chunk, twoAtCurrent, false, LabelResolvedFinding, "", hash, ""},
+		{"no hash: the findings saw another revision", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "Ghanima"}, chunk, atOther, true, "", UnresolvedChunkChanged, "", ""},
+		{"no hash: findings, chunk gone", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "Ghanima"}, labelTarget{}, atOther, false, "", UnresolvedChunkNotFound, "", ""},
+		{"no hash: the findings' revision, context missing", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "Ghanima", Context: "now ganema"}, chunk, atCurrent, false, "", UnresolvedContextNotInChunk, "", ""},
+		{"no hash, no finding: off by default", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "x"}, chunk, atCurrent, false, "", UnresolvedNoRecordedRevision, "", ""},
+		{"no hash, no finding: current chunk opt-in", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "x"}, chunk, nil, true, LabelResolvedChunk, "", hash, ""},
+		{"opt-in: span only in the corrected text", LabelItem{ChunkID: "c1", Original: "Ghanima", Correction: "x"}, chunk, nil, true, "", UnresolvedSpanNotInChunk, "", ""},
+		{"opt-in: context in the corrected text", LabelItem{ChunkID: "c1", Original: "ganema", Correction: "x", Context: "then Ghanima"}, chunk, nil, true, LabelResolvedChunk, "", hash, ""},
+		{"current hash, span present", LabelItem{ChunkID: "c1", ChunkTextSHA256: hash, Original: "ganema", Correction: "x"}, chunk, nil, false, LabelResolvedHash, "", hash, ""},
+		{"current hash, span absent", LabelItem{ChunkID: "c1", ChunkTextSHA256: hash, Original: "nowhere", Correction: "x"}, chunk, nil, false, "", UnresolvedSpanNotInChunk, "", ""},
+		{"known older hash", LabelItem{ChunkID: "c1", ChunkTextSHA256: other, Original: "x", Correction: "y"}, chunk, atOther, false, LabelResolvedHash, "", other, ""},
+		{"known hash, chunk gone", LabelItem{ChunkID: "c1", ChunkTextSHA256: other, Original: "x", Correction: "y"}, labelTarget{}, atOther, false, LabelResolvedHash, "", other, ""},
+		{"unknown hash", LabelItem{ChunkID: "c1", ChunkTextSHA256: other, Original: "x", Correction: "y"}, chunk, nil, false, "", UnresolvedUnknownRevision, "", ""},
+		{"chunk gone", LabelItem{ChunkID: "c1", Original: "x", Correction: "y"}, labelTarget{}, nil, true, "", UnresolvedChunkNotFound, "", ""},
+		{"empty original", LabelItem{ChunkID: "c1", Original: " ", Correction: "y"}, chunk, nil, false, "", UnresolvedInvalid, "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r, reason, _ := resolveLabel(tt.it, tt.t, tt.known, tt.req)
+			r, reason, _ := resolveLabel(tt.it, tt.t, tt.onChunk, tt.match)
 			if reason != tt.wantReason {
 				t.Fatalf("reason %q, want %q", reason, tt.wantReason)
 			}
 			if reason != "" {
 				return
 			}
-			if r.by != tt.wantBy || strOr(r.sha) != tt.wantSHA || (r.findingID != nil) != tt.wantFinding {
-				t.Errorf("resolved by %q sha %q finding %v, want %q %q %v", r.by, strOr(r.sha), r.findingID != nil,
+			if r.by != tt.wantBy || strOr(r.sha) != tt.wantSHA || strOr(r.findingID) != tt.wantFinding {
+				t.Errorf("resolved by %q sha %q finding %q, want %q %q %q", r.by, strOr(r.sha), strOr(r.findingID),
 					tt.wantBy, tt.wantSHA, tt.wantFinding)
 			}
-			if tt.wantFinding && (r.original != "ganema" || r.correctn != "Ghanima" || r.issueType != "misheard_proper_noun") {
+			if tt.it.FindingID == "f1" && (r.original != "ganema" || r.correctn != "Ghanima" || r.issueType != "misheard_proper_noun") {
 				t.Errorf("a finding-resolved label must carry the finding's texts: %+v", r)
 			}
 		})
