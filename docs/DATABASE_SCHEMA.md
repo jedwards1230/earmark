@@ -1,6 +1,6 @@
 # Database Schema Reference
 
-> **See CONTRACT.md §§1.1, 1.2, 1.4, 1.5, 1.6, 1.8, 1.9, 2.17, 2.20 and 3 for authoritative definitions.**
+> **See CONTRACT.md §§1.1, 1.2, 1.4, 1.5, 1.6, 1.8, 1.9, 2.15, 2.17, 2.20 and 3 for authoritative definitions.**
 > This document summarises the current schema; CONTRACT.md wins on any discrepancy.
 
 ## Migrations
@@ -25,6 +25,7 @@ version is in `goose_db_version`.
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` (every build that registered a recipe), `recipe_builds_code_version_idx`, backfilled from `recipes`; comment on `recipes.code_version` (first build) |
 | 12 | `00012_model_settings.sql` | `model_settings` (runtime per-step model overrides) and the append-only `model_setting_events` history + `model_setting_events_step_idx`; nothing backfilled |
 | 13 | `00013_audit_lineage.sql` | `judge_passes` (per transcript × judge recipe; `legacy` rows backfilled) and `transcript_archive` (a requeue's replaced transcript); on `transcript_findings`: `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (filled on insert, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` patch state; `finding_events.anchor_offset` + the `transcript_findings_record_reanchor` trigger; transitions read `earmark.reason`; `stale_work` propose arm skips duplicates |
+| 14 | `00014_finding_labels_scorecard.sql` | `finding_labels` (append-only quality labels; generated `correction_key` via `finding_correction_key()` and UNIQUE `dedupe_key`); views `finding_labels_effective`, `recipe_scorecard`, `decide_scorecard` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -793,6 +794,60 @@ Each change writes the row and its event in one transaction; setting the
 stored value again writes nothing. A row whose
 endpoint is no longer in `AI_ENDPOINTS` is an error for its step (never a
 fallback): see CONTRACT §2.20. No foreign keys.
+
+### 15. `finding_labels` and the scorecard views (CONTRACT §2.15 "Labels and scorecards")
+
+Append-only quality labels on proposed fixes, written only by `earmark labels
+import`, and the read-only views `earmark models report` prints.
+
+```sql
+CREATE TABLE finding_labels (                             -- append-only: UPDATE/DELETE/TRUNCATE refused
+    id                BIGSERIAL   PRIMARY KEY,
+    label_set         TEXT        NOT NULL,               -- e.g. bakeoff-2026-10-qw2; [A-Za-z0-9._:/-], ≤ 128
+    labeler           TEXT        NOT NULL,               -- kind:name — human:justin, opus:bakeoff-2026-10
+    label             TEXT        NOT NULL,               -- good | junk | partial | unsure
+    reason            TEXT,                               -- ≤ 2000
+    chunk_id          UUID,                               -- plain column (chunks are disposable)
+    chunk_text_sha256 TEXT,                               -- the chunk revision the label is about
+    original          TEXT        NOT NULL,
+    correction        TEXT        NOT NULL,
+    issue_type        TEXT,                               -- as the source stated it
+    finding_id        UUID,                               -- plain column; the target when there is no hash
+    resolved_by       TEXT        NOT NULL,               -- finding | hash | chunk
+    source_ref        TEXT,                               -- the item's id in its file (J003, Q120)
+    labelled_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    correction_key    TEXT GENERATED ALWAYS AS
+                      (finding_correction_key(chunk_text_sha256, original, correction)) STORED,
+    dedupe_key        TEXT GENERATED ALWAYS AS (…) STORED, -- md5(set, labeler, target, label, reason); UNIQUE
+    CHECK (chunk_text_sha256 IS NOT NULL OR finding_id IS NOT NULL)
+);
+-- indexes: finding_labels_dedupe_idx UNIQUE (dedupe_key);
+--   finding_labels_correction_key_idx (correction_key, labelled_at DESC, id DESC);
+--   finding_labels_finding_idx (finding_id) WHERE correction_key IS NULL;
+--   finding_labels_set_idx (label_set, labeler)
+```
+
+`finding_correction_key(sha, original, correction)` is the
+`transcript_findings.correction_key` expression (migration 13) as an
+IMMUTABLE function, so a label keys exactly like every finding of the same fix
+on the same chunk text. Views:
+
+- `finding_labels_effective` — the label in force per target (`human:` first,
+  then latest `labelled_at`, then latest row).
+- `recipe_scorecard` — one row per propose recipe (plus a NULL-recipe row):
+  coverage, findings per 1k chunks, issue/state mix, drops, parse failures,
+  decide outcomes per decide recipe, revert rate, cross-recipe agreement,
+  labelled precision (overall and `misheard_proper_noun`), cost and latency.
+  `legacy = true` when the recipe has no recorded judge pass and no logged
+  judge call; the per-chunk columns are then NULL.
+- `decide_scorecard` — one row per decide recipe: outcome × evidence,
+  reasons, labels per outcome, p calibration against labels and human
+  decisions, human agreement, flip rate against the previous decide recipe,
+  calls/cost/latency from `fn_calls`.
+
+Read them with `SET LOCAL jit = off` (CONTRACT §2.15): JIT compilation
+otherwise costs about a second per read.
 
 ## Relationships
 
