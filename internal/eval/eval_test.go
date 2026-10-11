@@ -181,6 +181,16 @@ func TestJudgeChunk_PerChunkCap(t *testing.T) {
 			wantOccurrences: 7,
 		},
 		{
+			// A repeat group larger than the cap is cut like any other
+			// overflow (capFindings): bounded, and the cut rows are counted.
+			name:            "repeat group larger than the cap is bounded",
+			resp:            repeatedNameJSON(defaultMaxFindingsPerChunk+2, 0),
+			chunk:           repeatedNameChunk(defaultMaxFindingsPerChunk+2, 0),
+			wantKept:        defaultMaxFindingsPerChunk,
+			wantOverCap:     2,
+			wantOccurrences: defaultMaxFindingsPerChunk,
+		},
+		{
 			name:     "exactly at the cap",
 			resp:     manyFindingsJSON(defaultMaxFindingsPerChunk),
 			chunk:    manyFindingsChunk(defaultMaxFindingsPerChunk),

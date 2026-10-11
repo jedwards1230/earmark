@@ -3383,7 +3383,9 @@ the judge's over-flagging, in this order:
    **highest-confidence** findings are kept and the remainder dropped (logged at
    DEBUG). The cap counts rows, and a name misheard several times in one chunk
    is one row per occurrence: each finding anchors to a single occurrence
-   (`anchor_occurrence`, §2.17), so repeats are never collapsed. The default
+   (`anchor_occurrence`, §2.17), so repeats are never collapsed. A repeat
+   group larger than the cap is cut like any other overflow — the cut rows are
+   counted as `over_cap` and those occurrences stay unpatched. The default
    was 5 until a 150-chunk bake-off showed a 96%-precision judge losing 16
    findings to `over_cap`, 13 of them good name fixes; with the pre-filters and
    floor running first, the cap is now only a bound on a runaway reply. The cap

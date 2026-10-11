@@ -33,22 +33,10 @@ import (
 	"github.com/jedwards1230/earmark/internal/recipe"
 )
 
-// defaultMaxFindingsPerChunk bounds how many findings the judge keeps for a
-// single chunk. The judge over-flags in practice (one chunk produced 31;
-// llama3.2:3b and qwen2.5:7b both averaged ~3/chunk over a 50-chunk sample, but
-// the tail is long), so a per-chunk cap keeps the highest-confidence signal and
-// drops the noisy remainder. Tunable via EVAL_MAX_FINDINGS_PER_CHUNK; <= 0
-// disables the cap.
-//
-// History: 8, lowered to 5 with taxonomy rev 2, raised to 12 once the
-// pre-filters and confidence floor ran ahead of the cap. At 5 the cap was
-// discarding good fixes: a misheard name repeats within a chunk, and every
-// occurrence is its own finding (internal/patch anchors each row to ONE
-// occurrence via anchor_occurrence, so the repeats cannot be collapsed into a
-// single row without leaving the other occurrences unpatched). In a 150-chunk
-// bake-off a 96%-precision judge lost 16 findings to over_cap, 13 of them good
-// name fixes. 12 still bounds a runaway reply; the junk it once trimmed is now
-// dropped by prefilter and the floor before it reaches the cap.
+// defaultMaxFindingsPerChunk bounds a runaway judge reply. It counts rows,
+// and a name misheard N times needs N rows (each anchors one occurrence), so
+// it leaves room for repeats; junk is dropped by prefilter and the floor first.
+// Tunable via EVAL_MAX_FINDINGS_PER_CHUNK; <= 0 disables the cap.
 const defaultMaxFindingsPerChunk = 12
 
 // defaultMinConfidence is the floor below which a finding is dropped. A
@@ -425,6 +413,9 @@ func (j *Judge) floorFindings(c db.EvalChunk, parsed []parsedFinding, dropped []
 // descending (stable, so equal-confidence findings keep their original order
 // for a deterministic result) and truncates. A cap of 0 (disabled) or a set
 // already within the cap is returned unchanged. Logs at DEBUG when it truncates.
+// Truncation can split one repeated correction's rows: the cut rows are
+// reported as over_cap and those occurrences stay unpatched. That is
+// intentional — keeping a group whole would let one reply exceed the bound.
 func (j *Judge) capFindings(c db.EvalChunk, parsed []parsedFinding, dropped []Dropped) ([]parsedFinding, []Dropped) {
 	if j.maxPerChunk <= 0 || len(parsed) <= j.maxPerChunk {
 		return parsed, dropped
