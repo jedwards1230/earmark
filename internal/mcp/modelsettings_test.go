@@ -155,3 +155,34 @@ func TestEmbedSwapErrorOnCard(t *testing.T) {
 		}
 	}
 }
+
+// The Judge card shows the thinking knobs the judge sends and where each came
+// from (CONTRACT §2.15): a propose row's params beat the EVAL_* env vars.
+func TestJudgeCardThinking(t *testing.T) {
+	t.Setenv("EVAL_REASONING_EFFORT", "none")
+	t.Setenv("EVAL_CHAT_TEMPLATE_KWARGS", "")
+	judgeCard := func(rows ...db.ModelSetting) roleCard {
+		t.Helper()
+		em := applyModelSettings(settingsCfg(), rows)
+		for _, c := range buildRoleCards(roleInputs{Cfg: em.Cfg, Settings: em, Now: time.Now(), ServersKnown: true}) {
+			if c.Key == "judge" {
+				return c
+			}
+		}
+		t.Fatal("no judge card")
+		return roleCard{}
+	}
+
+	c := judgeCard(db.ModelSetting{Step: recipe.StepPropose, EndpointID: "judge", Model: "openrouter/openai/gpt-6-luna",
+		Params: map[string]any{config.ParamReasoningEffort: "low", config.ParamChatTemplateKwargs: "omit"}})
+	assert.Equal(t, `reasoning_effort "low" (model setting) · chat_template_kwargs omitted (model setting)`, c.Thinking)
+	assert.Empty(t, c.ThinkingError)
+
+	c = judgeCard()
+	assert.Equal(t, `reasoning_effort "none" (EVAL_REASONING_EFFORT) · chat_template_kwargs omitted (auto: hosted route)`, c.Thinking)
+
+	t.Setenv("EVAL_CHAT_TEMPLATE_KWARGS", "[1]")
+	c = judgeCard()
+	assert.Empty(t, c.Thinking)
+	assert.Contains(t, c.ThinkingError, "EVAL_CHAT_TEMPLATE_KWARGS")
+}

@@ -140,7 +140,7 @@ func (c *Config) ValidateStepSetting(s StepSetting) error {
 			return fmt.Errorf("%s %q contains whitespace", name, v)
 		}
 	}
-	if err := validatePinParams(s.Params); err != nil {
+	if err := validatePinParams(s.Step, s.Params); err != nil {
 		return fmt.Errorf("params%w", err)
 	}
 	return nil

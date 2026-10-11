@@ -2,11 +2,13 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -63,7 +65,9 @@ type ModelPin struct {
 	// the step to run; a mismatch with the code is logged at startup.
 	PromptVersion string `yaml:"prompt_version"`
 	// Params are step-specific settings. ParseModelRegistry accepts only
-	// known keys: usd_per_mtok_in (decide, scan), a non-negative number.
+	// known keys (knownPinParams): usd_per_mtok_in (decide, scan), a
+	// non-negative number, and on the propose step the judge request params
+	// reasoning_effort / chat_template_kwargs / temperature.
 	Params map[string]any `yaml:"params"`
 }
 
@@ -130,7 +134,7 @@ func ParseModelRegistry(r io.Reader) (*ModelRegistry, error) {
 			strings.Join(unknown, ", "), strings.Join(recipe.Steps, ", "))
 	}
 	for step, pin := range reg.Steps {
-		if err := validatePinParams(pin.Params); err != nil {
+		if err := validatePinParams(step, pin.Params); err != nil {
 			return nil, fmt.Errorf("model registry: steps.%s.params%w", step, err)
 		}
 	}
@@ -144,26 +148,129 @@ type pinParamError struct{ msg string }
 
 func (e *pinParamError) Error() string { return e.msg }
 
-// validatePinParams accepts only the known pin params (usd_per_mtok_in, a
-// non-negative number). Shared by MODELS_FILE and the runtime model settings
+// Judge thinking params (CONTRACT §2.15 "Thinking controls"): the propose
+// step's per-model reasoning knobs, settable on the propose step only (a
+// model_settings row's params, or MODELS_FILE steps.propose.params). They
+// outrank the deployment-wide EVAL_REASONING_EFFORT / EVAL_CHAT_TEMPLATE_KWARGS,
+// so the knobs travel with the model they were tuned for.
+const (
+	// ParamReasoningEffort is the judge request's reasoning_effort: "auto"
+	// (the route default), "omit" (never sent), or any other token sent
+	// verbatim ("none", "low", "medium", "high", …). A string.
+	ParamReasoningEffort = "reasoning_effort"
+	// ParamChatTemplateKwargs is the judge request's chat_template_kwargs:
+	// "auto", "omit", or a JSON object (an object value, or its JSON text).
+	ParamChatTemplateKwargs = "chat_template_kwargs"
+	// ParamTemperature is the judge request's temperature, a non-negative
+	// number. It outranks the endpoint's temperature option and the route
+	// default (0 locally, omitted on hosted routes; CONTRACT §2.15).
+	ParamTemperature = "temperature"
+)
+
+// knownPinParams are the param keys a step accepts: usd_per_mtok_in on any
+// step, plus the step's own keys.
+func knownPinParams(step string) []string {
+	if step == recipe.StepPropose {
+		return []string{ParamUSDPerMTokIn, ParamReasoningEffort, ParamChatTemplateKwargs, ParamTemperature}
+	}
+	return []string{ParamUSDPerMTokIn}
+}
+
+// validatePinParams accepts only the step's known pin params (knownPinParams)
+// with valid values. Shared by MODELS_FILE and the runtime model settings
 // (CONTRACT §2.20) so both refuse the same input.
-func validatePinParams(params map[string]any) error {
+func validatePinParams(step string, params map[string]any) error {
 	keys := make([]string, 0, len(params))
 	for k := range params {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	known := knownPinParams(step)
 	for _, k := range keys {
 		v := params[k]
-		if k != ParamUSDPerMTokIn {
+		if !slices.Contains(known, k) {
 			// A misspelt key must not silently fall back to a default.
-			return &pinParamError{fmt.Sprintf(": unknown key %q (known: %s)", k, ParamUSDPerMTokIn)}
+			return &pinParamError{fmt.Sprintf(": unknown key %q (known for %s: %s)", k, step, strings.Join(known, ", "))}
 		}
-		if f, ok := toFloat(v); !ok || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
-			return &pinParamError{fmt.Sprintf(".%s must be a non-negative number, got %v", k, v)}
+		switch k {
+		case ParamUSDPerMTokIn:
+			if f, ok := toFloat(v); !ok || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+				return &pinParamError{fmt.Sprintf(".%s must be a non-negative number, got %v", k, v)}
+			}
+		case ParamReasoningEffort:
+			if _, err := ReasoningEffortParam(v); err != nil {
+				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
+			}
+		case ParamChatTemplateKwargs:
+			if _, err := ChatTemplateKwargsParam(v); err != nil {
+				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
+			}
+		case ParamTemperature:
+			if _, err := TemperatureParam(v); err != nil {
+				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
+			}
 		}
 	}
 	return nil
+}
+
+// TemperatureParam reads a temperature param: a finite non-negative number
+// (an int from YAML, a float64 from JSON or a --param flag). A string such as
+// "zero" is refused rather than silently leaving the route default.
+func TemperatureParam(v any) (float64, error) {
+	f, ok := toFloat(v)
+	if !ok || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("must be a non-negative number, got %v", v)
+	}
+	return f, nil
+}
+
+// ReasoningEffortParam reads a reasoning_effort param: a non-empty string
+// token with no whitespace ("auto", "omit", "none", "low", …), trimmed.
+// Numbers and other types are refused: a typo must not turn into a request
+// field the provider rejects at run time.
+func ReasoningEffortParam(v any) (string, error) {
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("must be a string (auto, omit, none, low, medium, high, …), got %v", v)
+	}
+	s = strings.TrimSpace(s)
+	if s == "" || strings.ContainsAny(s, " \t\r\n") {
+		return "", fmt.Errorf("must be a non-empty token without whitespace, got %q", v)
+	}
+	return s, nil
+}
+
+// ChatTemplateKwargsParam reads a chat_template_kwargs param and returns it
+// as text: "auto" or "omit" (lower-cased), or the JSON of an object. It
+// accepts an object (YAML / a JSON params document) or a string holding
+// "auto", "omit" or a JSON object (a --param flag).
+func ChatTemplateKwargsParam(v any) (string, error) {
+	// An empty object is refused: the judge request drops an empty
+	// chat_template_kwargs (omitempty), so it could never take effect.
+	const want = "must be \"auto\", \"omit\" or a non-empty JSON object"
+	switch t := v.(type) {
+	case map[string]any:
+		if len(t) == 0 {
+			return "", fmt.Errorf("%s (use omit), got {}", want)
+		}
+		b, err := json.Marshal(t)
+		if err != nil {
+			return "", fmt.Errorf("must be a JSON object: %w", err)
+		}
+		return string(b), nil
+	case string:
+		s := strings.TrimSpace(t)
+		if l := strings.ToLower(s); l == "auto" || l == "omit" {
+			return l, nil
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(s), &obj); err != nil || len(obj) == 0 {
+			return "", fmt.Errorf("%s, got %q", want, t)
+		}
+		return s, nil
+	}
+	return "", fmt.Errorf("%s, got %v", want, v)
 }
 
 // loadModelRegistry reads MODELS_FILE into c.Models and checks every pinned

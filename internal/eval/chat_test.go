@@ -167,15 +167,20 @@ func TestResolveChatClient_RejectsBadTemplateKwargs(t *testing.T) {
 
 func TestIsHostedRoute(t *testing.T) {
 	for model, want := range map[string]bool{
-		"anthropic/claude-sonnet-4-5": true,
-		" anthropic/x":                true,
-		"bedrock/anthropic/claude-x":  true, // nested route
-		"openrouter/Anthropic/claude": true,
-		"judge":                       false, // alias hiding the provider: needs explicit omit
-		"qwen3:8b":                    false,
-		"qwen2.5:7b-instruct":         false,
-		"claude-local-finetune":       false, // not a provider route
-		"":                            false,
+		"anthropic/claude-sonnet-4-5":  true,
+		" anthropic/x":                 true,
+		"bedrock/anthropic/claude-x":   true, // nested route
+		"openrouter/Anthropic/claude":  true,
+		"openrouter/openai/gpt-6-luna": true, // OpenRouter, any provider
+		"openrouter/qwen/qwen3-235b":   true,
+		"openai/gpt-6-luna":            true, // OpenAI's hosted API
+		"OpenAI/gpt-6-luna":            true,
+		"ollama/qwen3.8:27b-q8_0":      false, // LiteLLM route to a local Ollama
+		"judge":                        false, // alias hiding the provider: needs explicit omit
+		"qwen3:8b":                     false,
+		"qwen2.5:7b-instruct":          false,
+		"claude-local-finetune":        false, // not a provider route
+		"":                             false,
 	} {
 		if got := isHostedRoute(model); got != want {
 			t.Errorf("isHostedRoute(%q) = %v, want %v", model, got, want)
@@ -536,11 +541,23 @@ func TestJudgeRecipe_TemperatureOnlyWhenSent(t *testing.T) {
 		}
 		return mustRecipeID(t, r)
 	}
-	local := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: "http://ollama:11434/v1", Model: "qwen3.8"}))
+	// Thinking is resolved as ResolveChatClient does, with no setting and no
+	// env: the route defaults add no recipe params (Thinking.recipeParams).
+	t.Setenv(envReasoningEffort, "")
+	t.Setenv(envChatTemplateKwargs, "")
+	resolved := func(model string) Thinking {
+		th, err := ResolveThinking(model, JudgeSetting{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return th
+	}
+	local := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: "http://ollama:11434/v1", Model: "qwen3.8", Thinking: resolved("qwen3.8")}))
 	if got, want := mustRecipeID(t, local.Recipe()), legacyID(local); got != want {
 		t.Errorf("local recipe id changed: %s, want the historical %s", got, want)
 	}
-	hosted := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: "http://litellm:4000/v1", Model: "anthropic/claude-haiku-5-5"}))
+	hosted := NewJudge(newOpenAIChatClient(chatConfig{BaseURL: "http://litellm:4000/v1", Model: "anthropic/claude-haiku-5-5",
+		Thinking: resolved("anthropic/claude-haiku-5-5")}))
 	if _, ok := hosted.Recipe().Params["temperature"]; ok {
 		t.Error("hosted recipe must not record a temperature that is not sent")
 	}

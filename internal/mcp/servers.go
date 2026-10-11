@@ -809,6 +809,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
     <dt>requested</dt><dd>{{if .Requested}}<span class="mono">{{.Requested}}</span>{{if .EndpointID}} <span class="time-muted">@ {{or .EndpointLabel .EndpointID}}</span>{{end}}{{else}}—{{end}}</dd>
     {{if .ModelSource}}<dt>source</dt><dd>{{template "roleSource" .}}</dd>{{end}}
     {{if .Expected}}<dt>pinned</dt><dd><span class="mono">{{.Expected}}</span>{{with .ExpectedRevisionShort}} <span class="time-muted">· rev {{.}}</span>{{end}}{{if eq .Key "asr"}} <span class="time-muted">· recorded only</span>{{end}}</dd>{{end}}
+    {{if .ThinkingError}}<dt>thinking</dt><dd class="err mono err-clamp" title="{{.ThinkingError}}">{{.ThinkingError}}</dd>{{else if .Thinking}}<dt>thinking</dt><dd class="mono">{{.Thinking}}</dd>{{end}}
     <dt>answered</dt><dd>{{template "roleAnswered" .}}</dd>
     {{if .AlsoAnswered}}<dt><span class="sr-only">also answered</span></dt><dd class="time-muted">also: {{range $i, $m := .AlsoAnswered}}{{if $i}}, {{end}}<span class="mono">{{$m.Model}}</span> ×{{commafy $m.Count}}{{end}} (7d)</dd>{{end}}
     <dt>last ok</dt><dd>{{if not .LastKnown}}—{{else if .LastOK.IsZero}}<span class="time-muted">never</span>{{else}}<span title="{{formatTime .LastOK}}">{{relTime .LastOK}}</span>{{end}}{{if and (or (eq .Key "judge") .IsFnRole) .LastKnown}} · {{if .LastFail.IsZero}}<span class="time-muted">no failures</span>{{else}}last fail <span title="{{formatTime .LastFail}}">{{relTime .LastFail}}</span>{{end}}{{end}}</dd>

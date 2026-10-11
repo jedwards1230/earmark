@@ -118,6 +118,14 @@ type TemperatureReporter interface {
 	Temperature() *float64
 }
 
+// ThinkingReporter is an optional ChatClient extension reporting the thinking
+// knobs (reasoning_effort / chat_template_kwargs) the client sends. The
+// judge's recipe params follow it (Thinking.recipeParams): a client that
+// doesn't implement it adds no thinking params.
+type ThinkingReporter interface {
+	Thinking() Thinking
+}
+
 // ChunkReader is the read-only slice of the DB the judge needs to fetch chunks.
 // Intentionally read-only — there is no transcript-mutating method here.
 type ChunkReader interface {
@@ -203,7 +211,10 @@ func (j *Judge) Recipe() recipe.Recipe {
 // recipeParams are the propose recipe's output-shaping params. temperature is
 // recorded only when it is actually sent (sentTemperature): a hosted route
 // that omits it has no temperature param, which is a different recipe from
-// the historical temperature-0 one (CONTRACT §1.9 / §2.15). max_tokens is not
+// the historical temperature-0 one (CONTRACT §1.9 / §2.15). reasoning_effort /
+// chat_template_kwargs are recorded only where they differ from the route
+// default (Thinking.recipeParams), so a reasoning change is a new recipe while
+// default judges keep their id. max_tokens is not
 // a param — it bounds the reply's length, and a reply that hits it is an error
 // (ErrTruncatedResponse), never a finding set.
 func (j *Judge) recipeParams() map[string]any {
@@ -213,6 +224,9 @@ func (j *Judge) recipeParams() map[string]any {
 	}
 	if t := j.sentTemperature(); t != nil {
 		params["temperature"] = *t
+	}
+	if tr, ok := j.chat.(ThinkingReporter); ok {
+		tr.Thinking().recipeParams(params)
 	}
 	return params
 }

@@ -144,6 +144,12 @@ type roleCard struct {
 	// what an answer is compared against).
 	Expected         string
 	ExpectedRevision string
+	// Thinking (judge only) is the reasoning_effort / chat_template_kwargs
+	// the judge sends and where each came from (CONTRACT §2.15): the propose
+	// model setting's params, the EVAL_* env vars, or the route default.
+	// ThinkingError is set instead when a layer holds an invalid value.
+	Thinking         string
+	ThinkingError    string
 	Answered         string
 	AnsweredMatch    string          // match|mismatch|unreported|none|unchecked
 	AlsoAnswered     []db.ModelCount // judge only: other models in the last 7 days, max 3
@@ -428,6 +434,13 @@ func buildJudgeCard(c *roleCard, in roleInputs) {
 	} else if in.Judge.Configured {
 		c.EndpointID, c.Requested = judgeSourceEnv, in.Judge.Model
 		c.Gateway, c.GatewayInferred = gatewayFor("", host)
+	}
+	if c.Requested != "" {
+		if t, err := eval.JudgeThinkingFor(eval.ConfigSource(in.Cfg), c.Requested); err != nil {
+			c.ThinkingError = err.Error()
+		} else {
+			c.Thinking = t.Describe()
+		}
 	}
 
 	if in.Snap != nil {

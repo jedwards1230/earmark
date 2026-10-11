@@ -4,6 +4,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -229,11 +230,16 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 }
 
 // judgeKey identifies everything about the propose step a runtime setting
-// can change: the chat endpoint (URL, key, model) and the propose pin.
+// can change: the chat endpoint (URL, key, model) and the propose pin,
+// including its params.
 func judgeKey(cfg *config.Config) string {
 	ep, _ := cfg.EvalEndpoint()
 	pin := cfg.ModelPin(recipe.StepPropose)
-	return strings.Join([]string{ep.ID, ep.BaseURL, ep.Model, ep.APIKey, pin.ExpectedModel, pin.Revision}, "\x00")
+	// The pin params carry the judge's thinking knobs (reasoning_effort,
+	// chat_template_kwargs): a row that changes only them rebuilds the judge.
+	// json.Marshal sorts map keys, so equal params give equal keys.
+	params, _ := json.Marshal(pin.Params)
+	return strings.Join([]string{ep.ID, ep.BaseURL, ep.Model, ep.APIKey, pin.ExpectedModel, pin.Revision, string(params)}, "\x00")
 }
 
 // workerSteps are the steps the worker itself runs.

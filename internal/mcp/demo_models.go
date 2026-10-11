@@ -69,7 +69,7 @@ const demoScenarioRecipeChanged = "recipe-changed"
 
 // demoScenarioModelSettings: runtime model settings (CONTRACT §2.20) — the
 // judge runs on a db-set model (another model on the LiteLLM chat endpoint,
-// set 2h ago, after its newest answer), and the decide row names an endpoint
+// set 2h ago, after its newest answer, with a per-model reasoning_effort), and the decide row names an endpoint
 // no longer in AI_ENDPOINTS (invalid: Decide FAILING with the fix).
 const demoScenarioModelSettings = "model-settings"
 
@@ -88,6 +88,7 @@ func (d demoDB) ListModelSettings(context.Context) ([]db.ModelSetting, error) {
 		{Step: recipe.StepDecide, EndpointID: "ollama-clef", Model: "clef-1.0.0",
 			UpdatedAt: now.Add(-26 * time.Hour), UpdatedBy: "cli:justin"},
 		{Step: recipe.StepPropose, EndpointID: "litellm-judge", Model: demoSettingJudgeModel,
+			Params:    map[string]any{config.ParamReasoningEffort: "low"},
 			UpdatedAt: now.Add(-2 * time.Hour), UpdatedBy: "cli:justin"},
 	}, nil
 }
