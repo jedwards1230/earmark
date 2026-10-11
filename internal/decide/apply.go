@@ -55,7 +55,10 @@ type ApplyOptions struct {
 	// undecided and are decided by the next run.
 	MaxAccepts  int
 	Concurrency int
-	Params      ShouldApplyParams
+	// Params is the decide policy (+ rung 0's threshold); PolicySource names
+	// where the policy came from (Policy.SourceLabel), for the report.
+	Params       ShouldApplyParams
+	PolicySource string
 	// Progress, when set, records the run's live progress (CONTRACT §1.10).
 	Progress *runs.Run
 	// Model is the decision model asked (zero = DefaultModel).
@@ -85,14 +88,20 @@ type WriteStats struct {
 	Stopped string `json:"stopped,omitempty"`
 }
 
-// CurrentRecipe is the decide recipe this configuration would decide under,
-// for current_recipes. ok=false when AI_ROLES.decide is unbound.
+// CurrentRecipe is the decide recipe this configuration would decide under —
+// its effective model and that model's decide policy (ResolvePolicy, no
+// per-run override) — for current_recipes. ok=false when AI_ROLES.decide is
+// unbound.
 func CurrentRecipe(cfg *config.Config) (recipe.Recipe, bool, error) {
 	if _, ok, err := ClientFromConfig(cfg); !ok || err != nil {
 		return recipe.Recipe{}, ok, err
 	}
 	m, _ := ModelFromConfig(cfg)
-	f, err := ShouldApplyFnFor(DefaultShouldApplyParams(), m)
+	pol, err := ResolvePolicy(cfg, nil)
+	if err != nil {
+		return recipe.Recipe{}, true, err
+	}
+	f, err := ShouldApplyFnFor(pol.Params, m)
 	if err != nil {
 		return recipe.Recipe{}, true, err
 	}
@@ -183,7 +192,8 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		all = append(all, items...)
 	}
 
-	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: o.Limit}, Model: o.Model}, recipeID, all, nil)
+	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: o.Limit}, Model: o.Model,
+		Params: o.Params, PolicySource: o.PolicySource}, recipeID, all, nil)
 	rep.DryRun = false
 	rep.Write = ws
 	return rep, nil

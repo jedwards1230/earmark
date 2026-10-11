@@ -241,6 +241,13 @@ type roleCard struct {
 	// against this deployment's AI_ENDPOINTS: the card is FAILING and shows
 	// the row, not the env model.
 	SettingError string
+	// DecidePolicy (Decide only) is the effective decide policy in one line
+	// and DecidePolicySource where it came from (CONTRACT §2.19 "Decide
+	// policy"); DecidePolicyError is set instead when the merged policy is
+	// invalid (the card is then FAILING: decide runs refuse it).
+	DecidePolicy       string
+	DecidePolicySource string
+	DecidePolicyError  string
 }
 
 // IsFnRole reports whether the role runs through internal/fn (decide, scan):
@@ -331,6 +338,9 @@ func buildRoleCards(in roleInputs) []roleCard {
 			c.Health = health(roleNotConfigured, "no model role for this step yet")
 		}
 		applySettingState(&c, in.Settings)
+		if d.Key == "decide" {
+			applyDecidePolicy(&c, in)
+		}
 		cards = append(cards, c)
 	}
 	return cards

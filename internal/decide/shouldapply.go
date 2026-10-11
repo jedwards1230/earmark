@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
@@ -47,7 +50,7 @@ const (
 // Outcome reasons beyond rung 0's Reason* constants. A data contract, like
 // those: add, never rename.
 const (
-	// ReasonConfident — p ≥ apply_p with text evidence: applied.
+	// ReasonConfident — p ≥ apply_p with allowed text evidence: applied.
 	ReasonConfident = "confident_with_evidence"
 	// ReasonNoEvidence — p ≥ apply_p but no text evidence: held.
 	ReasonNoEvidence = "no_evidence"
@@ -56,6 +59,13 @@ const (
 	// ReasonTypeCapped — p ≥ apply_p for an issue type that may never be
 	// applied by machine (dropped_word, number_artifact): held.
 	ReasonTypeCapped = "issue_type_capped"
+	// ReasonEvidenceExcluded — p ≥ apply_p with text evidence of a kind the
+	// policy's apply_evidence leaves out (e.g. exact_repeat for Clef): held.
+	ReasonEvidenceExcluded = "evidence_excluded"
+	// ReasonCapitalised — p ≤ reject_p, but the policy rejects only an
+	// all-lowercase replacement (or p < reject_floor) and this one has an
+	// uppercase letter (a name the model may simply not know): held.
+	ReasonCapitalised = "capitalised_replacement"
 	// ReasonJevReject — p ≤ reject_p: rejected.
 	ReasonJevReject = "jev_reject"
 	// ReasonJevUnavailable — the model could not give a usable answer (error,
@@ -124,23 +134,46 @@ func shouldApplyPromptSHA256(q systemone.Question, layout []string) string {
 
 // ShouldApplyParams are the decide recipe's params: changing any of them
 // yields a new recipe (CONTRACT §1.9), so decisions made under different
-// thresholds are never confused.
+// thresholds are never confused. ApplyP, RejectP, ApplyEvidence,
+// RejectRequiresLowercase and RejectFloor are the decide policy (CONTRACT
+// §2.19 "Decide policy"): per decide model, resolved by ResolvePolicy.
 type ShouldApplyParams struct {
-	// ApplyP: p at or above it may apply (with evidence). Default 0.95.
+	// ApplyP: p at or above it may apply (with allowed evidence). Default 0.85.
 	ApplyP float64
 	// RejectP: p at or below it rejects. Default 0.20.
 	RejectP float64
+	// ApplyEvidence are the text-evidence kinds an apply needs (a subset of
+	// asin_verbatim, exact_repeat; non-empty). Default both.
+	ApplyEvidence []string
+	// RejectRequiresLowercase: a p ≤ reject_p reject also needs a replacement
+	// with no uppercase letter, or p < RejectFloor; otherwise it holds
+	// (capitalised_replacement). Default false.
+	RejectRequiresLowercase bool
+	// RejectFloor: with RejectRequiresLowercase, p below it rejects whatever
+	// the case. In [0, reject_p]; must be 0 without RejectRequiresLowercase.
+	RejectFloor float64
 	// PhoneticMinSim is rung 0's sound-alike threshold. Default 0.67.
 	PhoneticMinSim float64
 }
 
-// DefaultShouldApplyParams returns the phase-1 thresholds.
+// applyEvidenceKinds are the evidence kinds an apply may rest on, in
+// canonical order.
+var applyEvidenceKinds = []string{EvidenceASINVerbatim, EvidenceExactRepeat}
+
+// DefaultShouldApplyParams returns the default policy: apply at p ≥ 0.85
+// with either kind of text evidence, reject at p ≤ 0.20. It is also Jev's
+// preset (CONTRACT §2.19 "Decide policy").
 func DefaultShouldApplyParams() ShouldApplyParams {
-	return ShouldApplyParams{ApplyP: 0.95, RejectP: 0.20, PhoneticMinSim: DefaultParams().SoundAlikeThreshold}
+	return ShouldApplyParams{
+		ApplyP: 0.85, RejectP: 0.20,
+		ApplyEvidence:  slices.Clone(applyEvidenceKinds),
+		PhoneticMinSim: DefaultParams().SoundAlikeThreshold,
+	}
 }
 
-// Validate requires 0 ≤ reject_p < apply_p ≤ 1 and a sound-alike threshold
-// in (0, 1].
+// Validate requires 0 ≤ reject_p < apply_p ≤ 1, a non-empty set of known
+// apply evidence kinds without repeats, 0 ≤ reject_floor ≤ reject_p (and 0
+// unless reject_requires_lowercase), and a sound-alike threshold in (0, 1].
 func (p ShouldApplyParams) Validate() error {
 	ok := func(f float64) bool { return !math.IsNaN(f) && f >= 0 && f <= 1 }
 	switch {
@@ -148,26 +181,95 @@ func (p ShouldApplyParams) Validate() error {
 		return fmt.Errorf("decide: need 0 ≤ reject_p (%v) < apply_p (%v) ≤ 1", p.RejectP, p.ApplyP)
 	case !ok(p.PhoneticMinSim) || p.PhoneticMinSim == 0:
 		return fmt.Errorf("decide: phonetic_min_sim %v outside (0, 1]", p.PhoneticMinSim)
+	case len(p.ApplyEvidence) == 0:
+		return fmt.Errorf("decide: apply_evidence is empty (allowed: %s)", strings.Join(applyEvidenceKinds, ", "))
+	case !ok(p.RejectFloor) || p.RejectFloor > p.RejectP:
+		return fmt.Errorf("decide: need 0 ≤ reject_floor (%v) ≤ reject_p (%v)", p.RejectFloor, p.RejectP)
+	case p.RejectFloor != 0 && !p.RejectRequiresLowercase:
+		return fmt.Errorf("decide: reject_floor (%v) only applies with reject_requires_lowercase=true; "+
+			"to turn the lowercase rule off, also set reject_floor=0", p.RejectFloor)
+	}
+	seen := map[string]bool{}
+	for _, k := range p.ApplyEvidence {
+		switch {
+		case !slices.Contains(applyEvidenceKinds, k):
+			return fmt.Errorf("decide: apply_evidence %q is not an evidence kind (allowed: %s)", k, strings.Join(applyEvidenceKinds, ", "))
+		case seen[k]:
+			return fmt.Errorf("decide: apply_evidence lists %q twice", k)
+		}
+		seen[k] = true
 	}
 	return nil
+}
+
+// applyEvidence is ApplyEvidence in canonical order, so the order a policy
+// lists the kinds in never changes a recipe.
+func (p ShouldApplyParams) applyEvidence() []string {
+	var out []string
+	for _, k := range applyEvidenceKinds {
+		if slices.Contains(p.ApplyEvidence, k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// PolicyParams are the decide policy as config params (the keys of
+// config.DecidePolicyParams), for display.
+func (p ShouldApplyParams) PolicyParams() map[string]any {
+	return map[string]any{
+		config.ParamApplyP:                  p.ApplyP,
+		config.ParamRejectP:                 p.RejectP,
+		config.ParamApplyEvidence:           p.applyEvidence(),
+		config.ParamRejectRequiresLowercase: p.RejectRequiresLowercase,
+		config.ParamRejectFloor:             p.RejectFloor,
+	}
+}
+
+// Describe is the policy in one line: "apply p ≥ 0.85 with asin_verbatim or
+// exact_repeat · reject p ≤ 0.20". Thresholds print exactly (at least two
+// decimals, more when the value has them: 0.855 is never shown as 0.85), so
+// the line a reviewer gates a run on is the policy the recipe holds.
+func (p ShouldApplyParams) Describe() string {
+	s := fmt.Sprintf("apply p ≥ %s with %s · reject p ≤ %s", fmtP(p.ApplyP), strings.Join(p.applyEvidence(), " or "), fmtP(p.RejectP))
+	if p.RejectRequiresLowercase {
+		if p.RejectFloor > 0 {
+			s += fmt.Sprintf(" if the replacement is lowercase or p < %s", fmtP(p.RejectFloor))
+		} else {
+			s += " if the replacement is lowercase"
+		}
+	}
+	return s
+}
+
+// fmtP formats a threshold exactly, with at least two decimals.
+func fmtP(v float64) string {
+	exact := strconv.FormatFloat(v, 'f', -1, 64)
+	if _, dec, _ := strings.Cut(exact, "."); len(dec) >= 2 {
+		return exact
+	}
+	return strconv.FormatFloat(v, 'f', 2, 64)
 }
 
 // recipeParams is every knob that changes an outcome, as recorded in the
 // recipe.
 func (p ShouldApplyParams) recipeParams() map[string]any {
 	return map[string]any{
-		"apply_p":                p.ApplyP,
-		"reject_p":               p.RejectP,
-		"phonetic_min_sim":       p.PhoneticMinSim,
-		"evidence_rule":          EvidenceRule,
-		"rung0_version":          Rung0Version,
-		"context_words":          ContextWords,
-		"neighbour_words":        NeighbourWords,
-		"fallback_words":         FallbackWords,
-		"max_relevant_sentences": MaxRelevantSentences,
-		"max_relevant_runes":     MaxRelevantRunes,
-		"max_sentence_runes":     MaxSentenceRunes,
-		"clip_words":             ClipWords,
+		"apply_p":                   p.ApplyP,
+		"reject_p":                  p.RejectP,
+		"apply_evidence":            p.applyEvidence(),
+		"reject_requires_lowercase": p.RejectRequiresLowercase,
+		"reject_floor":              p.RejectFloor,
+		"phonetic_min_sim":          p.PhoneticMinSim,
+		"evidence_rule":             EvidenceRule,
+		"rung0_version":             Rung0Version,
+		"context_words":             ContextWords,
+		"neighbour_words":           NeighbourWords,
+		"fallback_words":            FallbackWords,
+		"max_relevant_sentences":    MaxRelevantSentences,
+		"max_relevant_runes":        MaxRelevantRunes,
+		"max_sentence_runes":        MaxSentenceRunes,
+		"clip_words":                ClipWords,
 	}
 }
 
@@ -242,16 +344,20 @@ func ShouldApplyFnFor(p ShouldApplyParams, m Model) (fn.Fn, error) {
 // their best outcome is hold.
 var cappedTypes = map[string]bool{IssueDroppedWord: true, IssueNumberArtifact: true}
 
-// Decide maps the model's probability, the text evidence and the issue type
-// to a decision and its reason:
+// Decide maps the model's probability, the text evidence, the issue type and
+// the proposed replacement to a decision and its reason:
 //
-//	p NaN or outside [0, 1]          → hold   jev_unavailable
-//	p ≥ apply_p, capped issue type   → hold   issue_type_capped
-//	p ≥ apply_p, evidence            → apply  confident_with_evidence
-//	p ≥ apply_p, no evidence         → hold   no_evidence
-//	reject_p < p < apply_p           → hold   uncertain
-//	p ≤ reject_p                     → reject jev_reject
-func (p ShouldApplyParams) Decide(prob float64, evidence, issueType string) (decision, reason string) {
+//	p NaN or outside [0, 1]                    → hold   jev_unavailable
+//	p ≥ apply_p, capped issue type             → hold   issue_type_capped
+//	p ≥ apply_p, evidence in apply_evidence    → apply  confident_with_evidence
+//	p ≥ apply_p, evidence not in apply_evidence → hold  evidence_excluded
+//	p ≥ apply_p, no evidence                   → hold   no_evidence
+//	reject_p < p < apply_p                     → hold   uncertain
+//	p ≤ reject_p, reject_requires_lowercase,
+//	  replacement has an uppercase letter,
+//	  p ≥ reject_floor                         → hold   capitalised_replacement
+//	p ≤ reject_p                               → reject jev_reject
+func (p ShouldApplyParams) Decide(prob float64, evidence, issueType, replacement string) (decision, reason string) {
 	switch {
 	case math.IsNaN(prob) || prob < 0 || prob > 1:
 		return DecisionHold, ReasonJevUnavailable
@@ -259,16 +365,26 @@ func (p ShouldApplyParams) Decide(prob float64, evidence, issueType string) (dec
 		switch {
 		case cappedTypes[issueType]:
 			return DecisionHold, ReasonTypeCapped
-		case evidence == EvidenceASINVerbatim || evidence == EvidenceExactRepeat:
-			return DecisionApply, ReasonConfident
-		default:
+		case evidence != EvidenceASINVerbatim && evidence != EvidenceExactRepeat:
 			return DecisionHold, ReasonNoEvidence
+		case !slices.Contains(p.ApplyEvidence, evidence):
+			return DecisionHold, ReasonEvidenceExcluded
+		default:
+			return DecisionApply, ReasonConfident
 		}
 	case prob <= p.RejectP:
+		if p.RejectRequiresLowercase && hasUpper(replacement) && prob >= p.RejectFloor {
+			return DecisionHold, ReasonCapitalised
+		}
 		return DecisionReject, ReasonJevReject
 	default:
 		return DecisionHold, ReasonUncertain
 	}
+}
+
+// hasUpper reports whether s has an uppercase letter.
+func hasUpper(s string) bool {
+	return strings.IndexFunc(s, unicode.IsUpper) >= 0
 }
 
 // Asker is the System One call (*systemone.Client implements it).
@@ -429,7 +545,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) Outcome {
 		return unavailable(genai.ErrorClass(err))
 	}
 	out.P = &p
-	out.Decision, out.Reason = e.params.Decide(p, out.Evidence, c.IssueType)
+	out.Decision, out.Reason = e.params.Decide(p, out.Evidence, c.IssueType, c.Replacement)
 	out.Retryable = out.Reason == ReasonJevUnavailable
 	return out
 }

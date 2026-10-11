@@ -1,4 +1,5 @@
 decide dry run · recipe abababababab · model jev-1.13.0 · seed "golden"
+policy: apply p ≥ 0.85 with asin_verbatim · reject p ≤ 0.20 if the replacement is lowercase or p < 0.10 (source db (reject_floor) over preset clef)
 sampled 8 of 10 requested · scope 929
 
 outcomes: apply 2 · hold 3 · reject 2 · reanchor 1

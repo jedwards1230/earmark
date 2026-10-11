@@ -181,6 +181,43 @@ func runAsker() *fakeAsker {
 	}}
 }
 
+// A policy change re-decides from the cached model answers: the second dry
+// run, under Clef's policy, asks again only what failed, registers a new recipe, and
+// holds the exact_repeat fix Jev's policy applies.
+func TestDryRunPolicyChange(t *testing.T) {
+	store, asker := runFixture(), runAsker()
+	run := func(p ShouldApplyParams) *Report {
+		t.Helper()
+		rep, err := DryRun(context.Background(), store, asker, RunOptions{
+			Scope: db.DecideScope{Sample: 50, Seed: "s"}, Concurrency: 2, Params: p,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+	jev := run(DefaultShouldApplyParams())
+	calls := asker.calls
+	_, clef, _ := PresetFor("clef:27b")
+	cl := run(clef)
+	if asker.calls != calls+1 {
+		// Only the outage is asked again: a failed call is never cached.
+		t.Errorf("the policy change made %d new model calls; the cache should serve all but the outage", asker.calls-calls)
+	}
+	if jev.RecipeID == cl.RecipeID {
+		t.Error("the policy change kept the recipe")
+	}
+	if jev.Outcomes[DecisionApply] != 2 || cl.Outcomes[DecisionApply] != 1 {
+		t.Errorf("applies: jev %d, clef %d; want 2 and 1", jev.Outcomes[DecisionApply], cl.Outcomes[DecisionApply])
+	}
+	if cl.Reasons[ReasonEvidenceExcluded] != 1 || cl.Reasons[ReasonJevReject] != 1 {
+		t.Errorf("clef reasons %v: want the exact_repeat fix held and the lowercase low-p fix rejected", cl.Reasons)
+	}
+	if cl.Policy[config.ParamRejectRequiresLowercase] != true {
+		t.Errorf("report policy %v", cl.Policy)
+	}
+}
+
 func TestDryRun(t *testing.T) {
 	store, asker := runFixture(), runAsker()
 	rep, err := DryRun(context.Background(), store, asker, RunOptions{
@@ -271,7 +308,9 @@ func TestReportGolden(t *testing.T) {
 		mk(IssueHomophone, DecisionHold, ReasonJevUnavailable, EvidenceNone, true, nil, false, 0, "timeout"),
 		mk(IssueNumberArtifact, DecisionHold, ReasonTypeCapped, EvidenceNone, true, p(0.98), false, 1000*time.Millisecond, ""),
 	}
-	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: 10, Seed: "golden"}}, strings.Repeat("ab", 32), items,
+	_, clef, _ := PresetFor("clef:27b")
+	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: 10, Seed: "golden"}, Params: clef,
+		PolicySource: "db (reject_floor) over preset clef"}, strings.Repeat("ab", 32), items,
 		map[string]int{IssueMisheardProperNoun: 200, IssueMisheardWord: 600, IssueRepeatedText: 50, IssueHomophone: 40, IssueNumberArtifact: 30, IssueDroppedWord: 9})
 
 	wrep := buildReport(RunOptions{Scope: db.DecideScope{Sample: 2000}}, strings.Repeat("ab", 32), items, nil)

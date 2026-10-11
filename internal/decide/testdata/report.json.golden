@@ -3,6 +3,16 @@
   "calibrate": false,
   "recipe_id": "abababababababababababababababababababababababababababababababab",
   "model": "jev-1.13.0",
+  "policy": {
+    "apply_evidence": [
+      "asin_verbatim"
+    ],
+    "apply_p": 0.85,
+    "reject_floor": 0.1,
+    "reject_p": 0.2,
+    "reject_requires_lowercase": true
+  },
+  "policy_source": "db (reject_floor) over preset clef",
   "seed": "golden",
   "requested": 10,
   "findings": 8,

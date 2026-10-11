@@ -150,7 +150,7 @@ func sweepAt(items []*item, p ShouldApplyParams, t float64) SweepRow {
 			continue
 		}
 		evidence := TextEvidence(it.input.Candidate, v, it.sentences)
-		switch d, _ := p.Decide(*it.outcome.P, evidence, it.finding.IssueType); d {
+		switch d, _ := p.Decide(*it.outcome.P, evidence, it.finding.IssueType, it.input.Candidate.Replacement); d {
 		case DecisionApply:
 			row.Apply++
 			if label == HumanAccepted {

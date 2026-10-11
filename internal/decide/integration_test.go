@@ -379,3 +379,50 @@ func TestIntegrationDecideApplyLockSkip(t *testing.T) {
 		t.Errorf("re-run %+v, cache hits %d, calls %d", again.Write, again.Jev.CacheHits, asker.calls)
 	}
 }
+
+// A decide policy stored in model_settings.params (JSONB: numbers, a boolean,
+// a list) round-trips into the same policy and recipe a run resolves — the
+// path `earmark models set decide --param …` then `earmark decide` takes.
+func TestIntegrationPolicyInModelSettings(t *testing.T) {
+	d, _ := integrationDB(t)
+	ctx := context.Background()
+	base := policyBase(config.ModelPin{})
+	params := map[string]any{
+		config.ParamRejectFloor:             0.05,
+		config.ParamRejectRequiresLowercase: true,
+		config.ParamApplyEvidence:           []string{EvidenceASINVerbatim},
+		config.ParamUSDPerMTokIn:            0.01,
+	}
+	if _, _, err := d.SetModelSetting(ctx, db.ModelSetting{Step: "decide", EndpointID: "litellm-s1", Model: "clef:27b",
+		Params: params}, "cli:test", "policy"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := db.ResolveStep(ctx, d, base, "decide", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := ResolvePolicy(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, want, _ := PresetFor("clef:27b")
+	want.RejectFloor = 0.05
+	if !slices.Equal(pol.Params.ApplyEvidence, want.ApplyEvidence) || pol.Params.RejectFloor != 0.05 ||
+		!pol.Params.RejectRequiresLowercase || pol.Params.ApplyP != want.ApplyP {
+		t.Errorf("stored policy %+v, want %+v", pol.Params, want)
+	}
+	if got := pol.SourceLabel(); got != "db (apply_evidence, reject_floor, reject_requires_lowercase) over preset clef" {
+		t.Errorf("source %q", got)
+	}
+	stored, _, err := CurrentRecipe(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := ShouldApplyFnFor(want, Model{Alias: "clef:27b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recipeID(t, stored) != recipeID(t, f.Recipe("")) {
+		t.Error("the stored policy's current recipe differs from the in-memory policy's")
+	}
+}
