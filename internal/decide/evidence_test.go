@@ -164,3 +164,58 @@ func TestTextEvidence(t *testing.T) {
 		})
 	}
 }
+
+// TestDecodeErrorDegradesPerBook: db.GetBookRecords no longer fails a batch
+// for one book whose chapters JSON does not decode — it returns that record
+// with DecodeError set and Chapters nil. Decide then reads it without its
+// chapters: that book loses the asin_verbatim evidence only its chapter
+// titles carried, and never gains a match it would not have had intact,
+// while another book in the same batch is unaffected.
+func TestDecodeErrorDegradesPerBook(t *testing.T) {
+	intact := hailMary()
+	intact.Chapters = append(intact.Chapters, metaprovider.Chapter{Title: "Petrova Line"})
+	other := &db.BookRecord{
+		ASIN: "B002V1OF70", Title: "Children of Dune", Author: "Frank Herbert",
+		Chapters:    []metaprovider.Chapter{{Title: "Sietch Tabr"}},
+		Description: "<p>Ghanima and Leto face Alia.</p>",
+	}
+	// The batch as GetBookRecords returns it after a decode error on the
+	// first book: same row, chapters dropped, the error recorded.
+	degraded := *intact
+	degraded.Chapters, degraded.DecodeError = nil, "chapters: unexpected end of JSON input"
+	batch := map[string]db.BookRecord{"/b/PHM": degraded, "/b/Dune": *other}
+
+	pass := Verdict{Pass: true}
+	evidence := func(r db.BookRecord, orig, repl string) string {
+		return TextEvidence(Candidate{IssueType: IssueMisheardProperNoun, Original: orig, Replacement: repl}, pass, RecordSentences(&r))
+	}
+	tests := []struct {
+		name, dir, orig, repl string
+		intact, degraded      string // evidence with the intact record vs the batch's record
+	}{
+		{"chapter-only name is lost", "/b/PHM", "pet rova line", "Petrova Line", EvidenceASINVerbatim, EvidenceNone},
+		{"name also in the description survives", "/b/PHM", "auto sebo", "Arecibo", EvidenceASINVerbatim, EvidenceASINVerbatim},
+		{"header field survives", "/b/PHM", "ray porta", "Ray Porter", EvidenceASINVerbatim, EvidenceASINVerbatim},
+		{"no match stays none", "/b/PHM", "holovo", "Holova", EvidenceNone, EvidenceNone},
+		{"other book's chapter is unaffected", "/b/Dune", "see etch tab", "Sietch Tabr", EvidenceASINVerbatim, EvidenceASINVerbatim},
+		{"other book's description is unaffected", "/b/Dune", "galena", "Ghanima", EvidenceASINVerbatim, EvidenceASINVerbatim},
+	}
+	full := map[string]*db.BookRecord{"/b/PHM": intact, "/b/Dune": other}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := evidence(*full[tc.dir], tc.orig, tc.repl); got != tc.intact {
+				t.Errorf("intact record: %s, want %s", got, tc.intact)
+			}
+			got := evidence(batch[tc.dir], tc.orig, tc.repl)
+			if got != tc.degraded {
+				t.Errorf("batch record: %s, want %s", got, tc.degraded)
+			}
+			if got == EvidenceASINVerbatim && tc.intact != EvidenceASINVerbatim {
+				t.Error("a degraded record gained a match")
+			}
+		})
+	}
+	if batch["/b/Dune"].DecodeError != "" || batch["/b/PHM"].DecodeError == "" {
+		t.Error("the decode error must stay on its own book")
+	}
+}

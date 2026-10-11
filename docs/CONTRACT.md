@@ -851,7 +851,8 @@ track under the book). It is **additive** — nothing in §1.1–§1.5 or §3 de
 on it, and a missing row never blocks the pipeline. Writer: **Go monitor**, at
 enqueue time via `MetadataProvider.Lookup`. Readers: the Python ASR runner reads
 `bias_terms` to drive NeMo word-boosting; the **Go MCP read path** reads
-`chapters` and `series` (see below).
+`chapters` and `series` (see below); the **eval judge**, when opted in to
+`judge@v3`, renders its Book record block from the row (§2.15 "Book context").
 
 ```sql
 CREATE TABLE IF NOT EXISTS book_metadata (
@@ -941,6 +942,7 @@ result.
 | **Python ASR runner** | before each transcription | `bias_terms` (NeMo word-boosting) |
 | **Go MCP layer** | per search-result book (`db.loadBookContext`, cached per `book_dir`) | `chapters`, `series` |
 | **Go MCP layer** | `list_books` (LEFT JOIN on `book_dir`) | `series` |
+| **Go eval judge** (only under the opt-in `judge@v3`, §2.15 "Book context") | once per judge run, before the first call (`db.GetBookRecords`, ≤256 dirs per query) | `asin`, `title`, `author`, `narrator`, `series`, `chapters`, `description`, `bias_terms` |
 
 `chapters` and `series` are read in a **single** `SELECT chapters, series FROM
 book_metadata WHERE book_dir = $1` per distinct book directory in a result set,
@@ -1414,15 +1416,27 @@ yet reported stale.
 
 **Current steps.** `scan` (when `AI_ROLES.scan` is bound): the `scan_chunk`
 function's recipe (§1.9 "Chunk scan") with the expected model answering.
-`propose`: `step_version` 2 (1 before the pre-filters, §2.15 "Noise filters"), prompt `judge@v2` + sha256 of
-(system prompt, user template, response JSON schema), params `temperature`
+`propose`: `step_version` 2 (1 before the pre-filters, §2.15 "Noise filters"), prompt `judge@v2` (the
+default) + sha256 of (system prompt, user template, response JSON schema), params `temperature`
 (**only when it is sent** — omitted for hosted routes unless configured, §2.15
 "Request parameters"), `min_confidence`, `max_findings_per_chunk`, and
 `reasoning_effort` / `chat_template_kwargs` **only when they differ from the
 route default** (§2.15 "Thinking controls"). `max_tokens`
 is deliberately not a param: a reply that hits it is an error, never findings. `embed`: `step_version` 1, params
 `chunk_size`, `dimensions`, `document_prefix`. Both take `expected_model` /
-`revision` from the model registry (§2.18).
+`revision` from the model registry (§2.18). The `judge@v2` recipe is
+byte-identical to the one before `judge@v3` existed (same prompts, hash and
+params), so its id is unchanged. **`judge@v3` is opt-in** until a labelled
+v2-vs-v3 A/B shows it is better (§2.15 "Book context"): selected for one run by
+`earmark eval --judge-prompt v3`, or for every judge of the deployment by the
+propose step's `judge_prompt` param (`earmark models set propose … --param
+judge_prompt=v3`, or MODELS_FILE `steps.propose.params.judge_prompt: v3`, §2.18
+/ §2.20; the flag outranks it). Its recipe differs: prompt `judge@v3` + sha256
+of (system prompt, user template, Book record layout, response JSON schema) —
+per-book content is not in the prompt hash; it is `book_context_sha256`, per
+transcript — and the extra param `book_context` (`record@v1`, the block's
+rendering rules). With the pin param set, the startup current recipe is the v3
+one. The default lives in one place, `eval.DefaultJudgePrompt`.
 
 **Legacy rows.** Migration 2 gives every pre-existing row one recipe per
 `(step, model)` with `step_version` 0 and `code_version` `legacy-unknown`,
@@ -3198,11 +3212,14 @@ NULL when the endpoint omits the field. In-pipeline and standalone eval events
 carry it as `detail.resolved_model`.
 
 Each finding also carries `recipe_id` (§1.9): the judge's `propose` recipe —
-requested model, the model that answered, prompt version `judge@v2` and the
-hash of every prompt part sent, and the confidence floor / per-chunk cap — so
-a fallback answer is a different, re-runnable recipe. Bump `judgePromptVersion`
-(`internal/eval/prompt.go`) whenever the prompt or response schema changes;
-`TestJudgePromptVersionPinned` fails until you do.
+requested model, the model that answered, prompt version (`judge@v2` by
+default, `judge@v3` when opted in) and the hash of every static prompt part sent, the confidence floor /
+per-chunk cap and, for v3, `book_context` — so a fallback answer is a
+different, re-runnable recipe. Bump the prompt version (`judgePromptVersionV2`
+/ `judgePromptVersionV3`, `internal/eval/prompt.go`) whenever its prompt, user
+template, Book record layout or the response schema changes;
+`TestJudgePromptVersionPinned` fails until you do. A change to how the Book
+record is rendered bumps `bookContextVersion` (`record@v1`) instead.
 
 #### `transcript_findings` table
 
@@ -3391,7 +3408,7 @@ earmark eval --backfill-eval-errors --limit 10 --write   # re-judge them
 earmark eval --backfill-eval-errors --write              # all of them
 ```
 
-#### Judge prompt (`judge@v2`)
+#### Judge prompt (`judge@v2` default; `judge@v3` opt-in)
 
 A finding is only worth a row if the decide step can act on it: rung 0 (§2.19)
 rejects a substitution whose changed words do not **sound** like the originals
@@ -3409,6 +3426,116 @@ types and the response schema are unchanged from v1. It replaced v1's
 repetitive don't-list at less than half the size — **1,105 → 501** cl100k
 tokens, so every call costs fewer input tokens — and
 `TestSystemPromptTokenBudget` fails if it grows past 520.
+
+`judge@v3` (**opt-in**, pending the A/B below) is v2 plus the book's
+catalogue record. Condition (2)
+names "the book record or book/track path" as name context, and one rule says
+what the record is for: *when the book record lists a name that the misheard
+words sound like, prefer the record's spelling; never change a word only
+because a record name exists — rule 1 still applies.* 542 cl100k tokens
+(`TestSystemPromptV3TokenBudget`, budget 560). Book context is read and sent
+only under v3. Selecting it:
+
+| Route | Scope |
+|---|---|
+| `earmark eval … --judge-prompt v3` (or `v2`) | this run only; outranks the pin param |
+| propose pin param `judge_prompt: v3` — `earmark models set propose --model <m> --param judge_prompt=v3`, or MODELS_FILE `steps.propose.params.judge_prompt` | every judge of the deployment: the in-pipeline worker, the dashboard's run-eval buttons, `--backfill-*` (the CronJob), and the startup current recipe |
+| neither | `judge@v2` (`eval.DefaultJudgePrompt`) |
+
+`judge_prompt` accepts `v2` / `v3` (or `judge@v2` / `judge@v3`); anything else
+is refused when the setting is applied or MODELS_FILE is loaded. Adopt v3 by
+default only after the labelled A/B passes — then flip
+`eval.DefaultJudgePrompt`, which changes the live judge's recipe on deploy.
+
+#### Book context
+
+Under `judge@v3` (opt-in) each chunk's user message is
+
+```
+Book/track: <file_path>
+<Book record block, or nothing>Span time: <start>s–<end>s
+
+Transcript span:
+<chunk text>
+```
+
+The block is rendered from the book's `book_metadata` row (`db.GetBookRecords`,
+keyed by `book_dir` = `filepath.Dir(file_path)`; §1.6) **only when the record
+has an ASIN** (identity resolved). A book with no row, no catalogue match, or
+an identity conflict (its catalogue columns are cleared at ingest, §1.6) gets no
+block — the message is then v2's byte for byte. For example:
+
+```
+Book record:
+- Title: Children of Dune
+- Author: Frank Herbert
+- Series: Dune #3
+- Narrator: Scott Brick, Simon Vance
+- Names: Leto, Preacher, Sietch Tabr Ambush, Ghanima Atreides, Alia, Arrakis, Bene Gesserit, Stilgar
+```
+
+Rules (`record@v1`, `internal/eval/bookcontext.go`):
+
+- **Budget.** The whole block — header lines included — stays within **200
+  cl100k tokens**, counted with the embedded offline tokenizer. There is no
+  fallback budget (it would render different bytes under the same
+  `record@v1`): if the tokenizer fails, that book's context is a
+  `record_error` (below). The output is deterministic.
+- **Header.** Title, author, series (`Name #N`, comma-joined), narrator, each
+  omitted when empty. Fields are clipped to the first rune cap of 80, 48, 32,
+  20 at which the header alone fits the budget, at a word boundary (a single
+  over-long word is cut), ending in `…`.
+- **Names.** Up to **40**, drawn in priority order from `bias_terms` (NULL
+  elements dropped), the chapter titles (in chapter order), then the
+  description (HTML tags stripped, script/style dropped, entities decoded), and
+  added whole while the block fits. A name is a run of capitalized words (mixed
+  case, ≥ 2 letters, no digits; an elided `d'`/`l'` is allowed: `d'Artagnan`).
+  Lowercase particles (`da`, `de`, `van`, `von`, `bin`, …) stay inside a run
+  between two name words (`Leonardo da Vinci`); a title or a first name that is
+  also a common word (`Lord`, `Sir`, `Dr`, `Will`, `May`, …) opens a run only
+  when a name word follows (`Lord Leto`, `Will Treaty`). Stopwords, number
+  words, all-caps words and roman numerals, and structural words (`Chapter`,
+  `Part`, `Book`, `Prologue`, …) break a run and never stand alone;
+  punctuation — an em or en dash included (`Leto—Ghanima` is two names) — and a
+  possessive end one. A single capitalized word that starts a sentence — or
+  sits in a Title Case chapter title — counts only when the same word is
+  capitalized mid-sentence elsewhere in the chapters or description. Curly and
+  straight apostrophes are the same (output uses `'`). Names are deduplicated
+  case-insensitively; a name already visible in a header field is skipped, and
+  so is one contained in another candidate (`Paul` when `Paul Atreides` is
+  listed, in either order), as are a few publisher-blurb phrases ("New York
+  Times").
+
+Per transcript the judge reports its **book context**: `source` =
+`asin_record` (the block was sent), `path_only`, or `record_error` (the book
+has an ASIN record that could not be used), and `book_context_sha256` =
+sha256 hex of the rendered block (`""` for `path_only`) — in
+`RunStats.BookContexts` (keyed by transcript id; with `RunStats.PromptVersion`),
+on each per-chunk `Result`, in `--dump`, and in a `--backfill-*` dry run's
+per-transcript line (`judge@v3 asin_record 1a2b3c4d`; under v2 every
+transcript is `path_only` and no record is read). They are not persisted
+yet. The records are read once per run (book / sample: the whole chunk set;
+backfill and the in-pipeline judge: per transcript), at most
+`db.MaxDecideBookBatch` (256) book dirs per query, before the first judge call.
+Failures never degrade to path-only (`eval.ErrBookContext`):
+
+- **The record read fails** (or a v3 judge has no record source at all): no
+  judge call is made. A book / sample run exits non-zero and a `--backfill-*`
+  run stops. The in-pipeline judge — gated or not — records it as an eval
+  failure, every chunk failed (`eval_failed_at`, `eval_error`, no latch): the
+  job leaves the gated eval pass's selection (no retry loop), an ungated job is
+  still embedded, and `--backfill-eval-errors` re-judges it later.
+- **One book's record is unusable** — its stored chapters JSON does not decode
+  (`db.BookRecord.DecodeError`; `GetBookRecords` never fails the batch for one
+  row), or rendering failed: that book's context is `record_error` and each of
+  its chunks fails with the reason, like a failed judge call, so only its
+  transcripts record an eval failure; other books are judged. (The decide step
+  reads the same record without its chapters — less reference text, so fewer
+  applies, never more.)
+
+There is no judge reply cache: every chunk is a fresh model call, so a reply
+can never be served across a different book context. A future cache must key on
+`book_context_sha256` as well as the recipe and chunk text.
 
 **Noise filters (applied per chunk, before persistence).** Three stages trim
 the judge's over-flagging, in this order:
@@ -3486,13 +3613,24 @@ library picks the same chunks in any build. `--dump <path>` (`-` = stdout, the
 report then goes to stderr; refused with `--write` and with `--backfill-*`)
 writes one JSON line per judged chunk: `chunk_id`, `transcript_id`,
 `file_path`, `chunk_index`, `text_chars`, `prompt_version`, `prompt_sha256`,
-`step_version`, `model`, `resolved_model`, `prompt_tokens` /
+`step_version`, `book_context_source` (`asin_record` / `path_only` /
+`record_error`),
+`book_context_sha256` (omitted for `path_only`; the block itself is not dumped),
+`model`, `resolved_model`, `prompt_tokens` /
 `completion_tokens` (the response `usage`; `null` when unreported), `cost_usd`
 (LiteLLM's `x-litellm-response-cost` header; `null` when absent), `latency_ms`,
 `error` (a skipped chunk, ≤300 runes), `findings` and `dropped` (each
 `original`, `correction`, `issue_type`, `confidence`; dropped ones with their
 `reason`). Kept plus dropped is everything the judge returned, so two dumps
 join on `chunk_id` and the old build's raw output can be re-filtered offline.
+
+A/B of the judge prompt on one build (same chunks; diff the two dumps on
+`chunk_id`) — the evidence `judge@v3` needs before it becomes the default:
+
+```bash
+earmark eval --seed q4 --sample 300 --dump /tmp/v2.jsonl --judge-prompt v2
+earmark eval --seed q4 --sample 300 --dump /tmp/v3.jsonl --judge-prompt v3
+```
 
 **Clearing.** Findings only accumulate (re-running eval appends); the `/findings`
 dashboard page exposes a token-gated **clear findings** button (and the
@@ -4339,7 +4477,7 @@ steps:
 | `expected_model` | the model the endpoint should report serving; the current recipe's `model_resolved`. Unset → the requested model |
 | `revision` | HF commit / `.nemo` sha256 / Ollama digest / provider snapshot |
 | `prompt_version` | the prompt version this deployment expects; the code's own version is authoritative, a mismatch is logged |
-| `params` | optional step settings. Known keys: `usd_per_mtok_in` (any step; used by decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14); `reasoning_effort`, `chat_template_kwargs` and `temperature` (propose only) — the judge's per-model request knobs (§2.15 "Thinking controls"); on `decide` only, the decide policy keys `apply_p`, `reject_p`, `reject_floor` (numbers in [0, 1]), `reject_requires_lowercase` (boolean) and `apply_evidence` (a list, or a comma-separated string, of evidence kinds) — §2.19 "Decide policy". An unknown key, a key the step does not accept, or a bad value is a startup error; a decide policy that is invalid once merged (e.g. `reject_p ≥ apply_p`) fails every decide run |
+| `params` | optional step settings. Known keys: `usd_per_mtok_in` (any step; used by decide, scan) — a non-negative number, the System One input price used when the gateway reports no cost (§2.14); `reasoning_effort`, `chat_template_kwargs` and `temperature` (propose only) — the judge's per-model request knobs (§2.15 "Thinking controls"); `judge_prompt` (propose only) — `v2` (the default) or `v3`, the judge prompt version (§2.15 "Book context"); on `decide` only, the decide policy keys `apply_p`, `reject_p`, `reject_floor` (numbers in [0, 1]), `reject_requires_lowercase` (boolean) and `apply_evidence` (a list, or a comma-separated string, of evidence kinds) — §2.19 "Decide policy". An unknown key, a key the step does not accept, or a bad value is a startup error; a decide policy that is invalid once merged (e.g. `reject_p ≥ apply_p`) fails every decide run |
 
 Because `expected_model` becomes the current recipe's `model_resolved`, a
 response served by any other model (a LiteLLM fallback, or an alias silently
@@ -4888,7 +5026,7 @@ step is off). An override never writes `model_settings`.
 it, plus optional pins with `MODELS_FILE` semantics (§2.18):
 `expected_model`, `revision`, `params` (known: `usd_per_mtok_in`; on
 `propose` also `reasoning_effort`, `chat_template_kwargs` and `temperature`, §2.15 "Thinking
-controls"; on `decide` also the decide policy keys, §2.19 "Decide policy"). URLs and
+controls", and `judge_prompt` (`v2` default / `v3`), §2.15 "Book context"; on `decide` also the decide policy keys, §2.19 "Decide policy"). URLs and
 keys are never stored: where to connect and with which credential stays in
 the env registry, so a setting can only choose among endpoints the deployment
 already declares. Applying it (`config.(*Config).WithStepSettings`) returns a

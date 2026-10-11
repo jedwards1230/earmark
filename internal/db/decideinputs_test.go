@@ -53,21 +53,32 @@ func TestGetBookRecords(t *testing.T) {
 
 	mock := newMockPool(t)
 	mock.ExpectQuery(`FROM book_metadata`).WithArgs([]string{"/b/PHM", "/b/Libro"}).
-		WillReturnRows(pgxmock.NewRows([]string{"book_dir", "asin", "title", "author", "narrator", "series", "chapters", "description"}).
+		WillReturnRows(pgxmock.NewRows([]string{"book_dir", "asin", "title", "author", "narrator", "series", "chapters", "description", "bias_terms"}).
 			AddRow("/b/PHM", "B08GB58KD5", "Project Hail Mary", "Andy Weir", "Ray Porter", "Standalone #1",
-				[]byte(`[{"Index":0,"Title":"Chapter 1","StartSec":0,"EndSec":10}]`), "<p>Blurb.</p>").
-			AddRow("/b/Libro", "", "Some Book", "", "", "", []byte(nil), ""))
+				[]byte(`[{"Index":0,"Title":"Chapter 1","StartSec":0,"EndSec":10}]`), "<p>Blurb.</p>",
+				[]string{"Andy", "Weir", "Andy Weir"}).
+			AddRow("/b/Libro", "", "Some Book", "", "", "", []byte(nil), "", []string{}).
+			AddRow("/b/Bad", "B000BAD", "Bad", "", "", "", []byte(`{`), "", []string{}))
 	got, err := getBookRecords(ctx, mock, []string{"/b/PHM", "/b/Libro"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	phm := got["/b/PHM"]
 	if phm.ASIN != "B08GB58KD5" || phm.Narrator != "Ray Porter" || len(phm.Series) != 1 || phm.Series[0].Name != "Standalone" ||
-		len(phm.Chapters) != 1 || phm.Chapters[0].Title != "Chapter 1" || phm.Description != "<p>Blurb.</p>" {
+		len(phm.Chapters) != 1 || phm.Chapters[0].Title != "Chapter 1" || phm.Description != "<p>Blurb.</p>" ||
+		strings.Join(phm.BiasTerms, "|") != "Andy|Weir|Andy Weir" {
 		t.Errorf("phm = %+v", phm)
 	}
-	if lib := got["/b/Libro"]; lib.ASIN != "" || lib.Chapters != nil || lib.Series != nil {
+	if lib := got["/b/Libro"]; lib.ASIN != "" || lib.Chapters != nil || lib.Series != nil || lib.BiasTerms != nil || lib.DecodeError != "" {
 		t.Errorf("libro = %+v", lib)
+	}
+	// One undecodable chapters row does not fail the batch: that record
+	// carries the error, the others are intact.
+	if bad := got["/b/Bad"]; bad.ASIN != "B000BAD" || bad.Chapters != nil || !strings.Contains(bad.DecodeError, "chapters") {
+		t.Errorf("bad = %+v", bad)
+	}
+	if phm.DecodeError != "" {
+		t.Errorf("phm decode error = %q", phm.DecodeError)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
@@ -92,10 +103,11 @@ func TestIntegrationDecideInputs(t *testing.T) {
 		  ('`+t1+`', '00000000-0000-0000-0000-00000000000a', '/b/PHM/01.m4b', 'c1', 'en', 10,
 		   '[{"id":0,"start":0,"end":2,"text":"the dish at auto sebo","words":[]},{"id":1,"start":2,"end":4,"text":"picked it up","words":[]}]', 'x', 'parakeet'),
 		  ('`+t2+`', '00000000-0000-0000-0000-00000000000b', '/b/Libro/01.m4b', 'c2', 'en', 10, '[]', 'x', 'parakeet');
-		INSERT INTO book_metadata (book_dir, title, author, narrator, series, asin, chapters, description) VALUES
+		INSERT INTO book_metadata (book_dir, title, author, narrator, series, asin, chapters, description, bias_terms) VALUES
 		  ('/b/PHM', 'Project Hail Mary', 'Andy Weir', 'Ray Porter', 'Standalone #1', 'B08GB58KD5',
-		   '[{"Index":0,"Title":"The Arecibo Message","StartSec":0,"EndSec":10}]', '<p>Arecibo.</p>'),
-		  ('/b/Libro', 'Some Book', NULL, NULL, NULL, NULL, NULL, NULL);`)
+		   '[{"Index":0,"Title":"The Arecibo Message","StartSec":0,"EndSec":10}]', '<p>Arecibo.</p>',
+		   ARRAY['Andy',NULL,'Weir','Andy Weir']),
+		  ('/b/Libro', 'Some Book', NULL, NULL, NULL, NULL, NULL, NULL, NULL);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,10 +128,10 @@ func TestIntegrationDecideInputs(t *testing.T) {
 		t.Fatalf("records = %+v", recs)
 	}
 	if r := recs["/b/PHM"]; r.ASIN != "B08GB58KD5" || len(r.Chapters) != 1 || r.Chapters[0].Title != "The Arecibo Message" ||
-		len(r.Series) != 1 || !strings.Contains(r.Description, "Arecibo") {
+		len(r.Series) != 1 || !strings.Contains(r.Description, "Arecibo") || strings.Join(r.BiasTerms, "|") != "Andy|Weir|Andy Weir" {
 		t.Errorf("phm = %+v", r)
 	}
-	if r := recs["/b/Libro"]; r.ASIN != "" || r.Title != "Some Book" || r.Chapters != nil {
+	if r := recs["/b/Libro"]; r.ASIN != "" || r.Title != "Some Book" || r.Chapters != nil || r.BiasTerms != nil {
 		t.Errorf("libro = %+v", fmt.Sprint(r))
 	}
 }

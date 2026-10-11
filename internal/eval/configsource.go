@@ -72,7 +72,10 @@ func ConfigSource(cfg *config.Config) EvalEndpointSource {
 
 // NewJudgeForConfig is NewJudge plus the model registry's propose pin
 // (MODELS_FILE, CONTRACT §2.18), so the judge's recipe records the expected
-// model and revision. A nil cfg is a plain NewJudge.
+// model and revision, and the pin's judge_prompt param (a model_settings row
+// or MODELS_FILE steps.propose.params) selects the prompt version — absent,
+// DefaultJudgePrompt. A run's --judge-prompt outranks it (SetPrompt after
+// this). A nil cfg is a plain NewJudge.
 func NewJudgeForConfig(chat ChatClient, cfg *config.Config) *Judge {
 	j := NewJudge(chat)
 	pin := cfg.ModelPin(recipe.StepPropose)
@@ -84,10 +87,23 @@ func NewJudgeForConfig(chat ChatClient, cfg *config.Config) *Judge {
 		j.logger.Info("no MODELS_FILE expected_model pin for the judge; the current propose recipe expects the endpoint to report the requested model id",
 			"requested", chat.Model())
 	}
-	if pin.PromptVersion != "" && pin.PromptVersion != judgePromptVersion {
-		j.logger.Warn("MODELS_FILE pins a different judge prompt version than this build runs",
-			"pinned", pin.PromptVersion, "running", judgePromptVersion)
+	if v, ok := pin.Params[config.ParamJudgePrompt]; ok {
+		// Validated when the pin was loaded or the setting applied; a value
+		// that slipped past (a hand-built config) keeps the default, loudly.
+		p, err := config.JudgePromptParam(v)
+		if err == nil {
+			j.prompt, err = ParseJudgePrompt(p)
+		}
+		if err != nil {
+			j.prompt = DefaultJudgePrompt
+			j.logger.Error("invalid propose params.judge_prompt; the judge runs the default prompt",
+				"value", v, "default", DefaultJudgePrompt.Version(), "error", err)
+		}
 	}
+	// The registry's prompt_version is checked against the prompt the judge
+	// runs, now and again whenever SetPrompt selects another (--judge-prompt).
+	j.pinnedPrompt = pin.PromptVersion
+	j.warnPinnedPrompt()
 	return j
 }
 

@@ -987,3 +987,80 @@ func TestRunBackfill_WriteFailuresAfterJudgingAreFailures(t *testing.T) {
 		})
 	}
 }
+
+// fakeBookRecords serves book records to a judge@v3 backfill.
+type fakeBookRecords struct {
+	recs map[string]db.BookRecord
+	err  error
+}
+
+func (f fakeBookRecords) GetBookRecords(_ context.Context, dirs []string) (map[string]db.BookRecord, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := map[string]db.BookRecord{}
+	for _, d := range dirs {
+		if r, ok := f.recs[d]; ok {
+			out[d] = r
+		}
+	}
+	return out, nil
+}
+
+// TestRunBackfill_BookContext: a backfill reports, per transcript, the prompt
+// and book context it judged with; a failed record read stops the backfill
+// instead of judging path-only.
+func TestRunBackfill_BookContext(t *testing.T) {
+	transcripts := func() []*db.Transcript {
+		return []*db.Transcript{
+			{ID: "t1", JobID: "j1", FilePath: "/books/Dune/01.m4b", RawText: "the spice must flow"},
+			{ID: "t2", JobID: "j2", FilePath: "/books/Unmatched/01.m4b", RawText: "hello there"},
+		}
+	}
+	recs := map[string]db.BookRecord{"/books/Dune": {BookDir: "/books/Dune", ASIN: "B0011UGNDG", Title: "Dune", Author: "Frank Herbert"}}
+	bc, err := evalpkg.NewBookContext(&db.BookRecord{ASIN: "B0011UGNDG", Title: "Dune", Author: "Frank Herbert"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := bc.SHA256
+	cfg := &config.Config{ChunkSize: 32, EvalGatesEmbed: true}
+
+	for _, tt := range []struct {
+		prompt     evalpkg.JudgePrompt
+		want, also string
+	}{
+		{evalpkg.JudgePromptV3, "judge@v3 asin_record " + sha[:8], "judge@v3 path_only"},
+		{evalpkg.JudgePromptV2, "judge@v2 path_only", "judge@v2 path_only"},
+	} {
+		t.Run(string(tt.prompt), func(t *testing.T) {
+			judge := evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[]}`})
+			if err := judge.SetPrompt(tt.prompt); err != nil {
+				t.Fatal(err)
+			}
+			judge.SetBookRecords(fakeBookRecords{recs: recs})
+			var out strings.Builder
+			if err := runBackfill(context.Background(), &out, &fakeBackfillDB{transcripts: transcripts()}, judge, cfg, backfillOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(out.String(), "\n")
+			if !strings.Contains(lines[0], "01.m4b") || !strings.Contains(lines[0], tt.want) || !strings.Contains(lines[1], tt.also) {
+				t.Errorf("want %q then %q in:\n%s", tt.want, tt.also, out.String())
+			}
+		})
+	}
+
+	judge := evalpkg.NewJudge(fakeBackfillChat{resp: `{"findings":[]}`})
+	if err := judge.SetPrompt(evalpkg.JudgePromptV3); err != nil {
+		t.Fatal(err)
+	}
+	judge.SetBookRecords(fakeBookRecords{err: errors.New("records unavailable")})
+	fdb := &fakeBackfillDB{transcripts: transcripts()}
+	var out strings.Builder
+	err = runBackfill(context.Background(), &out, fdb, judge, cfg, backfillOptions{write: true})
+	if err == nil || !strings.Contains(err.Error(), "records unavailable") {
+		t.Fatalf("err = %v, want the record read error", err)
+	}
+	if len(fdb.evalMetrics) != 0 || len(fdb.findings) != 0 {
+		t.Errorf("a failed record read wrote %d metrics / %d findings", len(fdb.evalMetrics), len(fdb.findings))
+	}
+}

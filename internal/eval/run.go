@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/jedwards1230/earmark/internal/db"
@@ -56,6 +57,14 @@ type RunStats struct {
 	// Dropped counts, per drop reason (Drop* constants), the findings the
 	// judge returned that never became rows. nil when none were dropped.
 	Dropped map[string]int
+	// PromptVersion is the judge prompt the run used (judge@v2 / judge@v3).
+	PromptVersion string
+	// BookContexts is the book context each transcript's chunks were judged
+	// with, keyed by transcript id: source (asin_record / path_only /
+	// record_error) and
+	// book_context_sha256 (CONTRACT §2.15 "Book context"). Every transcript
+	// the run selected is present, judged or not. Not persisted yet.
+	BookContexts map[string]BookContext
 }
 
 // addDropped folds one chunk's drops into s.Dropped.
@@ -117,7 +126,13 @@ func Run(ctx context.Context, reader ChunkReader, judge *Judge, writer FindingWr
 	if err != nil {
 		return nil, RunStats{}, err
 	}
-	return runChunks(ctx, judge, writer, chunks, opts.Write, opts.Observe)
+	records := judge.records
+	if records == nil {
+		// db.DB is both: a judge wired to no record source reads them through
+		// the run's chunk reader.
+		records, _ = reader.(BookRecordReader)
+	}
+	return runChunks(ctx, judge, records, writer, chunks, opts.Write, opts.Observe)
 }
 
 // RunOnChunks judges an already-resolved set of chunks (e.g. the in-memory
@@ -127,20 +142,52 @@ func Run(ctx context.Context, reader ChunkReader, judge *Judge, writer FindingWr
 // Used by the in-pipeline eval path so eval can run on chunks that are not yet
 // in transcript_chunks (their UUIDs are caller-assigned and consistent with the
 // rows the worker subsequently inserts).
+//
+// A book-context prompt reads the chunks' book records through the judge's
+// record source (SetBookRecords).
 func RunOnChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks []db.EvalChunk, write bool) ([]db.Finding, RunStats, error) {
-	return runChunks(ctx, judge, writer, chunks, write, nil)
+	return runChunks(ctx, judge, judge.records, writer, chunks, write, nil)
 }
 
 // runChunks is the shared judge-collect-persist core behind Run and RunOnChunks.
 // A transient per-chunk judge error skips that chunk (logged) and the run
 // continues; a cancelled/expired context aborts but returns the findings
 // gathered so far. Findings are persisted only under the write gate.
-func runChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks []db.EvalChunk, write bool,
+//
+// Under a book-context prompt the chunks' book records are read once, before
+// the first judge call (GetBookRecords in batches of db.MaxDecideBookBatch
+// dirs). A read error, or no record source at all, fails the run before any
+// paid call (ErrBookContext) — it never silently judges path_only. A book
+// whose own record is unusable (BookContextRecordError) is not judged: each
+// of its chunks is skipped with the reason, like a failed judge call, so only
+// that book's transcripts record an eval failure.
+func runChunks(ctx context.Context, judge *Judge, records BookRecordReader, writer FindingWriter, chunks []db.EvalChunk, write bool,
 	observe func(Result, error)) ([]db.Finding, RunStats, error) {
 	var all []db.Finding
-	var stats RunStats
+	stats := RunStats{PromptVersion: judge.prompt.Version()}
+	contexts, err := judge.bookContextsFor(ctx, records, chunks)
+	if err != nil {
+		return nil, stats, err
+	}
 	for _, c := range chunks {
-		res, jerr := judge.JudgeChunk(ctx, c)
+		bc := pathOnlyContext
+		if v, ok := contexts[filepath.Dir(c.FilePath)]; ok {
+			bc = v
+		}
+		if stats.BookContexts == nil {
+			stats.BookContexts = map[string]BookContext{}
+		}
+		stats.BookContexts[c.TranscriptID] = bc
+	}
+	for _, c := range chunks {
+		bc := stats.BookContexts[c.TranscriptID]
+		var res Result
+		var jerr error
+		if bc.err != nil {
+			res, jerr = Result{Chunk: c, PromptVersion: judge.prompt.Version(), BookContext: bc}, bc.err
+		} else {
+			res, jerr = judge.JudgeChunkWithBook(ctx, c, bc)
+		}
 		if observe != nil {
 			observe(res, jerr)
 		}
@@ -176,6 +223,20 @@ func runChunks(ctx context.Context, judge *Judge, writer FindingWriter, chunks [
 		stats.Persisted = true
 	}
 	return all, stats, nil
+}
+
+// bookContextsFor reads the book contexts of chunks' books when the judge's
+// prompt carries one; nil (every chunk path_only) otherwise. A book-context
+// prompt with no record source is an error (ErrBookContext): judging every
+// chunk path_only under that prompt's recipe would misstate what it saw.
+func (j *Judge) bookContextsFor(ctx context.Context, records BookRecordReader, chunks []db.EvalChunk) (map[string]BookContext, error) {
+	if !j.prompt.usesBookContext() || len(chunks) == 0 {
+		return nil, nil
+	}
+	if records == nil {
+		return nil, fmt.Errorf("%w: %s needs book records but the judge has no record source", ErrBookContext, j.prompt.Version())
+	}
+	return bookContexts(ctx, records, chunks)
 }
 
 // selectChunks resolves the chunk set for a run from the options.

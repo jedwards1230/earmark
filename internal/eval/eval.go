@@ -154,6 +154,17 @@ type Judge struct {
 	pin ModelPin
 	// resolvedWarn fires the not-the-expected-model warning once per judge.
 	resolvedWarn sync.Once
+	// prompt is the judge prompt version this judge runs (DefaultJudgePrompt
+	// unless SetPrompt chose another).
+	prompt JudgePrompt
+	// records is where a book-context prompt reads book records (nil: Run
+	// falls back to its ChunkReader when that implements BookRecordReader).
+	records BookRecordReader
+	// pinnedPrompt is MODELS_FILE's steps.propose.prompt_version ("" unset).
+	pinnedPrompt string
+	// warnedPrompt is the running version warnPinnedPrompt last warned
+	// about ("" none), so the same mismatch is logged once.
+	warnedPrompt string
 }
 
 // ModelPin is the model registry's pin for the judge: the model expected to
@@ -179,12 +190,50 @@ func NewJudge(chat ChatClient) *Judge {
 		logger:      log.NewLogger("eval"),
 		maxPerChunk: maxFindingsPerChunk(),
 		minConf:     minConfidence(),
+		prompt:      DefaultJudgePrompt,
 	}
 }
 
 // SetModelPin records the registry pin for the propose step; it feeds the
 // judge's recipe.
 func (j *Judge) SetModelPin(pin ModelPin) { j.pin = pin }
+
+// SetPrompt selects the judge prompt version (an A/B run's
+// `--judge-prompt v3`). Call it before judging: the prompt is part of the
+// recipe every finding is stamped with. "" is DefaultJudgePrompt; any value
+// but JudgePromptV2 / JudgePromptV3 is refused and leaves the judge as it was.
+func (j *Judge) SetPrompt(p JudgePrompt) error {
+	if p == "" {
+		p = DefaultJudgePrompt
+	}
+	if !p.known() {
+		return fmt.Errorf("unknown judge prompt %q (want v2 or v3)", string(p))
+	}
+	j.prompt = p
+	j.warnPinnedPrompt()
+	return nil
+}
+
+// Prompt is the judge prompt version this judge runs.
+func (j *Judge) Prompt() JudgePrompt { return j.prompt }
+
+// SetBookRecords sets where a book-context prompt (judge@v3) reads book
+// records. db.DB implements BookRecordReader.
+func (j *Judge) SetBookRecords(r BookRecordReader) { j.records = r }
+
+// warnPinnedPrompt warns when MODELS_FILE pins a different judge prompt
+// version than this judge runs (the pin is advisory; the judge's own
+// version is what its recipe records).
+// It warns once per running version, so constructing the judge and then
+// applying --judge-prompt never repeats the same warning.
+func (j *Judge) warnPinnedPrompt() {
+	running := j.prompt.Version()
+	if j.pinnedPrompt != "" && j.pinnedPrompt != running && j.warnedPrompt != running {
+		j.warnedPrompt = running
+		j.logger.Warn("MODELS_FILE pins a different judge prompt version than this judge runs",
+			"pinned", j.pinnedPrompt, "running", j.prompt.Version())
+	}
+}
 
 // Recipe is the judge's CURRENT recipe (CONTRACT §1.9): what it asks for, the
 // model expected to answer (the registry's pin, else the requested model), the
@@ -202,8 +251,8 @@ func (j *Judge) Recipe() recipe.Recipe {
 		ModelAlias:    model,
 		ModelResolved: expected,
 		ModelRevision: j.pin.Revision,
-		PromptVersion: judgePromptVersion,
-		PromptSHA256:  judgePromptSHA256(),
+		PromptVersion: j.prompt.Version(),
+		PromptSHA256:  j.prompt.sha256(),
 		Params:        j.recipeParams(),
 	}
 }
@@ -216,11 +265,17 @@ func (j *Judge) Recipe() recipe.Recipe {
 // default (Thinking.recipeParams), so a reasoning change is a new recipe while
 // default judges keep their id. max_tokens is not
 // a param — it bounds the reply's length, and a reply that hits it is an error
-// (ErrTruncatedResponse), never a finding set.
+// (ErrTruncatedResponse), never a finding set. A book-context prompt
+// (judge@v3) adds book_context, the block's rendering version, so a change to
+// how records are rendered is a new recipe; judge@v2 has no such key, keeping
+// its recipe id unchanged.
 func (j *Judge) recipeParams() map[string]any {
 	params := map[string]any{
 		"min_confidence":         j.minConf,
 		"max_findings_per_chunk": j.maxPerChunk,
+	}
+	if j.prompt.usesBookContext() {
+		params["book_context"] = bookContextVersion
 	}
 	if t := j.sentTemperature(); t != nil {
 		params["temperature"] = *t
@@ -282,6 +337,11 @@ type Result struct {
 	// Dropped is every finding the judge returned that did not become a row,
 	// with the reason.
 	Dropped []Dropped
+	// PromptVersion is the judge prompt the chunk was judged with.
+	PromptVersion string
+	// BookContext is the book context the prompt carried (path_only for
+	// judge@v2 and for books without a usable record).
+	BookContext BookContext
 }
 
 // Usage is one judge call's accounting: token counts from the response's
@@ -299,12 +359,27 @@ func usageOf(c Completion) Usage {
 		CostUSD: c.CostUSD, HasCost: c.HasCost}
 }
 
-// JudgeChunk evaluates a single chunk: build the prompt, call the model, parse
-// the response, and map suspected errors into db.Finding rows (attributed to the
-// chunk, its transcript, and its run). It performs NO database writes — the
-// caller persists via FindingWriter only when not in dry-run.
+// JudgeChunk evaluates a single chunk with no book record (path_only); see
+// JudgeChunkWithBook.
 func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) {
-	system, user := buildPrompt(c)
+	return j.JudgeChunkWithBook(ctx, c, pathOnlyContext)
+}
+
+// JudgeChunkWithBook evaluates a single chunk: build the prompt (with bc, the
+// chunk's book context, when the prompt version carries one), call the model,
+// parse the response, and map suspected errors into db.Finding rows
+// (attributed to the chunk, its transcript, and its run). It performs NO
+// database writes — the caller persists via FindingWriter only when not in
+// dry-run.
+func (j *Judge) JudgeChunkWithBook(ctx context.Context, c db.EvalChunk, bc BookContext) (Result, error) {
+	if !j.prompt.usesBookContext() {
+		bc = pathOnlyContext
+	}
+	if bc.err != nil {
+		return Result{Chunk: c, PromptVersion: j.prompt.Version(), BookContext: bc}, bc.err
+	}
+	system, user := buildPrompt(j.prompt, c, bc)
+	base := Result{Chunk: c, PromptVersion: j.prompt.Version(), BookContext: bc}
 	var ep Endpoint
 	if er, ok := j.chat.(EndpointReporter); ok {
 		ep = er.Endpoint()
@@ -320,7 +395,8 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 	}
 	endChatSpan(ctx, span, j.chat.Model(), j.pin.ExpectedModel, comp, recipeID, err)
 	if err != nil {
-		return Result{Chunk: c, Usage: usageOf(comp), Elapsed: elapsed}, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
+		base.Usage, base.Elapsed = usageOf(comp), elapsed
+		return base, fmt.Errorf("judge chunk %s: %w", c.ChunkID, err)
 	}
 	if resolved != "" && resolved != j.chat.Model() {
 		j.logger.DebugContext(ctx, "judge request served by a different model id",
@@ -337,7 +413,8 @@ func (j *Judge) JudgeChunk(ctx context.Context, c db.EvalChunk) (Result, error) 
 		})
 	}
 
-	res := Result{Chunk: c, ResolvedModel: resolved, Usage: usageOf(comp), Elapsed: elapsed}
+	res := base
+	res.ResolvedModel, res.Usage, res.Elapsed = resolved, usageOf(comp), elapsed
 	parsed, dropped, perr := parseFindings(comp.Content)
 	if perr != nil {
 		// A malformed judge response is a soft failure: log and treat the chunk

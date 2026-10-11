@@ -220,13 +220,26 @@ func NewWorker(q *queue.Queue, database DBInterface, cfg *config.Config) *Worker
 			w.log.Warn("EVAL_IN_PIPELINE set but no eval chat endpoint resolved — inline eval disabled",
 				"error", err)
 		} else {
-			w.judge = eval.NewJudgeForConfig(chat, cfg)
+			w.judge = w.newJudge(chat, cfg)
 			w.log.Info("in-pipeline eval enabled", "judge_model", chat.Model(),
 				"eval_gates_embed", cfg.EvalGatesEmbed)
 		}
 		w.activeJudge = judgeKey(cfg)
 	}
 	return w
+}
+
+// newJudge builds the in-pipeline judge for cfg. The judge reads its book
+// records (judge@v3's book context) through the worker's database when that
+// can serve them (db.DB does). A judge@v3 judge without one fails every run
+// (eval.ErrBookContext, recorded as an eval failure) rather than judging
+// path-only.
+func (w *Worker) newJudge(chat eval.ChatClient, cfg *config.Config) *eval.Judge {
+	j := eval.NewJudgeForConfig(chat, cfg)
+	if br, ok := w.db.(eval.BookRecordReader); ok {
+		j.SetBookRecords(br)
+	}
+	return j
 }
 
 // judgeKey identifies everything about the propose step a runtime setting
@@ -317,7 +330,7 @@ func (w *Worker) applyConfig(eff *config.Config) error {
 				w.log.Warn("in-pipeline eval disabled: the env config has no usable eval chat endpoint", "error", err)
 				return w.applyEmbed(eff)
 			}
-			w.judge = eval.NewJudgeForConfig(chat, eff)
+			w.judge = w.newJudge(chat, eff)
 			w.activeJudge = key
 			w.log.Info("in-pipeline judge follows the model settings", "step", eff.DescribeStep(recipe.StepPropose))
 		}
@@ -846,7 +859,9 @@ type judgeOutcome struct {
 	findings []db.Finding
 	stats    eval.RunStats
 	// err is non-nil only when the run was stopped by the worker's context
-	// (shutdown); per-chunk judge errors are counted in stats instead.
+	// (shutdown); per-chunk judge errors — and a book context the judge could
+	// not get (eval.ErrBookContext), counted as every chunk failing — are in
+	// stats instead.
 	err        error
 	chunks     int
 	started    time.Time
@@ -901,6 +916,16 @@ func (w *Worker) judgeChunks(t *db.Transcript, chunks []db.Chunk) *judgeOutcome 
 	})
 	o.findings, o.stats, o.err = eval.RunOnChunks(w.ctx, w.judge, nil, evalChunks, false)
 	o.finished = time.Now()
+	if o.err != nil && w.ctx.Err() == nil && errors.Is(o.err, eval.ErrBookContext) {
+		// judge@v3 could not get the book context (record read failed, no
+		// record source): nothing was judged. It is a judge failure like an
+		// outage — every chunk failed — so it is RECORDED (eval_failed_at /
+		// eval_error, no latch) on the gated and ungated paths alike: the job
+		// leaves the eval pass's selection (no hot loop) and stays
+		// re-judgeable by --backfill-eval-errors.
+		o.stats.ChunksEvaluated, o.stats.ChunksSkipped = 0, len(evalChunks)
+		o.stats.FirstError, o.findings, o.err = o.err.Error(), nil, nil
+	}
 	detail := map[string]any{
 		"evaluated": o.stats.ChunksEvaluated,
 		"skipped":   o.stats.ChunksSkipped,

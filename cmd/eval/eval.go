@@ -64,6 +64,10 @@ type options struct {
 	// propose step's model for this run only (CONTRACT §2.20).
 	overrideEndpoint string
 	overrideModel    string
+	// judgePrompt is --judge-prompt: the judge prompt version (v2 | v3;
+	// "" = the propose pin's judge_prompt param, else the default v2).
+	// CONTRACT §2.15 "Book context".
+	judgePrompt string
 }
 
 var opts options
@@ -133,7 +137,18 @@ Model: the judge runs on the propose step's effective model (CONTRACT §2.20):
 models set propose ...'), else AI_ROLES.eval. --model alone keeps the
 endpoint; --endpoint alone uses that endpoint's own model. A different model
 is a different propose recipe. Neither flag writes model_settings.
-  earmark eval --sample 200 --seed q4 --dump /tmp/qwen.jsonl --model ollama/qwen3.8:27b-q8_0`,
+  earmark eval --sample 200 --seed q4 --dump /tmp/qwen.jsonl --model ollama/qwen3.8:27b-q8_0
+
+Prompt: --judge-prompt selects the judge prompt version for this run (CONTRACT
+§2.15 "Book context"); without it the propose pin's judge_prompt param decides
+('earmark models set propose ... --param judge_prompt=v3'), else v2. v2 (the
+default) is the path-only prompt. v3 (opt-in until a labelled A/B shows it is
+better) adds the book's catalogue record — title, author, series, narrator and
+up to 40 names — to each chunk's message when the book's identity is resolved
+(an ASIN); other books get the path-only message. --dump records
+prompt_version, book_context_source and book_context_sha256 per chunk:
+  earmark eval --seed q4 --sample 300 --dump /tmp/v2.jsonl --judge-prompt v2
+  earmark eval --seed q4 --sample 300 --dump /tmp/v3.jsonl --judge-prompt v3`,
 	Run: runEval,
 }
 
@@ -156,6 +171,8 @@ func init() {
 		"this run only: the AI_ENDPOINTS id (a chat endpoint) the judge calls (default: the propose step's effective endpoint)")
 	EvalCmd.Flags().StringVar(&opts.overrideModel, "model", "",
 		"this run only: the model id the judge requests (default: the propose step's effective model)")
+	EvalCmd.Flags().StringVar(&opts.judgePrompt, "judge-prompt", "",
+		"judge prompt version for this run: v2 (default; path only) or v3 (opt-in; adds the book's catalogue record). Default: the propose pin's judge_prompt param, else v2")
 	EvalCmd.MarkFlagsMutuallyExclusive("backfill-unevaluated", "backfill-eval-errors")
 }
 
@@ -195,7 +212,23 @@ func runEval(cmd *cobra.Command, args []string) {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
+	// The prompt version: --judge-prompt for this run, else the propose pin's
+	// judge_prompt param (applied by NewJudgeForConfig), else the default v2.
 	judge := evalpkg.NewJudgeForConfig(chat, cfg)
+	if opts.judgePrompt != "" {
+		prompt, perr := evalpkg.ParseJudgePrompt(opts.judgePrompt)
+		if perr == nil {
+			perr = judge.SetPrompt(prompt)
+		}
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "Error: --judge-prompt: %v\n", perr)
+			os.Exit(2)
+		}
+	}
+	// judge@v3 reads each book's catalogue record (book_metadata) for its
+	// book context; a read error fails the run rather than judging path-only.
+	judge.SetBookRecords(database)
+	log.Printf("judge prompt %s", judge.Prompt().Version())
 
 	// OpenTelemetry (CONTRACT §2.16): judge calls emit gen_ai spans when an
 	// OTLP endpoint is configured. Flushed before the process exits.
@@ -360,12 +393,13 @@ func (d *dbRunner) Run(ctx context.Context, o evalpkg.RunOptions) ([]db.Finding,
 			DurationMS: db.Int64Ptr(time.Since(start).Milliseconds()),
 			ItemCount:  db.IntPtr(stats.FindingsFound),
 			Detail: map[string]any{
-				"evaluated": stats.ChunksEvaluated,
-				"skipped":   stats.ChunksSkipped,
-				"scope":     "standalone",
-				"sample":    o.Sample,
-				"book":      o.Book,
-				"persisted": stats.Persisted,
+				"evaluated":      stats.ChunksEvaluated,
+				"skipped":        stats.ChunksSkipped,
+				"scope":          "standalone",
+				"sample":         o.Sample,
+				"book":           o.Book,
+				"persisted":      stats.Persisted,
+				"prompt_version": stats.PromptVersion,
 			},
 		}
 		if stats.ResolvedModel != "" {
@@ -708,7 +742,9 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	res.judged = true
 	res.stats = stats
 	if jerr != nil {
-		// RunOnChunks only errors when ctx was cancelled: stop, record nothing.
+		// RunOnChunks errors when ctx was cancelled, or when the book record
+		// read behind judge@v3's book context failed (before any judge call):
+		// stop, record nothing — never judge path-only on a broken read.
 		return res, jerr
 	}
 
@@ -740,8 +776,8 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 			state = fmt.Sprintf("would stay unlatched: %d chunk(s) failed: %s", stats.ChunksSkipped, stats.FirstError)
 			res.latched, res.failed = false, true
 		}
-		p("  [dry-run] %s: %d/%d chunks judged, %d new finding(s) (%d already recorded) — %s\n",
-			name, stats.ChunksEvaluated, len(evalChunks), len(fresh), res.dupes, state)
+		p("  [dry-run] %s: %d/%d chunks judged, %d new finding(s) (%d already recorded), %s — %s\n",
+			name, stats.ChunksEvaluated, len(evalChunks), len(fresh), res.dupes, bookContextLabel(stats, t.ID), state)
 		return res, nil
 	}
 
@@ -796,6 +832,21 @@ func backfillOne(ctx context.Context, p func(string, ...any), bdb backfillDB, ju
 	p("  done %s: %d chunks, %d new finding(s) (%d already recorded), eval_finished_at written\n",
 		name, stats.ChunksEvaluated, len(fresh), res.dupes)
 	return res, nil
+}
+
+// bookContextLabel describes the prompt and book context a transcript was
+// judged with: "judge@v3 asin_record 1a2b3c4d" (sha prefix) or
+// "judge@v3 path_only".
+func bookContextLabel(stats evalpkg.RunStats, transcriptID string) string {
+	bc, ok := stats.BookContexts[transcriptID]
+	if !ok {
+		bc.Source = evalpkg.BookContextPathOnly
+	}
+	label := strings.TrimSpace(stats.PromptVersion + " " + bc.Source)
+	if len(bc.SHA256) >= 8 {
+		label += " " + bc.SHA256[:8]
+	}
+	return label
 }
 
 // run holds the testable logic: validate flags, run the judge, and report.
@@ -893,6 +944,9 @@ func startSelectedRun(ctx context.Context, book string, o options) *runs.Run {
 		if o.seed != "" {
 			spec.Args += " --seed " + o.seed
 		}
+	}
+	if o.judgePrompt != "" {
+		spec.Args += " --judge-prompt " + o.judgePrompt
 	}
 	if o.write {
 		spec.Args += " --write"

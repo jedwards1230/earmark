@@ -82,6 +82,8 @@ func TestDumper(t *testing.T) {
 		Elapsed:       1500 * time.Millisecond,
 		Findings:      []db.Finding{{OriginalText: "fox", SuggestedCorrection: &corr, IssueType: "misheard_word", Confidence: 0.8}},
 		Dropped:       []evalpkg.Dropped{{Reason: evalpkg.DropCosmeticOnly, OriginalText: "a", SuggestedCorrection: "A", IssueType: "misheard_word", Confidence: 0.9}},
+		PromptVersion: "judge@v3",
+		BookContext:   evalpkg.BookContext{Source: evalpkg.BookContextASINRecord, SHA256: "feed", Block: "Book record:\n"},
 	}, nil)
 	d.observe(evalpkg.Result{Chunk: db.EvalChunk{ChunkID: "c2"}}, errors.New(strings.Repeat("x", 1000)))
 	if d.err != nil {
@@ -98,7 +100,8 @@ func TestDumper(t *testing.T) {
 	}
 	for k, v := range map[string]any{
 		"chunk_id": "c1", "transcript_id": "t1", "chunk_index": 4.0, "text_chars": 9.0,
-		"prompt_version": "judge@v9", "prompt_sha256": "abc", "step_version": 3.0, "model": "earmark-judge",
+		"prompt_version": "judge@v3", "prompt_sha256": "abc", "step_version": 3.0, "model": "earmark-judge",
+		"book_context_source": "asin_record", "book_context_sha256": "feed",
 		"resolved_model": "anthropic/claude-haiku-5-5", "prompt_tokens": 1500.0, "completion_tokens": 40.0,
 		"cost_usd": 0.002, "latency_ms": 1500.0,
 	} {
@@ -116,6 +119,17 @@ func TestDumper(t *testing.T) {
 	var second map[string]any
 	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
 		t.Fatal(err)
+	}
+	// A result with no prompt version / context (never judged) falls back to
+	// the run's recipe and path_only; the block itself is never dumped.
+	if second["prompt_version"] != "judge@v9" || second["book_context_source"] != "path_only" {
+		t.Errorf("second line prompt/context = %v / %v", second["prompt_version"], second["book_context_source"])
+	}
+	if _, ok := second["book_context_sha256"]; ok {
+		t.Error("path_only line carries a book_context_sha256")
+	}
+	if strings.Contains(buf.String(), "Book record") {
+		t.Error("the dump carries the rendered block")
 	}
 	for _, k := range []string{"prompt_tokens", "completion_tokens", "cost_usd"} {
 		if v, ok := second[k]; !ok || v != nil {

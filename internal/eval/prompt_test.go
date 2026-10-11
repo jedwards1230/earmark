@@ -24,6 +24,22 @@ func TestSystemPromptTokenBudget(t *testing.T) {
 	t.Logf("system prompt: %d cl100k tokens", n)
 }
 
+// judgePromptV3TokenBudget caps judge@v3's system prompt: v2 plus the book
+// record rule (542 cl100k tokens). The Book record block itself is capped
+// separately (maxBookRecordTokens, TestBookRecordTokenBudget).
+const judgePromptV3TokenBudget = 560
+
+func TestSystemPromptV3TokenBudget(t *testing.T) {
+	n, err := tokenizer.CountTokens(systemPromptV3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > judgePromptV3TokenBudget {
+		t.Errorf("judge@v3 system prompt is %d tokens, budget %d", n, judgePromptV3TokenBudget)
+	}
+	t.Logf("judge@v3 system prompt: %d cl100k tokens", n)
+}
+
 func TestParseFindings_ValidJSON(t *testing.T) {
 	raw := `{"findings":[
 		{"original_text":"Doctor Grace","issue_type":"misheard_proper_noun","suggested_correction":"Dr. Grace","confidence":0.91},

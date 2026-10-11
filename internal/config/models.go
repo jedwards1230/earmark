@@ -256,14 +256,33 @@ const (
 	// number. It outranks the endpoint's temperature option and the route
 	// default (0 locally, omitted on hosted routes; CONTRACT §2.15).
 	ParamTemperature = "temperature"
+	// ParamJudgePrompt selects the judge prompt version on the propose step:
+	// "v2" (the default) or "v3" (judge@v3, the book record block; CONTRACT
+	// §2.15 "Book context"). `earmark eval --judge-prompt` outranks it for
+	// one run.
+	ParamJudgePrompt = "judge_prompt"
 )
+
+// JudgePromptParam reads a judge_prompt param: "v2" or "v3" (also
+// "judge@v2" / "judge@v3"), any case, returned as "v2" / "v3".
+func JudgePromptParam(v any) (string, error) {
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("must be \"v2\" or \"v3\", got %v", v)
+	}
+	switch p := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(s)), "judge@"); p {
+	case "v2", "v3":
+		return p, nil
+	}
+	return "", fmt.Errorf("must be \"v2\" or \"v3\", got %q", s)
+}
 
 // knownPinParams are the param keys a step accepts: usd_per_mtok_in on any
 // step, plus the step's own keys.
 func knownPinParams(step string) []string {
 	switch step {
 	case recipe.StepPropose:
-		return []string{ParamUSDPerMTokIn, ParamReasoningEffort, ParamChatTemplateKwargs, ParamTemperature}
+		return []string{ParamUSDPerMTokIn, ParamReasoningEffort, ParamChatTemplateKwargs, ParamTemperature, ParamJudgePrompt}
 	case recipe.StepDecide:
 		return append([]string{ParamUSDPerMTokIn}, DecidePolicyParams...)
 	}
@@ -301,6 +320,10 @@ func validatePinParams(step string, params map[string]any) error {
 			}
 		case ParamTemperature:
 			if _, err := TemperatureParam(v); err != nil {
+				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
+			}
+		case ParamJudgePrompt:
+			if _, err := JudgePromptParam(v); err != nil {
 				return &pinParamError{fmt.Sprintf(".%s %v", k, err)}
 			}
 		case ParamApplyP, ParamRejectP, ParamRejectFloor:

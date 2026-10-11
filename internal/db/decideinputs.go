@@ -22,9 +22,10 @@ const MaxDecideTranscriptBatch = 32
 const MaxDecideBookBatch = 256
 
 // BookRecord is the catalogue record of one book: the book_metadata columns
-// the decide step treats as reference text. ASIN is "" for books with no
-// catalogue match (libro.fm, unmatched files) and for identity conflicts,
-// whose catalogue columns are cleared at ingest (CONTRACT §1.6).
+// the decide step treats as reference text, and the judge's book context
+// (judge@v3, CONTRACT §2.15) renders. ASIN is "" for books with no catalogue
+// match (libro.fm, unmatched files) and for identity conflicts, whose
+// catalogue columns are cleared at ingest (CONTRACT §1.6).
 type BookRecord struct {
 	BookDir     string
 	ASIN        string
@@ -34,6 +35,16 @@ type BookRecord struct {
 	Series      []metaprovider.SeriesRef
 	Chapters    []metaprovider.Chapter
 	Description string
+	// BiasTerms is book_metadata.bias_terms (CONTRACT §1.6): the proper
+	// nouns derived from author/narrator/series/title, in stored order, NULL
+	// elements dropped. nil when the column is NULL or empty.
+	BiasTerms []string
+	// DecodeError is set (and Chapters left nil) when this book's stored
+	// chapters JSON cannot be decoded. One bad row never fails the batch:
+	// the decide step reads the record without chapters (less reference
+	// text, so fewer applies — never more); the judge's book context treats
+	// the record as unusable and fails only that book's transcripts.
+	DecodeError string
 }
 
 var transcriptSegmentsSQL = `
@@ -87,15 +98,17 @@ func getTranscriptSegments(ctx context.Context, q rowQuerier, ids []string) (map
 
 var bookRecordsSQL = `
 	SELECT book_dir, COALESCE(asin, ''), COALESCE(title, ''), COALESCE(author, ''),
-	       COALESCE(narrator, ''), COALESCE(series, ''), chapters, COALESCE(description, '')
+	       COALESCE(narrator, ''), COALESCE(series, ''), chapters, COALESCE(description, ''),
+	       COALESCE(array_remove(bias_terms, NULL), '{}')
 	FROM book_metadata
 	WHERE book_dir = ANY($1::text[])`
 
 // GetBookRecords returns the catalogue record of each listed book directory
 // (filepath.Dir of a transcript's file_path), keyed by book_dir. A book with
 // no book_metadata row is absent from the map. Chapter titles are cleaned on
-// read exactly as GetBookChapters cleans them. At most MaxDecideBookBatch dirs
-// per call.
+// read exactly as GetBookChapters cleans them. A row whose chapters cannot
+// be decoded is returned with DecodeError set instead of failing the batch.
+// At most MaxDecideBookBatch dirs per call.
 func (db *DB) GetBookRecords(ctx context.Context, bookDirs []string) (map[string]BookRecord, error) {
 	return getBookRecords(ctx, db.pool, bookDirs)
 }
@@ -117,13 +130,17 @@ func getBookRecords(ctx context.Context, q rowQuerier, bookDirs []string) (map[s
 		var r BookRecord
 		var series string
 		var chapters []byte
-		if err := rows.Scan(&r.BookDir, &r.ASIN, &r.Title, &r.Author, &r.Narrator, &series, &chapters, &r.Description); err != nil {
+		var bias []string
+		if err := rows.Scan(&r.BookDir, &r.ASIN, &r.Title, &r.Author, &r.Narrator, &series, &chapters, &r.Description, &bias); err != nil {
 			return nil, fmt.Errorf("get book records: scan: %w", err)
 		}
 		r.Series = metaprovider.ParseSeries(series)
+		if len(bias) > 0 {
+			r.BiasTerms = bias
+		}
 		if len(chapters) > 0 {
 			if r.Chapters, err = decodeChapters(chapters); err != nil {
-				return nil, fmt.Errorf("get book records: %s: %w", r.BookDir, err)
+				r.Chapters, r.DecodeError = nil, fmt.Sprintf("chapters: %v", err)
 			}
 		}
 		out[r.BookDir] = r

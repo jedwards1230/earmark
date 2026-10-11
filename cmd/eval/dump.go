@@ -24,8 +24,14 @@ type dumpLine struct {
 	PromptVersion string `json:"prompt_version"`
 	PromptSHA256  string `json:"prompt_sha256"`
 	StepVersion   int    `json:"step_version"`
-	Model         string `json:"model"`
-	ResolvedModel string `json:"resolved_model,omitempty"`
+	// BookContextSource is asin_record (the prompt carried the book's
+	// catalogue record), path_only, or record_error (the book's record could
+	// not be used; the chunk carries the error and was not judged); BookContextSHA256 is the sha256 of the
+	// rendered record block ("" for path_only). CONTRACT §2.15 "Book context".
+	BookContextSource string `json:"book_context_source"`
+	BookContextSHA256 string `json:"book_context_sha256,omitempty"`
+	Model             string `json:"model"`
+	ResolvedModel     string `json:"resolved_model,omitempty"`
 	// Token counts and cost are null when the endpoint did not report them.
 	PromptTokens     *int     `json:"prompt_tokens"`
 	CompletionTokens *int     `json:"completion_tokens"`
@@ -72,18 +78,26 @@ func (d *dumper) observe(res evalpkg.Result, jerr error) {
 	}
 	c := res.Chunk
 	line := dumpLine{
-		ChunkID:       c.ChunkID,
-		TranscriptID:  c.TranscriptID,
-		FilePath:      c.FilePath,
-		ChunkIndex:    c.ChunkIndex,
-		TextChars:     utf8.RuneCountInString(c.Text),
-		PromptVersion: d.rec.PromptVersion,
-		PromptSHA256:  d.rec.PromptSHA256,
-		StepVersion:   d.rec.StepVersion,
-		Model:         d.model,
-		ResolvedModel: res.ResolvedModel,
-		LatencyMS:     res.Elapsed.Milliseconds(),
-		Findings:      []dumpFinding{},
+		ChunkID:           c.ChunkID,
+		TranscriptID:      c.TranscriptID,
+		FilePath:          c.FilePath,
+		ChunkIndex:        c.ChunkIndex,
+		TextChars:         utf8.RuneCountInString(c.Text),
+		PromptVersion:     d.rec.PromptVersion,
+		BookContextSource: res.BookContext.Source,
+		BookContextSHA256: res.BookContext.SHA256,
+		PromptSHA256:      d.rec.PromptSHA256,
+		StepVersion:       d.rec.StepVersion,
+		Model:             d.model,
+		ResolvedModel:     res.ResolvedModel,
+		LatencyMS:         res.Elapsed.Milliseconds(),
+		Findings:          []dumpFinding{},
+	}
+	if res.PromptVersion != "" {
+		line.PromptVersion = res.PromptVersion
+	}
+	if line.BookContextSource == "" {
+		line.BookContextSource = evalpkg.BookContextPathOnly
 	}
 	if u := res.Usage; u.HasUsage {
 		in, out := u.InputTokens, u.OutputTokens
