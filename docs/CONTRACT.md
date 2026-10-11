@@ -4000,7 +4000,11 @@ failed and the cached share (cached ÷ judged), findings (all, and not
 superseded), findings per 1k chunks judged (`findings_kept` +
 `dropped.already_recorded`, ÷ `chunks_judged`), `issue_mix` and `state_mix`
 (jsonb), `drops`, `parse_failures` (`fn_calls` `judge_chunk` rows with
-`error_class = 'invalid_reply'`), `decisions` (jsonb: per decide recipe, the
+`error_class = 'invalid_reply'`; the judge logs every attempt there, §2.15
+"Judge calls" — a cache hit is its own row with `cache_hit`, no cost and
+`cached_from`, and a fallback model's answer is stored under that model's
+recipe with `error_class = 'model_fallback'`, so neither counts as an
+answered call of this recipe), `decisions` (jsonb: per decide recipe, the
 outcome of **that recipe's latest live — unrevoked — decision** on each of
 the recipe's findings, with `outcome:reason` counts), `applied_ever` /
 `reverted` / `revert_rate` (from `finding_events` transitions to `applied` /
