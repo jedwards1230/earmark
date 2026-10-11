@@ -1,6 +1,6 @@
 # Database Schema Reference
 
-> **See CONTRACT.md §§1.1, 1.2, 1.5, 1.6, 1.8, 1.9, 2.20 and 3 for authoritative definitions.**
+> **See CONTRACT.md §§1.1, 1.2, 1.4, 1.5, 1.6, 1.8, 1.9, 2.17, 2.20 and 3 for authoritative definitions.**
 > This document summarises the current schema; CONTRACT.md wins on any discrepancy.
 
 ## Migrations
@@ -24,6 +24,7 @@ version is in `goose_db_version`.
 | 10 | `00010_step_runs.sql` | `step_runs` (live progress of ad-hoc decide/scan/eval runs); partial `step_runs_running_idx`, `step_runs_started_at_idx` |
 | 11 | `00011_recipe_builds.sql` | `recipe_builds` (every build that registered a recipe), `recipe_builds_code_version_idx`, backfilled from `recipes`; comment on `recipes.code_version` (first build) |
 | 12 | `00012_model_settings.sql` | `model_settings` (runtime per-step model overrides) and the append-only `model_setting_events` history + `model_setting_events_step_idx`; nothing backfilled |
+| 13 | `00013_audit_lineage.sql` | `judge_passes` (per transcript × judge recipe; `legacy` rows backfilled) and `transcript_archive` (a requeue's replaced transcript); on `transcript_findings`: `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (filled on insert, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` patch state; `finding_events.anchor_offset` + the `transcript_findings_record_reanchor` trigger; transitions read `earmark.reason` |
 
 New schema = a new numbered file. Never edit a shipped migration. Run the
 Postgres proofs locally with:
@@ -356,7 +357,9 @@ it READS `transcripts`/`transcript_chunks` and INSERTs here; it NEVER updates,
 deletes, or alters the transcript tables. The one foreign key points the other
 way and never cascades into them: `transcript_id → transcripts(id) ON DELETE SET
 NULL` (migration 5), so a requeue that deletes a transcript keeps its findings,
-archived as `superseded` with `transcript_id` NULL (CONTRACT §1.4).
+archived as `superseded` with `transcript_id` NULL (CONTRACT §1.4). The
+dashboard's clear archives the same way but keeps `transcript_id` (the
+transcript still exists); nothing deletes a finding.
 `suggested_correction` is informational only — never applied.
 
 ```sql
@@ -385,9 +388,10 @@ the transcript, so findings are attributable per ASR backend/run.
 
 Additive columns from the reviewable-patch migration are omitted above for
 brevity: `patch_state` (the `proposed → accepted → applied → reverted` /
-`rejected` / `stale` / `unanchorable` machine, plus the terminal `superseded`
-that requeue archives every state into), `superseded_at` (when a requeue
-archived it; migration 5), the anchor trio (`anchor_offset`,
+`rejected` / `stale` / `unanchorable` machine, the machine-managed
+`duplicate`, plus the terminal `superseded` that a requeue or a clear archives
+every state into), `superseded_at` (when a requeue or clear archived it;
+migration 5), the anchor trio (`anchor_offset`,
 `anchor_occurrence`, `chunk_text_sha256`), `decided_at`/`decided_by`,
 `applied_at`/`applied_before_text`/`applied_after_text` (**span**-level, not
 whole-chunk), and `stale_reason`. This table is the authoritative home of a
@@ -406,6 +410,34 @@ reanchored_at       TIMESTAMPTZ,  -- last time earmark reanchor wrote this row's
 --   (migration 5 appends 'superseded')
 -- CHECK (patch_state = 'unanchorable') = (unanchorable_reason IS NOT NULL)
 ```
+
+Migration 13 adds the lineage columns (CONTRACT §2.15 "Lineage",
+[`docs/design/audit-lineage.md`](design/audit-lineage.md)):
+
+```sql
+judge_pass_id        BIGINT REFERENCES judge_passes (id) ON DELETE SET NULL, -- the pass that proposed it
+fn_call_id           BIGINT REFERENCES fn_calls (id),                        -- the judge call; not yet written by any path
+origin_transcript_id UUID,      -- the transcript it was proposed against; set on INSERT, frozen once set
+correction_key       TEXT GENERATED ALWAYS AS (
+    CASE WHEN chunk_text_sha256 IS NULL THEN NULL
+         ELSE md5(chunk_text_sha256 || E'\x1f' || lower(btrim(original_text)) || E'\x1f'
+                  || lower(btrim(COALESCE(suggested_correction, '')))) END) STORED,
+duplicate_of         UUID REFERENCES transcript_findings (id) ON DELETE SET NULL,
+-- CHECK patch_state IN (..., superseded, duplicate)
+-- CHECK (duplicate_of IS NULL OR patch_state IN ('duplicate', 'superseded'))
+-- indexes: judge_pass_id, origin_transcript_id, correction_key,
+--          duplicate_of WHERE duplicate_of IS NOT NULL
+-- trigger transcript_findings_keep_origin (BEFORE INSERT OR UPDATE OF origin_transcript_id)
+```
+
+`origin_transcript_id` is what a finding keeps after a requeue nulls
+`transcript_id`; it joins to `transcript_archive.transcript_id`. Findings a
+requeue archived before migration 13 have it NULL (their transcript id was
+never kept). `correction_key` is recipe-independent: two recipes proposing the
+same fix to the same chunk text share it. A `duplicate` finding agrees with
+`duplicate_of` and is never replayed; a requeue or clear archives it with
+`duplicate_of` kept, and returning it to `proposed` clears `duplicate_of` in
+the same UPDATE.
 
 A re-anchor rewrites the existing anchor columns in place — `chunk_id`,
 `chunk_index` (from the chunk row), `chunk_text_sha256`, `anchor_offset`,
@@ -552,14 +584,104 @@ CREATE TABLE finding_events (
     chunk_text_sha256 TEXT,
     issue_type        TEXT,
     revokes_event_id  BIGINT      REFERENCES finding_events (id),
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    anchor_offset     INTEGER                 -- migration 13: the OLD offset on a reanchor_moved row
 );
 -- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at)
 -- unique finding_events_revokes_idx: (revokes_event_id) WHERE kind = 'revoke'
 -- triggers: transcript_findings_record_transition (AFTER UPDATE OF patch_state),
 --           transcript_findings_record_insert (AFTER INSERT, non-proposed),
+--           transcript_findings_record_reanchor (AFTER UPDATE OF chunk_text_sha256, anchor_offset),
 --           finding_events_append_only (BEFORE UPDATE OR DELETE: raises unless cascade)
 ```
+
+A transition's `reason` is the transaction's `earmark.reason` setting
+(`db.SetEventContext`): `requeue` for a requeue's supersede, `cleared` for the
+dashboard clear, NULL when unset. The re-anchor trigger appends a `transition`
+with `from_state = to_state` (the state before the UPDATE), reason
+`reanchor_moved`, and the OLD `chunk_text_sha256` / `anchor_offset` whenever a
+finding's hash or offset changes; the row holds the new ones. An UPDATE that
+also changes `patch_state` appends both, the reanchor event first.
+
+### 11a. `judge_passes` — Judge passes (CONTRACT §2.15 "Lineage")
+
+One row per (transcript × judge recipe) pass: the per-recipe "judged" record.
+`run_metrics.eval_*` stays the compatibility "latest judge" summary.
+
+```sql
+CREATE TABLE judge_passes (
+    id                  BIGSERIAL     PRIMARY KEY,
+    transcript_id       UUID          NOT NULL,          -- not a FK: survives a requeue
+    job_id              UUID          NOT NULL,
+    file_path           TEXT          NOT NULL,
+    recipe_id           TEXT          REFERENCES recipes (recipe_id),   -- NULL = unattributable
+    step_run_id         BIGINT,                          -- step_runs.id; plain (nothing references step_runs)
+    status              TEXT          NOT NULL DEFAULT 'running',  -- running | complete | partial | failed | legacy
+    chunks_total        INTEGER,      -- >= 0, like the three below
+    chunks_judged       INTEGER,
+    chunks_failed       INTEGER,
+    chunks_cached       INTEGER,
+    findings_kept       INTEGER,
+    dropped             JSONB,        -- {reason: n}; object or NULL
+    input_tokens        BIGINT,
+    output_tokens       BIGINT,
+    cost_usd            NUMERIC(14,8),
+    latency_ms_p50      INTEGER,
+    latency_ms_p95      INTEGER,
+    book_context_sha256 TEXT,
+    started_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    finished_at         TIMESTAMPTZ,  -- NULL iff status = 'running'
+    error               TEXT
+);
+-- index judge_passes_transcript_recipe_idx: (transcript_id, recipe_id)
+-- index judge_passes_complete_idx:          (transcript_id, recipe_id) WHERE status = 'complete'
+-- index judge_passes_recipe_idx:            (recipe_id, started_at)
+```
+
+Only `legacy` rows exist so far — the judge does not write passes yet.
+Migration 13 backfilled one per (transcript, `recipe_id`) of `origin='judge'`
+findings with a live transcript (`findings_kept` = their count, started/finished
+= first/last finding) and one per transcript latched by
+`run_metrics.eval_finished_at` with no judge finding (`chunks_total` =
+`eval_chunks`), its recipe resolved from `eval_model` against the propose
+recipes' `model_alias`/`model_resolved` only when exactly one matches, else
+NULL. Counters, tokens, cost, latency and drop counts were never recorded and
+are NULL on legacy rows.
+
+### 11b. `transcript_archive` — Replaced transcripts (CONTRACT §1.4)
+
+Written by every requeue (`requeueTx`), in its transaction, before the
+transcript is deleted: one row per replaced transcript.
+
+```sql
+CREATE TABLE transcript_archive (
+    id                 BIGSERIAL   PRIMARY KEY,
+    transcript_id      UUID        NOT NULL,   -- the replaced transcripts.id
+    job_id             UUID        NOT NULL,
+    file_path          TEXT        NOT NULL,
+    checksum           TEXT        NOT NULL,
+    language           TEXT        NOT NULL,
+    duration_seconds   FLOAT8      NOT NULL,
+    speaker_count      INTEGER,
+    segments           JSONB       NOT NULL,
+    raw_text           TEXT        NOT NULL,
+    model_name         TEXT        NOT NULL,
+    recipe_id          TEXT        REFERENCES recipes (recipe_id),
+    embedded_asin      TEXT,
+    asr_model_sha256   TEXT,
+    asr_runner_version TEXT,
+    asr_params         JSONB,
+    run_metrics        JSONB,                  -- to_jsonb of the job's run_metrics row; NULL if none
+    created_at         TIMESTAMPTZ NOT NULL,   -- the transcript's
+    archived_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    archived_reason    TEXT        NOT NULL,   -- 'requeue'
+    archived_by        TEXT                    -- earmark.actor when set
+);
+-- index transcript_archive_transcript_idx: (transcript_id)
+-- index transcript_archive_file_path_idx:  (file_path, archived_at)
+```
+
+Insert-only; no foreign key to the live tables, so it outlives the job too.
 
 ### 12. `chunk_scan` — Chunk quality scan (CONTRACT §1.9 "Chunk scan")
 
@@ -676,6 +798,9 @@ runner_control     (singleton, id=1)
 recipes (1) ←── transcripts / transcript_findings / transcript_chunks (N, via nullable recipe_id)
 recipes (1) ←── recipe_builds (N, one per build that registered it)
 transcript_findings (1) ←── finding_events (N, ON DELETE CASCADE)
+transcript_findings (1) ←── transcript_findings (N duplicates, via duplicate_of ON DELETE SET NULL)
+judge_passes (1) ←── transcript_findings (N, via judge_pass_id ON DELETE SET NULL)
+transcript_archive.transcript_id ←·· transcript_findings.origin_transcript_id / judge_passes.transcript_id (plain columns)
         (1) ←── current_recipes (one per step)
         (1) ←── fn_calls (N, via nullable recipe_id)
 fn_calls (1) ←── fn_calls (N cache-hit rows, via cached_from)

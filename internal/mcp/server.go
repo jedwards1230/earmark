@@ -511,8 +511,8 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("POST /actions/eval", s.handleEvalBook)
 	mux.HandleFunc("POST /actions/eval-sample", s.handleEvalSample)
 	// Clear recorded findings (htmx-guarded, fail-closed on an unset
-	// CONTROL_API_TOKEN like the eval actions). Deletes only advisory
-	// transcript_findings rows, then re-renders the /findings fragment.
+	// CONTROL_API_TOKEN like the eval actions). Archives transcript_findings
+	// rows as superseded (never deletes), then re-renders the /findings fragment.
 	mux.HandleFunc("POST /actions/findings-clear", s.handleFindingsClear)
 	// Runner self-update (CONTRACT §2.12): request the runner switch to a target
 	// earmark tag (or clear the request). htmx-guarded + fail-closed on an unset

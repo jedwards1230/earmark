@@ -1,8 +1,14 @@
 package db
 
 import (
+	"context"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/pashagolub/pgxmock/v5"
+
+	"github.com/jedwards1230/earmark/internal/patch"
 )
 
 // The eval layer's defining property (CONTRACT §2.15) is that it is read-only
@@ -97,36 +103,79 @@ func TestInsertFindingSQL_ColumnOrder(t *testing.T) {
 	}
 }
 
-// TestClearFindingsSQL_DeletesOnlyFindings guards the clear-findings feature
-// against the same read-only-transcripts invariant: clearing is the one place
-// the findings subsystem legitimately DELETEs, but it must DELETE only from
-// transcript_findings — never transcripts/segments/transcript_chunks. A clear
-// is recoverable (re-run eval); a stray delete against a transcript table would
-// not be.
-func TestClearFindingsSQL_DeletesOnlyFindings(t *testing.T) {
+// TestClearFindingsSQL_SupersedesOnlyFindings guards the clear-findings
+// feature: a clear archives findings as superseded — an UPDATE, never a
+// DELETE, so decisions and their finding_events history survive — and it
+// writes only transcript_findings, never transcripts/segments/transcript_chunks
+// (the read-only-transcripts invariant, §2.15).
+func TestClearFindingsSQL_SupersedesOnlyFindings(t *testing.T) {
 	transcriptTables := []string{"transcripts", "segments", "transcript_chunks"}
 	for name, sql := range map[string]string{
 		"clearFindingsAllSQL": clearFindingsAllSQL,
 		"clearFindingsDirSQL": clearFindingsDirSQL,
 	} {
 		upper := strings.ToUpper(sql)
-		if !strings.HasPrefix(strings.TrimSpace(upper), "DELETE FROM TRANSCRIPT_FINDINGS") {
-			t.Errorf("%s must DELETE FROM transcript_findings, got:\n%s", name, sql)
+		if !strings.HasPrefix(strings.TrimSpace(upper), "UPDATE TRANSCRIPT_FINDINGS") {
+			t.Errorf("%s must UPDATE transcript_findings, got:\n%s", name, sql)
+		}
+		if !strings.Contains(sql, "patch_state = 'superseded', superseded_at = now()") {
+			t.Errorf("%s must move findings to superseded, stamped:\n%s", name, sql)
+		}
+		if !strings.Contains(sql, "patch_state = ANY($1)") {
+			t.Errorf("%s must bind the from-states (never re-archive superseded):\n%s", name, sql)
 		}
 		for _, tbl := range transcriptTables {
-			// transcript_findings contains "transcript" — only flag the bare table
-			// as a delete target (followed by whitespace/EOL, not "_findings").
-			if strings.Contains(upper, "FROM "+strings.ToUpper(tbl)+" ") ||
-				strings.HasSuffix(upper, "FROM "+strings.ToUpper(tbl)) {
-				t.Errorf("%s must not delete from transcript table %q:\n%s", name, tbl, sql)
+			if strings.Contains(upper, " "+strings.ToUpper(tbl)+" ") ||
+				strings.HasSuffix(upper, " "+strings.ToUpper(tbl)) {
+				t.Errorf("%s must not touch transcript table %q:\n%s", name, tbl, sql)
 			}
 		}
-		// No other write verb should appear (e.g. a smuggled UPDATE/cascade).
-		for _, verb := range []string{"UPDATE", "ALTER", "DROP", "TRUNCATE"} {
+		for _, verb := range []string{"DELETE", "INSERT", "ALTER", "DROP", "TRUNCATE"} {
 			if strings.Contains(upper, verb+" ") {
-				t.Errorf("%s contains unexpected write verb %q:\n%s", name, verb, sql)
+				t.Errorf("%s contains forbidden verb %q:\n%s", name, verb, sql)
 			}
 		}
+	}
+	if !strings.Contains(clearFindingsDirSQL, "file_path LIKE $2 || '/%' OR file_path = $2") {
+		t.Errorf("clearFindingsDirSQL must scope by book dir prefix:\n%s", clearFindingsDirSQL)
+	}
+}
+
+// TestClearFindingsTx: the clear attributes its transitions (actor, reason
+// 'cleared') before it moves anything, and passes the derived from-states.
+func TestClearFindingsTx(t *testing.T) {
+	for _, tc := range []struct {
+		name, dir string
+		sql       string
+		args      []any
+	}{
+		{"all", "", clearFindingsAllSQL, []any{supersedeFromStates}},
+		{"book", " /b/Author/Book/ ", clearFindingsDirSQL, []any{supersedeFromStates, "/b/Author/Book"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mock.Close()
+			mock.ExpectExec(setEventContextSQL).WithArgs(clearFindingsActor, "", "cleared").
+				WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectExec(tc.sql).WithArgs(tc.args...).
+				WillReturnResult(pgxmock.NewResult("UPDATE", 7))
+			n, err := clearFindingsTx(context.Background(), mock, tc.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n != 7 {
+				t.Errorf("cleared %d, want 7", n)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+			if slices.Contains(supersedeFromStates, patch.StateSuperseded) {
+				t.Error("a clear must not re-archive superseded findings")
+			}
+		})
 	}
 }
 

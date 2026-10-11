@@ -1489,7 +1489,16 @@ func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 	mock.ExpectExec(requeueLockTranscriptsSQL).
 		WithArgs([]string{id}).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	// 2b) archive its transcript's findings — every state but superseded,
+	// 2a) copy the transcript (raw_text, segments, metadata, run_metrics as
+	//    jsonb) into transcript_archive BEFORE anything is deleted
+	mock.ExpectExec(requeueArchiveTranscriptsSQL).
+		WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	// 2b) the supersede transitions carry reason 'requeue' in finding_events
+	mock.ExpectExec(setEventContextSQL).
+		WithArgs("", "", requeueReason).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// 2c) archive its transcript's findings — every state but superseded,
 	//    human decisions included
 	mock.ExpectExec(requeueSupersedeFindingsSQL).
 		WithArgs([]string{id}, patch.StatesAllowing(patch.StateSuperseded)).
@@ -1528,6 +1537,46 @@ func TestRequeueTxSupersedesFindingsAndClearsRunMetrics(t *testing.T) {
 	if strings.Contains(strings.ToUpper(requeueSupersedeFindingsSQL), "DELETE") {
 		t.Error("superseding must UPDATE findings, never DELETE them")
 	}
+	// The archive keeps every transcripts column worth keeping, and the whole
+	// run_metrics row.
+	for _, col := range []string{"t.raw_text", "t.segments", "t.model_name", "t.recipe_id",
+		"t.asr_model_sha256", "t.asr_runner_version", "t.asr_params", "t.embedded_asin",
+		"t.created_at", "to_jsonb(m)", "LEFT JOIN run_metrics m ON m.job_id = t.job_id"} {
+		if !strings.Contains(requeueArchiveTranscriptsSQL, col) {
+			t.Errorf("requeueArchiveTranscriptsSQL is missing %q", col)
+		}
+	}
+}
+
+// TestRequeueTxArchiveFailureAborts: a failed transcript archive stops the
+// requeue before any finding moves or the transcript is deleted.
+func TestRequeueTxArchiveFailureAborts(t *testing.T) {
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	id := "11111111-1111-1111-1111-111111111111"
+	mock.ExpectBegin()
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	mock.ExpectQuery(requeueFailed.resetJobs).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, "/b/x.m4b"))
+	mock.ExpectExec(requeueLockTranscriptsSQL).WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(requeueArchiveTranscriptsSQL).WithArgs([]string{id}).
+		WillReturnError(errors.New("boom"))
+
+	if _, _, err := requeueTx(context.Background(), tx, requeueFailed); err == nil ||
+		!strings.Contains(err.Error(), "archive transcripts") {
+		t.Fatalf("err = %v, want an archive failure", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 // TestRequeueTxSupersedeFailureAborts asserts a failed supersede stops the
@@ -1549,6 +1598,10 @@ func TestRequeueTxSupersedeFailureAborts(t *testing.T) {
 	mock.ExpectQuery(requeueFailed.resetJobs).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "file_path"}).AddRow(id, "/b/x.m4b"))
 	mock.ExpectExec(requeueLockTranscriptsSQL).WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(requeueArchiveTranscriptsSQL).WithArgs([]string{id}).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec(setEventContextSQL).WithArgs("", "", requeueReason).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(requeueSupersedeFindingsSQL).
 		WithArgs([]string{id}, supersedeFromStates).

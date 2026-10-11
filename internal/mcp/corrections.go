@@ -597,7 +597,7 @@ func reviewable(from, to string) bool {
 
 func describeActions(actions []string) string {
 	if len(actions) == 0 {
-		return "none (terminal, or awaiting `earmark reanchor`)"
+		return "none (terminal, a duplicate of another finding, or awaiting `earmark reanchor`)"
 	}
 	return strings.Join(actions, ", ")
 }

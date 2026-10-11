@@ -202,20 +202,25 @@ func setPatchStateBulkTx(ctx context.Context, q rowQuerier, from, to, decidedBy 
 // decisions (CONTRACT §2.17 "Version history"): a stamped decision is
 // attributed to its decided_by, anything else to Actor, else 'system'.
 // RecipeID, when set, is recorded on every transition of the transaction.
+// Reason, when set, is the reason of every transition of the transaction
+// (e.g. "requeue", "cleared"); the re-anchor trigger writes its own
+// ("reanchor_moved").
 type EventContext struct {
 	Actor    string
 	RecipeID string
+	Reason   string
 }
 
 // setEventContextSQL sets the transaction-local settings the transition
 // trigger reads. is_local = true: they end with the transaction, so a pooled
 // connection never carries one transaction's attribution into the next.
-var setEventContextSQL = `SELECT set_config('earmark.actor', $1, true), set_config('earmark.recipe_id', $2, true)`
+var setEventContextSQL = `SELECT set_config('earmark.actor', $1, true), set_config('earmark.recipe_id', $2, true),
+	       set_config('earmark.reason', $3, true)`
 
 // SetEventContext attributes the rest of tx's transitions. Call it inside the
 // transaction that changes the findings.
 func SetEventContext(ctx context.Context, tx execer, ec EventContext) error {
-	if _, err := tx.Exec(ctx, setEventContextSQL, ec.Actor, ec.RecipeID); err != nil {
+	if _, err := tx.Exec(ctx, setEventContextSQL, ec.Actor, ec.RecipeID, ec.Reason); err != nil {
 		return fmt.Errorf("set finding event context: %w", err)
 	}
 	return nil

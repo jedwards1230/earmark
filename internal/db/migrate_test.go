@@ -325,3 +325,108 @@ func TestFindingEventsMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditLineageMigration pins 00013: the lock timeout comes first, the
+// new tables and columns exist with their guards, the correction key is an
+// IMMUTABLE expression with explicit separators, the triggers are in place,
+// the transition trigger reads earmark.reason, Down restores 00008's
+// transition body and drops everything, and resetSQL drops the new objects.
+func TestAuditLineageMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00013_audit_lineage.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	for name, part := range map[string]string{"Up": up, "Down": down} {
+		i := strings.Index(part, "SET LOCAL lock_timeout = '5s'")
+		j := strings.Index(part, "ALTER TABLE")
+		if i < 0 || j < 0 || i > j {
+			t.Errorf("%s: SET LOCAL lock_timeout must precede the first ALTER TABLE", name)
+		}
+	}
+	for _, want := range []string{
+		"CREATE TABLE judge_passes",
+		"CHECK (status IN ('running', 'complete', 'partial', 'failed', 'legacy'))",
+		"CREATE INDEX judge_passes_complete_idx ON judge_passes (transcript_id, recipe_id) WHERE status = 'complete'",
+		"CREATE TABLE transcript_archive",
+		"run_metrics JSONB",
+		"ADD COLUMN judge_pass_id BIGINT REFERENCES judge_passes (id) ON DELETE SET NULL",
+		"ADD COLUMN fn_call_id BIGINT REFERENCES fn_calls (id)",
+		"ADD COLUMN origin_transcript_id UUID",
+		"ADD COLUMN duplicate_of UUID REFERENCES transcript_findings (id) ON DELETE SET NULL",
+		"lower(btrim(original_text)) || E'\\x1f'",
+		"lower(btrim(COALESCE(suggested_correction, '')))",
+		") STORED",
+		"SELECT pg_temp.set_patch_states('duplicate', NULL)",
+		"CHECK (duplicate_of IS NULL OR patch_state IN ('duplicate', 'superseded'))",
+		"BEFORE INSERT OR UPDATE OF origin_transcript_id ON transcript_findings",
+		"ALTER TABLE finding_events ADD COLUMN anchor_offset INTEGER",
+		"current_setting('earmark.reason', true)",
+		"AFTER UPDATE OF chunk_text_sha256, anchor_offset ON transcript_findings",
+		"'reanchor_moved'",
+		"OLD.chunk_text_sha256, OLD.anchor_offset",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("00013 Up is missing %q", want)
+		}
+	}
+	// The generated column must use operators, not concat()/concat_ws(),
+	// which are only STABLE and would be refused.
+	if strings.Contains(strings.ToLower(up), "concat(") || strings.Contains(strings.ToLower(up), "concat_ws(") {
+		t.Error("correction_key must use ||, not concat/concat_ws")
+	}
+	// The backfill runs after the ALTER takes transcript_findings' lock, and
+	// the origin guard is created after the backfill that sets it.
+	alterAt := strings.Index(up, "ALTER TABLE transcript_findings ADD COLUMN judge_pass_id")
+	fillAt := strings.Index(up, "INSERT INTO judge_passes")
+	guardAt := strings.Index(up, "CREATE TRIGGER transcript_findings_keep_origin")
+	if alterAt < 0 || fillAt < alterAt || guardAt < fillAt {
+		t.Error("Up must ALTER transcript_findings, then backfill, then create the origin guard")
+	}
+	for _, want := range []string{
+		"DROP TRIGGER transcript_findings_record_reanchor ON transcript_findings",
+		"DROP FUNCTION finding_events_record_reanchor()",
+		"DROP TRIGGER transcript_findings_keep_origin ON transcript_findings",
+		"DROP FUNCTION transcript_findings_keep_origin()",
+		"SET patch_state = 'proposed', duplicate_of = NULL WHERE patch_state = 'duplicate'",
+		"SELECT pg_temp.set_patch_states(NULL, 'duplicate')",
+		"ALTER TABLE finding_events DROP COLUMN anchor_offset",
+		"DROP TABLE transcript_archive",
+		"DROP TABLE judge_passes",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("00013 Down is missing %q", want)
+		}
+	}
+	// Down restores 00008's transition body verbatim (no reason column).
+	b8, err := migrationFiles.ReadFile("migrations/00008_finding_events.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := func(src string) string {
+		i := strings.Index(src, "RETURNS TRIGGER LANGUAGE plpgsql AS $$ DECLARE stamped")
+		j := strings.Index(src[i:], "END $$;")
+		if i < 0 || j < 0 {
+			return ""
+		}
+		return src[i : i+j]
+	}
+	up8, _, _ := strings.Cut(string(b8), "-- +goose Down")
+	if want := body(norm(stripSQLComments(up8))); want == "" || body(down) != want {
+		t.Error("00013 Down must restore 00008's finding_events_record_transition body exactly")
+	}
+	for _, want := range []string{
+		"DROP TABLE    IF EXISTS judge_passes",
+		"DROP TABLE    IF EXISTS transcript_archive",
+		"DROP FUNCTION IF EXISTS finding_events_record_reanchor()",
+		"DROP FUNCTION IF EXISTS transcript_findings_keep_origin()",
+	} {
+		if !strings.Contains(resetSQL, want) {
+			t.Errorf("resetSQL is missing %q (every migration-created object is reset)", want)
+		}
+	}
+}
