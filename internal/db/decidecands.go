@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -112,11 +113,49 @@ type DecideFinding struct {
 	ChunkTextSHA256  string
 	PatchState       string
 	DecidedBy        string // "" when undecided
+	// CorrectionKey is transcript_findings.correction_key (migration 13): the
+	// fix — chunk revision, normalised original and correction — without the
+	// recipe. "" when the row has none.
+	CorrectionKey string
+	// CurrentPropose: proposed by the current propose recipe (current_recipes,
+	// or a recipe equivalent to it, CONTRACT §1.9).
+	CurrentPropose bool
+	CreatedAt      time.Time
+	// HasDuplicates: some finding is a duplicate of this one (duplicate_of).
+	HasDuplicates bool
+	// LastDecisionRecipe is the recipe of the finding's latest live (unrevoked)
+	// decision; "" when it has none.
+	LastDecisionRecipe string
 	// JudgeModel is the model that proposed the finding (resolved_model,
 	// else the requested model). Only DecideSample fills it — the decide
 	// dry run's --dump reports it; nothing decides on it.
 	JudgeModel string
 }
+
+// decideGroupingCols are the columns decide's grouping of agreeing findings
+// reads (DecideFinding.CorrectionKey … LastDecisionRecipe), appended after
+// decided_by by every statement scanDecideFinding reads. f is the finding.
+const decideGroupingCols = `,
+	       COALESCE(f.correction_key, ''),
+	       EXISTS (SELECT 1
+	                 FROM current_recipes cr
+	                 JOIN recipes c ON c.recipe_id = cr.recipe_id
+	                 JOIN recipes o
+	                   ON (o.step, o.step_version, o.model_alias, o.model_resolved, o.model_revision,
+	                       o.prompt_version, o.prompt_sha256, o.params)
+	                      IS NOT DISTINCT FROM
+	                      (c.step, c.step_version, c.model_alias, c.model_resolved, c.model_revision,
+	                       c.prompt_version, c.prompt_sha256, c.params)
+	                WHERE cr.step = 'propose' AND o.recipe_id = f.recipe_id),
+	       f.created_at,
+	       EXISTS (SELECT 1 FROM transcript_findings dup
+	                WHERE dup.duplicate_of = f.id AND dup.patch_state = 'duplicate'),
+	       COALESCE((SELECT e.recipe_id FROM finding_events e
+	                  WHERE e.finding_id = f.id AND e.kind = 'decision'
+	                    AND NOT EXISTS (SELECT 1 FROM finding_events v
+	                                     WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
+	                  ORDER BY e.id DESC
+	                  LIMIT 1), '')`
 
 // decideScopeWhere is the shared filter: anchored judge findings (an anchor
 // offset and a chunk hash, so rung 0 can verify the revision), in the scope's
@@ -142,7 +181,7 @@ var decideSampleSQL = `
 	SELECT f.id::text, f.transcript_id::text, f.file_path, f.issue_type, f.original_text,
 	       COALESCE(f.suggested_correction, ''), f.confidence, f.chunk_index,
 	       f.anchor_offset, COALESCE(f.anchor_occurrence, -1), f.chunk_text_sha256,
-	       f.patch_state, COALESCE(f.decided_by, ''),
+	       f.patch_state, COALESCE(f.decided_by, '')` + decideGroupingCols + `,
 	       COALESCE(NULLIF(f.resolved_model, ''), f.model)
 	  FROM transcript_findings f` + decideScopeWhere + `
 	 ORDER BY md5(f.id::text || $5), f.id
@@ -180,7 +219,8 @@ func scanDecideFinding(r pgx.CollectableRow) (DecideFinding, error) {
 	var f DecideFinding
 	err := r.Scan(&f.ID, &f.TranscriptID, &f.FilePath, &f.IssueType, &f.Original, &f.Replacement,
 		&f.Confidence, &f.ChunkIndex, &f.AnchorOffset, &f.AnchorOccurrence, &f.ChunkTextSHA256,
-		&f.PatchState, &f.DecidedBy)
+		&f.PatchState, &f.DecidedBy,
+		&f.CorrectionKey, &f.CurrentPropose, &f.CreatedAt, &f.HasDuplicates, &f.LastDecisionRecipe)
 	return f, err
 }
 
@@ -190,7 +230,9 @@ func scanDecideSampleFinding(r pgx.CollectableRow) (DecideFinding, error) {
 	var f DecideFinding
 	err := r.Scan(&f.ID, &f.TranscriptID, &f.FilePath, &f.IssueType, &f.Original, &f.Replacement,
 		&f.Confidence, &f.ChunkIndex, &f.AnchorOffset, &f.AnchorOccurrence, &f.ChunkTextSHA256,
-		&f.PatchState, &f.DecidedBy, &f.JudgeModel)
+		&f.PatchState, &f.DecidedBy,
+		&f.CorrectionKey, &f.CurrentPropose, &f.CreatedAt, &f.HasDuplicates, &f.LastDecisionRecipe,
+		&f.JudgeModel)
 	return f, err
 }
 
@@ -240,6 +282,10 @@ type DecideChunk struct {
 	Competitors []DecideFinding
 	// Overlay is the chunk's accepted + applied corrections.
 	Overlay []patch.Patch
+	// OverlayFindings are the same rows as Overlay, as findings — what the
+	// grouping of agreeing findings reads (an accepted or applied member is a
+	// group's representative).
+	OverlayFindings []DecideFinding
 }
 
 var decideChunksSQL = `
@@ -256,7 +302,7 @@ var decideChunkFindingsSQL = `
 	SELECT f.id::text, f.transcript_id::text, f.file_path, f.issue_type, f.original_text,
 	       COALESCE(f.suggested_correction, ''), f.confidence, f.chunk_index,
 	       COALESCE(f.anchor_offset, -1), COALESCE(f.anchor_occurrence, -1), COALESCE(f.chunk_text_sha256, ''),
-	       f.patch_state, COALESCE(f.decided_by, '')
+	       f.patch_state, COALESCE(f.decided_by, '')` + decideGroupingCols + `
 	  FROM transcript_findings f
 	  JOIN unnest($1::uuid[], $2::int[]) AS k(tid, idx)
 	    ON f.transcript_id = k.tid AND f.chunk_index = k.idx
@@ -318,6 +364,7 @@ func decideChunks(ctx context.Context, q rowQuerier, keys []ChunkKey) (map[Chunk
 			c.Competitors = append(c.Competitors, f)
 			continue
 		}
+		c.OverlayFindings = append(c.OverlayFindings, f)
 		c.Overlay = append(c.Overlay, patch.Patch{
 			ID:         f.ID,
 			Anchor:     patch.Anchor{OriginalText: f.Original, Offset: f.AnchorOffset, Occurrence: f.AnchorOccurrence},

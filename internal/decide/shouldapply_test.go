@@ -31,7 +31,7 @@ func TestShouldApplyPromptPinned(t *testing.T) {
 	if ShouldApplyPromptSHA256 != want {
 		t.Errorf("ShouldApplyPromptSHA256 = %s, want %s — bump ShouldApplyPromptVersion when the question changes", ShouldApplyPromptSHA256, want)
 	}
-	if ShouldApplyPromptVersion != "should_apply@v2" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 2 {
+	if ShouldApplyPromptVersion != "should_apply@v2" || ShouldApplyModel != "jev-1.13.0" || ShouldApplyStepVersion != 3 {
 		t.Errorf("identity changed: %s %s step %d", ShouldApplyPromptVersion, ShouldApplyModel, ShouldApplyStepVersion)
 	}
 	// An earlier prompt's hash must never come back: its cached answers would
@@ -563,6 +563,7 @@ func TestDecodeShouldApply(t *testing.T) {
 func TestOutcomeVocabularyMatchesDB(t *testing.T) {
 	for got, want := range map[string]string{
 		DecisionApply: db.OutcomeApply, DecisionHold: db.OutcomeHold, DecisionReject: db.OutcomeReject,
+		DecisionDuplicate:    db.OutcomeDuplicate,
 		EvidenceASINVerbatim: db.EvidenceASINVerbatim, EvidenceExactRepeat: db.EvidenceExactRepeat, EvidenceNone: db.EvidenceNone,
 	} {
 		if got != want {
@@ -580,6 +581,34 @@ func TestEvaluatorRecipe(t *testing.T) {
 	}
 	if err := r.Validate(); err != nil {
 		t.Error(err)
+	}
+	if r.StepVersion != ShouldApplyStepVersion {
+		t.Errorf("recipe step_version %d, want %d", r.StepVersion, ShouldApplyStepVersion)
+	}
+}
+
+// Step version 3 (grouping of agreeing findings, conflicts ranked by p) is a
+// new decide recipe: the same model, prompt and policy under step 2 has
+// another id, so step-2 decisions are re-checked rather than taken as this
+// recipe's, and "decided under this recipe" never matches an older run.
+func TestStepVersionBumpChangesRecipe(t *testing.T) {
+	f, err := ShouldApplyFn(DefaultShouldApplyParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := f.Recipe("")
+	old := cur
+	old.StepVersion = 2
+	curID, err := cur.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID, err := old.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.StepVersion != 3 || curID == oldID {
+		t.Errorf("step %d: id %s, step-2 id %s — the bump must mint a new recipe", cur.StepVersion, curID, oldID)
 	}
 }
 

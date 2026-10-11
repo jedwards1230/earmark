@@ -223,7 +223,7 @@ func TestIntegrationModelsPageDecide(t *testing.T) {
 		assert.Contains(t, card, `<span class="mono">`+itJev+`</span> <span class="time-muted">@ litellm-jev</span>`)
 		assert.Contains(t, card, `<span class="mono">typesafe/`+itJev+`</span> <span class="match-ok">✓ matches request</span>`)
 		assert.Contains(t, card, `1 <span class="mono">should_apply</span> call`)
-		assert.Contains(t, card, "<dt>decided</dt><dd>3 by Jev · 1 by humans · 6 proposed awaiting</dd>")
+		assert.Contains(t, card, `<dt>decided</dt><dd>3 by <span class="mono">`+itJev+`</span> · 1 by humans · 6 proposed awaiting</dd>`)
 		assert.Contains(t, roleCardHTML(t, out, "scan"), "no current scan recipe yet")
 		assert.NotContains(t, out, "Not configured: Decide")
 		// The judge-output table splits Decided by decider.
@@ -236,7 +236,7 @@ func TestIntegrationModelsPageDecide(t *testing.T) {
 	t.Run("jev decisions are not counted as human", func(t *testing.T) {
 		// Decide unbound: the strip still reports the counts, split by decider.
 		out := renderModelsIT(t, d, modelsITConfig(false))
-		assert.Contains(t, out, "decided by humans 1 · by Jev 3")
+		assert.Contains(t, out, "decided by humans 1 · by "+itJev+" 3")
 		assert.NotContains(t, out, "decided by humans 4")
 	})
 }

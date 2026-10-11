@@ -443,3 +443,48 @@ func TestAuditLineageMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestDecideDuplicatesMigration pins 00016: lock timeout, then the one lock
+// (finding_events), before any DDL; the duplicate outcome and its
+// representative guard; a plain related_finding_id (no foreign key on the
+// append-only log); and a Down that refuses to drop pointers unless
+// earmark.allow_data_loss is on and restores the old CHECK NOT VALID.
+func TestDecideDuplicatesMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00016_decide_duplicates.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	i := strings.Index(up, "SET LOCAL lock_timeout = '5s'")
+	l := strings.Index(up, "LOCK TABLE finding_events IN ACCESS EXCLUSIVE MODE;")
+	a := strings.Index(up, "ALTER TABLE")
+	if i < 0 || l < i || a < l {
+		t.Error("Up: want lock_timeout, then LOCK finding_events, before any DDL")
+	}
+	for _, want := range []string{
+		"ADD COLUMN related_finding_id UUID;",
+		"CHECK (outcome IN ('apply', 'hold', 'reject', 'duplicate'))",
+		"CHECK (outcome IS DISTINCT FROM 'duplicate' OR related_finding_id IS NOT NULL)",
+		"CREATE INDEX finding_events_related_idx ON finding_events (related_finding_id) WHERE related_finding_id IS NOT NULL;",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("Up lacks %q", want)
+		}
+	}
+	if strings.Contains(up, "REFERENCES") {
+		t.Error("related_finding_id must be a plain column: finding_events is append-only")
+	}
+	for _, want := range []string{
+		"earmark.allow_data_loss",
+		"CHECK (outcome IN ('apply', 'hold', 'reject')) NOT VALID;",
+		"DROP COLUMN related_finding_id;",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("Down lacks %q", want)
+		}
+	}
+}

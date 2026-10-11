@@ -21,18 +21,24 @@ const ClassReanchor = "reanchor"
 // --rung0-only replay: eligible for the model, but not decided.
 const ClassRung0Pass = "rung0_pass"
 
+// ClassDuplicate is the class of a finding grouped as a duplicate of another
+// that proposes the same fix (DecisionDuplicate): agreement, not a reject.
+const ClassDuplicate = DecisionDuplicate
+
 // reportClasses is the order outcome classes are printed in; rung0Classes
 // the order in a --rung0-only report.
 var (
-	reportClasses = []string{DecisionApply, DecisionHold, DecisionReject, ClassReanchor}
-	rung0Classes  = []string{ClassRung0Pass, DecisionReject, ClassReanchor}
+	reportClasses = []string{DecisionApply, DecisionHold, DecisionReject, ClassDuplicate, ClassReanchor}
+	rung0Classes  = []string{ClassRung0Pass, DecisionReject, ClassDuplicate, ClassReanchor}
 )
 
 // pBuckets is the number of equal-width p histogram buckets over [0, 1].
 const pBuckets = 10
 
 // Report is a dry run's result (the --json output). Every count is an
-// aggregate: no finding ids or text.
+// aggregate — no finding ids or text — except a dry run's
+// Grouping.GroupLines / ConflictLines, which name the groups and conflict
+// sets it found so they can be checked.
 type Report struct {
 	DryRun    bool `json:"dry_run"`
 	Calibrate bool `json:"calibrate"`
@@ -52,8 +58,11 @@ type Report struct {
 	Requested int `json:"requested"`
 	Findings  int `json:"findings"`
 
-	// Outcomes counts apply / hold / reject / reanchor.
+	// Outcomes counts apply / hold / reject / duplicate / reanchor.
 	Outcomes map[string]int `json:"outcomes"`
+	// Grouping counts agreeing findings grouped as duplicates and conflicts
+	// ranked by p (CONTRACT §2.19 "Agreeing and conflicting findings").
+	Grouping Grouping `json:"grouping"`
 	// Cells is outcome × issue_type × evidence.
 	Cells []Cell `json:"cells"`
 	// Reasons counts the decision rule's reasons (holds and model rejects).
@@ -63,8 +72,15 @@ type Report struct {
 	Rung0Rejects map[string]int `json:"rung0_rejects"`
 	Reanchor     map[string]int `json:"reanchor"`
 	// PHistogram counts answered p in ten buckets [0,0.1) … [0.9,1.0].
-	PHistogram []int    `json:"p_histogram"`
-	Jev        JevStats `json:"jev"`
+	PHistogram []int `json:"p_histogram"`
+	// Jev is the model calls — under the "jev" key for compatibility, whatever
+	// the decide model (Model names it).
+	Jev JevStats `json:"jev"`
+	// ConflictAsks counts calls made for findings outside the run, asked only
+	// so a conflict with one of the run's findings could be ranked by p (they
+	// are in Jev's counts; no outcome counts them).
+	ConflictAsks int `json:"conflict_asks"`
+	latencies    []time.Duration
 	// Projection scales the sample's rates to the whole scope.
 	Projection Projection `json:"projection"`
 	// Calibration is set by --calibrate.
@@ -118,6 +134,9 @@ type Projection struct {
 
 // classOf is the report class of an outcome.
 func classOf(o Outcome) string {
+	if o.Decision == DecisionDuplicate {
+		return ClassDuplicate
+	}
 	if o.Rung0.Pass && o.Decision == "" {
 		return ClassRung0Pass
 	}
@@ -162,7 +181,7 @@ func buildReport(o RunOptions, recipeID string, items []*item, backlog map[strin
 		switch {
 		case class == ClassReanchor:
 			rep.Reanchor[out.Reason]++
-		case class == ClassRung0Pass:
+		case class == ClassRung0Pass, class == ClassDuplicate:
 		case !out.Rung0.Pass:
 			rep.Rung0Rejects[out.Reason]++
 		default:
@@ -172,26 +191,9 @@ func buildReport(o RunOptions, recipeID string, items []*item, backlog map[strin
 			continue
 		}
 		t.asked++
-		rep.Jev.Asked++
-		if out.CacheHit {
-			rep.Jev.CacheHits++
-		} else if out.Latency > 0 {
-			latencies = append(latencies, out.Latency)
-		}
-		if out.P != nil {
-			rep.Jev.Answered++
-			rep.PHistogram[min(int(*out.P*pBuckets), pBuckets-1)]++
-		}
-		if out.Reason == ReasonJevUnavailable {
-			rep.Jev.Unavailable++
-			rep.Jev.Errors[out.ErrorClass]++
-		}
-		if !out.CacheHit && out.ErrorClass == "" {
+		if rep.countCall(out, &latencies) {
 			uncached++
 		}
-		rep.Jev.InputTokens += out.InputTokens
-		rep.Jev.OutputTokens += out.OutputTokens
-		rep.Jev.CostUSD += out.CostUSD
 	}
 	for c, n := range cells {
 		c.Count = n
@@ -207,6 +209,7 @@ func buildReport(o RunOptions, recipeID string, items []*item, backlog map[strin
 		}
 		return a.Evidence < b.Evidence
 	})
+	rep.latencies = latencies
 	rep.Jev.LatencyP50MS = percentileMS(latencies, 0.50)
 	rep.Jev.LatencyP95MS = percentileMS(latencies, 0.95)
 
@@ -235,6 +238,43 @@ func buildReport(o RunOptions, recipeID string, items []*item, backlog map[strin
 	}
 	rep.Projection = proj
 	return rep
+}
+
+// countCall adds one asked outcome to the call stats; it reports whether the
+// call was uncached and answered (the projection's cost basis).
+func (r *Report) countCall(out Outcome, latencies *[]time.Duration) bool {
+	r.Jev.Asked++
+	if out.CacheHit {
+		r.Jev.CacheHits++
+	} else if out.Latency > 0 {
+		*latencies = append(*latencies, out.Latency)
+	}
+	if out.P != nil {
+		r.Jev.Answered++
+		r.PHistogram[min(int(*out.P*pBuckets), pBuckets-1)]++
+	}
+	if out.ErrorClass != "" {
+		r.Jev.Unavailable++
+		r.Jev.Errors[out.ErrorClass]++
+	}
+	r.Jev.InputTokens += out.InputTokens
+	r.Jev.OutputTokens += out.OutputTokens
+	r.Jev.CostUSD += out.CostUSD
+	return !out.CacheHit && out.ErrorClass == ""
+}
+
+// addShadowCalls adds the model calls made for shadow items — competitors
+// asked only so a conflict could be ranked by p — to the call stats. They
+// are not the run's findings, so no outcome counts them; ConflictAsks does.
+func (r *Report) addShadowCalls(shadows []*item) {
+	for _, it := range shadows {
+		if it.outcome.Asked {
+			r.ConflictAsks++
+			r.countCall(it.outcome, &r.latencies)
+		}
+	}
+	r.Jev.LatencyP50MS = percentileMS(r.latencies, 0.50)
+	r.Jev.LatencyP95MS = percentileMS(r.latencies, 0.95)
 }
 
 func classRank(c string) int {
@@ -322,6 +362,7 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	p("\ndecision reasons: %s\n", counts(r.Reasons, sortedKeys(r.Reasons)))
 	p("rung-0 rejects:   %s\n", counts(r.Rung0Rejects, sortedKeys(r.Rung0Rejects)))
 	p("reanchor needed:  %s\n", counts(r.Reanchor, sortedKeys(r.Reanchor)))
+	r.Grouping.print(p)
 	if r.Rung0Only {
 		r.printRung0Only(p)
 		_, err := io.WriteString(w, b.String())
@@ -342,9 +383,13 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	}
 
 	j := r.Jev
-	p("\njev: asked %d · answered %d · unavailable %d · cache hits %d\n", j.Asked, j.Answered, j.Unavailable, j.CacheHits)
+	p("\n%s: asked %d · answered %d · unavailable %d · cache hits %d", r.Model, j.Asked, j.Answered, j.Unavailable, j.CacheHits)
+	if r.ConflictAsks > 0 {
+		p(" (incl. %d to rank conflicts with findings outside the run)", r.ConflictAsks)
+	}
+	p("\n")
 	if len(j.Errors) > 0 {
-		p("jev errors: %s\n", counts(j.Errors, sortedKeys(j.Errors)))
+		p("%s errors: %s\n", r.Model, counts(j.Errors, sortedKeys(j.Errors)))
 	}
 	if j.LatencyP50MS != nil {
 		p("latency: p50 %dms · p95 %dms (uncached calls)\n", *j.LatencyP50MS, *j.LatencyP95MS)
@@ -427,4 +472,22 @@ func short(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// print writes the grouping summary and, in a dry run, one line per group and
+// per ranked conflict set.
+func (g Grouping) print(p func(string, ...any)) {
+	p("\nduplicates grouped: %d group(s) · %d duplicate(s) (agreeing findings: one representative decided, the rest recorded as duplicates)\n",
+		g.Groups, g.Duplicates)
+	for _, l := range g.GroupLines {
+		p("  %s\n", l)
+	}
+	p("conflicts ranked by p: %d set(s) · %d finding(s) · %d overlap_dup", g.Conflicts, g.Ranked, g.Losers)
+	if g.Unranked > 0 {
+		p(" · %d unranked (a member had no p; nothing in them applied)", g.Unranked)
+	}
+	p("\n")
+	for _, l := range g.ConflictLines {
+		p("  %s\n", l)
+	}
 }

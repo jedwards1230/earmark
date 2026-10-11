@@ -44,6 +44,12 @@ jev:<recipe_id>) are touched — a person's decision never is:
   accepted → rejected   (never replayed)
   rejected → proposed   (decided again)
   reverted → proposed   (a re-check's undo; decided again)
+  duplicate → proposed  (the recipe's grouping undone; duplicate_of cleared)
+
+Undoing a representative undoes its grouping too: every duplicate of a
+finding the revert moves returns to proposed (duplicate_of cleared, reason
+duplicate_released, its duplicate decision revoked), whichever recipe grouped
+it — reported as "cascaded".
 
 Each move is attributed to revert:jev:<recipe_id> and recorded in
 finding_events; every live decision in scope gets a revoke event. Afterwards
@@ -132,7 +138,7 @@ func revert(ctx context.Context, out io.Writer, store Reverter, o revertOptions)
 		return err
 	}
 	rec.Progress(int64(rep.Moved), map[string]int64{
-		"moved": int64(rep.Moved), "skipped": int64(rep.Skipped),
+		"moved": int64(rep.Moved), "cascaded": int64(rep.Cascaded), "skipped": int64(rep.Skipped),
 		"revoked": rep.Revoked, "reflagged": rep.Reflagged,
 	}, 0, "done")
 	if o.json {
@@ -155,10 +161,11 @@ func revert(ctx context.Context, out io.Writer, store Reverter, o revertOptions)
 		p("  %-22s %d\n", strings.Replace(k, "->", " → ", 1), rep.Transitions[k])
 	}
 	if rep.DryRun {
+		p("duplicates released with their representative: %d\n", rep.Cascaded)
 		p("decisions to revoke: %d\n\n(dry run) nothing changed — pass --yes to undo.\n", rep.Revoked)
 	} else {
-		p("moved %d · skipped %d (changed by another writer since listed) · decisions revoked %d · chunks re-flagged %d\n",
-			rep.Moved, rep.Skipped, rep.Revoked, rep.Reflagged)
+		p("moved %d · cascaded %d (duplicates of a moved representative → proposed) · skipped %d (changed by another writer since listed) · decisions revoked %d · chunks re-flagged %d\n",
+			rep.Moved, rep.Cascaded, rep.Skipped, rep.Revoked, rep.Reflagged)
 	}
 	_, err = io.WriteString(out, b.String())
 	return err

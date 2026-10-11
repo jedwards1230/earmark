@@ -63,7 +63,9 @@ func TestDryRunRung0Only(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]int{ClassRung0Pass: 5, DecisionReject: 2, ClassReanchor: 1}
+	// f-dup and its competitor conflict: ranking needs p, so a rung-0 replay
+	// leaves f-dup a pass.
+	want := map[string]int{ClassRung0Pass: 6, DecisionReject: 1, ClassReanchor: 1}
 	for k, v := range want {
 		if rep.Outcomes[k] != v {
 			t.Errorf("outcome %s = %d, want %d (all %v)", k, rep.Outcomes[k], v, rep.Outcomes)
@@ -72,7 +74,7 @@ func TestDryRunRung0Only(t *testing.T) {
 	if !rep.Rung0Only || rep.Jev.Asked != 0 || len(rep.Reasons) != 0 || rep.Projection.Asked != 0 {
 		t.Errorf("rung-0 report asked the model: %+v", rep)
 	}
-	if rep.Rung0Rejects[ReasonNotSoundAlike] != 1 || rep.Rung0Rejects[ReasonOverlapDup] != 1 || rep.Reanchor[ReasonChunkChanged] != 1 {
+	if len(rep.Rung0Rejects) != 1 || rep.Rung0Rejects[ReasonNotSoundAlike] != 1 || rep.Reanchor[ReasonChunkChanged] != 1 {
 		t.Errorf("rung-0 %v reanchor %v", rep.Rung0Rejects, rep.Reanchor)
 	}
 	wantID, err := mustFn(t).Recipe("").ID()
@@ -104,12 +106,15 @@ func TestDryRunRung0Only(t *testing.T) {
 	if r := byID["f-stale"]; r.Class != ClassReanchor {
 		t.Errorf("f-stale %+v", r)
 	}
+	if r := byID["f-dup"]; r.Class != ClassRung0Pass || !slices.Equal(r.Conflicts, []string{"c-overlap"}) {
+		t.Errorf("f-dup %+v", r)
+	}
 
 	var text bytes.Buffer
 	if err := rep.Print(&text, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []string{"rung 0 only", "rung0_pass 5", "no model calls, no recipe registered, no decisions written (startup migrations still run)"} {
+	for _, s := range []string{"rung 0 only", "rung0_pass 6", "no model calls, no recipe registered, no decisions written (startup migrations still run)"} {
 		if !strings.Contains(text.String(), s) {
 			t.Errorf("text report lacks %q:\n%s", s, text.String())
 		}
@@ -138,8 +143,14 @@ func TestDryRunDump(t *testing.T) {
 	if r := byID["f-outage"]; r.Outcome != DecisionHold || r.Reason != ReasonJevUnavailable || r.P != nil {
 		t.Errorf("f-outage %+v", r)
 	}
-	if r := byID["f-dup"]; r.Outcome != "" || r.Rung0.Reason != ReasonOverlapDup {
+	// f-dup won its conflict on p (0.6 vs the competitor's 0.3, though the
+	// competitor's judge confidence is higher) and is decided on its own p.
+	if r := byID["f-dup"]; r.Outcome != DecisionHold || r.Reason != ReasonUncertain || r.P == nil || *r.P != 0.6 ||
+		r.OverlapWinner != "" || !slices.Equal(r.Conflicts, []string{"c-overlap"}) {
 		t.Errorf("f-dup %+v", r)
+	}
+	if _, ok := byID["c-overlap"]; ok {
+		t.Error("an unsampled competitor was dumped")
 	}
 }
 
@@ -155,14 +166,14 @@ func TestDryRunRung0OnlyCalibrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c := rep.Calibration; c == nil || c.Matrix[HumanAccepted][ClassRung0Pass] != 5 || c.Matrix[HumanAccepted][DecisionReject] != 2 {
+	if c := rep.Calibration; c == nil || c.Matrix[HumanAccepted][ClassRung0Pass] != 6 || c.Matrix[HumanAccepted][DecisionReject] != 1 {
 		t.Fatalf("calibration %+v", rep.Calibration)
 	}
 	var text bytes.Buffer
 	if err := rep.Print(&text, false); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text.String(), "human accepted → rung0_pass 5") || strings.Contains(text.String(), "apply precision") {
+	if !strings.Contains(text.String(), "human accepted → rung0_pass 6") || strings.Contains(text.String(), "apply precision") {
 		t.Errorf("text:\n%s", text.String())
 	}
 }

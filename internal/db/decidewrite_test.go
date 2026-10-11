@@ -59,7 +59,8 @@ func TestDecideWorkScope(t *testing.T) {
 	}
 	mock := newMockPool(t)
 	cols := []string{"id", "transcript_id", "file_path", "issue_type", "original_text", "suggested_correction",
-		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by"}
+		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by",
+		"correction_key", "current_propose", "created_at", "has_duplicates", "last_decision_recipe"}
 	after := "00000000-0000-0000-0000-000000000001"
 	mock.ExpectQuery(`FROM transcript_findings f`).
 		WithArgs(testRecipe2, "%Dune%", "", 4, 1, &after, 10, "jev_unavailable").
@@ -118,8 +119,23 @@ func TestApplyRecheckLockSQL(t *testing.T) {
 
 func TestRevertTransitionsAreLegal(t *testing.T) {
 	for from, to := range revertTransitions {
+		if from == patch.StateDuplicate {
+			// A machine move the bulk path refuses: releaseDuplicatesSQL
+			// makes it, clearing duplicate_of in the same UPDATE.
+			if !patch.CanTransition(from, to) || !patch.IsMachineTransition(from, to) {
+				t.Errorf("%s -> %s must be a legal machine transition", from, to)
+			}
+			continue
+		}
 		if err := validateBulk(from, to, "revert:jev:"+testRecipe2); err != nil {
 			t.Errorf("%s -> %s: %v", from, to, err)
+		}
+	}
+	s0 := norm(releaseDuplicatesSQL)
+	for _, want := range []string{"duplicate_of = NULL", "patch_state = 'proposed'", "ORDER BY id FOR UPDATE",
+		"(id = ANY($1) OR duplicate_of = ANY($2)) AND patch_state = 'duplicate'"} {
+		if !strings.Contains(s0, want) {
+			t.Errorf("release duplicates lacks %q", want)
 		}
 	}
 	// Only a decide recipe's own moves are undone: a person's decided_by,
@@ -142,14 +158,20 @@ func TestRevertScope(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"id", "patch_state", "recipe"}).
 			AddRow("a", patch.StateApplied, testRecipe2).
 			AddRow("b", patch.StateApplied, testRecipe2).
-			AddRow("c", patch.StateRejected, testRecipe2))
+			AddRow("c", patch.StateRejected, testRecipe2).
+			AddRow("d", patch.StateDuplicate, testRecipe2))
+	// The cascade: duplicates of the moved representatives that are not
+	// candidates themselves.
+	mock.ExpectQuery(`d.duplicate_of = ANY`).WithArgs([]string{"a", "b", "c"}, []string{"a", "b", "c", "d"}).
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(2))
 	mock.ExpectQuery(`SELECT count`).WithArgs(testRecipe2, (*string)(nil), &since).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(5)))
 	rep, err := revertDecisions(context.Background(), mock, RevertScope{RecipeID: testRecipe2, Since: since}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rep.DryRun || rep.Moved != 3 || rep.Transitions["applied->reverted"] != 2 || rep.Transitions["rejected->proposed"] != 1 || rep.Revoked != 5 {
+	if !rep.DryRun || rep.Moved != 4 || rep.Transitions["applied->reverted"] != 2 || rep.Transitions["rejected->proposed"] != 1 ||
+		rep.Transitions["duplicate->proposed"] != 3 || rep.Cascaded != 2 || rep.Revoked != 5 {
 		t.Errorf("dry-run report %+v", rep)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

@@ -15,12 +15,27 @@
   "policy_source": "db (reject_floor) over preset clef",
   "seed": "golden",
   "requested": 10,
-  "findings": 8,
+  "findings": 10,
   "outcomes": {
     "apply": 2,
+    "duplicate": 1,
     "hold": 3,
     "reanchor": 1,
-    "reject": 2
+    "reject": 3
+  },
+  "grouping": {
+    "groups": 1,
+    "duplicates": 1,
+    "conflicts": 1,
+    "ranked": 2,
+    "losers": 1,
+    "unranked": 0,
+    "group_lines": [
+      "0b5c11aa [accepted · accepted/applied] \"auto sebo\" → \"Arecibo\" · duplicates: 7d2e90f1"
+    ],
+    "conflict_lines": [
+      "1a2b3c4d \"walked\" → \"woked\" p 0.60 kept · 5e6f7a8b \"walked\" → \"worked\" p 0.40 overlap_dup → 1a2b3c4d"
+    ]
   },
   "cells": [
     {
@@ -57,7 +72,13 @@
       "outcome": "reject",
       "issue_type": "misheard_word",
       "evidence": "none",
-      "count": 2
+      "count": 3
+    },
+    {
+      "outcome": "duplicate",
+      "issue_type": "misheard_proper_noun",
+      "evidence": "none",
+      "count": 1
     },
     {
       "outcome": "reanchor",
@@ -71,7 +92,8 @@
     "issue_type_capped": 1,
     "jev_reject": 1,
     "jev_unavailable": 1,
-    "no_evidence": 1
+    "no_evidence": 1,
+    "overlap_dup": 1
   },
   "rung0_rejects": {
     "not_soundalike": 1
@@ -84,27 +106,28 @@
     0,
     0,
     0,
-    0,
-    0,
+    1,
+    1,
     0,
     0,
     0,
     4
   ],
   "jev": {
-    "asked": 6,
-    "answered": 5,
+    "asked": 8,
+    "answered": 7,
     "unavailable": 1,
-    "cache_hits": 1,
+    "cache_hits": 2,
     "errors": {
       "timeout": 1
     },
     "latency_p50_ms": 900,
     "latency_p95_ms": 1200,
-    "input_tokens": 1600,
-    "output_tokens": 12,
-    "cost_usd": 0.0000672
+    "input_tokens": 2000,
+    "output_tokens": 15,
+    "cost_usd": 0.000084
   },
+  "conflict_asks": 1,
   "projection": {
     "backlog": 929,
     "by_issue": {
@@ -116,13 +139,14 @@
       "repeated_text": 50
     },
     "outcomes": {
-      "apply": 150,
-      "hold": 170,
-      "reanchor": 200,
-      "reject": 400
+      "apply": 117,
+      "duplicate": 67,
+      "hold": 137,
+      "reanchor": 150,
+      "reject": 450
     },
     "unprojected": 9,
-    "asked": 520,
-    "cost_usd": 0.008735999999999999
+    "asked": 553,
+    "cost_usd": 0.009296
   }
 }

@@ -567,7 +567,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
   {{with .RoleCards}}<div class="panels role-panels">
   {{range .}}{{template "roleCard" .}}{{end}}
   </div>{{end}}
-  {{with .UnconfiguredRoles}}<p class="server-note roles-unconfigured">○ Not configured: {{range $i, $r := .}}{{if $i}}, {{end}}{{$r.Title}}{{if $r.HasModel}} <span class="time-muted">({{$r.Health.Sub}}{{if $r.HumanDecided}} · decided by humans {{commafyPtr $r.HumanDecided}}{{if $r.JevDecided}} · by Jev {{commafy $r.JevDecided}}{{end}}{{end}})</span>{{end}}{{end}}</p>{{end}}
+  {{with .UnconfiguredRoles}}<p class="server-note roles-unconfigured">○ Not configured: {{range $i, $r := .}}{{if $i}}, {{end}}{{$r.Title}}{{if $r.HasModel}} <span class="time-muted">({{$r.Health.Sub}}{{if $r.HumanDecided}} · decided by humans {{commafyPtr $r.HumanDecided}}{{if $r.JevDecided}}{{range $r.JevByModel}} · by {{.Model}} {{commafy .Count}}{{end}}{{end}}{{end}})</span>{{end}}{{end}}</p>{{end}}
 </section>
 
 <section class="section" aria-labelledby="recipes-title">
@@ -676,8 +676,8 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
       <th scope="col" class="num">Proposed</th>
       <th scope="col" class="num">Unanchorable</th>
       <th scope="col" class="num" title="accepted + rejected + applied + reverted, decided by a person (mcp:, cli:, other, or unattributed)">Decided · human</th>
-      <th scope="col" class="num" title="accepted + rejected + applied + reverted by the decide step (jev:&lt;recipe&gt;), incl. its undos (revert:jev:&lt;recipe&gt;)">Decided · Jev</th>
-      <th scope="col" class="num" title="superseded by a re-transcribe, plus the patch state 'stale' (a replay quarantine — not stale_work)">Superseded / other</th>
+      <th scope="col" class="num" title="accepted + rejected + applied + reverted by the decide step (jev:&lt;recipe&gt;, whatever its model), incl. its undos (revert:jev:&lt;recipe&gt;)">Decided · decide step</th>
+      <th scope="col" class="num" title="superseded by a re-transcribe or a clear, duplicates of another finding's fix, plus the patch state 'stale' (a replay quarantine — not stale_work)">Superseded / other</th>
       <th scope="col" class="num">Total</th>
     </tr></thead>
     <tbody>
@@ -818,7 +818,7 @@ var serversFragmentTmpl = template.Must(template.New("models").Funcs(tmplFuncs).
     {{if .FailingNow}}<dt>failing</dt><dd>{{commafy .FailingNow}} {{plural .FailingNow "transcript" "transcripts"}} currently failing</dd>{{end}}
     {{if eq .Key "judge"}}<dt>coverage</dt><dd>{{if .StatsKnown}}{{commafy .CoverageDone}} / {{commafy .CoverageTotal}} {{plural .CoverageTotal "transcript" "transcripts"}} judged{{else}}—{{end}}</dd>{{end}}
     {{if and .IsFnRole .FnKnown .CountsKnown}}<dt>calls</dt><dd>{{commafy .Calls}} <span class="mono">{{.Fn}}</span> {{plural .Calls "call" "calls"}}{{if .CacheHits}} + {{commafy .CacheHits}} cached{{end}}{{if .Failures24h}} · <span class="err">{{commafy .Failures24h}} failed (24h)</span>{{end}}{{if .Fallbacks}} · {{commafy .Fallbacks}} {{plural .Fallbacks "fallback" "fallbacks"}}{{end}} <span class="time-muted">· current recipe{{if not .RecipeSince.IsZero}}, since <span title="{{formatTime .RecipeSince}}">{{relTime .RecipeSince}}</span>{{end}}</span></dd>{{end}}
-    {{if and (eq .Key "decide") .HumanDecided}}<dt>decided</dt><dd>{{commafy .JevDecided}} by Jev · {{commafyPtr .HumanDecided}} by humans{{if .JevUndone}} · {{commafy .JevUndone}} undone{{end}} · {{commafy .Proposed}} proposed awaiting</dd>{{end}}
+    {{if and (eq .Key "decide") .HumanDecided}}<dt>decided</dt><dd>{{range .JevByModel}}{{commafy .Count}} by <span class="mono">{{.Model}}</span> · {{else}}0 by the decide step · {{end}}{{commafyPtr .HumanDecided}} by humans{{if .JevUndone}} · {{commafy .JevUndone}} undone{{end}} · {{commafy .Proposed}} proposed awaiting</dd>{{end}}
     {{if and (eq .Key "scan") .Scanned}}<dt>scanned</dt><dd>{{commafy64Ptr .Scanned}}{{if .ChunksTotal}} / {{commafy .ChunksTotal}}{{end}} chunks <span class="time-muted">· current recipe</span></dd>{{end}}
     {{if eq .Key "embeddings"}}<dt>backlog</dt><dd>{{if .StatsKnown}}{{commafy .Backlog}} {{plural .Backlog "transcript" "transcripts"}} awaiting embedding{{else}}—{{end}}</dd>{{end}}
   {{end}}

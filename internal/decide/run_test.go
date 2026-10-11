@@ -146,8 +146,10 @@ func runFixture() *fakeRunStore {
 		finding("f-capped", runT2, lib, IssueNumberArtifact, libText, "too forty", "240", 0, 0.9),
 		finding("f-outage", runT2, lib, IssueHomophone, libText, "to the", "two the", 0, 0.5),
 	}
-	// An unsampled proposed competitor on f-dup's span with a higher judge
-	// confidence wins dedupe: f-dup fails overlap_dup, as in a full run.
+	// An unsampled proposed competitor proposes a different fix on f-dup's
+	// span, with a HIGHER judge confidence but a LOWER p: both are asked, and
+	// the conflict goes to f-dup (p ranks, not confidence). The competitor
+	// loses overlap_dup but, being outside the sample, is not reported.
 	comp := finding("c-overlap", runT2, lib, IssueMisheardWord, libText, "walked", "worked", 0, 0.95)
 	sample = append(sample, finding("f-dup", runT2, lib, IssueMisheardWord, libText, "walked", "woked", 0, 0.5))
 	chunk := func(tid string, idx int, text string, start, end float64, comps ...db.DecideFinding) *db.DecideChunk {
@@ -175,6 +177,10 @@ func runAsker() *fakeAsker {
 			return 0.97, nil
 		case strings.Contains(state, "[[dolors]]"):
 			return 0.05, nil
+		case strings.Contains(state, "[[woked]]"):
+			return 0.6, nil
+		case strings.Contains(state, "[[worked]]"):
+			return 0.3, nil
 		default:
 			return 0, &systemone.ServerError{Code: 503}
 		}
@@ -201,7 +207,8 @@ func TestDryRunPolicyChange(t *testing.T) {
 	_, clef, _ := PresetFor("clef:27b")
 	cl := run(clef)
 	if asker.calls != calls+1 {
-		// Only the outage is asked again: a failed call is never cached.
+		// Only the outage is asked again: a failed call is never cached (the
+		// conflict's competitor is served from the cache like the rest).
 		t.Errorf("the policy change made %d new model calls; the cache should serve all but the outage", asker.calls-calls)
 	}
 	if jev.RecipeID == cl.RecipeID {
@@ -228,23 +235,32 @@ func TestDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]int{DecisionApply: 2, DecisionHold: 2, DecisionReject: 3, ClassReanchor: 1}
+	want := map[string]int{DecisionApply: 2, DecisionHold: 3, DecisionReject: 2, ClassReanchor: 1}
 	for k, v := range want {
 		if rep.Outcomes[k] != v {
 			t.Errorf("outcome %s = %d, want %d (all %v)", k, rep.Outcomes[k], v, rep.Outcomes)
 		}
 	}
-	if rep.Rung0Rejects[ReasonNotSoundAlike] != 1 || rep.Rung0Rejects[ReasonOverlapDup] != 1 || rep.Reanchor[ReasonChunkChanged] != 1 {
-		t.Errorf("rung-0 %v reanchor %v", rep.Rung0Rejects, rep.Reanchor)
+	if len(rep.Rung0Rejects) != 1 || rep.Rung0Rejects[ReasonNotSoundAlike] != 1 || rep.Reanchor[ReasonChunkChanged] != 1 {
+		t.Errorf("rung-0 %v reanchor %v (a conflict is not a rung-0 reject)", rep.Rung0Rejects, rep.Reanchor)
 	}
-	if rep.Reasons[ReasonConfident] != 2 || rep.Reasons[ReasonTypeCapped] != 1 || rep.Reasons[ReasonJevUnavailable] != 1 || rep.Reasons[ReasonJevReject] != 1 {
+	if rep.Reasons[ReasonConfident] != 2 || rep.Reasons[ReasonTypeCapped] != 1 || rep.Reasons[ReasonJevUnavailable] != 1 ||
+		rep.Reasons[ReasonJevReject] != 1 || rep.Reasons[ReasonUncertain] != 1 {
 		t.Errorf("reasons %v", rep.Reasons)
 	}
-	if j := rep.Jev; j.Asked != 5 || j.Answered != 4 || j.Unavailable != 1 || j.Errors["503"] != 1 || j.InputTokens != 1600 {
-		t.Errorf("jev %+v", j)
+	// Seven calls: the five passes, f-dup, and the competitor it conflicts
+	// with (asked so the conflict can be ranked by p).
+	if j := rep.Jev; j.Asked != 7 || j.Answered != 6 || j.Unavailable != 1 || j.Errors["503"] != 1 || j.InputTokens != 2400 ||
+		rep.ConflictAsks != 1 {
+		t.Errorf("jev %+v conflict asks %d", j, rep.ConflictAsks)
 	}
-	if asker.calls != 5 {
-		t.Errorf("%d model calls, want 5 (rung-0 failures make none)", asker.calls)
+	if asker.calls != 7 {
+		t.Errorf("%d model calls, want 7 (rung-0 failures make none)", asker.calls)
+	}
+	if g := rep.Grouping; g.Conflicts != 1 || g.Ranked != 2 || g.Losers != 1 || g.Unranked != 0 || len(g.ConflictLines) != 1 ||
+		!strings.Contains(g.ConflictLines[0], `"walked" → "woked" p 0.60 kept`) ||
+		!strings.Contains(g.ConflictLines[0], `"walked" → "worked" p 0.30 overlap_dup → f-dup`) {
+		t.Errorf("grouping %+v", g)
 	}
 
 	// The dry run's only writes: decide recipe registrations and one
@@ -254,8 +270,8 @@ func TestDryRun(t *testing.T) {
 			t.Errorf("registered a %s recipe", r.Step)
 		}
 	}
-	if len(store.rows) != 5 {
-		t.Errorf("%d fn_calls rows, want 5", len(store.rows))
+	if len(store.rows) != 7 {
+		t.Errorf("%d fn_calls rows, want 7", len(store.rows))
 	}
 
 	// A second run is served from fn_calls: no new model call for the
@@ -266,7 +282,7 @@ func TestDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if asker.calls != 6 || rep2.Jev.CacheHits != 4 || rep2.Outcomes[DecisionApply] != 2 {
+	if asker.calls != 8 || rep2.Jev.CacheHits != 6 || rep2.Outcomes[DecisionApply] != 2 {
 		t.Errorf("rerun: calls %d, cache hits %d, outcomes %v", asker.calls, rep2.Jev.CacheHits, rep2.Outcomes)
 	}
 
@@ -307,15 +323,26 @@ func TestReportGolden(t *testing.T) {
 		mk(IssueMisheardWord, DecisionReject, ReasonAnchorMissing, EvidenceNone, false, nil, false, 0, ""),
 		mk(IssueHomophone, DecisionHold, ReasonJevUnavailable, EvidenceNone, true, nil, false, 0, "timeout"),
 		mk(IssueNumberArtifact, DecisionHold, ReasonTypeCapped, EvidenceNone, true, p(0.98), false, 1000*time.Millisecond, ""),
+		{finding: db.DecideFinding{IssueType: IssueMisheardProperNoun},
+			outcome: Outcome{Decision: DecisionDuplicate, Reason: ReasonDuplicate, Related: "rep", Rung0: Verdict{Pass: true}, Evidence: EvidenceNone}},
+		mk(IssueMisheardWord, DecisionReject, ReasonOverlapDup, EvidenceNone, true, p(0.40), true, time.Millisecond, ""),
 	}
+	grouping := Grouping{Groups: 1, Duplicates: 1, Conflicts: 1, Ranked: 2, Losers: 1,
+		GroupLines:    []string{`0b5c11aa [accepted · accepted/applied] "auto sebo" → "Arecibo" · duplicates: 7d2e90f1`},
+		ConflictLines: []string{`1a2b3c4d "walked" → "woked" p 0.60 kept · 5e6f7a8b "walked" → "worked" p 0.40 overlap_dup → 1a2b3c4d`}}
 	_, clef, _ := PresetFor("clef:27b")
 	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: 10, Seed: "golden"}, Params: clef,
 		PolicySource: "db (reject_floor) over preset clef"}, strings.Repeat("ab", 32), items,
 		map[string]int{IssueMisheardProperNoun: 200, IssueMisheardWord: 600, IssueRepeatedText: 50, IssueHomophone: 40, IssueNumberArtifact: 30, IssueDroppedWord: 9})
 
+	rep.Grouping = grouping
+	rep.addShadowCalls([]*item{mk(IssueMisheardWord, DecisionHold, ReasonUncertain, EvidenceNone, true, p(0.5), false, 700*time.Millisecond, "")})
+
 	wrep := buildReport(RunOptions{Scope: db.DecideScope{Sample: 2000}}, strings.Repeat("ab", 32), items, nil)
 	wrep.DryRun = false
-	wrep.Write = &WriteStats{Accepted: 2, Rejected: 2, Held: 2, Kept: 3, KeptHeld: 1, Reverted: 1, Skipped: 1, Reanchor: 1, Capped: 4, Stopped: "max-accepts"}
+	wrep.Write = &WriteStats{Accepted: 2, Rejected: 2, Held: 2, Kept: 3, KeptHeld: 1, Reverted: 1, Skipped: 1, Reanchor: 1, Capped: 4,
+		Duplicates: 1, Stopped: "max-accepts"}
+	wrep.Grouping = Grouping{Groups: 1, Duplicates: 1, Conflicts: 1, Ranked: 2, Losers: 1}
 	for name, c := range map[string]struct {
 		rep    *Report
 		asJSON bool

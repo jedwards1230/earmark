@@ -1,6 +1,8 @@
 # Design: audit lineage for transcripts and findings
 
-Migration `00013_audit_lineage.sql`. Reference: CONTRACT §1.4 "Operator
+Migrations `00013_audit_lineage.sql` and `00016_decide_duplicates.sql` (the
+decide step's duplicate decisions and `finding_events.related_finding_id`).
+Reference: CONTRACT §1.4 "Operator
 requeue", §2.15 "Lineage" and "Clearing", §2.17 "Lifecycle" and "Version
 history"; schema detail in `docs/DATABASE_SCHEMA.md`.
 
@@ -92,7 +94,29 @@ undoing the representative's grouping, with `duplicate_of` cleared in the same
 UPDATE — or to `superseded`, which keeps `duplicate_of` so an archived
 duplicate still says what it agreed with (the CHECK admits `duplicate_of` on
 those two states only). Both moves are machine moves; no review action applies.
-No path groups findings into `duplicate` yet.
+The decide step is the writer (decide `step_version` 3, migration 16;
+CONTRACT §2.19 "Agreeing and conflicting findings"). Per chunk, before rung
+0's dedupe, the proposed findings that resolve to the same span with the same
+stored `correction_key` — plus any accepted/applied finding of that fix — form
+a group. The representative is the accepted/applied member, else an existing
+representative (already has duplicates, or already decided under this
+recipe — so a re-run never flip-flops), else one rung 0 can vet, else the
+current propose recipe's, else the newest. It alone is decided and can be
+applied; every other proposed member gets a `duplicate` decision event
+(`related_finding_id` = the representative) and moves to `duplicate` with
+transition reason `duplicate`. Already-rejected findings are never members:
+they stay rejected and out of decide's scope, linked to re-proposals by
+`correction_key` for reporting only. Different fixes to overlapping text are
+not duplicates but conflicts: each is asked, and the decide model's `p` —
+not the judge's confidence — picks the survivor; the losers are rejected
+`overlap_dup` with `related_finding_id` naming the winner.
+
+Undo cascades. `earmark decide revert` returns a reverted recipe's
+duplicates to `proposed`, and so does every duplicate of a finding the
+revert moves, whichever recipe grouped it: `duplicate_of` cleared in the same
+UPDATE, transition reason `duplicate_released`, and the duplicates' live
+`duplicate` decisions revoked so the next run decides them afresh. A
+reviewer's move of a representative does not cascade.
 
 ### Nothing is deleted — clear-as-supersede
 

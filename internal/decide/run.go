@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 
@@ -90,6 +91,11 @@ type item struct {
 	chunk     *db.DecideChunk // nil when the chunk is gone
 	outcome   Outcome
 	sentences []RecordSentence
+	// shadow marks a finding outside the run's sample or work page that the
+	// run still handles (prepared): never reported as one of the run's
+	// findings, never ticked; a conflict shadow is asked for its p, a
+	// duplicate shadow is written by --yes with its group.
+	shadow bool
 }
 
 // DryRun samples findings, decides each — rung 0, evidence, should_apply —
@@ -135,24 +141,32 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 		return nil, err
 	}
 	rec.Phase("loading chunks + rung-0")
-	items, err := prepare(ctx, store, sample, o.Params)
+	prep, err := prepare(ctx, store, sample, o.Params, recipeID)
 	if err != nil {
 		return nil, err
 	}
+	var grouping Grouping
+	grouping.addGroups(prep.groups, true)
 	if o.Rung0Only {
 		rec.Phase("rung-0")
-		rung0Outcomes(items)
-		for _, it := range items {
-			tickOutcome(rec, it.outcome)
+		rung0Outcomes(prep.items)
+		for _, it := range prep.items {
+			if !it.shadow {
+				tickOutcome(rec, it.outcome)
+			}
 		}
 	} else {
 		rec.Phase(askingPhase(o.Model))
-		evaluateAll(ctx, ev, items, o.Concurrency, rec)
+		evaluateAll(ctx, ev, prep.items, o.Concurrency, rec)
+		resolveConflicts(prep.items, &grouping, true)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	items, shadows := splitShadows(prep.items)
 	rep := buildReport(o, recipeID, items, backlog)
+	rep.Grouping = grouping
+	rep.addShadowCalls(shadows)
 	if o.Scope.Calibrate {
 		sweep := o.Sweep
 		if sweep == nil {
@@ -168,11 +182,27 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 	return rep, nil
 }
 
+// splitShadows separates the run's items from the shadow items.
+func splitShadows(all []*item) (items, shadows []*item) {
+	for _, it := range all {
+		if it.shadow {
+			shadows = append(shadows, it)
+		} else {
+			items = append(items, it)
+		}
+	}
+	return items, shadows
+}
+
 // rung0Outcomes fills each item's outcome from its rung-0 verdict alone: a
 // failure is the reject Evaluate would return, a pass is left undecided
-// (Decision "", reported as ClassRung0Pass) with its text evidence. No call.
+// (Decision "", reported as ClassRung0Pass) with its text evidence — a
+// conflict too: ranking needs p. A duplicate keeps its outcome. No call.
 func rung0Outcomes(items []*item) {
 	for _, it := range items {
+		if it.outcome.Decision == DecisionDuplicate {
+			continue
+		}
 		c, v := it.input.Candidate, *it.input.Verdict
 		out := Outcome{FindingID: c.FindingID, Rung0: v, ChunkHash: c.ChunkHash, Evidence: EvidenceNone}
 		if v.Pass {
@@ -184,11 +214,23 @@ func rung0Outcomes(items []*item) {
 	}
 }
 
+// prepared is what prepare builds: the run's items, plus shadow items — a
+// competitor (a proposed finding of the same chunk outside the run) that is
+// in a conflict with a run item, so it must be asked for its p, or that is
+// grouped as a duplicate in a group holding a run item — and the groups of
+// agreeing findings that hold a run item.
+type prepared struct {
+	items  []*item
+	groups []DupGroup
+}
+
 // prepare groups the sample by transcript, loads chunks, segments and book
-// records in bounded batches, and runs rung 0 per chunk (Check + Dedupe over
-// the chunk's sampled findings, its other proposed findings, and its
-// accepted/applied overlay).
-func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p ShouldApplyParams) ([]*item, error) {
+// records in bounded batches, and runs rung 0 per chunk (Check, grouping of
+// agreeing findings, then Dedupe over the chunk's sampled findings, its other
+// proposed findings, and its accepted/applied overlay). runRecipe is the
+// decide recipe the run decides under ("" = none: no member is an existing
+// representative by decision).
+func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p ShouldApplyParams, runRecipe string) (*prepared, error) {
 	byTranscript := map[string][]db.DecideFinding{}
 	for _, f := range sample {
 		byTranscript[f.TranscriptID] = append(byTranscript[f.TranscriptID], f)
@@ -199,7 +241,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 	}
 	sort.Strings(tids)
 
-	var items []*item
+	out := &prepared{}
 	for start := 0; start < len(tids); start += db.MaxDecideTranscriptBatch {
 		batch := tids[start:min(start+db.MaxDecideTranscriptBatch, len(tids))]
 		segs, err := store.GetTranscriptSegments(ctx, batch)
@@ -246,14 +288,16 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		}
 
 		for _, t := range batch {
-			items = append(items, prepareTranscript(byTranscript[t], chunks, segs[t], records, p)...)
+			items, groups := prepareTranscript(byTranscript[t], chunks, segs[t], records, p, runRecipe)
+			out.items = append(out.items, items...)
+			out.groups = append(out.groups, groups...)
 		}
 	}
-	return items, nil
+	return out, nil
 }
 
 func prepareTranscript(fs []db.DecideFinding, chunks map[db.ChunkKey]*db.DecideChunk,
-	segs []db.Segment, records map[string]db.BookRecord, p ShouldApplyParams) []*item {
+	segs []db.Segment, records map[string]db.BookRecord, p ShouldApplyParams, runRecipe string) ([]*item, []DupGroup) {
 	byChunk := map[db.ChunkKey][]db.DecideFinding{}
 	var order []db.ChunkKey
 	for _, f := range fs {
@@ -266,53 +310,151 @@ func prepareTranscript(fs []db.DecideFinding, chunks map[db.ChunkKey]*db.DecideC
 	sort.Slice(order, func(i, j int) bool { return order[i].ChunkIndex < order[j].ChunkIndex })
 
 	var out []*item
+	var groups []DupGroup
 	for _, k := range order {
 		chunk := chunks[k]
-		verdicts := chunkVerdicts(byChunk[k], chunk, p.PhoneticMinSim)
-		for _, f := range byChunk[k] {
+		plan := planChunk(byChunk[k], chunk, p.PhoneticMinSim, runRecipe)
+		mk := func(f db.DecideFinding, shadow bool) *item {
 			var rec *db.BookRecord
 			if r, ok := records[filepath.Dir(f.FilePath)]; ok {
 				rec = &r
 			}
-			it := &item{finding: f, chunk: chunk, sentences: RecordSentences(rec)}
-			v := verdicts[f.ID]
+			it := &item{finding: f, chunk: chunk, sentences: RecordSentences(rec), shadow: shadow}
+			v := plan.verdicts[f.ID]
 			it.input = Input{Candidate: candidateOf(f, chunk), Verdict: &v, Segments: segs, Record: rec}
 			if chunk != nil {
 				it.input.Chunk = ChunkWindow{StartSec: chunk.StartSec, EndSec: chunk.EndSec}
 			}
-			out = append(out, it)
+			if rep := plan.dupOf[f.ID]; rep != "" {
+				it.outcome = duplicateOutcome(f, v, rep)
+			}
+			return it
+		}
+		inRun := map[string]bool{}
+		for _, f := range byChunk[k] {
+			inRun[f.ID] = true
+			out = append(out, mk(f, false))
+		}
+		if chunk == nil {
+			continue
+		}
+		// Groups and conflicts that hold a run item pull in the chunk's other
+		// proposed findings: a duplicate is recorded with its group, and a
+		// conflicting competitor is asked so the set can be ranked by p.
+		touched := plan.touching(inRun)
+		for _, g := range plan.groups {
+			if touched[g.Rep] || slices.ContainsFunc(g.Members, func(m string) bool { return touched[m] }) {
+				groups = append(groups, g)
+			}
+		}
+		for _, f := range chunk.Competitors {
+			if !inRun[f.ID] && touched[f.ID] && (plan.dupOf[f.ID] != "" || len(plan.verdicts[f.ID].Conflicts) > 0) {
+				out = append(out, mk(f, true))
+			}
 		}
 	}
-	return out
+	return out, groups
 }
 
-// chunkVerdicts runs rung 0 for the sampled findings of one chunk, with the
-// chunk's other proposed findings as dedupe competitors. A missing chunk
-// fails every finding chunk_changed.
-func chunkVerdicts(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold float64) map[string]Verdict {
-	out := make(map[string]Verdict, len(sampled))
+// chunkPlan is rung 0 over one chunk: every candidate's verdict (after
+// grouping and Dedupe), the duplicates (member → representative) and the
+// groups of agreeing findings.
+type chunkPlan struct {
+	verdicts map[string]Verdict
+	dupOf    map[string]string
+	groups   []DupGroup
+}
+
+// touching returns the ids connected to a run finding (inRun) through a
+// group or a conflict: the run findings themselves, their groups' members and
+// representatives, and every finding in a conflict set with one of them.
+func (cp chunkPlan) touching(inRun map[string]bool) map[string]bool {
+	adj := map[string][]string{}
+	link := func(a, b string) {
+		adj[a] = append(adj[a], b)
+		adj[b] = append(adj[b], a)
+	}
+	for _, g := range cp.groups {
+		for _, m := range g.Members {
+			link(g.Rep, m)
+		}
+	}
+	for id, v := range cp.verdicts {
+		for _, o := range v.Conflicts {
+			link(id, o)
+		}
+	}
+	seen := map[string]bool{}
+	var stack []string
+	for id := range inRun {
+		seen[id] = true
+		stack = append(stack, id)
+	}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, n := range adj[id] {
+			if !seen[n] {
+				seen[n] = true
+				stack = append(stack, n)
+			}
+		}
+	}
+	return seen
+}
+
+// planChunk runs rung 0 for the sampled findings of one chunk, with the
+// chunk's other proposed findings as competitors: Check on each, then the
+// grouping of agreeing findings (groupChunk, with the chunk's overlay), then
+// Dedupe over everything not grouped as a duplicate. A missing chunk fails
+// every sampled finding chunk_changed.
+func planChunk(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold float64, runRecipe string) chunkPlan {
+	plan := chunkPlan{verdicts: map[string]Verdict{}, dupOf: map[string]string{}}
 	if chunk == nil {
 		for _, f := range sampled {
-			out[f.ID] = Verdict{Reason: ReasonChunkChanged, Evidence: "chunk no longer exists"}
+			plan.verdicts[f.ID] = Verdict{Reason: ReasonChunkChanged, Evidence: "chunk no longer exists"}
 		}
-		return out
+		return plan
 	}
-	cands := make([]Candidate, 0, len(sampled)+len(chunk.Competitors))
+	fs := make([]db.DecideFinding, 0, len(sampled)+len(chunk.Competitors))
 	seen := map[string]bool{}
 	for _, f := range sampled {
-		cands = append(cands, candidateOf(f, chunk))
+		fs = append(fs, f)
 		seen[f.ID] = true
 	}
 	for _, f := range chunk.Competitors {
 		if !seen[f.ID] {
-			cands = append(cands, candidateOf(f, chunk))
+			fs = append(fs, f)
 		}
 	}
-	verdicts := Rung0(cands, chunk.Overlay, Params{SoundAlikeThreshold: threshold})
-	for i, c := range cands {
-		if seen[c.FindingID] {
-			out[c.FindingID] = verdicts[i]
+	rp := Params{SoundAlikeThreshold: threshold}
+	for _, f := range fs {
+		plan.verdicts[f.ID] = Check(candidateOf(f, chunk), rp)
+	}
+	plan.dupOf, plan.groups = groupChunk(chunk.Text, fs, plan.verdicts, chunk.OverlayFindings, runRecipe)
+
+	var cands []Candidate
+	var vs []Verdict
+	for _, f := range fs {
+		if plan.dupOf[f.ID] != "" {
+			continue
 		}
+		cands = append(cands, candidateOf(f, chunk))
+		vs = append(vs, plan.verdicts[f.ID])
+	}
+	for i, v := range Dedupe(cands, vs, chunk.Overlay) {
+		plan.verdicts[cands[i].FindingID] = v
+	}
+	return plan
+}
+
+// chunkVerdicts is planChunk's verdicts for the sampled findings alone (the
+// calibration sweep's view).
+func chunkVerdicts(sampled []db.DecideFinding, chunk *db.DecideChunk, threshold float64) map[string]Verdict {
+	plan := planChunk(sampled, chunk, threshold, "")
+	out := make(map[string]Verdict, len(sampled))
+	for _, f := range sampled {
+		out[f.ID] = plan.verdicts[f.ID]
 	}
 	return out
 }
@@ -352,15 +494,30 @@ func tickOutcome(rec *runs.Run, o Outcome) {
 }
 
 // evaluateAll runs Evaluate over items with at most n calls in flight.
-// Rung-0 failures return without a call, so they never wait for a slot. Each
-// finished item ticks rec (nil = no progress recording).
+// Rung-0 failures return without a call, so they never wait for a slot; a
+// duplicate keeps the outcome grouping gave it and is never asked. Each
+// finished item but a shadow ticks rec (nil = no progress recording); a
+// shadow's call is counted as "conflict_asks".
 func evaluateAll(ctx context.Context, ev *Evaluator, items []*item, n int, rec *runs.Run) {
 	sem := make(chan struct{}, n)
 	var wg sync.WaitGroup
+	tick := func(it *item) {
+		if it.shadow {
+			if it.outcome.Asked {
+				rec.Count("conflict_asks", 1)
+			}
+			return
+		}
+		tickOutcome(rec, it.outcome)
+	}
 	for _, it := range items {
+		if it.outcome.Decision == DecisionDuplicate {
+			tick(it)
+			continue
+		}
 		if !it.input.Verdict.Pass {
 			it.outcome = ev.Evaluate(ctx, it.input)
-			tickOutcome(rec, it.outcome)
+			tick(it)
 			continue
 		}
 		if ctx.Err() != nil {
@@ -376,7 +533,7 @@ func evaluateAll(ctx context.Context, ev *Evaluator, items []*item, n int, rec *
 			defer wg.Done()
 			defer func() { <-sem }()
 			it.outcome = ev.Evaluate(ctx, it.input)
-			tickOutcome(rec, it.outcome)
+			tick(it)
 		}(it)
 	}
 	wg.Wait()

@@ -30,8 +30,12 @@ const (
 	// ShouldApplyModel is the pinned decision model. Never an alias.
 	ShouldApplyModel = "jev-1.13.0"
 	// ShouldApplyStepVersion is bumped when the decide logic around the call
-	// changes (context building, evidence, the decision rule).
-	ShouldApplyStepVersion = 2
+	// changes (context building, evidence, the decision rule). 3: agreeing
+	// findings are grouped (one representative decided, the rest recorded as
+	// duplicates) and overlapping different fixes are ranked by the model's p
+	// instead of judge confidence (CONTRACT §2.19 "Agreeing and conflicting
+	// findings").
+	ShouldApplyStepVersion = 3
 	// questionKey is the System One question name.
 	questionKey = "should_apply"
 )
@@ -45,6 +49,10 @@ const (
 	DecisionApply  = "apply"
 	DecisionHold   = "hold"
 	DecisionReject = "reject"
+	// DecisionDuplicate — the finding proposes the same fix as its group's
+	// representative (Outcome.Related), which carries the decision. Never
+	// applied, never a rejection.
+	DecisionDuplicate = "duplicate"
 )
 
 // Outcome reasons beyond rung 0's Reason* constants. A data contract, like
@@ -68,6 +76,8 @@ const (
 	ReasonCapitalised = "capitalised_replacement"
 	// ReasonJevReject — p ≤ reject_p: rejected.
 	ReasonJevReject = "jev_reject"
+	// ReasonDuplicate — grouped as a duplicate of the representative.
+	ReasonDuplicate = db.ReasonDuplicate
 	// ReasonJevUnavailable — the model could not give a usable answer (error,
 	// timeout, 4xx/5xx, a reply that does not decode, a fallback model, or a
 	// probability outside [0, 1]): held, retryable. NEVER applied.
@@ -413,7 +423,7 @@ type Input struct {
 // as a decision event.
 type Outcome struct {
 	FindingID string
-	// Decision is apply, hold or reject.
+	// Decision is apply, hold, reject or duplicate.
 	Decision string
 	// Reason is a rung-0 Reason* (on a rung-0 reject) or one of the reasons
 	// above.
@@ -426,6 +436,9 @@ type Outcome struct {
 	P *float64
 	// Evidence is asin_verbatim, exact_repeat or none.
 	Evidence string
+	// Related is the other finding the decision is about: a duplicate's
+	// representative, or the winner an overlap_dup reject lost to ("" = none).
+	Related string
 	// Rung0 is the rung-0 verdict the outcome rests on.
 	Rung0 Verdict
 	// ChunkHash is the chunk revision decided on (the finding's

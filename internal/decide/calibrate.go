@@ -177,6 +177,9 @@ func pct(r *float64) string {
 }
 
 func (c *Calibration) print(p func(string, ...any), classes []string) {
+	// A calibration finding is human-decided, never proposed, so grouping
+	// never makes it a duplicate.
+	classes = slices.DeleteFunc(slices.Clone(classes), func(c string) bool { return c == ClassDuplicate })
 	p("\ncalibration: %d human-accepted · %d human-rejected\n", c.HumanAccepted, c.HumanRejected)
 	for _, label := range []string{HumanAccepted, HumanRejected} {
 		p("  human %-8s → %s\n", label, counts(c.Matrix[label], classes))

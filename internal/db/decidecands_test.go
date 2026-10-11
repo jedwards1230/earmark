@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pashagolub/pgxmock/v5"
 
@@ -79,16 +80,21 @@ func TestDecideScope(t *testing.T) {
 
 	mock := newMockPool(t)
 	cols := []string{"id", "transcript_id", "file_path", "issue_type", "original_text", "suggested_correction",
-		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by", "model"}
+		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by",
+		"correction_key", "current_propose", "created_at", "has_duplicates", "last_decision_recipe", "model"}
+	created := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 	mock.ExpectQuery(`ORDER BY md5`).
 		WithArgs([]string{"proposed"}, "%Dune%", "homophone", []string{}, "s1", 2).
 		WillReturnRows(pgxmock.NewRows(cols).
-			AddRow("f1", "t1", "/b/Dune/1.m4b", "homophone", "their", "there", 0.9, 3, 10, -1, "aa", "proposed", "", "qwen3:32b"))
+			AddRow("f1", "t1", "/b/Dune/1.m4b", "homophone", "their", "there", 0.9, 3, 10, -1, "aa", "proposed", "",
+				"k1", true, created, true, "r1", "qwen3:32b"))
 	got, err := decideSample(ctx, mock, DecideScope{Sample: 2, Seed: "s1", Book: "Dune", IssueType: "homophone"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].ID != "f1" || got[0].AnchorOccurrence != -1 || got[0].ChunkIndex != 3 || got[0].JudgeModel != "qwen3:32b" {
+	if len(got) != 1 || got[0].ID != "f1" || got[0].AnchorOccurrence != -1 || got[0].ChunkIndex != 3 || got[0].JudgeModel != "qwen3:32b" ||
+		got[0].CorrectionKey != "k1" || !got[0].CurrentPropose || !got[0].CreatedAt.Equal(created) || !got[0].HasDuplicates ||
+		got[0].LastDecisionRecipe != "r1" {
 		t.Errorf("got %+v", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -106,13 +112,15 @@ func TestDecideChunks(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"transcript_id", "chunk_index", "text", "start_sec", "end_sec"}).
 			AddRow("t1", 0, "the dish at auto sebo", 0.0, 4.0))
 	cols := []string{"id", "transcript_id", "file_path", "issue_type", "original_text", "suggested_correction",
-		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by"}
+		"confidence", "chunk_index", "anchor_offset", "anchor_occurrence", "chunk_text_sha256", "patch_state", "decided_by",
+		"correction_key", "current_propose", "created_at", "has_duplicates", "last_decision_recipe"}
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 	mock.ExpectQuery(`FROM transcript_findings`).
 		WithArgs([]string{"t1", "t1"}, []int{0, 1}, "proposed", []string{"accepted", "applied"}).
 		WillReturnRows(pgxmock.NewRows(cols).
-			AddRow("p1", "t1", "/b/x", "misheard_word", "dish", "fish", 0.5, 0, 4, 0, "aa", "proposed", "").
-			AddRow("a1", "t1", "/b/x", "misheard_word", "the", "a", 0.5, 0, -1, -1, "", "accepted", "mcp:r").
-			AddRow("z1", "t1", "/b/x", "misheard_word", "x", "y", 0.5, 1, 0, 0, "aa", "proposed", ""))
+			AddRow("p1", "t1", "/b/x", "misheard_word", "dish", "fish", 0.5, 0, 4, 0, "aa", "proposed", "", "k1", false, at, false, "").
+			AddRow("a1", "t1", "/b/x", "misheard_word", "the", "a", 0.5, 0, -1, -1, "", "accepted", "mcp:r", "", false, at, false, "").
+			AddRow("z1", "t1", "/b/x", "misheard_word", "x", "y", 0.5, 1, 0, 0, "aa", "proposed", "", "k2", false, at, false, ""))
 	got, err := decideChunks(ctx, mock, []ChunkKey{{"t1", 0}, {"t1", 1}})
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +131,9 @@ func TestDecideChunks(t *testing.T) {
 	}
 	if o := c.Overlay[0]; o.ID != "a1" || o.Anchor.Offset != -1 || o.Correction != "a" || o.ChunkHash != "" {
 		t.Errorf("overlay %+v", o)
+	}
+	if len(c.OverlayFindings) != 1 || c.OverlayFindings[0].ID != "a1" || c.Competitors[0].CorrectionKey != "k1" {
+		t.Errorf("overlay findings %+v competitors %+v", c.OverlayFindings, c.Competitors)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)

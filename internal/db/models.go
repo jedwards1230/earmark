@@ -144,7 +144,12 @@ type FindingsModelCount struct {
 	Model      string
 	PatchState string
 	Decider    string
-	Count      int
+	// DecideModel is the decide recipe's model (recipes.model_alias) when
+	// Decider is DeciderJev or DeciderJevRevert — "jev:<recipe>" names the
+	// automated decide recipe, not the model, so a Clef decision is labelled
+	// clef, not Jev. "" for a person, or a recipe with no row.
+	DecideModel string
+	Count       int
 }
 
 // Decider classes of transcript_findings.decided_by (CONTRACT §2.17, §2.19).
@@ -168,17 +173,24 @@ const findingsByModelLimit = 500
 // findingsByModelSQL is one pass over the judge findings. The decider CASE
 // mirrors findingevents.go's automatedDeciderRe loosely (LIKE, not the
 // 64-hex check): a malformed jev-looking decider is still not a person.
+//
+// The decide model is the recipe's model_alias, joined on the recipe id the
+// decider names ("jev:<id>" / "revert:jev:<id>").
 const findingsByModelSQL = `
-	SELECT coalesce(resolved_model, model), patch_state,
-	       CASE WHEN decided_by LIKE 'jev:%'        THEN 'jev'
-	            WHEN decided_by LIKE 'revert:jev:%' THEN 'jev_revert'
-	            WHEN coalesce(decided_by, '') = ''  THEN ''
+	SELECT coalesce(f.resolved_model, f.model), f.patch_state,
+	       CASE WHEN f.decided_by LIKE 'jev:%'        THEN 'jev'
+	            WHEN f.decided_by LIKE 'revert:jev:%' THEN 'jev_revert'
+	            WHEN coalesce(f.decided_by, '') = ''  THEN ''
 	            ELSE 'human' END,
+	       coalesce(r.model_alias, ''),
 	       count(*)
-	  FROM transcript_findings
-	 WHERE origin = 'judge'
-	 GROUP BY 1, 2, 3
-	 ORDER BY 1, 2, 3
+	  FROM transcript_findings f
+	  LEFT JOIN recipes r
+	    ON f.decided_by ~ '^(revert:)?jev:'
+	   AND r.recipe_id = regexp_replace(f.decided_by, '^(revert:)?jev:', '')
+	 WHERE f.origin = 'judge'
+	 GROUP BY 1, 2, 3, 4
+	 ORDER BY 1, 2, 3, 4
 	 LIMIT $1`
 
 // FindingsByModel counts judge findings by the model that answered, their
@@ -191,7 +203,7 @@ func (db *DB) FindingsByModel(ctx context.Context) ([]FindingsModelCount, error)
 	}
 	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (FindingsModelCount, error) {
 		var f FindingsModelCount
-		err := r.Scan(&f.Model, &f.PatchState, &f.Decider, &f.Count)
+		err := r.Scan(&f.Model, &f.PatchState, &f.Decider, &f.DecideModel, &f.Count)
 		return f, err
 	})
 	if err != nil {

@@ -187,6 +187,14 @@ func TestDecisionEventValidate(t *testing.T) {
 		"p negative":   func(e *DecisionEvent) { e.P = p(-0.1) },
 		"p NaN":        func(e *DecisionEvent) { e.P = p(math.NaN()) },
 		"bad evidence": func(e *DecisionEvent) { e.Evidence = "vibes" },
+		"duplicate without a representative": func(e *DecisionEvent) {
+			e.Outcome, e.Reason = OutcomeDuplicate, ReasonDuplicate
+		},
+		"related finding not a uuid": func(e *DecisionEvent) { e.RelatedFindingID = "rep" },
+		"related finding is itself": func(e *DecisionEvent) {
+			e.FindingID = "00000000-0000-0000-0000-000000000001"
+			e.RelatedFindingID = e.FindingID
+		},
 	}
 	for name, mutate := range bad {
 		e := ok
@@ -194,6 +202,19 @@ func TestDecisionEventValidate(t *testing.T) {
 		if err := e.validate(); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestDecisionEventValidateDuplicate(t *testing.T) {
+	dup := DecisionEvent{FindingID: "00000000-0000-0000-0000-000000000001", RecipeID: testRecipe,
+		Outcome: OutcomeDuplicate, Reason: ReasonDuplicate, RelatedFindingID: "00000000-0000-0000-0000-000000000002"}
+	if err := dup.validate(); err != nil {
+		t.Errorf("duplicate refused: %v", err)
+	}
+	loser := DecisionEvent{FindingID: "00000000-0000-0000-0000-000000000003", RecipeID: testRecipe,
+		Outcome: OutcomeReject, Reason: "overlap_dup", RelatedFindingID: "00000000-0000-0000-0000-000000000002"}
+	if err := loser.validate(); err != nil {
+		t.Errorf("overlap loser naming its winner refused: %v", err)
 	}
 }
 

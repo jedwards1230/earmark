@@ -16,7 +16,7 @@ import (
 //
 //	active / batch-analyze — Judge HEALTHY (Haiku, with a qwen3.8 fallback ×3
 //	                         visible in "also"), Embeddings HEALTHY, Decide
-//	                         HEALTHY (1,189 decided by Jev, 6 by humans), Scan
+//	                         HEALTHY (1,169 decided by jev-1.13.0 and 20 by clef:27b, 6 by humans), Scan
 //	                         HEALTHY
 //	failed                 — Judge FAILING (401 from LiteLLM, 12 failing),
 //	                         Decide FAILING (timeout after the last ok call)
@@ -318,8 +318,10 @@ func (d demoDB) FindingsByModel(context.Context) ([]db.FindingsModelCount, error
 	return []db.FindingsModelCount{
 		{Model: demoJudgeModel, PatchState: "proposed", Count: 2_140},
 		{Model: demoJudgeModel, PatchState: "unanchorable", Count: 12},
-		{Model: demoJudgeModel, PatchState: "accepted", Decider: db.DeciderJev, Count: 820},
-		{Model: demoJudgeModel, PatchState: "rejected", Decider: db.DeciderJev, Count: 369},
+		{Model: demoJudgeModel, PatchState: "accepted", Decider: db.DeciderJev, DecideModel: demoJevModel, Count: 800},
+		{Model: demoJudgeModel, PatchState: "rejected", Decider: db.DeciderJev, DecideModel: demoJevModel, Count: 369},
+		{Model: demoJudgeModel, PatchState: "accepted", Decider: db.DeciderJev, DecideModel: "clef:27b", Count: 20},
+		{Model: demoJudgeModel, PatchState: "duplicate", Decider: db.DeciderJev, DecideModel: "clef:27b", Count: 7},
 		{Model: demoJudgeModel, PatchState: "accepted", Decider: db.DeciderHuman, Count: 6},
 		{Model: demoFallback, PatchState: "proposed", Count: 26_861},
 		{Model: demoFallback, PatchState: "unanchorable", Count: 3_324},

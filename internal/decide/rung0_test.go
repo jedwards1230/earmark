@@ -329,6 +329,9 @@ func TestDedupe(t *testing.T) {
 		cands    []Candidate
 		existing []patch.Patch
 		want     []string // reason per candidate, "" = pass
+		// conflicts per candidate id (passing candidates with an
+		// overlapping different fix); absent = none.
+		conflicts map[string][]string
 	}{
 		{
 			name: "disjoint spans all pass",
@@ -339,20 +342,15 @@ func TestDedupe(t *testing.T) {
 			want: []string{"", ""},
 		},
 		{
-			name: "overlap keeps the higher confidence",
+			// Rung 0 no longer picks a winner by judge confidence: both pass
+			// and the decide step ranks them by p (RankConflicts).
+			name: "overlapping fixes both pass, each naming the other",
 			cands: []Candidate{
 				at("a", 0.7, "holovo", "Holevo", IssueMisheardProperNoun),
 				at("b", 0.9, "holovo bound", "Holevo bound", IssueMisheardProperNoun),
 			},
-			want: []string{ReasonOverlapDup, ""},
-		},
-		{
-			name: "confidence tie goes to the lower finding id",
-			cands: []Candidate{
-				at("b", 0.8, "holovo", "Holevo", IssueMisheardProperNoun),
-				at("a", 0.8, "holovo bound", "Holevo bound", IssueMisheardProperNoun),
-			},
-			want: []string{ReasonOverlapDup, ""},
+			want:      []string{"", ""},
+			conflicts: map[string][]string{"a": {"b"}, "b": {"a"}},
 		},
 		{
 			name: "touching spans do not overlap",
@@ -371,13 +369,14 @@ func TestDedupe(t *testing.T) {
 			want: []string{"", ReasonNotSoundAlike},
 		},
 		{
-			name: "chain: winner knocks out its neighbour, the far end survives",
+			name: "chain: each names only the spans it overlaps",
 			cands: []Candidate{
 				at("a", 0.9, "the holovo", "the Holevo", IssueMisheardProperNoun),
 				at("b", 0.8, "holovo bound", "Holevo bound", IssueMisheardProperNoun),
 				at("c", 0.7, "bound and", "bound end", IssueHomophone),
 			},
-			want: []string{"", ReasonOverlapDup, ""},
+			want:      []string{"", "", ""},
+			conflicts: map[string][]string{"a": {"b"}, "b": {"a", "c"}, "c": {"b"}},
 		},
 		{
 			name: "overlaps an accepted correction",
@@ -452,6 +451,9 @@ func TestDedupe(t *testing.T) {
 					t.Errorf("candidate %s: pass %v reason %q (%s); want reason %q",
 						tc.cands[i].FindingID, v.Pass, v.Reason, v.Evidence, tc.want[i])
 				}
+				if want := tc.conflicts[tc.cands[i].FindingID]; !slices.Equal(v.Conflicts, want) {
+					t.Errorf("candidate %s: conflicts %v, want %v", tc.cands[i].FindingID, v.Conflicts, want)
+				}
 			}
 		})
 	}
@@ -475,8 +477,8 @@ func TestDedupeDoesNotMutateInput(t *testing.T) {
 	}
 	in := []Verdict{Check(cands[0], DefaultParams()), Check(cands[1], DefaultParams())}
 	out := Dedupe(cands, in, nil)
-	if !in[0].Pass || out[0].Pass {
-		t.Fatalf("want input untouched and output deduped; in %+v out %+v", in[0], out[0])
+	if len(in[0].Conflicts) != 0 || !slices.Equal(out[0].Conflicts, []string{"b"}) {
+		t.Fatalf("want input untouched and output marked; in %+v out %+v", in[0], out[0])
 	}
 }
 
