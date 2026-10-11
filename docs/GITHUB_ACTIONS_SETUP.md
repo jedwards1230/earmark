@@ -30,7 +30,7 @@ The build target is **linux/amd64** only — earmark is a Linux container servic
 
 ### Release (`release.yml`)
 
-Triggers automatically on push to `main` (reads the `semver:*` label from the merged PR: `major`/`minor`/`patch` set the bump, `none` skips the release; with no label it releases as patch unless every changed file matches the dev-only list in the `detect` step, in which case no release is cut) or manually via `workflow_dispatch`.
+Triggers automatically on push to `main` (reads the `semver:*` label from the merged PR: `major`/`minor`/`patch` set the bump, `none` skips the release; with no label it releases as patch unless every changed file matches `.github/.releaseignore`, in which case no release is cut) or manually via `workflow_dispatch`.
 
 Pipeline:
 

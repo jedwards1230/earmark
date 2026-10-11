@@ -2,7 +2,7 @@
 # Release rule for a merged PR: an explicit semver:major|minor|patch label wins
 # (semver:none skips the release). With no label, the PR's changed files decide:
 # if EVERY file is dev-only (CI, editor/agent config, tests, non-embedded docs;
-# see DEV_ONLY in the detect step) no release is cut, otherwise it is a patch.
+# see .github/.releaseignore) no release is cut, otherwise it is a patch.
 # No associated PR or an unreadable file list falls back to patch with a
 # warning. workflow_dispatch always releases. A release delegates the
 # version/tag/Chart.yaml-bump/AI-release-notes pipeline to the shared
@@ -67,6 +67,13 @@ jobs:
       release: ${{ steps.bump.outputs.release }}
       dry_run: ${{ steps.bump.outputs.dry_run }}
     steps:
+      - name: Fetch the dev-only list
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/.releaseignore
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Determine bump type
         id: bump
         env:
@@ -87,47 +94,6 @@ jobs:
             fi
             exit 0
           fi
-
-          # Dev-only paths. With no semver:* label, a merged PR releases as patch
-          # UNLESS every changed file matches one of these. Patterns are bash
-          # [[ == ]] globs, where `*` also matches `/` -- so 'deploy/x/*' covers
-          # the whole subtree and '*_test.go' matches at any depth. Anything not
-          # listed counts as product. README*, runner/ (the ASR worker), the Helm
-          # chart and openapi.{go,yaml} (embedded in the image via COPY . .) are
-          # product on purpose; the rest of docs/ is .dockerignored and not served.
-          DEV_ONLY=(
-            '.github/*'
-            '.devcontainer/*'
-            '.claude/*'
-            '.vscode/*'
-            '.mcp.json'
-            'CLAUDE.md'
-            '*/CLAUDE.md'
-            'AGENTS.md'
-            '*/AGENTS.md'
-            'CONTRIBUTING*'
-            'docs/*.md'
-            'docs/design/*'
-            '*_test.go'
-            'runner/test_*.py'
-            '.gitignore'
-            '.env.example'
-            '.editorconfig'
-            '.golangci*'
-            '.pre-commit-config.yaml'
-            '.markdownlint*'
-            '.yamllint*'
-            'Makefile'
-            'compose.yaml'
-          )
-          is_dev_only() {
-            local p
-            for p in "${DEV_ONLY[@]}"; do
-              # shellcheck disable=SC2053 # unquoted on purpose: $p is a glob
-              [[ $1 == $p ]] && return 0
-            done
-            return 1
-          }
 
           # push event: find the merged PR (retry -- the GitHub API may not have
           # the merge commit indexed yet).
@@ -164,18 +130,37 @@ jobs:
             FILES=""
           fi
 
-          # Classify the diff: DEV_ONLY=true when every changed file is dev-only.
+          # Classify the diff with git's own ignore engine. The dev-only list is
+          # .github/.releaseignore (gitignore syntax). A throwaway empty repo keeps
+          # every other excludes source (.gitignore, global) out of the match.
+          # Result: DEV_ONLY_DIFF=true when every changed file matches the list,
+          # FIRST_PRODUCT = first file that does not, CLASSIFY_ERR=1 on git error.
           DEV_ONLY_DIFF=false
           FIRST_PRODUCT=""
-          if [ -n "$FILES" ]; then
-            DEV_ONLY_DIFF=true
-            while IFS= read -r f; do
-              if ! is_dev_only "$f"; then
-                DEV_ONLY_DIFF=false
-                FIRST_PRODUCT="$f"
-                break
+          CLASSIFY_ERR=0
+          RELEASEIGNORE="${GITHUB_WORKSPACE}/.github/.releaseignore"
+          if [ ! -s "$RELEASEIGNORE" ]; then
+            echo "::notice::.github/.releaseignore is missing or empty -- nothing is dev-only"
+            FIRST_PRODUCT="${FILES%%$'\n'*}"
+          elif [ -n "$FILES" ]; then
+            mapfile -t CHANGED < <(printf '%s\n' "$FILES" | sort -u)
+            SCRATCH=$(mktemp -d)
+            git init -q "$SCRATCH"
+            printf '%s\0' "${CHANGED[@]}" > "$SCRATCH.paths"
+            rc=0
+            git -C "$SCRATCH" -c core.excludesFile="$RELEASEIGNORE" \
+              check-ignore --no-index -z --stdin < "$SCRATCH.paths" > "$SCRATCH.matched" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              CLASSIFY_ERR=1
+            else
+              mapfile -d '' MATCHED < "$SCRATCH.matched"
+              if [ "${#MATCHED[@]}" -eq "${#CHANGED[@]}" ]; then
+                DEV_ONLY_DIFF=true
+              else
+                FIRST_PRODUCT=$(comm -23 <(printf '%s\n' "${CHANGED[@]}") \
+                  <(printf '%s\n' "${MATCHED[@]}" | sort -u) | head -n1)
               fi
-            done <<< "$FILES"
+            fi
           fi
 
           # Rule 1: an explicit label always wins.
@@ -192,7 +177,9 @@ jobs:
               echo "type=patch" >> "$GITHUB_OUTPUT"
               echo "release=false" >> "$GITHUB_OUTPUT"
             else
-              if [ "$DEV_ONLY_DIFF" = true ]; then
+              if [ "$CLASSIFY_ERR" = 1 ]; then
+                echo "::warning::Could not evaluate .github/.releaseignore for PR #${PR}; skipping the dev-only check"
+              elif [ "$DEV_ONLY_DIFF" = true ]; then
                 echo "::warning::PR #${PR} carries semver:${LABEL_TYPE} but its diff is dev-only; semver:none (or no label) would skip the release"
               fi
               echo "type=${LABEL_TYPE}" >> "$GITHUB_OUTPUT"
@@ -204,6 +191,7 @@ jobs:
 
           # Rule 2: no label -- decide from the changed files.
           [ -n "$FILES" ] || fallback "Could not list changed files for PR #${PR}"
+          [ "$CLASSIFY_ERR" = 0 ] || fallback "git check-ignore failed on .github/.releaseignore for PR #${PR}"
           echo "type=patch" >> "$GITHUB_OUTPUT"
           echo "dry_run=false" >> "$GITHUB_OUTPUT"
           if [ "$DEV_ONLY_DIFF" = true ]; then
