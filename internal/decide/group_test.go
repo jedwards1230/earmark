@@ -15,7 +15,8 @@ import (
 // testKey stands in for transcript_findings.correction_key in fixtures: equal
 // for the same fix to the same chunk text, whatever the recipe.
 func testKey(chunk, original, correction string) string {
-	return patch.ChunkHash(chunk) + "|" + strings.ToLower(original) + "|" + strings.ToLower(correction)
+	// Like the SQL column: whitespace collapsed and trimmed, case folded.
+	return patch.ChunkHash(chunk) + "|" + strings.ToLower(exactCorrection(original)) + "|" + strings.ToLower(exactCorrection(correction))
 }
 
 // keyed is finding() with its correction key and creation time set.
@@ -235,7 +236,7 @@ func groupFixture() *fakeRunStore {
 	luna := keyed("g-luna", runT1, path, IssueMisheardProperNoun, runText, "auto sebo", "Arecibo", 0.6, t0.Add(time.Hour))
 	luna.CurrentPropose = true
 	gemma := keyed("g-gemma", runT1, path, IssueMisheardProperNoun, runText, "auto sebo", "Arecibo", 0.9, t0)
-	comp := keyed("g-comp", runT1, path, IssueMisheardProperNoun, runText, "auto sebo", "arecibo", 0.7, t0.Add(time.Minute))
+	comp := keyed("g-comp", runT1, path, IssueMisheardProperNoun, runText, "auto sebo", "Arecibo ", 0.7, t0.Add(time.Minute))
 	repeat := keyed("g-repeat", runT1, path, IssueRepeatedText, runText, "the the cat", "the cat", 0.8, t0)
 	fx := runFixture()
 	fx.sample = []db.DecideFinding{gemma, luna, repeat}
@@ -477,4 +478,116 @@ func (s *countingStore) ApplyDecisions(ctx context.Context, recipe string, evs [
 		s.work = slices.DeleteFunc(s.work, func(f db.DecideFinding) bool { return f.ID == e.FindingID })
 	}
 	return res, err
+}
+
+// A case-only difference is a different correction: "Frodo" and "frodo"
+// share a correction_key (it folds case) but are not grouped — they conflict
+// and are ranked by p. A cosmetic no-op agrees with nothing.
+func TestGroupChunkKeepsCase(t *testing.T) {
+	const text = "and fro dough walked on while frodo slept"
+	mk := func(id, orig, repl string) db.DecideFinding {
+		f := keyed(id, runT1, "/b/x/1.m4b", IssueMisheardProperNoun, text, orig, repl, 0.9, t0)
+		f.CorrectionKey = testKey(text, orig, "frodo") // the key folds case
+		return f
+	}
+	chunk := &db.DecideChunk{Text: text}
+	for name, cands := range map[string][]db.DecideFinding{
+		"different casing of a fix": {mk("cap", "fro dough", "Frodo"), mk("low", "fro dough", "frodo")},
+		"case-only fix and no-op":   {mk("cap", "frodo", "Frodo"), mk("low", "frodo", "frodo")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			verdicts := map[string]Verdict{}
+			for _, f := range cands {
+				verdicts[f.ID] = Check(candidateOf(f, chunk), DefaultParams())
+			}
+			if dupOf, groups := groupChunk(text, cands, verdicts, nil); len(dupOf) != 0 || len(groups) != 0 {
+				t.Errorf("grouped %v %+v", dupOf, groups)
+			}
+		})
+	}
+}
+
+// A member the model rejects on its own p neither wins nor loses: the rest
+// are ranked among themselves, so two overlapping fixes are never both kept
+// because a third, rejected one sat between them. A > B > C by p, A overlaps
+// B, C overlaps only B, A is rejected: B is kept, C loses to B.
+func TestResolveConflictsSkipsRejectedMembers(t *testing.T) {
+	const text = "the holovo bound and the cat"
+	mk := func(id, orig string, p float64, decision string, conflicts ...string) *item {
+		o := patch.Occurrences(text, orig)[0]
+		out := Outcome{FindingID: id, Decision: decision, Reason: ReasonConfident, P: &p, Asked: true,
+			Rung0: Verdict{Pass: true, Span: patch.Span{Start: o, End: o + len(orig)}, Conflicts: conflicts}}
+		if decision == DecisionReject {
+			out.Reason = ReasonJevReject
+		}
+		return &item{finding: db.DecideFinding{ID: id, Original: orig},
+			input: Input{Candidate: Candidate{FindingID: id, ChunkText: text}}, outcome: out}
+	}
+	a := mk("a", "the holovo", 0.9, DecisionReject, "b")
+	b := mk("b", "holovo bound", 0.8, DecisionApply, "a", "c")
+	c := mk("c", "bound and", 0.7, DecisionApply, "b")
+	var g Grouping
+	resolveConflicts([]*item{a, b, c}, &g, false)
+	if a.outcome.Decision != DecisionReject || a.outcome.Reason != ReasonJevReject {
+		t.Errorf("a %+v", a.outcome)
+	}
+	if b.outcome.Decision != DecisionApply {
+		t.Errorf("b %+v: the best surviving fix applies", b.outcome)
+	}
+	if c.outcome.Decision != DecisionReject || c.outcome.Reason != ReasonOverlapDup || c.outcome.Related != "b" {
+		t.Errorf("c %+v: overlaps the applied b, must not apply too", c.outcome)
+	}
+}
+
+// --max-accepts caps the winner's apply: its loser is not rejected for a fix
+// that did not go in — it is held overlap_pending, naming the winner.
+func TestApplyCappedWinnerHoldsLoser(t *testing.T) {
+	store, asker := conflictStore(0.97, 0.40)
+	path := "/b/PHM/01.m4b"
+	first := keyed("a-repeat", runT1, path, IssueRepeatedText, runText, "the the cat", "the cat", 0.8, t0)
+	store.work = append([]db.DecideFinding{first}, store.work...)
+	store.sample = store.work
+	o := applyOpts()
+	o.MaxAccepts = 1
+	rep, err := Apply(context.Background(), store, asker, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evs := eventsByID(store.fresh)
+	if _, written := evs["x-right"]; written || rep.Write.Capped != 1 {
+		t.Fatalf("winner should be capped: %+v", rep.Write)
+	}
+	if l := evs["x-wrong"]; l.Outcome != db.OutcomeHold || l.Reason != ReasonOverlapPending || l.RelatedFindingID != "x-right" {
+		t.Errorf("loser %+v", l)
+	}
+}
+
+// The winner is a competitor outside the run (another issue type than
+// --issue-type): it is asked and applies, but is not written here, so its
+// loser is held overlap_pending rather than rejected for it.
+func TestApplyShadowWinnerHoldsLoser(t *testing.T) {
+	store, asker := conflictStore(0.97, 0.40)
+	k := db.ChunkKey{TranscriptID: runT1, ChunkIndex: 0}
+	var winner db.DecideFinding
+	for _, f := range store.work {
+		if f.ID == "x-right" {
+			winner = f
+		}
+	}
+	store.chunks[k].Competitors = []db.DecideFinding{winner}
+	store.work = slices.DeleteFunc(store.work, func(f db.DecideFinding) bool { return f.ID == "x-right" })
+	rep, err := Apply(context.Background(), store, asker, applyOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	evs := eventsByID(store.fresh)
+	if _, written := evs["x-right"]; written {
+		t.Error("a conflict shadow was written")
+	}
+	if l := evs["x-wrong"]; l.Outcome != db.OutcomeHold || l.Reason != ReasonOverlapPending || l.RelatedFindingID != "x-right" {
+		t.Errorf("loser %+v", l)
+	}
+	if rep.ConflictAsks != 1 {
+		t.Errorf("conflict asks %d", rep.ConflictAsks)
+	}
 }

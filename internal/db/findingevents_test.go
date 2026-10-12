@@ -193,6 +193,14 @@ func TestDecisionEventValidate(t *testing.T) {
 			e.Outcome, e.Reason = OutcomeDuplicate, ReasonDuplicate
 		},
 		"related finding not a uuid": func(e *DecisionEvent) { e.RelatedFindingID = "rep" },
+		"requires an accept on a non-reject": func(e *DecisionEvent) {
+			e.RelatedFindingID = "00000000-0000-0000-0000-000000000009"
+			e.RequiresAccepted = e.RelatedFindingID
+		},
+		"requires an accept of another finding than it names": func(e *DecisionEvent) {
+			e.Outcome, e.RelatedFindingID = OutcomeReject, "00000000-0000-0000-0000-000000000009"
+			e.RequiresAccepted = "00000000-0000-0000-0000-000000000008"
+		},
 		"related finding is itself": func(e *DecisionEvent) {
 			e.FindingID = "00000000-0000-0000-0000-000000000001"
 			e.RelatedFindingID = e.FindingID
@@ -398,5 +406,13 @@ func TestApplyDecisionsDuplicateSkipsLockedRepresentative(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+// Only a live fix can represent duplicates.
+func TestLockRepresentativesSQL(t *testing.T) {
+	if got := norm(lockRepresentativesSQL); !strings.Contains(got, "patch_state IN ('proposed', 'accepted', 'applied')") ||
+		!strings.Contains(got, "FOR SHARE SKIP LOCKED") {
+		t.Errorf("representative lock:\n%s", got)
 	}
 }

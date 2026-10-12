@@ -557,7 +557,7 @@ func TestDecideDuplicatesMigration(t *testing.T) {
 	for _, want := range []string{
 		"ADD COLUMN related_finding_id UUID;",
 		"CHECK (outcome IN ('apply', 'hold', 'reject', 'duplicate'))",
-		"CHECK (outcome IS DISTINCT FROM 'duplicate' OR related_finding_id IS NOT NULL)",
+		"CHECK (outcome IS DISTINCT FROM 'duplicate' OR related_finding_id IS NOT NULL) NOT VALID;",
 		"CREATE INDEX finding_events_related_idx ON finding_events (related_finding_id) WHERE related_finding_id IS NOT NULL;",
 	} {
 		if !strings.Contains(up, want) {

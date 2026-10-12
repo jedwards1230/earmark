@@ -282,6 +282,12 @@ type DecisionEvent struct {
 	// duplicate's representative (required for OutcomeDuplicate) or the
 	// winner an overlap_dup reject lost to. "" = none.
 	RelatedFindingID string
+	// RequiresAccepted makes a reject conditional on another finding's
+	// accept: written as a reject only if that finding moves to accepted in
+	// the same ApplyDecisions call; otherwise it is recorded as a hold with
+	// reason overlap_pending, naming it (CONTRACT §2.19: a conflict's loser is
+	// rejected only for a fix that is actually in). "" = unconditional.
+	RequiresAccepted string
 }
 
 var decisionOutcomes = []string{OutcomeApply, OutcomeHold, OutcomeReject, OutcomeDuplicate}
@@ -300,6 +306,8 @@ func (e DecisionEvent) validate() error {
 		return fmt.Errorf("decision event %s: related finding %q is not a uuid", e.FindingID, e.RelatedFindingID)
 	case e.RelatedFindingID != "" && e.RelatedFindingID == e.FindingID:
 		return fmt.Errorf("decision event %s: names itself as the related finding", e.FindingID)
+	case e.RequiresAccepted != "" && (e.Outcome != OutcomeReject || e.RequiresAccepted != e.RelatedFindingID):
+		return fmt.Errorf("decision event %s: only a reject naming its related finding can require that finding's accept", e.FindingID)
 	case e.Reason == "":
 		return fmt.Errorf("decision event %s: reason is empty", e.FindingID)
 	case e.P != nil && (math.IsNaN(*e.P) || *e.P < 0 || *e.P > 1):
@@ -586,14 +594,16 @@ var applyDecisionsChunksSQL = `
 // name, FOR SHARE in id order, SKIP LOCKED: a representative another writer
 // holds right now — an undo releasing its duplicates, a reviewer — is not
 // waited on (no deadlock with the findings → chunks order); its duplicates
-// are skipped and grouped again next run. A representative that is itself a
-// duplicate, or archived, stale or unanchorable, cannot represent anything.
+// are skipped and grouped again next run. Only a live fix can represent: a
+// proposed, accepted or applied finding — never a duplicate, a rejected or
+// reverted one (nothing would ever release its duplicates), or an archived,
+// stale or unanchorable one.
 // Held until commit, so an undo that releases a representative's duplicates
 // sees every duplicate this write records.
 var lockRepresentativesSQL = `
 	SELECT id::text FROM transcript_findings
 	 WHERE id = ANY($1)
-	   AND patch_state NOT IN ('duplicate', 'superseded', 'stale', 'unanchorable')
+	   AND patch_state IN ('proposed', 'accepted', 'applied')
 	 ORDER BY id
 	   FOR SHARE SKIP LOCKED
 `
@@ -761,6 +771,17 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 		return ApplyResult{}, fmt.Errorf("lock decided chunks: %w", err)
 	}
 
+	// willAccept: the findings this call moves to accepted, for the
+	// conditional rejects (RequiresAccepted).
+	willAccept := map[string]bool{}
+	for _, e := range evs {
+		_, isLocked := state[e.FindingID]
+		cur, hasChunk := chunkSHA[e.FindingID]
+		if isLocked && hasChunk && (e.ChunkTextSHA256 == "" || e.ChunkTextSHA256 == cur) &&
+			decideMove(state[e.FindingID], e.Outcome, recheck) == patch.StateAccepted {
+			willAccept[e.FindingID] = true
+		}
+	}
 	type move struct{ from, to string }
 	var (
 		res     ApplyResult
@@ -779,6 +800,11 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 			res.Skipped = append(res.Skipped, e.FindingID)
 			continue
 		}
+		if e.RequiresAccepted != "" && !willAccept[e.RequiresAccepted] {
+			// The fix it lost to is not going in now: held, pending it.
+			e.Outcome, e.Reason = OutcomeHold, ReasonOverlapPending
+		}
+		e.RequiresAccepted = ""
 		write = append(write, e)
 		if e.Outcome == OutcomeDuplicate {
 			res.Duplicates = append(res.Duplicates, e.FindingID)

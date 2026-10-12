@@ -114,7 +114,9 @@ stored `correction_key` — plus any accepted/applied finding of that fix — fo
 a group. The representative is the accepted/applied member, else an existing
 representative (already has duplicates, or already decided under this
 recipe — so a re-run never flip-flops), else one rung 0 can vet, else the
-current propose recipe's, else the newest. It alone is decided and can be
+current propose recipe's, else the newest. Members must also share the
+exact correction (case kept: the key folds case, but `Frodo` and `frodo` are
+different fixes), and a cosmetic-only edit is no member. It alone is decided and can be
 applied; every other proposed member gets a `duplicate` decision event
 (`related_finding_id` = the representative) and moves to `duplicate` with
 transition reason `duplicate`. Already-rejected findings are never members:
@@ -122,10 +124,11 @@ they stay rejected and out of decide's scope, linked to re-proposals by
 `correction_key` for reporting only. Different fixes to overlapping text are
 not duplicates but conflicts: each is asked, and the decide model's `p` —
 not the judge's confidence — picks the survivor. A loser follows its
-winner: rejected `overlap_dup` when the winner applies, held
-`overlap_pending` while the winner is held (decided again once the winner
-leaves `proposed`), its own verdict when the winner is rejected; the event's
-`related_finding_id` names the winner.
+winner: rejected `overlap_dup` only when the winner's accept is written in the
+same transaction, otherwise — winner held, capped, skipped or outside the run
+— held `overlap_pending` and decided again unless the recipe holds the
+winner; the event's `related_finding_id` names the winner. A member the model
+rejects on its own `p` is not ranked.
 
 Duplicates follow their representative on undo. When `earmark decide
 revert` takes a representative out of the overlay, its duplicates are

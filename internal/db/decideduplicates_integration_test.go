@@ -190,4 +190,74 @@ func TestIntegrationDecideDuplicatesDownRefuses(t *testing.T) {
 		VALUES ($1, $2, 'decision', 'duplicate', 'duplicate', $3, $4)`, ids[1], feTranscript, "jev:"+r, r); err == nil {
 		t.Error("the restored outcome CHECK must refuse a new duplicate decision")
 	}
+	// …and Up again: the duplicate decision the Down kept has no
+	// related_finding_id now, which Up's NOT VALID CHECK leaves alone.
+	if _, err := providerFor(t, dbURL).UpTo(ctx, 15); err != nil {
+		t.Fatalf("Up after an opted-in Down: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO finding_events (finding_id, transcript_id, kind, outcome, reason, actor, recipe_id)
+		VALUES ($1, $2, 'decision', 'duplicate', 'duplicate', $3, $4)`, ids[1], feTranscript, "jev:"+r, r); err == nil {
+		t.Error("a new duplicate decision without a representative must still be refused")
+	}
+}
+
+// An overlap_dup reject is conditional on its winner's accept in the same
+// write: with the winner absent (capped, or decided elsewhere) or skipped
+// (locked), the loser is held overlap_pending naming it; with the winner
+// accepted, it is rejected.
+func TestIntegrationLoserRejectRequiresWinnerAccept(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	ids := seedFindingEvents(t, conn, 6)
+	anchorAll(t, d, ids)
+	r := strings.Repeat("a7", 32)
+	registerTestRecipe(t, conn, r, 3)
+	sha := patch.ChunkHash("ganema said")
+	loser := func(id, winner string) DecisionEvent {
+		return DecisionEvent{FindingID: id, RecipeID: r, Outcome: OutcomeReject, Reason: "overlap_dup",
+			RelatedFindingID: winner, RequiresAccepted: winner, ChunkTextSHA256: sha}
+	}
+	// Winner absent from the write.
+	res, err := d.ApplyDecisions(ctx, r, []DecisionEvent{loser(ids[2], ids[0])})
+	if err != nil || len(res.Held) != 1 || len(res.Rejected) != 0 {
+		t.Fatalf("winner absent: %+v, %v", res, err)
+	}
+	if n := countRows(t, conn, `SELECT count(*) FROM finding_events WHERE finding_id = $1 AND kind = 'decision'
+		AND outcome = 'hold' AND reason = 'overlap_pending' AND related_finding_id = $2`, ids[2], ids[0]); n != 1 {
+		t.Errorf("loser of an absent winner: %d overlap_pending holds", n)
+	}
+	// Winner accepted in the same write.
+	res, err = d.ApplyDecisions(ctx, r, []DecisionEvent{
+		{FindingID: ids[0], RecipeID: r, Outcome: OutcomeApply, Reason: "confident_with_evidence", ChunkTextSHA256: sha},
+		loser(ids[4], ids[0]),
+	})
+	if err != nil || len(res.Accepted) != 1 || len(res.Rejected) != 1 {
+		t.Fatalf("winner accepted: %+v, %v", res, err)
+	}
+	if st, _, _ := stateOf(t, conn, ids[4]); st != "rejected" {
+		t.Errorf("loser of an accepted winner is %s", st)
+	}
+}
+
+// A representative that is no longer a live fix (here: rejected between
+// grouping and the write) cannot take duplicates: they are skipped.
+func TestIntegrationDuplicateOfRejectedRepresentativeSkipped(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	ids := seedFindingEvents(t, conn, 4)
+	anchorAll(t, d, ids)
+	r := strings.Repeat("b8", 32)
+	registerTestRecipe(t, conn, r, 3)
+	if err := d.SetPatchState(ctx, ids[0], "proposed", "rejected", "mcp:alice"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := d.ApplyDecisions(ctx, r, []DecisionEvent{dupEvent(ids[2], ids[0], r, patch.ChunkHash("ganema said"))})
+	if err != nil || len(res.Skipped) != 1 || len(res.Duplicates) != 0 {
+		t.Fatalf("%+v, %v", res, err)
+	}
+	if st, _, _ := stateOf(t, conn, ids[2]); st != "proposed" {
+		t.Errorf("duplicate of a rejected representative is %s", st)
+	}
 }

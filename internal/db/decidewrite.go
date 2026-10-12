@@ -64,10 +64,13 @@ func (s DecideWorkScope) validate() error {
 //
 // and whose latest live (unrevoked) decision is absent, is by another recipe,
 // or is this recipe's retryable hold ($8, jev_unavailable), or its
-// overlap_pending hold whose winner (related_finding_id) has left proposed —
-// applied, rejected, archived — so the conflict is re-ranked. Every other
-// verdict of this recipe is final, so a re-run does not ask again (a loser
-// pending on a winner that is still held stays put: no flip-flop).
+// overlap_pending hold unless its winner (related_finding_id) is still
+// proposed AND held by this recipe — so the conflict is re-ranked once the
+// winner is applied, rejected or archived, and also when the winner was never
+// decided under this recipe (its accept capped or skipped, or a competitor
+// outside the run's scope). Every other verdict of this recipe is final, so
+// a re-run does not ask again (a loser pending on a winner this recipe holds
+// stays put: no flip-flop).
 //
 // "This recipe" is the recipe and every recipe equivalent to it
 // (equivalentRecipesCTE): a format-1 recipe id that differs from the run's
@@ -106,8 +109,17 @@ var decideWorkSQL = `
 	   AND (d.recipe_id IS NULL OR d.recipe_id NOT IN (SELECT eq.recipe_id FROM eq)
 	        OR (d.outcome = 'hold' AND d.reason = $8)
 	        OR (d.outcome = 'hold' AND d.reason = '` + ReasonOverlapPending + `'
-	            AND NOT EXISTS (SELECT 1 FROM transcript_findings w
-	                             WHERE w.id = d.related_finding_id AND w.patch_state = 'proposed')))
+	            AND NOT EXISTS (
+	                SELECT 1 FROM transcript_findings w
+	                 CROSS JOIN LATERAL (
+	                       SELECT e2.recipe_id, e2.outcome FROM finding_events e2
+	                        WHERE e2.finding_id = w.id AND e2.kind = 'decision'
+	                          AND NOT EXISTS (SELECT 1 FROM finding_events v2
+	                                           WHERE v2.kind = 'revoke' AND v2.revokes_event_id = e2.id)
+	                        ORDER BY e2.id DESC
+	                        LIMIT 1) lw
+	                 WHERE w.id = d.related_finding_id AND w.patch_state = 'proposed'
+	                   AND lw.outcome = 'hold' AND lw.recipe_id IN (SELECT eq.recipe_id FROM eq))))
 	   AND ($2 = '' OR f.file_path ILIKE $2)
 	   AND ($3 = '' OR f.issue_type = $3)
 	   AND ($4 = 0 OR mod(mod(hashtext(f.transcript_id::text)::bigint, $4) + $4, $4) = $5)

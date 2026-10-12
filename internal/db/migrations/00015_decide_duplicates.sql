@@ -36,9 +36,12 @@ ALTER TABLE finding_events DROP CONSTRAINT finding_events_outcome_valid;
 ALTER TABLE finding_events
     ADD CONSTRAINT finding_events_outcome_valid
     CHECK (outcome IN ('apply', 'hold', 'reject', 'duplicate'));
+-- NOT VALID: every new row is checked, but rows a rollback left behind (a
+-- Down keeps the append-only log's 'duplicate' decisions and drops their
+-- related_finding_id) are not re-validated, so Down → Up round-trips.
 ALTER TABLE finding_events
     ADD CONSTRAINT finding_events_duplicate_names_representative
-    CHECK (outcome IS DISTINCT FROM 'duplicate' OR related_finding_id IS NOT NULL);
+    CHECK (outcome IS DISTINCT FROM 'duplicate' OR related_finding_id IS NOT NULL) NOT VALID;
 
 -- "Which events point at finding X" (a representative's duplicates, an
 -- overlap winner's losers).

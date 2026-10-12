@@ -1178,7 +1178,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 13 | `00013_audit_lineage.sql` | Audit lineage (§1.4, §2.15 "Lineage", §2.17): `judge_passes` (legacy rows backfilled) and `transcript_archive`; on `transcript_findings` `judge_pass_id`, `fn_call_id`, `origin_transcript_id` (trigger-filled, frozen), generated `correction_key`, `duplicate_of`, the `duplicate` state; `finding_events.anchor_offset` + the reanchor trigger; transitions read `earmark.reason`; `stale_work`'s propose arm skips duplicates. Locks `recipes` (SHARE ROW EXCLUSIVE) then `transcript_findings` (ACCESS EXCLUSIVE) first — a running judge's order — and rewrites `transcript_findings` (`lock_timeout` 5s). |
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
 | 14 | `00014_finding_labels_scorecard.sql` | Model quality over time (§2.15 "Labels and scorecards"): the append-only `finding_labels` table (UPDATE/DELETE refused by a row trigger, TRUNCATE by a statement trigger; generated `correction_key` and `target`), the `finding_correction_key()` function (13's `correction_key` expression verbatim), and the read-only views `finding_label_current`, `recipe_scorecard` and `decide_scorecard`. One new table, three views, two functions; no ALTER, no backfill, no lock beyond the ACCESS SHARE a view takes (`lock_timeout` 5s). Down refuses while `finding_labels` has rows unless the session sets `earmark.allow_data_loss = 'on'`. |
-| 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
+| 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. The representative CHECK is added `NOT VALID`, so Up after an opted-in Down (which keeps the append-only log's `duplicate` decisions and drops their pointer) succeeds. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -5466,9 +5466,10 @@ in scope and writes the decisions (`decide.Apply`). `--sample`, `--seed` and
   `applied`), reject → `rejected` (rung-0 rejects and `overlap_dup` losers
   included), hold → stays `proposed` (`overlap_pending` losers included),
   duplicate → `duplicate` of its representative — written only with the
-  representative locked `FOR SHARE` (`SKIP LOCKED`: a representative another
-  writer holds, e.g. an undo, makes its duplicates *skipped*, grouped again
-  next run). A rung-0 `chunk_changed` / `anchor_missing` is **not written**
+  representative locked `FOR SHARE` and still a live fix (`proposed`,
+  `accepted` or `applied`; `SKIP LOCKED`: a representative another writer
+  holds, e.g. an undo, or one rejected meanwhile makes its duplicates
+  *skipped*, grouped again next run). A rung-0 `chunk_changed` / `anchor_missing` is **not written**
   (re-anchoring's job). `proposed → applied` stays illegal: only a rebuild
   applies.
 - **`--limit N`** stops after N findings; **`--max-accepts N`** stops after N
@@ -5520,10 +5521,13 @@ after rung 0's per-candidate checks and before its dedupe (`decide.groupChunk`,
 - **Grouping.** Members are the chunk's accepted/applied findings whose
   correction resolves on the chunk text, and its **proposed** candidates whose
   span rung 0 located (a pass, or a failure on what the finding claims — shape,
-  issue type, cosmetic — not on its anchor). Two members agree when they have
-  the same stored `correction_key` (chunk revision + normalised original +
-  normalised correction, §2.15 "Lineage"; never recomputed in Go) **and** the
-  same resolved span. A rejected finding is never a member: already-rejected
+  issue type — not on its anchor; a `cosmetic_only` edit, a case-only change
+  or a no-op, is no fix and agrees with nothing). Two members agree when they
+  have the same stored `correction_key` (chunk revision + normalised original +
+  normalised correction, §2.15 "Lineage"), the same **exact** correction
+  (whitespace collapsed and trimmed as in the key, but case kept — the key
+  folds case, and `Frodo` and `frodo` are different corrections that
+  conflict and are ranked by `p`), **and** the same resolved span. A rejected finding is never a member: already-rejected
   findings stay rejected and out of scope (the work list never selects them);
   `correction_key` links them to a re-proposal for reporting only.
 - **Representative**, by the first criterion the members differ on:
@@ -5547,17 +5551,27 @@ after rung 0's per-candidate checks and before its dedupe (`decide.groupChunk`,
 - **Conflicts.** Different fixes to overlapping text (passing candidates that
   are not duplicates and not refused `overlaps_overlay`) are **all asked**,
   including competitors outside the run, and ranked by the decide model's `p`
-  (Clef is local and free) — then judge confidence, then finding id. The
-  highest is kept (decided on its own `p`); a candidate that overlaps a kept
-  one **follows its winner's decision**:
+  (Clef is local and free) — then judge confidence, then finding id. A member
+  the decision rule rejects on its own `p` keeps that reject and is not
+  ranked; the others are ranked among themselves, so two overlapping fixes
+  are never both kept because a rejected third sat between them. The highest
+  is kept (decided on its own `p`); a candidate that overlaps a kept one
+  **follows its winner's decision**:
   - winner **applies** → the loser is rejected `overlap_dup`, with its own `p`
-    and `related_finding_id` = the winner;
+    and `related_finding_id` = the winner — **only if the winner's accept is
+    written in the same transaction** (`DecisionEvent.RequiresAccepted`).
+    When it is not — capped by `--max-accepts`, skipped (locked, chunk
+    changed), or the winner is a competitor outside the run, decided on its
+    own page — the loser is held `overlap_pending` instead: never rejected for
+    a fix that is not in;
   - winner **held** → the loser is held too, reason `overlap_pending`,
-    `related_finding_id` = the winner — never rejected for a fix that is not
-    in. The work list decides it again once the winner leaves `proposed`
-    (applied, rejected, archived); while the winner stays held, a re-run does
-    not touch it (no flip-flop);
-  - winner **rejected** on its own `p` → the loser keeps its own verdict.
+    `related_finding_id` = the winner.
+
+  The work list decides an `overlap_pending` loser again unless its winner is
+  still `proposed` **and held by this recipe**: once the winner is applied,
+  rejected or archived — or was never decided under this recipe (capped,
+  skipped, out of the run's scope) — the conflict is re-ranked; while this
+  recipe holds the winner, a re-run does not touch the loser (no flip-flop).
 
   A competitor outside the run is asked only to rank (counted in the report's
   model calls as `conflict_asks`) and decided on its own page. If any member

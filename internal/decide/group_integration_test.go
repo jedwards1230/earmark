@@ -85,8 +85,9 @@ func seedGroupRows(t *testing.T, conn *pgx.Conn, rows ...groupRow) {
 }
 
 // seedGroups: one transcript, two chunks. Chunk 0 holds three proposals of
-// the same fix by two recipes (one differing only in case and surrounding
-// whitespace, an NBSP included — the same correction_key) and a rejected one; chunk 1 holds two
+// the same fix by two recipes (one differing only in surrounding whitespace,
+// an NBSP included — the same correction_key and exact correction) and a
+// rejected one; chunk 1 holds two
 // different fixes to the same word.
 func seedGroups(t *testing.T, d *db.DB, conn *pgx.Conn) (gemma, luna string) {
 	t.Helper()
@@ -109,7 +110,7 @@ func seedGroups(t *testing.T, d *db.DB, conn *pgx.Conn) (gemma, luna string) {
 	seedGroupRows(t, conn,
 		groupRow{id: gGemma, recipe: gemma, issue: IssueMisheardProperNoun, orig: "auto sebo", repl: "Arecibo", state: "proposed", conf: 0.9, created: base},
 		groupRow{id: gLuna, recipe: luna, issue: IssueMisheardProperNoun, orig: "auto sebo", repl: "Arecibo", state: "proposed", conf: 0.6, created: base.Add(time.Hour)},
-		groupRow{id: gNewer, recipe: gemma, issue: IssueMisheardProperNoun, orig: "auto sebo", repl: " arecibo\u00a0", state: "proposed", conf: 0.8, created: base.Add(2 * time.Hour)},
+		groupRow{id: gNewer, recipe: gemma, issue: IssueMisheardProperNoun, orig: "auto sebo", repl: " Arecibo\u00a0", state: "proposed", conf: 0.8, created: base.Add(2 * time.Hour)},
 		groupRow{id: gRej, recipe: gemma, issue: IssueMisheardProperNoun, orig: "auto sebo", repl: "Arecibo", state: "rejected",
 			decidedBy: "mcp:bob", conf: 0.9, created: base},
 		groupRow{id: gConf, recipe: gemma, issue: IssueMisheardWord, orig: "walked", repl: "worked", state: "proposed", chunk: 1, conf: 0.95, created: base},
@@ -366,5 +367,50 @@ func TestIntegrationDuplicateOfAcceptedFix(t *testing.T) {
 	}
 	if asker.calls != 0 || rep.Write.Rejected != 0 || rep.Write.Duplicates != 1 {
 		t.Errorf("calls %d write %+v", asker.calls, rep.Write)
+	}
+}
+
+// The winner of a conflict is outside the run's scope (--issue-type): it is
+// asked and would apply, but is not written, so its loser is held
+// overlap_pending — not rejected for a fix that is not in. The next unscoped
+// run decides both: the winner applies and the loser is rejected for it.
+func TestIntegrationShadowWinnerDefersLoser(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	gemma, _ := seedGroups(t, d, conn)
+	if _, err := conn.Exec(ctx, `DELETE FROM transcript_findings WHERE transcript_id = $1`, gT); err != nil {
+		t.Fatal(err)
+	}
+	seedGroupRows(t, conn,
+		groupRow{id: gLuna, recipe: gemma, issue: IssueMisheardProperNoun, orig: "auto sebo", repl: "Arecibo", state: "proposed",
+			conf: 0.5, created: time.Now()},
+		groupRow{id: gConf, recipe: gemma, issue: IssueMisheardWord, orig: "auto sebo", repl: "Arrecibo", state: "proposed",
+			conf: 0.9, created: time.Now()},
+	)
+	asker := &fakeAsker{p: func(state string) (float64, error) {
+		if strings.Contains(state, "[[Arrecibo]]") {
+			return 0.4, nil
+		}
+		return 0.97, nil
+	}}
+	opts := ApplyOptions{Concurrency: 1, Params: DefaultShouldApplyParams(), IssueType: IssueMisheardWord}
+	rep, err := Apply(ctx, d, asker, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := groupStates(t, conn)
+	if s[gLuna].state != "proposed" || s[gConf].state != "proposed" || rep.Write.Rejected != 0 {
+		t.Fatalf("scoped run: %+v write %+v", s, rep.Write)
+	}
+	if n := countOf(t, conn, `SELECT count(*) FROM finding_events WHERE finding_id = $1 AND kind = 'decision'
+		AND outcome = 'hold' AND reason = 'overlap_pending' AND related_finding_id = $2`, gConf, gLuna); n != 1 {
+		t.Errorf("%d overlap_pending holds on the loser", n)
+	}
+	opts.IssueType = ""
+	if _, err := Apply(ctx, d, asker, opts); err != nil {
+		t.Fatal(err)
+	}
+	if s = groupStates(t, conn); s[gLuna].state != "accepted" || s[gConf].state != "rejected" {
+		t.Errorf("unscoped run: %+v", s)
 	}
 }

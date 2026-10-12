@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/patch"
@@ -73,8 +74,20 @@ var spanlessReasons = map[string]bool{
 
 // groupable reports whether a candidate's verdict places it on the chunk:
 // passed, or failed only on what it claims (shape, issue type, cosmetic).
+// A cosmetic_only edit is no fix at all (a case-only change or a no-op), so
+// it agrees with nothing.
 func groupable(v Verdict) bool {
-	return v.Span.End > v.Span.Start && (v.Pass || !spanlessReasons[v.Reason])
+	return v.Span.End > v.Span.Start && v.Reason != ReasonCosmeticOnly && (v.Pass || !spanlessReasons[v.Reason])
+}
+
+// exactCorrection is the replacement as grouping compares it on top of
+// correction_key: whitespace runs collapsed and trimmed like the key, but
+// case kept. correction_key folds case, and "Frodo" and "frodo" are
+// different corrections — a capitalised fix the decide policy may hold must
+// not swallow a lowercase one as its duplicate. They conflict instead and
+// are ranked by p.
+func exactCorrection(s string) string {
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || r == '\ufeff' }), " ")
 }
 
 // repTiers are the representative criteria, best first, as booleans
@@ -124,7 +137,8 @@ func tierOf(rep, runnerUp groupMember) string {
 // Members are the overlay findings whose correction resolves on the chunk
 // text, and the proposed candidates that groupable places; a candidate that
 // is neither (a calibration run's human-decided finding) takes no part. Two
-// members agree when they have the same correction_key and the same span.
+// members agree when they have the same correction_key, the same exact
+// correction (exactCorrection: case kept) and the same span.
 //
 // In a group of two or more, the best member by repTier is the
 // representative and every other PROPOSED member is a duplicate of it (dupOf:
@@ -133,7 +147,7 @@ func tierOf(rep, runnerUp groupMember) string {
 func groupChunk(text string, cands []db.DecideFinding, verdicts map[string]Verdict,
 	overlay []db.DecideFinding) (dupOf map[string]string, groups []DupGroup) {
 	type key struct {
-		ck         string
+		ck, repl   string
 		start, end int
 	}
 	byKey := map[key][]groupMember{}
@@ -155,14 +169,16 @@ func groupChunk(text string, cands []db.DecideFinding, verdicts map[string]Verdi
 		if err != nil {
 			continue
 		}
-		add(key{f.CorrectionKey, span.Start, span.End}, groupMember{f: f, span: span, overlay: true, pass: true})
+		add(key{f.CorrectionKey, exactCorrection(f.Replacement), span.Start, span.End},
+			groupMember{f: f, span: span, overlay: true, pass: true})
 	}
 	for _, f := range cands {
 		v, ok := verdicts[f.ID]
 		if seen[f.ID] || !ok || f.PatchState != patch.StateProposed || f.CorrectionKey == "" || !groupable(v) {
 			continue
 		}
-		add(key{f.CorrectionKey, v.Span.Start, v.Span.End}, groupMember{f: f, span: v.Span, pass: v.Pass})
+		add(key{f.CorrectionKey, exactCorrection(f.Replacement), v.Span.Start, v.Span.End},
+			groupMember{f: f, span: v.Span, pass: v.Pass})
 	}
 
 	dupOf = map[string]string{}
@@ -253,10 +269,15 @@ func (g *Grouping) addGroups(gs []DupGroup, lines bool) {
 
 // resolveConflicts ranks every conflict among items by p (RankConflicts),
 // after evaluation. Each set is the connected component of Verdict.Conflicts.
-// A loser's outcome follows its winner's (CONTRACT §2.19): reject overlap_dup
-// naming the winner when the winner applies; hold overlap_pending naming it
-// while the winner is held; its own verdict when the winner is rejected. Its
-// p, evidence and call stay on the record. A set with a member that got no
+// Only members the model did not reject on their own p are ranked: a member
+// rejected by the decision rule keeps its reject and cannot win, so the
+// survivors are ranked among themselves (two overlapping fixes are never
+// both kept because a third, rejected one sat between them). A loser's
+// outcome follows its winner's (CONTRACT §2.19): reject overlap_dup naming
+// the winner when the winner applies — written only if the winner's accept is
+// written in the same transaction, else held overlap_pending
+// (db.DecisionEvent.RequiresAccepted) — and hold overlap_pending naming it
+// while the winner is held. Its p, evidence and call stay on the record. A set with a member that got no
 // usable p is unranked: any apply in it becomes a retryable hold. Items not
 // in a conflict are untouched; so are rung-0-only runs (no p), which the
 // caller does not pass here.
@@ -300,12 +321,22 @@ func resolveConflicts(items []*item, g *Grouping, lines bool) {
 			continue
 		}
 		slices.SortFunc(set, func(a, b *item) int { return strings.Compare(a.finding.ID, b.finding.ID) })
-		rs := make([]Ranked, len(set))
-		for i, it := range set {
-			rs[i] = Ranked{FindingID: it.finding.ID, ChunkText: it.input.Candidate.ChunkText,
-				Span: it.outcome.Rung0.Span, P: it.outcome.P, Confidence: it.finding.Confidence}
+		ok := true
+		var rs []Ranked
+		for _, it := range set {
+			if it.outcome.P == nil {
+				ok = false
+			}
+			if it.outcome.Decision == DecisionReject {
+				continue // rejected on its own p: neither wins nor loses
+			}
+			rs = append(rs, Ranked{FindingID: it.finding.ID, ChunkText: it.input.Candidate.ChunkText,
+				Span: it.outcome.Rung0.Span, P: it.outcome.P, Confidence: it.finding.Confidence})
 		}
-		losers, ok := RankConflicts(rs)
+		var losers map[string]string
+		if ok {
+			losers, ok = RankConflicts(rs)
+		}
 		g.Conflicts++
 		g.Ranked += len(set)
 		if !ok {
@@ -343,9 +374,6 @@ func resolveConflicts(items []*item, g *Grouping, lines bool) {
 				it.outcome.Decision, it.outcome.Reason, it.outcome.Retryable = DecisionHold, ReasonOverlapPending, false
 				it.outcome.Related = w
 				g.Pending++
-			default:
-				// The winner is rejected on its own p: the loser, ranked
-				// lower, keeps its own verdict.
 			}
 		}
 		if lines {
@@ -385,8 +413,8 @@ func conflictLine(set []*item, losers map[string]string, ranked bool) string {
 			verdict = "unranked"
 		case losers[it.finding.ID] != "" && (it.outcome.Reason == ReasonOverlapDup || it.outcome.Reason == ReasonOverlapPending):
 			verdict = it.outcome.Reason + " → " + shortID(losers[it.finding.ID])
-		case losers[it.finding.ID] != "":
-			verdict = "lost to " + shortID(losers[it.finding.ID]) + ", decided on its own p"
+		case it.outcome.Decision == DecisionReject:
+			verdict = "rejected on its own p"
 		}
 		parts[i] = fmt.Sprintf("%s %q → %q %s %s", shortID(it.finding.ID), it.finding.Original, it.finding.Replacement, p, verdict)
 	}

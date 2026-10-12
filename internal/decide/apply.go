@@ -268,6 +268,11 @@ func eventOf(recipeID string, o Outcome) (db.DecisionEvent, bool) {
 	if o.Rung0.Pass && o.Decision != DecisionDuplicate {
 		e.Evidence = o.Evidence
 	}
+	if o.Reason == ReasonOverlapDup && o.Decision == DecisionReject {
+		// Rejected for the winner's fix: only if that fix is accepted in the
+		// same write (not capped, skipped, or a shadow decided elsewhere).
+		e.RequiresAccepted = o.Related
+	}
 	if o.FnCallID != 0 {
 		id := o.FnCallID
 		e.FnCallID = &id

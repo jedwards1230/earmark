@@ -43,6 +43,19 @@ func (s *fakeWriteStore) DecideWork(_ context.Context, sc db.DecideWorkScope) ([
 
 func (s *fakeWriteStore) apply(evs []db.DecisionEvent, recheck bool) db.ApplyResult {
 	var r db.ApplyResult
+	// Like db.ApplyDecisions: a reject that requires another finding's accept
+	// is held overlap_pending unless that accept is in this write.
+	accepted := map[string]bool{}
+	for _, e := range evs {
+		if !recheck && !s.skip[e.FindingID] && e.Outcome == db.OutcomeApply {
+			accepted[e.FindingID] = true
+		}
+	}
+	for i, e := range evs {
+		if e.RequiresAccepted != "" && !accepted[e.RequiresAccepted] {
+			evs[i].Outcome, evs[i].Reason = db.OutcomeHold, db.ReasonOverlapPending
+		}
+	}
 	for _, e := range evs {
 		switch {
 		case s.skip[e.FindingID]:

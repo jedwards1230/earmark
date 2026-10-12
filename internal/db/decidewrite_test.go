@@ -28,7 +28,8 @@ func TestDecideWorkSQL(t *testing.T) {
 		"ORDER BY e.id DESC LIMIT 1",
 		"(d.recipe_id IS NULL OR d.recipe_id NOT IN (SELECT eq.recipe_id FROM eq) OR (d.outcome = 'hold' AND d.reason = $8)",
 		// a loser held while its winner was held: re-ranked once the winner left proposed
-		"OR (d.outcome = 'hold' AND d.reason = 'overlap_pending' AND NOT EXISTS (SELECT 1 FROM transcript_findings w WHERE w.id = d.related_finding_id AND w.patch_state = 'proposed')))",
+		"OR (d.outcome = 'hold' AND d.reason = 'overlap_pending' AND NOT EXISTS ( SELECT 1 FROM transcript_findings w",
+		"WHERE w.id = d.related_finding_id AND w.patch_state = 'proposed' AND lw.outcome = 'hold' AND lw.recipe_id IN (SELECT eq.recipe_id FROM eq))))",
 		// the shard, non-negative
 		"($4 = 0 OR mod(mod(hashtext(f.transcript_id::text)::bigint, $4) + $4, $4) = $5)",
 		// keyset
