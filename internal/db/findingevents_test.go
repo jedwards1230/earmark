@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -187,6 +189,22 @@ func TestDecisionEventValidate(t *testing.T) {
 		"p negative":   func(e *DecisionEvent) { e.P = p(-0.1) },
 		"p NaN":        func(e *DecisionEvent) { e.P = p(math.NaN()) },
 		"bad evidence": func(e *DecisionEvent) { e.Evidence = "vibes" },
+		"duplicate without a representative": func(e *DecisionEvent) {
+			e.Outcome, e.Reason = OutcomeDuplicate, ReasonDuplicate
+		},
+		"related finding not a uuid": func(e *DecisionEvent) { e.RelatedFindingID = "rep" },
+		"requires an accept on a non-reject": func(e *DecisionEvent) {
+			e.RelatedFindingID = "00000000-0000-0000-0000-000000000009"
+			e.RequiresAccepted = e.RelatedFindingID
+		},
+		"requires an accept of another finding than it names": func(e *DecisionEvent) {
+			e.Outcome, e.RelatedFindingID = OutcomeReject, "00000000-0000-0000-0000-000000000009"
+			e.RequiresAccepted = "00000000-0000-0000-0000-000000000008"
+		},
+		"related finding is itself": func(e *DecisionEvent) {
+			e.FindingID = "00000000-0000-0000-0000-000000000001"
+			e.RelatedFindingID = e.FindingID
+		},
 	}
 	for name, mutate := range bad {
 		e := ok
@@ -194,6 +212,19 @@ func TestDecisionEventValidate(t *testing.T) {
 		if err := e.validate(); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestDecisionEventValidateDuplicate(t *testing.T) {
+	dup := DecisionEvent{FindingID: "00000000-0000-0000-0000-000000000001", RecipeID: testRecipe,
+		Outcome: OutcomeDuplicate, Reason: ReasonDuplicate, RelatedFindingID: "00000000-0000-0000-0000-000000000002"}
+	if err := dup.validate(); err != nil {
+		t.Errorf("duplicate refused: %v", err)
+	}
+	loser := DecisionEvent{FindingID: "00000000-0000-0000-0000-000000000003", RecipeID: testRecipe,
+		Outcome: OutcomeReject, Reason: "overlap_dup", RelatedFindingID: "00000000-0000-0000-0000-000000000002"}
+	if err := loser.validate(); err != nil {
+		t.Errorf("overlap loser naming its winner refused: %v", err)
 	}
 }
 
@@ -306,5 +337,82 @@ func TestApplyDecisionsSQL_LockOrder(t *testing.T) {
 	if !strings.Contains(norm(applyDecisionsChunksSQL), "ORDER BY c.id FOR SHARE OF c") ||
 		!strings.Contains(applyDecisionsChunksSQL, "COALESCE(c.source_text, c.text)") {
 		t.Errorf("chunks must be read pristine and locked FOR SHARE in order:\n%s", applyDecisionsChunksSQL)
+	}
+}
+
+// A duplicate decision moves its finding through markDuplicatesSQL —
+// proposed → duplicate, naming the representative — and never through the
+// bulk path: no accepted, rejected or any other move is issued for it.
+func TestApplyDecisionsDuplicateNeverRejects(t *testing.T) {
+	const dup, rep = "00000000-0000-0000-0000-0000000000d1", "00000000-0000-0000-0000-0000000000a1"
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("FOR UPDATE SKIP LOCKED")).WithArgs([]string{rep, dup}).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "patch_state"}).AddRow(rep, "proposed").AddRow(dup, "proposed"))
+	mock.ExpectQuery(regexp.QuoteMeta("FOR SHARE SKIP LOCKED")).WithArgs([]string{rep}).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(rep))
+	mock.ExpectQuery(regexp.QuoteMeta("FOR SHARE OF c")).WithArgs([]string{rep, dup}).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "sha"}).AddRow(rep, "h").AddRow(dup, "h"))
+	any9 := make([]any, 9)
+	for i := range any9 {
+		any9[i] = pgxmock.AnyArg()
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO finding_events")).WithArgs(any9...).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(1)).AddRow(int64(2)))
+	mock.ExpectExec(regexp.QuoteMeta("set_config('earmark.actor'")).WithArgs("", "", ReasonDuplicate).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SET patch_state  = 'duplicate'")).
+		WithArgs([]string{dup}, []string{rep}, "jev:"+testRecipe).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(dup))
+	mock.ExpectExec(regexp.QuoteMeta("set_config('earmark.actor'")).WithArgs("", "", "").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectCommit()
+	res, err := applyDecisions(context.Background(), mock, testRecipe, []DecisionEvent{
+		{FindingID: rep, RecipeID: testRecipe, Outcome: OutcomeHold, Reason: "uncertain", ChunkTextSHA256: "h"},
+		{FindingID: dup, RecipeID: testRecipe, Outcome: OutcomeDuplicate, Reason: ReasonDuplicate, RelatedFindingID: rep, ChunkTextSHA256: "h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Duplicates, []string{dup}) || len(res.Rejected) != 0 || !slices.Equal(res.Held, []string{rep}) {
+		t.Errorf("result %+v", res)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// A duplicate whose representative another writer holds is skipped, not
+// written: grouping it now could race an undo of that representative.
+func TestApplyDecisionsDuplicateSkipsLockedRepresentative(t *testing.T) {
+	const dup, rep = "00000000-0000-0000-0000-0000000000d1", "00000000-0000-0000-0000-0000000000a1"
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("FOR UPDATE SKIP LOCKED")).WithArgs([]string{dup}).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "patch_state"}).AddRow(dup, "proposed"))
+	mock.ExpectQuery(regexp.QuoteMeta("FOR SHARE SKIP LOCKED")).WithArgs([]string{rep}).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(regexp.QuoteMeta("FOR SHARE OF c")).WithArgs([]string{dup}).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "sha"}).AddRow(dup, "h"))
+	mock.ExpectCommit()
+	res, err := applyDecisions(context.Background(), mock, testRecipe, []DecisionEvent{
+		{FindingID: dup, RecipeID: testRecipe, Outcome: OutcomeDuplicate, Reason: ReasonDuplicate, RelatedFindingID: rep, ChunkTextSHA256: "h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Skipped, []string{dup}) || len(res.Duplicates) != 0 {
+		t.Errorf("result %+v", res)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// Only a live fix can represent duplicates.
+func TestLockRepresentativesSQL(t *testing.T) {
+	if got := norm(lockRepresentativesSQL); !strings.Contains(got, "patch_state IN ('proposed', 'accepted', 'applied')") ||
+		!strings.Contains(got, "FOR SHARE SKIP LOCKED") {
+		t.Errorf("representative lock:\n%s", got)
 	}
 }

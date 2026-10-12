@@ -1,7 +1,9 @@
 # Design: audit lineage for transcripts and findings
 
-Migrations `00013_audit_lineage.sql` (the record) and
-`00014_finding_labels_scorecard.sql` (model quality over time, below). Reference: CONTRACT §1.4 "Operator
+Migrations `00013_audit_lineage.sql` (the record),
+`00014_finding_labels_scorecard.sql` (model quality over time, below) and
+`00015_decide_duplicates.sql` (the decide step's duplicate decisions and
+`finding_events.related_finding_id`). Reference: CONTRACT §1.4 "Operator
 requeue", §2.15 "Lineage" and "Clearing", §2.17 "Lifecycle" and "Version
 history"; schema detail in `docs/DATABASE_SCHEMA.md`.
 
@@ -105,7 +107,38 @@ undoing the representative's grouping, with `duplicate_of` cleared in the same
 UPDATE — or to `superseded`, which keeps `duplicate_of` so an archived
 duplicate still says what it agreed with (the CHECK admits `duplicate_of` on
 those two states only). Both moves are machine moves; no review action applies.
-No path groups findings into `duplicate` yet.
+The decide step is the writer (decide `step_version` 3, migration 15;
+CONTRACT §2.19 "Agreeing and conflicting findings"). Per chunk, before rung
+0's dedupe, the proposed findings that resolve to the same span with the same
+stored `correction_key` — plus any accepted/applied finding of that fix — form
+a group. The representative is the accepted/applied member, else an existing
+representative (already has duplicates, or already decided under this
+recipe — so a re-run never flip-flops), else one rung 0 can vet, else the
+current propose recipe's, else the newest. Members must also share the
+exact correction (case kept: the key folds case, but `Frodo` and `frodo` are
+different fixes), and a cosmetic-only edit is no member. It alone is decided and can be
+applied; every other proposed member gets a `duplicate` decision event
+(`related_finding_id` = the representative) and moves to `duplicate` with
+transition reason `duplicate`. Already-rejected findings are never members:
+they stay rejected and out of decide's scope, linked to re-proposals by
+`correction_key` for reporting only. Different fixes to overlapping text are
+not duplicates but conflicts: each is asked, and the decide model's `p` —
+not the judge's confidence — picks the survivor. A loser follows its
+winner: rejected `overlap_dup` only when the winner's accept is written in the
+same transaction, otherwise — winner held, capped, skipped or outside the run
+— held `overlap_pending` and decided again unless the recipe holds the
+winner; the event's `related_finding_id` names the winner. A member the model
+rejects on its own `p` is not ranked.
+
+Duplicates follow their representative on undo. When `earmark decide
+revert` takes a representative out of the overlay, its duplicates are
+rejected with it — transition reason `duplicate_of_reverted`, a reject
+decision attributed to the undo naming the representative — so re-running
+the recipe cannot bring the fix back through a duplicate. When the undo
+returns a representative to `proposed`, its duplicates (and any it earlier
+rejected that way) return to `proposed` with it, reason
+`duplicate_released`. Either way the followers' decisions are revoked. A
+reviewer's move of a representative does not cascade.
 
 ### Nothing is deleted — clear-as-supersede
 

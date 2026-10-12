@@ -76,8 +76,10 @@ const (
 	// ReasonBadInsertion — a dropped_word fix that does anything other than
 	// insert one or two words.
 	ReasonBadInsertion = "bad_insertion"
-	// ReasonOverlapDup — another passing candidate on the same chunk claims
-	// overlapping text and won the tie-break.
+	// ReasonOverlapDup — another candidate on the same chunk proposes a
+	// different fix to overlapping text and ranked higher: the decide model's
+	// p, then judge confidence, then finding id (RankConflicts). The decision
+	// names the winner (finding_events.related_finding_id).
 	ReasonOverlapDup = "overlap_dup"
 	// ReasonOverlapsOverlay — the span overlaps a correction already accepted
 	// or applied on this chunk.
@@ -146,6 +148,11 @@ type Verdict struct {
 	// Evidence is a human-readable account of what the check saw — scores,
 	// codes, tokens — for audit, not for parsing.
 	Evidence string
+	// Conflicts lists, on a passing verdict, the other passing candidates of
+	// the chunk whose spans overlap this one (Dedupe): different fixes to the
+	// same text. Rung 0 does not choose between them; the decide step asks
+	// the model about each and keeps the highest p (RankConflicts). Sorted.
+	Conflicts []string
 }
 
 // Params tunes the rung-0 checks. It is destined to be part of the decide
@@ -605,7 +612,8 @@ func subsequenceExtras(sub, full []string) ([]string, bool) {
 // same order. It panics if the lengths differ, which is a programming error.
 //
 // Only passing verdicts take part — a failed check has no trustworthy span.
-// In order:
+// Agreeing candidates (the same fix) are grouped before Dedupe runs
+// (groupChunk), so every candidate here proposes its own fix. In order:
 //
 //  1. A candidate whose span overlaps a span OCCUPIED by an existing
 //     accepted/applied correction fails overlaps_overlay. A correction
@@ -619,9 +627,10 @@ func subsequenceExtras(sub, full []string) ([]string, bool) {
 //     finding must not conflict with itself) and is computed from that
 //     candidate's view, so the self-exclusion never hides a conflict between
 //     the candidate's row and another.
-//  2. The rest are ranked by Confidence descending, then FindingID ascending,
-//     and kept greedily: one that overlaps an already-kept candidate fails
-//     overlap_dup.
+//  2. The rest pass, each listing the others whose spans overlap its own in
+//     Verdict.Conflicts. Which of them survives is not a rung-0 question: the
+//     decide step asks the model about every one and ranks them by p
+//     (RankConflicts).
 //
 // Spans overlap when they share at least one rune (half-open intervals, as in
 // the overlay). Candidates are only compared with others judged against the
@@ -649,33 +658,75 @@ func Dedupe(cands []Candidate, verdicts []Verdict, existing []patch.Patch) []Ver
 				Evidence: fmt.Sprintf("overlaps correction %s at runes %d-%d", o.id, o.span.Start, o.span.End)}
 			continue
 		}
+		out[i].Conflicts = nil
 		live = append(live, i)
 	}
+	for x, i := range live {
+		for _, j := range live[x+1:] {
+			if cands[i].ChunkText == cands[j].ChunkText && overlaps(out[i].Span, out[j].Span) {
+				out[i].Conflicts = append(out[i].Conflicts, cands[j].FindingID)
+				out[j].Conflicts = append(out[j].Conflicts, cands[i].FindingID)
+			}
+		}
+	}
+	for _, i := range live {
+		slices.Sort(out[i].Conflicts)
+	}
+	return out
+}
 
-	slices.SortStableFunc(live, func(a, b int) int {
-		if c := cmp.Compare(cands[b].Confidence, cands[a].Confidence); c != 0 {
+// Ranked is one conflicting candidate RankConflicts orders: its span on the
+// chunk text, the decide model's p (nil = no usable answer), and the judge's
+// confidence (the tie-break).
+type Ranked struct {
+	FindingID  string
+	ChunkText  string
+	Span       patch.Span
+	P          *float64
+	Confidence float64
+}
+
+// RankConflicts resolves one set of conflicting candidates — different fixes
+// to overlapping text on a chunk — by the decide model's p (CONTRACT §2.19
+// "Agreeing and conflicting findings"): highest p first, then judge
+// confidence, then finding id; kept greedily, so a candidate that overlaps an
+// already-kept one loses to it (losers maps it to that winner), while one
+// that overlaps only losers is kept too. ok is false — and losers nil — when
+// any candidate has no p: the ranking cannot be trusted, so nothing may be
+// applied over a candidate the model could not judge.
+func RankConflicts(rs []Ranked) (losers map[string]string, ok bool) {
+	for _, r := range rs {
+		if r.P == nil {
+			return nil, false
+		}
+	}
+	order := slices.Clone(rs)
+	slices.SortStableFunc(order, func(a, b Ranked) int {
+		if c := cmp.Compare(*b.P, *a.P); c != 0 {
 			return c
 		}
-		return strings.Compare(cands[a].FindingID, cands[b].FindingID)
+		if c := cmp.Compare(b.Confidence, a.Confidence); c != 0 {
+			return c
+		}
+		return strings.Compare(a.FindingID, b.FindingID)
 	})
-	var kept []int
-	for _, i := range live {
-		winner := -1
+	losers = map[string]string{}
+	var kept []Ranked
+	for _, r := range order {
+		winner := ""
 		for _, k := range kept {
-			if cands[k].ChunkText == cands[i].ChunkText && overlaps(out[k].Span, out[i].Span) {
-				winner = k
+			if k.ChunkText == r.ChunkText && overlaps(k.Span, r.Span) {
+				winner = k.FindingID
 				break
 			}
 		}
-		if winner < 0 {
-			kept = append(kept, i)
+		if winner == "" {
+			kept = append(kept, r)
 			continue
 		}
-		out[i] = Verdict{Reason: ReasonOverlapDup, Span: out[i].Span,
-			Evidence: fmt.Sprintf("overlaps finding %s (confidence %.2f) at runes %d-%d",
-				cands[winner].FindingID, cands[winner].Confidence, out[winner].Span.Start, out[winner].Span.End)}
+		losers[r.FindingID] = winner
 	}
-	return out
+	return losers, true
 }
 
 // describe renders one side of a phonetic comparison for evidence: the text,

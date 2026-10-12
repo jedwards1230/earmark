@@ -32,6 +32,13 @@ type DumpRecord struct {
 	P       *float64 `json:"p,omitempty"`
 	// Evidence is the text-evidence class of a rung-0 pass.
 	Evidence string `json:"evidence,omitempty"`
+	// DuplicateOf is the representative of a finding grouped as a duplicate
+	// (class duplicate); OverlapWinner the finding an overlap_dup reject lost
+	// to. Conflicts lists the overlapping candidates rung 0 left to the
+	// model's p.
+	DuplicateOf   string   `json:"duplicate_of,omitempty"`
+	OverlapWinner string   `json:"overlap_winner,omitempty"`
+	Conflicts     []string `json:"conflicts,omitempty"`
 }
 
 // DumpRung0 is the rung-0 verdict in a DumpRecord.
@@ -50,10 +57,17 @@ func dumpRecord(it *item) DumpRecord {
 		Rung0: DumpRung0{Pass: o.Rung0.Pass, Reason: o.Rung0.Reason, Evidence: o.Rung0.Evidence},
 		Class: classOf(o),
 	}
-	if o.Rung0.Pass {
+	r.Conflicts = o.Rung0.Conflicts
+	switch {
+	case o.Decision == DecisionDuplicate:
+		r.Outcome, r.Reason, r.DuplicateOf = o.Decision, o.Reason, o.Related
+	case o.Rung0.Pass:
 		r.Evidence = o.Evidence
 		if o.Decision != "" {
 			r.Outcome, r.Reason, r.P = o.Decision, o.Reason, o.P
+		}
+		if o.Reason == ReasonOverlapDup {
+			r.OverlapWinner = o.Related
 		}
 	}
 	return r

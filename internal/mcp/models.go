@@ -167,8 +167,12 @@ type roleCard struct {
 	// counts are unknown (the others are then 0).
 	HumanDecided *int
 	JevDecided   int
-	JevUndone    int
-	Proposed     int
+	// JevByModel splits JevDecided by the decide recipe's model
+	// (recipes.model_alias), most first: "jev:<recipe>" names the automated
+	// decide recipe, not Jev, so a Clef decision is labelled clef:….
+	JevByModel []db.ModelCount
+	JevUndone  int
+	Proposed   int
 	// PriorModelChanged (matchPredates only) says the pre-recipe answer is a
 	// different model from the one now expected — "the model changed" rather
 	// than "the recipe changed".
@@ -783,6 +787,7 @@ func buildFnCard(c *roleCard, in roleInputs) {
 		if c.Key == "decide" {
 			t := decideTally(in.Snap.Findings)
 			c.HumanDecided, c.JevDecided, c.JevUndone, c.Proposed = &t.Human, t.Jev, t.JevUndone, t.Proposed
+			c.JevByModel = t.ByModel
 		}
 	}
 	if in.Stats != nil {
@@ -828,17 +833,25 @@ func fnRoleHealth(c roleCard, probe, host string, now time.Time) roleHealth {
 
 // decisionTally is the decide card's split of judge findings by decider.
 type decisionTally struct {
-	Human     int // decided (accepted/rejected/applied/reverted) by a person, incl. unattributed
-	Jev       int // decided by a decide recipe (decided_by jev:<recipe>)
+	Human int // decided (accepted/rejected/applied/reverted) by a person, incl. unattributed
+	Jev   int // decided by a decide recipe (decided_by jev:<recipe>)
+	// ByModel splits Jev by the decide recipe's model, most first (then by
+	// name); a recipe with no recipes row is "unknown recipe".
+	ByModel   []db.ModelCount
 	JevUndone int // last moved by `earmark decide revert` (revert:jev:<recipe>), any state
 	Proposed  int // awaiting a decision (undone ones included)
 }
 
+// unknownDecideModel labels decisions whose recipe has no recipes row.
+const unknownDecideModel = "unknown recipe"
+
 // decideTally classifies the judge findings by decider. Only a decided state
 // with a person's (or no) decided_by is a human decision: jev:<recipe> is the
-// decide step, revert:jev:<recipe> its undo.
+// decide step, revert:jev:<recipe> its undo. A duplicate is not a decided
+// state: its representative carries the decision.
 func decideTally(fs []db.FindingsModelCount) decisionTally {
 	var t decisionTally
+	byModel := map[string]int{}
 	for _, f := range fs {
 		if f.Decider == db.DeciderJevRevert {
 			t.JevUndone += f.Count
@@ -849,10 +862,24 @@ func decideTally(fs []db.FindingsModelCount) decisionTally {
 		case !isDecidedState(f.PatchState):
 		case f.Decider == db.DeciderJev:
 			t.Jev += f.Count
+			m := f.DecideModel
+			if m == "" {
+				m = unknownDecideModel
+			}
+			byModel[m] += f.Count
 		case isHumanDecider(f.Decider):
 			t.Human += f.Count
 		}
 	}
+	for m, n := range byModel {
+		t.ByModel = append(t.ByModel, db.ModelCount{Model: m, Count: n})
+	}
+	sort.Slice(t.ByModel, func(i, j int) bool {
+		if t.ByModel[i].Count != t.ByModel[j].Count {
+			return t.ByModel[i].Count > t.ByModel[j].Count
+		}
+		return t.ByModel[i].Model < t.ByModel[j].Model
+	})
 	return t
 }
 

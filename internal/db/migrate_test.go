@@ -525,3 +525,55 @@ func TestFindingLabelsMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestDecideDuplicatesMigration pins 00015: lock timeout, then the one lock
+// (finding_events), before any DDL; the duplicate outcome and its
+// representative guard; a plain related_finding_id (no foreign key on the
+// append-only log); and a Down that refuses to drop pointers unless
+// earmark.allow_data_loss is on and restores the old CHECK NOT VALID.
+func TestDecideDuplicatesMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00015_decide_duplicates.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	for name, part := range map[string]string{"Up": up, "Down": down} {
+		i := strings.Index(part, "SET LOCAL lock_timeout = '5s'")
+		l := strings.Index(part, "LOCK TABLE finding_events IN ACCESS EXCLUSIVE MODE;")
+		first := len(part)
+		for _, stmt := range []string{"ALTER TABLE", "DROP ", "CREATE ", "DO $$"} {
+			if at := strings.Index(part, stmt); at >= 0 && at < first {
+				first = at
+			}
+		}
+		if i < 0 || l < i || first < l {
+			t.Errorf("%s: want lock_timeout, then LOCK finding_events, before the refusal check and any DDL", name)
+		}
+	}
+	for _, want := range []string{
+		"ADD COLUMN related_finding_id UUID;",
+		"CHECK (outcome IN ('apply', 'hold', 'reject', 'duplicate'))",
+		"CHECK (outcome IS DISTINCT FROM 'duplicate' OR related_finding_id IS NOT NULL) NOT VALID;",
+		"CREATE INDEX finding_events_related_idx ON finding_events (related_finding_id) WHERE related_finding_id IS NOT NULL;",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("Up lacks %q", want)
+		}
+	}
+	if strings.Contains(up, "REFERENCES") {
+		t.Error("related_finding_id must be a plain column: finding_events is append-only")
+	}
+	for _, want := range []string{
+		"earmark.allow_data_loss",
+		"CHECK (outcome IN ('apply', 'hold', 'reject')) NOT VALID;",
+		"DROP COLUMN related_finding_id;",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("Down lacks %q", want)
+		}
+	}
+}

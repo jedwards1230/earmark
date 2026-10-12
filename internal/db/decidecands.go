@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -112,11 +113,69 @@ type DecideFinding struct {
 	ChunkTextSHA256  string
 	PatchState       string
 	DecidedBy        string // "" when undecided
+	// The grouping fields below (CorrectionKey … DecidedHere) are filled by
+	// DecideChunks only — the chunk's view of each finding, run recipe
+	// included; the decide step reads them from there.
+	//
+	// CorrectionKey is transcript_findings.correction_key (migration 13): the
+	// fix — chunk revision, normalised original and correction — without the
+	// recipe. "" when the row has none.
+	CorrectionKey string
+	// CurrentPropose: proposed by the current propose recipe (current_recipes,
+	// or a recipe equivalent to it, CONTRACT §1.9).
+	CurrentPropose bool
+	CreatedAt      time.Time
+	// HasDuplicates: some finding is a duplicate of this one (duplicate_of).
+	HasDuplicates bool
+	// DecidedHere: the finding's latest live (unrevoked) decision is by the
+	// run's decide recipe or one equivalent to it (CONTRACT §1.9).
+	DecidedHere bool
 	// JudgeModel is the model that proposed the finding (resolved_model,
 	// else the requested model). Only DecideSample fills it — the decide
 	// dry run's --dump reports it; nothing decides on it.
 	JudgeModel string
 }
+
+// decideGroupingCols are the columns decide's grouping of agreeing findings
+// reads (DecideFinding.CorrectionKey … DecidedHere), appended after
+// decided_by in decideChunkFindingsSQL. f is the finding, ld its latest live
+// decision (a LATERAL join), $5 the run's decide recipe (” = none).
+const decideGroupingCols = `,
+	       COALESCE(f.correction_key, ''),
+	       EXISTS (SELECT 1
+	                 FROM current_recipes cr
+	                 JOIN recipes c ON c.recipe_id = cr.recipe_id
+	                 JOIN recipes o
+	                   ON (o.step, o.step_version, o.model_alias, o.model_resolved, o.model_revision,
+	                       o.prompt_version, o.prompt_sha256, o.params)
+	                      IS NOT DISTINCT FROM
+	                      (c.step, c.step_version, c.model_alias, c.model_resolved, c.model_revision,
+	                       c.prompt_version, c.prompt_sha256, c.params)
+	                WHERE cr.step = 'propose' AND o.recipe_id = f.recipe_id),
+	       f.created_at,
+	       EXISTS (SELECT 1 FROM transcript_findings dup
+	                WHERE dup.duplicate_of = f.id AND dup.patch_state = 'duplicate'),
+	       COALESCE(ld.recipe_id = $5
+	                OR EXISTS (SELECT 1
+	                             FROM recipes c
+	                             JOIN recipes o
+	                               ON (o.step, o.step_version, o.model_alias, o.model_resolved, o.model_revision,
+	                                   o.prompt_version, o.prompt_sha256, o.params)
+	                                  IS NOT DISTINCT FROM
+	                                  (c.step, c.step_version, c.model_alias, c.model_resolved, c.model_revision,
+	                                   c.prompt_version, c.prompt_sha256, c.params)
+	                            WHERE c.recipe_id = $5 AND o.recipe_id = ld.recipe_id), false)`
+
+// decideLatestDecisionJoin is decideGroupingCols' ld: the finding's latest
+// live decision.
+const decideLatestDecisionJoin = `
+	  LEFT JOIN LATERAL (
+	        SELECT e.recipe_id FROM finding_events e
+	         WHERE e.finding_id = f.id AND e.kind = 'decision'
+	           AND NOT EXISTS (SELECT 1 FROM finding_events v
+	                            WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
+	         ORDER BY e.id DESC
+	         LIMIT 1) ld ON true`
 
 // decideScopeWhere is the shared filter: anchored judge findings (an anchor
 // offset and a chunk hash, so rung 0 can verify the revision), in the scope's
@@ -184,6 +243,17 @@ func scanDecideFinding(r pgx.CollectableRow) (DecideFinding, error) {
 	return f, err
 }
 
+// scanDecideChunkFinding scans decideChunkFindingsSQL: scanDecideFinding's
+// columns plus the grouping columns.
+func scanDecideChunkFinding(r pgx.CollectableRow) (DecideFinding, error) {
+	var f DecideFinding
+	err := r.Scan(&f.ID, &f.TranscriptID, &f.FilePath, &f.IssueType, &f.Original, &f.Replacement,
+		&f.Confidence, &f.ChunkIndex, &f.AnchorOffset, &f.AnchorOccurrence, &f.ChunkTextSHA256,
+		&f.PatchState, &f.DecidedBy,
+		&f.CorrectionKey, &f.CurrentPropose, &f.CreatedAt, &f.HasDuplicates, &f.DecidedHere)
+	return f, err
+}
+
 // scanDecideSampleFinding scans decideSampleSQL: scanDecideFinding's columns
 // plus the judge model.
 func scanDecideSampleFinding(r pgx.CollectableRow) (DecideFinding, error) {
@@ -240,6 +310,10 @@ type DecideChunk struct {
 	Competitors []DecideFinding
 	// Overlay is the chunk's accepted + applied corrections.
 	Overlay []patch.Patch
+	// OverlayFindings are the same rows as Overlay, as findings — what the
+	// grouping of agreeing findings reads (an accepted or applied member is a
+	// group's representative).
+	OverlayFindings []DecideFinding
 }
 
 var decideChunksSQL = `
@@ -251,13 +325,14 @@ var decideChunksSQL = `
 
 // decideChunkFindingsSQL reads every finding on the chunks that rung 0 has
 // to weigh: $3 = proposed (competitors, judge-only, anchored) and $4 = the
-// overlay states (any origin).
+// overlay states (any origin), with the grouping columns ($5 = the run's
+// decide recipe).
 var decideChunkFindingsSQL = `
 	SELECT f.id::text, f.transcript_id::text, f.file_path, f.issue_type, f.original_text,
 	       COALESCE(f.suggested_correction, ''), f.confidence, f.chunk_index,
 	       COALESCE(f.anchor_offset, -1), COALESCE(f.anchor_occurrence, -1), COALESCE(f.chunk_text_sha256, ''),
-	       f.patch_state, COALESCE(f.decided_by, '')
-	  FROM transcript_findings f
+	       f.patch_state, COALESCE(f.decided_by, '')` + decideGroupingCols + `
+	  FROM transcript_findings f` + decideLatestDecisionJoin + `
 	  JOIN unnest($1::uuid[], $2::int[]) AS k(tid, idx)
 	    ON f.transcript_id = k.tid AND f.chunk_index = k.idx
 	 WHERE f.patch_state = ANY($4)
@@ -265,14 +340,15 @@ var decideChunkFindingsSQL = `
 	        AND f.anchor_offset IS NOT NULL AND f.chunk_text_sha256 IS NOT NULL)
 	 ORDER BY f.transcript_id, f.chunk_index, f.id`
 
-// DecideChunks loads the listed chunks with their competitors and overlay.
-// A chunk that no longer exists is absent from the result. At most
-// MaxDecideChunkBatch keys per call.
-func (db *DB) DecideChunks(ctx context.Context, keys []ChunkKey) (map[ChunkKey]*DecideChunk, error) {
-	return decideChunks(ctx, db.pool, keys)
+// DecideChunks loads the listed chunks with their competitors and overlay,
+// each with the grouping fields relative to recipeID, the run's decide recipe
+// ("" = none: DecidedHere is false). A chunk that no longer exists is absent
+// from the result. At most MaxDecideChunkBatch keys per call.
+func (db *DB) DecideChunks(ctx context.Context, recipeID string, keys []ChunkKey) (map[ChunkKey]*DecideChunk, error) {
+	return decideChunks(ctx, db.pool, recipeID, keys)
 }
 
-func decideChunks(ctx context.Context, q rowQuerier, keys []ChunkKey) (map[ChunkKey]*DecideChunk, error) {
+func decideChunks(ctx context.Context, q rowQuerier, recipeID string, keys []ChunkKey) (map[ChunkKey]*DecideChunk, error) {
 	if len(keys) > MaxDecideChunkBatch {
 		return nil, fmt.Errorf("decide chunks: %d keys, max %d per call", len(keys), MaxDecideChunkBatch)
 	}
@@ -301,11 +377,11 @@ func decideChunks(ctx context.Context, q rowQuerier, keys []ChunkKey) (map[Chunk
 		out[c.Key] = c
 	}
 
-	rows, err = q.Query(ctx, decideChunkFindingsSQL, tids, idxs, patch.StateProposed, overlayStates)
+	rows, err = q.Query(ctx, decideChunkFindingsSQL, tids, idxs, patch.StateProposed, overlayStates, recipeID)
 	if err != nil {
 		return nil, fmt.Errorf("decide chunk findings: %w", err)
 	}
-	fs, err := pgx.CollectRows(rows, scanDecideFinding)
+	fs, err := pgx.CollectRows(rows, scanDecideChunkFinding)
 	if err != nil {
 		return nil, fmt.Errorf("decide chunk findings: %w", err)
 	}
@@ -318,6 +394,7 @@ func decideChunks(ctx context.Context, q rowQuerier, keys []ChunkKey) (map[Chunk
 			c.Competitors = append(c.Competitors, f)
 			continue
 		}
+		c.OverlayFindings = append(c.OverlayFindings, f)
 		c.Overlay = append(c.Overlay, patch.Patch{
 			ID:         f.ID,
 			Anchor:     patch.Anchor{OriginalText: f.Original, Offset: f.AnchorOffset, Occurrence: f.AnchorOccurrence},

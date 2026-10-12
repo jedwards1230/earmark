@@ -17,8 +17,9 @@ import (
 // DefaultWriteBatch is how many transcripts one --yes write transaction covers.
 const DefaultWriteBatch = 20
 
-// workPage is how many findings one compute phase decides before writing.
-const workPage = 500
+// workPage is how many findings one compute phase decides before writing (a
+// var so a test can page small).
+var workPage = 500
 
 // WriteStore is what a --yes run needs (*db.DB implements it): the dry run's
 // reads, the work list, and the two decision writes.
@@ -84,6 +85,10 @@ type WriteStats struct {
 	Reanchor int `json:"reanchor"`
 	// Capped: applies not written because MaxAccepts was reached.
 	Capped int `json:"capped"`
+	// Duplicates: findings moved proposed → duplicate of their group's
+	// representative (the page's own and, grouped with them, the chunk's
+	// other proposed findings).
+	Duplicates int `json:"duplicates"`
 	// Stopped names why the run ended early ("" = scope exhausted).
 	Stopped string `json:"stopped,omitempty"`
 }
@@ -138,7 +143,8 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 	rec.SetRecipe(recipeID, ev.Model())
 
 	ws := &WriteStats{}
-	var all []*item
+	var all, shadows []*item
+	var grouping Grouping
 	scope := db.DecideWorkScope{
 		RecipeID: recipeID, RetryReason: ReasonJevUnavailable, Book: o.Book, IssueType: o.IssueType,
 		Shard: o.Shard, Shards: o.Shards,
@@ -171,14 +177,27 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		scope.After = work[len(work)-1].ID
 
 		rec.Phase(fmt.Sprintf("page %d: loading chunks + rung-0", page))
-		items, err := prepare(ctx, store, work, o.Params)
+		prep, err := prepare(ctx, store, work, o.Params, recipeID)
 		if err != nil {
 			return nil, err
 		}
+		grouping.addGroups(prep.groups, false)
 		rec.Phase(fmt.Sprintf("page %d: %s", page, askingPhase(o.Model)))
-		evaluateAll(ctx, ev, items, o.Concurrency, rec)
+		evaluateAll(ctx, ev, prep.items, o.Concurrency, rec)
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		resolveConflicts(prep.items, &grouping, false)
+		// Written: the page's findings and the duplicates grouped with them.
+		// A conflict shadow was only asked for its p; it is decided on its
+		// own page.
+		var items []*item
+		for _, it := range prep.items {
+			if it.shadow && it.outcome.Decision != DecisionDuplicate {
+				shadows = append(shadows, it)
+				continue
+			}
+			items = append(items, it)
 		}
 		before := *ws
 		if err := writeItems(ctx, store, recipeID, items, batch, o.MaxAccepts, ws, pageRecorder{rec, page}); err != nil {
@@ -186,16 +205,23 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		}
 		rec.Count("skipped", int64(ws.Skipped-before.Skipped))
 		rec.Count("capped", int64(ws.Capped-before.Capped))
-		for _, it := range items {
+		rec.Count("duplicates", int64(ws.Duplicates-before.Duplicates))
+		for _, it := range prep.items {
 			it.input, it.chunk, it.sentences = Input{}, nil, nil // the report needs finding + outcome only
 		}
-		all = append(all, items...)
+		for _, it := range items {
+			if !it.shadow {
+				all = append(all, it)
+			}
+		}
 	}
 
 	rep := buildReport(RunOptions{Scope: db.DecideScope{Sample: o.Limit}, Model: o.Model,
 		Params: o.Params, PolicySource: o.PolicySource}, recipeID, all, nil)
 	rep.DryRun = false
 	rep.Write = ws
+	rep.Grouping = grouping
+	rep.addShadowCalls(shadows)
 	return rep, nil
 }
 
@@ -237,10 +263,15 @@ func eventOf(recipeID string, o Outcome) (db.DecisionEvent, bool) {
 	}
 	e := db.DecisionEvent{
 		FindingID: o.FindingID, RecipeID: recipeID, Outcome: o.Decision, Reason: o.Reason,
-		P: o.P, ChunkTextSHA256: o.ChunkHash,
+		P: o.P, ChunkTextSHA256: o.ChunkHash, RelatedFindingID: o.Related,
 	}
-	if o.Rung0.Pass {
+	if o.Rung0.Pass && o.Decision != DecisionDuplicate {
 		e.Evidence = o.Evidence
+	}
+	if o.Reason == ReasonOverlapDup && o.Decision == DecisionReject {
+		// Rejected for the winner's fix: only if that fix is accepted in the
+		// same write (not capped, skipped, or a shadow decided elsewhere).
+		e.RequiresAccepted = o.Related
 	}
 	if o.FnCallID != 0 {
 		id := o.FnCallID
@@ -295,6 +326,7 @@ func writeItems(ctx context.Context, store WriteStore, recipeID string, items []
 			ws.Accepted += len(res.Accepted)
 			ws.Rejected += len(res.Rejected)
 			ws.Held += len(res.Held)
+			ws.Duplicates += len(res.Duplicates)
 			ws.Skipped += len(res.Skipped)
 		}
 		if len(recheck) > 0 {
@@ -337,8 +369,8 @@ func capAccepts(evs []db.DecisionEvent, room int, ws *WriteStats) []db.DecisionE
 }
 
 func (w *WriteStats) print(p func(string, ...any)) {
-	p("\nwritten: accepted %d · rejected %d · held %d · re-check kept %d (held for review %d) · re-check reverted %d\n",
-		w.Accepted, w.Rejected, w.Held, w.Kept, w.KeptHeld, w.Reverted)
+	p("\nwritten: accepted %d · rejected %d · held %d · duplicates %d · re-check kept %d (held for review %d) · re-check reverted %d\n",
+		w.Accepted, w.Rejected, w.Held, w.Duplicates, w.Kept, w.KeptHeld, w.Reverted)
 	p("not written: skipped %d (locked, moved or chunk changed; decided next run) · reanchor needed %d · over --max-accepts %d\n",
 		w.Skipped, w.Reanchor, w.Capped)
 	if w.Stopped != "" {

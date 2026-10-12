@@ -43,6 +43,19 @@ func (s *fakeWriteStore) DecideWork(_ context.Context, sc db.DecideWorkScope) ([
 
 func (s *fakeWriteStore) apply(evs []db.DecisionEvent, recheck bool) db.ApplyResult {
 	var r db.ApplyResult
+	// Like db.ApplyDecisions: a reject that requires another finding's accept
+	// is held overlap_pending unless that accept is in this write.
+	accepted := map[string]bool{}
+	for _, e := range evs {
+		if !recheck && !s.skip[e.FindingID] && e.Outcome == db.OutcomeApply {
+			accepted[e.FindingID] = true
+		}
+	}
+	for i, e := range evs {
+		if e.RequiresAccepted != "" && !accepted[e.RequiresAccepted] {
+			evs[i].Outcome, evs[i].Reason = db.OutcomeHold, db.ReasonOverlapPending
+		}
+	}
 	for _, e := range evs {
 		switch {
 		case s.skip[e.FindingID]:
@@ -51,6 +64,8 @@ func (s *fakeWriteStore) apply(evs []db.DecisionEvent, recheck bool) db.ApplyRes
 			r.Reverted = append(r.Reverted, e.FindingID)
 		case recheck:
 			r.Kept = append(r.Kept, e.FindingID)
+		case e.Outcome == db.OutcomeDuplicate:
+			r.Duplicates = append(r.Duplicates, e.FindingID)
 		case e.Outcome == db.OutcomeApply:
 			r.Accepted = append(r.Accepted, e.FindingID)
 		case e.Outcome == db.OutcomeReject:
@@ -96,12 +111,17 @@ func TestApply(t *testing.T) {
 	if w == nil || rep.DryRun {
 		t.Fatalf("report %+v", rep)
 	}
-	// f-apply and f-repeat accept; f-notsound, f-dup (rung 0) and f-lowp reject;
-	// f-capped and f-outage hold; f-stale needs re-anchoring and is not written.
-	if w.Accepted != 2 || w.Rejected != 3 || w.Held != 2 || w.Reanchor != 1 || w.Skipped != 0 || w.Stopped != "" {
+	// f-apply and f-repeat accept; f-notsound (rung 0) and f-lowp reject;
+	// f-capped, f-outage and f-dup (won its conflict by p, then uncertain)
+	// hold; f-stale needs re-anchoring and is not written. The competitor
+	// f-dup beat is outside the work list: asked, never written.
+	if w.Accepted != 2 || w.Rejected != 2 || w.Held != 3 || w.Reanchor != 1 || w.Skipped != 0 || w.Duplicates != 0 || w.Stopped != "" {
 		t.Errorf("write stats %+v", w)
 	}
 	evs := eventsByID(store.fresh)
+	if _, ok := evs["c-overlap"]; ok {
+		t.Error("a conflict shadow was written")
+	}
 	if _, ok := evs["f-stale"]; ok {
 		t.Error("a re-anchor case was written as a decision")
 	}

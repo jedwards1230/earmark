@@ -36,7 +36,27 @@ const (
 	OutcomeApply  = "apply"
 	OutcomeHold   = "hold"
 	OutcomeReject = "reject"
+	// OutcomeDuplicate (migration 15) — the finding proposes the same fix as
+	// its representative (DecisionEvent.RelatedFindingID), which carries the
+	// decision: proposed → duplicate, duplicate_of = the representative.
+	// Agreement, never a rejection (CONTRACT §2.19 "Agreeing and conflicting
+	// findings").
+	OutcomeDuplicate = "duplicate"
 )
+
+// ReasonDuplicate is the reason of a duplicate decision, and of the
+// transition that moves its finding into duplicate.
+const ReasonDuplicate = "duplicate"
+
+// ReasonOverlapPending is the reason of a hold on a conflict's loser whose
+// winner is held: the work list decides it again once the winner leaves
+// proposed (decideWorkSQL).
+const ReasonOverlapPending = "overlap_pending"
+
+// ReasonDuplicateReleased is the transition reason when a duplicate returns to
+// proposed because its grouping was undone (`earmark decide revert` of the
+// duplicate's recipe, or of its representative).
+const ReasonDuplicateReleased = "duplicate_released"
 
 // Evidence classes a decision may cite (finding_events.evidence).
 const (
@@ -258,7 +278,19 @@ type DecisionEvent struct {
 	Evidence        string   // Evidence*; "" = not assessed
 	FnCallID        *int64   // the fn_calls row that answered
 	ChunkTextSHA256 string   // the chunk revision the decider saw
+	// RelatedFindingID is the other finding the decision is about: a
+	// duplicate's representative (required for OutcomeDuplicate) or the
+	// winner an overlap_dup reject lost to. "" = none.
+	RelatedFindingID string
+	// RequiresAccepted makes a reject conditional on another finding's
+	// accept: written as a reject only if that finding moves to accepted in
+	// the same ApplyDecisions call; otherwise it is recorded as a hold with
+	// reason overlap_pending, naming it (CONTRACT §2.19: a conflict's loser is
+	// rejected only for a fix that is actually in). "" = unconditional.
+	RequiresAccepted string
 }
+
+var decisionOutcomes = []string{OutcomeApply, OutcomeHold, OutcomeReject, OutcomeDuplicate}
 
 func (e DecisionEvent) validate() error {
 	switch {
@@ -266,8 +298,16 @@ func (e DecisionEvent) validate() error {
 		return errors.New("decision event: finding id is empty")
 	case !sha256HexRe.MatchString(e.RecipeID):
 		return fmt.Errorf("decision event %s: recipe_id %q is not lowercase hex sha256", e.FindingID, e.RecipeID)
-	case !slices.Contains([]string{OutcomeApply, OutcomeHold, OutcomeReject}, e.Outcome):
+	case !slices.Contains(decisionOutcomes, e.Outcome):
 		return fmt.Errorf("decision event %s: unknown outcome %q", e.FindingID, e.Outcome)
+	case e.Outcome == OutcomeDuplicate && e.RelatedFindingID == "":
+		return fmt.Errorf("decision event %s: a duplicate names no representative", e.FindingID)
+	case e.RelatedFindingID != "" && !uuidRe.MatchString(e.RelatedFindingID):
+		return fmt.Errorf("decision event %s: related finding %q is not a uuid", e.FindingID, e.RelatedFindingID)
+	case e.RelatedFindingID != "" && e.RelatedFindingID == e.FindingID:
+		return fmt.Errorf("decision event %s: names itself as the related finding", e.FindingID)
+	case e.RequiresAccepted != "" && (e.Outcome != OutcomeReject || e.RequiresAccepted != e.RelatedFindingID):
+		return fmt.Errorf("decision event %s: only a reject naming its related finding can require that finding's accept", e.FindingID)
 	case e.Reason == "":
 		return fmt.Errorf("decision event %s: reason is empty", e.FindingID)
 	case e.P != nil && (math.IsNaN(*e.P) || *e.P < 0 || *e.P > 1):
@@ -284,12 +324,14 @@ func (e DecisionEvent) validate() error {
 // refuses that).
 var insertDecisionEventsSQL = `
 	INSERT INTO finding_events (finding_id, transcript_id, kind, outcome, reason, actor,
-	                            recipe_id, p, evidence, fn_call_id, chunk_text_sha256, issue_type)
+	                            recipe_id, p, evidence, fn_call_id, chunk_text_sha256, issue_type,
+	                            related_finding_id)
 	SELECT f.id, f.transcript_id, 'decision', d.outcome, d.reason, 'jev:' || d.recipe_id,
-	       d.recipe_id, d.p, NULLIF(d.evidence, ''), d.fn_call_id, NULLIF(d.chunk_sha, ''), f.issue_type
+	       d.recipe_id, d.p, NULLIF(d.evidence, ''), d.fn_call_id, NULLIF(d.chunk_sha, ''), f.issue_type,
+	       d.related
 	  FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::text[],
-	              $7::bigint[], $8::text[])
-	       WITH ORDINALITY AS d(finding_id, recipe_id, outcome, reason, p, evidence, fn_call_id, chunk_sha, ord)
+	              $7::bigint[], $8::text[], $9::uuid[])
+	       WITH ORDINALITY AS d(finding_id, recipe_id, outcome, reason, p, evidence, fn_call_id, chunk_sha, related, ord)
 	  JOIN transcript_findings f ON f.id = d.finding_id
 	 ORDER BY d.ord
 	RETURNING id
@@ -312,6 +354,7 @@ func InsertDecisionEvents(ctx context.Context, tx rowQuerier, evs []DecisionEven
 		evidence  = make([]string, len(evs))
 		fnCalls   = make([]*int64, len(evs))
 		chunkSHAs = make([]string, len(evs))
+		related   = make([]*string, len(evs))
 	)
 	for i, e := range evs {
 		if err := e.validate(); err != nil {
@@ -319,9 +362,13 @@ func InsertDecisionEvents(ctx context.Context, tx rowQuerier, evs []DecisionEven
 		}
 		findings[i], recipes[i], outcomes[i], reasons[i] = e.FindingID, e.RecipeID, e.Outcome, e.Reason
 		ps[i], evidence[i], fnCalls[i], chunkSHAs[i] = e.P, e.Evidence, e.FnCallID, e.ChunkTextSHA256
+		if e.RelatedFindingID != "" {
+			r := e.RelatedFindingID
+			related[i] = &r
+		}
 	}
 	rows, err := tx.Query(ctx, insertDecisionEventsSQL,
-		findings, recipes, outcomes, reasons, ps, evidence, fnCalls, chunkSHAs)
+		findings, recipes, outcomes, reasons, ps, evidence, fnCalls, chunkSHAs, related)
 	if err != nil {
 		return nil, fmt.Errorf("insert %d decision events: %w", len(evs), err)
 	}
@@ -388,8 +435,11 @@ type FindingEvent struct {
 	ChunkTextSHA256 string
 	IssueType       string
 	RevokesEventID  *int64
-	Revoked         bool // a decision a later revoke event withdrew
-	CreatedAt       time.Time
+	// RelatedFindingID is the other finding the event is about (a
+	// duplicate's representative, an overlap_dup's winner); "" = none.
+	RelatedFindingID string
+	Revoked          bool // a decision a later revoke event withdrew
+	CreatedAt        time.Time
 }
 
 // findingHistorySQL is a finding's log, oldest first: the newest
@@ -400,7 +450,7 @@ var findingHistorySQL = `
 	           COALESCE(e.from_state, ''), COALESCE(e.to_state, ''), COALESCE(e.outcome, ''),
 	           COALESCE(e.reason, ''), e.actor, COALESCE(e.recipe_id, ''), e.p,
 	           COALESCE(e.evidence, ''), e.fn_call_id, COALESCE(e.chunk_text_sha256, ''),
-	           COALESCE(e.issue_type, ''), e.revokes_event_id,
+	           COALESCE(e.issue_type, ''), e.revokes_event_id, COALESCE(e.related_finding_id::text, ''),
 	           EXISTS (SELECT 1 FROM finding_events v
 	                    WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id) AS revoked,
 	           e.created_at
@@ -427,7 +477,7 @@ func findingHistory(ctx context.Context, q rowQuerier, findingID string) ([]Find
 		var e FindingEvent
 		err := r.Scan(&e.ID, &e.FindingID, &e.TranscriptID, &e.Kind, &e.FromState, &e.ToState,
 			&e.Outcome, &e.Reason, &e.Actor, &e.RecipeID, &e.P, &e.Evidence, &e.FnCallID,
-			&e.ChunkTextSHA256, &e.IssueType, &e.RevokesEventID, &e.Revoked, &e.CreatedAt)
+			&e.ChunkTextSHA256, &e.IssueType, &e.RevokesEventID, &e.RelatedFindingID, &e.Revoked, &e.CreatedAt)
 		return e, err
 	})
 	if err != nil {
@@ -495,7 +545,10 @@ type ApplyResult struct {
 	Reverted []string // re-check reject of an applied finding: applied → reverted
 	Held     []string // hold: recorded, left proposed
 	Kept     []string // re-check apply or hold: recorded, left accepted/applied
-	Skipped  []string // not written: locked by someone else, out of scope now, or its chunk changed
+	// Duplicates: duplicate, proposed → duplicate with duplicate_of set (a
+	// first decision only; never a re-check).
+	Duplicates []string
+	Skipped    []string // not written: locked by someone else, out of scope now, or its chunk changed
 }
 
 // applyDecisionsLockSQL locks the findings first (the repo-wide order:
@@ -537,14 +590,52 @@ var applyDecisionsChunksSQL = `
 	   FOR SHARE OF c
 `
 
+// lockRepresentativesSQL locks the representatives duplicates are about to
+// name, FOR SHARE in id order, SKIP LOCKED: a representative another writer
+// holds right now — an undo releasing its duplicates, a reviewer — is not
+// waited on (no deadlock with the findings → chunks order); its duplicates
+// are skipped and grouped again next run. Only a live fix can represent: a
+// proposed, accepted or applied finding — never a duplicate, a rejected or
+// reverted one (nothing would ever release its duplicates), or an archived,
+// stale or unanchorable one.
+// Held until commit, so an undo that releases a representative's duplicates
+// sees every duplicate this write records.
+var lockRepresentativesSQL = `
+	SELECT id::text FROM transcript_findings
+	 WHERE id = ANY($1)
+	   AND patch_state IN ('proposed', 'accepted', 'applied')
+	 ORDER BY id
+	   FOR SHARE SKIP LOCKED
+`
+
+// markDuplicatesSQL moves locked proposed findings to duplicate, each naming
+// its representative ($2, index-aligned with $1), stamped as the decide
+// recipe ($3). The rows are already locked by the caller's transaction; the
+// patch_state guard keeps it a compare-and-swap. A duplicate is never in the
+// overlay, so no chunk is flagged.
+var markDuplicatesSQL = `
+	UPDATE transcript_findings f
+	   SET patch_state  = 'duplicate',
+	       duplicate_of = d.rep,
+	       decided_at   = clock_timestamp(),
+	       decided_by   = $3
+	  FROM unnest($1::uuid[], $2::uuid[]) AS d(id, rep)
+	 WHERE f.id = d.id AND f.patch_state = 'proposed'
+	RETURNING f.id::text
+`
+
 // ApplyDecisions is the decide step's write (CONTRACT §2.17 "Automated
 // decisions"): in one short transaction it locks the decided findings then
 // their chunks, drops any finding that is locked elsewhere, no longer
 // proposed, or whose chunk no longer hashes to the event's ChunkTextSHA256
 // (the decider saw other text), then records the remaining decision events
 // and moves apply → accepted and reject → rejected as "jev:<recipeID>". Holds
-// are recorded and stay proposed. Model calls belong before this call, never
-// inside it.
+// are recorded and stay proposed. A duplicate moves proposed → duplicate with
+// duplicate_of = its RelatedFindingID, its transition carrying reason
+// "duplicate" (CONTRACT §2.19 "Agreeing and conflicting findings"); its
+// representative is locked FOR SHARE first (lockRepresentativesSQL) and a
+// duplicate whose representative cannot be locked is skipped. Model
+// calls belong before this call, never inside it.
 //
 // Every event must belong to recipeID, the recipe must be registered, and a
 // finding may appear once.
@@ -604,6 +695,9 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 		if seen[e.FindingID] {
 			return ApplyResult{}, fmt.Errorf("apply decisions: finding %s decided twice", e.FindingID)
 		}
+		if recheck && e.Outcome == OutcomeDuplicate {
+			return ApplyResult{}, fmt.Errorf("apply decisions: re-check of %s cannot record a duplicate", e.FindingID)
+		}
 		seen[e.FindingID] = true
 		ids = append(ids, e.FindingID)
 	}
@@ -635,6 +729,30 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 	}); err != nil {
 		return ApplyResult{}, fmt.Errorf("lock decided findings: %w", err)
 	}
+	var reps []string
+	for _, e := range evs {
+		if e.Outcome == OutcomeDuplicate {
+			if _, ok := state[e.FindingID]; ok {
+				reps = append(reps, e.RelatedFindingID)
+			}
+		}
+	}
+	repOK := map[string]bool{}
+	if len(reps) > 0 {
+		slices.Sort(reps)
+		reps = slices.Compact(reps)
+		rows, err := tx.Query(ctx, lockRepresentativesSQL, reps)
+		if err != nil {
+			return ApplyResult{}, fmt.Errorf("lock representatives: %w", err)
+		}
+		got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return ApplyResult{}, fmt.Errorf("lock representatives: %w", err)
+		}
+		for _, id := range got {
+			repOK[id] = true
+		}
+	}
 	locked := make([]string, 0, len(state))
 	for id := range state {
 		locked = append(locked, id)
@@ -653,22 +771,46 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 		return ApplyResult{}, fmt.Errorf("lock decided chunks: %w", err)
 	}
 
+	// willAccept: the findings this call moves to accepted, for the
+	// conditional rejects (RequiresAccepted).
+	willAccept := map[string]bool{}
+	for _, e := range evs {
+		_, isLocked := state[e.FindingID]
+		cur, hasChunk := chunkSHA[e.FindingID]
+		if isLocked && hasChunk && (e.ChunkTextSHA256 == "" || e.ChunkTextSHA256 == cur) &&
+			decideMove(state[e.FindingID], e.Outcome, recheck) == patch.StateAccepted {
+			willAccept[e.FindingID] = true
+		}
+	}
 	type move struct{ from, to string }
 	var (
-		res   ApplyResult
-		write []DecisionEvent
-		moves = map[move][]string{}
+		res     ApplyResult
+		write   []DecisionEvent
+		moves   = map[move][]string{}
+		dupIDs  []string
+		dupReps []string
 	)
 	for _, e := range evs {
 		st, isLocked := state[e.FindingID]
 		cur, hasChunk := chunkSHA[e.FindingID]
 		// A decision about text the chunk no longer holds is not written; an
 		// event that names no hash still needs the chunk to exist.
-		if !isLocked || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) {
+		if !isLocked || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) ||
+			(e.Outcome == OutcomeDuplicate && !repOK[e.RelatedFindingID]) {
 			res.Skipped = append(res.Skipped, e.FindingID)
 			continue
 		}
+		if e.RequiresAccepted != "" && !willAccept[e.RequiresAccepted] {
+			// The fix it lost to is not going in now: held, pending it.
+			e.Outcome, e.Reason = OutcomeHold, ReasonOverlapPending
+		}
+		e.RequiresAccepted = ""
 		write = append(write, e)
+		if e.Outcome == OutcomeDuplicate {
+			res.Duplicates = append(res.Duplicates, e.FindingID)
+			dupIDs, dupReps = append(dupIDs, e.FindingID), append(dupReps, e.RelatedFindingID)
+			continue
+		}
 		to := decideMove(st, e.Outcome, recheck)
 		switch {
 		case to == patch.StateAccepted:
@@ -712,11 +854,37 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 			return ApplyResult{}, fmt.Errorf("apply decisions: %d locked finding(s) did not move %s -> %s", len(br.Skipped), mv.from, mv.to)
 		}
 	}
+	if len(dupIDs) > 0 {
+		if err := markDuplicatesTx(ctx, tx, dupIDs, dupReps, decider); err != nil {
+			return ApplyResult{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ApplyResult{}, fmt.Errorf("commit apply decisions: %w", err)
 	}
-	for _, l := range [][]string{res.Accepted, res.Rejected, res.Reverted, res.Held, res.Kept, res.Skipped} {
+	for _, l := range [][]string{res.Accepted, res.Rejected, res.Reverted, res.Held, res.Kept, res.Duplicates, res.Skipped} {
 		slices.Sort(l)
 	}
 	return res, nil
+}
+
+// markDuplicatesTx moves the locked, proposed ids to duplicate (reps
+// index-aligned), their transitions carrying reason "duplicate". Every id must
+// move: the caller holds their locks and saw them proposed.
+func markDuplicatesTx(ctx context.Context, tx pgx.Tx, ids, reps []string, decider string) error {
+	if err := SetEventContext(ctx, tx, EventContext{Reason: ReasonDuplicate}); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, markDuplicatesSQL, ids, reps, decider)
+	if err != nil {
+		return fmt.Errorf("mark %d duplicates: %w", len(ids), err)
+	}
+	moved, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("mark %d duplicates: %w", len(ids), err)
+	}
+	if len(moved) != len(ids) {
+		return fmt.Errorf("apply decisions: %d of %d locked finding(s) did not move proposed -> duplicate", len(ids)-len(moved), len(ids))
+	}
+	return SetEventContext(ctx, tx, EventContext{})
 }

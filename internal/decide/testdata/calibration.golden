@@ -1,7 +1,7 @@
 decide calibration (human-decided findings) · recipe cdcdcdcdcdcd · model jev-1.13.0 · seed "cal"
 sampled 6 of 6 requested · scope 60
 
-outcomes: apply 2 · hold 1 · reject 2 · reanchor 1
+outcomes: apply 2 · hold 1 · reject 2 · duplicate 0 · reanchor 1
 outcome   issue_type            evidence       count
 apply     misheard_proper_noun  asin_verbatim  2
 hold      misheard_word         none           1
@@ -11,6 +11,9 @@ reanchor  misheard_word         none           1
 decision reasons: confident_with_evidence 2 · jev_reject 1 · no_evidence 1
 rung-0 rejects:   not_soundalike 1
 reanchor needed:  anchor_missing 1
+
+duplicates grouped: 0 group(s) · 0 duplicate(s) (agreeing findings: one representative decided, the rest recorded as duplicates)
+conflicts ranked by p: 0 set(s) · 0 finding(s) · 0 overlap_dup · 0 overlap_pending (winner held)
 
 p histogram (answered 0):
   [0.0,0.1)     0
@@ -24,10 +27,10 @@ p histogram (answered 0):
   [0.8,0.9)     0
   [0.9,1.0]     0
 
-jev: asked 0 · answered 0 · unavailable 0 · cache hits 0
+jev-1.13.0: asked 0 · answered 0 · unavailable 0 · cache hits 0
 tokens: 0 in · 0 out · cost $0.000000
 
-projection to the scope (60 findings): apply 20 · hold 10 · reject 20 · reanchor 10
+projection to the scope (60 findings): apply 20 · hold 10 · reject 20 · duplicate 0 · reanchor 10
   ~0 model calls · cost unknown (no uncached call in the sample)
 
 calibration: 3 human-accepted · 3 human-rejected

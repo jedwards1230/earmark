@@ -378,9 +378,9 @@ func TestServersDataScenarios(t *testing.T) {
 				"runner version: running", "not reported (pre-provenance runner)", "AI endpoints (4)", "unbound", "direct",
 				"✗ unreachable", "✓ lists model", `<span title="role token: eval">Judge</span>`,
 				"29,001", "3,336", "· counts as of", "· stale counts as of",
-				`id="role-decide"`, `id="role-scan"`, "<dt>decided</dt><dd>1,189 by Jev · 6 by humans · 29,001 proposed awaiting",
+				`id="role-decide"`, `id="role-scan"`, `<dt>decided</dt><dd>1,169 by <span class="mono">jev-1.13.0</span> · 20 by <span class="mono">clef:27b</span> · 6 by humans · 29,001 proposed awaiting`,
 				"proposed findings await a decision", "29,001 proposed findings", "1,412 <span class=\"mono\">should_apply</span> calls + 230 cached",
-				"<dt>scanned</dt><dd>50", "Decided · Jev", "Decided · human",
+				"<dt>scanned</dt><dd>50", "Decided · decide step", "Decided · human",
 				"1 transcript currently failing", "<dt>last error</dt>", "· last fail",
 				"LiteLLM gateway", "proxy healthy · db connected", "v1.102.1", "$12.25 · no budget set",
 				"<dt>used by</dt><dd>Embeddings, Judge, Decide</dd>",
@@ -900,10 +900,11 @@ func TestServersFragmentRoleCards(t *testing.T) {
 			unconfigured: []roleCard{
 				{Key: "judge", Title: "Judge", HasModel: true, Health: health(roleNotConfigured, "judging is off")},
 				{Key: "decide", Title: "Decide", HasModel: true, HumanDecided: &decided, JevDecided: jev,
-					Health: health(roleNotConfigured, "no AI_ROLES.decide binding — the decide step is off")},
+					JevByModel: []db.ModelCount{{Model: "jev-1.13.0", Count: 1_100}, {Model: "clef:27b", Count: 89}},
+					Health:     health(roleNotConfigured, "no AI_ROLES.decide binding — the decide step is off")},
 				{Key: "format", Title: "Format", Health: health(roleNotConfigured, "no model role for this step yet")},
 			},
-			wantContains: []string{`○ Not configured: Judge <span class="time-muted">(judging is off)</span>, Decide <span class="time-muted">(no AI_ROLES.decide binding — the decide step is off · decided by humans 7 · by Jev 1,189)</span>, Format</p>`},
+			wantContains: []string{`○ Not configured: Judge <span class="time-muted">(judging is off)</span>, Decide <span class="time-muted">(no AI_ROLES.decide binding — the decide step is off · decided by humans 7 · by jev-1.13.0 1,100 · by clef:27b 89)</span>, Format</p>`},
 			wantAbsent:   []string{"role-card", "NOT CONFIGURED", "no model role for this step yet", `class="panels role-panels"`},
 		},
 	}
@@ -1035,20 +1036,24 @@ func TestFnRoleHealthPrecedence(t *testing.T) {
 
 // TestDecideTally: decided_by jev:<recipe> is the decide step, never a human;
 // revert:jev:<recipe> is its undo; mcp:/cli:/other and unattributed are people.
+// The decide step's decisions are split by the recipe's model, so Clef's are
+// never labelled Jev; a duplicate is not a decision.
 func TestDecideTally(t *testing.T) {
 	got := decideTally([]db.FindingsModelCount{
 		{PatchState: "proposed", Count: 100},
 		{PatchState: "proposed", Decider: db.DeciderJevRevert, Count: 3},
-		{PatchState: "accepted", Decider: db.DeciderJev, Count: 820},
-		{PatchState: "rejected", Decider: db.DeciderJev, Count: 369},
-		{PatchState: "applied", Decider: db.DeciderJev, Count: 11},
+		{PatchState: "accepted", Decider: db.DeciderJev, DecideModel: "jev-1.13.0", Count: 820},
+		{PatchState: "rejected", Decider: db.DeciderJev, DecideModel: "jev-1.13.0", Count: 369},
+		{PatchState: "applied", Decider: db.DeciderJev, DecideModel: "clef:27b", Count: 11},
+		{PatchState: "duplicate", Decider: db.DeciderJev, DecideModel: "clef:27b", Count: 40},
 		{PatchState: "rejected", Decider: db.DeciderJevRevert, Count: 2},
 		{PatchState: "accepted", Decider: db.DeciderHuman, Count: 6},
 		{PatchState: "reverted", Decider: db.DeciderNone, Count: 1},
 		{PatchState: "unanchorable", Count: 9},
 		{PatchState: "superseded", Decider: db.DeciderJev, Count: 4},
 	})
-	assert.Equal(t, decisionTally{Human: 7, Jev: 1_200, JevUndone: 5, Proposed: 103}, got)
+	assert.Equal(t, decisionTally{Human: 7, Jev: 1_200, JevUndone: 5, Proposed: 103,
+		ByModel: []db.ModelCount{{Model: "jev-1.13.0", Count: 1_189}, {Model: "clef:27b", Count: 11}}}, got)
 }
 
 // TestFnRolesErrIsBestEffort: a failed fn_calls aggregate marks only the
