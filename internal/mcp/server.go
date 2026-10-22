@@ -452,13 +452,19 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	GET  /api/v1/openapi.yaml        — this API's OpenAPI 3.1 contract (YAML, no auth)
 //	GET  /health               — liveness probe (always 200 "ok")
 //	GET  /readyz               — readiness probe (200 if DB ping OK, 503 otherwise)
-//	*    /mcp                  — MCP streamable-HTTP handler
+//	POST /mcp                  — MCP streamable-HTTP handler (stateless; GET/DELETE answer 405)
 //
 // Extracted so that tests can wire the same mux without binding a port.
 func (s *MCPServer) buildMux() *http.ServeMux {
-	// getServer returns the single prebuilt server for every session — the tool
+	// getServer returns the single prebuilt server for every request — the tool
 	// set is process-wide, not per-request.
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.server }, nil)
+	//
+	// Stateless is required, not optional: a stateful handler rejects a forwarded
+	// _meta protocolVersion with -32022; only stateless serves 2026-07-28 (docs/CONTRACT.md §2.2).
+	mcpHandler := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return s.server },
+		&mcp.StreamableHTTPOptions{Stateless: true},
+	)
 
 	mux := http.NewServeMux()
 

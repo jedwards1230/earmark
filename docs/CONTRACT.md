@@ -1832,6 +1832,7 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 | Property | Value |
 |----------|-------|
 | Transport | `streamable-http` (wiki parity) |
+| Session mode | stateless (`StreamableHTTPOptions.Stateless`): no `Mcp-Session-Id`, POST only (GET/DELETE answer `405`) |
 | Container port | `8081` |
 | URL path | `/mcp` |
 | In-cluster URL | `http://earmark.earmark:8081/mcp` |
@@ -1845,6 +1846,15 @@ The mcp-proxy configmap entry (add to `mcpServers` object):
   "transportType": "streamable-http"
 }
 ```
+
+The HTTP handler **must stay stateless**. go-sdk serves protocol revision
+`2026-07-28` over streamable HTTP only on a stateless handler. A stateful one
+also rejects, with `-32022`, any call whose `_meta` carries
+`io.modelcontextprotocol/protocolVersion`, even at a legacy version, and
+ContextForge forwards that key from its clients. Nothing in this server needs a
+session: there are no server-to-client requests, no progress or logging
+notifications, no resources, and the tool set is fixed at startup. The stdio
+transport is unaffected.
 
 #### 2.2.1 MCP Tools
 
