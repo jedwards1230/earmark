@@ -225,6 +225,13 @@ MCP_TRANSPORT=http ./earmark mcp
 go run . mcp --demo
 ```
 
+The HTTP transport is **stateless** (`StreamableHTTPOptions{Stateless: true}`):
+no `Mcp-Session-Id`, POST only. That is what lets it serve protocol revision
+`2026-07-28` and accept ContextForge's forwarded
+`_meta["io.modelcontextprotocol/protocolVersion"]` at `2025-11-25`. A stateful
+handler rejects both with `-32022` (CONTRACT §2.2). `http_protocol_test.go`
+guards both flows.
+
 ## Testing
 
 ```bash

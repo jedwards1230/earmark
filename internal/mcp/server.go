@@ -452,13 +452,27 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	GET  /api/v1/openapi.yaml        — this API's OpenAPI 3.1 contract (YAML, no auth)
 //	GET  /health               — liveness probe (always 200 "ok")
 //	GET  /readyz               — readiness probe (200 if DB ping OK, 503 otherwise)
-//	*    /mcp                  — MCP streamable-HTTP handler
+//	POST /mcp                  — MCP streamable-HTTP handler (stateless; GET/DELETE answer 405)
 //
 // Extracted so that tests can wire the same mux without binding a port.
 func (s *MCPServer) buildMux() *http.ServeMux {
-	// getServer returns the single prebuilt server for every session — the tool
+	// getServer returns the single prebuilt server for every request — the tool
 	// set is process-wide, not per-request.
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.server }, nil)
+	//
+	// Stateless is required, not a tuning knob. go-sdk serves protocol revision
+	// 2026-07-28 over streamable HTTP only on a stateless handler, and a
+	// stateful one rejects ANY call whose _meta carries
+	// io.modelcontextprotocol/protocolVersion with -32022, even at a legacy
+	// version. ContextForge forwards that key from its downstream clients, so a
+	// stateful /mcp fails every federated tool call. Nothing here needs a
+	// session: no server->client requests, no progress or logging
+	// notifications, no resources or subscriptions, and the tool set never
+	// changes after startup. TestHTTPLegacyCallWithProtocolMetaIsAccepted and
+	// TestHTTPModernProtocolIsServed fail if this is removed.
+	mcpHandler := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return s.server },
+		&mcp.StreamableHTTPOptions{Stateless: true},
+	)
 
 	mux := http.NewServeMux()
 
