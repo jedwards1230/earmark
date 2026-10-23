@@ -13,6 +13,7 @@ mcp:
   # pod's own env. This is where per-workload OTEL_* goes, e.g.
   #   - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://collector:4318"}
   #   - {name: OTEL_SERVICE_NAME, value: earmark-mcp}
+  #   - {name: OTEL_METRICS_EXPORTER, value: prometheus}
   # earmark speaks OTLP http/protobuf only (:4318, never :4317). Also set
   # OTEL_METRICS_EXPORTER=prometheus: /metrics is already scraped by the
   # PodMonitor, so an OTLP metric push would publish every series twice.
