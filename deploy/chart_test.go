@@ -236,6 +236,113 @@ func TestEvalBackfillExtraEnvCollisionFails(t *testing.T) {
 	}
 }
 
+// deployEnv returns the env list of a Deployment's first container.
+func deployEnv(t *testing.T, docs map[string]map[string]any, name string) []any {
+	t.Helper()
+	d := docs["Deployment/"+name]
+	require.NotNil(t, d, "Deployment/%s not rendered", name)
+	return dig(t, d, "spec", "template", "spec", "containers", 0, "env").([]any)
+}
+
+func TestDeploymentExtraEnvEmptyByDefault(t *testing.T) {
+	docs := render(t)
+	for _, name := range []string{"earmark-mcp", "earmark-ingest"} {
+		for _, e := range deployEnv(t, docs, name) {
+			assert.NotContains(t, e.(map[string]any)["name"], "OTEL_", name)
+		}
+	}
+}
+
+func TestDeploymentExtraEnvRendersInOwnContainer(t *testing.T) {
+	docs := render(t,
+		"mcp.extraEnv[0].name=OTEL_EXPORTER_OTLP_ENDPOINT",
+		"mcp.extraEnv[0].value=http://collector:4318",
+		"mcp.extraEnv[1].name=OTEL_SERVICE_NAME",
+		"mcp.extraEnv[1].value=earmark-mcp",
+		"ingest.extraEnv[0].name=OTEL_SERVICE_NAME",
+		"ingest.extraEnv[0].value=earmark-ingest",
+		"evalBackfill.enabled=true",
+		"evalBackfill.extraEnv[0].name=OTEL_SERVICE_NAME",
+		"evalBackfill.extraEnv[0].value=earmark-eval",
+	)
+
+	// extraEnv lands last: after the shared env and the pod's own env.
+	mcp := deployEnv(t, docs, "earmark-mcp")
+	assert.Equal(t, []any{
+		map[string]any{"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://collector:4318"},
+		map[string]any{"name": "OTEL_SERVICE_NAME", "value": "earmark-mcp"},
+	}, mcp[len(mcp)-2:])
+	assert.Equal(t,
+		map[string]any{"name": "MCP_HTTP_ADDR", "value": ":8081"}, mcp[len(mcp)-3])
+
+	ingest := deployEnv(t, docs, "earmark-ingest")
+	assert.Equal(t,
+		map[string]any{"name": "OTEL_SERVICE_NAME", "value": "earmark-ingest"},
+		ingest[len(ingest)-1])
+	assert.Equal(t,
+		map[string]any{"name": "INGEST_HTTP_ADDR", "value": ":8082"}, ingest[len(ingest)-2])
+
+	// Each list reaches only its own workload.
+	c := dig(t, docs["CronJob/earmark-eval-backfill"], "spec", "jobTemplate", "spec",
+		"template", "spec", "containers", 0, "env").([]any)
+	assert.Equal(t,
+		map[string]any{"name": "OTEL_SERVICE_NAME", "value": "earmark-eval"}, c[len(c)-1])
+	for _, env := range [][]any{mcp, ingest, c} {
+		n := 0
+		for _, e := range env {
+			if e.(map[string]any)["name"] == "OTEL_SERVICE_NAME" {
+				n++
+			}
+		}
+		assert.Equal(t, 1, n)
+	}
+}
+
+func TestDeploymentExtraEnvCollisionFails(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	for _, tc := range []struct{ key, name string }{
+		{"mcp.extraEnv", "DATABASE_URL"}, // shared env (commonEnv)
+		{"mcp.extraEnv", "LOG_FORMAT"},
+		{"mcp.extraEnv", "MCP_TRANSPORT"}, // the Deployment's own env
+		{"mcp.extraEnv", "MCP_HTTP_ADDR"},
+		{"mcp.extraEnv", "CONTROL_API_TOKEN"},
+		{"ingest.extraEnv", "DATABASE_URL"},
+		{"ingest.extraEnv", "LOG_FORMAT"},
+		{"ingest.extraEnv", "INGEST_HTTP_ADDR"},
+	} {
+		t.Run(tc.key+"/"+tc.name, func(t *testing.T) {
+			cmd := exec.Command("helm", "template", "earmark", chartDir,
+				"--set", tc.key+"[0].name="+tc.name,
+				"--set", tc.key+"[0].value=x")
+			out, err := cmd.CombinedOutput()
+			require.Error(t, err, "expected collision failure, got:\n%s", out)
+			assert.Contains(t, string(out), tc.key+" sets \""+tc.name+"\"")
+		})
+	}
+}
+
+func TestDeploymentExtraEnvSchemaRejectsBadValues(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	for _, tc := range []struct{ set, path string }{
+		{"mcp.extraEnv[0].value=x", "/mcp/extraEnv/0"}, // entry without a name
+		{"ingest.extraEnv[0].value=x", "/ingest/extraEnv/0"},
+		{"mcp.extraEnv=foo", "/mcp/extraEnv"}, // not a list
+		{"ingest.extraEnv=foo", "/ingest/extraEnv"},
+		{"ingest.unknownKey=1", "/ingest"},
+	} {
+		t.Run(tc.set, func(t *testing.T) {
+			out, err := exec.Command("helm", "template", "earmark", chartDir,
+				"--set", tc.set).CombinedOutput()
+			require.Error(t, err, "expected schema rejection, got:\n%s", out)
+			assert.Contains(t, string(out), tc.path)
+		})
+	}
+}
+
 // helmInstallNotes renders NOTES.txt via a client-side dry-run install.
 func helmInstallNotes(t *testing.T, sets ...string) string {
 	t.Helper()

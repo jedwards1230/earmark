@@ -68,6 +68,12 @@ spec:
                   name: {{ .Values.secrets.controlApiToken.name | quote }}
                   key: {{ .Values.secrets.controlApiToken.key | quote }}
             {{- end }}
+            {{- /* extraEnv is additions only — see earmark.extraEnvGuard. The reserved
+              names are this block's own env above: keep them in step. */}}
+            {{- include "earmark.extraEnvGuard" (dict "root" . "key" "mcp.extraEnv" "env" .Values.mcp.extraEnv "reserved" (list "MCP_TRANSPORT" "MCP_HTTP_ADDR" "CONTROL_API_TOKEN")) }}
+            {{- with .Values.mcp.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
 
           livenessProbe:
             httpGet:

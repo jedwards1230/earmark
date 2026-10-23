@@ -29,7 +29,21 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "replicaCount": { "type": "integer", "minimum": 1 }
+        "replicaCount": { "type": "integer", "minimum": 1 },
+        "extraEnv": {
+          "type": "array",
+          "items": { "type": "object", "required": ["name"] }
+        }
+      }
+    },
+    "ingest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "extraEnv": {
+          "type": "array",
+          "items": { "type": "object", "required": ["name"] }
+        }
       }
     },
     "service": {

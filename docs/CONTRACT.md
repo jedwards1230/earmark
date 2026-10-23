@@ -2340,6 +2340,10 @@ legitimate) but `NOTES` warns that both paths will judge. Defaults: schedule
 `activeDeadlineSeconds: 3000`, `startingDeadlineSeconds: 600`,
 `ttlSecondsAfterFinished: 86400`, history limits 3/3.
 
+`mcp.extraEnv` and `ingest.extraEnv` are the same hook for the two Deployments
+(rendered after `commonEnv` and the pod's own env; additions only, one shared
+guard for all three lists) — the place for per-workload `OTEL_*` (§2.16).
+
 Sync policy: **auto-sync** (`prune: true`, `selfHeal: true`) — this is a
 non-critical new service, not in the manual-sync exceptions list.
 
@@ -4207,6 +4211,9 @@ nothing about any collector is hard-coded:
 The exporters read the rest of the standard set themselves
 (`OTEL_EXPORTER_OTLP_HEADERS`, `_INSECURE`, `_TIMEOUT`,
 `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_BSP_*`).
+
+In the Helm chart these are set per workload (e.g. a distinct `OTEL_SERVICE_NAME`)
+through `mcp.extraEnv`, `ingest.extraEnv` and `evalBackfill.extraEnv` (§2.7).
 
 > **Do not ingest metrics twice.** If the same Prometheus both scrapes
 > `/metrics` (PodMonitor) and receives the OTLP metric push, every series

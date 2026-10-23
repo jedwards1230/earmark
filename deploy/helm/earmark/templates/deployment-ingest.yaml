@@ -59,6 +59,12 @@ spec:
             {{- include "earmark.commonEnv" . | nindent 12 }}
             - name: INGEST_HTTP_ADDR
               value: {{ .Values.config.ingestHttpAddr | quote }}
+            {{- /* extraEnv is additions only — see earmark.extraEnvGuard. The reserved
+              names are this block's own env above: keep them in step. */}}
+            {{- include "earmark.extraEnvGuard" (dict "root" . "key" "ingest.extraEnv" "env" .Values.ingest.extraEnv "reserved" (list "INGEST_HTTP_ADDR")) }}
+            {{- with .Values.ingest.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
 
           # Liveness: HTTP /healthz on the ingest pod's minimal listener (replaces
           # the old `pgrep -f earmark` exec probe, which errored because pgrep is

@@ -251,6 +251,43 @@ AI_ENDPOINTS/AI_ROLES so the judge it runs is the one the Deployments see).
 {{- end }}
 
 {{/*
+extraEnv collision guard — shared by mcp.extraEnv, ingest.extraEnv and
+evalBackfill.extraEnv so all three behave identically.
+
+extraEnv is additions only: a name that is already set would leave a duplicate
+env entry (API-server "hides previous definition" warnings, SSA / ArgoCD diff
+churn on the `name` merge key) and silently fork that workload's config from
+the others'. Fail the render instead.
+
+Call with a dict:
+  root     the root context (.)
+  key      the values path of the list, used in the error message (e.g. "mcp.extraEnv")
+  env      the list itself
+  reserved (optional) names the calling template sets itself, outside
+           earmark.commonEnv (e.g. the Deployment's own env block)
+Renders nothing; fails the render on a collision.
+*/}}
+{{- define "earmark.extraEnvGuard" -}}
+{{- $common := dict }}
+{{- range (include "earmark.commonEnv" .root | fromYamlArray) }}
+{{- $_ := set $common .name true }}
+{{- end }}
+{{- $own := dict }}
+{{- range (.reserved | default list) }}
+{{- $_ := set $own . true }}
+{{- end }}
+{{- $key := .key }}
+{{- range .env }}
+{{- if hasKey $common .name }}
+{{- fail (printf "%s sets %q, which the chart's shared env (earmark.commonEnv) already sets. extraEnv is additions only — change %s through the chart's config/secrets values so every workload agrees." $key .name .name) }}
+{{- end }}
+{{- if hasKey $own .name }}
+{{- fail (printf "%s sets %q, which this workload's own env already sets. extraEnv is additions only." $key .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Shared container securityContext.
 */}}
 {{- define "earmark.containerSecurityContext" -}}
