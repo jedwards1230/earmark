@@ -9,6 +9,27 @@ image:
 # The ingest worker is always 1 replica (Recreate strategy).
 mcp:
   replicaCount: 1
+  # Extra env vars (core/v1 EnvVar list) appended after the shared env and the
+  # pod's own env. This is where per-workload OTEL_* goes, e.g.
+  #   - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://collector:4318"}
+  #   - {name: OTEL_SERVICE_NAME, value: earmark-mcp}
+  #   - {name: OTEL_METRICS_EXPORTER, value: prometheus}
+  # earmark speaks OTLP http/protobuf only (:4318, never :4317). Also set
+  # OTEL_METRICS_EXPORTER=prometheus: /metrics is already scraped by the
+  # PodMonitor, so an OTLP metric push would publish every series twice.
+  # ADDITIONS ONLY: a name the chart already sets (DATABASE_URL,
+  # MCP_TRANSPORT, …) fails the render — change it via `config` instead. See
+  # ingest.extraEnv and evalBackfill.extraEnv for the other workloads.
+  extraEnv: []
+
+# ── Ingest worker ──────────────────────────────────────────────────────────────
+# The ingest Deployment (`earmark monitor`) has no other per-workload values;
+# it shares image, resources, nodeSelector and config with the mcp Deployment.
+ingest:
+  # Extra env vars (core/v1 EnvVar list) appended after the shared env and the
+  # pod's own env — same rules as mcp.extraEnv (e.g. OTEL_SERVICE_NAME:
+  # earmark-ingest). Additions only: a colliding name fails the render.
+  extraEnv: []
 
 # ── Pod metadata (shared by both the mcp and ingest deployments) ────────────────
 # -- Pod annotations (e.g. Velero backup-volumes hooks). Not applied to the

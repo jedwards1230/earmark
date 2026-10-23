@@ -194,7 +194,7 @@ The ones you are most likely to set:
 | `EVAL_REASONING_EFFORT` / `EVAL_CHAT_TEMPLATE_KWARGS` | `auto` | Deployment-wide thinking fields sent to the judge: on for local models, omitted when the model id contains `anthropic/`, `openrouter/` or `openai/` (a LiteLLM alias that hides the provider needs `omit`); `omit` or an explicit value overrides. Per model, the propose model setting's `reasoning_effort` / `chat_template_kwargs` params outrank them (`earmark models set propose --param reasoning_effort=low`, CONTRACT §2.15) |
 | `CONTROL_API_TOKEN` | — | Bearer token for the mutating control API; unset means those endpoints fail closed |
 | `LOG_FORMAT` | `pretty` | `pretty` or `json`. JSON records logged inside an OpenTelemetry span carry `trace_id`/`span_id` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP collector for traces (judge `gen_ai.*` spans) and pushed metrics. Unset → no OTLP at all. OTLP/HTTP (`http/protobuf`) only — use the collector's HTTP port (Alloy `:4318`). Standard `OTEL_*` vars only: `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRICS_EXPORTER`, `OTEL_TRACES_EXPORTER`, `OTEL_SDK_DISABLED` (CONTRACT §2.16) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP collector for traces (judge `gen_ai.*` spans) and pushed metrics. Unset → no OTLP at all. OTLP/HTTP (`http/protobuf`) only — use the collector's HTTP port (Alloy `:4318`). Standard `OTEL_*` vars only: `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRICS_EXPORTER`, `OTEL_TRACES_EXPORTER`, `OTEL_SDK_DISABLED` (CONTRACT §2.16). In the Helm chart, set them per workload via `mcp.extraEnv`, `ingest.extraEnv` and `evalBackfill.extraEnv` |
 
 ## Deployment
 
