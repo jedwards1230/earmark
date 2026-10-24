@@ -249,8 +249,9 @@ type FnRoleActivity struct {
 
 // fnRoleActivitySQL is one round trip: the current decide/scan recipes and an
 // aggregate over their calls. fn_calls has no index on fn alone, so this is a
-// scan of the call log — bounded output (≤ 2 rows), run on the page's 30 s
-// snapshot timer. $1 is ErrorClassModelFallback.
+// scan of the call log (~0.8 s at 150k rows, mostly the ordered array_agg sort)
+// — bounded output (≤ 2 rows), run from its own 60 s cache under a 30 s budget,
+// not the snapshot's 3 s one (CONTRACT §2.14). $1 is ErrorClassModelFallback.
 //
 // cur is MATERIALIZED on purpose. Left to inline it, the planner joins fn_calls
 // to ALL of recipes first and filters against current_recipes afterwards: a
