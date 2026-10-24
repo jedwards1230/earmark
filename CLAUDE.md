@@ -171,7 +171,9 @@ HEALTHY (Decide with 1,169 decided by jev-1.13.0 and 20 by clef:27b, Scan), `fai
 FAILING, `stale` DEGRADED (Decide answered by a fallback), `idle` Judge/Embeddings HEALTHY · idle
 (ASR DEGRADED: asr-runner stopped), `winddown` Judge/Embeddings/Decide/Scan and the LiteLLM
 gateway DOWN, `empty` the "○ Not configured" strip (fixtures in
-`internal/mcp/demo_models.go`). The **Running now** panel (`/runs/data`, top of
+`internal/mcp/demo_models.go`). The page's **Track record** region (`/servers/track-record`, polled
+every 60 s, fixtures in `internal/mcp/demo_trackrecord.go`): every scenario a per-alias table,
+`empty` "no judge passes or decisions recorded yet", `snapshot-error` "track record unavailable". The **Running now** panel (`/runs/data`, top of
 both pages; fixtures in `internal/mcp/demo_runs.go`): `active`/`batch-analyze` a
 live `decide --yes` at 12,400 / 29,000 plus a stale scan, `stale` only the stale
 scan, `failed` a live eval backfill with no total and a failed recent run,
@@ -185,6 +187,7 @@ curl -sf http://localhost:9876/             # full dashboard page
 curl -sf http://localhost:9876/status/data  # htmx auto-refresh fragment
 curl -sf http://localhost:9876/servers      # Models page (role board)
 curl -sf http://localhost:9876/servers/data # Models fragment
+curl -sf http://localhost:9876/servers/track-record # Track record fragment (judge passes + decisions per model alias)
 curl -sf http://localhost:9876/runs/data    # Running now + Recent runs fragment
 curl -sf http://localhost:9876/api/v1/runs  # the same runs as JSON
 ```

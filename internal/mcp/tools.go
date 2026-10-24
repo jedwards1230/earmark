@@ -104,6 +104,10 @@ type DBInterface interface {
 	// "Running now" panel, the role cards' active-run link and GET
 	// /api/v1/runs. Two index-backed LIMIT queries.
 	StepRuns(ctx context.Context, activeLimit, recentLimit int) (db.StepRunList, error)
+	// ModelTrackRecord summarises judge passes and decisions per model alias
+	// for the Models page's Track record (CONTRACT §2.14): two aggregates in
+	// one read-only transaction under a statement timeout.
+	ModelTrackRecord(ctx context.Context) ([]db.ModelTrack, error)
 	// AuditRows serves one page of an audit source as stored (CONTRACT
 	// §2.12.2): rows of the named table from the cursor — ascending after an
 	// id, or newest first before one — narrowed by the source's equality

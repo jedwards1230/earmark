@@ -2613,7 +2613,8 @@ LAN-only; only reachable under the HTTP transport.
 | `GET /status/data` | Status fragment (htmx-refreshed every 3 s): counts, pipeline state, read-only phase badge, and the token-gated pause + run-budget controls. |
 | `GET /failed/data` | Failed-jobs fragment. **No standalone `/failed` page** — it renders inside `/pipeline`. |
 | `GET /runs/data` | **Running now + Recent runs** fragment (§1.10), the first region of both `/pipeline` and `/servers`, polled every 3 s (5 s htmx timeout; the read has a 2 s server-side deadline). Each active run is a card (`id="run-<id>"`): step, mode, status, the current phase, a done/total bar (or "N done · total unknown"), model, recipe short id, counts, elapsed and ETA (live runs with a total), spend, host and args. A stale run (heartbeat > 2 min) shows amber, "⚠ stale", with its last heartbeat and no ETA. "Recent runs" lists the newest 10 others: outcome, counts, cost, duration, start. A failed or slow read renders `200` "run status unavailable" — never the page's connection-lost banner. |
-| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the "Running now" runs region (`/runs/data`) on top, then the role board, recipes & stale work, LiteLLM gateway, AI endpoints, judge output, ASR runners. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s, the decide/scan `fn_calls` aggregate 60 s, queue stats 15 s and stale counts 5 min, all served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
+| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the "Running now" runs region (`/runs/data`) on top, then the role board, recipes & stale work, LiteLLM gateway, AI endpoints, judge output, ASR runners. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. Below the form, the **Track record** region (`/servers/track-record`, below). DB aggregates are cached 30 s, the decide/scan `fn_calls` aggregate 60 s, queue stats 15 s and stale counts 5 min, all served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
+| `GET /servers/track-record` | **Track record** fragment of the Models page (§2.14), a region of the static shell below the runner-update form, polled every 60 s (6 s htmx timeout; the read runs under a 5 s request deadline, which is the bound on the whole read, and each of its two statements under a 4 s `statement_timeout`). One row per model alias: judge passes (Passes, Complete, Partial / failed, Legacy) and decisions (Apply, Hold, Reject, Duplicate, Undone), plus Last active. A failed or slow read renders `200` "track record unavailable" — never the connection-lost banner, and the rest of the page is unaffected. A transport failure the handler cannot answer (a proxy `502`, a reset, the 6 s htmx timeout) reveals the same "unavailable" line in the region's initial placeholder instead of leaving "loading track record…" up; a table already rendered stays until the next successful poll. Stateless: no snapshot cache. |
 | `GET /findings` · `/findings/data` | Findings page + fragment (§2.15). |
 | `GET /book` · `/book/data` | Per-book detail page + fragment. |
 | `GET /track?id=…[&t=<startSec>]` | Per-track detail page. The optional **`t`** (seconds) is the finding "Where" deep-jump: the reader preloads pages `[0 .. the page containing the segment spanning t]`, marks that segment active, and scrolls to it. |
@@ -3241,7 +3242,7 @@ bottom:
    split into *Decided · human* (`mcp:`, `cli:`, other, unattributed) and
    *Decided · decide step* (`jev:<recipe_id>`, plus `revert:jev:<recipe_id>` undos),
    superseded / other (superseded, `duplicate`, and the patch state `stale`), total.
-6. **ASR runners** — last, so the static update form in the shell follows it
+6. **ASR runners** — last in the polled fragment, so the static update form in the shell follows it
    directly. The runner cards (state table above, §2.4, each state paired
    with a glyph; unconfigured history-only hosts only within 30 days), one
    read-only runner version line (running / requested / state, §2.12
@@ -3254,6 +3255,43 @@ bottom:
    grouped by (model, runner version, `.nemo` sha256), newest first, at most 8
    groups; transcripts from a runner that reported no provenance form one
    *not reported* group.
+7. **Track record** — its own region in the static shell, below the
+   runner-update form (a 5 s poll of the region above never replaces it), at
+   `GET /servers/track-record`, polled every 60 s. One row per model alias
+   (`recipes.model_alias`; recipes and passes without one are a single
+   "(no model alias)" row, last), alphabetical. Two aggregates read in one
+   read-only, repeatable-read transaction with JIT off and a 4 s
+   `statement_timeout` on each statement (`db.ModelTrackRecord`), no table of
+   their own:
+   - **Judge passes** — `judge_passes` grouped by the propose recipe's alias
+     and status: *Passes* (all, including any still running), *Complete*,
+     *Partial / failed* (title: the split) and *Legacy* (backfilled by
+     migration 13).
+   - **Decisions** — `finding_events` decisions grouped by the decide recipe's
+     alias: each finding counts **once per alias**, at the newest decision a
+     recipe of that alias made that has **not been revoked** — the same "latest
+     unrevoked decision" `decide_scorecard` and `earmark_decisions` use, grouped
+     by alias instead of recipe, so a retried hold is one finding, not several,
+     and leaving out findings a requeue superseded (archived in place; the same
+     audio is re-judged under new ids), as `earmark_decisions` does — as *Apply*, *Hold*, *Reject* or *Duplicate* (the outcome of migration 15:
+     the finding agrees with another's fix). *Undone* counts the alias's
+     decisions that a `revoke` event has since withdrawn (events, not findings,
+     and not in the counts beside it).
+   A side the alias never worked on reads "—", not 0. *Last active* is the
+   newest pass started or live decision. The table says what each model did,
+   not whether it was right — precision against labels is
+   `earmark models report` (§2.15 "Labels and scorecards").
+   The read scans every decision event and joins its finding (a hash
+   aggregate and one sort, ≈0.7 s at ≈100k events on production, linear in the
+   log), which is why the region polls at 60 s instead of riding the 5 s
+   fragment. Its bound is the handler's 5 s request deadline — the two
+   statements each carry a 4 s `statement_timeout`, so the server alone could
+   spend about 8 s — and a log that has outgrown it shows "track record
+   unavailable" for this section only. The same line appears when the request
+   itself fails in transit (a proxy `502`, a reset, the region's 6 s htmx
+   timeout) before the first table has rendered; a poll that fails after one
+   has rendered leaves that table up until the next success. An integration test fails when a migration adds a decision outcome or
+   a judge pass status the table does not count.
 
 Each table's description is a paragraph above its scroll container (not a
 `<caption>`, which would scroll out of view on a phone) and labels the table

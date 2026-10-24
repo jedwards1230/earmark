@@ -190,6 +190,10 @@ func (m *MockDBInterface) AuditRows(_ context.Context, source string, _ db.Audit
 	return db.AuditPage{Source: source, Rows: json.RawMessage("[]")}, nil
 }
 
+func (m *MockDBInterface) ModelTrackRecord(context.Context) ([]db.ModelTrack, error) {
+	return nil, nil
+}
+
 func (m *MockDBInterface) StepRuns(context.Context, int, int) (db.StepRunList, error) {
 	return db.StepRunList{}, nil
 }

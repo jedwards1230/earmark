@@ -352,6 +352,8 @@
   caption { caption-side: top; text-align: left; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); padding: 10px 14px 0; }
   th { text-align: left; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-2); padding: 10px 14px; border-bottom: 1px solid var(--border); }
   td { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  /* a column-group header spanning several numeric columns (Models → Track record) */
+  th.group { text-align: center; }
   /* no stray rule under the last row — row headers (th) included; a tfoot
      gets its own top rule instead */
   tbody tr:last-child > *, tfoot tr:last-child > * { border-bottom: none; }
