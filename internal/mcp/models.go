@@ -218,6 +218,10 @@ type roleCard struct {
 	// CountsKnown is false when no snapshot has ever loaded: answered/last
 	// ok/stale render "—" instead of a misleading "never".
 	CountsKnown bool
+	// CountsFailed (decide/scan) says this role's OWN evidence query — the
+	// fn_calls aggregate — failed or timed out while the rest of the snapshot
+	// loaded. CountsKnown is then false too; the API reports it as countsError.
+	CountsFailed bool
 	// StatsKnown is false when the queue stats read failed (coverage/backlog
 	// render "—"). LastKnown says whether LastOK/LastFail come from a source
 	// that loaded (the snapshot for ASR/Judge, queue stats for Embeddings).
@@ -768,7 +772,8 @@ func buildFnCard(c *roleCard, in roleInputs) {
 		}
 	}
 	if in.Snap != nil && in.Snap.FnRolesErr != nil {
-		c.CountsKnown, c.LastKnown = false, false // only this query failed: unknown, not "never"
+		// Only this query failed: unknown, not "never".
+		c.CountsKnown, c.LastKnown, c.CountsFailed = false, false, true
 	}
 	if in.Snap != nil {
 		if cur := in.Snap.currentRecipe(c.Step); cur != nil {
@@ -817,6 +822,8 @@ func fnRoleHealth(c roleCard, probe, host string, now time.Time) roleHealth {
 	case c.CountsKnown && c.AnsweredMatch == matchMismatch:
 		return health(roleDegraded, fmt.Sprintf("answered by %s, expected %s — the reply is stored but never served (fallback route?)",
 			c.Answered, c.CompareTarget()))
+	case c.CountsFailed:
+		return health(roleUnknown, "call outcomes unavailable — fn_calls aggregate failed or timed out (see server logs)")
 	case !c.CountsKnown:
 		return health(roleUnknown, "call outcomes unavailable — counts query failed")
 	case !c.FnKnown:

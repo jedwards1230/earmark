@@ -2465,7 +2465,7 @@ ready` and `roles[judge].state = failing`.
   "failingNow": 0,              // judge only (null otherwise / when counts unavailable); transcripts whose LATEST attempt failed
   "stale": 32337,               // stale_work rows for the step; null = not tracked / unavailable / still counting
   "countsAsOf": "2026-10-06T00:13:30Z", // the 30 s aggregate snapshot; null = never loaded
-  "countsError": false,         // the latest aggregate refresh failed (last good still served)
+  "countsError": false,         // the latest aggregate refresh failed (last good still served); decide/scan: also true when that role's own fn_calls aggregate failed or timed out (state unknown)
   "staleAsOf": "2026-10-06T00:10:02Z",  // the separate 5 min stale-count snapshot; null = not loaded yet
   "modelSource": "db",          // §2.20: db | env | unset | unknown (settings unreadable); omitted for asr, format
   "settingUpdatedBy": "cli:justin",            // the model_settings row's updated_by; omitted without a row
@@ -2499,6 +2499,16 @@ A failed refresh keeps the last good snapshot (`countsError: true`); with none,
 those fields are `null` and the judge's `state` is `unknown` — the response
 itself never fails on it, and a slow or failed stale count never affects the
 other fields.
+
+The decide and scan evidence is one more query in that snapshot, an aggregate
+over the `fn_calls` log (`db.FnRoleActivity`), and it is best-effort: when it
+alone fails — an error, or the snapshot's 3 s budget — the snapshot still
+loads, the other roles are untouched (`countsError: false`), and only
+`roles[decide]` and `roles[scan]` read `state: unknown` with `countsError:
+true` and the reason `call outcomes unavailable — fn_calls aggregate failed or
+timed out (see server logs)`; their `lastOkAt`/`lastFailedAt`/`lastError` are
+`null` (unknown, not "never"). `countsError` on a role is therefore true when
+the snapshot refresh failed **or that role's own evidence query did**.
 
 **`gateways[]` array** — one entry per distinct LiteLLM gateway (and virtual
 key) the AI registry routes through (§2.14 "LiteLLM gateway"); empty when none.

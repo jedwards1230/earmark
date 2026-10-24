@@ -1057,7 +1057,8 @@ func TestDecideTally(t *testing.T) {
 }
 
 // TestFnRolesErrIsBestEffort: a failed fn_calls aggregate marks only the
-// Decide and Scan cards unknown; the judge still reads its evidence.
+// Decide and Scan cards unknown — naming the failed query — while the judge
+// still reads its evidence.
 func TestFnRolesErrIsBestEffort(t *testing.T) {
 	ok := ago(time.Hour)
 	cards := buildRoleCards(roleInputs{
@@ -1079,6 +1080,52 @@ func TestFnRolesErrIsBestEffort(t *testing.T) {
 	for _, c := range cards[3:5] {
 		assert.Equal(t, roleUnknown, c.Health.Token, c.Key)
 		assert.Contains(t, c.Health.Sub, "call outcomes unavailable", c.Key)
+		assert.Contains(t, c.Health.Sub, "fn_calls aggregate failed or timed out", c.Key)
+		assert.True(t, c.CountsFailed, c.Key)
+	}
+	for _, c := range cards[:3] {
+		assert.False(t, c.CountsFailed, c.Key)
+	}
+}
+
+// failingFnRolesDB answers every Models-page query but the decide/scan
+// fn_calls aggregate, which times out — the failure seen in production when
+// the aggregate outran the snapshot's budget.
+type failingFnRolesDB struct{ SimpleMockDB }
+
+func (*failingFnRolesDB) FnRoleActivity(context.Context) ([]db.FnRoleActivity, error) {
+	return nil, errors.New("fn role activity: timeout: context deadline exceeded")
+}
+
+// TestAPIStatusFnRolesErr: when only the fn_calls aggregate fails, GET
+// /api/v1/status says so per role — decide and scan are `unknown` with
+// countsError true and a reason naming the query, and every other role keeps
+// countsError false — instead of `unknown` with countsError false.
+func TestAPIStatusFnRolesErr(t *testing.T) {
+	cfg := &config.Config{
+		AIEndpoints: []config.AIEndpoint{{ID: "jev", Type: config.AIEndpointTypeSystemOne, Model: "jev-1.13.0"}},
+		AIRoles:     &config.AIRoles{Decide: "jev", Scan: "jev"},
+	}
+	srv := NewMCPServer(&failingFnRolesDB{}, cfg)
+	srv.endpointProber = demoEndpointProber{} // every endpoint ready: the only trouble is the query
+	w := httptest.NewRecorder()
+	srv.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	var got apiStatus
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	require.Len(t, got.Roles, 6)
+	for _, r := range got.Roles {
+		failed := r.Role == "decide" || r.Role == "scan"
+		assert.Equal(t, failed, r.CountsError, "role %s countsError", r.Role)
+		if failed {
+			assert.Equal(t, roleUnknown, r.State, r.Role)
+			assert.Equal(t, "call outcomes unavailable — fn_calls aggregate failed or timed out (see server logs)", r.Reason, r.Role)
+			assert.Nil(t, r.LastOKAt, "%s: unknown, not a last-ok time", r.Role)
+			assert.Nil(t, r.LastError, r.Role)
+		} else {
+			assert.NotContains(t, r.Reason, "fn_calls", r.Role)
+		}
+		require.NotNil(t, r.CountsAsOf, "role %s: the snapshot itself loaded", r.Role)
 	}
 }
 

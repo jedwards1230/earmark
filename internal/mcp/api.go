@@ -121,7 +121,9 @@ type apiEndpoint struct {
 // unknown. countsAsOf dates the 30 s aggregate snapshot (answered, judge
 // lastOkAt/lastFailedAt/lastError/failingNow, ASR lastOkAt); staleAsOf dates
 // the separate 5 min stale-count snapshot. Embeddings' lastOkAt comes from the
-// live queue stats, not a snapshot.
+// live queue stats, not a snapshot. countsError is true when the snapshot
+// refresh failed or, for decide/scan, when that role's own fn_calls aggregate
+// did (state is then "unknown"); the other roles' flag is unaffected by it.
 type apiRole struct {
 	Role            string  `json:"role"`
 	Step            string  `json:"step"`
@@ -229,7 +231,7 @@ func apiRolesFrom(cards []roleCard, ev modelsEvidence) []apiRole {
 			Requested: c.Requested, Expected: c.Expected,
 			Answered: c.Answered, AnsweredMatch: c.AnsweredMatch, ModelAllowed: c.ModelAllowed,
 			LastOKAt: rfc3339Ptr(c.LastOK), LastFailedAt: rfc3339Ptr(c.LastFail),
-			Stale: c.Stale, CountsAsOf: asOf, CountsError: ev.SnapErr != nil, StaleAsOf: staleAsOf,
+			Stale: c.Stale, CountsAsOf: asOf, CountsError: ev.SnapErr != nil || c.CountsFailed, StaleAsOf: staleAsOf,
 		}
 		r.ModelSource, r.SettingUpdatedBy, r.SettingUpdatedAt = c.ModelSource, c.SettingBy, rfc3339Ptr(c.SettingAt)
 		r.DecidePolicy, r.DecidePolicySource = c.DecidePolicy, c.DecidePolicySource

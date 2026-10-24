@@ -251,8 +251,18 @@ type FnRoleActivity struct {
 // aggregate over their calls. fn_calls has no index on fn alone, so this is a
 // scan of the call log — bounded output (≤ 2 rows), run on the page's 30 s
 // snapshot timer. $1 is ErrorClassModelFallback.
+//
+// cur is MATERIALIZED on purpose. Left to inline it, the planner joins fn_calls
+// to ALL of recipes first and filters against current_recipes afterwards: a
+// decide model's recipes differ only in build/params yet share (fn,
+// model_alias, prompt_sha256) with the current one, so each call matched every
+// one of them — 150k calls became 436k joined rows, an Incremental Sort of
+// those spilled ~250 MB, and the query ran past the snapshot's 3 s budget
+// (Decide/Scan then read "unknown" on every refresh). Materialized, cur is the
+// two current recipes and the join sees only their calls (~67k rows, one 10 MB
+// sort, under a second).
 const fnRoleActivitySQL = `
-	WITH cur AS (
+	WITH cur AS MATERIALIZED (
 	  SELECT cr.step, r.recipe_id, coalesce(r.model_alias, '') AS model_alias,
 	         coalesce(r.prompt_sha256, '') AS prompt_sha256, coalesce(r.params->>'fn', '') AS fn,
 	         CASE WHEN cr.step = 'scan'

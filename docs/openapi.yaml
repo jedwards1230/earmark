@@ -877,7 +877,8 @@ components:
             - string
             - "null"
         countsError:
-          description: True when the most recent aggregate-snapshot refresh failed; the last good snapshot (if any, see `countsAsOf`) is still served.
+          description: |
+            True when the most recent aggregate-snapshot refresh failed (the last good snapshot, if any — see `countsAsOf` — is still served), or, on `decide` and `scan`, when that role's own `fn_calls` aggregate failed or timed out: its `state` is then `unknown` and its `lastOkAt`/`lastFailedAt`/`lastError` are null. A failure of the decide/scan evidence query leaves every other role at `false`.
           type: boolean
         decidePolicy:
           description: 'Decide only: the effective decide policy in one line (e.g. `apply p ≥ 0.85 with asin_verbatim · reject p ≤ 0.20 if the replacement is lowercase or p < 0.10`). Omitted for other roles and when the policy is invalid (see `settingError`). CONTRACT §2.19 "Decide policy".'

@@ -282,6 +282,129 @@ func TestIntegrationFnRoleActivity(t *testing.T) {
 	}
 }
 
+// planNodes flattens an EXPLAIN (FORMAT JSON) plan tree.
+func planNodes(plan map[string]any) []map[string]any {
+	nodes := []map[string]any{plan}
+	kids, _ := plan["Plans"].([]any)
+	for _, k := range kids {
+		if m, ok := k.(map[string]any); ok {
+			nodes = append(nodes, planNodes(m)...)
+		}
+	}
+	return nodes
+}
+
+// TestIntegrationFnRoleActivityJoinsOnlyCurrentCalls: a decide model's recipes
+// differ only in build/params, so several of them share (fn, model_alias,
+// prompt_sha256) with the current recipe. The evidence query must join the
+// call log to the two CURRENT recipes only: with `cur` inlined the planner
+// joined fn_calls to every recipe first — each call matched each sibling, 150k
+// production calls became 436k joined rows and a ~250 MB sort, and the query
+// outran the models snapshot's 3 s budget on every refresh (Decide/Scan
+// "unknown"). The counts are checked against what was seeded, then the plan:
+// no node may emit more rows than the call log holds, which only a join
+// multiplied by the sibling recipes can.
+func TestIntegrationFnRoleActivityJoinsOnlyCurrentCalls(t *testing.T) {
+	ctx := context.Background()
+	d := integrationDB(t, newTestDatabase(t))
+	mk := func(step, fn, prompt string, applyP float64) recipe.Recipe {
+		return recipe.Recipe{Step: step, StepVersion: 1, CodeVersion: "test", ModelAlias: "jev-1.13.0",
+			ModelResolved: "jev-1.13.0", PromptVersion: fn + "@v1", PromptSHA256: prompt,
+			Params: map[string]any{"fn": fn, "apply_p": applyP}}
+	}
+	dec, scn := mk(recipe.StepDecide, "should_apply", "5e1ec7", 0.85), mk(recipe.StepScan, "scan_chunk", "5ca115", 0)
+	if err := d.SetCurrentRecipes(ctx, dec, scn); err != nil {
+		t.Fatal(err)
+	}
+	decID, _ := dec.ID()
+	// Siblings: the same request identity, other params — registered recipes
+	// of the same decide model, the way earlier policies and builds are.
+	const siblings = 5
+	for i := 0; i < siblings; i++ {
+		if _, err := d.RegisterRecipe(ctx, mk(recipe.StepDecide, "should_apply", "5e1ec7", 0.80+float64(i)/100)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// fn_calls: 30,000 calls under the current decide request, in ten equal
+	// classes by g%10 — 0-5 ok (6), 6-7 cache hits (2), 8 fallbacks, 9 failures —
+	// plus 7 failures three days old (outside the 24 h window), 10,000 calls of
+	// another prompt and 5,000 scan calls.
+	const (
+		decideCalls = 30_000
+		otherCalls  = 10_000
+		scanCalls   = 5_000
+	)
+	seed := []string{
+		`INSERT INTO fn_calls (fn, prompt_version, prompt_sha256, model_alias, model_resolved, input_sha256, input, error_class, cache_hit, created_at)
+		 SELECT 'should_apply', 'should_apply@v1', '5e1ec7', 'jev-1.13.0',
+		        CASE g % 10 WHEN 8 THEN 'jev-1.12.0' WHEN 9 THEN NULL ELSE 'typesafe/jev-1.13.0' END,
+		        lpad(to_hex(g), 64, '0'), '{}',
+		        CASE g % 10 WHEN 8 THEN 'model_fallback' WHEN 9 THEN '503' END,
+		        g % 10 IN (6, 7), now() - g * interval '1 second'
+		   FROM generate_series(1, ` + fmt.Sprint(decideCalls) + `) g`,
+		`INSERT INTO fn_calls (fn, prompt_version, prompt_sha256, model_alias, model_resolved, input_sha256, input, error_class, created_at)
+		 SELECT 'should_apply', 'should_apply@v1', '5e1ec7', 'jev-1.13.0', NULL,
+		        lpad(to_hex(g + 100000), 64, '0'), '{}', 'timeout', now() - interval '3 days' - g * interval '1 second'
+		   FROM generate_series(1, 7) g`,
+		`INSERT INTO fn_calls (fn, prompt_version, prompt_sha256, model_alias, model_resolved, input_sha256, input, created_at)
+		 SELECT 'should_apply', 'should_apply@v1', '0dd', 'jev-1.13.0', 'typesafe/jev-1.13.0',
+		        lpad(to_hex(g + 200000), 64, '0'), '{}', now() - g * interval '1 second'
+		   FROM generate_series(1, ` + fmt.Sprint(otherCalls) + `) g`,
+		`INSERT INTO fn_calls (fn, prompt_version, prompt_sha256, model_alias, model_resolved, input_sha256, input, created_at)
+		 SELECT 'scan_chunk', 'scan_chunk@v1', '5ca115', 'jev-1.13.0', 'typesafe/jev-1.13.0',
+		        lpad(to_hex(g + 300000), 64, '0'), '{}', now() - g * interval '1 second'
+		   FROM generate_series(1, ` + fmt.Sprint(scanCalls) + `) g`,
+		`ANALYZE fn_calls`, `ANALYZE recipes`, `ANALYZE current_recipes`,
+	}
+	for _, q := range seed {
+		if _, err := d.pool.Exec(ctx, q); err != nil {
+			t.Fatalf("seed: %v\n%s", err, q)
+		}
+	}
+	const total = decideCalls + 7 + otherCalls + scanCalls
+
+	got, err := d.FnRoleActivity(ctx)
+	if err != nil {
+		t.Fatalf("FnRoleActivity: %v", err)
+	}
+	if len(got) != 2 || got[0].Step != recipe.StepDecide || got[1].Step != recipe.StepScan {
+		t.Fatalf("FnRoleActivity = %+v, want decide then scan", got)
+	}
+	a := got[0]
+	// Calls = every non-cache-hit row of the request: 6+1+1 tenths and the 7 old ones.
+	if want := decideCalls/10*8 + 7; a.Calls != want || a.CacheHits != decideCalls/10*2 ||
+		a.Fallbacks != decideCalls/10 || a.Failures24h != decideCalls/10 {
+		t.Errorf("decide calls/hits/fallbacks/fail24h = %d/%d/%d/%d, want %d/%d/%d/%d (a sibling recipe must not multiply them)",
+			a.Calls, a.CacheHits, a.Fallbacks, a.Failures24h, decideCalls/10*8+7, decideCalls/10*2, decideCalls/10, decideCalls/10)
+	}
+	if a.RecipeID != decID || a.LastOK == nil || a.LastFail == nil || a.LastErrorClass != "503" || a.LastModel != "typesafe/jev-1.13.0" {
+		t.Errorf("decide identity/last = %q ok %v fail %v class %q model %q", a.RecipeID, a.LastOK, a.LastFail, a.LastErrorClass, a.LastModel)
+	}
+	if s := got[1]; s.Calls != scanCalls || s.CacheHits != 0 || s.Failures24h != 0 || s.LastFail != nil {
+		t.Errorf("scan = %+v, want %d calls and no failures", s, scanCalls)
+	}
+
+	var planJSON []byte
+	if err := d.pool.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+fnRoleActivitySQL, ErrorClassModelFallback).Scan(&planJSON); err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	var plans []struct {
+		Plan map[string]any `json:"Plan"`
+	}
+	if err := json.Unmarshal(planJSON, &plans); err != nil || len(plans) != 1 {
+		t.Fatalf("explain output: %v\n%s", err, planJSON)
+	}
+	for _, n := range planNodes(plans[0].Plan) {
+		rows, _ := n["Actual Rows"].(float64)
+		loops, _ := n["Actual Loops"].(float64)
+		if emitted := rows * loops; emitted > total {
+			t.Errorf("plan node %v (%v) emitted %.0f rows, more than the %d rows of fn_calls: the call log was joined to the sibling recipes\n%s",
+				n["Node Type"], n["Relation Name"], emitted, total, planJSON)
+		}
+	}
+}
+
 func TestIntegrationASRProvenanceGroups(t *testing.T) {
 	ctx := context.Background()
 	d := integrationDB(t, newTestDatabase(t))
