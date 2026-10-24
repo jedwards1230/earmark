@@ -111,6 +111,13 @@ jev-1.13.0"); a run whose heartbeat stopped for over 2 minutes (a killed exec) s
 Agents read the same via `GET /api/v1/runs`. Recording never fails the step. See
 CONTRACT §1.10.
 
+The Models page ends with a **Track record**: per model alias, the judge passes it ran
+(all, complete, partial/failed, legacy) and what it decided (apply, hold, reject,
+duplicate — each finding once, at its latest decision that has not been undone — and
+how many decisions were undone), read from `judge_passes` and `finding_events` and
+refreshed every minute. It says what each model did; precision against labels is
+`earmark models report`. See CONTRACT §2.14 "Models page".
+
 ## Using it from an MCP client
 
 Point your client at the server over stdio:

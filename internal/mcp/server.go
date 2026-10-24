@@ -441,6 +441,7 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	GET  /failed/data          — failed-jobs fragment (no standalone page; rendered inside /pipeline)
 //	GET  /servers              — Models page (shell)
 //	GET  /servers/data         — Models fragment (role board + recipes + runners + endpoints)
+//	GET  /servers/track-record — Models "Track record" fragment (judge passes + decisions per model alias)
 //	GET  /static/htmx.min.js   — vendored htmx library
 //	POST /actions/requeue      — re-transcribe one job (htmx-guarded)
 //	POST /actions/retry-failed — re-transcribe all failed jobs (htmx-guarded)
@@ -494,6 +495,7 @@ func (s *MCPServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/servers", getOnly(s.handleServersPage))
 	mux.HandleFunc("/servers/data", getOnly(s.handleServersData))
 	mux.HandleFunc("/runs/data", getOnly(s.handleRunsData))
+	mux.HandleFunc("/servers/track-record", getOnly(s.handleTrackRecordData))
 	mux.HandleFunc("/findings", getOnly(s.handleFindingsPage))
 	mux.HandleFunc("/findings/data", getOnly(s.handleFindingsData))
 
