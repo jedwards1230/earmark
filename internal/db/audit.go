@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
@@ -238,6 +239,25 @@ func (s AuditSource) CheckFilter(name, value string) error {
 		strings.Join(s.FilterNames(), ", "))
 }
 
+// AuditCursor says where an audit read starts and which way it runs: ascending
+// from the rows with id > ID, or, with Desc, newest first from the rows with
+// id < ID. The zero value is the first page of an ascending read.
+type AuditCursor struct {
+	ID   int64
+	Desc bool
+}
+
+// AuditAfter is the ascending cursor: rows with id > id, oldest first.
+func AuditAfter(id int64) AuditCursor { return AuditCursor{ID: id} }
+
+// AuditBefore is the descending cursor: rows with id < id, newest first.
+func AuditBefore(id int64) AuditCursor { return AuditCursor{ID: id, Desc: true} }
+
+// AuditNewest starts a descending read at the newest row. It is AuditBefore
+// of the largest id, so the statement keeps its one `id < $1` bind predicate
+// (a plain primary-key range scan); a row with id MaxInt64 cannot exist.
+func AuditNewest() AuditCursor { return AuditBefore(math.MaxInt64) }
+
 // selectExpr renders the column for the inner SELECT.
 func (c AuditColumn) selectExpr() string {
 	if c.Clip > 0 {
@@ -246,18 +266,22 @@ func (c AuditColumn) selectExpr() string {
 	return c.Name
 }
 
-// buildQuery renders the statement and its bind arguments for one request:
+// buildQuery renders the statement and its bind arguments for one request,
+// ascending:
 //
 //	SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.id), '[]'::json), max(t.id)
 //	  FROM (SELECT <columns> FROM <table> WHERE id > $1 [AND <column> = $n …]
 //	         ORDER BY id LIMIT $k) t
 //
-// Identifiers come from the registry alone; after, every filter value and the
-// limit are bind parameters (a UUID filter is cast server-side from text).
+// and for a descending cursor with `id < $1`, `ORDER BY id DESC` (in the
+// subquery and in the aggregate) and min(t.id): the page's last row either way.
+//
+// Identifiers come from the registry alone; the cursor, every filter value and
+// the limit are bind parameters (a UUID filter is cast server-side from text).
 // Filter clauses follow registry order, so the SQL is deterministic.
-func (s AuditSource) buildQuery(after int64, limit int, filters map[string]string) (string, []any, error) {
-	if after < 0 {
-		return "", nil, fmt.Errorf("audit after %d: must be >= 0", after)
+func (s AuditSource) buildQuery(cur AuditCursor, limit int, filters map[string]string) (string, []any, error) {
+	if cur.ID < 0 {
+		return "", nil, fmt.Errorf("audit cursor %d: must be >= 0", cur.ID)
 	}
 	if limit < 1 || limit > AuditMaxLimit {
 		return "", nil, fmt.Errorf("audit limit %d: must be 1..%d", limit, AuditMaxLimit)
@@ -273,9 +297,13 @@ func (s AuditSource) buildQuery(after int64, limit int, filters map[string]strin
 		}
 	}
 
-	args := []any{after}
+	cmp, dir, last := ">", "", "max"
+	if cur.Desc {
+		cmp, dir, last = "<", " DESC", "min"
+	}
+	args := []any{cur.ID}
 	var b strings.Builder
-	b.WriteString("SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.id), '[]'::json), max(t.id) FROM (SELECT ")
+	b.WriteString("SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.id" + dir + "), '[]'::json), " + last + "(t.id) FROM (SELECT ")
 	for i, c := range s.Columns {
 		if i > 0 {
 			b.WriteString(", ")
@@ -284,7 +312,7 @@ func (s AuditSource) buildQuery(after int64, limit int, filters map[string]strin
 	}
 	b.WriteString(" FROM ")
 	b.WriteString(s.Table)
-	b.WriteString(" WHERE id > $1")
+	b.WriteString(" WHERE id " + cmp + " $1")
 	for _, f := range s.Filters {
 		v, ok := filters[f.Name]
 		if !ok {
@@ -297,13 +325,14 @@ func (s AuditSource) buildQuery(after int64, limit int, filters map[string]strin
 		}
 	}
 	args = append(args, limit)
-	b.WriteString(" ORDER BY id LIMIT $" + strconv.Itoa(len(args)) + ") t")
+	b.WriteString(" ORDER BY id" + dir + " LIMIT $" + strconv.Itoa(len(args)) + ") t")
 	return b.String(), args, nil
 }
 
 // AuditPage is one page of an audit source, in the shape of the API response.
-// Rows is a JSON array of objects, one per row, exactly as stored; Next is the
-// last row's id (nil when the page is empty).
+// Rows is a JSON array of objects, one per row, exactly as stored, in the
+// order read; Next is the last row's id — the highest of an ascending page,
+// the lowest of a descending one — and nil when the page is empty.
 type AuditPage struct {
 	Source string          `json:"source"`
 	Rows   json.RawMessage `json:"rows"`
@@ -318,23 +347,24 @@ type AuditPage struct {
 const auditSessionSQL = `SELECT set_config('jit', 'off', true), set_config('TimeZone', 'UTC', true), ` +
 	`set_config('statement_timeout', $1, true)`
 
-// AuditRows returns up to limit rows of the named source with id > after,
-// ordered by id, narrowed by the equality filters (CONTRACT §2.12.2). It
-// validates everything the HTTP layer does, so a caller cannot reach the SQL
-// builder with an unlisted source, filter or out-of-range limit.
-func (db *DB) AuditRows(ctx context.Context, source string, after int64, limit int, filters map[string]string) (AuditPage, error) {
+// AuditRows returns up to limit rows of the named source from cur — ascending
+// after an id, or newest first before one — narrowed by the equality filters
+// (CONTRACT §2.12.2). It validates everything the HTTP layer does, so a caller
+// cannot reach the SQL builder with an unlisted source, filter or
+// out-of-range limit.
+func (db *DB) AuditRows(ctx context.Context, source string, cur AuditCursor, limit int, filters map[string]string) (AuditPage, error) {
 	s, err := LookupAuditSource(source)
 	if err != nil {
 		return AuditPage{}, err
 	}
-	return readAudit(ctx, db.pool, s, after, limit, filters)
+	return readAudit(ctx, db.pool, s, cur, limit, filters)
 }
 
 // readAudit runs one audit read in a read-only transaction with JIT off and the
 // statement timeout set.
-func readAudit(ctx context.Context, b txOptionsBeginner, s AuditSource, after int64, limit int,
+func readAudit(ctx context.Context, b txOptionsBeginner, s AuditSource, cur AuditCursor, limit int,
 	filters map[string]string) (AuditPage, error) {
-	query, args, err := s.buildQuery(after, limit, filters)
+	query, args, err := s.buildQuery(cur, limit, filters)
 	if err != nil {
 		return AuditPage{}, err
 	}

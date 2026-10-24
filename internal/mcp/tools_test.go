@@ -186,7 +186,7 @@ func (m *MockDBInterface) FnRoleActivity(context.Context) ([]db.FnRoleActivity, 
 	return nil, nil
 }
 
-func (m *MockDBInterface) AuditRows(_ context.Context, source string, _ int64, _ int, _ map[string]string) (db.AuditPage, error) {
+func (m *MockDBInterface) AuditRows(_ context.Context, source string, _ db.AuditCursor, _ int, _ map[string]string) (db.AuditPage, error) {
 	return db.AuditPage{Source: source, Rows: json.RawMessage("[]")}, nil
 }
 

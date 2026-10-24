@@ -23,15 +23,16 @@ import (
 // auditCall is one AuditRows call as the handler made it.
 type auditCall struct {
 	source  string
-	after   int64
+	cur     db.AuditCursor
 	limit   int
 	filters map[string]string
 }
 
 // auditFakeDB records the calls the handler makes and answers from page. With
-// total > 0 it behaves like a table of ids 1..total: rows with id > after,
-// ascending, at most limit of them. With gate set, a call blocks until the gate
-// closes or its context ends, announcing itself on entered first.
+// total > 0 it behaves like a table of ids 1..total: the rows after (ascending)
+// or before (descending) the cursor, at most limit of them, next = the last
+// row's id. With gate set, a call blocks until the gate closes or its context
+// ends, announcing itself on entered first.
 type auditFakeDB struct {
 	SimpleMockDB
 	mu    sync.Mutex
@@ -46,13 +47,13 @@ type auditFakeDB struct {
 	entered  chan struct{}
 }
 
-func (f *auditFakeDB) AuditRows(ctx context.Context, source string, after int64, limit int, filters map[string]string) (db.AuditPage, error) {
+func (f *auditFakeDB) AuditRows(ctx context.Context, source string, cur db.AuditCursor, limit int, filters map[string]string) (db.AuditPage, error) {
 	var left time.Duration
 	if dl, ok := ctx.Deadline(); ok {
 		left = time.Until(dl)
 	}
 	f.mu.Lock()
-	f.calls = append(f.calls, auditCall{source, after, limit, filters})
+	f.calls = append(f.calls, auditCall{source, cur, limit, filters})
 	f.timeLeft = append(f.timeLeft, left)
 	f.mu.Unlock()
 	if f.gate != nil {
@@ -72,9 +73,16 @@ func (f *auditFakeDB) AuditRows(ctx context.Context, source string, after int64,
 	if f.total > 0 {
 		var rows []string
 		var last int64
-		for id := after + 1; id <= f.total && len(rows) < limit; id++ {
-			rows = append(rows, fmt.Sprintf(`{"id":%d}`, id))
-			last = id
+		if cur.Desc {
+			for id := min(cur.ID-1, f.total); id >= 1 && len(rows) < limit; id-- {
+				rows = append(rows, fmt.Sprintf(`{"id":%d}`, id))
+				last = id
+			}
+		} else {
+			for id := cur.ID + 1; id <= f.total && len(rows) < limit; id++ {
+				rows = append(rows, fmt.Sprintf(`{"id":%d}`, id))
+				last = id
+			}
 		}
 		p := db.AuditPage{Source: source, Rows: json.RawMessage("[" + strings.Join(rows, ",") + "]")}
 		if last > 0 {
@@ -136,7 +144,7 @@ func TestAPIAuditOK(t *testing.T) {
 				t.Errorf("response = %+v", got)
 			}
 			// Defaults reach the database layer; no filters.
-			if len(f.calls) != 1 || f.calls[0].source != src.Name || f.calls[0].after != 0 ||
+			if len(f.calls) != 1 || f.calls[0].source != src.Name || f.calls[0].cur != db.AuditAfter(0) ||
 				f.calls[0].limit != db.AuditDefaultLimit || len(f.calls[0].filters) != 0 {
 				t.Errorf("calls = %+v", f.calls)
 			}
@@ -162,23 +170,46 @@ func TestAPIAuditParamsReachTheDB(t *testing.T) {
 		want   auditCall
 	}{
 		{"after and limit", "/api/v1/audit/fn_calls?after=117999&limit=7",
-			auditCall{"fn_calls", 117999, 7, nil}},
+			auditCall{"fn_calls", db.AuditAfter(117999), 7, nil}},
 		{"limit at the cap", "/api/v1/audit/fn_calls?limit=500",
-			auditCall{"fn_calls", 0, 500, nil}},
+			auditCall{"fn_calls", db.AuditAfter(0), 500, nil}},
 		{"limit of one", "/api/v1/audit/fn_calls?limit=1",
-			auditCall{"fn_calls", 0, 1, nil}},
+			auditCall{"fn_calls", db.AuditAfter(0), 1, nil}},
 		{"largest cursor", "/api/v1/audit/fn_calls?after=9223372036854775807",
-			auditCall{"fn_calls", 9223372036854775807, 100, nil}},
+			auditCall{"fn_calls", db.AuditAfter(9223372036854775807), 100, nil}},
 		{"explicit zero cursor", "/api/v1/audit/fn_calls?after=0",
-			auditCall{"fn_calls", 0, 100, nil}},
+			auditCall{"fn_calls", db.AuditAfter(0), 100, nil}},
 		{"one filter", "/api/v1/audit/step_runs?status=running",
-			auditCall{"step_runs", 0, 100, map[string]string{"status": "running"}}},
+			auditCall{"step_runs", db.AuditAfter(0), 100, map[string]string{"status": "running"}}},
 		{"uuid filter", "/api/v1/audit/finding_events?finding_id=" + id,
-			auditCall{"finding_events", 0, 100, map[string]string{"finding_id": id}}},
+			auditCall{"finding_events", db.AuditAfter(0), 100, map[string]string{"finding_id": id}}},
 		{"every filter at once", "/api/v1/audit/finding_events?kind=decision&recipe_id=ab&transcript_id=" + id + "&finding_id=" + id + "&after=5&limit=3",
-			auditCall{"finding_events", 5, 3, map[string]string{"kind": "decision", "recipe_id": "ab", "transcript_id": id, "finding_id": id}}},
+			auditCall{"finding_events", db.AuditAfter(5), 3, map[string]string{"kind": "decision", "recipe_id": "ab", "transcript_id": id, "finding_id": id}}},
 		{"hostile text value is passed through as data", "/api/v1/audit/fn_calls?fn=" + url.QueryEscape(hostile),
-			auditCall{"fn_calls", 0, 100, map[string]string{"fn": hostile}}},
+			auditCall{"fn_calls", db.AuditAfter(0), 100, map[string]string{"fn": hostile}}},
+
+		// order=asc is the default spelled out.
+		{"explicit ascending", "/api/v1/audit/fn_calls?order=asc",
+			auditCall{"fn_calls", db.AuditAfter(0), 100, nil}},
+		{"explicit ascending with after", "/api/v1/audit/fn_calls?order=asc&after=40&limit=5",
+			auditCall{"fn_calls", db.AuditAfter(40), 5, nil}},
+		// order=desc: newest first, from the newest row unless before bounds it.
+		{"descending from the newest row", "/api/v1/audit/fn_calls?order=desc",
+			auditCall{"fn_calls", db.AuditNewest(), 100, nil}},
+		{"descending with a limit", "/api/v1/audit/fn_calls?order=desc&limit=3",
+			auditCall{"fn_calls", db.AuditNewest(), 3, nil}},
+		{"descending before an id", "/api/v1/audit/fn_calls?order=desc&before=117999&limit=7",
+			auditCall{"fn_calls", db.AuditBefore(117999), 7, nil}},
+		{"before is read whichever side of order it is on", "/api/v1/audit/fn_calls?before=12&order=desc",
+			auditCall{"fn_calls", db.AuditBefore(12), 100, nil}},
+		{"descending before zero", "/api/v1/audit/fn_calls?order=desc&before=0",
+			auditCall{"fn_calls", db.AuditBefore(0), 100, nil}},
+		{"descending before the largest id", "/api/v1/audit/fn_calls?order=desc&before=9223372036854775807",
+			auditCall{"fn_calls", db.AuditBefore(9223372036854775807), 100, nil}},
+		{"descending with a filter", "/api/v1/audit/step_runs?order=desc&status=running",
+			auditCall{"step_runs", db.AuditNewest(), 100, map[string]string{"status": "running"}}},
+		{"descending with every filter", "/api/v1/audit/finding_events?order=desc&before=50&kind=decision&recipe_id=ab&transcript_id=" + id + "&finding_id=" + id + "&limit=3",
+			auditCall{"finding_events", db.AuditBefore(50), 3, map[string]string{"kind": "decision", "recipe_id": "ab", "transcript_id": id, "finding_id": id}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -192,7 +223,7 @@ func TestAPIAuditParamsReachTheDB(t *testing.T) {
 			}
 			got := f.calls[0]
 			wantDeadline(t, f.timeLeft[0])
-			if got.source != c.want.source || got.after != c.want.after || got.limit != c.want.limit ||
+			if got.source != c.want.source || got.cur != c.want.cur || got.limit != c.want.limit ||
 				fmt.Sprint(got.filters) != fmt.Sprint(c.want.filters) {
 				t.Errorf("call = %+v, want %+v", got, c.want)
 			}
@@ -238,7 +269,7 @@ func TestAPIAuditBadRequest(t *testing.T) {
 		name, target, wantMsg string
 	}{
 		{"unknown filter", "/api/v1/audit/step_runs?fn=judge_chunk", `unknown filter "fn" for source "step_runs"; filters: step, status, recipe_id`},
-		{"unknown parameter", "/api/v1/audit/step_runs?order=desc", `unknown filter "order"`},
+		{"unknown parameter", "/api/v1/audit/step_runs?sort=desc", `unknown filter "sort"`},
 		{"a served column that is not a filter", "/api/v1/audit/finding_events?actor=system", `unknown filter "actor"`},
 		{"the id column", "/api/v1/audit/fn_calls?id=5", `unknown filter "id"`},
 		{"a secret column as filter", "/api/v1/audit/fn_calls?input=x", `unknown filter "input"`},
@@ -281,6 +312,33 @@ func TestAPIAuditBadRequest(t *testing.T) {
 		{"empty limit", "/api/v1/audit/fn_calls?limit=", `parameter "limit" is empty`},
 		{"empty filter", "/api/v1/audit/step_runs?status=", `parameter "status" is empty`},
 		{"key without value", "/api/v1/audit/step_runs?status", `parameter "status" is empty`},
+		// order and before.
+		{"unknown order", "/api/v1/audit/fn_calls?order=newest", "order must be asc or desc"},
+		{"order in capitals", "/api/v1/audit/fn_calls?order=DESC", "order must be asc or desc"},
+		{"order with a trailing space", "/api/v1/audit/fn_calls?order=desc%20", "order must be asc or desc"},
+		{"order given a number", "/api/v1/audit/fn_calls?order=1", "order must be asc or desc"},
+		{"empty order", "/api/v1/audit/fn_calls?order=", `parameter "order" is empty`},
+		{"repeated order", "/api/v1/audit/fn_calls?order=asc&order=desc", `parameter "order" must be given once`},
+		{"descending together with after", "/api/v1/audit/fn_calls?order=desc&after=5", "order=desc pages with before, not after"},
+		{"descending together with after zero", "/api/v1/audit/fn_calls?order=desc&after=0", "order=desc pages with before, not after"},
+		{"descending with both cursors", "/api/v1/audit/fn_calls?order=desc&after=1&before=9", "order=desc pages with before, not after"},
+		{"before without an order", "/api/v1/audit/fn_calls?before=5", "before needs order=desc"},
+		{"before with an explicit ascending order", "/api/v1/audit/fn_calls?order=asc&before=5", "before needs order=desc"},
+		{"before with after", "/api/v1/audit/fn_calls?after=1&before=9", "before needs order=desc"},
+		{"empty before", "/api/v1/audit/fn_calls?order=desc&before=", `parameter "before" is empty`},
+		{"repeated before", "/api/v1/audit/fn_calls?order=desc&before=1&before=2", `parameter "before" must be given once`},
+		{"negative before", "/api/v1/audit/fn_calls?order=desc&before=-1", "before must be an integer >= 0 in plain digits"},
+		{"non-numeric before", "/api/v1/audit/fn_calls?order=desc&before=abc", "before must be an integer >= 0 in plain digits"},
+		{"float before", "/api/v1/audit/fn_calls?order=desc&before=1.5", "before must be an integer >= 0 in plain digits"},
+		{"overflowing before", "/api/v1/audit/fn_calls?order=desc&before=9223372036854775808", "before must be an integer >= 0 in plain digits"},
+		{"before with a plus sign", "/api/v1/audit/fn_calls?order=desc&before=%2B5", "before must be an integer >= 0 in plain digits"},
+		{"before with leading zeros", "/api/v1/audit/fn_calls?order=desc&before=007", "before must be an integer >= 0 in plain digits"},
+		{"before negative zero", "/api/v1/audit/fn_calls?order=desc&before=-0", "before must be an integer >= 0 in plain digits"},
+		{"before in exponent form", "/api/v1/audit/fn_calls?order=desc&before=1e3", "before must be an integer >= 0 in plain digits"},
+		{"before with a leading space", "/api/v1/audit/fn_calls?order=desc&before=%205", "before must be an integer >= 0 in plain digits"},
+		{"bad before without an order", "/api/v1/audit/fn_calls?before=abc", "before must be an integer >= 0 in plain digits"},
+		{"descending with a bad limit", "/api/v1/audit/fn_calls?order=desc&limit=501", "limit must be 1..500"},
+		{"descending with an unknown filter", "/api/v1/audit/step_runs?order=desc&fn=judge_chunk", `unknown filter "fn"`},
 		{"non-UUID on a UUID filter", "/api/v1/audit/finding_events?finding_id=123", `"finding_id" must be a UUID`},
 		{"SQL on a UUID filter", "/api/v1/audit/pipeline_events?job_id=" + url.QueryEscape("x' OR '1'='1"), `"job_id" must be a UUID`},
 		{"UUID filter given a UUID with braces", "/api/v1/audit/judge_passes?transcript_id=%7B" + id + "%7D", `"transcript_id" must be a UUID`},
@@ -309,6 +367,10 @@ func TestAPIAuditErrorsDoNotEchoValues(t *testing.T) {
 		"/api/v1/audit/finding_events?finding_id=SECRETVALUE",
 		"/api/v1/audit/fn_calls?limit=SECRETVALUE",
 		"/api/v1/audit/fn_calls?after=SECRETVALUE",
+		"/api/v1/audit/fn_calls?order=SECRETVALUE",
+		"/api/v1/audit/fn_calls?order=desc&before=SECRETVALUE",
+		"/api/v1/audit/fn_calls?before=SECRETVALUE",
+		"/api/v1/audit/fn_calls?order=SECRETVALUE&after=1",
 		"/api/v1/audit/fn_calls?fn=SECRETVALUE%ff",
 		"/api/v1/audit/fn_calls?fn=SECRETVALUE%00",
 		"/api/v1/audit/fn_calls?fn=SECRETVALUE;x",
@@ -363,6 +425,102 @@ func TestAPIAuditCursorPaging(t *testing.T) {
 		if id != int64(i+1) {
 			t.Fatalf("row %d has id %d; want ascending 1..25: %v", i, id, seen)
 		}
+	}
+}
+
+// auditPageOf decodes a 200 audit response into its row ids and cursor.
+func auditPageOf(t *testing.T, w *httptest.ResponseRecorder) (ids []int64, next *int64) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Rows []struct {
+			ID int64 `json:"id"`
+		} `json:"rows"`
+		Next *int64 `json:"next"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	ids = []int64{}
+	for _, r := range got.Rows {
+		ids = append(ids, r.ID)
+	}
+	return ids, got.Next
+}
+
+// Newest first: the first page is the highest ids, descending; next is the last
+// (lowest) row's id and goes back as before; every row is seen exactly once;
+// the page ending at id 1 gives next=1, and before=1 is empty with a null
+// cursor.
+func TestAPIAuditCursorPagingDesc(t *testing.T) {
+	h := buildTestMux(&auditFakeDB{total: 25})
+
+	var seen []int64
+	target := "/api/v1/audit/fn_calls?order=desc&limit=10"
+	var nexts []int64
+	for page := 1; ; page++ {
+		if page > 10 {
+			t.Fatal("paging does not terminate")
+		}
+		ids, next := auditPageOf(t, auditGET(h, target))
+		if len(ids) == 0 {
+			if next != nil {
+				t.Errorf("empty page has next = %d, want null", *next)
+			}
+			break
+		}
+		if next == nil || *next != ids[len(ids)-1] {
+			t.Fatalf("page %d: next = %v, want the last row's id %d", page, next, ids[len(ids)-1])
+		}
+		nexts = append(nexts, *next)
+		seen = append(seen, ids...)
+		target = fmt.Sprintf("/api/v1/audit/fn_calls?order=desc&limit=10&before=%d", *next)
+	}
+	if len(seen) != 25 {
+		t.Fatalf("saw %d rows, want 25: %v", len(seen), seen)
+	}
+	for i, id := range seen {
+		if want := int64(25 - i); id != want {
+			t.Fatalf("row %d has id %d; want descending 25..1: %v", i, id, seen)
+		}
+	}
+	if want := []int64{16, 6, 1}; fmt.Sprint(nexts) != fmt.Sprint(want) {
+		t.Errorf("cursors = %v, want %v: the last page ends at id 1 and next is 1", nexts, want)
+	}
+}
+
+// What a descending read returns on the wire for the edge cursors.
+func TestAPIAuditDescEdges(t *testing.T) {
+	cases := []struct {
+		name, query string
+		wantIDs     []int64
+		wantNext    int64 // 0 = null
+	}{
+		{"newest rows first", "order=desc&limit=3", []int64{25, 24, 23}, 23},
+		{"before an id", "order=desc&before=10&limit=2", []int64{9, 8}, 8},
+		{"before is exclusive", "order=desc&before=25&limit=1", []int64{24}, 24},
+		{"before above the newest row", "order=desc&before=9999&limit=2", []int64{25, 24}, 24},
+		{"before the oldest row", "order=desc&before=2", []int64{1}, 1},
+		{"before 1: nothing is older", "order=desc&before=1", []int64{}, 0},
+		{"before 0 matches nothing", "order=desc&before=0", []int64{}, 0},
+		{"a short page", "order=desc&before=4", []int64{3, 2, 1}, 1},
+		{"explicit ascending", "order=asc&limit=2&after=3", []int64{4, 5}, 5},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ids, next := auditPageOf(t, auditGET(buildTestMux(&auditFakeDB{total: 25}), "/api/v1/audit/fn_calls?"+c.query))
+			if fmt.Sprint(ids) != fmt.Sprint(c.wantIDs) {
+				t.Errorf("ids = %v, want %v", ids, c.wantIDs)
+			}
+			switch {
+			case c.wantNext == 0 && next != nil:
+				t.Errorf("next = %d, want null", *next)
+			case c.wantNext != 0 && (next == nil || *next != c.wantNext):
+				t.Errorf("next = %v, want %d", next, c.wantNext)
+			}
+		})
 	}
 }
 

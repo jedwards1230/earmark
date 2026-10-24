@@ -97,7 +97,7 @@ func TestAuditDocsMatchRegistry(t *testing.T) {
 				}
 			}
 		}
-		for _, paging := range []string{"after", "limit"} {
+		for _, paging := range []string{"order", "after", "before", "limit"} {
 			if _, ok := query[paging]; !ok {
 				t.Errorf("query parameter %q is not documented", paging)
 			}

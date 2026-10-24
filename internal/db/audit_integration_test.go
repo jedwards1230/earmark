@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	neturl "net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -166,7 +167,7 @@ func (f auditFixture) auditAll(t *testing.T, source string, pageSize int, filter
 		if pages > 1000 {
 			t.Fatal("paging does not terminate")
 		}
-		p, err := f.d.AuditRows(context.Background(), source, after, pageSize, filters)
+		p, err := f.d.AuditRows(context.Background(), source, AuditAfter(after), pageSize, filters)
 		if err != nil {
 			t.Fatalf("AuditRows(%s, after %d): %v", source, after, err)
 		}
@@ -239,7 +240,7 @@ func TestIntegrationAuditPaging(t *testing.T) {
 
 			// A cursor in the middle returns exactly the rows after it.
 			mid := want[len(want)/2]
-			p, err := f.d.AuditRows(context.Background(), src.Name, mid, AuditMaxLimit, nil)
+			p, err := f.d.AuditRows(context.Background(), src.Name, AuditAfter(mid), AuditMaxLimit, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -254,17 +255,222 @@ func TestIntegrationAuditPaging(t *testing.T) {
 			}
 
 			// limit bounds a page.
-			p, err = f.d.AuditRows(context.Background(), src.Name, 0, 2, nil)
+			p, err = f.d.AuditRows(context.Background(), src.Name, AuditAfter(0), 2, nil)
 			if err != nil || len(auditRows(t, p)) != 2 || p.Next == nil || *p.Next != want[1] {
 				t.Errorf("limit 2: %s next %v err %v", p.Rows, p.Next, err)
 			}
 
 			// Past the end.
-			p, err = f.d.AuditRows(context.Background(), src.Name, want[len(want)-1], 10, nil)
+			p, err = f.d.AuditRows(context.Background(), src.Name, AuditAfter(want[len(want)-1]), 10, nil)
 			if err != nil || string(p.Rows) != "[]" || p.Next != nil {
 				t.Errorf("past the end: rows %s next %v err %v", p.Rows, p.Next, err)
 			}
 		})
+	}
+}
+
+// auditAllDesc pages through a source newest first — AuditNewest, then
+// AuditBefore(next) — and returns every row, failing if a page repeats or skips
+// an id, is not strictly descending below its cursor, or has the wrong next.
+func (f auditFixture) auditAllDesc(t *testing.T, source string, pageSize int, filters map[string]string) []map[string]any {
+	t.Helper()
+	var all []map[string]any
+	cur := AuditNewest()
+	for pages := 0; ; pages++ {
+		if pages > 1000 {
+			t.Fatal("paging does not terminate")
+		}
+		p, err := f.d.AuditRows(context.Background(), source, cur, pageSize, filters)
+		if err != nil {
+			t.Fatalf("AuditRows(%s, %+v): %v", source, cur, err)
+		}
+		if p.Source != source {
+			t.Fatalf("page source = %q, want %q", p.Source, source)
+		}
+		rows := auditRows(t, p)
+		if len(rows) == 0 {
+			if p.Next != nil || string(p.Rows) != "[]" {
+				t.Fatalf("empty page: next = %v rows = %s, want null and []", p.Next, p.Rows)
+			}
+			return all
+		}
+		if len(rows) > pageSize {
+			t.Fatalf("page of %d rows exceeds limit %d", len(rows), pageSize)
+		}
+		prev := cur.ID
+		for _, r := range rows {
+			id := rowID(t, r)
+			if id >= prev {
+				t.Fatalf("row id %d is not below %d: rows must descend, strictly under the cursor", id, prev)
+			}
+			prev = id
+		}
+		if p.Next == nil || *p.Next != prev {
+			t.Fatalf("next = %v, want the last (lowest) row's id %d", p.Next, prev)
+		}
+		all = append(all, rows...)
+		cur = AuditBefore(prev)
+	}
+}
+
+// TestIntegrationAuditNewestFirst: for every source, the newest-first read
+// starts at the highest ids, paging by next → before walks down to the lowest
+// row exactly once whatever the page size and ends with an empty page, returns
+// the very rows the ascending read does, and before bounds a page strictly.
+func TestIntegrationAuditNewestFirst(t *testing.T) {
+	f := seedAudit(t)
+	ctx := context.Background()
+	for _, src := range AuditSources() {
+		t.Run(src.Name, func(t *testing.T) {
+			asc := f.ids(t, "SELECT id FROM "+src.Table+" ORDER BY id")
+			want := f.ids(t, "SELECT id FROM "+src.Table+" ORDER BY id DESC")
+			if len(want) < 6 {
+				t.Fatalf("only %d seeded rows", len(want))
+			}
+			for _, size := range []int{1, 4, 5, len(want), AuditMaxLimit} {
+				if got := idsOf(t, f.auditAllDesc(t, src.Name, size, nil)); !slices.Equal(got, want) {
+					t.Errorf("page size %d: ids = %v, want %v", size, got, want)
+				}
+			}
+
+			// The first page is the newest rows, with a small limit.
+			p, err := f.d.AuditRows(ctx, src.Name, AuditNewest(), 3, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := idsOf(t, auditRows(t, p)); !slices.Equal(got, want[:3]) || p.Next == nil || *p.Next != want[2] {
+				t.Errorf("newest 3: ids %v next %v, want %v next %d", got, p.Next, want[:3], want[2])
+			}
+
+			// Same rows as the ascending read, same content, opposite order.
+			ascRows := auditRows(t, mustPage(t, f, src.Name, nil))
+			descRows := f.auditAllDesc(t, src.Name, AuditMaxLimit, nil)
+			slices.Reverse(descRows)
+			if !reflect.DeepEqual(ascRows, descRows) {
+				t.Errorf("descending rows differ from the ascending ones:\nasc  %v\ndesc %v", ascRows, descRows)
+			}
+
+			// before is exclusive: a cursor in the middle returns exactly the rows below it.
+			mid := asc[len(asc)/2]
+			p, err = f.d.AuditRows(ctx, src.Name, AuditBefore(mid), AuditMaxLimit, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var below []int64
+			for _, id := range want {
+				if id < mid {
+					below = append(below, id)
+				}
+			}
+			if got := idsOf(t, auditRows(t, p)); !slices.Equal(got, below) {
+				t.Errorf("before %d: ids = %v, want %v", mid, got, below)
+			}
+
+			// A cursor above the newest row is the newest row's page; the lowest
+			// row's id, and zero, are past the end.
+			p, err = f.d.AuditRows(ctx, src.Name, AuditBefore(want[0]+1000), 2, nil)
+			if err != nil || !slices.Equal(idsOf(t, auditRows(t, p)), want[:2]) {
+				t.Errorf("before above the newest: %s err %v", p.Rows, err)
+			}
+			for _, id := range []int64{asc[0], 0} {
+				p, err = f.d.AuditRows(ctx, src.Name, AuditBefore(id), 10, nil)
+				if err != nil || string(p.Rows) != "[]" || p.Next != nil {
+					t.Errorf("before %d (nothing is older): rows %s next %v err %v", id, p.Rows, p.Next, err)
+				}
+			}
+		})
+	}
+}
+
+// TestIntegrationAuditNewestFirstFilters: the equality filters hold in the
+// descending read, across the cursor, alone and combined.
+func TestIntegrationAuditNewestFirstFilters(t *testing.T) {
+	f := seedAudit(t)
+	cases := []struct {
+		source  string
+		filters map[string]string
+		where   string
+		args    []any
+	}{
+		{"finding_events", map[string]string{"kind": "decision"}, "kind = 'decision'", nil},
+		{"finding_events", map[string]string{"kind": "revoke"}, "kind = 'revoke'", nil},
+		{"finding_events", map[string]string{"recipe_id": auRecipe1, "kind": "decision"}, "recipe_id = $1 AND kind = 'decision'", []any{auRecipe1}},
+		{"finding_events", map[string]string{"transcript_id": feTranscript, "kind": "decision", "recipe_id": auRecipe2}, "transcript_id = $1::uuid AND kind = 'decision' AND recipe_id = $2", []any{feTranscript, auRecipe2}},
+		{"judge_passes", map[string]string{"transcript_id": auTranscriptA}, "transcript_id = $1::uuid", []any{auTranscriptA}},
+		{"fn_calls", map[string]string{"fn": "judge_chunk"}, "fn = 'judge_chunk'", nil},
+		{"fn_calls", map[string]string{"fn": "judge_chunk", "recipe_id": auRecipe1}, "fn = 'judge_chunk' AND recipe_id = $1", []any{auRecipe1}},
+		{"step_runs", map[string]string{"step": "scan", "status": "done"}, "step = 'scan' AND status = 'done'", nil},
+		{"pipeline_events", map[string]string{"stage": "embed"}, "stage = 'embed'", nil},
+		{"pipeline_events", map[string]string{"job_id": feJob}, "job_id = $1::uuid", []any{feJob}},
+		{"fn_calls", map[string]string{"error_class": "nope"}, "error_class = 'nope'", nil},
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%s/%v", c.source, c.filters), func(t *testing.T) {
+			src, _ := LookupAuditSource(c.source)
+			want := f.ids(t, "SELECT id FROM "+src.Table+" WHERE "+c.where+" ORDER BY id DESC", c.args...)
+			for _, size := range []int{1, 2, AuditMaxLimit} {
+				if got := idsOf(t, f.auditAllDesc(t, c.source, size, c.filters)); !slices.Equal(got, want) {
+					t.Errorf("page size %d: ids = %v, want %v", size, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestIntegrationAuditNewestFirstEnds: paging down ends at the oldest row with
+// a page whose next is its id, and the page below it is empty with a null
+// cursor. A fresh table makes the ids 1..5 exactly.
+func TestIntegrationAuditNewestFirstEnds(t *testing.T) {
+	dbURL, d := migratedTestDB(t)
+	ctx := context.Background()
+	conn := connect(t, dbURL)
+	if _, err := conn.Exec(ctx, `INSERT INTO step_runs (step, mode, status, finished_at) SELECT 'scan', 'dry_run', 'done', now() FROM generate_series(1, 5)`); err != nil {
+		t.Fatal(err)
+	}
+	steps := []struct {
+		cur      AuditCursor
+		wantIDs  []int64
+		wantNext int64 // 0 = null
+	}{
+		{AuditNewest(), []int64{5, 4}, 4},
+		{AuditBefore(4), []int64{3, 2}, 2},
+		{AuditBefore(2), []int64{1}, 1},
+		{AuditBefore(1), []int64{}, 0},
+		{AuditBefore(0), []int64{}, 0},
+		{AuditBefore(6), []int64{5, 4}, 4},
+	}
+	for _, c := range steps {
+		p, err := d.AuditRows(ctx, "step_runs", c.cur, 2, nil)
+		if err != nil {
+			t.Fatalf("%+v: %v", c.cur, err)
+		}
+		if got := idsOf(t, auditRows(t, p)); !slices.Equal(got, c.wantIDs) {
+			t.Errorf("%+v: ids = %v, want %v", c.cur, got, c.wantIDs)
+		}
+		switch {
+		case c.wantNext == 0 && (p.Next != nil || string(p.Rows) != "[]"):
+			t.Errorf("%+v: next = %v rows = %s, want null and []", c.cur, p.Next, p.Rows)
+		case c.wantNext != 0 && (p.Next == nil || *p.Next != c.wantNext):
+			t.Errorf("%+v: next = %v, want %d", c.cur, p.Next, c.wantNext)
+		}
+	}
+}
+
+// TestIntegrationAuditNewestFirstEmptyTable: a newest-first read of an empty
+// table is an empty page with a null cursor, for every source.
+func TestIntegrationAuditNewestFirstEmptyTable(t *testing.T) {
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	for _, src := range AuditSources() {
+		if n := countRows(t, conn, "SELECT count(*) FROM "+src.Table); n != 0 {
+			t.Fatalf("a freshly migrated database has %d rows in %s; the test needs it empty", n, src.Table)
+		}
+		for _, cur := range []AuditCursor{AuditNewest(), AuditBefore(10), AuditBefore(0)} {
+			p, err := d.AuditRows(context.Background(), src.Name, cur, 10, nil)
+			if err != nil || string(p.Rows) != "[]" || p.Next != nil {
+				t.Errorf("%s %+v: rows %s next %v err %v, want an empty page", src.Name, cur, p.Rows, p.Next, err)
+			}
+		}
 	}
 }
 
@@ -363,7 +569,7 @@ func TestIntegrationAuditColumns(t *testing.T) {
 	}
 	for _, src := range AuditSources() {
 		t.Run(src.Name, func(t *testing.T) {
-			p, err := f.d.AuditRows(context.Background(), src.Name, 0, AuditMaxLimit, nil)
+			p, err := f.d.AuditRows(context.Background(), src.Name, AuditAfter(0), AuditMaxLimit, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -436,7 +642,7 @@ func TestIntegrationAuditColumns(t *testing.T) {
 
 func mustPage(t *testing.T, f auditFixture, source string, filters map[string]string) AuditPage {
 	t.Helper()
-	p, err := f.d.AuditRows(context.Background(), source, 0, AuditMaxLimit, filters)
+	p, err := f.d.AuditRows(context.Background(), source, AuditAfter(0), AuditMaxLimit, filters)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +732,7 @@ func TestIntegrationAuditInjection(t *testing.T) {
 	for _, src := range AuditSources() {
 		for _, flt := range src.Filters {
 			for _, hostile := range []string{auHostile, "' OR '1'='1", `\'; --`, "%", "a\x00b", "\xff", "\x00"} {
-				p, err := f.d.AuditRows(ctx, src.Name, 0, 10, map[string]string{flt.Name: hostile})
+				p, err := f.d.AuditRows(ctx, src.Name, AuditAfter(0), 10, map[string]string{flt.Name: hostile})
 				invalidText := strings.ContainsRune(hostile, 0) || hostile == "\xff"
 				switch {
 				case flt.UUID || invalidText:
@@ -544,7 +750,7 @@ func TestIntegrationAuditInjection(t *testing.T) {
 	}
 	// Unlisted names never reach SQL at all.
 	for name := range map[string]string{"input": "", "fn = 1 OR 1": "", "id": ""} {
-		if _, err := f.d.AuditRows(ctx, "fn_calls", 0, 10, map[string]string{name: "x"}); !errors.Is(err, ErrAuditUnknownFilter) {
+		if _, err := f.d.AuditRows(ctx, "fn_calls", AuditAfter(0), 10, map[string]string{name: "x"}); !errors.Is(err, ErrAuditUnknownFilter) {
 			t.Errorf("filter %q: err = %v", name, err)
 		}
 	}
@@ -691,7 +897,7 @@ func TestIntegrationAuditTimestampsAreUTC(t *testing.T) {
 		{"finding_events", "created_at"}, {"judge_passes", "started_at"}, {"fn_calls", "created_at"},
 		{"step_runs", "heartbeat_at"}, {"pipeline_events", "created_at"},
 	} {
-		p, err := tokyo.AuditRows(ctx, c.source, 0, 5, nil)
+		p, err := tokyo.AuditRows(ctx, c.source, AuditAfter(0), 5, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -716,7 +922,7 @@ func TestIntegrationAuditDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := readAudit(ctx, f.d.pool, slow, 0, 10, nil)
+	_, err := readAudit(ctx, f.d.pool, slow, AuditAfter(0), 10, nil)
 	if !errors.Is(err, ErrAuditTimeout) {
 		t.Fatalf("err = %v, want ErrAuditTimeout", err)
 	}
@@ -727,12 +933,12 @@ func TestIntegrationAuditDeadline(t *testing.T) {
 	// The client going away is a cancellation, not a timeout.
 	cctx, ccancel := context.WithCancel(context.Background())
 	time.AfterFunc(300*time.Millisecond, ccancel)
-	_, err = readAudit(cctx, f.d.pool, slow, 0, 10, nil)
+	_, err = readAudit(cctx, f.d.pool, slow, AuditAfter(0), 10, nil)
 	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrAuditTimeout) {
 		t.Errorf("canceled read: err = %v, want context.Canceled and not ErrAuditTimeout", err)
 	}
 
-	if p, err := f.d.AuditRows(context.Background(), "step_runs", 0, 1, nil); err != nil || len(auditRows(t, p)) != 1 {
+	if p, err := f.d.AuditRows(context.Background(), "step_runs", AuditAfter(0), 1, nil); err != nil || len(auditRows(t, p)) != 1 {
 		t.Errorf("pool unusable after a timeout: %v", err)
 	}
 }

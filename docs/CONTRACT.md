@@ -1773,7 +1773,7 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 
 | Step | Mode | Total | Counters | Phases |
 |---|---|---|---|---|
-| `decide` | `write` with `--yes`, else `dry_run` | `--yes`: the work list's size (`db.DecideWorkCount`, the very query `DecideWork` pages, 10 s budget) capped by `--limit`; NULL when the count fails. Dry run: the sample size | one per decided finding: `apply`, `hold`, `reject`, `duplicate`, `reanchor` (`rung0_pass` with `--rung0-only`), plus `cached`, `errors` (a `jev_unavailable` hold's model error), `conflict_asks` (calls made only to rank a conflict with a finding outside the run), and with `--yes` `skipped`, `capped`, `duplicates` (duplicates written, those grouped from outside the page included) | `sampling findings`, `counting work`, `loading page N`, `page N: loading chunks + rung-0`, `page N: asking jev-1.13.0`, `page N: writing batch i/n` |
+| `decide` | `write` with `--yes`, else `dry_run` | `--yes`: the work list's size (`db.DecideWorkCount`, the very query `DecideWork` pages, 10 s budget) capped by `--limit`; NULL when the count fails. Dry run: the sample size | one per decided finding: `apply`, `hold`, `reject`, `duplicate`, `reanchor` (`rung0_pass` with `--rung0-only`), plus `cached`, `errors` (a `jev_unavailable` hold's model error), `conflict_asks` (calls made only to rank a conflict with a finding outside the run), and with `--yes` `skipped`, `capped`, `duplicates` (rows written as duplicates, group members outside the page included — **not** the `duplicate` outcome, see below) | `sampling findings`, `counting work`, `loading page N`, `page N: loading chunks + rung-0`, `page N: asking jev-1.13.0`, `page N: writing batch i/n` |
 | `decide_revert` | `write` with `--yes` | — (one transaction) | `moved`, `skipped`, `revoked`, `reflagged` | `previewing the undo` / `revoking decisions`, then `done` |
 | `scan` | `write` with `--yes` | `--sample N`; NULL otherwise | `scanned`, `cached`, `fallback`, `errors`, `written` | `selecting chunks`, `asking <model>`, `writing chunk_scan` |
 | `eval_sample` / `eval_book` | `write` with `--write` | `--sample N` / NULL | `evaluated`, `errors`, `findings` | `asking <model>` |
@@ -1782,6 +1782,31 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 
 `done` counts finished items; `cost_usd` sums the calls' reported cost
 (cached calls are free).
+
+**`duplicate` and `duplicates` are two different counters of a decide run**
+(`internal/decide/run.go` `tickOutcome`, `apply.go` `Apply`):
+
+- `duplicate` is an *outcome* like `apply` or `hold`: one tick, counted in
+  `done`, for each finding of the run's **own** work list (the sample, or the
+  `--yes` work pages) that grouping classified as a duplicate of another
+  finding's identical fix (§2.19 "Agreeing and conflicting findings"). Dry runs
+  have it too. `done` is the sum of the outcome counters: `apply` + `hold` +
+  `reject` + `duplicate` + `reanchor` (with `--rung0-only`: `rung0_pass` +
+  `reject` + `duplicate` + `reanchor`).
+- `duplicates` (`--yes` only) counts the rows the write phase actually moved
+  `proposed → duplicate`. It is not an outcome and not part of `done`. A group is
+  written whole, so it also holds the group members that are *not* in the work
+  list of the page being decided — proposed findings of the same chunk on a later
+  page, outside `--book`/`--issue-type`/`--shard`, or past `--limit`. Those are
+  written as duplicates but never ticked (once written they leave the work list),
+  which is why `duplicates` is normally larger (run 365: `duplicate` 207,
+  `duplicates` 381). It can also be smaller: a duplicate ticked in the compute
+  phase whose write was skipped (row locked, chunk changed, representative not
+  written) is in `duplicate` but not in `duplicates`.
+
+They count different things in different units; never add them. The
+Prometheus series `earmark_step_run_items_total{outcome="duplicate"}` and
+`{outcome="duplicates"}` carry them under the same names (§2.16).
 
 - **Lifecycle.** Inserted at start (synchronously, so the run is visible at
   once), heartbeated, closed with `done`, `failed` (any error) or `cancelled`
@@ -2400,7 +2425,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 |--------|------|------|------|--------|
 | `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed, gateway, gatewayInferred — the AI endpoint registry with **liveness-only** probes, §2.14), a **`roles[]`** array (the Models page role board — see below), an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed), a **`pipeline`** object (see below), and a **`runs`** object (the `GET /api/v1/runs` body; `null` when its read failed) |
 | `GET` | `/api/v1/runs[?recent=N]` | none | — | `200 {"active":[…],"recent":[…],"staleAfterSeconds":120}` — the ad-hoc step runs (§1.10): `active` = open runs with a heartbeat under 24 h old, newest first; `recent` = the newest N (1–100, default 10) other runs. Each: `id, step, mode, status` (`running`·`stale`·`done`·`failed`·`cancelled`), `stale, recipeId, model, args, host, startedAt, heartbeatAt, finishedAt, total, done, progress` (0..1, null without a total), `elapsedSeconds, etaSeconds` (live runs with a total only), `counters, costUsd, message` (the current phase), `error`. `400` on a bad `recent`. |
-| `GET` | `/api/v1/audit/{source}[?after=ID&limit=N&<filter>=V]` | none | — | `200 {"source":"…","rows":[…],"next":ID\|null}` — the audit trail served as stored: `source` is one of `finding_events`, `judge_passes`, `fn_calls`, `step_runs`, `pipeline_events`; `rows` are ordered by `id` ascending, strictly after `after` (default 0), at most `limit` (1–500, default 100); `next` is the last row's `id` (feed it back as `after`), `null` exactly when `rows` is empty. `404` unknown source; `400` malformed query string, unknown/repeated/empty parameter, bad `after`/`limit`, bad filter value; `429` (`Retry-After: 1`) three audit reads already running; `503` the query hit its 5 s statement timeout. Columns and filters per source: §2.12.2 |
+| `GET` | `/api/v1/audit/{source}[?after=ID \| order=desc[&before=ID]][&limit=N][&<filter>=V]` | none | — | `200 {"source":"…","rows":[…],"next":ID\|null}` — the audit trail served as stored: `source` is one of `finding_events`, `judge_passes`, `fn_calls`, `step_runs`, `pipeline_events`; by default `rows` are ordered by `id` ascending, strictly after `after` (default 0), at most `limit` (1–500, default 100), and `next` is the last row's `id` (feed it back as `after`); with `order=desc` they are **newest first**, strictly below `before` (default: from the newest row), and `next` is the last — lowest — row's `id` (feed it back as `before`); `next` is `null` exactly when `rows` is empty. `404` unknown source; `400` malformed query string, unknown/repeated/empty parameter, bad `after`/`before`/`limit`/`order`, `order=desc` together with `after`, `before` without `order=desc`, bad filter value; `429` (`Retry-After: 1`) three audit reads already running; `503` the query hit its 5 s statement timeout. Columns and filters per source: §2.12.2 |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
@@ -2465,7 +2490,7 @@ ready` and `roles[judge].state = failing`.
   "failingNow": 0,              // judge only (null otherwise / when counts unavailable); transcripts whose LATEST attempt failed
   "stale": 32337,               // stale_work rows for the step; null = not tracked / unavailable / still counting
   "countsAsOf": "2026-10-06T00:13:30Z", // the 30 s aggregate snapshot; null = never loaded
-  "countsError": false,         // the latest aggregate refresh failed (last good still served)
+  "countsError": false,         // the latest aggregate refresh failed (last good still served); decide/scan: also true when that role's own fn_calls aggregate failed or timed out (state unknown)
   "staleAsOf": "2026-10-06T00:10:02Z",  // the separate 5 min stale-count snapshot; null = not loaded yet
   "modelSource": "db",          // §2.20: db | env | unset | unknown (settings unreadable); omitted for asr, format
   "settingUpdatedBy": "cli:justin",            // the model_settings row's updated_by; omitted without a row
@@ -2499,6 +2524,16 @@ A failed refresh keeps the last good snapshot (`countsError: true`); with none,
 those fields are `null` and the judge's `state` is `unknown` — the response
 itself never fails on it, and a slow or failed stale count never affects the
 other fields.
+
+The decide and scan evidence is one more query in that snapshot, an aggregate
+over the `fn_calls` log (`db.FnRoleActivity`), and it is best-effort: when it
+alone fails — an error, or the snapshot's 3 s budget — the snapshot still
+loads, the other roles are untouched (`countsError: false`), and only
+`roles[decide]` and `roles[scan]` read `state: unknown` with `countsError:
+true` and the reason `call outcomes unavailable — fn_calls aggregate failed or
+timed out (see server logs)`; their `lastOkAt`/`lastFailedAt`/`lastError` are
+`null` (unknown, not "never"). `countsError` on a role is therefore true when
+the snapshot refresh failed **or that role's own evidence query did**.
 
 **`gateways[]` array** — one entry per distinct LiteLLM gateway (and virtual
 key) the AI registry routes through (§2.14 "LiteLLM gateway"); empty when none.
@@ -2593,33 +2628,55 @@ Monitoring is the read side of the write path: the steps already append to
 stored. There is no per-table handler, no union across sources and no write.
 
 ```
-GET /api/v1/audit/{source}?after=<id>&limit=<n>&<filter>=<value>
+GET /api/v1/audit/{source}?after=<id>&limit=<n>&<filter>=<value>          oldest first (default)
+GET /api/v1/audit/{source}?order=desc&before=<id>&limit=<n>&<filter>=<value>   newest first
 → 200 {"source":"step_runs","rows":[{…},{…}],"next":367}
 ```
 
 - **`source`** — `finding_events` · `judge_passes` · `fn_calls` · `step_runs` ·
   `pipeline_events`. Anything else is `404 {"error":"unknown audit source …"}`
   (the body lists the valid ones).
-- **`after`** — exclusive cursor on the table's `id`; default `0`. Plain decimal
-  digits only (`0`, `364`; not `+5`, `007`, `-0`, `1e3`), at most
-  `9223372036854775807`.
+- **`order`** — `asc` (the default) or `desc`; anything else is `400`. `desc`
+  reads newest first, so the latest rows of a large table need no knowledge of
+  its highest id.
+- **`after`** — exclusive cursor on the table's `id` for an ascending read;
+  default `0`. Plain decimal digits only (`0`, `364`; not `+5`, `007`, `-0`,
+  `1e3`), at most `9223372036854775807`. Not allowed with `order=desc`.
+- **`before`** — the same cursor for a descending read: rows with `id` strictly
+  below it, written exactly like `after`. Default: no bound — the read starts at
+  the newest row. `before=0` is valid and matches nothing (`rows: []`,
+  `next: null`). Only allowed with `order=desc`.
 - **`limit`** — rows per page; default `100`, valid `1..500`, written as plain
   decimal digits. Out of range is `400` (never clamped), the same convention as
   `recent` on `/api/v1/runs`.
 - **filters** — equality only, at most one value each, per the table below. A
-  parameter that is not `after`, `limit` or a filter of this source is `400`
-  (the body lists the valid ones), as is a repeated parameter, an empty value, a
-  value that is not valid UTF-8 or contains a NUL byte, or a non-UUID value for
-  a UUID filter. Filters AND together. A query string that does not parse (a
+  parameter that is not `order`, `after`, `before`, `limit` or a filter of this
+  source is `400` (the body lists the valid ones), as is a repeated parameter,
+  an empty value, a value that is not valid UTF-8 or contains a NUL byte, or a
+  non-UUID value for a UUID filter. The two directions do not mix: `order=desc`
+  with `after`, and `before` without `order=desc` (including with `order=asc`),
+  are `400`. Filters AND together. A query string that does not parse (a
   `;` separator, a bad `%` escape) is `400 {"error":"malformed query string"}`
   — it is never read as if the broken pair were absent.
-- **`rows`** — ordered by `id` ascending, strictly after `after`; the objects
+- **`rows`** — in the requested order: ascending by `id`, strictly after
+  `after` (the default), or descending, strictly below `before`; the objects
   carry exactly the columns below under their column names. `[]` (never `null`)
   when nothing matches.
-- **`next`** — the last returned row's `id`; `null` exactly when `rows` is
-  empty. Page by passing `next` back as `after`; a page shorter than `limit`
-  means there is nothing newer *right now*, and tailing is polling again with
-  the same `after`.
+- **`next`** — the last returned row's `id`, which is the highest of an
+  ascending page and the **lowest** of a descending one; `null` exactly when
+  `rows` is empty. Page by passing `next` back as `after` (ascending) or as
+  `before` (descending). Ascending: a page shorter than `limit` means there is
+  nothing newer *right now*, and tailing is polling again with the same
+  `after`. Descending: paging down ends at the oldest row — a page whose last
+  row is id `1` has `next: 1`, and `before=1` is then `rows: []`,
+  `next: null`. A newest-first read does not move when rows are appended:
+  ids below `before` are fixed.
+- **Cost** — both directions are a range scan of the table's primary key
+  stopped by `LIMIT` (`Index Scan Backward` for `desc`), with the filters
+  applied on top, so a page is a handful of buffer reads whatever the table
+  holds. A filter that matches little of a big table (`fn_calls?error_class=…`)
+  may walk far before it finds `limit` rows; the 5 s statement timeout (`503`)
+  bounds it.
 - **Errors** — every error body is `{"error":"…"}`; no message echoes a value
   the caller sent.
   - `400` — as above.
@@ -2644,7 +2701,7 @@ UUIDs are strings, `JSONB` columns are embedded objects, `NULL` is `null`.
 
 **The registry is the security boundary.** The source → table → columns →
 filters mapping is one static Go slice (`internal/db/audit.go`); the table and
-column names in the SQL come only from it, and every value (`after`, filter
+column names in the SQL come only from it, and every value (`after`/`before`, filter
 values, `limit`) is a bind parameter, so a request can neither name a table or
 column of its own nor inject SQL. Only the listed columns are ever selected;
 a column is served only if it is on the list, so a column added by a later
@@ -4392,7 +4449,7 @@ judge's bounded drop `reason` and the three-value quality scope (`library` · `a
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
 | `earmark_step_run_active` | gauge | `step` (`decide` · `decide_revert` · `scan` · `eval_sample` · `eval_book` · `eval_backfill` · `eval_rejudge`), `mode` (`dry_run` · `write`) | Step runs (§1.10) open with a live heartbeat (≤ 2 min old); a stale run is not counted. Ingest pod; read from `step_runs` every 15 s. No series while nothing runs. |
 | `earmark_step_run_progress_ratio` | gauge | `step` | `done / total` (0..1) of the step's newest live run that knows its total. No series without one. Ingest pod, every 15 s. |
-| `earmark_step_run_items_total` | counter | `step`, `outcome` (the run counters of §1.10: `apply`, `hold`, `reject`, `reanchor`, `cached`, `errors`, `scanned`, `written`, `evaluated`, `latched`, …) | Every counter summed over every recorded run in `step_runs` (an observable counter read from the table, so it survives pod restarts). Ingest pod, every 15 s. **No run id is ever a label.** |
+| `earmark_step_run_items_total` | counter | `step`, `outcome` (the run counters of §1.10: `apply`, `hold`, `reject`, `reanchor`, `cached`, `errors`, `scanned`, `written`, `evaluated`, `latched`, …) | Every counter summed over every recorded run in `step_runs` (an observable counter read from the table, so it survives pod restarts). Ingest pod, every 15 s. **No run id is ever a label.** The `outcome` values are not one unit: for `step="decide"`, `outcome="duplicate"` counts findings of the run's own work list classified duplicate (part of `done`) and `outcome="duplicates"` the rows `--yes` wrote as duplicates, group members outside the page included (not part of `done`) — summing them double-counts, as does adding `cached`, `errors` or `conflict_asks` to the decision outcomes (§1.10). |
 | `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |
 | `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 
