@@ -16,10 +16,14 @@ import (
 // alias of the recipe that wrote each row — with no table of its own.
 
 const (
-	// TrackRecordStatementTimeout is the server-side statement_timeout of the
-	// read. The decisions aggregate scans every decision event (≈100k rows,
-	// ≈0.35 s on production, growing linearly); the timeout turns a table that
-	// has outgrown it into "unavailable", not a hung page.
+	// TrackRecordStatementTimeout is the server-side statement_timeout of each
+	// of the read's two statements, so a single runaway statement is stopped
+	// by the server. It is not the bound on the whole read: the two statements
+	// can spend up to twice this, and the caller's context deadline (5 s on the
+	// dashboard, trackRecordQueryTimeout) is what ends the read first. The
+	// decisions aggregate scans every decision event and joins its finding
+	// (≈100k rows, ≈0.7 s on production, growing linearly), so a log that has
+	// outgrown that deadline shows "unavailable", not a hung page.
 	TrackRecordStatementTimeout = 4 * time.Second
 
 	// trackRecordLimit bounds each aggregate's result. A row is a (model alias,
@@ -49,7 +53,8 @@ type ModelTrack struct {
 
 	// Decisions: each finding's latest decision by a recipe of this alias that
 	// has not been revoked, by outcome. A finding the alias decided again
-	// (a retried hold, a later build) counts once, at its latest outcome.
+	// (a retried hold, a later build) counts once, at its latest outcome;
+	// findings a requeue superseded are not counted (as earmark_decisions).
 	Apply, Hold, Reject, Duplicate int64
 	// Undone is the alias's decisions since revoked (`earmark decide revert`):
 	// events, not findings, and not counted above.
@@ -91,14 +96,18 @@ const trackRecordJudgeSQL = `
 // per (finding, alias), the newest decision that was not revoked — the same
 // "latest unrevoked decision" decide_scorecard and earmark_decisions count,
 // grouped by alias instead of recipe, so one alias's retried holds are one
-// finding, not several. The second arm counts the revoked events. $1 is the
-// result bound.
+// finding, not several. Findings a requeue superseded are left out of both
+// arms, as earmark_decisions leaves them out (the archived finding is the same
+// audio as its re-judged successor, which carries the decision now); the
+// scorecard views keep them. The second arm counts the revoked events. $1 is
+// the result bound.
 const trackRecordDecisionsSQL = `
 	WITH ev AS MATERIALIZED (
 	  SELECT e.id, e.finding_id, e.outcome, e.created_at, coalesce(r.model_alias, '') AS alias,
 	         (v.revokes_event_id IS NOT NULL) AS revoked
 	    FROM finding_events e
 	    JOIN recipes r ON r.recipe_id = e.recipe_id
+	    JOIN transcript_findings f ON f.id = e.finding_id AND f.patch_state <> 'superseded'
 	    LEFT JOIN finding_events v ON v.kind = 'revoke' AND v.revokes_event_id = e.id
 	   WHERE e.kind = 'decision'
 	), live AS (

@@ -113,7 +113,7 @@ CONTRACT §1.10.
 
 The Models page ends with a **Track record**: per model alias, the judge passes it ran
 (all, complete, partial/failed, legacy) and what it decided (apply, hold, reject,
-duplicate — each finding once, at its latest decision that has not been undone — and
+duplicate — each finding once, at its latest decision that has not been undone, requeue-archived findings left out — and
 how many decisions were undone), read from `judge_passes` and `finding_events` and
 refreshed every minute. It says what each model did; precision against labels is
 `earmark models report`. See CONTRACT §2.14 "Models page".

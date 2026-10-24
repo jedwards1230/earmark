@@ -16,13 +16,15 @@ import (
 // judge_passes and finding_events (db.ModelTrackRecord). It is its own region
 // below the polled Models fragment, fetched like the "Running now" panel is —
 // stateless on the server, no snapshot cache — but every 60 s rather than 3 s:
-// the decisions aggregate scans the whole decision log (≈0.35 s at ≈100k
+// the decisions aggregate scans the whole decision log (≈0.7 s at ≈100k
 // events), so the poll interval, not a server-side cache, keeps its cost down.
 
 const (
-	// trackRecordQueryTimeout is the hard deadline on the read: a margin over
-	// the database's own statement timeout, so a slow query ends as the
-	// server's cancellation, and inside the region's htmx timeout.
+	// trackRecordQueryTimeout is the deadline on the whole read, and the bound
+	// that actually ends a slow one: the read runs two statements, each under
+	// db.TrackRecordStatementTimeout, so the server alone could spend about
+	// twice that. It sits inside the region's 6 s htmx timeout, so a read that
+	// outgrows it renders "unavailable" instead of timing the request out.
 	trackRecordQueryTimeout = db.TrackRecordStatementTimeout + time.Second
 
 	// noAliasLabel names the row of recipes (and passes) that carry no model alias.
@@ -116,19 +118,38 @@ func (s *MCPServer) handleTrackRecordData(w http.ResponseWriter, r *http.Request
 
 // trackRecordRegion is the polled region the Models page embeds below its
 // runner-update form. hx-sync drop: a slow read is not stacked on itself.
+//
+// The handler answers a failed read with a 200 fragment, so the only failures
+// the client sees are transport ones: an HTTP error from a proxy
+// (htmx:response:error; hx-status:5xx keeps its body out of the swap) or a
+// refused, reset or timed-out request (htmx:error, incl. the 6 s timeout). On
+// either, the initial placeholder swaps its "loading" line for the
+// "unavailable" one — the same words as the handler's own — so a first load
+// that never lands does not read "loading" forever. A poll that fails after a
+// table has rendered leaves that table up (no placeholder left to swap), and
+// the next successful poll replaces whatever is shown.
 const trackRecordRegion = `<div id="track-record-region" class="track-record-region"
      hx-get="/servers/track-record" hx-trigger="load, every 60s" hx-swap="innerHTML"
-     hx-sync="this:drop" hx-config='{"timeout": 6000}' hx-status:5xx="swap:none">
-  <p class="htmx-indicator">loading track record…</p>
+     hx-sync="this:drop" hx-config='{"timeout": 6000}' hx-status:5xx="swap:none"
+     hx-on::response:error="this.querySelector('[data-unavailable]')?.removeAttribute('hidden'); this.querySelector('[data-loading]')?.setAttribute('hidden', '')"
+     hx-on::error="this.querySelector('[data-unavailable]')?.removeAttribute('hidden'); this.querySelector('[data-loading]')?.setAttribute('hidden', '')">
+  <section class="section" aria-labelledby="track-record-title">
+    <h2 class="section-title" id="track-record-title">Track record</h2>
+    <p class="htmx-indicator" data-loading>loading track record…</p>
+    <p class="lib-empty err" data-unavailable hidden>` + trackRecordUnavailable + `</p>
+  </section>
 </div>`
+
+// trackRecordUnavailable is the section's text when it cannot be read.
+const trackRecordUnavailable = "track record unavailable — see server logs"
 
 var trackRecordFragmentTmpl = template.Must(template.New("track-record").Funcs(tmplFuncs).Parse(`
 <section class="section" aria-labelledby="track-record-title" id="track-record">
   <h2 class="section-title" id="track-record-title">Track record</h2>
-  {{if .Err}}<p class="lib-empty err">track record unavailable — see server logs</p>
+  {{if .Err}}<p class="lib-empty err">` + trackRecordUnavailable + `</p>
   {{else if not .Rows}}<p class="lib-empty">no judge passes or decisions recorded yet</p>
   {{else}}
-  <p class="server-note table-lead" id="track-record-note">Per model alias, from the judge-pass and decision logs. <em>Judge passes</em>: every pass its propose recipes ran, and how they ended. <em>Decisions</em>: each finding counted once, at the latest decision a recipe of that alias made that has not since been undone. <em>Undone</em> counts decisions since revoked (<code>earmark decide revert</code>). A model that only judges or only decides shows — on the other side.</p>
+  <p class="server-note table-lead" id="track-record-note">Per model alias, from the judge-pass and decision logs. <em>Judge passes</em>: every pass its propose recipes ran, and how they ended. <em>Decisions</em>: each finding counted once, at the latest decision a recipe of that alias made that has not since been undone; findings a requeue archived are left out. <em>Undone</em> counts decisions since revoked (<code>earmark decide revert</code>). A model that only judges or only decides shows — on the other side.</p>
   <div class="table-wrap">
   <table aria-labelledby="track-record-note">
     <thead>

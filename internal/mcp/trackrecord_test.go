@@ -139,6 +139,29 @@ func TestTrackRecordDataStates(t *testing.T) {
 	})
 }
 
+// TestTrackRecordRegionShowsUnavailableOnTransportFailure: the handler answers
+// its own failures with 200, so what the client can see fail is the transport
+// (a proxy 502, a reset, the htmx timeout). The placeholder holds a hidden
+// "unavailable" line, with the handler's own words, that both error events
+// reveal while hiding "loading" — and a swap replaces the placeholder.
+func TestTrackRecordRegionShowsUnavailableOnTransportFailure(t *testing.T) {
+	assert.Contains(t, trackRecordRegion, `<h2 class="section-title" id="track-record-title">Track record</h2>`,
+		"the placeholder names the section, so the unavailable line has a heading")
+	assert.Contains(t, trackRecordRegion, `<p class="htmx-indicator" data-loading>loading track record…</p>`)
+	assert.Contains(t, trackRecordRegion, `<p class="lib-empty err" data-unavailable hidden>`+trackRecordUnavailable+`</p>`)
+	for _, ev := range []string{`hx-on::response:error="`, `hx-on::error="`} {
+		i := strings.Index(trackRecordRegion, ev)
+		require.GreaterOrEqual(t, i, 0, ev)
+		handler := trackRecordRegion[i+len(ev):]
+		handler = handler[:strings.Index(handler, `"`)]
+		assert.Contains(t, handler, `[data-unavailable]')?.removeAttribute('hidden')`, ev)
+		assert.Contains(t, handler, `[data-loading]')?.setAttribute('hidden', '')`, ev)
+	}
+	// The handler's own failure renders the same words.
+	_, out := serveTrackRecord(t, &trackDB{err: errors.New("boom")})
+	assert.Contains(t, out, `<p class="lib-empty err">`+trackRecordUnavailable+`</p>`)
+}
+
 func TestTrackRecordRegionIsOnTheModelsPage(t *testing.T) {
 	srv := NewMCPServer(&SimpleMockDB{}, &config.Config{})
 	w := httptest.NewRecorder()

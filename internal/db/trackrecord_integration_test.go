@@ -146,6 +146,37 @@ func TestIntegrationModelTrackRecord(t *testing.T) {
 			t.Errorf("last row = %q, want the alias-less one last", last.ModelAlias)
 		}
 	})
+
+	// earmark_decisions leaves out findings a requeue superseded: the archived
+	// finding is the same audio as the finding re-judged in its place, which
+	// carries the decision now. So must the Track record, in both arms.
+	t.Run("decisions on a superseded finding are not counted", func(t *testing.T) {
+		var archived string
+		if err := conn.QueryRow(ctx, `SELECT id FROM transcript_findings WHERE patch_state = 'superseded'`).Scan(&archived); err != nil {
+			t.Fatalf("the fixture's archived finding: %v", err)
+		}
+		before := by(t)
+		decide := func(recipe, outcome, at string) int64 {
+			t.Helper()
+			var id int64
+			if err := conn.QueryRow(ctx, `INSERT INTO finding_events (finding_id, transcript_id, kind, outcome, reason, actor, recipe_id, p, evidence, created_at)
+				VALUES ($1, $2, 'decision', $3, 'r', 'jev:' || $4, $4, 0.5, 'none', $5) RETURNING id`,
+				archived, lbTranscript, outcome, recipe, at).Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			return id
+		}
+		decide(scJev, "apply", "2026-10-20")
+		decide(scClef, "reject", "2026-10-20")
+		revoked := decide(scJev, "reject", "2026-10-21")
+		if _, err := conn.Exec(ctx, `INSERT INTO finding_events (finding_id, transcript_id, kind, reason, actor, recipe_id, revokes_event_id)
+			VALUES ($1, $2, 'revoke', 'decide revert', 'revert:jev:' || $3, $3, $4)`, archived, lbTranscript, scJev, revoked); err != nil {
+			t.Fatal(err)
+		}
+		if after := by(t); !reflect.DeepEqual(after, before) {
+			t.Errorf("deciding a superseded finding changed the track record (counts, undone or last active)\n before %+v\n  after %+v", before, after)
+		}
+	})
 }
 
 // TestIntegrationTrackRecordCoversTheVocabularies fails when a migration adds a
