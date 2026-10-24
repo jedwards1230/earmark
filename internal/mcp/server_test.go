@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +204,10 @@ func (m *SimpleMockDB) FindingsByModel(context.Context) ([]db.FindingsModelCount
 
 func (m *SimpleMockDB) FnRoleActivity(context.Context) ([]db.FnRoleActivity, error) {
 	return nil, nil
+}
+
+func (m *SimpleMockDB) AuditRows(_ context.Context, source string, _ int64, _ int, _ map[string]string) (db.AuditPage, error) {
+	return db.AuditPage{Source: source, Rows: json.RawMessage("[]")}, nil
 }
 
 func (m *SimpleMockDB) StepRuns(context.Context, int, int) (db.StepRunList, error) {

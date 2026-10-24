@@ -39,6 +39,8 @@ servers:
 tags:
   - name: status
     description: Read-only pipeline snapshot.
+  - name: audit
+    description: The audit trail (finding events, judge passes, function calls, step runs, pipeline events), read as stored.
   - name: pipeline
     description: Pause/resume and bounded-run control of the transcription pipeline.
   - name: runner
@@ -101,6 +103,181 @@ paths:
               schema: { $ref: "#/components/schemas/StepRuns" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/audit/{source}:
+    get:
+      tags: [audit]
+      operationId: getAudit
+      summary: Audit trail rows of one source, as stored
+      description: >
+        One generic, read-only view of the tables the pipeline already appends
+        to (CONTRACT §2.12.2): `finding_events`, `judge_passes`, `fn_calls`,
+        `step_runs`, `pipeline_events`. Rows are ordered by `id` ascending,
+        strictly after `after`, at most `limit` of them; `next` is the last
+        row's `id` (pass it back as `after`) and `null` exactly when `rows` is
+        empty.
+
+
+        Only an allowlist of slim columns is served per source: no prompt or
+        reply bodies, no error text, no command lines and no library paths or
+        titles. Text that names a model, host or actor is cut to 256
+        characters. Each source accepts only its own equality filters (listed
+        per parameter below); a parameter that is not `after`, `limit` or a
+        filter of this source is a 400, as is a repeated or empty one, a value
+        that is not valid UTF-8 or holds a NUL byte, and a query string that
+        does not parse. Filters AND together.
+
+
+        `step_runs` and `judge_passes` rows are updated in place until they
+        close, so a row is the current state when read and is never re-sent;
+        the other sources are append-only. The cursor is the row id, visible
+        at commit, so it is not gap-safe for a tailing client: re-read an
+        overlap and de-duplicate on `id` (CONTRACT §2.12.2). At most three
+        audit reads run at once per server; one more is a 429.
+        Unauthenticated like `/api/v1/status`; the column allowlist is the
+        boundary.
+      security: []
+      parameters:
+        - name: source
+          in: path
+          required: true
+          description: The audit source (a table). Anything else is a 404.
+          schema:
+            type: string
+            enum: [finding_events, judge_passes, fn_calls, step_runs, pipeline_events]
+        - name: after
+          in: query
+          required: false
+          description: >
+            Exclusive id cursor; rows with `id` greater than this are returned.
+            Plain decimal digits only (no sign, no leading zeros).
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          description: >
+            Rows per page (1..500, default 100), plain decimal digits. Out of
+            range is a 400, not clamped.
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: finding_id
+          in: query
+          required: false
+          description: "`finding_events` only. UUID of the finding."
+          schema: { type: string, format: uuid }
+        - name: transcript_id
+          in: query
+          required: false
+          description: "`finding_events`, `judge_passes`. UUID of the transcript."
+          schema: { type: string, format: uuid }
+        - name: job_id
+          in: query
+          required: false
+          description: "`pipeline_events` only. UUID of the transcription job."
+          schema: { type: string, format: uuid }
+        - name: recipe_id
+          in: query
+          required: false
+          description: "`finding_events`, `judge_passes`, `fn_calls`, `step_runs`. The recipe id (64 hex characters)."
+          schema: { type: string }
+        - name: kind
+          in: query
+          required: false
+          description: "`finding_events` only. `transition`, `decision` or `revoke`."
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: "`judge_passes` (`running`, `complete`, `partial`, `failed`, `legacy`) and `step_runs` (`running`, `done`, `failed`, `cancelled`)."
+          schema: { type: string }
+        - name: fn
+          in: query
+          required: false
+          description: "`fn_calls` only. The pure function name (e.g. `judge_chunk`, `should_apply`). Unindexed: scans the table in id order."
+          schema: { type: string }
+        - name: error_class
+          in: query
+          required: false
+          description: "`fn_calls` only. The failed call's error class (e.g. `503`, `timeout`). Unindexed: scans the table in id order."
+          schema: { type: string }
+        - name: step
+          in: query
+          required: false
+          description: "`step_runs` only. The step token: `decide`, `decide_revert`, `scan`, `eval_sample`, `eval_book`, `eval_backfill` or `eval_rejudge`."
+          schema: { type: string }
+        - name: stage
+          in: query
+          required: false
+          description: "`pipeline_events` only. The pipeline stage (`enqueue`, `embed`, `eval`, `requeue`, …)."
+          schema: { type: string }
+        - name: event
+          in: query
+          required: false
+          description: "`pipeline_events` only. `start`, `finish`, `error`, `skip`, `retry` or `state`. Unindexed: scans the table in id order."
+          schema: { type: string }
+      responses:
+        "200":
+          description: One page of rows (possibly empty).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditPage" }
+              example:
+                source: step_runs
+                rows:
+                  - id: 365
+                    step: decide
+                    mode: write
+                    recipe_id: f1c32cfe5f8401528d84874ef74e7e853710f4438da2bbd573113e8376caef7a
+                    model: clef:27b
+                    host: earmark-ingest-7d9f
+                    started_at: "2026-10-23T14:02:11.123456+00:00"
+                    heartbeat_at: "2026-10-23T14:41:02.500000+00:00"
+                    finished_at: null
+                    status: running
+                    total: 29000
+                    done: 12400
+                    counters: { apply: 9100, hold: 2800, reject: 500 }
+                    cost_usd: 0.42
+                next: 365
+        "400":
+          description: >
+            A query string that does not parse; an unknown, repeated or empty
+            parameter; a malformed or out-of-range `after`/`limit`; a filter
+            value that is not valid UTF-8, holds a NUL byte, or is not a UUID
+            for a UUID filter. The message names the valid choices and never
+            echoes a value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "unknown filter \"fn\" for source \"step_runs\"; filters: step, status, recipe_id" }
+        "404":
+          description: Unknown audit source. The message lists the valid ones.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "unknown audit source \"users\"; sources: finding_events, judge_passes, fn_calls, step_runs, pipeline_events" }
+        "429":
+          description: >
+            Three audit reads are already running in this server. Retry after
+            the `Retry-After` interval; nothing was queued.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (always `1`).
+              schema:
+                type: string
+                examples: ["1"]
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "too many concurrent audit reads; retry shortly" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503":
+          description: >
+            The query exceeded its 5 s statement timeout — narrow it with a
+            filter or lower the `limit`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "audit query timed out; add a filter or lower limit" }
 
   /api/v1/pipeline/pause:
     get:
@@ -316,6 +493,35 @@ components:
           example: { error: "control API token not configured" }
 
   schemas:
+    AuditPage:
+      description: |
+        One page of an audit source (CONTRACT §2.12.2), rows exactly as stored.
+      properties:
+        next:
+          description: The last returned row's `id` — pass it back as `after` for the next page. `null` exactly when `rows` is empty.
+          type:
+            - integer
+            - "null"
+        rows:
+          description: |
+            Row objects ordered by `id` ascending, strictly after `after`; `[]` when nothing matches. The keys are the source's allowlisted columns (CONTRACT §2.12.2) under their column names: timestamps are ISO-8601 with a `+00:00` offset, numerics are JSON numbers, UUIDs are strings, JSONB columns are embedded objects, NULL is `null`. Text that names a model, host or actor is cut to 256 characters; no error text, command line or library path is served.
+          items:
+            type: object
+          type: array
+        source:
+          description: The requested source.
+          enum:
+            - finding_events
+            - judge_passes
+            - fn_calls
+            - step_runs
+            - pipeline_events
+          type: string
+      required:
+        - source
+        - rows
+        - next
+      type: object
     ETA:
       description: |
         Empirical pipeline ETA (CONTRACT §4). Exposes both the busy-time estimate and the calendar estimate so a caller can tell "3h of GPU work" apart from "done by Tuesday".

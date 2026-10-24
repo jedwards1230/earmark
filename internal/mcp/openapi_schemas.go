@@ -1,10 +1,13 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
+
+	"github.com/jedwards1230/earmark/internal/db"
 )
 
 // This file derives the OpenAPI `components.schemas` block from the Go types
@@ -76,6 +79,7 @@ func schemaTypes() []schemaType {
 		{"PipelineLifecycle", reflect.TypeOf(pipelineLifecycle{}), roleResponse},
 		{"StepRun", reflect.TypeOf(apiRun{}), roleResponse},
 		{"StepRuns", reflect.TypeOf(apiRuns{}), roleResponse},
+		{"AuditPage", reflect.TypeOf(db.AuditPage{}), roleResponse},
 		{"Status", reflect.TypeOf(apiStatus{}), roleResponse},
 	}
 }
@@ -210,6 +214,13 @@ func typeSchema(t reflect.Type, refs map[reflect.Type]string, role payloadRole, 
 
 	if name, ok := refs[t]; ok {
 		return map[string]any{"$ref": "#/components/schemas/" + name}, nil
+	}
+
+	// A json.RawMessage is pre-encoded JSON, which reflection cannot see into.
+	// The only one in this API is the audit page's rows (CONTRACT §2.12.2): a
+	// JSON array of row objects whose keys depend on the source.
+	if t == reflect.TypeOf(json.RawMessage(nil)) {
+		return map[string]any{"type": "array", "items": map[string]any{"type": "object"}}, nil
 	}
 
 	switch t.Kind() {

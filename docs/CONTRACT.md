@@ -2400,6 +2400,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 |--------|------|------|------|--------|
 | `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed, gateway, gatewayInferred — the AI endpoint registry with **liveness-only** probes, §2.14), a **`roles[]`** array (the Models page role board — see below), an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed), a **`pipeline`** object (see below), and a **`runs`** object (the `GET /api/v1/runs` body; `null` when its read failed) |
 | `GET` | `/api/v1/runs[?recent=N]` | none | — | `200 {"active":[…],"recent":[…],"staleAfterSeconds":120}` — the ad-hoc step runs (§1.10): `active` = open runs with a heartbeat under 24 h old, newest first; `recent` = the newest N (1–100, default 10) other runs. Each: `id, step, mode, status` (`running`·`stale`·`done`·`failed`·`cancelled`), `stale, recipeId, model, args, host, startedAt, heartbeatAt, finishedAt, total, done, progress` (0..1, null without a total), `elapsedSeconds, etaSeconds` (live runs with a total only), `counters, costUsd, message` (the current phase), `error`. `400` on a bad `recent`. |
+| `GET` | `/api/v1/audit/{source}[?after=ID&limit=N&<filter>=V]` | none | — | `200 {"source":"…","rows":[…],"next":ID\|null}` — the audit trail served as stored: `source` is one of `finding_events`, `judge_passes`, `fn_calls`, `step_runs`, `pipeline_events`; `rows` are ordered by `id` ascending, strictly after `after` (default 0), at most `limit` (1–500, default 100); `next` is the last row's `id` (feed it back as `after`), `null` exactly when `rows` is empty. `404` unknown source; `400` malformed query string, unknown/repeated/empty parameter, bad `after`/`limit`, bad filter value; `429` (`Retry-After: 1`) three audit reads already running; `503` the query hit its 5 s statement timeout. Columns and filters per source: §2.12.2 |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
@@ -2521,7 +2522,7 @@ with `503` — the pipeline can never be paused/driven by an unauthenticated
 caller. Read endpoints are always open. This is layered on the LAN-only ingress.
 
 **Machine-readable contract**: `docs/openapi.yaml` (OpenAPI 3.1) specifies the
-eight `/api/v1` operations above and is embedded in the binary, served at
+nine `/api/v1` operations above and is embedded in the binary, served at
 `GET /api/v1/openapi.yaml`. It covers **only** this JSON API — the htmx
 dashboard routes below return HTML fragments and are deliberately out of scope.
 The spec cannot drift: `apiRoutes` (internal/mcp/routes.go) is the single source
@@ -2583,6 +2584,159 @@ LAN-only; only reachable under the HTTP transport.
 > `earmark batch` coordinator owns all phase transitions (§1.4). Only `paused`
 > and `run_limit` are dashboard-writable (pause/resume + run-budget actions). A
 > phase read error degrades to `idle` and is logged; it never blocks a page.
+
+#### 2.12.2 Audit trail — `GET /api/v1/audit/{source}`
+
+Monitoring is the read side of the write path: the steps already append to
+`finding_events`, `judge_passes`, `fn_calls`, `step_runs` and `pipeline_events`
+(§1.7, §1.9, §1.10, §2.15, §2.17), and one generic endpoint serves those rows as
+stored. There is no per-table handler, no union across sources and no write.
+
+```
+GET /api/v1/audit/{source}?after=<id>&limit=<n>&<filter>=<value>
+→ 200 {"source":"step_runs","rows":[{…},{…}],"next":367}
+```
+
+- **`source`** — `finding_events` · `judge_passes` · `fn_calls` · `step_runs` ·
+  `pipeline_events`. Anything else is `404 {"error":"unknown audit source …"}`
+  (the body lists the valid ones).
+- **`after`** — exclusive cursor on the table's `id`; default `0`. Plain decimal
+  digits only (`0`, `364`; not `+5`, `007`, `-0`, `1e3`), at most
+  `9223372036854775807`.
+- **`limit`** — rows per page; default `100`, valid `1..500`, written as plain
+  decimal digits. Out of range is `400` (never clamped), the same convention as
+  `recent` on `/api/v1/runs`.
+- **filters** — equality only, at most one value each, per the table below. A
+  parameter that is not `after`, `limit` or a filter of this source is `400`
+  (the body lists the valid ones), as is a repeated parameter, an empty value, a
+  value that is not valid UTF-8 or contains a NUL byte, or a non-UUID value for
+  a UUID filter. Filters AND together. A query string that does not parse (a
+  `;` separator, a bad `%` escape) is `400 {"error":"malformed query string"}`
+  — it is never read as if the broken pair were absent.
+- **`rows`** — ordered by `id` ascending, strictly after `after`; the objects
+  carry exactly the columns below under their column names. `[]` (never `null`)
+  when nothing matches.
+- **`next`** — the last returned row's `id`; `null` exactly when `rows` is
+  empty. Page by passing `next` back as `after`; a page shorter than `limit`
+  means there is nothing newer *right now*, and tailing is polling again with
+  the same `after`.
+- **Errors** — every error body is `{"error":"…"}`; no message echoes a value
+  the caller sent.
+  - `400` — as above.
+  - `404` — unknown source.
+  - `429 {"error":"too many concurrent audit reads; retry shortly"}` with
+    `Retry-After: 1` — three audit reads are already running in this process.
+    The cap is per server, non-blocking (nothing queues), and is taken only
+    after the request validated, so a malformed request is a `400` however busy
+    the server is.
+  - `503 {"error":"audit query timed out; add a filter or lower limit"}` — the
+    query exceeded its 5 s statement timeout.
+  - `500 {"error":"internal error"}` — anything else; the database error is
+    logged, never returned. A client that disconnects mid-query gets no
+    response and is not logged as an error.
+  A response must be written within 10 s of the request starting (a write
+  deadline), so a client that reads slowly cannot hold the connection open.
+
+Values are JSON as PostgreSQL renders a row: timestamps are ISO-8601 with a
+`+00:00` offset (the read pins the session `TimeZone` to UTC, so the offset does
+not depend on the database's setting), `NUMERIC`/`FLOAT8` are JSON numbers,
+UUIDs are strings, `JSONB` columns are embedded objects, `NULL` is `null`.
+
+**The registry is the security boundary.** The source → table → columns →
+filters mapping is one static Go slice (`internal/db/audit.go`); the table and
+column names in the SQL come only from it, and every value (`after`, filter
+values, `limit`) is a bind parameter, so a request can neither name a table or
+column of its own nor inject SQL. Only the listed columns are ever selected;
+a column is served only if it is on the list, so a column added by a later
+migration is *not* served until someone adds it (a database test fails until the
+new column is either allowed or recorded as excluded).
+
+What is served follows one rule: **no prompt or reply bodies, no error text, no
+command lines, and no library paths or titles.** Error text can wrap an upstream
+response body (transcript text); `args` and the audio file path carry book
+names and endpoint overrides. What *happened* is still there — `job_id`,
+`status`, `error_class`, `counters` and the timestamps — and the recent errors
+of step runs are on `GET /api/v1/runs`.
+
+| Source (table) | Columns returned | Excluded | Filters |
+|---|---|---|---|
+| `finding_events` | `id`, `finding_id`, `transcript_id`, `kind`, `from_state`, `to_state`, `outcome`, `reason`†, `actor`†, `recipe_id`, `p`, `evidence`, `fn_call_id`, `chunk_text_sha256`, `issue_type`, `revokes_event_id`, `related_finding_id`, `anchor_offset`, `created_at` | — (every column is served) | `finding_id` (UUID), `transcript_id` (UUID), `recipe_id`, `kind` |
+| `judge_passes` | `id`, `transcript_id`, `job_id`, `recipe_id`, `step_run_id`, `status`, `chunks_total`, `chunks_judged`, `chunks_failed`, `chunks_cached`, `findings_kept`, `dropped`, `input_tokens`, `output_tokens`, `cost_usd`, `latency_ms_p50`, `latency_ms_p95`, `book_context_sha256`, `started_at`, `finished_at` | `file_path` (a library path), `error` (error text) | `transcript_id` (UUID), `recipe_id`, `status` |
+| `fn_calls` | `id`, `fn`, `prompt_version`, `prompt_sha256`, `model_alias`†, `model_resolved`†, `model_revision`†, `recipe_id`, `input_sha256`, `error_class`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`, `cache_hit`, `cached_from`, `created_at` | `input`, `output` (the JSONB prompt and model reply: large, and the content of the book) | `fn`, `recipe_id`, `error_class` |
+| `step_runs` | `id`, `step`, `mode`, `recipe_id`, `model`†, `host`†, `started_at`, `heartbeat_at`, `finished_at`, `status`, `total`, `done`, `counters`, `cost_usd` | `args` (the command line: book names, endpoint overrides), `error` (error text), `last_message` (the current phase, which can name the audio file) | `step`, `status`, `recipe_id` |
+| `pipeline_events` | `id`, `job_id`, `stage`, `event`, `runner_host`†, `model`†, `model_version`†, `duration_ms`, `item_count`, `token_count`, `attempt`, `created_at` | `file_path` (a library path), `reason` (failure text), `detail` (JSONB of unbounded, stage-specific shape) | `job_id` (UUID), `stage`, `event` |
+
+† Text that names a model, a host or an actor: externally sourced, so it is cut
+to its first 256 characters (`left(col, 256)`). Every other served column is an
+id, a UUID, a hash, a number, a timestamp, a boolean, a closed-vocabulary token
+(`kind`, `from_state`, `to_state`, `outcome`, `evidence`, `issue_type`, `mode`,
+`status`, `stage`, `event`, `step`, `error_class`), a name fixed in code (`fn`,
+`prompt_version`) or an embedded counter object. A page therefore cannot be made
+large by what a model, a host or an upstream says.
+
+`step` is one of `decide`, `decide_revert`, `scan`, `eval_sample`, `eval_book`,
+`eval_backfill`, `eval_rejudge` (`internal/runs`).
+
+Embeddings (`transcript_chunks.embedding`), transcript text and segments, and
+every other table are not reachable through this endpoint.
+
+**Cost.** The default query of every source (`id > 0 ORDER BY id LIMIT 100`) is an
+`Index Scan using <table>_pkey` that stops after the limit; measured against the
+live database on 2026-10-23 (`finding_events` ≈ 96k rows, `fn_calls` ≈ 114k,
+`pipeline_events` ≈ 40k, `judge_passes` ≈ 8.6k, `step_runs` ≈ 366) it takes
+1–4 ms. Each read runs in a read-only transaction with JIT off, the session
+`TimeZone` pinned to UTC and a 5 s `statement_timeout`; at most three run at
+once per server. A filter is cheap where an index backs it (`finding_id`,
+`job_id`, `transcript_id` on `judge_passes`, `status=running` on `step_runs`, the
+rare `kind`/`stage` values) or where it is common enough that the PK-order scan
+finds its page early (`recipe_id` 5–50 ms). `fn_calls.fn`, `fn_calls.error_class`
+and `pipeline_events.event` have no supporting index: a selective value scans the
+table in `id` order (0.08–0.5 s at today's size, growing linearly, bounded by
+the timeout). No migration was added for them; if `fn_calls` keeps growing, an
+index on `(fn, id)` and `(error_class, id)` is the fix. The same filters run as
+prepared statements with a forced generic plan — the worst case once PostgreSQL
+stops planning per value, as a pgx-style client reaches it — measured
+0.002–0.55 s on the live database (`finding_events` by `transcript_id` 0.30 s with
+a bitmap scan and a top-N sort; `fn_calls` by `recipe_id` 0.55 s, a PK-order
+scan; `judge_passes` by `transcript_id` 2 ms), all inside the timeout. Follow-up
+(hardening, not built): run this path under a SELECT-only database role.
+
+**Semantics a consumer must know.**
+
+1. *The cursor is not gap-safe.* It is the `BIGSERIAL`/identity `id`, which is
+   allocated at insert but becomes visible only at commit. `finding_events`
+   rows are written inside multi-row transactions (a decide batch, a revert
+   batch, bulk patch-state changes, a judge-pass commit that fires the
+   `transcript_findings` triggers), so a concurrent transaction's lower ids can
+   commit after a higher id has already been read — for as long as that
+   transaction runs — and a tailing client then never sees them. A client that
+   tails must re-read an overlap by default (`after = next − k`) and
+   de-duplicate on `id`, `finding_events` above all; paging a settled table
+   from `after=0` is unaffected.
+2. *Mutable and cascading rows.* `finding_events`, `fn_calls` and
+   `pipeline_events` are append-only (the retention prune of §1.7 removes
+   `heartbeat` and `runner_availability` rows older than 180 days from
+   `pipeline_events`), except that `ON DELETE CASCADE` removes a job's
+   `pipeline_events` with the job (§1.7) and a finding's `finding_events` with
+   the finding (§2.17). `step_runs` (heartbeat, counters, status) and
+   `judge_passes` (status, counts, `finished_at`) are updated in place until
+   they close: the endpoint returns a row's **current** state and never
+   re-sends a row it already returned, so watching a run's progress means
+   re-reading it (`?step=decide&status=running`, or `after=<id-1>`), not
+   tailing.
+3. *Ascending only.* There is no descending order and no `before`: reaching the
+   newest rows of a large table means narrowing with a filter (`recipe_id`,
+   `transcript_id`, `status=running`, …) or paging. A tail/`before` option is a
+   follow-up, not part of this contract.
+4. *Access.* An unauthenticated read like `/api/v1/status` and `/api/v1/runs`,
+   behind the LAN-only ingress (the `redirect-lan` middleware, §2.8). The
+   allowlist above is what keeps it safe to leave open; the concurrency cap, the
+   statement timeout and the write deadline keep it cheap.
+
+Out of scope here (follow-ups): any write, SSE/streaming, a union feed across
+sources, MCP tools over it, a per-book audit view, a JSON scorecard, indexes for
+the unindexed filters, a dedicated connection pool, and a SELECT-only database
+role.
 
 ### 2.13 ASR Backend Capability Vocabulary
 

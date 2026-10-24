@@ -117,7 +117,11 @@ is a foreign key `ON DELETE SET NULL` (CONTRACT §1.4). The findings pages'
 For scripts/agents there is a JSON **control API** under `/api/v1` (see
 `docs/CONTRACT.md §2.12`): `GET /status`, `GET /runs` (the step runs — what
 decide/scan/eval is doing now, §1.10), `GET|PUT /pipeline/pause`, and
-`POST|DELETE /pipeline/run` (run N jobs then auto-pause — a one-call smoke test).
+`POST|DELETE /pipeline/run` (run N jobs then auto-pause — a one-call smoke test), and
+`GET /audit/{source}` (the audit trail as stored: `finding_events`, `judge_passes`, `fn_calls`,
+`step_runs`, `pipeline_events`; `?after=<id>&limit=<n>&<filter>=<v>`, a slim column allowlist per
+source in `internal/db/audit.go` — no prompt/reply bodies, error text, command lines or library
+paths; at most 3 reads at once, then `429` — see `docs/CONTRACT.md §2.12.2`).
 Mutations require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed
 (`503`) when the token is unset.
 
