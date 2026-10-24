@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/jedwards1230/earmark/cmd"
+	"github.com/jedwards1230/earmark/cmd/audit"
 	"github.com/jedwards1230/earmark/cmd/backfill"
 	"github.com/jedwards1230/earmark/cmd/batch"
 	"github.com/jedwards1230/earmark/cmd/decide"
@@ -38,6 +39,7 @@ func main() {
 	rootCmd.AddCommand(scan.ScanCmd)
 	rootCmd.AddCommand(decide.DecideCmd)
 	rootCmd.AddCommand(models.ModelsCmd)
+	rootCmd.AddCommand(audit.AuditCmd)
 	rootCmd.AddCommand(labels.LabelsCmd)
 	rootCmd.AddCommand(prunechunks.PruneChunksCmd)
 	rootCmd.AddCommand(batch.BatchCmd)
