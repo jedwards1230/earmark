@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1169,4 +1170,91 @@ func TestServersData_QueueStatsCached(t *testing.T) {
 	srv.buildMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/servers/data", nil))
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Less(t, time.Since(start), queueStatsFirstWait+time.Second, "a slow first load must not hold the poll")
+}
+
+// fnRolesProbeDB records the deadline FnRoleActivity runs under and answers
+// from a script, one entry per call.
+type fnRolesProbeDB struct {
+	SimpleMockDB
+	mu        sync.Mutex
+	calls     int
+	script    []error // error to return on call i (nil = success); the last entry repeats
+	remaining time.Duration
+}
+
+func (p *fnRolesProbeDB) FnRoleActivity(ctx context.Context) ([]db.FnRoleActivity, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if dl, ok := ctx.Deadline(); ok {
+		p.remaining = time.Until(dl)
+	}
+	err := p.script[min(p.calls, len(p.script))-1]
+	if err != nil {
+		return nil, err
+	}
+	return []db.FnRoleActivity{{Step: recipe.StepDecide, Fn: "should_apply", Calls: p.calls}}, nil
+}
+
+// TestModelsCaches_FnRolesOwnBudget: the fn_calls aggregate scans the whole
+// call log (~0.8 s at 150k rows), so sharing the snapshot's 3 s budget with the
+// four other queries made it time out on every refresh in production
+// (Decide/Scan stuck at "unknown"). It must run in its own cache under a budget
+// well past the snapshot's, and must not be part of the snapshot's load.
+func TestModelsCaches_FnRolesOwnBudget(t *testing.T) {
+	p := &fnRolesProbeDB{script: []error{nil}}
+	c := newModelsCaches(p, nil)
+	ev := c.read(context.Background(), 50*time.Millisecond)
+	require.NotNil(t, ev.Snap)
+	require.NoError(t, ev.Snap.FnRolesErr)
+	require.Len(t, ev.Snap.FnRoles, 1)
+	assert.Greater(t, p.remaining, 2*modelsSnapshotTimeout, "the aggregate must outlast the snapshot's budget")
+
+	// The snapshot alone never runs it.
+	before := p.calls
+	s, err := loadModelsSnapshot(context.Background(), p)
+	require.NoError(t, err)
+	assert.Empty(t, s.FnRoles)
+	assert.Equal(t, before, p.calls, "loadModelsSnapshot must not run the fn_calls aggregate")
+}
+
+// TestModelsCaches_FnRolesFailureModes: a genuine failure is reported (Decide
+// and Scan unknown), a failure after a good value serves that value, and the
+// failure never reaches the rest of the snapshot.
+func TestModelsCaches_FnRolesFailureModes(t *testing.T) {
+	boom := errors.New("fn role activity: timeout: context deadline exceeded")
+	tests := []struct {
+		name      string
+		script    []error
+		advance   time.Duration // clock step before the second read (0 = no second read)
+		wantErr1  bool
+		wantErr2  bool
+		wantCalls int
+	}{
+		{name: "first load fails: unknown", script: []error{boom}, wantErr1: true, wantCalls: 1},
+		{name: "good then fail: last good served", script: []error{nil, boom}, advance: fnRolesTTL + time.Second, wantCalls: 2},
+		{name: "fresh value: no second query", script: []error{nil}, advance: time.Second, wantCalls: 1},
+		{name: "fail then retry succeeds", script: []error{boom, nil}, advance: modelsSnapshotTTL + time.Second, wantErr1: true, wantCalls: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &fnRolesProbeDB{script: tt.script}
+			clock := testNow
+			c := newModelsCaches(p, nil)
+			c.fnRoles.now = func() time.Time { return clock }
+			ev := c.read(context.Background(), 50*time.Millisecond)
+			require.NotNil(t, ev.Snap, "the snapshot loads whatever the aggregate does")
+			assert.Equal(t, tt.wantErr1, ev.Snap.FnRolesErr != nil)
+			if tt.advance > 0 {
+				clock = clock.Add(tt.advance)
+				c.read(context.Background(), 50*time.Millisecond) // starts the background refresh
+				c.fnRoles.waitIdle()
+				ev = c.read(context.Background(), 50*time.Millisecond)
+				require.NotNil(t, ev.Snap)
+				assert.Equal(t, tt.wantErr2, ev.Snap.FnRolesErr != nil)
+				assert.NotEmpty(t, ev.Snap.FnRoles, "a good value is kept or refreshed")
+			}
+			assert.Equal(t, tt.wantCalls, p.calls)
+		})
+	}
 }

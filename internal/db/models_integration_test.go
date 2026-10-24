@@ -513,3 +513,53 @@ func hexSHA(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
+
+// TestIntegrationFnRoleActivityAtScale: the evidence query is a full scan of the
+// call log, so it must stay well inside the cache's budget as fn_calls grows.
+// Seeds a few thousand calls (mostly the current decide request, some
+// another's) with generate_series and asserts exact counts and a latency far
+// under the old shared 3 s snapshot budget it kept overrunning in production.
+func TestIntegrationFnRoleActivityAtScale(t *testing.T) {
+	ctx := context.Background()
+	d := integrationDB(t, newTestDatabase(t))
+	if _, err := d.pool.Exec(ctx, modelsSeedSQL); err != nil {
+		t.Fatal(err)
+	}
+	dec := recipe.Recipe{Step: recipe.StepDecide, StepVersion: 1, CodeVersion: "test", ModelAlias: "jev-1.13.0",
+		ModelResolved: "jev-1.13.0", PromptVersion: "should_apply@v1", PromptSHA256: "5e1ec7",
+		Params: map[string]any{"fn": "should_apply"}}
+	if err := d.SetCurrentRecipes(ctx, dec); err != nil {
+		t.Fatal(err)
+	}
+	decID, _ := dec.ID()
+	const current, cacheHits, other = 4000, 1500, 800
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO fn_calls (fn, prompt_version, prompt_sha256, model_alias, model_resolved, recipe_id,
+		                      input_sha256, input, output, error_class, cache_hit, created_at)
+		SELECT 'should_apply', 'should_apply@v1', CASE WHEN g <= $1::int + $2::int THEN '5e1ec7' ELSE '0dd' END,
+		       'jev-1.13.0', 'typesafe/jev-1.13.0', $4, md5(g::text) || md5(g::text), '{}', '{"p":0.5}',
+		       CASE WHEN g % 100 = 0 AND g <= $1::int THEN 'timeout' END,
+		       g > $1::int AND g <= $1::int + $2::int,
+		       now() - g * interval '1 second'
+		  FROM generate_series(1, $1::int + $2::int + $3::int) g`, current, cacheHits, other, decID); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	got, err := d.FnRoleActivity(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("FnRoleActivity: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("FnRoleActivity = %+v, want the decide row", got)
+	}
+	a := got[0]
+	// 40 of the first 4000 rows are timeouts; cache-hit rows are the next 1500.
+	if a.Calls != current || a.CacheHits != cacheHits || a.Failures24h != current/100 || a.LastErrorClass != "timeout" {
+		t.Errorf("counts calls/hits/fail24h/class = %d/%d/%d/%q, want %d/%d/%d/timeout",
+			a.Calls, a.CacheHits, a.Failures24h, a.LastErrorClass, current, cacheHits, current/100)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("FnRoleActivity took %v over %d rows, want well under the old 3 s snapshot budget", elapsed, current+cacheHits+other)
+	}
+}

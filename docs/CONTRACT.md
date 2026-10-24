@@ -2525,9 +2525,13 @@ those fields are `null` and the judge's `state` is `unknown` — the response
 itself never fails on it, and a slow or failed stale count never affects the
 other fields.
 
-The decide and scan evidence is one more query in that snapshot, an aggregate
-over the `fn_calls` log (`db.FnRoleActivity`), and it is best-effort: when it
-alone fails — an error, or the snapshot's 3 s budget — the snapshot still
+The decide and scan evidence is a separate cache, an aggregate over the
+`fn_calls` log (`db.FnRoleActivity`) refreshed every 60 s under its own 30 s
+budget — it scans the whole call log (~0.8 s at 150k rows and growing), which
+the snapshot's 3 s budget shared with its four other queries could not
+reliably cover — and it is best-effort: a refresh that fails after a good one
+keeps serving the last good value; when it alone fails with none — an error
+or its 30 s budget — the snapshot still
 loads, the other roles are untouched (`countsError: false`), and only
 `roles[decide]` and `roles[scan]` read `state: unknown` with `countsError:
 true` and the reason `call outcomes unavailable — fn_calls aggregate failed or
@@ -2608,7 +2612,7 @@ LAN-only; only reachable under the HTTP transport.
 | `GET /status/data` | Status fragment (htmx-refreshed every 3 s): counts, pipeline state, read-only phase badge, and the token-gated pause + run-budget controls. |
 | `GET /failed/data` | Failed-jobs fragment. **No standalone `/failed` page** — it renders inside `/pipeline`. |
 | `GET /runs/data` | **Running now + Recent runs** fragment (§1.10), the first region of both `/pipeline` and `/servers`, polled every 3 s (5 s htmx timeout; the read has a 2 s server-side deadline). Each active run is a card (`id="run-<id>"`): step, mode, status, the current phase, a done/total bar (or "N done · total unknown"), model, recipe short id, counts, elapsed and ETA (live runs with a total), spend, host and args. A stale run (heartbeat > 2 min) shows amber, "⚠ stale", with its last heartbeat and no ETA. "Recent runs" lists the newest 10 others: outcome, counts, cost, duration, start. A failed or slow read renders `200` "run status unavailable" — never the page's connection-lost banner. |
-| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the "Running now" runs region (`/runs/data`) on top, then the role board, recipes & stale work, LiteLLM gateway, AI endpoints, judge output, ASR runners. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s, queue stats 15 s and stale counts 5 min, all served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
+| `GET /servers` · `/servers/data` | **Models page** + fragment (§2.14): the "Running now" runs region (`/runs/data`) on top, then the role board, recipes & stale work, LiteLLM gateway, AI endpoints, judge output, ASR runners. The fragment polls every 5 s; the runner-update form lives in the static shell (outside the polled region) so a poll never wipes typed input. DB aggregates are cached 30 s, the decide/scan `fn_calls` aggregate 60 s, queue stats 15 s and stale counts 5 min, all served stale-while-revalidate; LiteLLM gateway status 60 s. Only a runner-observation read failure returns 5xx; a failed snapshot still renders `200` with "counts unavailable" for exactly the sections it backs. |
 | `GET /findings` · `/findings/data` | Findings page + fragment (§2.15). |
 | `GET /book` · `/book/data` | Per-book detail page + fragment. |
 | `GET /track?id=…[&t=<startSec>]` | Per-track detail page. The optional **`t`** (seconds) is the finding "Where" deep-jump: the reader preloads pages `[0 .. the page containing the segment spanning t]`, marks that segment active, and scrolls to it. |
@@ -3122,8 +3126,9 @@ bottom:
    unattributed), **undone** (`revert:jev:<recipe_id>`, any state) — and the
    proposed backlog awaiting a decision. Scan adds *scanned*: `chunk_scan`
    rows under the current recipe over the library's chunk count. The
-   `fn_calls` aggregate is one query on the 30 s snapshot, run last and
-   best-effort: its failure marks only Decide and Scan `unknown`.
+   `fn_calls` aggregate is one query with its own 60 s cache and 30 s budget,
+   best-effort: its failure (with no earlier good value) marks only Decide and
+   Scan `unknown`.
 
    Role health (`roles[].state` in the API) — a glyph always pairs with the word:
 
@@ -3244,7 +3249,8 @@ as that refresh's error.
 
 | Data | TTL | Refresh timeout | Header stamp |
 |---|---|---|---|
-| Aggregates: model activity, current recipes, judge findings by decider, ASR provenance, decide/scan `fn_calls` evidence (last, best-effort) | 30 s | 3 s | "counts as of" |
+| Aggregates: model activity, current recipes, judge findings by decider, ASR provenance | 30 s | 3 s | "counts as of" |
+| Decide/scan `fn_calls` evidence (a full scan of the call log, ≈0.8 s at 150k rows; best-effort, per-role `unknown` on failure) | 60 s | 30 s | — (rides the aggregates' "counts as of") |
 | Per-step `stale_work` counts (a full scan of chunks + findings, ≈1.6 s at production size) | 5 min | 30 s | "stale counts as of"; "loading…" for at most 1.5 s on the first load, then shown when ready |
 | Queue stats (`GetServiceStatus`: coverage, embed backlog, chunk total and last embed — a full count of `transcript_chunks` — and the runner version). The **page only**: the Pipeline page and `GET /api/v1/status` read them live, and the runner-update POST re-renders with live stats | 15 s | 30 s | — ("—" in the cards for at most 2 s on the first load) |
 | LiteLLM gateway readiness + key info | 60 s | 2 s per request (≤ 3 requests) | — |
