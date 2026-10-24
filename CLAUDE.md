@@ -82,6 +82,10 @@ MCP_TRANSPORT=http ./earmark mcp  # HTTP transport on :8081
 ./earmark models history decide
 # Track record per recipe — model quality over time (CONTRACT §2.15 "Labels and scorecards"):
 ./earmark models report [--since 2026-10-01] [--step propose|decide] [--json]
+# The audit trail, read-only (CONTRACT §2.12.2): newest first, 20 rows, same registry as GET /api/v1/audit/{source}
+./earmark audit step_runs -f status=running
+./earmark audit fn_calls -f error_class=timeout -n 50 -c id,fn,model_alias,latency_ms,created_at
+./earmark audit finding_events -f transcript_id=<uuid> --asc --json
 ./earmark labels import --set bakeoff-2026-10-qw2 --labeler opus:bakeoff-2026-10 --match-current-chunk --dry-run verdict-judges-qw2.md
 ./earmark labels import --set bakeoff-2026-10-qw1 --labeler opus:bakeoff-2026-10 --format bakeoff-key --labels jlabels.py --dry-run judge_items_key.json
 ./earmark decide --sample 200 --seed q4 --endpoint litellm-s1 --model clef:27b  # this run only

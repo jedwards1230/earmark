@@ -2763,6 +2763,29 @@ a bitmap scan and a top-N sort; `fn_calls` by `recipe_id` 0.55 s, a PK-order
 scan; `judge_passes` by `transcript_id` 2 ms), all inside the timeout. Follow-up
 (hardening, not built): run this path under a SELECT-only database role.
 
+**CLI — `earmark audit <source>`.** The same read from a shell, against the
+database (`DATABASE_URL`; like every command it applies pending migrations on
+connect) instead of the HTTP API: `db.AuditRows` on the same registry, so the
+sources, columns, filters, the read-only transaction, UTC timestamps and the 5 s
+statement timeout are the endpoint's, and the allowlist above governs the CLI
+too. It prints **newest first** (the cursor is `AuditNewest`), at most `-n/--limit`
+rows (default 20, `1..500`, never unbounded), narrowed by repeatable
+`-f/--filter name=value` (validated against the source's filters before any
+query; a value is never echoed back). `--before ID` / `--after ID` page like the
+API's cursors (`--after` and `--asc` read oldest first; `--before` and `--after`
+do not mix); a full page ends with `N rows · next page: --before ID`
+(`--after ID` ascending). The text view is a table in registry column order,
+abbreviated: 64-hex digests cut to 12 characters, timestamps to whole seconds
+(`…Z`, they are always UTC), cells to 48 characters, `NULL` as `-`;
+`-c/--columns a,b` prints just those columns, whole. Non-printable characters
+in a value (model, host and actor names and reason codes come from outside the
+process) print as `?`. `--json` prints the page exactly as the API returns it —
+`{"source":…,"rows":[…],"next":…}` on one line, every column, whole; `--columns`
+does not apply to it. Log lines go to stderr, so stdout is the page alone. There
+is no `--follow`: a tail is a rerun with a re-read overlap (semantics 1 below).
+Exit status: `2` for a bad flag or an unknown source, column or filter; `1` for
+a failed read (`add a --filter or lower --limit` on the statement timeout).
+
 **Semantics a consumer must know.**
 
 1. *The cursor is not gap-safe.* It is the `BIGSERIAL`/identity `id`, which is
@@ -2786,17 +2809,13 @@ scan; `judge_passes` by `transcript_id` 2 ms), all inside the timeout. Follow-up
    re-sends a row it already returned, so watching a run's progress means
    re-reading it (`?step=decide&status=running`, or `after=<id-1>`), not
    tailing.
-3. *Ascending only.* There is no descending order and no `before`: reaching the
-   newest rows of a large table means narrowing with a filter (`recipe_id`,
-   `transcript_id`, `status=running`, …) or paging. A tail/`before` option is a
-   follow-up, not part of this contract.
-4. *Access.* An unauthenticated read like `/api/v1/status` and `/api/v1/runs`,
+3. *Access.* An unauthenticated read like `/api/v1/status` and `/api/v1/runs`,
    behind the LAN-only ingress (the `redirect-lan` middleware, §2.8). The
    allowlist above is what keeps it safe to leave open; the concurrency cap, the
    statement timeout and the write deadline keep it cheap.
 
 Out of scope here (follow-ups): any write, SSE/streaming, a union feed across
-sources, MCP tools over it, a per-book audit view, a JSON scorecard, indexes for
+sources, `--follow`, MCP tools over it, a per-book audit view, a JSON scorecard, indexes for
 the unindexed filters, a dedicated connection pool, and a SELECT-only database
 role.
 
