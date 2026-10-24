@@ -142,6 +142,19 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
+// With returns a copy of c with opts applied. The copy has its own HTTP
+// client value (so WithTimeout on it leaves c's timeout alone) but shares c's
+// transport, and with it the connection pool.
+func (c *Client) With(opts ...Option) *Client {
+	cp := *c
+	h := *c.http
+	cp.http = &h
+	for _, o := range opts {
+		o(&cp)
+	}
+	return &cp
+}
+
 // Decide sends req and returns the validated reply.
 func (c *Client) Decide(ctx context.Context, req Request) (*Response, error) {
 	if err := validateRequest(req); err != nil {
