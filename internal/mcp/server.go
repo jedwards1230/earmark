@@ -82,6 +82,11 @@ type MCPServer struct {
 	// metrics is the Prometheus registry mounted at /metrics (CONTRACT §2.16).
 	// nil in the demo (no DB-backed scrape source).
 	metrics *metrics.Registry
+
+	// auditInflight counts the audit reads running now (GET /api/v1/audit/…,
+	// CONTRACT §2.12.2); past auditMaxInflight the next one is a 429. The zero
+	// value is ready to use.
+	auditInflight atomic.Int32
 }
 
 // evalState carries the dashboard's on-demand eval-run wiring. configured
@@ -444,6 +449,7 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 //	POST /actions/eval         — run the LLM judge over one book (htmx + token, async)
 //	POST /actions/eval-sample  — run the LLM judge over a library sample (htmx + token, async)
 //	GET  /api/v1/status              — pipeline status snapshot (JSON, no auth)
+//	GET  /api/v1/audit/{source}      — audit trail rows as stored, paged by id (JSON, no auth)
 //	GET  /api/v1/pipeline/pause      — current pause/run-limit state (JSON, no auth)
 //	PUT  /api/v1/pipeline/pause      — pause/resume (JSON, bearer token)
 //	POST /api/v1/pipeline/run        — run N jobs then auto-pause (JSON, bearer token)

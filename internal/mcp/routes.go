@@ -37,6 +37,7 @@ var apiRoutes = []apiRoute{
 	// and the spec is the public contract.
 	{Method: "GET", Pattern: "/api/v1/status", handler: (*MCPServer).handleAPIStatus},
 	{Method: "GET", Pattern: "/api/v1/runs", handler: (*MCPServer).handleAPIRuns},
+	{Method: "GET", Pattern: "/api/v1/audit/{source}", handler: (*MCPServer).handleAPIAudit},
 	{Method: "GET", Pattern: "/api/v1/pipeline/pause", handler: (*MCPServer).handleAPIPauseGet},
 	{Method: "GET", Pattern: "/api/v1/openapi.yaml", handler: (*MCPServer).handleOpenAPISpec},
 

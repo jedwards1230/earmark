@@ -104,6 +104,11 @@ type DBInterface interface {
 	// "Running now" panel, the role cards' active-run link and GET
 	// /api/v1/runs. Two index-backed LIMIT queries.
 	StepRuns(ctx context.Context, activeLimit, recentLimit int) (db.StepRunList, error)
+	// AuditRows serves one page of an audit source as stored (CONTRACT
+	// §2.12.2): rows of the named table with id > after, ascending, narrowed by
+	// the source's equality filters, from a fixed column allowlist. For GET
+	// /api/v1/audit/{source}; read-only, bounded by a statement timeout.
+	AuditRows(ctx context.Context, source string, after int64, limit int, filters map[string]string) (db.AuditPage, error)
 	// GetFindingsSummary returns the read-only eval-layer findings rollup
 	// (totals, confidence buckets, issue-type tally, per-book) for the /findings
 	// dashboard page (CONTRACT §2.15).
