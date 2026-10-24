@@ -1254,8 +1254,12 @@ components:
           additionalProperties:
             type: integer
           description: |
-            Outcome counters (decide: apply/hold/reject/reanchor/cached/errors/skipped/capped; scan: scanned/cached/fallback/errors/written; eval: evaluated/errors/findings, or for a backfill latched/failed/not_embedded/skipped/chunks/chunk_errors/findings; revert: moved/skipped/revoked/reflagged).
+            Outcome counters (decide: apply/hold/reject/duplicate/reanchor/cached/errors/conflict_asks, and with `--yes` skipped/capped/duplicates; scan: scanned/cached/fallback/errors/written; eval: evaluated/errors/findings, or for a backfill latched/failed/not_embedded/skipped/chunks/chunk_errors/findings; revert: moved/skipped/revoked/reflagged).
+
+
+            A decide run carries two different duplicate counters (CONTRACT §1.10); never add them. `duplicate` is a per-finding outcome like `apply`/`hold`: findings of the run's own work list that grouped as a duplicate of another finding's identical fix, counted in `done` (also in dry runs). `duplicates` (`--yes` only) is the number of rows actually written as duplicates — it also holds group members outside the page being decided (later pages, outside `--book`/`--issue-type`/`--shard`, past `--limit`), which are never ticked, so it is normally larger; it is not an outcome and not part of `done`.
           type: object
+          example: { apply: 1825, hold: 36461, reject: 7080, duplicate: 207, duplicates: 381, reanchor: 1, cached: 10712, conflict_asks: 4101 }
         done:
           description: |
             Items finished so far.

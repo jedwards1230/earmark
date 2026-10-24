@@ -493,6 +493,8 @@ func askingPhase(m Model) string { return "asking " + m.orDefault().Alias }
 
 // tickOutcome records one decided finding on rec: its class (apply, hold,
 // reject, reanchor, rung0_pass), a cache hit, a model error, and the spend.
+// A duplicate ticks "duplicate" here — a finding of the run's own list only; it
+// is not the "duplicates" rows-written counter of Apply (CONTRACT §1.10).
 func tickOutcome(rec *runs.Run, o Outcome) {
 	if rec == nil {
 		return

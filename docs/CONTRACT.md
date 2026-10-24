@@ -1773,7 +1773,7 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 
 | Step | Mode | Total | Counters | Phases |
 |---|---|---|---|---|
-| `decide` | `write` with `--yes`, else `dry_run` | `--yes`: the work list's size (`db.DecideWorkCount`, the very query `DecideWork` pages, 10 s budget) capped by `--limit`; NULL when the count fails. Dry run: the sample size | one per decided finding: `apply`, `hold`, `reject`, `duplicate`, `reanchor` (`rung0_pass` with `--rung0-only`), plus `cached`, `errors` (a `jev_unavailable` hold's model error), `conflict_asks` (calls made only to rank a conflict with a finding outside the run), and with `--yes` `skipped`, `capped`, `duplicates` (duplicates written, those grouped from outside the page included) | `sampling findings`, `counting work`, `loading page N`, `page N: loading chunks + rung-0`, `page N: asking jev-1.13.0`, `page N: writing batch i/n` |
+| `decide` | `write` with `--yes`, else `dry_run` | `--yes`: the work list's size (`db.DecideWorkCount`, the very query `DecideWork` pages, 10 s budget) capped by `--limit`; NULL when the count fails. Dry run: the sample size | one per decided finding: `apply`, `hold`, `reject`, `duplicate`, `reanchor` (`rung0_pass` with `--rung0-only`), plus `cached`, `errors` (a `jev_unavailable` hold's model error), `conflict_asks` (calls made only to rank a conflict with a finding outside the run), and with `--yes` `skipped`, `capped`, `duplicates` (rows written as duplicates, group members outside the page included — **not** the `duplicate` outcome, see below) | `sampling findings`, `counting work`, `loading page N`, `page N: loading chunks + rung-0`, `page N: asking jev-1.13.0`, `page N: writing batch i/n` |
 | `decide_revert` | `write` with `--yes` | — (one transaction) | `moved`, `skipped`, `revoked`, `reflagged` | `previewing the undo` / `revoking decisions`, then `done` |
 | `scan` | `write` with `--yes` | `--sample N`; NULL otherwise | `scanned`, `cached`, `fallback`, `errors`, `written` | `selecting chunks`, `asking <model>`, `writing chunk_scan` |
 | `eval_sample` / `eval_book` | `write` with `--write` | `--sample N` / NULL | `evaluated`, `errors`, `findings` | `asking <model>` |
@@ -1782,6 +1782,31 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 
 `done` counts finished items; `cost_usd` sums the calls' reported cost
 (cached calls are free).
+
+**`duplicate` and `duplicates` are two different counters of a decide run**
+(`internal/decide/run.go` `tickOutcome`, `apply.go` `Apply`):
+
+- `duplicate` is an *outcome* like `apply` or `hold`: one tick, counted in
+  `done`, for each finding of the run's **own** work list (the sample, or the
+  `--yes` work pages) that grouping classified as a duplicate of another
+  finding's identical fix (§2.19 "Agreeing and conflicting findings"). Dry runs
+  have it too. `done` is the sum of the outcome counters: `apply` + `hold` +
+  `reject` + `duplicate` + `reanchor` (with `--rung0-only`: `rung0_pass` +
+  `reject` + `duplicate` + `reanchor`).
+- `duplicates` (`--yes` only) counts the rows the write phase actually moved
+  `proposed → duplicate`. It is not an outcome and not part of `done`. A group is
+  written whole, so it also holds the group members that are *not* in the work
+  list of the page being decided — proposed findings of the same chunk on a later
+  page, outside `--book`/`--issue-type`/`--shard`, or past `--limit`. Those are
+  written as duplicates but never ticked (once written they leave the work list),
+  which is why `duplicates` is normally larger (run 365: `duplicate` 207,
+  `duplicates` 381). It can also be smaller: a duplicate ticked in the compute
+  phase whose write was skipped (row locked, chunk changed, representative not
+  written) is in `duplicate` but not in `duplicates`.
+
+They count different things in different units; never add them. The
+Prometheus series `earmark_step_run_items_total{outcome="duplicate"}` and
+`{outcome="duplicates"}` carry them under the same names (§2.16).
 
 - **Lifecycle.** Inserted at start (synchronously, so the run is visible at
   once), heartbeated, closed with `done`, `failed` (any error) or `cancelled`
@@ -4424,7 +4449,7 @@ judge's bounded drop `reason` and the three-value quality scope (`library` · `a
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
 | `earmark_step_run_active` | gauge | `step` (`decide` · `decide_revert` · `scan` · `eval_sample` · `eval_book` · `eval_backfill` · `eval_rejudge`), `mode` (`dry_run` · `write`) | Step runs (§1.10) open with a live heartbeat (≤ 2 min old); a stale run is not counted. Ingest pod; read from `step_runs` every 15 s. No series while nothing runs. |
 | `earmark_step_run_progress_ratio` | gauge | `step` | `done / total` (0..1) of the step's newest live run that knows its total. No series without one. Ingest pod, every 15 s. |
-| `earmark_step_run_items_total` | counter | `step`, `outcome` (the run counters of §1.10: `apply`, `hold`, `reject`, `reanchor`, `cached`, `errors`, `scanned`, `written`, `evaluated`, `latched`, …) | Every counter summed over every recorded run in `step_runs` (an observable counter read from the table, so it survives pod restarts). Ingest pod, every 15 s. **No run id is ever a label.** |
+| `earmark_step_run_items_total` | counter | `step`, `outcome` (the run counters of §1.10: `apply`, `hold`, `reject`, `reanchor`, `cached`, `errors`, `scanned`, `written`, `evaluated`, `latched`, …) | Every counter summed over every recorded run in `step_runs` (an observable counter read from the table, so it survives pod restarts). Ingest pod, every 15 s. **No run id is ever a label.** The `outcome` values are not one unit: for `step="decide"`, `outcome="duplicate"` counts findings of the run's own work list classified duplicate (part of `done`) and `outcome="duplicates"` the rows `--yes` wrote as duplicates, group members outside the page included (not part of `done`) — summing them double-counts, as does adding `cached`, `errors` or `conflict_asks` to the decision outcomes (§1.10). |
 | `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |
 | `earmark_model_calls_total` | counter | `fn` (`judge`, or a pure function's name), `model` (requested), `outcome` (`ok` · `error` · `fallback` · `cached`) | Every judge call and every pure-function call (§1.9 `fn_calls`). `fallback` = answered by a model other than the registry's `expected_model` (§2.18), compared without a router's route prefix (`anthropic/claude-…` = `claude-…`). `cached` = a pure-function call served from `fn_calls`, no model request made. |
 

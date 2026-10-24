@@ -205,6 +205,8 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		}
 		rec.Count("skipped", int64(ws.Skipped-before.Skipped))
 		rec.Count("capped", int64(ws.Capped-before.Capped))
+		// Rows written as duplicates, group members off this page included — not
+		// the "duplicate" outcome tickOutcome counts, never to be summed (CONTRACT §1.10).
 		rec.Count("duplicates", int64(ws.Duplicates-before.Duplicates))
 		for _, it := range prep.items {
 			it.input, it.chunk, it.sentences = Input{}, nil, nil // the report needs finding + outcome only

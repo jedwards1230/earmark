@@ -18,6 +18,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/db"
 	"github.com/jedwards1230/earmark/internal/patch"
 	"github.com/jedwards1230/earmark/internal/recipe"
+	"github.com/jedwards1230/earmark/internal/runs"
 )
 
 const (
@@ -150,6 +151,46 @@ func groupStates(t *testing.T, conn *pgx.Conn) map[string]findingRow {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// TestIntegrationDecideDuplicateCounters: a decide run's `duplicate` and
+// `duplicates` counters are different units (CONTRACT §1.10). `duplicate` ticks
+// the duplicates of the run's own work list; `duplicates` counts the rows the
+// write moved to duplicate — a group member outside the work page is written
+// with its group and never ticked. With --limit 1 the run decides one finding,
+// gGemma, a duplicate of gLuna, and the same group's gNewer rides along.
+func TestIntegrationDecideDuplicateCounters(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedGroups(t, d, conn)
+
+	run := runs.Start(ctx, d, runs.Spec{Step: runs.StepDecide, Mode: db.StepRunWrite})
+	rep, err := Apply(ctx, d, groupAsker(), ApplyOptions{Concurrency: 2, Params: DefaultShouldApplyParams(), Limit: 1, Progress: run})
+	run.Finish(err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Write.Duplicates != 2 {
+		t.Fatalf("write stats %+v, want gGemma and gNewer written as duplicates", rep.Write)
+	}
+	s := groupStates(t, conn)
+	for _, id := range []string{gGemma, gNewer} {
+		if s[id].state != "duplicate" || s[id].dupOf != gLuna {
+			t.Errorf("%s: %+v, want a duplicate of the representative", id, s[id])
+		}
+	}
+
+	var duplicate, duplicates, done int
+	if err := conn.QueryRow(ctx, `SELECT coalesce((counters->>'duplicate')::int, 0), coalesce((counters->>'duplicates')::int, 0), done
+		FROM step_runs ORDER BY id DESC LIMIT 1`).Scan(&duplicate, &duplicates, &done); err != nil {
+		t.Fatal(err)
+	}
+	if duplicate != 1 || done != 1 {
+		t.Errorf("duplicate = %d, done = %d; want the one finding of the work list ticked", duplicate, done)
+	}
+	if duplicates != 2 {
+		t.Errorf("duplicates = %d, want 2: the rows written, gNewer (off the page) included", duplicates)
+	}
 }
 
 func TestIntegrationDecideDuplicatesAndConflicts(t *testing.T) {
