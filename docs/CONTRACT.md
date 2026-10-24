@@ -3021,8 +3021,10 @@ LiteLLM pass-through, e.g.
   to unasked questions are dropped.
 - **Errors are typed**: 422 (not retryable), 429 (with `Retry-After`), 5xx,
   other statuses, and timeouts (15 s default; the caller's deadline counts) —
-  429, 5xx and timeouts are retryable. Error values carry no request or
-  response body and never the key.
+  429, 5xx and timeouts are retryable. `Client.With(opts…)` returns a copy with
+  its own options (it shares the transport); `earmark decide` uses it to give
+  the calls of a cold start a longer timeout (§2.19 "Cold start"). Error values
+  carry no request or response body and never the key.
 - **Cost**: the `x-litellm-response-cost` header when present and a
   non-negative number, else `input_tokens × usd_per_mtok_in / 1e6` (output is
   not billed) with `usd_per_mtok_in` from `MODELS_FILE`
@@ -5604,7 +5606,7 @@ bounded; neither writes.
 #### `earmark decide` (dry run)
 
 `earmark decide [--sample N] [--seed S] [--book X] [--issue-type T]
-[--concurrency 8] [--json] [--calibrate] [--rung0-only] [--dump FILE]` runs the pipeline above on a sample
+[--concurrency 4] [--json] [--calibrate] [--rung0-only] [--dump FILE]` runs the pipeline above on a sample
 and reports what a full run would do. **It decides nothing**: no
 `finding_events`, no state change, no `decided_by`. Its only writes are the
 decide recipe row (`recipes`, via `decide.Evaluator.Recipe`) and one `fn_calls`
@@ -5632,8 +5634,30 @@ GPU phase gate (System One is hosted).
   chunk over the sampled findings **plus** the chunk's unsampled proposed
   findings, so grouping and dedupe resolve exactly as a full run would. A sampled finding
   whose chunk no longer exists is `chunk_changed`.
-- **Model calls** through `internal/fn` with at most `--concurrency` (1–64) in
-  flight; a rung-0 failure makes no call.
+- **Model calls** through `internal/fn` with at most `--concurrency` (1–64,
+  default **4**) in flight; a rung-0 failure makes no call. 4 is the knee for
+  a decision model served locally, which answers one call at a time: measured
+  against `clef:27b` (Ollama, one loaded model, through LiteLLM), 1 in flight
+  gave 3.3 calls/s, 2 gave 4.5, 4 gave 4.64, and 8, 16 and 32 gave 4.63–4.66
+  with p50 latency rising from 0.9 s (4 in flight) to 1.7 s (8) to 6.8 s (32) —
+  past 4 calls only queue. The default does not change a decision: concurrency is not a recipe
+  param, and every call is independent of its neighbours. Raise it for an
+  endpoint that serves calls in parallel.
+- **Cold start.** A local decision model is unloaded after its keep-alive
+  (`OLLAMA_KEEP_ALIVE=5m`), and loading `clef:27b` takes about 15.4 s — longer
+  than the 15 s System One call timeout (§2.14). Left alone, the first calls of
+  a run would time out and be recorded as `jev_unavailable` holds while the
+  model loaded. So until the first System One call of a run has returned —
+  answered or failed — every call gets `decide.ColdStartTimeout` (2 min)
+  instead of 15 s (`decide.AskerFromConfig`, `earmark decide` and `--yes`
+  alike); after it, the ordinary timeout applies again. This is a longer
+  timeout, **not a warm-up call**: no request is made that is not a finding's
+  own, so nothing extra is logged in `fn_calls`, cached, counted in the report
+  or ticked as an outcome; the requests, cache keys, recipe, policy and
+  outcomes are exactly those of a run without it. An endpoint that never
+  answers costs one cold timeout, once. It does not re-arm if the model is
+  evicted mid-run (a game starting and the GPU arbiter parking it): those calls
+  time out at 15 s as before and are retried by the next run.
 - **Report** (text, or `--json`; aggregates, except the per-group and
   per-conflict lines of "Agreeing and conflicting findings"):
   outcome classes `apply` / `hold` / `reject` / `duplicate` / `reanchor` — a rung-0
@@ -5684,7 +5708,7 @@ GPU phase gate (System One is hosted).
 #### `earmark decide --yes` (full run)
 
 `earmark decide --yes [--limit N] [--shard i/N] [--batch 20] [--max-accepts N]
-[--book X] [--issue-type T] [--concurrency 8] [--json]` decides every finding
+[--book X] [--issue-type T] [--concurrency 4] [--json]` decides every finding
 in scope and writes the decisions (`decide.Apply`). `--sample`, `--seed` and
 `--calibrate` are dry-run only; `--limit`, `--shard` and `--max-accepts` need
 `--yes`.

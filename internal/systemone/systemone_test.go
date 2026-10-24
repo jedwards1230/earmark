@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -324,5 +325,58 @@ func TestNewRejectsBadBaseURL(t *testing.T) {
 		if _, err := New(u, ""); err == nil {
 			t.Errorf("base %q accepted", u)
 		}
+	}
+}
+
+// With copies the client: the copy's timeout is its own, the original keeps
+// its, and both keep the key, the route and the transport.
+func TestClientWith(t *testing.T) {
+	var auth []string
+	var mu sync.Mutex
+	slow := func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auth = append(auth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(w, reply(`"q":`+docNoul))
+	}
+	tr := &http.Transport{}
+	base := newTestClient(t, slow, WithHTTPClient(&http.Client{Transport: tr, Timeout: 40 * time.Millisecond}))
+	patient := base.With(WithTimeout(10 * time.Second))
+
+	tests := []struct {
+		name    string
+		client  *Client
+		wantErr bool
+	}{
+		{"original keeps its short timeout", base, true},
+		{"copy has its own long timeout", patient, false},
+		{"original still short after the copy was made", base, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.client.Decide(context.Background(), noulReq)
+			var te *TimeoutError
+			if timedOut := errors.As(err, &te); timedOut != tc.wantErr {
+				t.Fatalf("err = %v, want a timeout: %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	if patient.http.Transport != tr || base.http.Transport != tr {
+		t.Error("the copy does not share the original's transport")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, a := range auth {
+		if a != "Bearer sk-test" {
+			t.Errorf("a call went out with Authorization %q", a)
+		}
+	}
+	if len(auth) != 3 {
+		t.Errorf("%d requests, want 3", len(auth))
 	}
 }

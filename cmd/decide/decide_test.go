@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -20,7 +21,7 @@ import (
 )
 
 func TestValidate(t *testing.T) {
-	ok := options{sample: 10, seed: "s", concurrency: 8, batch: 20}
+	ok := options{sample: 10, seed: "s", concurrency: defaultConcurrency, batch: 20}
 	if err := validate(ok); err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +54,48 @@ func TestValidate(t *testing.T) {
 	o.issueType = decidepkg.IssueHomophone
 	if err := validate(o); err != nil {
 		t.Errorf("homophone refused: %v", err)
+	}
+}
+
+// --concurrency defaults to 4: the most a single local model, which serves
+// calls one at a time, can use (measured: 4.64 calls/s at 4, 4.63 at 8, 4.66
+// at 16, 4.65 at 32 — past 4 calls only queue). The default is what a bare
+// `earmark decide` runs with, it passes validation, and the help says so.
+func TestConcurrencyDefault(t *testing.T) {
+	f := DecideCmd.Flags().Lookup("concurrency")
+	if f == nil {
+		t.Fatal("no --concurrency flag")
+	}
+	for _, tc := range []struct {
+		name, got, want string
+		contains        bool // got must contain want, not equal it
+	}{
+		{"flag default", f.DefValue, "4", false},
+		{"constant", strconv.Itoa(defaultConcurrency), "4", false},
+		{"flag help names the limit", f.Usage, "past 4 they only queue", true},
+		{"long help names the default", DecideCmd.Long, "--concurrency (default 4)", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if (!tc.contains && tc.got != tc.want) || (tc.contains && !strings.Contains(tc.got, tc.want)) {
+				t.Errorf("got %q, want %q (contains: %v)", tc.got, tc.want, tc.contains)
+			}
+		})
+	}
+	if err := validate(options{sample: 1, seed: "s", concurrency: defaultConcurrency, batch: 20}); err != nil {
+		t.Errorf("the default is refused: %v", err)
+	}
+}
+
+// --concurrency stays bounded 1..64 whatever the default.
+func TestValidateConcurrencyBounds(t *testing.T) {
+	for _, tc := range []struct {
+		n    int
+		want bool
+	}{{0, false}, {1, true}, {4, true}, {8, true}, {64, true}, {65, false}, {-1, false}} {
+		err := validate(options{sample: 1, seed: "s", concurrency: tc.n, batch: 20})
+		if (err == nil) != tc.want {
+			t.Errorf("--concurrency %d: err %v, accepted %v", tc.n, err, tc.want)
+		}
 	}
 }
 

@@ -26,6 +26,7 @@ import (
 	decidepkg "github.com/jedwards1230/earmark/internal/decide"
 	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/runs"
+	"github.com/jedwards1230/earmark/internal/systemone"
 	"github.com/jedwards1230/earmark/internal/telemetry"
 )
 
@@ -62,6 +63,14 @@ type options struct {
 
 var opts options
 
+// defaultConcurrency is --concurrency's default: System One calls in flight.
+// Measured against Clef (clef:27b on one Ollama host, MAX_LOADED_MODELS=1,
+// through LiteLLM), which serializes the calls: 1 in flight gave 3.3 calls/s,
+// 2 gave 4.5, 4 gave 4.64, and 8, 16 and 32 gave 4.63-4.66 — the same
+// throughput with latency growing in step (p50 0.9 s at 4, 1.7 s at 8, 6.8 s at
+// 32). Past 4 calls only queue.
+const defaultConcurrency = 4
+
 // DecideCmd is `earmark decide`.
 var DecideCmd = &cobra.Command{
 	Use:   "decide [flags]",
@@ -84,6 +93,14 @@ Model: should_apply asks the decide step's effective model (CONTRACT §2.20):
 models set decide ...'), else AI_ROLES.decide. Any pinned System One model
 works; a different model is a different decide recipe, so its decisions are
 never confused with another model's. Neither flag writes model_settings.
+
+Calls: --concurrency (default 4) calls are in flight at once. A model served
+locally answers them one at a time (Clef: about 4.6 calls/s however many are
+in flight), so a higher value only lengthens the queue. A local model is also
+unloaded after its keep-alive, and loading it takes longer than the 15 s call
+timeout: until the first call has returned, calls get 2 minutes instead, so a
+cold start is waited out rather than recorded as jev_unavailable. No extra
+call is made for it and nothing about the decisions changes.
 
 Policy: each decide model has its own apply/reject rule (CONTRACT §2.19
 "Decide policy") — apply_p, reject_p, apply_evidence,
@@ -159,7 +176,8 @@ func init() {
 	f.StringVar(&opts.seed, "seed", "earmark", "sample seed: the same seed picks the same findings")
 	f.StringVar(&opts.book, "book", "", "only findings whose file path contains this (case-insensitive)")
 	f.StringVar(&opts.issueType, "issue-type", "", "only findings of this issue type")
-	f.IntVar(&opts.concurrency, "concurrency", 8, "concurrent System One calls")
+	f.IntVar(&opts.concurrency, "concurrency", defaultConcurrency,
+		fmt.Sprintf("concurrent System One calls (a local model serves them one at a time: past %d they only queue)", defaultConcurrency))
 	f.BoolVar(&opts.json, "json", false, "print the report as JSON")
 	f.BoolVar(&opts.calibrate, "calibrate", false, "sample human-decided findings and report agreement")
 	f.StringSliceVar(&opts.human, "human", nil, "with --calibrate: decided_by prefixes that count as a person (default mcp; e.g. mcp,cli)")
@@ -255,7 +273,7 @@ func runDecide(cmd *cobra.Command, _ []string) {
 	// A rung-0 replay asks no model, so it needs no decide endpoint.
 	var asker decidepkg.Asker
 	if !opts.rung0Only {
-		client, ok, err := decidepkg.ClientFromConfig(cfg)
+		a, ok, err := decidepkg.AskerFromConfig(cfg)
 		if !ok {
 			fmt.Fprintln(os.Stderr, "Error: earmark decide needs AI_ROLES.decide bound to a systemone endpoint in AI_ENDPOINTS (CONTRACT §2.14), or a decide model setting (earmark models set decide)")
 			os.Exit(2)
@@ -264,7 +282,9 @@ func runDecide(cmd *cobra.Command, _ []string) {
 			fmt.Fprintf(os.Stderr, "Error: decide endpoint: %v\n", err)
 			os.Exit(2)
 		}
-		asker = client
+		asker = a
+		log.Printf("decide: %d System One calls in flight; a call times out after %s, or %s until the first call has returned (a cold model load)",
+			opts.concurrency, systemone.DefaultTimeout, decidepkg.ColdStartTimeout)
 	}
 
 	tel, terr := telemetry.Setup(context.Background())
