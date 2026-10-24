@@ -2530,8 +2530,9 @@ The decide and scan evidence is a separate cache, an aggregate over the
 budget — it scans the whole call log (~0.8 s at 150k rows and growing), which
 the snapshot's 3 s budget shared with its four other queries could not
 reliably cover — and it is best-effort: a refresh that fails after a good one
-keeps serving the last good value; when it alone fails with none — an error
-or its 30 s budget — the snapshot still
+keeps serving the last good value; when it alone fails with none — an error,
+its 30 s budget, or a first load still running after 3 s (a request never waits
+longer; the load finishes in the background) — the snapshot still
 loads, the other roles are untouched (`countsError: false`), and only
 `roles[decide]` and `roles[scan]` read `state: unknown` with `countsError:
 true` and the reason `call outcomes unavailable — fn_calls aggregate failed or

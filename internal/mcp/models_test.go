@@ -1258,3 +1258,42 @@ func TestModelsCaches_FnRolesFailureModes(t *testing.T) {
 		})
 	}
 }
+
+// slowFnRolesDB blocks the fn_calls aggregate until released.
+type slowFnRolesDB struct {
+	SimpleMockDB
+	release chan struct{}
+}
+
+func (d *slowFnRolesDB) FnRoleActivity(ctx context.Context) ([]db.FnRoleActivity, error) {
+	select {
+	case <-d.release:
+		return []db.FnRoleActivity{{Step: recipe.StepDecide, Fn: "should_apply"}}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestModelsCaches_FnRolesFirstLoadIsBounded: a cold request must not be held
+// for the aggregate's full 30 s budget — it returns once fnRolesWait passes with
+// Decide/Scan unknown, and the next read picks up the value the background load
+// finished.
+func TestModelsCaches_FnRolesFirstLoadIsBounded(t *testing.T) {
+	d := &slowFnRolesDB{release: make(chan struct{})}
+	c := newModelsCaches(d, nil)
+	c.fnRolesWait = 50 * time.Millisecond
+
+	start := time.Now()
+	ev := c.read(context.Background(), 50*time.Millisecond)
+	assert.Less(t, time.Since(start), time.Second, "the page must not wait on the aggregate's full budget")
+	require.NotNil(t, ev.Snap, "the snapshot loads independently")
+	require.Error(t, ev.Snap.FnRolesErr, "no value yet: Decide/Scan unknown")
+	assert.Empty(t, ev.Snap.FnRoles)
+
+	close(d.release)
+	c.fnRoles.waitIdle()
+	ev = c.read(context.Background(), 50*time.Millisecond)
+	require.NotNil(t, ev.Snap)
+	assert.NoError(t, ev.Snap.FnRolesErr)
+	assert.Len(t, ev.Snap.FnRoles, 1)
+}

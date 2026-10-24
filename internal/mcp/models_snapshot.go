@@ -128,15 +128,20 @@ func loadStaleSnapshot(ctx context.Context, d DBInterface) (staleSnapshot, error
 type modelsCaches struct {
 	models  *refreshCache[modelsSnapshot]
 	fnRoles *refreshCache[[]db.FnRoleActivity]
-	stale   *refreshCache[staleSnapshot]
-	queue   *refreshCache[*db.QueueStats]
+	// fnRolesWait bounds how long a request waits for the fn_calls aggregate's
+	// FIRST load, so a cold page returns as fast as it did when the aggregate
+	// shared the snapshot's budget; the load carries on in the background.
+	fnRolesWait time.Duration
+	stale       *refreshCache[staleSnapshot]
+	queue       *refreshCache[*db.QueueStats]
 }
 
 func newModelsCaches(d DBInterface, logWarn func(msg string, args ...any)) modelsCaches {
 	c := modelsCaches{
 		models: newRefreshCache(modelsSnapshotTTL, modelsSnapshotTimeout,
 			func(ctx context.Context) (modelsSnapshot, error) { return loadModelsSnapshot(ctx, d) }),
-		fnRoles: newRefreshCache(fnRolesTTL, fnRolesTimeout, d.FnRoleActivity),
+		fnRoles:     newRefreshCache(fnRolesTTL, fnRolesTimeout, d.FnRoleActivity),
+		fnRolesWait: modelsSnapshotTimeout,
 		stale: newRefreshCache(staleSnapshotTTL, staleSnapshotTimeout,
 			func(ctx context.Context) (staleSnapshot, error) { return loadStaleSnapshot(ctx, d) }),
 		queue: newRefreshCache(queueStatsTTL, queueStatsTimeout, d.GetServiceStatus),
@@ -191,9 +196,12 @@ type modelsEvidence struct {
 
 // fnRoleActivity returns the cached decide/scan call evidence. A refresh that
 // failed after a good one keeps serving the last good value (logged by onError);
-// with none, the error is returned and the Decide and Scan cards read unknown.
+// with none — including a first load still running past fnRolesWait — the
+// error is returned and the Decide and Scan cards read unknown until it lands.
 func (c modelsCaches) fnRoleActivity(ctx context.Context) ([]db.FnRoleActivity, error) {
-	v, err := c.fnRoles.get(ctx)
+	wctx, cancel := context.WithTimeout(ctx, c.fnRolesWait)
+	defer cancel()
+	v, err := c.fnRoles.get(wctx)
 	if v != nil {
 		return v.Val, nil
 	}
@@ -205,7 +213,9 @@ func (c modelsCaches) fnRoleActivity(ctx context.Context) ([]db.FnRoleActivity, 
 
 // read returns both snapshots. After their first loads both are served from
 // cache without waiting. The aggregates' first load waits up to its own 3 s
-// timeout (bounded by ctx); the stale counts' first load (a full-library scan)
+// timeout (bounded by ctx), the fn_calls evidence's first load at most
+// fnRolesWait (then Decide/Scan read unknown while it finishes in the
+// background); the stale counts' first load (a full-library scan)
 // is waited for at most staleWait, then reported as pending while it finishes
 // in the background.
 func (c modelsCaches) read(ctx context.Context, staleWait time.Duration) modelsEvidence {
