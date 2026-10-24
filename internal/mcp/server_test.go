@@ -206,7 +206,7 @@ func (m *SimpleMockDB) FnRoleActivity(context.Context) ([]db.FnRoleActivity, err
 	return nil, nil
 }
 
-func (m *SimpleMockDB) AuditRows(_ context.Context, source string, _ int64, _ int, _ map[string]string) (db.AuditPage, error) {
+func (m *SimpleMockDB) AuditRows(_ context.Context, source string, _ db.AuditCursor, _ int, _ map[string]string) (db.AuditPage, error) {
 	return db.AuditPage{Source: source, Rows: json.RawMessage("[]")}, nil
 }
 

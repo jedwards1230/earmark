@@ -159,7 +159,7 @@ reversible. Full parameter documentation is in
 | `/` | htmx status dashboard — pipeline, library, per-book/track, models, findings |
 | `/api/v1/status` | JSON pipeline status (read-only, unauthenticated) |
 | `/api/v1/runs` | JSON step runs — what `decide`/`scan`/`eval` is running now (progress, phase, stale) and the recent outcomes (read-only, unauthenticated) |
-| `/api/v1/audit/{source}` | JSON audit trail as stored — `finding_events`, `judge_passes`, `fn_calls`, `step_runs`, `pipeline_events`; `after`/`limit` paging and equality filters per source; no prompt/reply bodies, error text, command lines or library paths (read-only, unauthenticated, 3 concurrent reads then `429`) |
+| `/api/v1/audit/{source}` | JSON audit trail as stored — `finding_events`, `judge_passes`, `fn_calls`, `step_runs`, `pipeline_events`; `after`/`limit` paging (oldest first) or `order=desc`/`before` (newest first) and equality filters per source; no prompt/reply bodies, error text, command lines or library paths (read-only, unauthenticated, 3 concurrent reads then `429`) |
 | `/api/v1/pipeline/pause`, `/api/v1/pipeline/run` | Pause/resume and run-N-then-pause. `PUT`/`POST`/`DELETE` require `Authorization: Bearer $CONTROL_API_TOKEN` and fail closed with `503` when it is unset |
 | `/api/v1/openapi.yaml` | OpenAPI 3.1 contract for the JSON control API, embedded in the binary (read-only, unauthenticated) |
 | `/healthz`, `/health` | Liveness |

@@ -2400,7 +2400,7 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
 |--------|------|------|------|--------|
 | `GET` | `/api/v1/status` | none | — | `200` queue/runner snapshot (JSON), incl. a `servers[]` array (name, host, role, configured, state, model, modelSize, computeMode, jobsDone; plus gpuProbed/gpuReachable/gpuState/vramUsedMb/vramTotalMb when a `gpuArbiterUrl` is configured), an `endpoints[]` array (id, type, backend, baseURL, model, options, role, state, probed, gateway, gatewayInferred — the AI endpoint registry with **liveness-only** probes, §2.14), a **`roles[]`** array (the Models page role board — see below), an `eta` object (the empirical ETA, §4: `{remainingChunks, workSeconds, calendarSeconds, calendarKnown, evalIncluded, hasWork, label}`; `null` when no estimate could be computed), a **`pipeline`** object (see below), and a **`runs`** object (the `GET /api/v1/runs` body; `null` when its read failed) |
 | `GET` | `/api/v1/runs[?recent=N]` | none | — | `200 {"active":[…],"recent":[…],"staleAfterSeconds":120}` — the ad-hoc step runs (§1.10): `active` = open runs with a heartbeat under 24 h old, newest first; `recent` = the newest N (1–100, default 10) other runs. Each: `id, step, mode, status` (`running`·`stale`·`done`·`failed`·`cancelled`), `stale, recipeId, model, args, host, startedAt, heartbeatAt, finishedAt, total, done, progress` (0..1, null without a total), `elapsedSeconds, etaSeconds` (live runs with a total only), `counters, costUsd, message` (the current phase), `error`. `400` on a bad `recent`. |
-| `GET` | `/api/v1/audit/{source}[?after=ID&limit=N&<filter>=V]` | none | — | `200 {"source":"…","rows":[…],"next":ID\|null}` — the audit trail served as stored: `source` is one of `finding_events`, `judge_passes`, `fn_calls`, `step_runs`, `pipeline_events`; `rows` are ordered by `id` ascending, strictly after `after` (default 0), at most `limit` (1–500, default 100); `next` is the last row's `id` (feed it back as `after`), `null` exactly when `rows` is empty. `404` unknown source; `400` malformed query string, unknown/repeated/empty parameter, bad `after`/`limit`, bad filter value; `429` (`Retry-After: 1`) three audit reads already running; `503` the query hit its 5 s statement timeout. Columns and filters per source: §2.12.2 |
+| `GET` | `/api/v1/audit/{source}[?after=ID \| order=desc[&before=ID]][&limit=N][&<filter>=V]` | none | — | `200 {"source":"…","rows":[…],"next":ID\|null}` — the audit trail served as stored: `source` is one of `finding_events`, `judge_passes`, `fn_calls`, `step_runs`, `pipeline_events`; by default `rows` are ordered by `id` ascending, strictly after `after` (default 0), at most `limit` (1–500, default 100), and `next` is the last row's `id` (feed it back as `after`); with `order=desc` they are **newest first**, strictly below `before` (default: from the newest row), and `next` is the last — lowest — row's `id` (feed it back as `before`); `next` is `null` exactly when `rows` is empty. `404` unknown source; `400` malformed query string, unknown/repeated/empty parameter, bad `after`/`before`/`limit`/`order`, `order=desc` together with `after`, `before` without `order=desc`, bad filter value; `429` (`Retry-After: 1`) three audit reads already running; `503` the query hit its 5 s statement timeout. Columns and filters per source: §2.12.2 |
 | `GET` | `/api/v1/pipeline/pause` | none | — | `200 {"paused":bool,"runLimit":int\|null}` |
 | `PUT` | `/api/v1/pipeline/pause` | bearer | `{"paused":bool}` | `200` current state (`paused:false` resumes + clears bound) |
 | `POST` | `/api/v1/pipeline/run` | bearer | `{"limit":N}` (N≥1) | `202 {"paused":false,"runLimit":N}` — run N then auto-pause |
@@ -2593,33 +2593,55 @@ Monitoring is the read side of the write path: the steps already append to
 stored. There is no per-table handler, no union across sources and no write.
 
 ```
-GET /api/v1/audit/{source}?after=<id>&limit=<n>&<filter>=<value>
+GET /api/v1/audit/{source}?after=<id>&limit=<n>&<filter>=<value>          oldest first (default)
+GET /api/v1/audit/{source}?order=desc&before=<id>&limit=<n>&<filter>=<value>   newest first
 → 200 {"source":"step_runs","rows":[{…},{…}],"next":367}
 ```
 
 - **`source`** — `finding_events` · `judge_passes` · `fn_calls` · `step_runs` ·
   `pipeline_events`. Anything else is `404 {"error":"unknown audit source …"}`
   (the body lists the valid ones).
-- **`after`** — exclusive cursor on the table's `id`; default `0`. Plain decimal
-  digits only (`0`, `364`; not `+5`, `007`, `-0`, `1e3`), at most
-  `9223372036854775807`.
+- **`order`** — `asc` (the default) or `desc`; anything else is `400`. `desc`
+  reads newest first, so the latest rows of a large table need no knowledge of
+  its highest id.
+- **`after`** — exclusive cursor on the table's `id` for an ascending read;
+  default `0`. Plain decimal digits only (`0`, `364`; not `+5`, `007`, `-0`,
+  `1e3`), at most `9223372036854775807`. Not allowed with `order=desc`.
+- **`before`** — the same cursor for a descending read: rows with `id` strictly
+  below it, written exactly like `after`. Default: no bound — the read starts at
+  the newest row. `before=0` is valid and matches nothing (`rows: []`,
+  `next: null`). Only allowed with `order=desc`.
 - **`limit`** — rows per page; default `100`, valid `1..500`, written as plain
   decimal digits. Out of range is `400` (never clamped), the same convention as
   `recent` on `/api/v1/runs`.
 - **filters** — equality only, at most one value each, per the table below. A
-  parameter that is not `after`, `limit` or a filter of this source is `400`
-  (the body lists the valid ones), as is a repeated parameter, an empty value, a
-  value that is not valid UTF-8 or contains a NUL byte, or a non-UUID value for
-  a UUID filter. Filters AND together. A query string that does not parse (a
+  parameter that is not `order`, `after`, `before`, `limit` or a filter of this
+  source is `400` (the body lists the valid ones), as is a repeated parameter,
+  an empty value, a value that is not valid UTF-8 or contains a NUL byte, or a
+  non-UUID value for a UUID filter. The two directions do not mix: `order=desc`
+  with `after`, and `before` without `order=desc` (including with `order=asc`),
+  are `400`. Filters AND together. A query string that does not parse (a
   `;` separator, a bad `%` escape) is `400 {"error":"malformed query string"}`
   — it is never read as if the broken pair were absent.
-- **`rows`** — ordered by `id` ascending, strictly after `after`; the objects
+- **`rows`** — in the requested order: ascending by `id`, strictly after
+  `after` (the default), or descending, strictly below `before`; the objects
   carry exactly the columns below under their column names. `[]` (never `null`)
   when nothing matches.
-- **`next`** — the last returned row's `id`; `null` exactly when `rows` is
-  empty. Page by passing `next` back as `after`; a page shorter than `limit`
-  means there is nothing newer *right now*, and tailing is polling again with
-  the same `after`.
+- **`next`** — the last returned row's `id`, which is the highest of an
+  ascending page and the **lowest** of a descending one; `null` exactly when
+  `rows` is empty. Page by passing `next` back as `after` (ascending) or as
+  `before` (descending). Ascending: a page shorter than `limit` means there is
+  nothing newer *right now*, and tailing is polling again with the same
+  `after`. Descending: paging down ends at the oldest row — a page whose last
+  row is id `1` has `next: 1`, and `before=1` is then `rows: []`,
+  `next: null`. A newest-first read does not move when rows are appended:
+  ids below `before` are fixed.
+- **Cost** — both directions are a range scan of the table's primary key
+  stopped by `LIMIT` (`Index Scan Backward` for `desc`), with the filters
+  applied on top, so a page is a handful of buffer reads whatever the table
+  holds. A filter that matches little of a big table (`fn_calls?error_class=…`)
+  may walk far before it finds `limit` rows; the 5 s statement timeout (`503`)
+  bounds it.
 - **Errors** — every error body is `{"error":"…"}`; no message echoes a value
   the caller sent.
   - `400` — as above.
@@ -2644,7 +2666,7 @@ UUIDs are strings, `JSONB` columns are embedded objects, `NULL` is `null`.
 
 **The registry is the security boundary.** The source → table → columns →
 filters mapping is one static Go slice (`internal/db/audit.go`); the table and
-column names in the SQL come only from it, and every value (`after`, filter
+column names in the SQL come only from it, and every value (`after`/`before`, filter
 values, `limit`) is a bind parameter, so a request can neither name a table or
 column of its own nor inject SQL. Only the listed columns are ever selected;
 a column is served only if it is on the list, so a column added by a later

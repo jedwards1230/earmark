@@ -30,14 +30,16 @@ const (
 	auditMaxInflight = 3
 )
 
-// handleAPIAudit serves GET /api/v1/audit/{source}[?after=ID&limit=N&<filter>=V]
-// (CONTRACT §2.12.2): the audit trail as stored, ascending by id after a
-// cursor. The source, its columns and its filters all come from the db.Audit*
-// registry; this handler only validates the query string against it.
+// handleAPIAudit serves GET /api/v1/audit/{source}[?after=ID | order=desc
+// [&before=ID]][&limit=N][&<filter>=V] (CONTRACT §2.12.2): the audit trail as
+// stored, ascending by id after a cursor or, with order=desc, newest first
+// before one. The source, its columns and its filters all come from the
+// db.Audit* registry; this handler only validates the query string against it.
 //
 //	404 unknown source
-//	400 malformed query string; unknown / repeated / empty parameter; bad after
-//	    or limit; bad filter value
+//	400 malformed query string; unknown / repeated / empty parameter; bad
+//	    after, before, order or limit; order=desc with after; before without
+//	    order=desc; bad filter value
 //	429 auditMaxInflight reads are already running (Retry-After: 1)
 //	503 the read hit its statement timeout
 //	500 anything else (logged, never echoed)
@@ -56,7 +58,7 @@ func (s *MCPServer) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "malformed query string")
 		return
 	}
-	after, limit, filters, err := parseAuditQuery(src, q)
+	cur, limit, filters, err := parseAuditQuery(src, q)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -78,13 +80,13 @@ func (s *MCPServer) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), auditQueryTimeout)
 	defer cancel()
-	page, err := s.db.AuditRows(ctx, src.Name, after, limit, filters)
+	page, err := s.db.AuditRows(ctx, src.Name, cur, limit, filters)
 	switch {
 	case errors.Is(err, context.Canceled):
 		s.logger.Debug("api audit: client went away", "source", src.Name)
 		return
 	case errors.Is(err, db.ErrAuditTimeout):
-		s.logger.Warn("api audit timed out", "source", src.Name, "after", after, "limit", limit, "filters", len(filters))
+		s.logger.Warn("api audit timed out", "source", src.Name, "cursor", cur.ID, "desc", cur.Desc, "limit", limit, "filters", len(filters))
 		writeJSONError(w, http.StatusServiceUnavailable, "audit query timed out; add a filter or lower limit")
 		return
 	case err != nil:
@@ -98,12 +100,22 @@ func (s *MCPServer) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, page)
 }
 
-// parseAuditQuery validates the query string against the source: after (plain
-// decimal digits, default 0), limit (plain decimal digits, 1..AuditMaxLimit,
-// default AuditDefaultLimit) and the source's equality filters. Any other
-// parameter, a repeated one, or an empty value is an error. Parameters are
-// checked in name order so the first error reported is stable.
-func parseAuditQuery(src db.AuditSource, q url.Values) (after int64, limit int, filters map[string]string, err error) {
+// parseAuditQuery validates the query string against the source: order (asc,
+// the default, or desc), after and before (plain decimal digits; after for an
+// ascending read, before for a descending one), limit (plain decimal digits,
+// 1..AuditMaxLimit, default AuditDefaultLimit) and the source's equality
+// filters. Any other parameter, a repeated one, or an empty value is an error,
+// and so is mixing the directions: order=desc with after, or before without
+// order=desc. Without order=desc and after the read is ascending from 0; with
+// order=desc and no before it starts at the newest row. Parameters are checked
+// in name order so the first error reported is stable. No message echoes a
+// value.
+func parseAuditQuery(src db.AuditSource, q url.Values) (cur db.AuditCursor, limit int, filters map[string]string, err error) {
+	var (
+		after, before       int64
+		hasAfter, hasBefore bool
+		desc                bool
+	)
 	limit = db.AuditDefaultLimit
 	names := make([]string, 0, len(q))
 	for name := range q {
@@ -113,28 +125,37 @@ func parseAuditQuery(src db.AuditSource, q url.Values) (after int64, limit int, 
 	for _, name := range names {
 		vals := q[name]
 		if len(vals) != 1 {
-			return 0, 0, nil, fmt.Errorf("parameter %q must be given once", name)
+			return db.AuditCursor{}, 0, nil, fmt.Errorf("parameter %q must be given once", name)
 		}
 		v := vals[0]
 		if v == "" {
-			return 0, 0, nil, fmt.Errorf("parameter %q is empty", name)
+			return db.AuditCursor{}, 0, nil, fmt.Errorf("parameter %q is empty", name)
 		}
 		switch name {
-		case "after":
+		case "after", "before":
 			n, ok := parseDigits(v)
 			if !ok {
-				return 0, 0, nil, errors.New("after must be an integer >= 0 in plain digits")
+				return db.AuditCursor{}, 0, nil, fmt.Errorf("%s must be an integer >= 0 in plain digits", name)
 			}
-			after = n
+			if name == "after" {
+				after, hasAfter = n, true
+			} else {
+				before, hasBefore = n, true
+			}
+		case "order":
+			if v != "asc" && v != "desc" {
+				return db.AuditCursor{}, 0, nil, errors.New("order must be asc or desc")
+			}
+			desc = v == "desc"
 		case "limit":
 			n, ok := parseDigits(v)
 			if !ok || n < 1 || n > db.AuditMaxLimit {
-				return 0, 0, nil, fmt.Errorf("limit must be 1..%d in plain digits", db.AuditMaxLimit)
+				return db.AuditCursor{}, 0, nil, fmt.Errorf("limit must be 1..%d in plain digits", db.AuditMaxLimit)
 			}
 			limit = int(n)
 		default:
 			if err = src.CheckFilter(name, v); err != nil {
-				return 0, 0, nil, err
+				return db.AuditCursor{}, 0, nil, err
 			}
 			if filters == nil {
 				filters = map[string]string{}
@@ -142,7 +163,19 @@ func parseAuditQuery(src db.AuditSource, q url.Values) (after int64, limit int, 
 			filters[name] = v
 		}
 	}
-	return after, limit, filters, nil
+	switch {
+	case desc && hasAfter:
+		return db.AuditCursor{}, 0, nil, errors.New("order=desc pages with before, not after")
+	case hasBefore && !desc:
+		return db.AuditCursor{}, 0, nil, errors.New("before needs order=desc")
+	case desc && hasBefore:
+		cur = db.AuditBefore(before)
+	case desc:
+		cur = db.AuditNewest()
+	default:
+		cur = db.AuditAfter(after)
+	}
+	return cur, limit, filters, nil
 }
 
 // parseDigits reads a canonical non-negative decimal: ASCII digits only, no sign,

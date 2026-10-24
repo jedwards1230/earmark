@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"strings"
@@ -241,7 +242,7 @@ func TestAuditCheckFilter(t *testing.T) {
 var sqlWords = map[string]bool{
 	"select": true, "coalesce": true, "json_agg": true, "row_to_json": true, "order": true, "by": true,
 	"t": true, "as": true, "json": true, "max": true, "from": true, "where": true, "and": true, "limit": true,
-	"left": true, "text": true, "uuid": true,
+	"left": true, "text": true, "uuid": true, "desc": true, "min": true,
 }
 
 var wordPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
@@ -250,73 +251,109 @@ func TestAuditBuildQuery(t *testing.T) {
 	const hostile = "x'; DROP TABLE fn_calls;--"
 	const goodUUID = "e530a6f7-c96a-4cd5-a910-f809a99e0449"
 
+	// The two directions differ in exactly four places: the id comparison, the
+	// aggregate's order, the subquery's order and the page's last-row aggregate.
+	dirs := []struct {
+		name   string
+		cur    AuditCursor
+		cmp    string // the id predicate's operator
+		dir    string // the ORDER BY suffix
+		last   string // the aggregate that yields next
+		curArg int64  // the first request's cursor bind
+	}{
+		{"ascending", AuditAfter(0), ">", "", "max", 0},
+		{"descending", AuditNewest(), "<", " DESC", "min", math.MaxInt64},
+	}
 	for _, s := range AuditSources() {
-		t.Run(s.Name, func(t *testing.T) {
-			allowed := map[string]bool{s.Table: true}
-			var sel []string
-			for _, c := range s.Columns {
-				allowed[c.Name] = true
-				sel = append(sel, c.selectExpr())
-			}
-			wantSelect := "SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.id), '[]'::json), max(t.id) FROM (SELECT " +
-				strings.Join(sel, ", ") + " FROM " + s.Table + " WHERE id > $1"
+		for _, d := range dirs {
+			t.Run(s.Name+"/"+d.name, func(t *testing.T) {
+				allowed := map[string]bool{s.Table: true}
+				var sel []string
+				for _, c := range s.Columns {
+					allowed[c.Name] = true
+					sel = append(sel, c.selectExpr())
+				}
+				wantSelect := "SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.id" + d.dir + "), '[]'::json), " + d.last + "(t.id) FROM (SELECT " +
+					strings.Join(sel, ", ") + " FROM " + s.Table + " WHERE id " + d.cmp + " $1"
 
-			// No filters: after, limit and nothing else.
-			q, args, err := s.buildQuery(0, AuditDefaultLimit, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if want := wantSelect + " ORDER BY id LIMIT $2) t"; q != want {
-				t.Errorf("default query\n got: %s\nwant: %s", q, want)
-			}
-			if !slices.Equal(args, []any{int64(0), AuditDefaultLimit}) {
-				t.Errorf("default args = %v", args)
-			}
+				// No filters: the cursor, limit and nothing else.
+				cur := d.cur
+				q, args, err := s.buildQuery(cur, AuditDefaultLimit, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := wantSelect + " ORDER BY id" + d.dir + " LIMIT $2) t"; q != want {
+					t.Errorf("default query\n got: %s\nwant: %s", q, want)
+				}
+				if !slices.Equal(args, []any{d.curArg, AuditDefaultLimit}) {
+					t.Errorf("default args = %v", args)
+				}
 
-			// Every filter at once: clauses in registry order, placeholders
-			// consecutive, values only in args, UUID filters cast from text.
-			filters := map[string]string{}
-			for _, f := range s.Filters {
-				if f.UUID {
-					filters[f.Name] = goodUUID
-				} else {
-					filters[f.Name] = hostile
+				// Every filter at once: clauses in registry order, placeholders
+				// consecutive, values only in args, UUID filters cast from text.
+				filters := map[string]string{}
+				for _, f := range s.Filters {
+					if f.UUID {
+						filters[f.Name] = goodUUID
+					} else {
+						filters[f.Name] = hostile
+					}
 				}
-			}
-			q, args, err = s.buildQuery(41, 7, filters)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := wantSelect
-			wantArgs := []any{int64(41)}
-			for i, f := range s.Filters {
-				want += fmt.Sprintf(" AND %s = $%d", f.Column, i+2)
-				if f.UUID {
-					want += "::text::uuid"
+				cur.ID = 41
+				q, args, err = s.buildQuery(cur, 7, filters)
+				if err != nil {
+					t.Fatal(err)
 				}
-				wantArgs = append(wantArgs, filters[f.Name])
-			}
-			want += fmt.Sprintf(" ORDER BY id LIMIT $%d) t", len(s.Filters)+2)
-			wantArgs = append(wantArgs, 7)
-			if q != want {
-				t.Errorf("filtered query\n got: %s\nwant: %s", q, want)
-			}
-			if !slices.Equal(args, wantArgs) {
-				t.Errorf("filtered args = %v, want %v", args, wantArgs)
-			}
-			for _, bad := range []string{hostile, goodUUID, "DROP", ";", "--"} {
-				if strings.Contains(q, bad) {
-					t.Errorf("statement contains the value %q:\n%s", bad, q)
+				want := wantSelect
+				wantArgs := []any{int64(41)}
+				for i, f := range s.Filters {
+					want += fmt.Sprintf(" AND %s = $%d", f.Column, i+2)
+					if f.UUID {
+						want += "::text::uuid"
+					}
+					wantArgs = append(wantArgs, filters[f.Name])
 				}
-			}
+				want += fmt.Sprintf(" ORDER BY id%s LIMIT $%d) t", d.dir, len(s.Filters)+2)
+				wantArgs = append(wantArgs, 7)
+				if q != want {
+					t.Errorf("filtered query\n got: %s\nwant: %s", q, want)
+				}
+				if !slices.Equal(args, wantArgs) {
+					t.Errorf("filtered args = %v, want %v", args, wantArgs)
+				}
+				for _, bad := range []string{hostile, goodUUID, "DROP", ";", "--", "9223372036854775807"} {
+					if strings.Contains(q, bad) {
+						t.Errorf("statement contains the value %q:\n%s", bad, q)
+					}
+				}
 
-			// Every word in the statement is the builder's own or a registry name.
-			for _, w := range wordPattern.FindAllString(strings.ReplaceAll(q, "'[]'", ""), -1) {
-				if lw := strings.ToLower(w); !sqlWords[lw] && !allowed[w] {
-					t.Errorf("statement uses %q, which is neither builder SQL nor a registry name:\n%s", w, q)
+				// Every word in the statement is the builder's own or a registry name.
+				for _, w := range wordPattern.FindAllString(strings.ReplaceAll(q, "'[]'", ""), -1) {
+					if lw := strings.ToLower(w); !sqlWords[lw] && !allowed[w] {
+						t.Errorf("statement uses %q, which is neither builder SQL nor a registry name:\n%s", w, q)
+					}
 				}
-			}
-		})
+			})
+		}
+	}
+}
+
+// The cursor constructors: AuditNewest is "before the largest id", so the
+// statement keeps its single `id < $1` bind predicate.
+func TestAuditCursors(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		got  AuditCursor
+		want AuditCursor
+	}{
+		{"zero value is the first ascending page", AuditCursor{}, AuditAfter(0)},
+		{"after", AuditAfter(7), AuditCursor{ID: 7}},
+		{"before", AuditBefore(7), AuditCursor{ID: 7, Desc: true}},
+		{"newest", AuditNewest(), AuditCursor{ID: math.MaxInt64, Desc: true}},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s: %+v, want %+v", c.name, c.got, c.want)
+		}
 	}
 }
 
@@ -329,7 +366,7 @@ func TestAuditBuildQueryFilterOrderIsStable(t *testing.T) {
 	}
 	const id = "e530a6f7-c96a-4cd5-a910-f809a99e0449"
 	filters := map[string]string{"kind": "decision", "recipe_id": "r", "transcript_id": id, "finding_id": id}
-	first, _, err := s.buildQuery(0, 10, filters)
+	first, _, err := s.buildQuery(AuditAfter(0), 10, filters)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,14 +374,19 @@ func TestAuditBuildQueryFilterOrderIsStable(t *testing.T) {
 		t.Errorf("filter clauses out of registry order: %s", first)
 	}
 	for i := 0; i < 20; i++ {
-		again, _, _ := s.buildQuery(0, 10, filters)
+		again, _, _ := s.buildQuery(AuditAfter(0), 10, filters)
 		if again != first {
 			t.Fatalf("statement changed between calls:\n%s\n%s", first, again)
 		}
 	}
-	sub, args, err := s.buildQuery(0, 10, map[string]string{"kind": "revoke"})
+	sub, args, err := s.buildQuery(AuditAfter(0), 10, map[string]string{"kind": "revoke"})
 	if err != nil || !strings.Contains(sub, "AND kind = $2 ORDER BY id LIMIT $3)") || len(args) != 3 {
 		t.Errorf("single filter: %s %v %v", sub, args, err)
+	}
+	// Descending: the same clauses in the same order, only the direction differs.
+	desc, _, err := s.buildQuery(AuditBefore(9), 10, filters)
+	if err != nil || !strings.Contains(desc, "WHERE id < $1 AND finding_id = $2::text::uuid AND transcript_id = $3::text::uuid AND recipe_id = $4 AND kind = $5 ORDER BY id DESC LIMIT $6) t") {
+		t.Errorf("descending filter clauses: %s %v", desc, err)
 	}
 }
 
@@ -355,22 +397,24 @@ func TestAuditBuildQueryRejects(t *testing.T) {
 	}
 	cases := []struct {
 		name    string
-		after   int64
+		cur     AuditCursor
 		limit   int
 		filters map[string]string
 		want    error
 	}{
-		{"unknown filter", 0, 10, map[string]string{"input": "x"}, ErrAuditUnknownFilter},
-		{"a column that is not a filter", 0, 10, map[string]string{"input_sha256": "x"}, ErrAuditUnknownFilter},
-		{"filter named like SQL", 0, 10, map[string]string{"fn = 1 OR 1": "x"}, ErrAuditUnknownFilter},
-		{"empty value", 0, 10, map[string]string{"fn": ""}, ErrAuditBadFilterValue},
-		{"negative after", -1, 10, nil, nil},
-		{"limit zero", 0, 0, nil, nil},
-		{"limit over cap", 0, AuditMaxLimit + 1, nil, nil},
-		{"negative limit", 0, -5, nil, nil},
+		{"unknown filter", AuditAfter(0), 10, map[string]string{"input": "x"}, ErrAuditUnknownFilter},
+		{"a column that is not a filter", AuditAfter(0), 10, map[string]string{"input_sha256": "x"}, ErrAuditUnknownFilter},
+		{"filter named like SQL", AuditAfter(0), 10, map[string]string{"fn = 1 OR 1": "x"}, ErrAuditUnknownFilter},
+		{"empty value", AuditAfter(0), 10, map[string]string{"fn": ""}, ErrAuditBadFilterValue},
+		{"negative after", AuditAfter(-1), 10, nil, nil},
+		{"negative before", AuditBefore(-1), 10, nil, nil},
+		{"limit zero", AuditAfter(0), 0, nil, nil},
+		{"limit over cap", AuditAfter(0), AuditMaxLimit + 1, nil, nil},
+		{"negative limit", AuditNewest(), -5, nil, nil},
+		{"descending limit over cap", AuditNewest(), AuditMaxLimit + 1, nil, nil},
 	}
 	for _, c := range cases {
-		q, args, err := s.buildQuery(c.after, c.limit, c.filters)
+		q, args, err := s.buildQuery(c.cur, c.limit, c.filters)
 		if err == nil || q != "" || args != nil {
 			t.Errorf("%s: accepted (%q, %v, %v)", c.name, q, args, err)
 		} else if c.want != nil && !errors.Is(err, c.want) {
@@ -378,14 +422,14 @@ func TestAuditBuildQueryRejects(t *testing.T) {
 		}
 	}
 	// The cap itself is valid.
-	if _, _, err := s.buildQuery(0, AuditMaxLimit, nil); err != nil {
+	if _, _, err := s.buildQuery(AuditAfter(0), AuditMaxLimit, nil); err != nil {
 		t.Errorf("limit %d rejected: %v", AuditMaxLimit, err)
 	}
 }
 
 func TestAuditRowsUnknownSource(t *testing.T) {
 	d := &DB{} // never reaches the pool
-	_, err := d.AuditRows(context.Background(), "transcript_chunks", 0, 10, nil)
+	_, err := d.AuditRows(context.Background(), "transcript_chunks", AuditAfter(0), 10, nil)
 	if !errors.Is(err, ErrAuditUnknownSource) {
 		t.Errorf("err = %v, want ErrAuditUnknownSource", err)
 	}
@@ -410,11 +454,33 @@ func TestReadAudit(t *testing.T) {
 			WithArgs(int64(364), "running", 100).
 			WillReturnRows(pgxmock.NewRows([]string{"rows", "next"}).AddRow([]byte(rowsJSON), &last))
 		mock.ExpectCommit()
-		page, err := readAudit(ctx, mock, s, 364, 100, map[string]string{"status": "running"})
+		page, err := readAudit(ctx, mock, s, AuditAfter(364), 100, map[string]string{"status": "running"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if page.Source != "step_runs" || string(page.Rows) != rowsJSON || page.Next == nil || *page.Next != 366 {
+			t.Errorf("page = %+v", page)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	t.Run("a descending page ends at its lowest id", func(t *testing.T) {
+		mock := newMockPool(t)
+		lowest := int64(365)
+		descJSON := `[{"id":366,"step":"scan"},{"id":365,"step":"decide"}]`
+		mock.ExpectBeginTx(roTx)
+		mock.ExpectExec(`set_config`).WithArgs("5000").WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		mock.ExpectQuery(`json_agg\(row_to_json\(t\) ORDER BY t\.id DESC\), '\[\]'::json\), min\(t\.id\) FROM \(SELECT .* FROM step_runs WHERE id < \$1 AND status = \$2 ORDER BY id DESC LIMIT \$3\) t`).
+			WithArgs(int64(math.MaxInt64), "running", 100).
+			WillReturnRows(pgxmock.NewRows([]string{"rows", "next"}).AddRow([]byte(descJSON), &lowest))
+		mock.ExpectCommit()
+		page, err := readAudit(ctx, mock, s, AuditNewest(), 100, map[string]string{"status": "running"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Source != "step_runs" || string(page.Rows) != descJSON || page.Next == nil || *page.Next != 365 {
 			t.Errorf("page = %+v", page)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -429,7 +495,7 @@ func TestReadAudit(t *testing.T) {
 		mock.ExpectQuery(`FROM step_runs`).WithArgs(int64(0), 100).
 			WillReturnRows(pgxmock.NewRows([]string{"rows", "next"}).AddRow([]byte("[]"), (*int64)(nil)))
 		mock.ExpectCommit()
-		page, err := readAudit(ctx, mock, s, 0, 100, nil)
+		page, err := readAudit(ctx, mock, s, AuditAfter(0), 100, nil)
 		if err != nil || string(page.Rows) != "[]" || page.Next != nil {
 			t.Errorf("page = %+v, err = %v", page, err)
 		}
@@ -438,7 +504,7 @@ func TestReadAudit(t *testing.T) {
 	// A query that is rejected before the pool is touched never opens a transaction.
 	t.Run("invalid request never reaches the pool", func(t *testing.T) {
 		mock := newMockPool(t)
-		if _, err := readAudit(ctx, mock, s, 0, 100, map[string]string{"fn": "x"}); !errors.Is(err, ErrAuditUnknownFilter) {
+		if _, err := readAudit(ctx, mock, s, AuditAfter(0), 100, map[string]string{"fn": "x"}); !errors.Is(err, ErrAuditUnknownFilter) {
 			t.Errorf("err = %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -464,7 +530,7 @@ func TestReadAudit(t *testing.T) {
 			mock.ExpectExec(`set_config`).WithArgs("5000").WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`FROM step_runs`).WithArgs(int64(0), 100).WillReturnError(f.err)
 			mock.ExpectRollback()
-			_, err := readAudit(ctx, mock, s, 0, 100, nil)
+			_, err := readAudit(ctx, mock, s, AuditAfter(0), 100, nil)
 			if err == nil {
 				t.Fatal("no error")
 			}
@@ -480,7 +546,7 @@ func TestReadAudit(t *testing.T) {
 	t.Run("begin failure", func(t *testing.T) {
 		mock := newMockPool(t)
 		mock.ExpectBeginTx(roTx).WillReturnError(context.DeadlineExceeded)
-		if _, err := readAudit(ctx, mock, s, 0, 100, nil); !errors.Is(err, ErrAuditTimeout) {
+		if _, err := readAudit(ctx, mock, s, AuditAfter(0), 100, nil); !errors.Is(err, ErrAuditTimeout) {
 			t.Errorf("err = %v", err)
 		}
 	})

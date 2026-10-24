@@ -112,20 +112,25 @@ paths:
       description: >
         One generic, read-only view of the tables the pipeline already appends
         to (CONTRACT §2.12.2): `finding_events`, `judge_passes`, `fn_calls`,
-        `step_runs`, `pipeline_events`. Rows are ordered by `id` ascending,
-        strictly after `after`, at most `limit` of them; `next` is the last
-        row's `id` (pass it back as `after`) and `null` exactly when `rows` is
-        empty.
+        `step_runs`, `pipeline_events`. By default rows are ordered by `id`
+        ascending, strictly after `after`, at most `limit` of them; `next` is
+        the last row's `id` (pass it back as `after`). With `order=desc` the
+        newest rows come first, strictly below `before` (default: from the
+        newest row), and `next` is the last — lowest — row's `id` (pass it back
+        as `before`; paging down ends at id 1, then `before=1` is an empty
+        page). `next` is `null` exactly when `rows` is empty.
 
 
         Only an allowlist of slim columns is served per source: no prompt or
         reply bodies, no error text, no command lines and no library paths or
         titles. Text that names a model, host or actor is cut to 256
         characters. Each source accepts only its own equality filters (listed
-        per parameter below); a parameter that is not `after`, `limit` or a
-        filter of this source is a 400, as is a repeated or empty one, a value
-        that is not valid UTF-8 or holds a NUL byte, and a query string that
-        does not parse. Filters AND together.
+        per parameter below); a parameter that is not `order`, `after`,
+        `before`, `limit` or a filter of this source is a 400, as is a repeated
+        or empty one, a value that is not valid UTF-8 or holds a NUL byte, and
+        a query string that does not parse. The directions do not mix:
+        `order=desc` with `after`, and `before` without `order=desc`, are a
+        400. Filters AND together.
 
 
         `step_runs` and `judge_passes` rows are updated in place until they
@@ -145,13 +150,30 @@ paths:
           schema:
             type: string
             enum: [finding_events, judge_passes, fn_calls, step_runs, pipeline_events]
+        - name: order
+          in: query
+          required: false
+          description: >
+            `asc` (default, oldest first, paged with `after`) or `desc` (newest
+            first, paged with `before`). Anything else is a 400.
+          schema: { type: string, enum: [asc, desc], default: asc }
         - name: after
           in: query
           required: false
           description: >
-            Exclusive id cursor; rows with `id` greater than this are returned.
-            Plain decimal digits only (no sign, no leading zeros).
+            Exclusive id cursor of an ascending read; rows with `id` greater
+            than this are returned. Plain decimal digits only (no sign, no
+            leading zeros). A 400 together with `order=desc`.
           schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: before
+          in: query
+          required: false
+          description: >
+            Exclusive id cursor of a descending read; rows with `id` less than
+            this are returned, newest first. Plain decimal digits only (no
+            sign, no leading zeros); `0` is valid and matches nothing. Omit it
+            to start at the newest row. A 400 without `order=desc`.
+          schema: { type: integer, format: int64, minimum: 0 }
         - name: limit
           in: query
           required: false
@@ -220,35 +242,54 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AuditPage" }
-              example:
-                source: step_runs
-                rows:
-                  - id: 365
-                    step: decide
-                    mode: write
-                    recipe_id: f1c32cfe5f8401528d84874ef74e7e853710f4438da2bbd573113e8376caef7a
-                    model: clef:27b
-                    host: earmark-ingest-7d9f
-                    started_at: "2026-10-23T14:02:11.123456+00:00"
-                    heartbeat_at: "2026-10-23T14:41:02.500000+00:00"
-                    finished_at: null
-                    status: running
-                    total: 29000
-                    done: 12400
-                    counters: { apply: 9100, hold: 2800, reject: 500 }
-                    cost_usd: 0.42
-                next: 365
+              examples:
+                oldestFirst:
+                  summary: "`?after=364` — ascending; `next` is the last row's id, pass it back as `after`"
+                  value:
+                    source: step_runs
+                    rows:
+                      - id: 365
+                        step: decide
+                        mode: write
+                        recipe_id: f1c32cfe5f8401528d84874ef74e7e853710f4438da2bbd573113e8376caef7a
+                        model: clef:27b
+                        host: earmark-ingest-7d9f
+                        started_at: "2026-10-23T14:02:11.123456+00:00"
+                        heartbeat_at: "2026-10-23T14:41:02.500000+00:00"
+                        finished_at: null
+                        status: running
+                        total: 29000
+                        done: 12400
+                        counters: { apply: 9100, hold: 2800, reject: 500 }
+                        cost_usd: 0.42
+                    next: 365
+                newestFirst:
+                  summary: "`?order=desc&limit=2` — descending from the newest row; `next` is the LOWEST id returned, pass it back as `before`"
+                  value:
+                    source: step_runs
+                    rows:
+                      - { id: 366, step: scan, mode: dry_run, status: done, total: 50, done: 50, counters: { scanned: 50 } }
+                      - { id: 365, step: decide, mode: write, status: running, total: 29000, done: 12400, counters: { apply: 9100, hold: 2800, reject: 500 } }
+                    next: 365
+                pastTheOldestRow:
+                  summary: "`?order=desc&before=1` — nothing below id 1; the end of a newest-first read"
+                  value: { source: step_runs, rows: [], next: null }
         "400":
           description: >
             A query string that does not parse; an unknown, repeated or empty
-            parameter; a malformed or out-of-range `after`/`limit`; a filter
-            value that is not valid UTF-8, holds a NUL byte, or is not a UUID
-            for a UUID filter. The message names the valid choices and never
-            echoes a value.
+            parameter; a malformed or out-of-range `after`/`before`/`limit`; an
+            `order` that is not `asc` or `desc`; `order=desc` together with
+            `after`; `before` without `order=desc`; a filter value that is not
+            valid UTF-8, holds a NUL byte, or is not a UUID for a UUID filter.
+            The message names the valid choices and never echoes a value.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
-              example: { error: "unknown filter \"fn\" for source \"step_runs\"; filters: step, status, recipe_id" }
+              examples:
+                unknownFilter:
+                  value: { error: "unknown filter \"fn\" for source \"step_runs\"; filters: step, status, recipe_id" }
+                mixedDirections:
+                  value: { error: "order=desc pages with before, not after" }
         "404":
           description: Unknown audit source. The message lists the valid ones.
           content:
@@ -498,13 +539,13 @@ components:
         One page of an audit source (CONTRACT §2.12.2), rows exactly as stored.
       properties:
         next:
-          description: The last returned row's `id` — pass it back as `after` for the next page. `null` exactly when `rows` is empty.
+          description: The last returned row's `id` — the highest of an ascending page (pass it back as `after`) and the lowest of a descending one (pass it back as `before`). `null` exactly when `rows` is empty.
           type:
             - integer
             - "null"
         rows:
           description: |
-            Row objects ordered by `id` ascending, strictly after `after`; `[]` when nothing matches. The keys are the source's allowlisted columns (CONTRACT §2.12.2) under their column names: timestamps are ISO-8601 with a `+00:00` offset, numerics are JSON numbers, UUIDs are strings, JSONB columns are embedded objects, NULL is `null`. Text that names a model, host or actor is cut to 256 characters; no error text, command line or library path is served.
+            Row objects in the requested order — by `id` ascending, strictly after `after` (the default), or descending, strictly below `before`; `[]` when nothing matches. The keys are the source's allowlisted columns (CONTRACT §2.12.2) under their column names: timestamps are ISO-8601 with a `+00:00` offset, numerics are JSON numbers, UUIDs are strings, JSONB columns are embedded objects, NULL is `null`. Text that names a model, host or actor is cut to 256 characters; no error text, command line or library path is served.
           items:
             type: object
           type: array
