@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -219,5 +220,50 @@ func TestScanResultRowsClosesOnScanError(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// cancellingMeta cancels the search's context on its first lookup — the
+// deadline running out after the result set was read, during enrichment.
+type cancellingMeta struct {
+	cancel context.CancelFunc
+	next   metaprovider.MetadataProvider
+}
+
+func (m cancellingMeta) Lookup(ctx context.Context, filePath, sampleName string) (metaprovider.BookMeta, error) {
+	m.cancel()
+	return m.next.Lookup(ctx, filePath, sampleName)
+}
+
+// TestScanResultsReportsContextEndDuringEnrichment: enrichment failures are
+// nonfatal, but a context that ends during enrichment is not one of them. The
+// search must fail with the context's error rather than return rows silently
+// stripped of their chapter/series/checksum enrichment — otherwise a timed-out
+// MCP tool call would answer with a degraded, non-error result.
+func TestScanResultsReportsContextEndDuringEnrichment(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	rows := pgxmock.NewRows(scanResultColumns).
+		AddRow("c1", "one", testLibationTrk1, 0, 0.0, 1.0, nil, 0.9, 1).
+		AddRow("c2", "two", testCustomTrack, 0, 0.0, 1.0, nil, 0.8, 1)
+	mock.ExpectQuery("SELECT").WithArgs("q", 10).WillReturnRows(rows)
+	// No book-context expectations: once the context has ended every
+	// enrichment read fails, which is what scanResults must not paper over.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newTestDB()
+	d.meta = cancellingMeta{cancel: cancel, next: d.meta}
+
+	got, err := d.textSearch(ctx, mock, "q", 10)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("textSearch err = %v (results %d), want it to wrap context.Canceled", err, len(got))
+	}
+	if got != nil {
+		t.Errorf("got %d results alongside the error, want none", len(got))
 	}
 }

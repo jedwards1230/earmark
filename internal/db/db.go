@@ -1644,6 +1644,14 @@ func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]S
 			}
 		}
 	}
+	// Enrichment failures are nonfatal (a missing label beats a failed
+	// search), but a cancelled or expired context is not an enrichment
+	// failure: every read after it failed, so the results are missing their
+	// enrichment for a reason the caller must see — an MCP tool call that ran
+	// out of time has to report the timeout, not a quietly degraded result.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("enrich search results: %w", err)
+	}
 	return results, nil
 }
 

@@ -11,7 +11,6 @@ import (
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
-	"github.com/jedwards1230/earmark/internal/log"
 )
 
 // hungSearchDB is a DB whose text search never returns on its own: it blocks
@@ -85,7 +84,7 @@ func TestToolTimeoutMiddlewareScope(t *testing.T) {
 				_, got = ctx.Deadline()
 				return nil, nil
 			}
-			h := toolTimeoutMiddleware(time.Minute, log.NewLogger("mcp-test"))(next)
+			h := toolTimeoutMiddleware(time.Minute, func(string, ...any) {})(next)
 			if _, err := h(context.Background(), tc.method, &mcp.CallToolRequest{}); err != nil {
 				t.Fatalf("handler: %v", err)
 			}
@@ -103,7 +102,7 @@ func TestToolTimeoutMiddlewareCancelsOnDeadline(t *testing.T) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	h := toolTimeoutMiddleware(20*time.Millisecond, log.NewLogger("mcp-test"))(next)
+	h := toolTimeoutMiddleware(20*time.Millisecond, func(string, ...any) {})(next)
 	_, err := h(context.Background(), "tools/call", &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: "x"}})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
@@ -118,4 +117,55 @@ func resultText(res *mcp.CallToolResult) string {
 		}
 	}
 	return b.String()
+}
+
+// TestToolTimeoutMiddlewareWarnsOnlyOnOwnTimeout pins when the "exceeded its
+// deadline" warning fires: only for a call that FAILED after the middleware's
+// own deadline expired. A call that succeeds as the deadline passes, or that
+// ran out of a shorter deadline its caller set, is not misattributed.
+func TestToolTimeoutMiddlewareWarnsOnlyOnOwnTimeout(t *testing.T) {
+	const own = 20 * time.Millisecond
+	// waitThen blocks until the handler's context ends, then returns the
+	// given outcome.
+	waitThen := func(res mcp.Result, err error) mcp.MethodHandler {
+		return func(ctx context.Context, _ string, _ mcp.Request) (mcp.Result, error) {
+			<-ctx.Done()
+			return res, err
+		}
+	}
+	cases := []struct {
+		name     string
+		next     mcp.MethodHandler
+		parent   time.Duration // 0 = no caller deadline
+		wantWarn bool
+	}{
+		{name: "error result after own deadline", next: waitThen(&mcp.CallToolResult{IsError: true}, nil), wantWarn: true},
+		{name: "protocol error after own deadline", next: waitThen(nil, context.DeadlineExceeded), wantWarn: true},
+		{name: "success as own deadline passes", next: waitThen(&mcp.CallToolResult{}, nil), wantWarn: false},
+		{name: "caller's shorter deadline", next: waitThen(&mcp.CallToolResult{IsError: true}, nil), parent: 5 * time.Millisecond, wantWarn: false},
+		{
+			name: "fast failure, no deadline involved",
+			next: func(context.Context, string, mcp.Request) (mcp.Result, error) {
+				return &mcp.CallToolResult{IsError: true}, nil
+			},
+			wantWarn: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var warned []string
+			warn := func(msg string, _ ...any) { warned = append(warned, msg) }
+			ctx := context.Background()
+			if tc.parent > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tc.parent)
+				defer cancel()
+			}
+			h := toolTimeoutMiddleware(own, warn)(tc.next)
+			_, _ = h(ctx, "tools/call", &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: "x"}})
+			if got := len(warned) > 0; got != tc.wantWarn {
+				t.Errorf("warned = %v (%q), want %v", got, warned, tc.wantWarn)
+			}
+		})
+	}
 }
