@@ -997,8 +997,8 @@ func (db *DB) EmbedDocumentsWithUsage(texts []string) ([][]float32, openai.Embed
 // search query embedded for semantic search. For nomic-embed-text the query is
 // prefixed with "search_query: ". Never use this to embed a stored passage (use
 // EmbedDocuments).
-func (db *DB) EmbedQuery(query string) ([]float32, error) {
-	return db.embedder().EmbedQuery(query)
+func (db *DB) EmbedQuery(ctx context.Context, query string) ([]float32, error) {
+	return db.embedder().EmbedQuery(ctx, query)
 }
 
 // ─── Run metrics (per-run observability, CONTRACT §1.5) ──────────────────────
@@ -1353,7 +1353,7 @@ func decodeChapters(chaptersJSON []byte) ([]metaprovider.Chapter, error) {
 
 // Search performs a vector-similarity search over transcript_chunks.
 func (db *DB) Search(ctx context.Context, query string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	vec, err := db.embedder().EmbedQuery(query)
+	vec, err := db.embedder().EmbedQuery(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
@@ -1421,7 +1421,7 @@ var searchInBookSQL = `
 // book's chunks — see searchInBookSQL for why HNSW is bypassed here. dir must be
 // an exact book_dir as returned by GetBookSummaries.
 func (db *DB) SearchInBook(ctx context.Context, query, dir string, limit int, threshold float64) ([]SearchResultWithMetadata, error) {
-	vec, err := db.embedder().EmbedQuery(query)
+	vec, err := db.embedder().EmbedQuery(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
@@ -1573,6 +1573,15 @@ func likePrefix(s string) string {
 // per-book fields (ChapterIndex/ChapterTitle, TotalChapters, Series,
 // FileChecksum) and the per-chunk WordCount.
 //
+// Two phases, and the order is load-bearing: the result set is read to the end
+// and CLOSED first (scanResultRows), and only then is it enriched. While rows
+// is open it holds a pool connection, and the enrichment reads go through q —
+// db.pool in production — which acquires a second one. Enriching inside the
+// rows loop made every search hold two connections at once, so a burst of more
+// concurrent searches than the pool has connections deadlocked it: each held
+// one and waited forever for another (the 2026-11-01 earmark-mcp outage).
+// TestScanResultsClosesRowsBeforeEnrichment pins the order.
+//
 // Chapter mapping: chunk start_sec is TRACK-relative (one ASR transcript per
 // audio file) while book_metadata.chapters is BOOK-absolute across the
 // concatenated tracks, so the chunk's track offset within the book must be added
@@ -1588,23 +1597,17 @@ func likePrefix(s string) string {
 // the MCP formatter suppresses the label (CONTRACT §2.2.1) — a missing label
 // beats a plausible wrong one.
 func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]SearchResultWithMetadata, error) {
+	results, err := scanResultRows(rows)
+	if err != nil {
+		return nil, err
+	}
+
 	// Cache per-book context (chapters + track rows) per book_dir to avoid
 	// redundant DB reads within one result set.
 	bookCache := make(map[string]bookContext)
 
-	var results []SearchResultWithMetadata
-	for rows.Next() {
-		var r SearchResultWithMetadata
-		var speaker *string
-		if err := rows.Scan(
-			&r.ID, &r.Content, &r.FilePath,
-			&r.ChunkIndex, &r.StartSec, &r.EndSec,
-			&speaker, &r.Similarity, &r.TotalChunks,
-		); err != nil {
-			return nil, fmt.Errorf("scan result: %w", err)
-		}
-		r.Speaker = speaker
-		r.ChunkID = r.ID
+	for i := range results {
+		r := &results[i]
 
 		// Derive Author/Title using the layout-aware provider so that both
 		// 3-level (author/title/track) and 2-level (author/book.m4b) collections
@@ -1621,7 +1624,6 @@ func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]S
 		bookDir := filepath.Dir(r.FilePath)
 		bc, seen := bookCache[bookDir]
 		if !seen {
-			var err error
 			bc, err = db.loadBookContext(ctx, q, bookDir)
 			if err != nil {
 				db.log.Debug("book context lookup failed (continuing without chapter label)",
@@ -1641,7 +1643,30 @@ func (db *DB) scanResults(ctx context.Context, q rowScanner, rows pgx.Rows) ([]S
 				r.ChapterTitle = title
 			}
 		}
+	}
+	return results, nil
+}
 
+// scanResultRows reads the 9 search-result columns of every row and closes
+// rows before returning, on success and on error alike, so the connection
+// behind it is back in the pool before scanResults issues any follow-up read.
+// It issues no queries of its own.
+func scanResultRows(rows pgx.Rows) ([]SearchResultWithMetadata, error) {
+	defer rows.Close()
+
+	var results []SearchResultWithMetadata
+	for rows.Next() {
+		var r SearchResultWithMetadata
+		var speaker *string
+		if err := rows.Scan(
+			&r.ID, &r.Content, &r.FilePath,
+			&r.ChunkIndex, &r.StartSec, &r.EndSec,
+			&speaker, &r.Similarity, &r.TotalChunks,
+		); err != nil {
+			return nil, fmt.Errorf("scan result: %w", err)
+		}
+		r.Speaker = speaker
+		r.ChunkID = r.ID
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {

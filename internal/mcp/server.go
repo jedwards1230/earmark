@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -155,6 +156,31 @@ func editAnnotations() *mcp.ToolAnnotations {
 	}
 }
 
+// toolTimeoutMiddleware bounds every tools/call request with a d deadline; all
+// other methods pass through untouched. A call that runs out of time is logged
+// with its tool name so a stuck dependency shows up in the logs as which tool
+// was waiting, not only as the error the client received.
+func toolTimeoutMiddleware(d time.Duration, logger log.Logger) mcp.Middleware {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method != "tools/call" {
+				return next(ctx, method, req)
+			}
+			ctx, cancel := context.WithTimeout(ctx, d)
+			defer cancel()
+			res, err := next(ctx, method, req)
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				name := ""
+				if ctr, ok := req.(*mcp.CallToolRequest); ok && ctr.Params != nil {
+					name = ctr.Params.Name
+				}
+				logger.Warn("mcp tool call exceeded its deadline", "tool", name, "timeout", d)
+			}
+			return res, err
+		}
+	}
+}
+
 // NewMCPServer creates a new MCP server instance
 func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	logger := log.NewLogger("mcp-server")
@@ -186,6 +212,16 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	}, &mcp.ServerOptions{
 		Instructions: "Semantic and keyword search over audiobook transcripts, plus full-transcript reading and library browsing.",
 	})
+
+	// Every tool call runs under a deadline (MCP_TOOL_TIMEOUT, CONTRACT §2.4).
+	// The SDK hands a tool handler the request's context, which carries no
+	// deadline of its own, so without this a call waiting on the DB pool or the
+	// embeddings endpoint waited forever — and kept whatever it held.
+	toolTimeout := cfg.MCPToolTimeout
+	if toolTimeout <= 0 {
+		toolTimeout = config.DefaultMCPToolTimeout
+	}
+	mcpServer.AddReceivingMiddleware(toolTimeoutMiddleware(toolTimeout, logger))
 
 	// Build the metadata provider from config. NewPathProvider handles parse
 	// errors internally (falls back to generic resolver) — labels are cosmetic,

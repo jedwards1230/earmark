@@ -467,6 +467,12 @@ func validateAIRoles(roles *AIRoles, eps []AIEndpoint) error {
 // absent and the deployment relies on the deprecated EMBEDDINGS_* vars.
 const legacyEmbeddingsID = "_legacy"
 
+// DefaultMCPToolTimeout is the MCP_TOOL_TIMEOUT default: the deadline on one
+// MCP tool call. A search is one query embed plus a few short reads, well under
+// a second when healthy; 60s leaves room for a cold embeddings model while
+// still releasing a stuck call's connections in bounded time.
+const DefaultMCPToolTimeout = 60 * time.Second
+
 // Config holds all runtime configuration for the earmark Go service.
 // Field names mirror the canonical env var names from CONTRACT.md §2.4.
 type Config struct {
@@ -499,6 +505,12 @@ type Config struct {
 	// STALE_JOB_TIMEOUT — how long a claimed job may be silent before the Go
 	// service resets it to pending. Default: 30m (CONTRACT §1.3).
 	StaleJobTimeout time.Duration
+
+	// MCP_TOOL_TIMEOUT — deadline on every MCP tool call (`tools/call`), so a
+	// call stuck on the database or the embeddings endpoint fails instead of
+	// holding its resources forever. Default: DefaultMCPToolTimeout (60s). Must
+	// be positive (CONTRACT §2.4).
+	MCPToolTimeout time.Duration
 
 	// SCAN_INTERVAL — how often the monitor re-walks BOOKS_DIR looking for new
 	// audio files, in addition to the startup scan. fsnotify only sees writes
@@ -660,6 +672,18 @@ func LoadConfig() (*Config, error) {
 	cfg.StaleJobTimeout, err = time.ParseDuration(staleStr)
 	if err != nil {
 		return nil, fmt.Errorf("STALE_JOB_TIMEOUT %q: %w", staleStr, err)
+	}
+
+	// MCP_TOOL_TIMEOUT: bound every MCP tool call. Must be positive — a zero
+	// or negative value is fatal rather than read as "no deadline", because an
+	// unbounded call is exactly what kept the DB pool drained on 2026-11-01.
+	toolStr := getEnvOrDefault("MCP_TOOL_TIMEOUT", DefaultMCPToolTimeout.String())
+	cfg.MCPToolTimeout, err = time.ParseDuration(toolStr)
+	if err != nil {
+		return nil, fmt.Errorf("MCP_TOOL_TIMEOUT %q: %w", toolStr, err)
+	}
+	if cfg.MCPToolTimeout <= 0 {
+		return nil, fmt.Errorf("MCP_TOOL_TIMEOUT %q: must be a positive duration", toolStr)
 	}
 
 	// SCAN_INTERVAL: cadence of the monitor's recurring BOOKS_DIR walk, the

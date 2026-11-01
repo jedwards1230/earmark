@@ -1,11 +1,14 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 )
@@ -154,7 +157,7 @@ func TestPrefixDivergence(t *testing.T) {
 
 	t.Run("query path prefixes search_query", func(t *testing.T) {
 		captured = nil
-		if _, err := e.EmbedQuery("default mode network"); err != nil {
+		if _, err := e.EmbedQuery(context.Background(), "default mode network"); err != nil {
 			t.Fatalf("EmbedQuery: %v", err)
 		}
 		want := []string{"search_query: default mode network"}
@@ -176,7 +179,7 @@ func TestPrefixDivergence(t *testing.T) {
 		doc := captured[0]
 
 		captured = nil
-		if _, err := e.EmbedQuery(text); err != nil {
+		if _, err := e.EmbedQuery(context.Background(), text); err != nil {
 			t.Fatalf("EmbedQuery: %v", err)
 		}
 		query := captured[0]
@@ -216,7 +219,7 @@ func TestNoPrefixForNonNomicModel(t *testing.T) {
 	}
 
 	captured = nil
-	if _, err := e.EmbedQuery("raw query"); err != nil {
+	if _, err := e.EmbedQuery(context.Background(), "raw query"); err != nil {
 		t.Fatalf("EmbedQuery: %v", err)
 	}
 	if captured[0] != "raw query" {
@@ -252,12 +255,54 @@ func TestEmbeddingsAuthorizationHeader(t *testing.T) {
 				BaseURL: srv.URL + "/v1", Model: "nomic-embed-text", APIKey: tc.apiKey,
 			}
 			e := NewEmbeddings(&config.Config{AIEndpoints: []config.AIEndpoint{ep}, AIRoles: &config.AIRoles{Embeddings: "e"}})
-			if _, err := e.EmbedQuery("q"); err != nil {
+			if _, err := e.EmbedQuery(context.Background(), "q"); err != nil {
 				t.Fatalf("EmbedQuery: %v", err)
 			}
 			if gotAuth != tc.want {
 				t.Errorf("Authorization = %q, want %q", gotAuth, tc.want)
 			}
 		})
+	}
+}
+
+// TestEmbedQueryHonorsContext pins that the query embed is bounded by its
+// caller's context. A search embeds its query inside a request — an MCP tool
+// call, an API handler — and the client has no timeout of its own, so before
+// ctx was threaded through, an embeddings endpoint that accepted the request
+// and never answered held that request open indefinitely.
+func TestEmbedQueryHonorsContext(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select { // hang until the client gives up (or the test ends)
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	ep := config.AIEndpoint{
+		ID: "e", Type: config.AIEndpointTypeEmbeddings, Backend: config.AIBackendOpenAI,
+		BaseURL: srv.URL + "/v1", Model: "nomic-embed-text",
+	}
+	e := NewEmbeddings(&config.Config{AIEndpoints: []config.AIEndpoint{ep}, AIRoles: &config.AIRoles{Embeddings: "e"}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.EmbedQuery(ctx, "q")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("EmbedQuery against a hung endpoint returned no error")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("EmbedQuery error = %v, want it to wrap context.DeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("EmbedQuery ignored its context deadline")
 	}
 }
