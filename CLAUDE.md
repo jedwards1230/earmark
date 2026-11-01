@@ -217,7 +217,7 @@ See `.env.example` and `docs/CONTRACT.md §2.4` for the canonical list.
 Required: `DATABASE_URL`
 
 Optional (with defaults): `BOOKS_DIR`, `EMBEDDINGS_BASE_URL`, `EMBEDDINGS_MODEL`,
-`MCP_HTTP_ADDR`, `STALE_JOB_TIMEOUT`, `SCAN_INTERVAL`, `CHUNK_SIZE`,
+`MCP_HTTP_ADDR`, `MCP_TOOL_TIMEOUT`, `STALE_JOB_TIMEOUT`, `SCAN_INTERVAL`, `CHUNK_SIZE`,
 `EMBED_BATCH_SIZE`, `DEBUG`.
 
 Optional (no default): `ASR_SERVERS` — JSON array declaring the transcription

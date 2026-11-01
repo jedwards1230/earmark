@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -155,6 +156,45 @@ func editAnnotations() *mcp.ToolAnnotations {
 	}
 }
 
+// toolTimeoutMiddleware bounds every tools/call request with a d deadline; all
+// other methods pass through untouched. A call that FAILED because THIS
+// deadline expired is reported through warn with its tool name, so a stuck
+// dependency shows up in the logs as which tool was waiting, not only as the
+// error the client received. A call that succeeded as the deadline passed, or
+// that ran out of a deadline its caller already set, is not reported.
+func toolTimeoutMiddleware(d time.Duration, warn func(msg string, args ...any)) mcp.Middleware {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(parent context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method != "tools/call" {
+				return next(parent, method, req)
+			}
+			ctx, cancel := context.WithTimeout(parent, d)
+			defer cancel()
+			res, err := next(ctx, method, req)
+			if toolCallFailed(res, err) && errors.Is(ctx.Err(), context.DeadlineExceeded) && parent.Err() == nil {
+				name := ""
+				if ctr, ok := req.(*mcp.CallToolRequest); ok && ctr.Params != nil {
+					name = ctr.Params.Name
+				}
+				warn("mcp tool call exceeded its deadline", "tool", name, "timeout", d)
+			}
+			return res, err
+		}
+	}
+}
+
+// toolCallFailed reports whether a tools/call outcome is a failure: a protocol
+// error, or a tool result flagged IsError. Earmark's handlers report their own
+// failures (a timed-out search included) as an IsError result with a nil
+// error, so the result has to be checked, not only err.
+func toolCallFailed(res mcp.Result, err error) bool {
+	if err != nil {
+		return true
+	}
+	ctr, ok := res.(*mcp.CallToolResult)
+	return ok && ctr != nil && ctr.IsError
+}
+
 // NewMCPServer creates a new MCP server instance
 func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	logger := log.NewLogger("mcp-server")
@@ -186,6 +226,16 @@ func NewMCPServer(database DBInterface, cfg *config.Config) *MCPServer {
 	}, &mcp.ServerOptions{
 		Instructions: "Semantic and keyword search over audiobook transcripts, plus full-transcript reading and library browsing.",
 	})
+
+	// Every tool call runs under a deadline (MCP_TOOL_TIMEOUT, CONTRACT §2.4).
+	// The SDK hands a tool handler the request's context, which carries no
+	// deadline of its own, so without this a call waiting on the DB pool or the
+	// embeddings endpoint waited forever — and kept whatever it held.
+	toolTimeout := cfg.MCPToolTimeout
+	if toolTimeout <= 0 {
+		toolTimeout = config.DefaultMCPToolTimeout
+	}
+	mcpServer.AddReceivingMiddleware(toolTimeoutMiddleware(toolTimeout, logger.Warn))
 
 	// Build the metadata provider from config. NewPathProvider handles parse
 	// errors internally (falls back to generic resolver) — labels are cosmetic,

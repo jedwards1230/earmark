@@ -988,6 +988,17 @@ result.
 `chapters` and `series` are read in a **single** `SELECT chapters, series FROM
 book_metadata WHERE book_dir = $1` per distinct book directory in a result set,
 cached for the rest of that set — never per row.
+These per-book reads run only **after the search's own result set has been
+read to the end and closed**, never while it is open. An open result set holds a
+pool connection and each follow-up read acquires another, so reading inside the
+row loop made every search hold two connections at once — and a burst of more
+concurrent searches than the pool has connections deadlocked it (2026-11-01:
+~22 scoped searches against the default 16-connection pool drained it until a
+restart). The metadata-provider lookup for each row is likewise done after the
+result set is closed. A failed per-book read is nonfatal (the row just carries
+no chapter label/series/checksum), **except** when the search's context has
+ended: then the search fails with that context error instead of returning rows
+silently stripped of their enrichment.
 
 **`series` format:** a comma-joined list of `Name #Sequence` entries, because a
 book can belong to several series — e.g. `"Dune #2, The Dune Sequence #13"`. The
@@ -2127,6 +2138,7 @@ All env var names are fixed. No synonyms, no alternatives.
 | `OTEL_METRICS_EXPORTER` / `OTEL_TRACES_EXPORTER` | no | Exporter selection: metrics `prometheus,otlp` (default), traces `otlp` (default); `none` disables. OTLP still needs an endpoint. |
 | `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` | no | Resource attributes; `service.name` defaults to `earmark`. Other standard `OTEL_*` exporter variables (headers, insecure, timeout, export interval) are read by the exporters. |
 | `STALE_JOB_TIMEOUT` | no | `30m` (Go duration string) |
+| `MCP_TOOL_TIMEOUT` | no | `60s` (Go duration string). Deadline on **every MCP tool call** (`tools/call`, both transports): the handler's context is cancelled when it passes, so a call waiting on the database pool or the embeddings endpoint (the query embed honors it) fails with `context deadline exceeded` and releases what it holds, instead of waiting forever. Other MCP methods (`initialize`, `tools/list`, …) are not bounded by it. A call that fails because this deadline expired is logged at Warn with its tool name (not one that succeeded as it passed, nor one that ran out of a shorter deadline its caller set). Must be **positive** — zero, negative or unparseable is fatal at startup (an unbounded tool call is what kept the pool drained on 2026-11-01). |
 | `SCAN_INTERVAL` | no | `1h` (Go duration string). How often the monitor **re-walks `BOOKS_DIR`** looking for new audio files, in addition to the walk it does at startup. Required for correctness on NFS: fsnotify/inotify only reports writes that pass through the monitor pod's own kernel, so a book written directly on the file server — or by any other NFS client — raises **no** watch event and would otherwise stay undiscovered until the pod restarted. The recurring walk is the backstop; fsnotify remains the low-latency path for local writes. The walk is metadata-only for known paths (already-queued `file_path`s are skipped without re-hashing, §1.1), so it is cheap over a multi-TB library. Per-entry errors (e.g. a transient NFS `EIO` on one subdirectory) are logged, counted, and skipped — one bad directory must never abort, and thereby silently disable, every subsequent scan. **`0` (or a negative value) disables periodic scanning**, leaving only the startup walk and fsnotify. |
 | `CHUNK_SIZE` | no | `512` (target tokens per chunk; overlap is 64 tokens) |
 | `EMBED_BATCH_SIZE` | no | `32`. Max transcripts the embed worker selects **per poll cycle** for BOTH gated-flow (`EVAL_GATES_EMBED`) passes — the eval pass and the embed pass each `… ORDER BY t.created_at ASC LIMIT $1`. Bounds the worker's per-cycle memory: an unbounded selection loads every matching transcript's `segments` JSONB into one slice, which OOM-kills the pod on a large backlog (e.g. a full re-embed after re-segmentation). The worker drains a backlog across cycles — a transcript that gets eval'd/embedded drops out of the next cycle's selection — and **loops immediately (no `pollInterval` sleep) whenever a pass returns a full batch**, so a multi-thousand-item backlog drains in back-to-back cycles rather than one batch per poll interval. Must be a **positive integer** — a non-positive or non-numeric value is fatal at startup (the OOM guard must never silently round-trip to unbounded). The ungated single-pass selection (`GetCompletedTranscripts`) is bounded by the same value but **keyset-paged** (`ORDER BY created_at, id`, `(created_at, id) > cursor`, `LIMIT`): each cycle walks every page, embedding one page before loading the next, so memory is bounded by one page while transcripts that keep failing to embed can never starve the ones behind them; the worker then sleeps `pollInterval` unless something was embedded (no hot retry of a failing transcript). |

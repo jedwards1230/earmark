@@ -117,7 +117,7 @@ func (e *Embeddings) EmbedDocuments(docs []string) ([][]float32, error) {
 // EmbedDocumentsWithUsage is EmbedDocuments plus the provider-reported token
 // usage (which Ollama may leave zeroed — see EmbeddingUsage).
 func (e *Embeddings) EmbedDocumentsWithUsage(docs []string) ([][]float32, EmbeddingUsage, error) {
-	return e.embed(docs, documentPrefix)
+	return e.embed(context.Background(), docs, documentPrefix)
 }
 
 // EmbedQuery embeds a single SEARCH QUERY — the query side of the pipeline. For
@@ -126,8 +126,12 @@ func (e *Embeddings) EmbedDocumentsWithUsage(docs []string) ([][]float32, Embedd
 //
 // This is the query counterpart of EmbedDocuments: see that method for why the
 // two prefixes must diverge.
-func (e *Embeddings) EmbedQuery(query string) ([]float32, error) {
-	vecs, _, err := e.embed([]string{query}, queryPrefix)
+//
+// ctx bounds the HTTP call: a search runs inside a request (an MCP tool call,
+// an API handler), and an embeddings endpoint that stops answering must fail
+// that request when it is cancelled or times out rather than hold it open.
+func (e *Embeddings) EmbedQuery(ctx context.Context, query string) ([]float32, error) {
+	vecs, _, err := e.embed(ctx, []string{query}, queryPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +168,8 @@ func (e *Embeddings) CheckDimension(ctx context.Context) error {
 // when this model wants task prefixes (modelWantsTaskPrefixes); otherwise inputs
 // are sent verbatim. Callers MUST pass the role-appropriate prefix (document vs
 // query) so the two sides of the pipeline never collapse to the same prefix.
-func (e *Embeddings) embed(inputs []string, prefix string) ([][]float32, EmbeddingUsage, error) {
+// ctx bounds the request.
+func (e *Embeddings) embed(ctx context.Context, inputs []string, prefix string) ([][]float32, EmbeddingUsage, error) {
 	if len(inputs) == 0 {
 		return nil, EmbeddingUsage{}, nil
 	}
@@ -178,7 +183,7 @@ func (e *Embeddings) embed(inputs []string, prefix string) ([][]float32, Embeddi
 	}
 
 	resp, err := e.c.CreateEmbeddings(
-		context.Background(),
+		ctx,
 		openai.EmbeddingRequest{
 			Input: apiInputs,
 			Model: openai.EmbeddingModel(e.model),

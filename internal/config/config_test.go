@@ -17,7 +17,7 @@ func clearContractEnvVars(t *testing.T) {
 	vars := []string{
 		"DATABASE_URL", "BOOKS_DIR",
 		"EMBEDDINGS_BASE_URL", "EMBEDDINGS_MODEL",
-		"MCP_HTTP_ADDR", "STALE_JOB_TIMEOUT", "SCAN_INTERVAL",
+		"MCP_HTTP_ADDR", "MCP_TOOL_TIMEOUT", "STALE_JOB_TIMEOUT", "SCAN_INTERVAL",
 		"CHUNK_SIZE", "EMBED_BATCH_SIZE", "DEBUG", "DEBUG_DB_RESET",
 		"ASR_SERVERS", "AI_ENDPOINTS", "AI_ROLES",
 		"EVAL_GATES_EMBED", "EVAL_IN_PIPELINE",
@@ -125,6 +125,40 @@ func TestLoadConfig_InvalidStaleJobTimeout(t *testing.T) {
 	_, err := LoadConfig()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "STALE_JOB_TIMEOUT")
+}
+
+// TestLoadConfig_MCPToolTimeout covers MCP_TOOL_TIMEOUT: the 60s default, an
+// override, and the fail-closed cases — a zero or negative value would mean an
+// unbounded tool call, so it is fatal rather than read as "disabled".
+func TestLoadConfig_MCPToolTimeout(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default", val: "", want: DefaultMCPToolTimeout},
+		{name: "override", val: "15s", want: 15 * time.Second},
+		{name: "not a duration", val: "soon", wantErr: true},
+		{name: "zero", val: "0s", wantErr: true},
+		{name: "negative", val: "-1m", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearContractEnvVars(t)
+			t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+			t.Setenv("MCP_TOOL_TIMEOUT", tc.val)
+
+			cfg, err := LoadConfig()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "MCP_TOOL_TIMEOUT")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.MCPToolTimeout)
+		})
+	}
 }
 
 func TestLoadConfig_InvalidScanInterval(t *testing.T) {
