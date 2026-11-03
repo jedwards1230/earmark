@@ -1,4 +1,4 @@
--- 00016_runner_arbiter_yield.sql — gpu-arbiter's own "step off the GPU"
+-- 00018_runner_arbiter_yield.sql — gpu-arbiter's own "step off the GPU"
 -- request on runner_control (CONTRACT §1.4 "GPU phase control", Contract C1).
 --
 -- Until now two writers shared runner_control.phase: `earmark batch` (and

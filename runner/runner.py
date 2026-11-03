@@ -22,7 +22,7 @@ active again (not paused AND phase in NULL/'idle'/'transcribe') it restores the
 model (asr_model.cuda()). The park/unpark only happen at the gate between jobs
 (a chunked job yields between windows and parks at the next gate — see
 _maybe_yield_mid_job), and only on a state change. gpu-arbiter's own
-runner_control.arbiter_yield (migration 00016) parks it too. The `phase` column is read
+runner_control.arbiter_yield (migration 00018) parks it too. The `phase` column is read
 defensively (it may not exist yet in the deployed DB — a separate PR adds it);
 a missing column/row degrades to 'idle' (model stays on GPU, today's behavior).
 
@@ -870,9 +870,9 @@ def _stamp_gpu_parked(conn: psycopg2.extensions.connection, parked: bool) -> Non
 def _read_arbiter_yield(conn: psycopg2.extensions.connection) -> bool:
     """
     Read runner_control.arbiter_yield defensively (CONTRACT §1.4, migration
-    00016): gpu-arbiter's own "step off the GPU" request, written only by its
-    gpu_gate. A missing column (a database older than 00016), a missing row or
-    any error reads as False — exactly the pre-00016 behaviour. Own transaction
+    00018): gpu-arbiter's own "step off the GPU" request, written only by its
+    gpu_gate. A missing column (a database older than 00018), a missing row or
+    any error reads as False — exactly the pre-00018 behaviour. Own transaction
     (commit on success, rollback on error), like _read_phase.
     """
     try:

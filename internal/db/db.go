@@ -1988,7 +1988,7 @@ type QueueStats struct {
 	// until the runner has stamped at least once (column default NULL).
 	RunnerHeartbeatAt *time.Time
 	// ArbiterYield / ArbiterYieldAt mirror runner_control.arbiter_yield(_at)
-	// (migration 00016, CONTRACT §1.4): true while gpu-arbiter holds the ASR
+	// (migration 00018, CONTRACT §1.4): true while gpu-arbiter holds the ASR
 	// runner off the GPU (e.g. a game is running), and when the arbiter last
 	// wrote it. Read-only here — only gpu-arbiter's gpu_gate writes it.
 	ArbiterYield   bool
@@ -2175,7 +2175,7 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 
 	// Global control row (runner_control singleton): pause flag + bounded-run
 	// counter. arbiter_yield(_at) is read in the same query on purpose: it needs
-	// migration 00016, which db.New applies before anything serves or polls, so
+	// migration 00018, which db.New applies before anything serves or polls, so
 	// a schema without it only exists under a rolled-back database (then every
 	// status read fails loudly rather than silently reporting "not held"). Tolerate a missing row by defaulting to not-paused/unlimited; the
 	// init seed normally guarantees it exists.

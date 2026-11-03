@@ -653,11 +653,11 @@ func TestASRPilotMigration(t *testing.T) {
 	}
 }
 
-// TestRunnerArbiterYieldMigration pins 00016 (CONTRACT §1.4, §1.8): two
+// TestRunnerArbiterYieldMigration pins 00018 (CONTRACT §1.4, §1.8): two
 // additive, idempotent columns on runner_control — gpu-arbiter's own yield
 // flag and its timestamp — under the 5s lock timeout, and nothing else.
 func TestRunnerArbiterYieldMigration(t *testing.T) {
-	b, err := migrationFiles.ReadFile("migrations/00016_runner_arbiter_yield.sql")
+	b, err := migrationFiles.ReadFile("migrations/00018_runner_arbiter_yield.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

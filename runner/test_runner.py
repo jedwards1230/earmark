@@ -4257,7 +4257,7 @@ class ParkGateArbiterYieldTests(unittest.TestCase):
         self.assertTrue(runner._read_arbiter_yield(_Conn({"arbiter_yield": True}, None)))
         self.assertTrue(runner._read_arbiter_yield(_Conn((True,), None)))
         self.assertFalse(runner._read_arbiter_yield(_Conn(None, None)))
-        missing = _PhaseConn(raise_on="arbiter_yield")  # pre-00016 schema
+        missing = _PhaseConn(raise_on="arbiter_yield")  # pre-00018 schema
         self.assertFalse(runner._read_arbiter_yield(missing))
         self.assertEqual(missing.rollbacks, 1)
 

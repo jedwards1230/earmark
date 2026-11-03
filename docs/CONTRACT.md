@@ -378,7 +378,7 @@ CREATE TABLE IF NOT EXISTS runner_control (
                                             ('idle','requested','updating','success','failed')),
     runner_update_error    TEXT,         -- failure detail for the last update attempt
     runner_update_at       TIMESTAMPTZ,  -- when the update state last changed
-    arbiter_yield    BOOLEAN NOT NULL DEFAULT false, -- gpu-arbiter's yield request (00016)
+    arbiter_yield    BOOLEAN NOT NULL DEFAULT false, -- gpu-arbiter's yield request (00018)
     arbiter_yield_at TIMESTAMPTZ,                    -- when gpu-arbiter last wrote it
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by TEXT
@@ -572,7 +572,7 @@ The Go service exposes these write shapes (see §2.7 Control API):
 resume/run set `run_limit` **before** flipping `paused=false`, so the runner is
 never momentarily unbounded.
 
-#### gpu-arbiter yield — `runner_control.arbiter_yield` (migration 00016)
+#### gpu-arbiter yield — `runner_control.arbiter_yield` (migration 00018)
 
 `arbiter_yield` is gpu-arbiter's **own** request that the ASR runner step off the GPU (a
 higher-priority tenant — a game, ComfyUI — wants the card). It is written **only** by
@@ -595,9 +595,9 @@ mid-job check reconnects the job connection if it was lost (a dead connection wo
 read "keep going"). A yield refunds the job's **attempt** but not `run_limit`: the claim
 decremented it, so a bounded run (`earmark batch`) spends one more unit when the yielded job is
 claimed again — a bounded run counts claims, not books. A runner reads the column defensively:
-absent (a database older than 00016), a missing row or a read error is `false`. The Go service
+absent (a database older than 00018), a missing row or a read error is `false`. The Go service
 only reads it — `/api/v1/status` `pipeline.arbiterYield` / `arbiterYieldAt` ("held by
-gpu-arbiter"). **Deploy order:** an earmark release containing 00016 and a runner pin bump in
+gpu-arbiter"). **Deploy order:** an earmark release containing 00018 and a runner pin bump in
 homelab-ansible (`asr_runner_windows_source_ref`) first; the `gpu_gate` change that writes
 `arbiter_yield` ships with or after that pin bump, never before (the gate does not tolerate a
 schema without the column).
@@ -1295,8 +1295,8 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
 | 14 | `00014_finding_labels_scorecard.sql` | Model quality over time (§2.15 "Labels and scorecards"): the append-only `finding_labels` table (UPDATE/DELETE refused by a row trigger, TRUNCATE by a statement trigger; generated `correction_key` and `target`), the `finding_correction_key()` function (13's `correction_key` expression verbatim), and the read-only views `finding_label_current`, `recipe_scorecard` and `decide_scorecard`. One new table, three views, two functions; no ALTER, no backfill, no lock beyond the ACCESS SHARE a view takes (`lock_timeout` 5s). Down refuses while `finding_labels` has rows unless the session sets `earmark.allow_data_loss = 'on'`. |
 | 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. The representative CHECK is added `NOT VALID`, so Up after an opted-in Down (which keeps the append-only log's `duplicate` decisions and drops their pointer) succeeds. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
-| 16 | `00016_runner_arbiter_yield.sql` | gpu-arbiter's own yield request (§1.4 "gpu-arbiter yield"): `runner_control.arbiter_yield BOOLEAN NOT NULL DEFAULT false` and `arbiter_yield_at TIMESTAMPTZ`, both `ADD COLUMN IF NOT EXISTS` (Down `DROP COLUMN IF EXISTS`). A constant default rewrites nothing; ACCESS EXCLUSIVE on the one-row `runner_control` only, `lock_timeout` 5s. Merge before 00017; if they merge in the other order, renumber the later one. |
-| 17 | `00017_asr_pilot.sql` | **MERGE GATE: 16 (the runner_control arbiter columns, ASR-runner hardening) must be merged and released BEFORE 17. If 17 is merged first, renumber the later migration — goose refuses out-of-order versions and a process that sees one will not start.** The second-ASR pilot (§1.11): `pilot_transcripts` (one row per track × model × revision × scope, written by `runner/pilot.py`; `production_transcript_id` → `transcripts(id) ON DELETE CASCADE`) and `finding_asr_votes` (one asr_vote per finding × pilot transcript — `heard_replacement`, `heard_original`, `neither`, `unmappable` or `style_only` — written by `earmark asr-pilot vote --yes`; cascades from both the finding and the pilot transcript). Two new tables, no ALTER, no backfill; the two foreign keys take SHARE ROW EXCLUSIVE on `transcript_findings` then `transcripts`, locked up front (`lock_timeout` 5s) in the order that cannot deadlock against a requeue (which row-locks transcripts, writes findings, then deletes transcripts). Down refuses while `pilot_transcripts` has rows unless `earmark.allow_data_loss = 'on'`. |
+| 17 | `00017_asr_pilot.sql` | The second-ASR pilot (§1.11): `pilot_transcripts` (one row per track × model × revision × scope, written by `runner/pilot.py`; `production_transcript_id` → `transcripts(id) ON DELETE CASCADE`) and `finding_asr_votes` (one asr_vote per finding × pilot transcript — `heard_replacement`, `heard_original`, `neither`, `unmappable` or `style_only` — written by `earmark asr-pilot vote --yes`; cascades from both the finding and the pilot transcript). Two new tables, no ALTER, no backfill; the two foreign keys take SHARE ROW EXCLUSIVE on `transcript_findings` then `transcripts`, locked up front (`lock_timeout` 5s) in the order that cannot deadlock against a requeue (which row-locks transcripts, writes findings, then deletes transcripts). Down refuses while `pilot_transcripts` has rows unless `earmark.allow_data_loss = 'on'`. |
+| 18 | `00018_runner_arbiter_yield.sql` | (Version 16 is unused: it was planned for this migration, which merged after 17.) gpu-arbiter's own yield request (§1.4 "gpu-arbiter yield"): `runner_control.arbiter_yield BOOLEAN NOT NULL DEFAULT false` and `arbiter_yield_at TIMESTAMPTZ`, both `ADD COLUMN IF NOT EXISTS` (Down `DROP COLUMN IF EXISTS`). A constant default rewrites nothing; ACCESS EXCLUSIVE on the one-row `runner_control` only, `lock_timeout` 5s. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
