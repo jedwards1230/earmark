@@ -232,13 +232,15 @@ config:
   # ABS books library UUID. Empty → the service's built-in default Books library.
   absLibraryID: ""
 
+# Applies to the ingest and MCP deployments. The ingest embed worker OOMKilled
+# at 512Mi while churning a full re-embed backlog, so the limit allows for that.
 resources:
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 256Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: "1"
+    memory: 2Gi
 
 # ── Eval backfill CronJob (CONTRACT §2.15, decoupled mode) ─────────────────────
 # Optional CronJob running `earmark eval --backfill-unevaluated --write
