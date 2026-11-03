@@ -39,13 +39,20 @@ Environment:
     PILOT_WINDOW_SEC      target window; granite default 90 (hard max 210),
                           canary default 38 (hard max 40).
     PILOT_DEVICE          default cuda.
+    PILOT_STOP_FILE       optional path; if it exists (checked before each track and
+                          window) the run stops cleanly with exit 5.
+    PILOT_OUT_DIR         per-track JSON dir when --out-dir is not given
+                          (default <tempdir>/earmark-asr-pilot-out).
 
-Exit codes: 0 ok, 2 config error, 3 some tracks failed, 4 stopped for gaming.
+Exit codes: 0 ok, 2 config error, 3 some tracks failed, 4 stopped for gaming,
+5 stopped by PILOT_STOP_FILE.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
+import contextlib
 import hashlib
 import json
 import logging
@@ -54,6 +61,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -68,6 +77,7 @@ EXIT_OK = 0
 EXIT_CONFIG = 2
 EXIT_TRACKS_FAILED = 3
 EXIT_GAMING = 4
+EXIT_STOPPED = 5
 
 SAMPLE_RATE = 16000
 
@@ -122,10 +132,15 @@ CANARY_MIN_NEW_TOKENS = 128
 REPEAT_MIN_RUNS: dict[int, int] = {1: 8, 2: 5, 3: 4, 4: 4, 5: 4, 6: 4}
 
 ARBITER_TIMEOUT_SEC = 5.0
+ARBITER_RETRY_DELAY_SEC = 2.0  # one retry of an unreadable /status
 ARBITER_BUSY_STATES = frozenset({"gaming", "evicting"})
 
 MAX_TRACK_ROWS = 5000  # bound on the track-list query
 MAX_FINDING_SPANS = 5000  # bound on the per-track findings query
+
+# Audio is decoded per group of contiguous windows of at most this many seconds
+# (~115 MB of float32 at 16 kHz), so memory is bounded whatever the track length.
+DECODE_CHUNK_SEC = 1800.0
 
 
 class ConfigError(Exception):
@@ -134,6 +149,10 @@ class ConfigError(Exception):
 
 class GamingStop(Exception):
     """The arbiter reports a gaming tenant: stop now, write nothing partial (exit 4)."""
+
+
+class StopRequested(Exception):
+    """PILOT_STOP_FILE exists: stop now, write nothing partial (exit 5)."""
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +172,7 @@ class Config:
     out_dir: Path | None = None
     arbiter_url: str | None = None
     self_check: bool = False
+    stop_file: Path | None = None
     database_url: str = ""
     model_id: str = ""
     model_revision: str = ""
@@ -269,9 +289,16 @@ def load_config(
         track_limit_per_book=args.track_limit_per_book,
         force=args.force,
         dry_run=args.dry_run,
-        out_dir=args.out_dir,
+        out_dir=args.out_dir
+        or Path(
+            env.get("PILOT_OUT_DIR", "").strip()
+            or Path(tempfile.gettempdir()) / "earmark-asr-pilot-out"
+        ),
         arbiter_url=(args.arbiter_url or "").rstrip("/") or None,
         self_check=args.self_check,
+        stop_file=Path(env["PILOT_STOP_FILE"].strip())
+        if env.get("PILOT_STOP_FILE", "").strip()
+        else None,
         database_url=database_url,
         model_id=env.get("PILOT_MODEL_ID", "").strip() or DEFAULT_MODEL_IDS[backend],
         model_revision=revision,
@@ -370,52 +397,98 @@ def resolve_audio_path(cfg: Config, file_path: str) -> Path:
 Span = tuple[float, float]
 
 
+class Gaps:
+    """Inter-word gaps of the production words, indexed by midpoint for bisect."""
+
+    def __init__(self, words: Sequence[Span]) -> None:
+        gaps = sorted(
+            ((words[i][1] + words[i + 1][0]) / 2.0, words[i + 1][0] - words[i][1])
+            for i in range(len(words) - 1)
+            if words[i + 1][0] > words[i][1]
+        )
+        self.mids = [m for m, _ in gaps]
+        self.lens = [g for _, g in gaps]
+
+    def best(self, lo: float, hi: float) -> float | None:
+        """Midpoint of the largest gap whose midpoint lies in [lo, hi], or None."""
+        i = bisect.bisect_left(self.mids, lo)
+        j = bisect.bisect_right(self.mids, hi)
+        if i >= j:
+            return None
+        k = max(range(i, j), key=self.lens.__getitem__)
+        return self.mids[k]
+
+
+def _gaps(words: Sequence[Span] | Gaps) -> Gaps:
+    return words if isinstance(words, Gaps) else Gaps(words)
+
+
 def plan_windows(
     start: float,
     end: float,
-    words: Sequence[Span],
+    words: Sequence[Span] | Gaps,
     target: float,
     hard_max: float,
 ) -> list[Span]:
     """Split [start, end) into windows of at most `target` (<= hard_max) seconds.
 
     Each cut is placed at the midpoint of the largest inter-word gap (from the
-    PRODUCTION word timestamps, sorted (start, end) pairs) whose midpoint lies in
-    the last CUT_SEARCH_FRACTION of the target window, so no word is split. With
-    no usable gap there (or no production words at all) the cut falls back to a
-    fixed cut at start + target.
+    PRODUCTION word timestamps) whose midpoint lies in the last
+    CUT_SEARCH_FRACTION of the target window, so no word is split. With no usable
+    gap there (or no production words at all) the cut falls back to a fixed cut
+    at start + target. A tail shorter than MIN_WINDOW_SEC is folded into the
+    previous window when the merged window still fits in hard_max.
     """
     target = min(target, hard_max)
     if end <= start:
         return []
+    gaps = _gaps(words)
     windows: list[Span] = []
     pos = start
-    gaps = [
-        (words[i][1], words[i + 1][0])
-        for i in range(len(words) - 1)
-        if words[i + 1][0] > words[i][1]
-    ]
     while end - pos > target:
-        lo = pos + target * (1.0 - CUT_SEARCH_FRACTION)
         hi = pos + target
-        best: float | None = None
-        best_len = -1.0
-        for g0, g1 in gaps:
-            mid = (g0 + g1) / 2.0
-            if lo <= mid <= hi and (g1 - g0) > best_len:
-                best, best_len = mid, g1 - g0
+        best = gaps.best(pos + target * (1.0 - CUT_SEARCH_FRACTION), hi)
         cut = best if best is not None else hi
         windows.append((pos, cut))
         pos = cut
     windows.append((pos, end))
+    if (
+        len(windows) > 1
+        and end - pos < MIN_WINDOW_SEC
+        and end - windows[-2][0] <= hard_max
+    ):
+        windows[-2:] = [(windows[-2][0], end)]
     return windows
 
 
-def merge_spans(spans: Sequence[Span], pad: float, duration: float) -> list[Span]:
-    """Pad each span by `pad`, clamp to [0, duration], merge overlapping/touching ones."""
-    padded = sorted(
-        (max(0.0, s - pad), min(duration, e + pad)) for s, e in spans if e >= s
-    )
+def merge_spans(
+    spans: Sequence[Span],
+    pad: float,
+    duration: float,
+    words: Sequence[Span] | Gaps = (),
+) -> list[Span]:
+    """Pad each span by `pad`, snap, clamp to [0, duration], merge overlapping ones.
+
+    Each padded edge is snapped to the largest production inter-word gap inside
+    its pad (between the padded edge and the original one), so a window never
+    starts or ends inside a word when a gap is available; otherwise the padded
+    edge is kept.
+    """
+    gaps = _gaps(words)
+    padded: list[Span] = []
+    for s, e in spans:
+        if e < s:
+            continue
+        lo, hi = max(0.0, s - pad), min(duration, e + pad)
+        snap_lo = gaps.best(lo, min(s, hi))
+        snap_hi = gaps.best(max(e, lo), hi)
+        padded.append(
+            (
+                snap_lo if snap_lo is not None else lo,
+                snap_hi if snap_hi is not None else hi,
+            )
+        )
+    padded.sort()
     merged: list[list[float]] = []
     for s, e in padded:
         if e <= s:
@@ -436,12 +509,32 @@ def plan_track(
     finding_spans: Sequence[Span] = (),
 ) -> list[Span]:
     """Whole-track plan (full) or the merged held-finding spans, each windowed (findings)."""
+    gaps = Gaps(words)
     if scope == "full":
-        return plan_windows(0.0, duration, words, target, hard_max)
+        return plan_windows(0.0, duration, gaps, target, hard_max)
     plan: list[Span] = []
-    for s, e in merge_spans(finding_spans, FINDING_PAD_SEC, duration):
-        plan.extend(plan_windows(s, e, words, target, hard_max))
+    for s, e in merge_spans(finding_spans, FINDING_PAD_SEC, duration, gaps):
+        plan.extend(plan_windows(s, e, gaps, target, hard_max))
     return plan
+
+
+def group_windows(plan: Sequence[Span], max_sec: float) -> list[list[Span]]:
+    """Group contiguous windows into decode chunks of at most max_sec each.
+
+    A window longer than max_sec gets its own group (windows are <= 210 s, so
+    that does not happen with the defaults).
+    """
+    groups: list[list[Span]] = []
+    for w in plan:
+        if (
+            groups
+            and abs(groups[-1][-1][1] - w[0]) < 1e-9
+            and w[1] - groups[-1][0][0] <= max_sec
+        ):
+            groups[-1].append(w)
+        else:
+            groups.append([w])
+    return groups
 
 
 def production_word_spans(segments: Any) -> list[Span]:
@@ -468,8 +561,9 @@ def parse_granite_timestamps(
 ) -> list[dict[str, Any]]:
     """Parse Granite `word [T:N]` output into absolute-time words.
 
-    N is the word END time in centiseconds modulo 1000 (it wraps every 10 s), so
-    the value is unrolled by adding 10 s whenever it would go backwards. `_`
+    N is the word END time in centiseconds modulo 1000 (it wraps every 10 s). A
+    drop of more than half the wrap period is a rollover (add 10 s); a smaller
+    backwards step is timestamp jitter and is clamped to the previous end. `_`
     marks silence: dropped from the output but it advances the clock. A word's
     start is the previous token's end (the window start for the first). Several
     words before one tag share that interval evenly; trailing untagged words run
@@ -499,16 +593,34 @@ def parse_granite_timestamps(
             )
 
     for chunk, ts in zip(parts[0::2], parts[1::2]):
-        end = int(ts) / 100.0
-        while end + offset < last_end:
+        raw = int(ts) / 100.0
+        while last_end - (raw + offset) > GRANITE_TS_WRAP_SEC / 2.0:
             offset += GRANITE_TS_WRAP_SEC
-        end = min(end + offset, window_len)
+        end = min(max(raw + offset, last_end), window_len)
         start = min(last_end, end)
         emit(chunk, start, end)
         last_end = max(last_end, end)
     if len(parts) % 2 == 1 and parts[-1].strip():
         emit(parts[-1], last_end, max(last_end, window_len))
     return words
+
+
+def granite_degenerate_reason(text: str) -> str | None:
+    """Why a Granite timestamp-mode output is unusable, or None.
+
+    `no_timestamps`: text but no [T:N] tag, so every word time is a guess.
+    `no_words`: only tags and/or `_` silence tokens.
+    """
+    stripped = _TS_SPLIT.sub(" ", text or "")
+    real = [t for t in stripped.split() if t != GRANITE_SILENCE_TOKEN]
+    has_tags = _TS_SPLIT.search(text or "") is not None
+    if real and not has_tags:
+        return "no_timestamps"
+    if has_tags and not real:
+        return "no_words"
+    if not real and (text or "").strip():
+        return "no_words"  # only `_` tokens
+    return None
 
 
 def has_repetition_loop(tokens: Sequence[str]) -> bool:
@@ -595,6 +707,19 @@ class WindowResult:
     text: str
     words: list[dict[str, Any]]
     hit_token_limit: bool = False
+    degenerate_reason: str | None = None
+
+
+def granite_window_result(
+    text: str, window_start: float, window_len: float, hit_token_limit: bool = False
+) -> WindowResult:
+    """Parse one Granite window's output into a WindowResult (pure; shared by tests)."""
+    return WindowResult(
+        text=text,
+        words=parse_granite_timestamps(text, window_start, window_len),
+        hit_token_limit=hit_token_limit,
+        degenerate_reason=granite_degenerate_reason(text),
+    )
 
 
 class Backend:
@@ -710,9 +835,8 @@ class GraniteBackend(Backend):
         text = self.tokenizer.decode(
             new_tokens, add_special_tokens=False, skip_special_tokens=True
         )
-        words = parse_granite_timestamps(text, window_start, window_len)
-        return WindowResult(
-            text=text, words=words, hit_token_limit=len(new_tokens) >= limit
+        return granite_window_result(
+            text, window_start, window_len, len(new_tokens) >= limit
         )
 
 
@@ -746,10 +870,12 @@ class CanaryBackend(Backend):
             [audios.shape[-1]], dtype=torch.int64, device=self.cfg.device
         )
         limit = max(CANARY_MIN_NEW_TOKENS, int(CANARY_TOKENS_PER_SECOND * window_len))
-        with (
-            torch.inference_mode(),
-            torch.autocast("cuda", dtype=torch.bfloat16),
-        ):
+        autocast = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if str(self.cfg.device).startswith("cuda")
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), autocast:
             ids = self.model.generate(
                 prompts=[[{"role": "user", "content": prompt}]],
                 audios=audios,
@@ -776,32 +902,62 @@ def make_backend(cfg: Config) -> Backend:
 
 
 def ffmpeg_timeout(duration: float) -> float:
-    """Decode deadline: 2 min floor plus 5% of real time (a 20 h book gets 1 h)."""
+    """Decode deadline per chunk: 2 min floor plus 5% of the chunk's real time."""
     return 120.0 + 0.05 * max(0.0, duration)
 
 
 def decode_audio(
-    cfg: Config, path: Path, duration: float
+    cfg: Config, path: Path, start: float, end: float
 ) -> Any:  # pragma: no cover - needs ffmpeg+numpy
-    """Decode the whole track ONCE to 16 kHz mono float32 (numpy) via ffmpeg."""
+    """Decode [start, end) of a track to 16 kHz mono float32 (numpy) via ffmpeg.
+
+    Streams ffmpeg's stdout into a preallocated buffer sized for the chunk (no
+    capture_output buffering), so memory is bounded by the chunk length; stderr
+    goes to a temp file. A watchdog kills ffmpeg past ffmpeg_timeout().
+    """
     import numpy as np
 
+    length = max(0.0, end - start)
     cmd = [
         cfg.ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-i", str(path), "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-",
+        "-ss", f"{start:.3f}", "-i", str(path), "-t", f"{length:.3f}",
+        "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-",
     ]  # fmt: skip
-    proc = subprocess.run(
-        cmd, capture_output=True, check=False, timeout=ffmpeg_timeout(duration)
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg exit {proc.returncode}: {proc.stderr.decode('utf-8', 'replace')[-500:]}"
-        )
-    return np.frombuffer(proc.stdout, dtype=np.float32)
+    expected = (int(length * SAMPLE_RATE) + SAMPLE_RATE) * 4  # +1 s of slack
+    buf = bytearray(expected)
+    view = memoryview(buf)
+    filled = 0
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        timer = threading.Timer(ffmpeg_timeout(length), proc.kill)
+        timer.start()
+        try:
+            assert proc.stdout is not None
+            while True:
+                if filled == len(buf):  # longer than expected: grow by 1 s
+                    buf.extend(bytes(SAMPLE_RATE * 4))
+                    view = memoryview(buf)
+                n = proc.stdout.readinto(view[filled:])
+                if not n:
+                    break
+                filled += n
+            rc = proc.wait()
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+        if rc != 0:
+            err.seek(0)
+            msg = err.read()[-500:].decode("utf-8", "replace")
+            raise RuntimeError(f"ffmpeg exit {rc} ({start:.1f}-{end:.1f} s): {msg}")
+    del view
+    usable = filled - filled % 4
+    return np.frombuffer(buf, dtype=np.float32, count=usable // 4)
 
 
 def slice_audio(audio: Any, start: float, end: float) -> Any:
-    return audio[round(start * SAMPLE_RATE) : round(end * SAMPLE_RATE)]
+    """Samples [start, end) (seconds relative to the decoded chunk), as a writable copy."""
+    return audio[round(start * SAMPLE_RATE) : round(end * SAMPLE_RATE)].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -822,19 +978,39 @@ def gaming_active(status: dict[str, Any] | None) -> bool:
 
 
 def check_gaming(
-    cfg: Config, fetch: Callable[[str], dict[str, Any]] = fetch_arbiter_status
+    cfg: Config,
+    fetch: Callable[[str], dict[str, Any]] = fetch_arbiter_status,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
+    """Raise GamingStop when a game holds the GPU.
+
+    An unreadable status is retried once after ARBITER_RETRY_DELAY_SEC; if it is
+    still unreadable it counts as gaming (fail toward stopping). A readable
+    `gaming`/`evicting` state stops at once.
+    """
     if not cfg.arbiter_url:
         return
-    try:
-        status: dict[str, Any] | None = fetch(cfg.arbiter_url)
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        log.warning("arbiter status unreadable (%s); treating as gaming", exc)
-        status = None
+    status: dict[str, Any] | None = None
+    for attempt in range(2):
+        try:
+            got = fetch(cfg.arbiter_url)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            log.warning("arbiter status unreadable (%s), attempt %d", exc, attempt + 1)
+            got = None
+        if isinstance(got, dict):
+            status = got
+            break
+        if attempt == 0:
+            sleep(ARBITER_RETRY_DELAY_SEC)
     if gaming_active(status):
         raise GamingStop(
             f"arbiter state={None if status is None else status.get('state')}"
         )
+
+
+def check_stop_file(cfg: Config) -> None:
+    if cfg.stop_file is not None and cfg.stop_file.exists():
+        raise StopRequested(f"stop file {cfg.stop_file} exists")
 
 
 # ---------------------------------------------------------------------------
@@ -853,13 +1029,24 @@ TRACKS_SQL = """
 
 PRODUCTION_SEGMENTS_SQL = "SELECT segments FROM transcripts WHERE id = %s::uuid"
 
+# Held = proposed, not superseded, and the finding's LATEST live decision (one
+# not revoked by a kind='revoke' event; same pattern as internal/db/decidecands.go
+# decideLatestDecisionJoin) is a hold.
 HELD_FINDING_SPANS_SQL = """
     SELECT DISTINCT f.start_sec, f.end_sec
       FROM transcript_findings f
+      JOIN LATERAL (
+            SELECT e.outcome FROM finding_events e
+             WHERE e.finding_id = f.id AND e.kind = 'decision'
+               AND NOT EXISTS (SELECT 1 FROM finding_events v
+                                WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
+             ORDER BY e.id DESC
+             LIMIT 1) ld ON true
      WHERE f.file_path = %s
        AND f.patch_state = 'proposed'
-       AND EXISTS (SELECT 1 FROM finding_events e
-                    WHERE e.finding_id = f.id AND e.kind = 'decision' AND e.outcome = 'hold')
+       AND f.superseded_at IS NULL
+       AND f.end_sec > f.start_sec
+       AND ld.outcome = 'hold'
      ORDER BY 1, 2
      LIMIT %s
 """
@@ -905,6 +1092,31 @@ def connect(cfg: Config) -> Any:  # pragma: no cover - thin psycopg2 wrapper
     return conn
 
 
+class DbSession:
+    """Holds the connection; `ensure()` reconnects one that died during a long track."""
+
+    def __init__(self, conn: Any, connect_fn: Callable[[], Any]) -> None:
+        self.conn = conn
+        self.connect_fn = connect_fn
+
+    def ensure(self) -> Any:
+        alive = not getattr(self.conn, "closed", 0)
+        if alive:
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                self.conn.rollback()
+            except Exception as exc:  # noqa: BLE001 - any failure means reconnect
+                log.warning("DB connection unusable (%s); reconnecting", exc)
+                alive = False
+        if not alive:
+            with contextlib.suppress(Exception):
+                self.conn.close()
+            self.conn = self.connect_fn()
+        return self.conn
+
+
 def select_tracks(conn: Any, cfg: Config) -> list[Track]:
     with conn.cursor() as cur:
         cur.execute(TRACKS_SQL, (cfg.asins, MAX_TRACK_ROWS))
@@ -937,6 +1149,13 @@ def already_done(conn: Any, cfg: Config, track: Track) -> bool:
     return row is not None
 
 
+def tracks_to_do(conn: Any, cfg: Config, tracks: Sequence[Track]) -> list[Track]:
+    """Drop already-stored tracks (unless --force), then apply --limit-tracks."""
+    todo = [t for t in tracks if cfg.force or not already_done(conn, cfg, t)]
+    log.info("%d track(s) selected, %d to do", len(tracks), len(todo))
+    return todo[: cfg.limit_tracks] if cfg.limit_tracks else todo
+
+
 def read_production_words(conn: Any, track: Track) -> list[Span]:
     """One track's production word times (a single bounded row)."""
     with conn.cursor() as cur:
@@ -955,6 +1174,19 @@ def read_finding_spans(conn: Any, track: Track) -> list[Span]:
         rows = cur.fetchall()
     conn.rollback()
     return [(float(s), float(e)) for s, e in rows]
+
+
+def track_plan(conn: Any, cfg: Config, track: Track) -> tuple[list[Span], int]:
+    """(window plan, production word count) for one track; warns on zero duration."""
+    if track.duration <= 0:
+        log.warning("skip %s: zero duration in transcripts", track.file_path)
+        return [], 0
+    words = read_production_words(conn, track)
+    spans = read_finding_spans(conn, track) if cfg.scope == "findings" else []
+    plan = plan_track(
+        track.duration, words, cfg.window_sec, cfg.hard_max_sec, cfg.scope, spans
+    )
+    return plan, len(words)
 
 
 def write_result(conn: Any, cfg: Config, track: Track, result: dict[str, Any]) -> None:
@@ -996,48 +1228,75 @@ def write_result(conn: Any, cfg: Config, track: Track, result: dict[str, Any]) -
 # Per-track pipeline
 # ---------------------------------------------------------------------------
 
+DecodeFn = Callable[[Config, Path, float, float], Any]
+
 
 def transcribe_track(
     cfg: Config,
     backend: Backend,
-    audio: Any,
     plan: Sequence[Span],
+    decode_chunk: Callable[[float, float], Any],
     gaming_check: Callable[[], None],
 ) -> dict[str, Any]:
-    """Transcribe every planned window; raises GamingStop between windows."""
+    """Transcribe every planned window; raises GamingStop between windows.
+
+    Audio is decoded per group of contiguous windows (<= DECODE_CHUNK_SEC), so
+    only one chunk is in memory at a time. `decode_sec` is timed separately and
+    `wall_sec` covers transcription only.
+    """
     segments: list[dict[str, Any]] = []
-    degenerate: list[int] = []
-    audio_sec = 0.0
-    for idx, (ws, we) in enumerate(plan):
+    degenerate: list[dict[str, Any]] = []
+    audio_sec = decode_sec = wall_sec = 0.0
+    idx = 0
+    for group in group_windows(plan, DECODE_CHUNK_SEC):
         gaming_check()
-        res = backend.transcribe_window(slice_audio(audio, ws, we), ws)
-        audio_sec += we - ws
-        tokens = (
-            [w["word"] for w in res.words] if res.words else (res.text or "").split()
-        )
-        bad = res.hit_token_limit or has_repetition_loop(tokens)
-        if bad:
-            degenerate.append(idx)
-            log.warning(
-                "window %d [%.1f, %.1f] degenerate (repetition/token limit)",
-                idx,
-                ws,
-                we,
+        g0, g1 = group[0][0], group[-1][1]
+        t0 = time.monotonic()
+        audio = decode_chunk(g0, g1)
+        decode_sec += time.monotonic() - t0
+        for ws, we in group:
+            gaming_check()
+            window = slice_audio(audio, ws - g0, we - g0)
+            t0 = time.monotonic()
+            res = backend.transcribe_window(window, ws)
+            wall_sec += time.monotonic() - t0
+            audio_sec += we - ws
+            tokens = (
+                [w["word"] for w in res.words]
+                if res.words
+                else (res.text or "").split()
             )
-        if backend.has_word_times:
-            new = words_to_segments(res.words, len(segments))
-        else:
-            seg = canary_segment(res.text, ws, we, len(segments))
-            new = [seg] if seg else []
-        if bad:
-            for s in new:
-                s["degenerate"] = True  # optional marker; §1.2.1 readers ignore it
-        segments.extend(new)
+            reason = res.degenerate_reason
+            if reason is None and res.hit_token_limit:
+                reason = "token_limit"
+            if reason is None and has_repetition_loop(tokens):
+                reason = "repetition"
+            if backend.has_word_times:
+                new = words_to_segments(res.words, len(segments))
+            else:
+                seg = canary_segment(res.text, ws, we, len(segments))
+                new = [seg] if seg else []
+            if reason:
+                degenerate.append(
+                    {"window": idx, "start": ws, "end": we, "reason": reason}
+                )
+                log.warning(
+                    "window %d [%.1f, %.1f] degenerate: %s", idx, ws, we, reason
+                )
+                for s in new:  # optional markers; §1.2.1 readers ignore them
+                    s["degenerate"] = True
+                    s["degenerate_reason"] = reason
+            segments.extend(new)
+            idx += 1
+        del audio
     return {
         "segments": segments,
         "raw_text": " ".join(s["text"] for s in segments),
         "has_word_times": backend.has_word_times,
         "audio_sec": round(audio_sec, 3),
+        "decode_sec": round(decode_sec, 3),
+        "wall_sec": round(wall_sec, 3),
+        "rtfx": round(audio_sec / wall_sec, 3) if wall_sec > 0 else None,
         "degenerate_windows": degenerate,
     }
 
@@ -1050,53 +1309,63 @@ def _out_file(cfg: Config, track: Track) -> Path | None:
 
 
 def process_track(
-    conn: Any,
+    db: DbSession,
     cfg: Config,
     backend: Backend,
     track: Track,
-    decode: Callable[[Config, Path, float], Any] = decode_audio,
+    decode: DecodeFn = decode_audio,
     gaming_check: Callable[[], None] | None = None,
 ) -> str:
-    """Run one track end to end. Returns 'done' or 'skipped'; raises on failure/GamingStop."""
-    words = read_production_words(conn, track)
-    spans = read_finding_spans(conn, track) if cfg.scope == "findings" else []
-    plan = plan_track(
-        track.duration, words, cfg.window_sec, cfg.hard_max_sec, cfg.scope, spans
-    )
+    """Run one track end to end. Returns 'done' or 'skipped'; raises on failure/GamingStop.
+
+    The per-track JSON goes to the out dir BEFORE the DB write, so a failed
+    write never loses the GPU work; the connection is checked (and reopened if
+    it died during the track) right before the write.
+    """
+    plan, _ = track_plan(db.conn, cfg, track)
     if not plan:
         log.info(
             "skip %s: nothing to transcribe (scope=%s)", track.file_path, cfg.scope
         )
         return "skipped"
-    check = gaming_check or (lambda: check_gaming(cfg))
+    gaming = gaming_check or (lambda: check_gaming(cfg))
+
+    def check() -> None:
+        check_stop_file(cfg)
+        gaming()
+
     check()
-    t0 = time.monotonic()
+    path = resolve_audio_path(cfg, track.file_path)
     backend.reset_peak()
-    audio = decode(cfg, resolve_audio_path(cfg, track.file_path), track.duration)
-    result = transcribe_track(cfg, backend, audio, plan, check)
-    wall = time.monotonic() - t0
-    alloc, reserved = backend.peak_mib()
-    result.update(
-        wall_sec=round(wall, 3),
-        rtfx=round(result["audio_sec"] / wall, 3) if wall > 0 else None,
-        peak_vram_mib=alloc,
-        peak_reserved_mib=reserved,
+    result = transcribe_track(
+        cfg, backend, plan, lambda s, e: decode(cfg, path, s, e), check
     )
-    write_result(conn, cfg, track, result)
+    alloc, reserved = backend.peak_mib()
+    result.update(peak_vram_mib=alloc, peak_reserved_mib=reserved)
     out = _out_file(cfg, track)
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(
-                {"file_path": track.file_path, "plan": plan, **result},
+                {
+                    "file_path": track.file_path,
+                    "transcript_id": track.transcript_id,
+                    "backend": cfg.backend,
+                    "model_id": cfg.model_id,
+                    "model_revision": cfg.model_revision,
+                    "scope": cfg.scope,
+                    "plan": plan,
+                    **result,
+                },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
         )
+    write_result(db.ensure(), cfg, track, result)
     log.info(
-        "done %s: %d windows, %.0f s audio, rtfx %s, peak %s MiB, degenerate %s",
-        track.file_path, len(plan), result["audio_sec"], result["rtfx"],
-        alloc, result["degenerate_windows"],
+        "done %s: %d windows, %.0f s audio, decode %.0f s, rtfx %s, peak %s MiB, degenerate %d",
+        track.file_path, len(plan), result["audio_sec"], result["decode_sec"],
+        result["rtfx"], alloc, len(result["degenerate_windows"]),
     )  # fmt: skip
     return "done"
 
@@ -1104,13 +1373,9 @@ def process_track(
 def dry_run(
     conn: Any, cfg: Config, tracks: Sequence[Track], emit: Callable[[str], None] = print
 ) -> None:
-    """Print the track list + window plan. Reads only; no model load, no writes."""
+    """Print the window plan of the tracks a real run would process. Reads only."""
     for t in tracks:
-        words = read_production_words(conn, t)
-        spans = read_finding_spans(conn, t) if cfg.scope == "findings" else []
-        plan = plan_track(
-            t.duration, words, cfg.window_sec, cfg.hard_max_sec, cfg.scope, spans
-        )
+        plan, n_words = track_plan(conn, cfg, t)
         emit(
             json.dumps(
                 {
@@ -1118,8 +1383,7 @@ def dry_run(
                     "file_path": t.file_path,
                     "duration_sec": t.duration,
                     "scope": cfg.scope,
-                    "already_done": already_done(conn, cfg, t),
-                    "production_words": len(words),
+                    "production_words": n_words,
                     "windows": [[round(s, 2), round(e, 2)] for s, e in plan],
                 },
                 ensure_ascii=False,
@@ -1158,38 +1422,56 @@ def run(
     cfg: Config,
     conn: Any,
     backend: Backend | None = None,
-    decode: Callable[[Config, Path, float], Any] = decode_audio,
+    decode: DecodeFn = decode_audio,
     gaming_check: Callable[[], None] | None = None,
+    connect_fn: Callable[[], Any] | None = None,
 ) -> int:
-    tracks = select_tracks(conn, cfg)
+    db = DbSession(conn, connect_fn or (lambda: connect(cfg)))
+    tracks = select_tracks(db.conn, cfg)
+    todo = tracks_to_do(db.conn, cfg, tracks)
     if cfg.dry_run:
-        dry_run(conn, cfg, tracks)
+        dry_run(db.conn, cfg, todo)
         return EXIT_OK
-    todo = [t for t in tracks if cfg.force or not already_done(conn, cfg, t)]
-    log.info("%d track(s) selected, %d to do", len(tracks), len(todo))
-    if cfg.limit_tracks:
-        todo = todo[: cfg.limit_tracks]
     if not todo:
         return EXIT_OK
     if backend is None:  # pragma: no cover - real model
         backend = make_backend(cfg)
         backend.load()
+    try:
+        return _run_tracks(db, cfg, backend, todo, decode, gaming_check)
+    finally:
+        if db.conn is not conn:  # reconnected mid-run: the caller only closes its own
+            with contextlib.suppress(Exception):
+                db.conn.close()
+
+
+def _run_tracks(
+    db: DbSession,
+    cfg: Config,
+    backend: Backend,
+    todo: Sequence[Track],
+    decode: DecodeFn,
+    gaming_check: Callable[[], None] | None,
+) -> int:
     failed = 0
     for track in todo:
         try:
             process_track(
-                conn, cfg, backend, track, decode=decode, gaming_check=gaming_check
+                db, cfg, backend, track, decode=decode, gaming_check=gaming_check
             )
         except GamingStop as exc:
             log.warning(
                 "stopping for gaming (%s); %s not written", exc, track.file_path
             )
             return EXIT_GAMING
+        except StopRequested as exc:
+            log.warning("stopping (%s); %s not written", exc, track.file_path)
+            return EXIT_STOPPED
         except Exception:
             failed += 1
             log.exception("track failed: %s", track.file_path)
             try:
-                conn.rollback()
+                db.conn.rollback()
             except Exception:  # noqa: BLE001
                 log.warning("rollback after failure also failed")
     return EXIT_TRACKS_FAILED if failed else EXIT_OK
@@ -1212,7 +1494,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return run(cfg, conn)
     finally:
-        conn.close()
+        with contextlib.suppress(Exception):
+            conn.close()
 
 
 if __name__ == "__main__":

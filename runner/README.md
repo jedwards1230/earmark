@@ -82,36 +82,60 @@ transaction per finished track. A track that does not finish writes nothing.
   times, read one track at a time. Each cut sits at the largest inter-word gap in
   the last 25% of the target window, so no word is split. No window exceeds the
   backend's hard max. With no production words, the cuts fall at fixed intervals.
-- **Audio.** Each track is decoded once to 16 kHz mono float32 (`ffmpeg`, with a
-  timeout of 120 s + 5% of the track length) and sliced in memory. That is about
-  230 MB of RAM per hour of audio.
+  A final window shorter than 5 s is folded into the previous one when the merged
+  window still fits the hard max.
+- **Audio.** Audio is decoded in chunks of contiguous windows, at most 30 min
+  each (`ffmpeg -ss … -t …` to 16 kHz mono float32). In findings scope that means
+  only the merged spans. ffmpeg's output is streamed into a buffer sized for the
+  chunk, so memory stays at about 115 MB whatever the track length. Each chunk
+  has a timeout of 120 s + 5% of its length, and each window gets its own
+  writable copy.
 - **Granite.** The model gets the model card's timestamp prompt with
   `repetition_penalty=2.0` and `num_beams=1`. `max_new_tokens` is
   `max(256, 48 × window_sec × 1.1)`. The output is parsed with
   `re.split(r"\[T:(\d+)\]")`:
-  - the centisecond end times wrap every 10 s and are unrolled;
+  - the centisecond end times wrap every 10 s. A backwards step of more than
+    5 s is a wrap (add 10 s); a smaller one is jitter and is clamped to the
+    previous end;
   - `_` silence tokens are dropped, but they still advance the clock;
   - a word starts where the previous token ended.
-- **Repetition guard.** A window is marked degenerate if any n-gram repeats
-  back-to-back (a single word 8 times, longer n-grams 4 to 5 times) or if the
-  window hits its token limit. Its segments then carry an optional
-  `"degenerate": true` key.
+- **Degenerate windows.** A window is marked degenerate for one of these reasons:
+  - `repetition`: an n-gram repeats back-to-back (a single word 8 times, longer
+    n-grams 4 to 5 times);
+  - `token_limit`: the window hit its token limit;
+  - `no_timestamps`: Granite output with no `[T:N]` tags, so its word times are
+    spread evenly and are guesses;
+  - `no_words`: Granite output of only tags and/or `_` tokens.
+
+  Its segments then carry the optional keys `"degenerate": true` and
+  `"degenerate_reason"`. The out-file lists every degenerate window.
 - **`--scope findings`.** Only the windows around the track's **held** findings
-  are transcribed. A held finding is `patch_state='proposed'` with a decide
-  `hold` event. Each finding's chunk span (`start_sec`/`end_sec`) is padded by
-  ±5 s. Overlapping spans are merged, then windowed as above. Rows carry
+  are transcribed. A held finding is `patch_state='proposed'`, not superseded,
+  with `end_sec > start_sec`, and its latest decision event not revoked by a
+  `revoke` event is a `hold`. Each finding's chunk span (`start_sec`/`end_sec`)
+  is padded by ±5 s, and each padded edge snaps to the largest production gap
+  inside the pad. Overlapping spans are merged, then windowed as above. Rows carry
   `scope='findings'`, and `audio_sec` is the sum of the windows.
 - **Idempotency.** A row is keyed by `(file_path, model_id, model_revision,
   scope)`. Tracks already stored are skipped. `--force` deletes the old row and
   inserts the new one in the same transaction.
 - **Gaming check.** With `--arbiter-url`, gpu-arbiter `GET /status` is read
-  before each track and before each window. State `gaming` or `evicting`, or an
-  unreadable status, stops the run with exit 4. The current track is not
+  before each track, each decode chunk and each window. State `gaming` or
+  `evicting` stops the run with exit 4. An unreadable status is retried once
+  after 2 s and then counts as gaming. The current track is not
   written; finished tracks stay done, so a re-run resumes.
+- **Stop file.** If `PILOT_STOP_FILE` is set and that file exists, checked at the
+  same points as the gaming check, the run stops cleanly with exit 5. The rules
+  are the same: the current track is not written and finished tracks stay done.
+- **Write order.** The per-track JSON is written to the out dir **before** the
+  DB write, so a failed write never loses the GPU work. Right before the write,
+  the connection is pinged and reopened if it died during the track.
 - **Metrics per track:**
   - `audio_sec`;
-  - `wall_sec`, which covers decode plus transcription;
+  - `wall_sec`: transcription time only (model calls, excluding decode);
   - `rtfx = audio_sec / wall_sec`;
+  - `decode_sec`: ffmpeg time, in the out-file JSON only (the table has no
+    column for it);
   - `peak_vram_mib` (`torch.cuda.max_memory_allocated`, reset per track);
   - `peak_reserved_mib` (`max_memory_reserved`).
 
@@ -127,8 +151,8 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 |---|---|
 | `--track-limit-per-book N` | Keeps the first N tracks of each book (by `file_path`). The set is stable across re-runs. |
 | `--limit-tracks N` | Caps how many not-yet-done tracks this run processes. |
-| `--dry-run` | Prints one JSON line per track with its window plan. It reads the DB in a read-only session. It loads no model, decodes no audio and writes nothing. |
-| `--out-dir` | Also writes each finished track's JSON (plan, segments, metrics) there. |
+| `--dry-run` | Prints one JSON line per track a real run would process, after the already-done filter and `--limit-tracks`, with its window plan. It reads the DB in a read-only session. It loads no model, decodes no audio and writes nothing. |
+| `--out-dir` | Where each finished track's JSON (plan, segments, metrics, degenerate windows, `decode_sec`) goes. The default is `PILOT_OUT_DIR`, else `<tempdir>/earmark-asr-pilot-out`. |
 | `--self-check` | Loads the model and transcribes 5 s of silence. Prints `{backend, model, revision, torch, cuda, vram, output, ffmpeg, ffprobe}`. Needs no DB. |
 
 ### Environment
@@ -142,9 +166,11 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `BOOKS_MOUNT`, `BOOKS_DB_ROOT`, `BOOKS_PATH_ENCODING` | Same meaning as in `runner.py`. |
 | `FFMPEG_BIN`, `FFPROBE_BIN` | Default `ffmpeg` / `ffprobe`. `runner.py` has no env names for these; it runs them from `PATH`. |
 | `PILOT_WINDOW_SEC` | Target window length. Values above the backend's hard max are a config error. |
-| `PILOT_DEVICE` | Default `cuda`. |
+| `PILOT_DEVICE` | Default `cuda`. bf16 autocast (Canary) is only used on a CUDA device. |
+| `PILOT_OUT_DIR` | Default out dir when `--out-dir` is not given. |
+| `PILOT_STOP_FILE` | Optional path. If the file exists, the run stops cleanly with exit 5. |
 
-**Exit codes:** `0` ok, `2` config error, `3` some tracks failed, `4` stopped for gaming.
+**Exit codes:** `0` ok, `2` config error, `3` some tracks failed, `4` stopped for gaming, `5` stopped by `PILOT_STOP_FILE`.
 
 ### Install layout
 

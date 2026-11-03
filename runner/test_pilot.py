@@ -14,6 +14,7 @@ import importlib.util
 import itertools
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Self
 
@@ -44,6 +45,8 @@ class FakeCursor:
 
     def execute(self, sql: str, params: Any = None) -> None:
         self.sql = sql
+        if self.conn.fail_insert and sql.lstrip().startswith("INSERT"):
+            raise OSError("insert failed")
         self.conn.executed.append((sql, params))
 
     def fetchall(self) -> list[Any]:
@@ -54,6 +57,10 @@ class FakeCursor:
         raise AssertionError(f"unexpected fetchall for {self.sql}")
 
     def fetchone(self) -> Any:
+        if self.sql == "SELECT 1":
+            if self.conn.dead:
+                raise OSError("server closed the connection")
+            return (1,)
         if "FROM pilot_transcripts" in self.sql:
             fp = self.conn.executed[-1][1][0]
             return (1,) if fp in self.conn.done else None
@@ -73,6 +80,9 @@ class FakeConn:
         self.executed: list[tuple[str, Any]] = []
         self.commits = 0
         self.rollbacks = 0
+        self.closed = 0
+        self.dead = False
+        self.fail_insert = False
 
     def cursor(self) -> FakeCursor:
         return FakeCursor(self)
@@ -82,6 +92,9 @@ class FakeConn:
 
     def rollback(self) -> None:
         self.rollbacks += 1
+
+    def close(self) -> None:
+        self.closed = 1
 
     def writes(self) -> list[tuple[str, Any]]:
         return [
@@ -117,15 +130,24 @@ class FakeBackend(pilot.Backend):
                 "hello [T:50] world [T:120]" if self.has_word_times else "Hello, World."
             )
         if self.has_word_times:
-            words = pilot.parse_granite_timestamps(
+            return pilot.granite_window_result(
                 text, window_start, len(audio) / pilot.SAMPLE_RATE
             )
-            return pilot.WindowResult(text=text, words=words)
         return pilot.WindowResult(text=text, words=[])
 
 
-def fake_decode(cfg: Any, path: Path, duration: float) -> list[float]:
-    return [0.0] * int(duration * pilot.SAMPLE_RATE)
+DECODES: list[tuple[float, float]] = []
+OUT_DIR = tempfile.mkdtemp(prefix="pilot-test-out-")
+
+
+def fake_decode(cfg: Any, path: Path, start: float, end: float) -> list[float]:
+    DECODES.append((start, end))
+    return [0.0] * round((end - start) * pilot.SAMPLE_RATE)
+
+
+def chunk_of(total_sec: float) -> Any:
+    audio = [0.0] * round(total_sec * pilot.SAMPLE_RATE)
+    return lambda s, e: audio[round(s * 16000) : round(e * 16000)]
 
 
 def make_cfg(
@@ -133,6 +155,7 @@ def make_cfg(
 ) -> Any:
     base = {
         "DATABASE_URL": "postgres://x@y/z",
+        "PILOT_OUT_DIR": OUT_DIR,
         "PILOT_MODEL_REVISION": REV,
         "BOOKS_MOUNT": "/books",
     }
@@ -294,9 +317,9 @@ def test_degenerate_window_is_marked() -> None:
     loop = " ".join(f"again [T:{i * 10}]" for i in range(1, 20))
     backend = FakeBackend(cfg, "granite", outputs=[loop])
     result = pilot.transcribe_track(
-        cfg, backend, [0.0] * 30 * 16000, [(0.0, 30.0)], no_gaming
+        cfg, backend, [(0.0, 30.0)], chunk_of(30.0), no_gaming
     )
-    assert result["degenerate_windows"] == [0]
+    assert [d["reason"] for d in result["degenerate_windows"]] == ["repetition"]
     assert all(s.get("degenerate") is True for s in result["segments"])
 
 
@@ -311,7 +334,7 @@ def test_granite_segments_shape() -> None:
     cfg = make_cfg("granite")
     backend = FakeBackend(cfg, "granite")
     res = pilot.transcribe_track(
-        cfg, backend, [0.0] * 200 * 16000, [(0.0, 100.0), (100.0, 200.0)], no_gaming
+        cfg, backend, [(0.0, 100.0), (100.0, 200.0)], chunk_of(200.0), no_gaming
     )
     segs = res["segments"]
     assert res["has_word_times"] is True
@@ -330,7 +353,7 @@ def test_canary_segments_shape_one_per_window_no_word_times() -> None:
     cfg = make_cfg("canary")
     backend = FakeBackend(cfg, "canary", outputs=["Hello, World.", "  ", "Dr. Who?"])
     plan = [(0.0, 38.0), (38.0, 76.0), (76.0, 100.0)]
-    res = pilot.transcribe_track(cfg, backend, [0.0] * 100 * 16000, plan, no_gaming)
+    res = pilot.transcribe_track(cfg, backend, plan, chunk_of(100.0), no_gaming)
     segs = res["segments"]
     assert res["has_word_times"] is False
     assert [(s["id"], s["start"], s["end"], s["text"]) for s in segs] == [
@@ -428,7 +451,7 @@ def test_gaming_between_windows_exits_4_and_writes_nothing_partial() -> None:
 
     rc = pilot.run(cfg, conn, backend=backend, decode=fake_decode, gaming_check=check)
     assert rc == pilot.EXIT_GAMING
-    # Track 1 (120 s -> 2 windows, 3 checks) finished and was written; track 2 stopped.
+    # Track 1 (120 s -> 2 windows: track + chunk + 2 window checks) finished and was written; track 2 stopped.
     assert [p[0] for p in conn.inserts()] == ["/books/a/t1.m4b"]
 
 
@@ -442,8 +465,20 @@ def test_check_gaming_states_and_unreachable() -> None:
     def boom(url: str) -> dict[str, Any]:
         raise OSError("connection refused")
 
+    sleeps: list[float] = []
     with pytest.raises(pilot.GamingStop):
-        pilot.check_gaming(cfg, fetch=boom)
+        pilot.check_gaming(cfg, fetch=boom, sleep=sleeps.append)
+    assert sleeps == [pilot.ARBITER_RETRY_DELAY_SEC]  # retried once
+
+    flaky = iter([OSError("blip"), {"state": "available"}])
+
+    def blip(url: str) -> dict[str, Any]:
+        got = next(flaky)
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    pilot.check_gaming(cfg, fetch=blip, sleep=lambda _s: None)  # recovers on retry
     pilot.check_gaming(
         make_cfg("granite"), fetch=boom
     )  # no --arbiter-url: never checked
@@ -621,3 +656,219 @@ def test_pilot_does_not_import_runner() -> None:
         if isinstance(n, ast.ImportFrom) and n.module
     }
     assert not top & {"torch", "transformers", "nemo", "numpy", "psycopg2"}
+
+
+# ── Review round 1 ─────────────────────────────────────────────────────────────
+def test_granite_parse_small_backwards_step_is_jitter_not_wrap() -> None:
+    words = pilot.parse_granite_timestamps("a [T:450] b [T:440] c [T:500]", 0.0, 60.0)
+    assert [w["end"] for w in words] == [4.5, 4.5, 5.0]
+    # A drop of more than 5 s is still a wrap.
+    words = pilot.parse_granite_timestamps("a [T:900] b [T:300]", 0.0, 60.0)
+    assert [w["end"] for w in words] == [9.0, 13.0]
+
+
+def test_held_finding_sql_uses_latest_unrevoked_decision() -> None:
+    sql = " ".join(pilot.HELD_FINDING_SPANS_SQL.split())
+    assert "JOIN LATERAL" in sql and "ORDER BY e.id DESC LIMIT 1" in sql
+    assert "v.kind = 'revoke' AND v.revokes_event_id = e.id" in sql
+    assert "ld.outcome = 'hold'" in sql
+    assert "f.superseded_at IS NULL" in sql
+    assert "f.end_sec > f.start_sec" in sql
+    assert "f.patch_state = 'proposed'" in sql
+    assert "LIMIT %s" in sql
+
+
+def test_short_tail_folds_into_previous_window_within_hard_max() -> None:
+    assert pilot.plan_windows(0.0, 92.0, [], 90.0, 210.0) == [(0.0, 92.0)]
+    # Folding would exceed the hard max: the short tail stays its own window.
+    assert pilot.plan_windows(0.0, 42.0, [], 40.0, 40.0) == [(0.0, 40.0), (40.0, 42.0)]
+    # A tail of at least MIN_WINDOW_SEC is left alone.
+    assert pilot.plan_windows(0.0, 96.0, [], 90.0, 210.0) == [(0.0, 90.0), (90.0, 96.0)]
+
+
+def test_findings_span_edges_snap_to_production_gaps_inside_pad() -> None:
+    words = [(t, t + 0.4) for t in [x * 0.5 for x in range(500)]]  # 0.1 s gaps
+    words = [w for w in words if not 96.0 <= w[0] < 97.0 and not 203.0 <= w[0] < 204.0]
+    merged = pilot.merge_spans([(100.0, 200.0)], 5.0, 1000.0, words)
+    assert len(merged) == 1
+    s, e = merged[0]
+    assert 95.9 < s < 97.0 and 202.9 < e < 204.0
+    # No gap inside the pad: fall back to the padded edge.
+    assert pilot.merge_spans([(100.0, 200.0)], 5.0, 1000.0, []) == [(95.0, 205.0)]
+
+
+def test_gaps_bisect_picks_largest_gap_in_range() -> None:
+    gaps = pilot.Gaps([(0.0, 1.0), (1.2, 2.0), (3.0, 4.0), (4.1, 5.0)])
+    assert gaps.best(0.0, 10.0) == 2.5
+    assert gaps.best(0.0, 2.0) == 1.1
+    assert gaps.best(6.0, 9.0) is None
+
+
+def test_granite_degenerate_reasons() -> None:
+    assert pilot.granite_degenerate_reason("hello [T:10] world [T:50]") is None
+    assert pilot.granite_degenerate_reason("hello world") == "no_timestamps"
+    assert pilot.granite_degenerate_reason("_ [T:100] [T:200]") == "no_words"
+    assert pilot.granite_degenerate_reason("_ _") == "no_words"
+    assert pilot.granite_degenerate_reason("") is None
+
+
+def test_untagged_granite_window_is_marked_degenerate() -> None:
+    cfg = make_cfg("granite")
+    backend = FakeBackend(cfg, "granite", outputs=["no tags at all here", "_ [T:900]"])
+    res = pilot.transcribe_track(
+        cfg, backend, [(0.0, 30.0), (30.0, 60.0)], chunk_of(60.0), no_gaming
+    )
+    assert [d["reason"] for d in res["degenerate_windows"]] == [
+        "no_timestamps",
+        "no_words",
+    ]
+    assert res["segments"] and all(
+        s["degenerate_reason"] == "no_timestamps" for s in res["segments"]
+    )
+
+
+def test_dry_run_honours_done_filter_and_limit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tracks = [("B1", f"/books/a/{i}.m4b", TID, 30.0) for i in range(4)]
+    cfg = make_cfg("canary", "--dry-run", "--limit-tracks", "2")
+    conn = FakeConn(tracks, SEGMENTS)
+    conn.done = {"/books/a/0.m4b"}
+    assert (
+        pilot.run(cfg, conn, backend=None, decode=fake_decode, gaming_check=no_gaming)
+        == 0
+    )
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    assert [x["file_path"] for x in lines] == ["/books/a/1.m4b", "/books/a/2.m4b"]
+    assert conn.writes() == []
+
+
+def test_zero_duration_track_is_skipped_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cfg = make_cfg("granite")
+    conn = FakeConn([("B1", "/books/a/z.m4b", TID, 0.0)], SEGMENTS)
+    with caplog.at_level("WARNING"):
+        rc = pilot.run(
+            cfg,
+            conn,
+            backend=FakeBackend(cfg, "granite"),
+            decode=fake_decode,
+            gaming_check=no_gaming,
+        )
+    assert rc == 0 and conn.inserts() == []
+    assert any("zero duration" in r.getMessage() for r in caplog.records)
+
+
+def test_decode_is_chunked_and_bounded() -> None:
+    cfg = make_cfg("granite")
+    conn = FakeConn([("B1", "/books/a/long.m4b", TID, 7200.0)], [])
+    DECODES.clear()
+    assert (
+        pilot.run(
+            cfg,
+            conn,
+            backend=FakeBackend(cfg, "granite"),
+            decode=fake_decode,
+            gaming_check=no_gaming,
+        )
+        == 0
+    )
+    assert len(DECODES) == 4
+    assert all(e - s <= pilot.DECODE_CHUNK_SEC for s, e in DECODES)
+    assert DECODES[0][0] == 0.0 and DECODES[-1][1] == 7200.0
+    assert all(a[1] == b[0] for a, b in itertools.pairwise(DECODES))
+    # findings scope decodes only the merged spans.
+    cfg = make_cfg("canary", "--scope", "findings")
+    conn = FakeConn([("B1", "/books/a/long.m4b", TID, 7200.0)], [])
+    conn.finding_spans = [(100.0, 120.0), (5000.0, 5010.0)]
+    DECODES.clear()
+    pilot.run(
+        cfg,
+        conn,
+        backend=FakeBackend(cfg, "canary"),
+        decode=fake_decode,
+        gaming_check=no_gaming,
+    )
+    assert DECODES == [(95.0, 125.0), (4995.0, 5015.0)]
+
+
+def test_group_windows_breaks_on_gaps_and_size() -> None:
+    plan = [(0.0, 90.0), (90.0, 180.0), (500.0, 590.0)]
+    assert pilot.group_windows(plan, 1800.0) == [plan[:2], plan[2:]]
+    assert pilot.group_windows(plan[:2], 100.0) == [[plan[0]], [plan[1]]]
+
+
+def test_out_file_written_before_db_write_and_kept_on_failure() -> None:
+    out = tempfile.mkdtemp(prefix="pilot-out-")
+    cfg = make_cfg("canary", "--out-dir", out)
+    conn = FakeConn([TRACKS[1]], SEGMENTS)
+    conn.fail_insert = True
+    rc = pilot.run(
+        cfg,
+        conn,
+        backend=FakeBackend(cfg, "canary"),
+        decode=fake_decode,
+        gaming_check=no_gaming,
+    )
+    assert rc == pilot.EXIT_TRACKS_FAILED
+    files = list(Path(out).glob("*.json"))
+    assert len(files) == 1
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    assert data["segments"] and "decode_sec" in data and data["model_revision"] == REV
+
+
+def test_out_dir_defaults_from_env_or_tempdir() -> None:
+    assert make_cfg("granite").out_dir == Path(OUT_DIR)
+    cfg = pilot.load_config(
+        ["--backend", "granite", "--asin", "B1"],
+        {"DATABASE_URL": "x", "PILOT_MODEL_REVISION": REV},
+    )
+    assert cfg.out_dir == Path(tempfile.gettempdir()) / "earmark-asr-pilot-out"
+
+
+def test_dead_connection_is_replaced_before_the_write() -> None:
+    cfg = make_cfg("canary")
+    conn = FakeConn([TRACKS[1]], SEGMENTS)
+    conn.dead = True  # the SELECT 1 ping fails after the long track
+    fresh = FakeConn([], SEGMENTS)
+    rc = pilot.run(
+        cfg, conn, backend=FakeBackend(cfg, "canary"), decode=fake_decode,
+        gaming_check=no_gaming, connect_fn=lambda: fresh,
+    )  # fmt: skip
+    assert rc == 0
+    assert conn.inserts() == [] and conn.closed == 1
+    assert [p[0] for p in fresh.inserts()] == ["/books/a/t2.m4b"]
+    assert fresh.closed == 1  # run closes a connection it opened itself
+
+
+def test_metrics_split_decode_from_transcription() -> None:
+    cfg = make_cfg("canary")
+    res = pilot.transcribe_track(
+        cfg, FakeBackend(cfg, "canary"), [(0.0, 38.0)], chunk_of(38.0), no_gaming
+    )
+    assert {"decode_sec", "wall_sec", "rtfx", "audio_sec"} <= set(res)
+    if res["wall_sec"]:
+        assert res["rtfx"] == round(res["audio_sec"] / res["wall_sec"], 3)
+
+
+def test_stop_file_stops_between_windows_with_exit_5() -> None:
+    stop = Path(tempfile.mkdtemp(prefix="pilot-stop-")) / "STOP"
+    cfg = make_cfg("canary", env={"PILOT_STOP_FILE": str(stop)})
+    assert cfg.stop_file == stop
+    conn = FakeConn(TRACKS, SEGMENTS)
+
+    class StopAfterTrack1(FakeBackend):
+        def transcribe_window(self, audio: Any, window_start: float) -> Any:
+            res = super().transcribe_window(audio, window_start)
+            if len(self.calls) == 5:  # first window of track 2 (track 1 = 4 windows)
+                stop.touch()
+            return res
+
+    backend = StopAfterTrack1(cfg, "canary")
+    rc = pilot.run(
+        cfg, conn, backend=backend, decode=fake_decode, gaming_check=no_gaming
+    )
+    assert rc == pilot.EXIT_STOPPED
+    assert [p[0] for p in conn.inserts()] == ["/books/a/t1.m4b"]  # done track kept
+    assert make_cfg("canary").stop_file is None
