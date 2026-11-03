@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,9 +24,12 @@ func TestBatchLockIntegration(t *testing.T) {
 	}
 	a, b := open(), open()
 
-	releaseA, ok, err := a.TryBatchLock(ctx)
+	lockA, ok, err := a.TryBatchLock(ctx)
 	if err != nil || !ok {
 		t.Fatalf("first TryBatchLock = (%v, %v), want acquired", ok, err)
+	}
+	if err := lockA.Check(ctx); err != nil {
+		t.Fatalf("Check while held: %v", err)
 	}
 	if _, ok, err := b.TryBatchLock(ctx); err != nil || ok {
 		t.Fatalf("second TryBatchLock = (%v, %v), want not acquired while held", ok, err)
@@ -34,11 +38,14 @@ func TestBatchLockIntegration(t *testing.T) {
 	if _, ok, err := a.TryBatchLock(ctx); err != nil || ok {
 		t.Fatalf("same-pool TryBatchLock = (%v, %v), want not acquired while held", ok, err)
 	}
-	if err := releaseA(); err != nil {
+	if err := lockA.Release(); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if err := releaseA(); err != nil {
+	if err := lockA.Release(); err != nil {
 		t.Fatalf("second release must be a no-op, got %v", err)
+	}
+	if err := lockA.Check(ctx); !errors.Is(err, ErrBatchLockLost) {
+		t.Fatalf("Check after release = %v, want ErrBatchLockLost", err)
 	}
 
 	var held int
@@ -52,11 +59,31 @@ func TestBatchLockIntegration(t *testing.T) {
 		t.Fatalf("lock still held after release (%d rows)", held)
 	}
 
-	releaseB, ok, err := b.TryBatchLock(ctx)
+	lockB, ok, err := b.TryBatchLock(ctx)
 	if err != nil || !ok {
 		t.Fatalf("TryBatchLock after release = (%v, %v), want acquired", ok, err)
 	}
-	if err := releaseB(); err != nil {
-		t.Fatalf("release B: %v", err)
+
+	// The pinned session dies (as on a network drop): Check must report the
+	// loss, and Postgres must have dropped the lock with the session.
+	var pid int
+	if err := lockB.conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatalf("backend pid: %v", err)
+	}
+	if _, err := a.pool.Exec(ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+	if err := lockB.Check(ctx); !errors.Is(err, ErrBatchLockLost) {
+		t.Fatalf("Check after the session died = %v, want ErrBatchLockLost", err)
+	}
+	if err := lockB.Release(); err == nil {
+		t.Fatal("Release on a dead session must report the unconfirmed unlock")
+	}
+	lockC, ok, err := a.TryBatchLock(ctx)
+	if err != nil || !ok {
+		t.Fatalf("TryBatchLock after the holder died = (%v, %v), want acquired", ok, err)
+	}
+	if err := lockC.Release(); err != nil {
+		t.Fatalf("release C: %v", err)
 	}
 }

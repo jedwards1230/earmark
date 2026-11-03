@@ -80,14 +80,23 @@ type EventSink interface {
 }
 
 // Locker admits one coordinator at a time (CONTRACT §1.4, "Single instance").
-// *db.DB satisfies it with a session-scoped pg_try_advisory_lock held on a
-// dedicated pooled connection for the whole run.
+// cmd/batch adapts *db.DB to it (a session-scoped pg_try_advisory_lock held on
+// a dedicated pooled connection for the whole run).
 //
 // TryBatchLock must not wait: acquired=false (err nil) means another
-// coordinator holds the lock. On success release is called once the run's
-// restore-idle cleanup has finished, and may be called more than once.
+// coordinator holds the lock.
 type Locker interface {
-	TryBatchLock(ctx context.Context) (release func() error, acquired bool, err error)
+	TryBatchLock(ctx context.Context) (lock Lock, acquired bool, err error)
+}
+
+// Lock is a held coordinator lock. Check reports whether it is still held (a
+// session lock dies silently with its connection); Run calls it every
+// PollInterval from a heartbeat goroutine. Release is called once the run's
+// restore-idle cleanup has finished, and may be called more than once. Check
+// and Release may be called from different goroutines.
+type Lock interface {
+	Check(ctx context.Context) error
+	Release() error
 }
 
 // ErrAlreadyRunning is returned by Run when Options.Lock reports another
@@ -96,6 +105,20 @@ type Locker interface {
 // would clobber the live coordinator's batch. Callers pick the exit code (a
 // scheduled run treats it as a clean no-op).
 var ErrAlreadyRunning = errors.New("another earmark batch coordinator is running")
+
+// ErrLockLost is returned (wrapping the heartbeat's error) when the lock
+// heartbeat fails mid-run: the run is no longer protected against a second
+// coordinator, so it stops — restoring idle as on any exit — and fails.
+var ErrLockLost = errors.New("batch lock lost mid-run")
+
+// ErrPhaseTimeout is returned when a Phase A does not finish within
+// Options.PhaseTimeout — typically the ASR runner is down or its host asleep,
+// so nothing is claimed and the batch would otherwise wait until the Job's
+// activeDeadlineSeconds.
+var ErrPhaseTimeout = errors.New("transcribe phase timed out")
+
+// lockCheckTimeout bounds one heartbeat round-trip.
+const lockCheckTimeout = 10 * time.Second
 
 // nopSink discards events. Used as the default when no sink is injected so the
 // coordinator core never needs a nil check.
@@ -166,6 +189,9 @@ type Options struct {
 	// Lock, when set, admits a single coordinator (CONTRACT §1.4). nil runs
 	// unguarded (unit tests; a caller that serialises runs itself).
 	Lock Locker
+	// PhaseTimeout bounds each Phase A's wall clock. 0 = unbounded. On expiry
+	// Run returns ErrPhaseTimeout (after restoring idle).
+	PhaseTimeout time.Duration
 }
 
 const (
@@ -191,6 +217,9 @@ func (o *Options) normalize() error {
 	}
 	if o.Sink == nil {
 		o.Sink = nopSink{}
+	}
+	if o.PhaseTimeout < 0 {
+		return fmt.Errorf("phase timeout must be >= 0, got %s", o.PhaseTimeout)
 	}
 	return nil
 }
@@ -225,7 +254,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	// while the lock is still held — a successor cannot start until this run
 	// has put the pipeline back to idle.
 	if o.Lock != nil {
-		release, acquired, lerr := o.Lock.TryBatchLock(ctx)
+		lock, acquired, lerr := o.Lock.TryBatchLock(ctx)
 		if lerr != nil {
 			return fmt.Errorf("take batch lock: %w", lerr)
 		}
@@ -234,10 +263,38 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 			return ErrAlreadyRunning
 		}
 		defer func() {
-			if rerr := release(); rerr != nil {
+			if rerr := lock.Release(); rerr != nil {
 				p("WARNING: releasing the batch lock: %v (the session was closed, which drops it)\n", rerr)
 			}
 		}()
+
+		// Heartbeat: a session lock vanishes silently when its connection
+		// drops, and the run would carry on unprotected. On a failed check the
+		// heartbeat cancels the run ctx, so the loop unwinds through the
+		// restore-idle defer like a SIGTERM, then Run fails with ErrLockLost.
+		// The heartbeat is stopped (and joined) before Release, which
+		// registered first and so runs last.
+		runCtx, cancelRun := context.WithCancelCause(ctx)
+		hbCtx, stopHB := context.WithCancel(ctx)
+		var lostErr error // written by the heartbeat; read only after hbDone
+		hbDone := make(chan struct{})
+		go func() {
+			defer close(hbDone)
+			if herr := heartbeat(hbCtx, lock, o.PollInterval); herr != nil {
+				lostErr = fmt.Errorf("%w: %w", ErrLockLost, herr)
+				cancelRun(lostErr)
+			}
+		}()
+		defer func() {
+			stopHB()
+			<-hbDone
+			cancelRun(nil)
+			if lostErr != nil {
+				p("ERROR: %v — stopped the run (pipeline restored to idle).\n", lostErr)
+				err = lostErr
+			}
+		}()
+		ctx = runCtx
 	}
 
 	// Robustness: restore idle + the pre-batch run budget on EVERY exit path.
@@ -268,7 +325,9 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	restoreLimit = captureRestoreLimit(ctx, p, store, phase)
 	if phase == db.PhaseTranscribe {
 		// Residue of a coordinator that died mid-Phase-A (with the lock held,
-		// no live one can own it). Nothing to finish: the run budget was just
+		// no live lock-taking one can own it — but a pre-#214 binary takes no
+		// lock, so an older coordinator running at the same time could; don't
+		// run mixed versions side by side). Nothing to finish: the run budget was just
 		// swapped to 0 and the first batch's Phase A sets a fresh one, while a
 		// job the runner still has claimed is waited out by Phase A's
 		// Claimed==0 check. captureRestoreLimit already chose unlimited for exit.
@@ -405,16 +464,58 @@ func runTranscribePhase(ctx context.Context, p func(string, ...any), store Phase
 	}
 	p("Phase A (transcribe): run_limit=%d — waiting for the batch to transcribe...\n", n)
 
+	pctx := ctx
+	if o.PhaseTimeout > 0 {
+		var cancel context.CancelFunc
+		pctx, cancel = context.WithTimeout(ctx, o.PhaseTimeout)
+		defer cancel()
+	}
+	// timedOut distinguishes our own bound from a cancel of the run itself.
+	timedOut := func() bool { return ctx.Err() == nil && errors.Is(pctx.Err(), context.DeadlineExceeded) }
 	for {
-		st, err := store.GetServiceStatus(ctx)
+		st, err := store.GetServiceStatus(pctx)
 		if err != nil {
+			if timedOut() {
+				return phaseTimeoutErr(o.PhaseTimeout)
+			}
 			return fmt.Errorf("poll transcribe status: %w", err)
 		}
 		if transcribeDone(st) {
 			p("Phase A complete (pending=%d, claimed=%d, run_limit reached).\n", st.Pending, st.Claimed)
 			return nil
 		}
-		if err := sleep(ctx, o.PollInterval); err != nil {
+		if err := sleep(pctx, o.PollInterval); err != nil {
+			if timedOut() {
+				return phaseTimeoutErr(o.PhaseTimeout)
+			}
+			return err
+		}
+	}
+}
+
+func phaseTimeoutErr(d time.Duration) error {
+	return fmt.Errorf("%w: Phase A did not finish within %s (is the ASR runner up and its host awake?)", ErrPhaseTimeout, d)
+}
+
+// heartbeat checks lock every interval until ctx is done (nil) or a check
+// fails (that error). A check failing only because ctx ended is a shutdown,
+// not a loss.
+func heartbeat(ctx context.Context, lock Lock, every time.Duration) error {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		cctx, cancel := context.WithTimeout(ctx, lockCheckTimeout)
+		err := lock.Check(cctx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 	}

@@ -144,3 +144,24 @@ func TestExitCode(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateOptions(t *testing.T) {
+	cases := []struct {
+		name    string
+		o       options
+		wantErr bool
+	}{
+		{"defaults", options{}, false},
+		{"exit 255", options{lockedExitCode: 255}, false},
+		{"exit 256", options{lockedExitCode: 256}, true},
+		{"exit -1", options{lockedExitCode: -1}, true},
+		{"negative phase timeout", options{phaseTimeout: -time.Second}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateOptions(tc.o); (err != nil) != tc.wantErr {
+				t.Errorf("validateOptions(%+v) = %v, wantErr %v", tc.o, err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -471,10 +471,22 @@ another coordinator holds it, this one logs `Another earmark batch coordinator
 holds the batch lock` and exits **without touching anything**: swapping
 `run_limit` or restoring idle would clobber the live batch. The exit code is `0`
 by default (an overlapping scheduled run is a clean no-op) and
-`--already-running-exit-code N` makes it visible instead. The lock is released
-only **after** the restore-idle cleanup, so a successor never starts while the
-pipeline is still mid-phase. An unlock failure closes the connection, and a
-coordinator that dies loses its session, so the lock never outlives its holder.
+`--already-running-exit-code N` (0–255) makes it visible instead. The lock is
+released only **after** the restore-idle cleanup, so a successor never starts
+while the pipeline is still mid-phase. An unlock failure closes the connection
+(bounded at 5 s), and a coordinator that dies loses its session, so the lock
+never outlives its holder. Because a session lock also vanishes **silently**
+when its connection drops, the coordinator re-checks ownership (`pg_locks` for
+its own `pg_backend_pid()`) every `--poll-interval`; a failed check cancels the
+run, which restores idle as on any exit and then exits `1` (`batch lock lost
+mid-run`). Only binaries containing this guard take the lock: an older
+`earmark batch` running alongside is not excluded, so don't mix versions.
+
+**Phase A bound.** `--phase-timeout` (default `3h`, `0` = unbounded) caps each
+Phase A's wall clock. A runner that claims nothing — its host asleep, the
+service stopped — would otherwise hold the run (and a scheduled Job) in Phase A
+until `activeDeadlineSeconds`; on expiry the coordinator restores idle and exits
+`1` (`transcribe phase timed out`), never moving on to Phase B.
 The CronJob (§2.7, `batch.enabled`) additionally pins `concurrencyPolicy:
 Forbid`; the lock is what covers runs started any other way (a manual
 `kubectl create job --from`, a laptop).
@@ -2399,8 +2411,10 @@ legitimate) but `NOTES` warns that both paths will judge. Defaults: schedule
 
 Only when `batch.enabled` (default `false`): CronJob `<release>-batch` runs the
 `earmark batch` coordinator (§1.4) — `earmark batch --batch-size N
-[--max-batches M]` (`batch.batchSize`, default 10; `batch.maxBatches`, default
-`0` = flag omitted = until the queue drains) plus `batch.extraArgs`. It shares
+[--max-batches M] [--phase-timeout D]` (`batch.batchSize`, default 10;
+`batch.maxBatches`, default `0` = flag omitted = until the queue drains;
+`batch.phaseTimeout`, a Go duration, default `null` = flag omitted = the CLI's
+`3h`) plus `batch.extraArgs`. It shares
 `commonEnv`, the security contexts, `nodeSelector`/`tolerations` and (when
 `config.models` is set) the model-registry mount — `MODELS_FILE` must resolve or
 config loading fails — and mounts no books volume. `batch.gpuArbiterUrl` sets
@@ -2409,12 +2423,15 @@ bare base reads as unreachable and silently drops the game-yield); empty =
 no game-yield, and `NOTES` warns. `batch.extraEnv` is additions only (also
 refuses `GPU_ARBITER_URL`). `concurrencyPolicy` is fixed at `Forbid`, not a
 value. Defaults: schedule `0 3 * * *`, `timeZone: null` (omitted — the
-controller's zone), `suspend: false`, `backoffLimit: 0` (the coordinator is
+controller's zone), `suspend: false` (always rendered, so a flip shows in
+every diff), `backoffLimit: 0` (the coordinator is
 resumable; the next run reconciles), `activeDeadlineSeconds: 21600` (on expiry
 the pod gets `SIGTERM` and restores idle), `terminationGracePeriodSeconds: 60`
 (schema minimum 45: the restore is bounded at 30 s and the lock release at
-10 s), `startingDeadlineSeconds: 600`, `ttlSecondsAfterFinished: 86400`,
-history limits 3/3.
+10 s), `startingDeadlineSeconds: 600` (schema minimum 10, also for
+`evalBackfill`: the CronJob controller checks every 10 s, so less can skip
+runs), `ttlSecondsAfterFinished: 86400`, history limits 3/3; `resources` accepts
+`cpu`, `memory` and `ephemeral-storage`.
 
 `mcp.extraEnv` and `ingest.extraEnv` are the same hook for the two Deployments
 (rendered after `commonEnv` and the pod's own env; additions only, one shared

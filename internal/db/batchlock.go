@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // batchLockKey is the advisory-lock key that admits ONE `earmark batch`
@@ -37,23 +39,57 @@ var (
 
 // batchUnlockTimeout bounds the unlock round-trip. The release usually runs
 // after the run's context is cancelled (SIGTERM), so it uses its own deadline.
-var batchUnlockTimeout = 10 * time.Second
+// batchCloseTimeout bounds closing a session we refuse to pool, so a dead
+// network can never hang the coordinator's exit. Package vars so tests can
+// shorten them.
+var (
+	batchUnlockTimeout = 10 * time.Second
+	batchCloseTimeout  = 5 * time.Second
+)
+
+// batchLockHeldSQL reports whether THIS session (pg_backend_pid) still holds
+// the lock. A bigint advisory key is stored as classid = high 32 bits, objid =
+// low 32 bits, objsubid = 1.
+var batchLockHeldSQL = `
+	SELECT EXISTS (
+		SELECT 1 FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND pid = pg_backend_pid()
+		  AND objsubid = 1
+		  AND granted
+		  AND ((classid::bigint << 32) | objid::bigint) = $1
+	)`
+
+// ErrBatchLockLost is returned by BatchLock.Check when the pinned session no
+// longer holds the lock (its connection dropped, or it was unlocked).
+var ErrBatchLockLost = errors.New("batch lock lost")
+
+// BatchLock is a held single-coordinator lock (see TryBatchLock). Check and
+// Release are safe to call from different goroutines: a mutex serialises every
+// use of the one pinned connection, which pgx does not allow concurrently.
+type BatchLock struct {
+	mu       sync.Mutex
+	conn     *pgxpool.Conn
+	released bool
+	relErr   error
+}
 
 // TryBatchLock tries to take the single-coordinator lock without waiting.
 //
 // acquired=false (err nil) means another coordinator holds it. When acquired,
-// the caller MUST call release exactly when the run is over — after its
-// restore-idle cleanup — and release is safe to call more than once.
+// the caller MUST call Release exactly when the run is over — after its
+// restore-idle cleanup — and should Check it periodically: a session lock dies
+// silently with its connection.
 //
 // The lock lives on a dedicated connection acquired from the pool and held
-// until release, so the pool can never give the locked session to another
+// until Release, so the pool can never give the locked session to another
 // query (which could then unlock it, or leak it to an unrelated caller). On
 // release the lock is dropped with pg_advisory_unlock and the connection goes
 // back to the pool; if the unlock fails or reports the lock was not held, the
 // connection is closed instead, which ends the session and drops the lock with
 // it. If the connection dies mid-run the server drops the lock too, so a
 // crashed coordinator never wedges the next one.
-func (db *DB) TryBatchLock(ctx context.Context) (release func() error, acquired bool, err error) {
+func (db *DB) TryBatchLock(ctx context.Context) (lock *BatchLock, acquired bool, err error) {
 	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("batch lock: acquire connection: %w", err)
@@ -61,37 +97,65 @@ func (db *DB) TryBatchLock(ctx context.Context) (release func() error, acquired 
 	if err := conn.QueryRow(ctx, batchTryLockSQL, batchLockKey).Scan(&acquired); err != nil {
 		// The try-lock may or may not have run; close the session rather than
 		// risk pooling one that holds the lock.
-		_ = conn.Hijack().Close(context.Background())
+		_ = closeConn(conn)
 		return nil, false, fmt.Errorf("batch lock: try lock: %w", err)
 	}
 	if !acquired {
 		conn.Release()
 		return nil, false, nil
 	}
+	return &BatchLock{conn: conn}, true, nil
+}
 
-	var (
-		once   sync.Once
-		relErr error
-		unlock = func() {
-			ctx, cancel := context.WithTimeout(context.Background(), batchUnlockTimeout)
-			defer cancel()
-			var unlocked bool
-			uerr := conn.QueryRow(ctx, batchUnlockSQL, batchLockKey).Scan(&unlocked)
-			if uerr == nil && unlocked {
-				conn.Release()
-				return
-			}
-			if uerr == nil {
-				uerr = errors.New("pg_advisory_unlock reported the lock was not held")
-			}
-			// Never pool a session that may still hold the lock: closing it ends
-			// the session, and Postgres drops its advisory locks with it.
-			cerr := conn.Hijack().Close(ctx)
-			relErr = errors.Join(fmt.Errorf("batch lock: unlock: %w", uerr), cerr)
-		}
-	)
-	return func() error {
-		once.Do(unlock)
-		return relErr
-	}, true, nil
+// Check verifies the pinned session still holds the lock. Any error — a query
+// failure on a dead connection, or the lock missing from pg_locks — means the
+// run is no longer protected; the result wraps ErrBatchLockLost.
+func (l *BatchLock) Check(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released {
+		return fmt.Errorf("%w: already released", ErrBatchLockLost)
+	}
+	var held bool
+	if err := l.conn.QueryRow(ctx, batchLockHeldSQL, batchLockKey).Scan(&held); err != nil {
+		return fmt.Errorf("%w: ownership check: %w", ErrBatchLockLost, err)
+	}
+	if !held {
+		return fmt.Errorf("%w: this session no longer holds it", ErrBatchLockLost)
+	}
+	return nil
+}
+
+// Release drops the lock and returns the connection to the pool, or closes it
+// when the unlock cannot be confirmed. Idempotent: later calls return the
+// first call's result.
+func (l *BatchLock) Release() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released {
+		return l.relErr
+	}
+	l.released = true
+	ctx, cancel := context.WithTimeout(context.Background(), batchUnlockTimeout)
+	defer cancel()
+	var unlocked bool
+	uerr := l.conn.QueryRow(ctx, batchUnlockSQL, batchLockKey).Scan(&unlocked)
+	if uerr == nil && unlocked {
+		l.conn.Release()
+		return nil
+	}
+	if uerr == nil {
+		uerr = errors.New("pg_advisory_unlock reported the lock was not held")
+	}
+	// Never pool a session that may still hold the lock: closing it ends the
+	// session, and Postgres drops its advisory locks with it.
+	l.relErr = errors.Join(fmt.Errorf("batch lock: unlock: %w", uerr), closeConn(l.conn))
+	return l.relErr
+}
+
+// closeConn takes conn out of the pool and closes it under batchCloseTimeout.
+func closeConn(conn *pgxpool.Conn) error {
+	ctx, cancel := context.WithTimeout(context.Background(), batchCloseTimeout)
+	defer cancel()
+	return conn.Hijack().Close(ctx)
 }

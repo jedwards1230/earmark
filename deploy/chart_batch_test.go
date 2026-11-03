@@ -23,6 +23,8 @@ func TestBatchCronJob(t *testing.T) {
 		"batch.batchSize=25",
 		"batch.maxBatches=4",
 		"batch.gpuArbiterUrl=http://192.0.2.10:48750/status",
+		"batch.phaseTimeout=90m",
+		"batch.resources.limits.ephemeral-storage=1Gi",
 	)
 	cj, ok := docs[batchCronJob]
 	require.True(t, ok, "batch CronJob not rendered; got %v", keys(docs))
@@ -43,7 +45,8 @@ func TestBatchCronJob(t *testing.T) {
 	assert.Equal(t, 60, dig(t, pod, "terminationGracePeriodSeconds"))
 	c := dig(t, pod, "containers", 0)
 	assert.Equal(t, "ghcr.io/jedwards1230/earmark:9.9.9", dig(t, c, "image"))
-	assert.Equal(t, []any{"batch", "--batch-size", "25", "--max-batches", "4"}, dig(t, c, "args"))
+	assert.Equal(t, []any{"batch", "--batch-size", "25", "--max-batches", "4", "--phase-timeout", "90m"}, dig(t, c, "args"))
+	assert.Equal(t, "1Gi", dig(t, c, "resources", "limits", "ephemeral-storage"))
 	v, set := envValue(t, c, "GPU_ARBITER_URL")
 	assert.True(t, set, "GPU_ARBITER_URL not set from batch.gpuArbiterUrl")
 	assert.Equal(t, "http://192.0.2.10:48750/status", v)
@@ -57,7 +60,8 @@ func TestBatchCronJob(t *testing.T) {
 	assert.Equal(t, dig(t, ipod, "containers", 0, "securityContext"), dig(t, c, "securityContext"))
 }
 
-// Defaults: no timeZone, not suspended, --max-batches omitted (0 = until the
+// Defaults: no timeZone, suspend rendered as an explicit false, --max-batches
+// and --phase-timeout omitted (0 = until the
 // queue drains), no GPU_ARBITER_URL; extraArgs/extraEnv land last.
 func TestBatchCronJobDefaultsAndExtras(t *testing.T) {
 	docs := render(t,
@@ -72,7 +76,7 @@ func TestBatchCronJobDefaultsAndExtras(t *testing.T) {
 	require.NotNil(t, cj)
 	spec := dig(t, cj, "spec").(map[string]any)
 	assert.NotContains(t, spec, "timeZone")
-	assert.NotContains(t, spec, "suspend")
+	assert.Equal(t, false, spec["suspend"], "suspend must always be rendered")
 	assert.NotContains(t, dig(t, spec, "jobTemplate", "spec").(map[string]any), "activeDeadlineSeconds")
 	c := dig(t, cronPodSpec(t, cj), "containers", 0)
 	assert.Equal(t, []any{"batch", "--batch-size", "10", "--poll-interval", "30s"}, dig(t, c, "args"))
@@ -92,6 +96,10 @@ func TestBatchSchemaRejectsBadValues(t *testing.T) {
 		"batch.concurrencyPolicy=Allow", // fixed at Forbid: not a value
 		"batch.terminationGracePeriodSeconds=5",
 		"batch.gpuArbiterUrl=http://192.0.2.10:48750", // must be the /status URL
+		"batch.gpuArbiterUrl=http://bad host:48750/status",
+		"batch.startingDeadlineSeconds=5",
+		"batch.phaseTimeout=3 hours",
+		"batch.resources.limits.gpu=1",
 		"batch.unknownKey=1",
 	} {
 		t.Run(set, func(t *testing.T) {
@@ -117,4 +125,14 @@ func TestBatchExtraEnvCollisionFails(t *testing.T) {
 			assert.Contains(t, string(out), "batch.extraEnv sets \""+name+"\"")
 		})
 	}
+}
+
+func TestEvalBackfillSchemaRejectsShortStartingDeadline(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	out, err := exec.Command("helm", "template", "earmark", chartDir,
+		"--set", "evalBackfill.enabled=true", "--set", "evalBackfill.startingDeadlineSeconds=5").CombinedOutput()
+	require.Error(t, err, "expected schema rejection, got:\n%s", out)
+	assert.Contains(t, string(out), "evalBackfill")
 }

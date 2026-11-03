@@ -38,6 +38,7 @@ type options struct {
 	arbiterTimeout time.Duration // per-request timeout for the arbiter probe
 	arbiterWaitCmd string        // explicit gpu-arbiter binary override (flag overrides $ARBITER_WAIT_CMD)
 	lockedExitCode int           // exit code when another coordinator holds the batch lock
+	phaseTimeout   time.Duration // wall-clock bound per Phase A (0 = unbounded)
 }
 
 // arbiterWaitCmdEnvVar overrides binary auto-detection (PATH lookup) with an
@@ -79,7 +80,13 @@ session-scoped pg_try_advisory_lock on one pooled connection held for the whole
 run) before it reads or writes runner_control. If another coordinator holds it,
 this one logs that and exits WITHOUT touching anything — exit code 0 by
 default, so an overlapping scheduled run (e.g. a CronJob) is a clean no-op; set
---already-running-exit-code to make it visible as a failure instead.
+--already-running-exit-code (0-255) to make it visible as a failure instead.
+The lock is re-checked every --poll-interval; if it is lost (its connection
+dropped) the run stops, restores idle, and exits 1.
+
+Phase A is bounded by --phase-timeout (default 3h; 0 = unbounded): if the
+runner claims nothing — its host asleep, the service down — the run restores
+idle and exits 1 instead of waiting out the whole schedule window.
 
 The coordinator is DB-driven and resumable: it keeps no critical state in
 memory. If it restarts mid-batch and finds phase=analyze, it finishes Phase B
@@ -115,10 +122,14 @@ func init() {
 	BatchCmd.Flags().StringVar(&opts.gpuArbiterURL, "gpu-arbiter-url", "", "gpu-arbiter /status URL (overrides $GPU_ARBITER_URL)")
 	BatchCmd.Flags().DurationVar(&opts.arbiterTimeout, "arbiter-timeout", 3*time.Second, "per-request timeout for the gpu-arbiter probe")
 	BatchCmd.Flags().IntVar(&opts.lockedExitCode, "already-running-exit-code", 0, "exit code when another `earmark batch` holds the batch lock (0 = a clean no-op, suits a CronJob)")
+	BatchCmd.Flags().DurationVar(&opts.phaseTimeout, "phase-timeout", 3*time.Hour, "wall-clock bound for each Phase A; on expiry restore idle and exit 1 (0 = unbounded)")
 	BatchCmd.Flags().StringVar(&opts.arbiterWaitCmd, "arbiter-wait-cmd", "", "path to the gpu-arbiter binary to delegate waits to (overrides $ARBITER_WAIT_CMD and PATH auto-detection); empty falls back to auto-detection, then the built-in HTTP poll loop")
 }
 
 func runBatch(_ *cobra.Command, _ []string) {
+	if err := validateOptions(opts); err != nil {
+		log.Fatalf("%v", err)
+	}
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -151,7 +162,8 @@ func runBatch(_ *cobra.Command, _ []string) {
 		// batch (Phase B completion, CONTRACT §1.4, §2.4).
 		EvalGatesEmbed: cfg.EvalGatesEmbed,
 		// Single instance (CONTRACT §1.4): a second coordinator exits untouched.
-		Lock: database,
+		Lock:         dbLocker{database},
+		PhaseTimeout: opts.phaseTimeout,
 	}
 
 	// SIGINT/SIGTERM handling lives inside batch.Run so the signal-aware scope
@@ -164,6 +176,29 @@ func runBatch(_ *cobra.Command, _ []string) {
 		database.Close() // os.Exit skips the deferred Close
 		os.Exit(code)
 	}
+}
+
+// validateOptions rejects flag values before anything touches the database.
+func validateOptions(o options) error {
+	if o.lockedExitCode < 0 || o.lockedExitCode > 255 {
+		return fmt.Errorf("--already-running-exit-code must be 0-255, got %d", o.lockedExitCode)
+	}
+	if o.phaseTimeout < 0 {
+		return fmt.Errorf("--phase-timeout must be >= 0, got %s", o.phaseTimeout)
+	}
+	return nil
+}
+
+// dbLocker adapts *db.DB to batch.Locker (its concrete *db.BatchLock return
+// does not satisfy the interface signature directly).
+type dbLocker struct{ d *db.DB }
+
+func (l dbLocker) TryBatchLock(ctx context.Context) (batch.Lock, bool, error) {
+	lock, ok, err := l.d.TryBatchLock(ctx)
+	if lock == nil { // never hand back a typed-nil interface
+		return nil, ok, err
+	}
+	return lock, ok, err
 }
 
 // exitCode maps batch.Run's result to the process exit. exit=false means a

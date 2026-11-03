@@ -276,8 +276,9 @@ evalBackfill:
   extraEnv: []
   # Forbid: never start a run while the previous one is still judging.
   concurrencyPolicy: Forbid
-  # Seconds after a missed schedule a run may still start; null omits the field
-  # (no deadline). Also stops the controller giving up after 100 missed runs.
+  # Seconds after a missed schedule a run may still start (>= 10, schema-checked:
+  # the controller polls every 10 s); null omits the field (no deadline). Also
+  # stops the controller giving up after 100 missed runs.
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -330,6 +331,11 @@ batch:
   # --max-batches: stop after N batches. 0 = until the queue drains (the flag
   # is omitted); size activeDeadlineSeconds to match.
   maxBatches: 0
+  # --phase-timeout: wall-clock bound for each Phase A (Go duration, e.g. "3h";
+  # "0" = unbounded). If the ASR runner claims nothing — its host asleep, the
+  # service down — the run restores idle and fails instead of waiting out
+  # activeDeadlineSeconds. null omits the flag (the CLI default, 3h).
+  phaseTimeout: null
   # Full gpu-arbiter /status URL (http://<gpu-host>:48750/status) → GPU_ARBITER_URL,
   # so each batch waits out a game first. Must end in /status: the coordinator
   # GETs it verbatim, and a bare base URL would read as "unreachable" and
@@ -342,7 +348,8 @@ batch:
   # ADDITIONS ONLY: a name the shared env already sets, or GPU_ARBITER_URL
   # (set from gpuArbiterUrl), fails the render.
   extraEnv: []
-  # Seconds after a missed schedule a run may still start; null omits the field.
+  # Seconds after a missed schedule a run may still start (>= 10: the CronJob
+  # controller checks schedules every 10 s, so less can skip runs); null omits.
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3

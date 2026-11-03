@@ -4,7 +4,7 @@
 {{- include "earmark.extraEnvGuard" (dict "root" . "key" "batch.extraEnv" "env" .Values.batch.extraEnv "reserved" (list "GPU_ARBITER_URL")) }}
 # Batch coordinator CronJob — `earmark batch` on a schedule (CONTRACT §1.4).
 #
-# Runs: earmark batch --batch-size N [--max-batches M]
+# Runs: earmark batch --batch-size N [--max-batches M] [--phase-timeout D]
 #   - Flips runner_control.phase transcribe→analyze per batch so the ASR runner
 #     and the eval judge time-share the GPU; exits when no pending job remains,
 #     after --max-batches, or on SIGTERM. It transcribes nothing itself.
@@ -40,9 +40,8 @@ spec:
   {{- end }}
   successfulJobsHistoryLimit: {{ int .Values.batch.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ int .Values.batch.failedJobsHistoryLimit }}
-  {{- if .Values.batch.suspend }}
-  suspend: true
-  {{- end }}
+  # Always explicit, so flipping it in values is visible in every diff.
+  suspend: {{ .Values.batch.suspend | default false }}
   jobTemplate:
     spec:
       backoffLimit: {{ int .Values.batch.backoffLimit }}
@@ -83,6 +82,10 @@ spec:
                 {{- with .Values.batch.maxBatches }}
                 - --max-batches
                 - {{ . | int | toString | quote }}
+                {{- end }}
+                {{- with .Values.batch.phaseTimeout }}
+                - --phase-timeout
+                - {{ . | quote }}
                 {{- end }}
                 {{- range .Values.batch.extraArgs }}
                 - {{ . | quote }}

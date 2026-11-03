@@ -8,24 +8,28 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/db"
 )
 
 // fakeLocker is an in-memory Locker. held simulates another coordinator owning
-// the lock; tryErr a failed lock query. onRelease runs inside release so a test
-// can observe the store at the moment the lock is dropped.
+// the lock; tryErr a failed lock query. onRelease runs inside Release so a test
+// can observe the store at the moment the lock is dropped. lostAfter > 0 makes
+// the lock's Check fail from that call on (a dropped connection).
 type fakeLocker struct {
 	mu        sync.Mutex
 	held      bool
 	tryErr    error
 	relErr    error
+	lostAfter int
+	checks    int
 	tries     int
 	releases  int
 	onRelease func()
 }
 
-func (l *fakeLocker) TryBatchLock(context.Context) (func() error, bool, error) {
+func (l *fakeLocker) TryBatchLock(context.Context) (Lock, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.tries++
@@ -36,16 +40,37 @@ func (l *fakeLocker) TryBatchLock(context.Context) (func() error, bool, error) {
 		return nil, false, nil
 	}
 	l.held = true
-	return func() error {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		l.releases++
-		l.held = false
-		if l.onRelease != nil {
-			l.onRelease()
-		}
-		return l.relErr
-	}, true, nil
+	return fakeLock{l}, true, nil
+}
+
+type fakeLock struct{ l *fakeLocker }
+
+func (f fakeLock) Check(context.Context) error {
+	f.l.mu.Lock()
+	defer f.l.mu.Unlock()
+	f.l.checks++
+	if f.l.lostAfter > 0 && f.l.checks >= f.l.lostAfter {
+		return errors.New("conn closed")
+	}
+	return nil
+}
+
+func (f fakeLock) Release() error {
+	l := f.l
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.releases++
+	l.held = false
+	if l.onRelease != nil {
+		l.onRelease()
+	}
+	return l.relErr
+}
+
+func (l *fakeLocker) counts() (checks, releases int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.checks, l.releases
 }
 
 // untouched fails the test if the coordinator read or wrote runner_control.
@@ -132,8 +157,8 @@ func TestRun_ReleasesLockAfterRestore(t *testing.T) {
 
 			_ = Run(ctx, io.Discard, store, &fakeArbiter{}, o)
 
-			if lock.releases != 1 {
-				t.Fatalf("release calls = %d, want 1", lock.releases)
+			if _, rel := lock.counts(); rel != 1 {
+				t.Fatalf("release calls = %d, want 1", rel)
 			}
 			if n := len(phaseAtRelease); n == 0 || phaseAtRelease[n-1] != db.PhaseIdle {
 				t.Errorf("lock released before idle was restored; phases at release = %v", phaseAtRelease)
@@ -187,5 +212,101 @@ func TestRun_ResumeFromTranscribeStartsFreshPhaseA(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "found phase=transcribe") {
 		t.Errorf("expected the transcribe-resume log line, got:\n%s", out.String())
+	}
+}
+
+// A lost lock (the pinned connection dropped) stops the run: the loop unwinds,
+// idle is restored, the lock is released, and Run fails with ErrLockLost.
+func TestRun_LockLostStopsRunAndRestores(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 5},
+		&db.QueueStats{Pending: 5, Claimed: 1, RunLimit: ptr(1)}, // Phase A never finishes
+	)
+	lock := &fakeLocker{lostAfter: 3}
+	o := fastOpts()
+	o.Lock = lock
+
+	var out bytes.Buffer
+	err := Run(context.Background(), &out, store, &fakeArbiter{}, o)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Run error = %v, want ErrLockLost", err)
+	}
+	got := store.transitions()
+	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
+		t.Errorf("idle must be restored after a lost lock; transitions=%v", got)
+	}
+	if store.currentRunLimit() != nil {
+		t.Errorf("pre-batch run_limit (unlimited) must be restored, got %d", *store.currentRunLimit())
+	}
+	if checks, rel := lock.counts(); checks < 3 || rel != 1 {
+		t.Errorf("checks=%d releases=%d, want >=3 checks and exactly 1 release", checks, rel)
+	}
+	if !strings.Contains(out.String(), "batch lock lost") {
+		t.Errorf("expected a lost-lock log line, got:\n%s", out.String())
+	}
+}
+
+// A healthy heartbeat never interferes with a normal run.
+func TestRun_HeartbeatChecksWhileRunning(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 2},
+		&db.QueueStats{Pending: 2, Claimed: 1, RunLimit: ptr(1)},
+		&db.QueueStats{Pending: 2, Claimed: 1, RunLimit: ptr(1)},
+		&db.QueueStats{Pending: 2, Claimed: 1, RunLimit: ptr(1)},
+		&db.QueueStats{Pending: 1, Claimed: 0, RunLimit: ptr(0)},
+		&db.QueueStats{EmbedBacklog: 0},
+	)
+	lock := &fakeLocker{}
+	o := fastOpts()
+	o.Lock = lock
+	if err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, rel := lock.counts(); rel != 1 {
+		t.Errorf("release calls = %d, want 1", rel)
+	}
+}
+
+// Phase A that never finishes (runner asleep: nothing claimed, budget unspent)
+// hits PhaseTimeout, restores idle and fails with ErrPhaseTimeout.
+func TestRun_PhaseTimeout(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 5},
+		&db.QueueStats{Pending: 5, RunLimit: ptr(2)},
+	)
+	o := fastOpts()
+	o.PhaseTimeout = 20 * time.Millisecond
+	err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o)
+	if !errors.Is(err, ErrPhaseTimeout) {
+		t.Fatalf("Run error = %v, want ErrPhaseTimeout", err)
+	}
+	want := []string{db.PhaseTranscribe, db.PhaseIdle}
+	if got := store.transitions(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("transitions = %v, want %v (no analyze after a timed-out Phase A)", got, want)
+	}
+}
+
+// A cancel of the run itself is not reported as a phase timeout.
+func TestRun_CancelIsNotPhaseTimeout(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 5},
+		&db.QueueStats{Pending: 5, RunLimit: ptr(2)},
+	)
+	o := fastOpts()
+	o.PhaseTimeout = time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := Run(ctx, io.Discard, store, &fakeArbiter{}, o)
+	if err == nil || errors.Is(err, ErrPhaseTimeout) {
+		t.Fatalf("Run error = %v, want a cancellation, not ErrPhaseTimeout", err)
+	}
+}
+
+func TestRun_RejectsNegativePhaseTimeout(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle)
+	o := fastOpts()
+	o.PhaseTimeout = -time.Second
+	if err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o); err == nil {
+		t.Fatal("expected an error for a negative phase timeout")
 	}
 }
