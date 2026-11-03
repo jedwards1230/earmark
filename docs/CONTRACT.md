@@ -282,9 +282,9 @@ The runner classifies every job failure:
 
 | Class | What | Handling |
 |---|---|---|
-| transient `db` | psycopg2 `OperationalError` / `InterfaceError` (connection lost) | in `_mark_done`: reconnect and retry up to `RUNNER_RETRY_DB_ATTEMPTS` (3) times; before re-writing, a job already `done` means the earlier commit landed |
+| transient `db` | a lost connection: psycopg2 `InterfaceError`, or `OperationalError` with no SQLSTATE (client-side loss) or SQLSTATE class `08` / `57P01`–`57P03`; any other `OperationalError` (statement or lock timeout, disk full) is permanent | in `_mark_done`: reconnect and retry up to `RUNNER_RETRY_DB_ATTEMPTS` (3) times; before re-writing, a job already `done` means the earlier commit landed |
 | transient `oom` | `torch.cuda.OutOfMemoryError` (or `CUDA out of memory` in the text) | per window (or single pass): `gc.collect()` + `torch.cuda.empty_cache()`, retry up to `RUNNER_RETRY_OOM_ATTEMPTS` (2) times |
-| transient `io` | network `OSError` (WinError 53/59/64/67/1231, `ETIMEDOUT`, `EHOSTUNREACH`, `ECONNRESET`, `EIO`, …), an ffmpeg/ffprobe I/O error, or any file/ffmpeg error **while the books share is unreachable** | retry up to `RUNNER_RETRY_IO_ATTEMPTS` (3) times with backoff |
+| transient `io` | network `OSError` (WinError 53/59/64/67/1231, `ETIMEDOUT`, `EHOSTUNREACH`, `ECONNRESET`, `EIO`, …), an ffmpeg/ffprobe I/O error, or any file/ffmpeg error **while the books share is unreachable** — "reachable" means `BOOKS_MOUNT` lists at least one entry, so a dropped Linux mount (an empty mountpoint dir) counts as down | retry up to `RUNNER_RETRY_IO_ATTEMPTS` (3) times with backoff |
 | transient `timeout` | an ffmpeg/ffprobe call outlived its timeout (`max(RUNNER_FFMPEG_TIMEOUT_FLOOR_SECONDS, RUNNER_FFMPEG_TIMEOUT_FACTOR × audio seconds)`; ffprobe gets the floor) | as `io` |
 | permanent | everything else — a missing file, permission error or undecodable audio on a **reachable** share, a path-traversal reject, empty model output, a constraint violation | `_mark_failed` (terminal), as before |
 
@@ -307,10 +307,14 @@ WHERE  id = $1 AND status = 'claimed' AND claimed_by = $3
 RETURNING status;
 ```
 
-The main loop then waits before its next claim — the same backoff over the number of
+The main loop then holds its next **claim** — the same backoff over the number of
 consecutive transient releases, capped at `RUNNER_TRANSIENT_BACKOFF_MAX_SECONDS` (600 s) and
 reset by the next completed job — and after an `io` release it does not claim at all until the
-books share answers again, so an outage does not burn every queued job's attempts.
+books share answers again, so an outage does not burn every queued job's attempts. Only the
+claim is held: every poll cycle still connects, stamps the liveness heartbeat, runs the
+self-update check and the GPU gate (so the runner still parks for a game and still reads as
+alive). The job-row writes (`_mark_failed`, the releases) roll back first — a failed statement
+leaves the connection in an aborted transaction — and fall back once to a fresh connection.
 
 #### Resume checkpoints (Python runner, chunked path)
 
@@ -322,7 +326,8 @@ atomically (temp file + fsync + `os.replace`). It is keyed by job id and invalid
 fingerprint of the DB `file_path`, the file's size and mtime, `ASR_BACKEND`, `ASR_MODEL`,
 `ASR_COMPUTE_TYPE`, the window/overlap geometry, the runner version and the bias terms. A claim
 that finds a valid checkpoint skips the finished windows; a mismatched or corrupt one is
-deleted. The checkpoint is deleted once `_mark_done` commits (or on a permanent failure) and
+deleted. The fingerprint also covers the runner's output-shaping parameters (`asr_params`,
+§1.9). The checkpoint is deleted once `_mark_done` commits (or on a permanent failure) and
 kept across a release, so a stop, a crash, a mid-job yield (§1.4) or an exhausted transient
 retry costs at most the window in flight. Checkpoints older than 7 days are pruned at startup.
 Nothing about it is in the database: the transcript is still written once, at the end, and the
@@ -574,7 +579,14 @@ in-flight old-style hold is released after the upgrade; the new gate never write
 The runner parks when **paused OR phase='analyze' (any non-GPU phase) OR arbiter_yield** — at
 the gate between jobs and, for a chunked job, **between windows** (the checkpoint keeps the
 finished windows; the job is released with its attempt refunded, as on a stop, and the next gate
-parks). An eviction therefore costs at most one window. A runner reads the column defensively:
+parks). An eviction therefore costs at most one window. This applies to `paused` too: pausing
+now stops a long job at its next window boundary (≤ `ASR_CHUNK_WINDOW_SECONDS` of audio) instead
+of after the whole file; it resumes from the checkpoint on unpause. Two cases still finish
+before parking: a single-pass file (at or under `ASR_CHUNK_THRESHOLD_SECONDS`, one window
+anyway), and a chunked job whose checkpoint is disabled or failed to save — yielding without one
+would discard the finished windows, so a flapping gate could cycle the job with no progress. The
+mid-job check reconnects the job connection if it was lost (a dead connection would otherwise
+read "keep going"). A runner reads the column defensively:
 absent (a database older than 00016), a missing row or a read error is `false`. The Go service
 only reads it — `/api/v1/status` `pipeline.arbiterYield` / `arbiterYieldAt` ("held by
 gpu-arbiter"). **Deploy order:** an earmark release containing 00016 and a runner pin bump in

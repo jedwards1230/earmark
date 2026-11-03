@@ -676,11 +676,62 @@ for _sig in _shutdown_signals():
 # ---------------------------------------------------------------------------
 
 
-def _connect() -> psycopg2.extensions.connection:
-    """Open a fresh database connection with autocommit disabled."""
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+def _connect(connect_timeout: int | None = None) -> psycopg2.extensions.connection:
+    """Open a fresh database connection with autocommit disabled.
+    `connect_timeout` (seconds) bounds the TCP/auth handshake; the side
+    connections (heartbeat, reconnects mid-job) set it so a DB host that is
+    down cannot hang them on an OS-level connect timeout."""
+    kwargs: dict[str, Any] = {"cursor_factory": psycopg2.extras.RealDictCursor}
+    if connect_timeout:
+        kwargs["connect_timeout"] = connect_timeout
+    conn = psycopg2.connect(DATABASE_URL, **kwargs)
     conn.autocommit = False
     return conn
+
+
+# connect_timeout for the side connections (heartbeat, mid-job reconnects).
+SIDE_CONNECT_TIMEOUT_SECONDS: int = 10
+
+
+def _conn_closed(conn: Any) -> bool:
+    """Whether psycopg2 has marked `conn` closed (it does after a lost
+    connection is detected). A conn without the attribute (test fakes) is open."""
+    return conn is None or bool(getattr(conn, "closed", 0))
+
+
+def _job_write(conn: Any, what: str, write: Any) -> Any:
+    """
+    Run one job-row write — `write(c)` executes on cursor-holding connection
+    `c` and returns a value — then commit. The connection is rolled back
+    FIRST: after a failed statement (e.g. a constraint violation in
+    _mark_done) psycopg2 leaves it in an aborted transaction that would refuse
+    the write. If `conn` is closed or the write fails, it is retried once on a
+    fresh connection (closed afterwards): the job connection is often the very
+    thing that broke. Returns write()'s value, or raises the last error.
+    """
+    last: BaseException | None = None
+    for attempt in (1, 2):
+        own = None
+        target = conn
+        try:
+            if attempt == 2 or _conn_closed(conn):
+                own = target = _connect(connect_timeout=SIDE_CONNECT_TIMEOUT_SECONDS)
+            else:
+                target.rollback()
+            value = write(target)
+            target.commit()
+            return value
+        except Exception as exc:  # noqa: BLE001 — retried once, then re-raised
+            last = exc
+            log.warning("%s failed (try %d): %s", what, attempt, exc)
+            try:
+                target.rollback()
+            except Exception:  # noqa: BLE001, S110 — best-effort cleanup
+                pass
+        finally:
+            _close_quietly(own)
+    assert last is not None
+    raise last
 
 
 # Atomic claim of one pending job: oldest pending row with attempts < 3, locked
@@ -1281,7 +1332,9 @@ def _heartbeat_loop(
     still running to another claim and burn an attempt.
     """
     interval = HEARTBEAT_INTERVAL if interval is None else interval
-    connect = _connect if connect is None else connect
+    if connect is None:
+        def connect() -> Any:
+            return _connect(connect_timeout=SIDE_CONNECT_TIMEOUT_SECONDS)
     hb_conn: Any = None
     try:
         while not stop.wait(interval):
@@ -1839,9 +1892,8 @@ def _release_job(
     Best-effort: a failure is logged and the stale-claim recovery remains the
     backstop.
     """
-    try:
-        conn.rollback()  # discard any transaction the interrupted job left open
-        with conn.cursor() as cur:
+    def write(c: Any) -> None:
+        with c.cursor() as cur:
             cur.execute(
                 """
                 UPDATE transcription_jobs
@@ -1854,14 +1906,12 @@ def _release_job(
                 """,
                 (job_id, RUNNER_IDENTITY),
             )
-        conn.commit()
+
+    try:
+        _job_write(conn, f"release job {job_id}", write)
         log.info("Job %s released back to pending (%s)", job_id, reason)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — the stale sweep is the backstop
         log.error("Failed to release job %s (%s): %s", job_id, reason, exc)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
 
 
 # Release after transient retries ran out (CONTRACT §1.3). Unlike _release_job
@@ -1895,34 +1945,24 @@ def _release_job_transient(
     """
     truncated = error[:MAX_ERROR_LEN]
     params = (truncated, truncated, job_id, RUNNER_IDENTITY)
-    for attempt in (1, 2):
-        own = None
-        try:
-            target = conn
-            if attempt == 2:
-                own = target = _connect()
-            else:
-                conn.rollback()
-            with target.cursor() as cur:
-                cur.execute(_RELEASE_TRANSIENT_SQL, params)
-                row = cur.fetchone()
-            target.commit()
-            status = (row.get("status") if isinstance(row, dict) else row[0]) if row else None
-            log.warning(
-                "Job %s released after transient failure (now %s): %s",
-                job_id,
-                status or "unchanged — no longer claimed by this runner",
-                truncated,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001 — the stale sweep is the backstop
-            log.error("Failed to release job %s (try %d): %s", job_id, attempt, exc)
-            try:
-                (own or conn).rollback()
-            except Exception:  # noqa: BLE001, S110 — best-effort cleanup
-                pass
-        finally:
-            _close_quietly(own)
+
+    def write(c: Any) -> Any:
+        with c.cursor() as cur:
+            cur.execute(_RELEASE_TRANSIENT_SQL, params)
+            return cur.fetchone()
+
+    try:
+        row = _job_write(conn, f"transient release of job {job_id}", write)
+    except Exception as exc:  # noqa: BLE001 — the stale sweep is the backstop
+        log.error("Failed to release job %s after a transient failure: %s", job_id, exc)
+        return
+    status = (row.get("status") if isinstance(row, dict) else row[0]) if row else None
+    log.warning(
+        "Job %s released after transient failure (now %s): %s",
+        job_id,
+        status or "unchanged — no longer claimed by this runner",
+        truncated,
+    )
 
 
 def _mark_failed(
@@ -1930,8 +1970,9 @@ def _mark_failed(
 ) -> None:
     """Mark a job as permanently failed with a truncated error message."""
     truncated = error[:MAX_ERROR_LEN]
-    try:
-        with conn.cursor() as cur:
+
+    def write(c: Any) -> None:
+        with c.cursor() as cur:
             cur.execute(
                 """
                 UPDATE transcription_jobs
@@ -1941,14 +1982,14 @@ def _mark_failed(
                 """,
                 (truncated, job_id),
             )
-        conn.commit()
+
+    try:
+        # _job_write rolls back first: a permanent SQL error in _mark_done
+        # leaves the job connection in an aborted transaction.
+        _job_write(conn, f"mark job {job_id} failed", write)
         log.error("Job %s marked failed: %s", job_id, truncated)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — the stale sweep is the backstop
         log.error("Failed to mark job %s as failed: %s", job_id, exc)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1985,9 +2026,15 @@ _FFMPEG_TRANSIENT_RE = re.compile(
 
 def _books_share_reachable() -> bool:
     """Whether the books mount (BOOKS_MOUNT, a UNC share on Windows) answers.
-    Distinguishes "file is missing" (permanent) from "share is down" (transient)."""
+    Distinguishes "file is missing" (permanent) from "share is down" (transient).
+
+    It must list at least one entry, not merely exist: on Linux the mountpoint
+    directory outlives a dropped NFS/SMB mount (isdir stays true, the dir is
+    empty), and a books share is never legitimately empty. Only the first
+    entry is read. On Windows a down UNC share fails the listing outright."""
     try:
-        return os.path.isdir(BOOKS_MOUNT)
+        with os.scandir(BOOKS_MOUNT) as it:
+            return next(it, None) is not None
     except Exception:  # noqa: BLE001 — unreachable either way
         return False
 
@@ -2013,6 +2060,24 @@ def _subprocess_stderr(exc: BaseException) -> str:
     return raw if isinstance(raw, str) else ""
 
 
+# SQLSTATEs that mean the connection, not the statement, failed: class 08
+# (connection exception) and 57P01-57P03 (admin/crash shutdown, cannot connect
+# now). Any other OperationalError (a statement timeout, a lock timeout, out of
+# disk) is the statement's own failure and is permanent.
+_DB_TRANSIENT_SQLSTATE_PREFIXES: tuple[str, ...] = ("08", "57P01", "57P02", "57P03")
+
+
+def _is_connection_failure(exc: BaseException) -> bool:
+    """For a psycopg2 OperationalError/InterfaceError: an InterfaceError
+    (the connection is closed), no SQLSTATE at all (a client-side connection
+    loss, "server closed the connection unexpectedly"), or a connection-class
+    SQLSTATE."""
+    if "InterfaceError" in _class_names(exc):
+        return True
+    pgcode = getattr(exc, "pgcode", None)
+    return not pgcode or str(pgcode).startswith(_DB_TRANSIENT_SQLSTATE_PREFIXES)
+
+
 def _classify_failure(exc: BaseException) -> str | None:
     """
     Classify a job failure: a TRANSIENT_* kind (retry, then release the job to
@@ -2020,7 +2085,8 @@ def _classify_failure(exc: BaseException) -> str | None:
     type lives in an optional dependency, so it needs neither a real psycopg2
     nor torch. Walks the cause chain (_audio_probe wraps ffprobe's error).
 
-      db       psycopg2 OperationalError / InterfaceError (connection lost)
+      db       psycopg2 OperationalError / InterfaceError that is a connection
+               loss (InterfaceError, no SQLSTATE, SQLSTATE 08xxx / 57P01-03)
       oom      torch.cuda.OutOfMemoryError, or "CUDA out of memory" in the text
       timeout  an ffmpeg/ffprobe call outlived its timeout (TimeoutExpired)
       io       a network OSError (WinError 53/59/64/67/1231, ETIMEDOUT,
@@ -2034,7 +2100,7 @@ def _classify_failure(exc: BaseException) -> str | None:
         names = _class_names(e)
         if names & {"OperationalError", "InterfaceError"} and "psycopg2" in (
             type(e).__module__ or ""
-        ):
+        ) and _is_connection_failure(e):
             return TRANSIENT_DB
         if "OutOfMemoryError" in names or "CUDA out of memory" in str(e):
             return TRANSIENT_OOM
@@ -2067,14 +2133,23 @@ def _failure_message(exc: BaseException) -> str:
 
 
 _jitter_rng = random.SystemRandom()
+# Bound on backoff growth steps (and on the main loop's consecutive-transient
+# counter, which only feeds _backoff_delay): far past any cap.
+_MAX_BACKOFF_STEPS = 64
 
 
 def _backoff_delay(attempt: int, cap: float | None = None) -> float:
     """Exponential backoff with jitter for retry number `attempt` (1-based):
     min(cap, BASE × FACTOR^(attempt-1)) × U(1-JITTER, 1+JITTER)."""
     cap = RETRY_MAX_SECONDS if cap is None else cap
-    raw = RETRY_BASE_SECONDS * (RETRY_FACTOR ** max(0, attempt - 1))
-    delay = min(cap, raw)
+    # Multiply up to the cap instead of RETRY_FACTOR ** n: a large attempt
+    # count (or factor) can never overflow a float, and the loop is bounded.
+    delay = RETRY_BASE_SECONDS
+    for _ in range(min(max(0, attempt - 1), _MAX_BACKOFF_STEPS)):
+        if delay >= cap:
+            break
+        delay *= RETRY_FACTOR
+    delay = min(cap, delay)
     if RETRY_JITTER > 0:
         delay *= _jitter_rng.uniform(1 - RETRY_JITTER, 1 + RETRY_JITTER)
     return max(0.0, delay)
@@ -2137,6 +2212,21 @@ class _ConnRef:
 
     def __init__(self, conn: Any) -> None:
         self.conn = conn
+
+    def live(self) -> Any:
+        """ref.conn, reconnected first when psycopg2 has marked it closed (the
+        new connection replaces it). A failed reconnect leaves the dead one
+        (every reader degrades safe; every job write falls back to a fresh
+        connection itself)."""
+        if _conn_closed(self.conn):
+            try:
+                fresh = _connect(connect_timeout=SIDE_CONNECT_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001 — callers degrade safe
+                log.warning("job connection lost and reconnect failed: %s", exc)
+                return self.conn
+            _close_quietly(self.conn)
+            self.conn = fresh
+        return self.conn
 
 
 def _job_status(conn: psycopg2.extensions.connection, job_id: str) -> str | None:
@@ -2861,6 +2951,8 @@ def _checkpoint_fingerprint(ctx: _JobContext, audio_path: Path) -> dict[str, Any
         "overlap_seconds": CHUNK_OVERLAP_SECONDS,
         "runner_version": RUNNER_VERSION,
         "bias_terms_sha256": bias,
+        # Everything else that shapes the output (dtype, geometry, biasing alpha…).
+        "asr_params": _asr_params(),
     }
 
 
@@ -3242,8 +3334,11 @@ def _transcribe_chunked(
         win_idx += 1
         if checkpoint is not None:
             checkpoint.save(offset, win_idx, all_words, all_segments)
-        if offset < duration_seconds:
+        if offset < duration_seconds and checkpoint is not None and checkpoint.enabled:
             # Mid-job yield (CONTRACT §1.4): an eviction costs at most a window.
+            # Only with a durable checkpoint — a yield without one would throw
+            # the finished windows away, so a flapping gate could cycle the
+            # job forever; without one the job finishes, then parks.
             _maybe_yield_mid_job()
 
     raw_text = " ".join(
@@ -4389,11 +4484,16 @@ def _require_audio(file_path: str) -> Path:
     return audio_path
 
 
-def _mid_job_park_reason(conn: psycopg2.extensions.connection) -> str | None:
+def _mid_job_park_reason(ref: _ConnRef) -> str | None:
     """The mid-job yield check (CONTRACT §1.4): the same park gate as between
     jobs — paused, phase not on the GPU, or arbiter_yield — read on the idle job
-    connection. Every read degrades safe, so a dead connection keeps working."""
+    connection. Every read degrades safe, which on a dead connection would read
+    "keep going" forever, so the connection is reconnected first when closed,
+    and once more if the reads found it dead."""
+    conn = ref.live()
     paused, _, phase, arbiter_yield = _read_gate_inputs(conn)
+    if _conn_closed(conn) and ref.live() is not conn:
+        paused, _, phase, arbiter_yield = _read_gate_inputs(ref.conn)
     if _should_park(paused, phase, arbiter_yield):
         return _park_reason(paused, phase, arbiter_yield)
     return None
@@ -4427,26 +4527,16 @@ def main() -> None:
     provider.load()
     _init_checkpoint_dir()
 
-    # Consecutive jobs released for a transient failure (reset by a completed
-    # job): drives the backoff before the next claim, and the kind of the last
-    # one (an unreachable share holds claims until it answers again).
+    # After a job is released for a transient failure the next CLAIM waits
+    # (only the claim: heartbeat, self-update and the GPU gate keep running
+    # every cycle, so the runner still parks for a game and still reads as
+    # alive). consecutive_transient (reset by a completed job, bounded) drives
+    # the backoff; after an io release, claims also wait for the books share.
     consecutive_transient = 0
-    last_transient_kind: str | None = None
+    claim_not_before = 0.0  # time.monotonic() deadline
+    hold_for_share = False
 
     while not _shutdown.is_set():
-        if consecutive_transient:
-            delay = _backoff_delay(consecutive_transient, cap=TRANSIENT_BACKOFF_MAX_SECONDS)
-            log.info(
-                "Backing off %.0f s before the next claim (%d consecutive transient failures)",
-                delay, consecutive_transient,
-            )
-            if _shutdown.wait(delay):
-                break
-            if last_transient_kind == TRANSIENT_IO and not _books_share_reachable():
-                # Don't burn another job's attempts on a share that is still down.
-                log.warning("Books share %s still unreachable — not claiming", BOOKS_MOUNT)
-                consecutive_transient += 1
-                continue
         conn: psycopg2.extensions.connection | None = None
         try:
             conn = _connect()
@@ -4478,6 +4568,23 @@ def main() -> None:
                 _evaluate_keep_awake(conn, False, *gate_inputs[:3])
                 conn.close()
                 _shutdown.wait(POLL_INTERVAL)
+                continue
+
+            if hold_for_share and _books_share_reachable():
+                log.info("Books share %s answers again — claims resume", BOOKS_MOUNT)
+                hold_for_share = False
+            remaining = claim_not_before - time.monotonic()
+            if remaining > 0 or hold_for_share:
+                # Wait in slices of at most one poll, so the next cycle re-runs
+                # the heartbeat and the GPU gate while claims are held.
+                log.debug(
+                    "Claim held (%s)",
+                    f"backoff, {remaining:.0f} s left" if remaining > 0
+                    else f"books share {BOOKS_MOUNT} unreachable",
+                )
+                _evaluate_keep_awake(conn, False, *gate_inputs[:3])
+                conn.close()
+                _shutdown.wait(min(POLL_INTERVAL, remaining) if remaining > 0 else POLL_INTERVAL)
                 continue
 
             job = _claim_job(conn)
@@ -4539,7 +4646,7 @@ def main() -> None:
             job_id,
             file_path,
             bias_terms=bias_terms,
-            should_yield=lambda ref=ref: _mid_job_park_reason(ref.conn),
+            should_yield=lambda ref=ref: _mid_job_park_reason(ref),
         )
         try:
             # Re-root the producer's BOOKS_DB_ROOT-relative file_path onto this
@@ -4552,7 +4659,7 @@ def main() -> None:
             result = _transcribe_interruptibly(provider, audio_path, bias_terms)
             _mark_done_with_retry(ref, job_id, file_path, checksum, result)
             _delete_checkpoint(job_id)
-            consecutive_transient, last_transient_kind = 0, None
+            consecutive_transient, claim_not_before, hold_for_share = 0, 0.0, False
             # Best-effort metrics write — AFTER the transcript commit.
             # _write_run_metrics catches all exceptions internally and never
             # raises, so a missing run_metrics table (sibling schema PR not yet
@@ -4563,17 +4670,17 @@ def main() -> None:
             log.warning(
                 "Shutdown requested mid-transcription — releasing job %s", job_id
             )
-            _release_job(ref.conn, job_id)
+            _release_job(ref.live(), job_id)
         except _YieldInterrupt as yi:
             # The checkpoint holds every finished window; refund the attempt (a
             # yield is not the job's fault) and park at the next gate, at once.
-            _release_job(ref.conn, job_id, reason=f"mid-job GPU yield: {yi}")
+            _release_job(ref.live(), job_id, reason=f"mid-job GPU yield: {yi}")
         except Exception as exc:
             kind = _classify_failure(exc)
             message = _failure_message(exc)
             if kind is None:
                 log.exception("Transcription failed for job %s (permanent)", job_id)
-                _mark_failed(ref.conn, job_id, message)
+                _mark_failed(ref.live(), job_id, message)
                 _delete_checkpoint(job_id)
             else:
                 # Retries in place are spent: back to pending, attempt kept, the
@@ -4581,10 +4688,18 @@ def main() -> None:
                 log.warning("Job %s: transient %s failure, retries exhausted", job_id, kind,
                             exc_info=True)
                 _release_job_transient(
-                    ref.conn, job_id, f"transient {kind} error (retries exhausted): {message}"
+                    ref.live(), job_id, f"transient {kind} error (retries exhausted): {message}"
                 )
-                consecutive_transient += 1
-                last_transient_kind = kind
+                consecutive_transient = min(consecutive_transient + 1, _MAX_BACKOFF_STEPS)
+                delay = _backoff_delay(consecutive_transient, cap=TRANSIENT_BACKOFF_MAX_SECONDS)
+                claim_not_before = time.monotonic() + delay
+                # Don't burn other jobs' attempts on a share that is still down.
+                hold_for_share = kind == TRANSIENT_IO
+                log.info(
+                    "Holding claims for %.0f s (%d consecutive transient failures)%s",
+                    delay, consecutive_transient,
+                    " and until the books share answers" if hold_for_share else "",
+                )
         finally:
             _active_job = None
             stop_hb.set()

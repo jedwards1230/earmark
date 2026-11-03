@@ -2174,7 +2174,10 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 	}
 
 	// Global control row (runner_control singleton): pause flag + bounded-run
-	// counter. Tolerate a missing row by defaulting to not-paused/unlimited; the
+	// counter. arbiter_yield(_at) is read in the same query on purpose: it needs
+	// migration 00016, which db.New applies before anything serves or polls, so
+	// a schema without it only exists under a rolled-back database (then every
+	// status read fails loudly rather than silently reporting "not held"). Tolerate a missing row by defaulting to not-paused/unlimited; the
 	// init seed normally guarantees it exists.
 	if err := db.pool.QueryRow(ctx,
 		`SELECT paused, run_limit, runner_heartbeat_at,

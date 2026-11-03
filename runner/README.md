@@ -65,6 +65,10 @@ window instead of 0 s (CONTRACT §1.3 "Resume checkpoints"). Between windows the
 runner re-checks the park gate — `paused`, `phase='analyze'`, or gpu-arbiter's
 `arbiter_yield` (migration 00016, CONTRACT §1.4) — and, if it closed, releases
 the job (attempt refunded) and parks: an eviction costs at most one window.
+Pausing therefore also stops a long job at its next window boundary. Single-pass
+files (≤ `ASR_CHUNK_THRESHOLD_SECONDS`) and jobs whose checkpoint is disabled
+finish first. While claims are held after a transient failure, the heartbeat,
+self-update check and GPU gate keep running every poll.
 
 | Variable | Default | What |
 |---|---|---|

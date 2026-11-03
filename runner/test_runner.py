@@ -3807,6 +3807,19 @@ class ClassifyFailureTests(unittest.TestCase):
         self.assertEqual(self._classify(FakeOperationalError("server closed")), runner.TRANSIENT_DB)
         self.assertEqual(self._classify(FakeInterfaceError("connection already closed")), runner.TRANSIENT_DB)
 
+    def test_db_transient_only_for_connection_sqlstates(self) -> None:
+        def op(pgcode: str | None) -> Exception:
+            e = FakeOperationalError("x")
+            e.pgcode = pgcode  # type: ignore[attr-defined]
+            return e
+
+        for code in (None, "08006", "08001", "57P01", "57P02", "57P03"):
+            with self.subTest(pgcode=code):
+                self.assertEqual(self._classify(op(code)), runner.TRANSIENT_DB)
+        for code in ("57014", "55P03", "53100"):  # statement timeout, lock timeout, disk full
+            with self.subTest(pgcode=code):
+                self.assertIsNone(self._classify(op(code)))
+
     def test_other_db_errors_are_permanent(self) -> None:
         self.assertIsNone(self._classify(FakeIntegrityError("duplicate key")))
         # Same class name outside psycopg2 is not a DB error.
@@ -3885,6 +3898,12 @@ class BackoffTests(unittest.TestCase):
             self.assertEqual([runner._backoff_delay(n) for n in (1, 2, 3)], [10.0, 30.0, 90.0])
             self.assertEqual(runner._backoff_delay(9), runner.RETRY_MAX_SECONDS)
             self.assertEqual(runner._backoff_delay(9, cap=600.0), 600.0)
+
+    def test_huge_attempt_counts_and_factors_never_overflow(self) -> None:
+        with mock.patch.object(runner, "RETRY_JITTER", 0.0):
+            self.assertEqual(runner._backoff_delay(10**9), runner.RETRY_MAX_SECONDS)
+            with mock.patch.object(runner, "RETRY_FACTOR", 1e300):
+                self.assertEqual(runner._backoff_delay(10**6, cap=600.0), 600.0)
 
     def test_jitter_stays_within_bounds(self) -> None:
         for _ in range(50):
@@ -4045,6 +4064,9 @@ class CheckpointTests(_CheckpointDirMixin):
                 self.assertIsNone(self._open(self._ctx()).load())
                 self.assertFalse((self.dir / "job-job-a.json").exists(), "stale checkpoint deleted")
             self._open(self._ctx()).save(600.0, 1, [], [])
+        with mock.patch.object(runner, "_asr_params", return_value={"biasing_alpha": 6.0}):
+            self.assertIsNone(self._open(self._ctx()).load(), "asr_params are fingerprinted")
+        self._open(self._ctx()).save(600.0, 1, [], [])
         self.assertIsNone(self._open(self._ctx(bias_terms=["Muad'Dib"])).load())
         self._open(self._ctx()).save(600.0, 1, [], [])
         self.audio.write_bytes(b"y" * 101)  # size (and mtime) of the source changed
@@ -4207,6 +4229,10 @@ class ChunkedResumeAndYieldTests(_CheckpointDirMixin):
             words, _ = self._run(model, self._ctx())
         free.assert_called_once()
         self.assertEqual(words, ["w0", "w1", "w2", "w3"])
+    def test_no_yield_without_a_checkpoint(self) -> None:
+        with mock.patch.object(runner, "CHECKPOINT_DIR", None):
+            words, _ = self._run(_WindowModel(), self._ctx(should_yield=lambda: "phase=analyze"))
+        self.assertEqual(len(words), 4, "the job finishes instead of throwing windows away")
 
     def _open_state(self) -> Any:
         with mock.patch.object(runner, "_active_job", self._ctx()):
@@ -4243,14 +4269,49 @@ class ParkGateArbiterYieldTests(unittest.TestCase):
         self.assertEqual(conn.parked_stamps, [True])
 
     def test_mid_job_park_reason(self) -> None:
+        ref = runner._ConnRef(object())  # no .closed attribute: an open connection
         with mock.patch.object(runner, "_read_gate_inputs", return_value=(False, None, "idle", True)):
-            self.assertEqual(runner._mid_job_park_reason(None), "held by gpu-arbiter (arbiter_yield)")
+            self.assertEqual(runner._mid_job_park_reason(ref), "held by gpu-arbiter (arbiter_yield)")
         with mock.patch.object(runner, "_read_gate_inputs", return_value=(False, None, "analyze", False)):
-            self.assertEqual(runner._mid_job_park_reason(None), "phase=analyze")
+            self.assertEqual(runner._mid_job_park_reason(ref), "phase=analyze")
         with mock.patch.object(runner, "_read_gate_inputs", return_value=(True, None, "idle", False)):
-            self.assertEqual(runner._mid_job_park_reason(None), "paused")
+            self.assertEqual(runner._mid_job_park_reason(ref), "paused")
         with mock.patch.object(runner, "_read_gate_inputs", return_value=(False, None, "transcribe", False)):
-            self.assertIsNone(runner._mid_job_park_reason(None))
+            self.assertIsNone(runner._mid_job_park_reason(ref))
+
+    def test_mid_job_check_reconnects_a_dead_job_connection(self) -> None:
+        dead = mock.Mock(closed=1)
+        fresh = mock.Mock(closed=0)
+        seen: list[Any] = []
+
+        def inputs(conn: Any) -> tuple[bool, None, str, bool]:
+            seen.append(conn)
+            return (False, None, "analyze", False)
+
+        ref = runner._ConnRef(dead)
+        with mock.patch.object(runner, "_connect", return_value=fresh) as connect, \
+                mock.patch.object(runner, "_read_gate_inputs", side_effect=inputs):
+            self.assertEqual(runner._mid_job_park_reason(ref), "phase=analyze")
+        self.assertIs(ref.conn, fresh, "the new connection replaces the dead one")
+        self.assertEqual(seen, [fresh])
+        dead.close.assert_called_once()
+        self.assertEqual(connect.call_args.kwargs, {"connect_timeout": runner.SIDE_CONNECT_TIMEOUT_SECONDS})
+
+    def test_mid_job_check_rereads_when_the_reads_found_the_conn_dead(self) -> None:
+        conn = mock.Mock(closed=0)
+        fresh = mock.Mock(closed=0)
+        answers = iter([(False, None, "idle", False), (False, None, "idle", True)])
+
+        def inputs(c: Any) -> Any:
+            if c is conn:
+                conn.closed = 2  # psycopg2 marks it closed after the failed read
+            return next(answers)
+
+        ref = runner._ConnRef(conn)
+        with mock.patch.object(runner, "_connect", return_value=fresh), \
+                mock.patch.object(runner, "_read_gate_inputs", side_effect=inputs):
+            self.assertEqual(runner._mid_job_park_reason(ref), "held by gpu-arbiter (arbiter_yield)")
+        self.assertIs(ref.conn, fresh)
 
 
 class _RetCursor(FakeCursor):
@@ -4470,3 +4531,147 @@ class TransientFailureMainLoopTests(_MainLoopHarness):
                 mock.patch.object(runner._shutdown, "wait", side_effect=stop_after_three):
             self._run(self._raise(OSError(_errno.EHOSTUNREACH, "no route")))
         self.assertEqual(self.claims, 1, "no claim while the share stays down")
+    def test_heartbeat_and_gpu_gate_run_while_claims_are_held(self) -> None:
+        import errno as _errno
+
+        runner._books_share_reachable.return_value = False  # type: ignore[attr-defined]
+        waits = {"n": 0}
+
+        def stop_after_four(_delay: float) -> bool:
+            waits["n"] += 1
+            if waits["n"] >= 4:
+                runner._shutdown.set()
+            return runner._shutdown.is_set()
+
+        with mock.patch.object(runner, "_retry_wait"), \
+                mock.patch.object(runner._shutdown, "wait", side_effect=stop_after_four):
+            self._run(self._raise(OSError(_errno.EHOSTUNREACH, "no route")))
+        self.assertEqual(self.claims, 1)
+        stamps = [s for s in self._sql() if "runner_heartbeat_at = now()" in s]
+        self.assertGreaterEqual(len(stamps), 4, "a liveness stamp every held cycle")
+        self.assertGreaterEqual(runner._gate_gpu.call_count, 4, "the GPU gate still runs (parks for a game)")
+
+    def test_claims_resume_when_the_share_answers(self) -> None:
+        import errno as _errno
+
+        answers = iter([False, True])
+        runner._books_share_reachable.side_effect = lambda: next(answers, True)  # type: ignore[attr-defined]
+        with mock.patch.object(runner, "_retry_wait"):
+            self._run(self._raise(OSError(_errno.EHOSTUNREACH, "no route")))
+        self.assertEqual(self.claims, 2, "the second cycle claimed again")
+
+
+class BooksShareReachableTests(unittest.TestCase):
+    def test_needs_a_listable_non_empty_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            empty = root / "mnt"  # a mountpoint left behind by a dropped mount
+            empty.mkdir()
+            with mock.patch.object(runner, "BOOKS_MOUNT", empty):
+                self.assertFalse(runner._books_share_reachable())
+            (empty / "Author").mkdir()
+            with mock.patch.object(runner, "BOOKS_MOUNT", empty):
+                self.assertTrue(runner._books_share_reachable())
+            with mock.patch.object(runner, "BOOKS_MOUNT", root / "missing"):
+                self.assertFalse(runner._books_share_reachable())
+
+
+class _OrderConn(_RetConn):
+    """Records rollbacks and statements in one ordered log."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.log: list[str] = []
+
+    def rollback(self) -> None:
+        self.log.append("rollback")
+        super().rollback()
+
+    def cursor(self) -> FakeCursor:
+        cur = super().cursor()
+        orig = cur.execute
+
+        def execute(sql: str, params: object = None) -> None:
+            self.log.append(sql.split()[0])
+            orig(sql, params)
+
+        cur.execute = execute  # type: ignore[method-assign]
+        return cur
+
+
+class JobWriteFallbackTests(unittest.TestCase):
+    """The job-row writes (_mark_failed, _release_job, _release_job_transient)
+    roll back first and fall back to a fresh connection."""
+
+    def test_mark_failed_rolls_back_an_aborted_transaction_first(self) -> None:
+        conn = _OrderConn()
+        runner._mark_failed(conn, "job-1", "CHECK violation")
+        self.assertEqual(conn.log[:2], ["rollback", "UPDATE"])
+        self.assertEqual(conn.commits, 1)
+
+    def test_release_on_a_closed_connection_uses_a_fresh_one(self) -> None:
+        dead = _RetConn()
+        dead.closed = True
+        fresh = _RetConn()
+        with mock.patch.object(runner, "_connect", return_value=fresh):
+            runner._release_job(dead, "job-1")
+        self.assertFalse(dead.executed)
+        self.assertTrue(any("GREATEST(attempts - 1, 0)" in s for s, _ in fresh.executed))
+        self.assertTrue(fresh.closed)
+
+    def test_mark_failed_falls_back_when_the_write_fails(self) -> None:
+        broken = _RetConn(fail_sql="UPDATE transcription_jobs")
+        fresh = _RetConn()
+        with mock.patch.object(runner, "_connect", return_value=fresh):
+            runner._mark_failed(broken, "job-1", "x")
+        self.assertTrue(any("SET    status = 'failed'" in s for s, _ in fresh.executed))
+
+    def test_both_tries_failing_is_logged_not_raised(self) -> None:
+        with mock.patch.object(runner, "_connect", side_effect=FakeOperationalError("down")):
+            runner._release_job(_RetConn(fail_sql="UPDATE"), "job-1")  # must not raise
+
+
+class ShutdownDuringDBRetryTests(_MainLoopHarness):
+    """A stop during _mark_done's reconnect backoff releases the job on a LIVE
+    connection — the job connection was closed for the retry."""
+
+    control_row = (False, None)
+    job_row: ClassVar[dict[str, str]] = {"id": "job-1", "file_path": "A/B/01.mp3", "checksum": "abc"}
+
+    def test_release_reaches_the_database(self) -> None:
+        def closing_conn() -> FakeConn:
+            conn = _RetConn()
+            conn.control_row, conn.job_row = self.control_row, self.job_row
+            self.conns.append(conn)
+            return conn
+
+        def stop_in_backoff(_delay: float) -> None:
+            runner._shutdown.set()
+            raise runner._ShutdownInterrupt(0)
+
+        with mock.patch.object(runner, "_connect", side_effect=lambda **_kw: closing_conn()), \
+                mock.patch.object(runner, "_make_provider", return_value=_LoopProvider()), \
+                mock.patch.object(runner, "_resolve_audio_path") as resolve, \
+                mock.patch.object(runner, "_mark_done", side_effect=FakeOperationalError("gone")), \
+                mock.patch.object(runner, "_retry_wait", side_effect=stop_in_backoff), \
+                mock.patch.object(runner, "_init_checkpoint_dir"):
+            resolve.return_value.exists.return_value = True
+            runner.main()
+        job_conn = self.conns[0]
+        self.assertTrue(job_conn.closed)
+        released = [c for c in self.conns[1:] if any("GREATEST(attempts - 1, 0)" in s for s, _ in c.executed)]
+        self.assertEqual(len(released), 1, "released once, on a fresh connection")
+
+
+class HeartbeatConnectTimeoutTests(unittest.TestCase):
+    def test_default_connect_sets_a_connect_timeout(self) -> None:
+        stop = threading.Event()
+        conn = _RetConn()
+
+        def connect(**kw: Any) -> Any:
+            stop.set()
+            return conn
+
+        with mock.patch.object(runner, "_connect", side_effect=connect) as c:
+            runner._heartbeat_loop(stop, "job-1", interval=0.001)
+        self.assertEqual(c.call_args.kwargs, {"connect_timeout": runner.SIDE_CONNECT_TIMEOUT_SECONDS})
