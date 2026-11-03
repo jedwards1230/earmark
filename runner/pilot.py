@@ -1141,9 +1141,7 @@ class GraniteBackend(Backend):
             chat, tokenize=False, add_generation_prompt=True
         )
 
-    def transcribe_batch(
-        self, audios: Sequence[Any]
-    ) -> list[WindowResult]:  # pragma: no cover
+    def transcribe_batch(self, audios: Sequence[Any]) -> list[WindowResult]:
         torch = self.torch
         # Pass the windows UNPADDED as a list: the feature extractor pads them
         # itself and derives per-row audio_embed_sizes + input_features_mask

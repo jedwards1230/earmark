@@ -800,3 +800,94 @@ def test_pilot_does_not_import_runner_and_keeps_heavy_imports_lazy() -> None:
 def test_no_timestamp_mode_left() -> None:
     src = _PILOT_PATH.read_text(encoding="utf-8")
     assert "[T:" not in src and "2b-plus" not in src
+
+
+# ── Granite batch call (stubbed torch / processor / model) ─────────────────────
+class _Shape(tuple):
+    pass
+
+
+class _FakeTensor:
+    def __init__(self, data: Any) -> None:
+        self.data = data
+        self.shape = (
+            _Shape([len(data[0])]) if data and isinstance(data[0], list) else None
+        )
+
+    def tolist(self) -> Any:
+        return self.data
+
+
+class _FakeInputs(dict):
+    def to(self, device: str) -> Self:
+        self["moved_to"] = device
+        return self
+
+
+class _FakeTorch:
+    def __init__(self) -> None:
+        self.from_numpy_calls: list[Any] = []
+
+    def from_numpy(self, a: Any) -> Any:
+        self.from_numpy_calls.append(a)
+        return ("tensor", tuple(a))
+
+    def stack(self, *a: Any, **k: Any) -> Any:
+        raise AssertionError("Granite must not stack/pad the batch itself")
+
+    def inference_mode(self) -> Any:
+        import contextlib
+
+        return contextlib.nullcontext()
+
+
+def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
+    cfg = make_cfg("granite")
+    b = pilot.GraniteBackend(cfg)
+    b.torch = _FakeTorch()
+    b.prompt = "<chat>PROMPT"
+    seen: dict[str, Any] = {}
+    mask = [[True, True, True], [True, False, False]]
+
+    def processor(text: Any, audio: Any, **kw: Any) -> Any:
+        seen["text"], seen["audio"], seen["kw"] = text, audio, kw
+        # input_ids: 2 left-padded rows of length 3; plus the per-row feature mask.
+        return _FakeInputs(
+            input_ids=_FakeTensor([[0, 5, 6], [5, 6, 7]]), input_features_mask=mask
+        )
+
+    class Model:
+        def generate(self, **kw: Any) -> Any:
+            seen["gen"] = kw
+            return _FakeTensor([[0, 5, 6, 11, 12, 2], [5, 6, 7, 21, 2, 2]])
+
+    class Tok:
+        pad_token_id = 2
+        eos_token_id = 2
+
+        def batch_decode(self, rows: Any, **kw: Any) -> list[str]:
+            seen["decoded"] = rows
+            return [" First row. ", "Second."]
+
+    b.processor, b.model, b.tokenizer = processor, Model(), Tok()
+    long_row = [0.1] * (3 * pilot.SAMPLE_RATE)
+    short_row = [0.2] * pilot.SAMPLE_RATE
+    res = b.transcribe_batch([long_row, short_row])
+
+    # The processor gets a LIST of 1-D rows with their own lengths, not one padded tensor.
+    assert isinstance(seen["audio"], list) and len(seen["audio"]) == 2
+    assert [len(r[1]) for r in seen["audio"]] == [
+        3 * pilot.SAMPLE_RATE,
+        pilot.SAMPLE_RATE,
+    ]
+    assert seen["text"] == ["<chat>PROMPT", "<chat>PROMPT"]
+    assert seen["kw"]["padding"] is True and seen["kw"]["device"] == "cuda"
+    # Whatever the processor returns (incl. input_features_mask) reaches generate().
+    assert seen["gen"]["input_features_mask"] is mask
+    assert seen["gen"]["num_beams"] == 1 and seen["gen"]["do_sample"] is False
+    assert seen["gen"]["repetition_penalty"] == 1.0
+    assert seen["gen"]["max_new_tokens"] == pilot.max_new_tokens(12, 64, [3.0, 1.0])
+    # New tokens are sliced per row past the shared input length.
+    assert seen["decoded"] == [[11, 12, 2], [21, 2, 2]]
+    assert [r.text for r in res] == ["First row.", "Second."]
+    assert not any(r.hit_token_limit for r in res)
