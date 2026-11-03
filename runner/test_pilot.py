@@ -913,3 +913,129 @@ def test_bench_honours_the_gaming_check_between_batches(
     assert run(cfg, conn, backend, gaming_check=check) == pilot.EXIT_GAMING
     assert backend.batches == [1, 1]  # step 1 finished; step 2 never ran a batch
     assert capsys.readouterr().out == "" and conn.writes() == []
+
+
+# ── Output language + --self-check on a real English clip ──────────────────────
+SPANISH = "Ellos son los que se encuentran en la mayoría de los edificios de la ciudad."
+EXPECTED = (
+    (Path(__file__).with_name("testdata") / "selfcheck_en.txt").read_text().strip()
+)
+
+
+def test_language_check_flags_non_english() -> None:
+    assert (
+        pilot.language_reason(SPANISH) == "language"
+    )  # the desktop-2 self-check output
+    assert (
+        pilot.language_reason("Le chat est sur la table et il ne veut pas descendre.")
+        == "language"
+    )
+    assert (
+        pilot.language_reason(
+            "Der Hund ist nicht im Haus und er will auch nicht spielen."
+        )
+        == "language"
+    )
+    assert (
+        pilot.language_reason("こんにちは、世界。今日はいい天気ですね。") == "language"
+    )
+    english = (
+        "It was the best of times, it was the worst of times, it was the age of wisdom."
+    )
+    assert pilot.language_reason(english) is None
+    # Names-only or short text proves nothing either way.
+    assert (
+        pilot.language_reason(
+            "Kaliko, Shaggy, Ruggedo, Polychrome, Betsy, Ann, Quox, Tititi-Hoochoo."
+        )
+        is None
+    )
+    assert pilot.language_reason("Buenos días, señor.") is None
+    assert pilot.degenerate_reason(SPANISH, False) == "language"
+
+
+def test_word_error_rate_ignores_case_punctuation_and_mister() -> None:
+    hyp = "Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel."
+    assert pilot.word_error_rate(EXPECTED, hyp) == 0.0
+    assert pilot.word_error_rate("a b c d", "a x c") == 0.5
+    assert pilot.word_error_rate(EXPECTED, SPANISH) > 0.9
+
+
+def test_self_check_clip_is_bundled_and_small() -> None:
+    clip = pilot.SELF_CHECK_AUDIO
+    assert clip.is_file() and clip.stat().st_size < 200_000
+    assert clip.with_suffix(".txt").is_file()
+    assert EXPECTED.startswith("MISTER QUILTER IS THE APOSTLE")
+
+
+def _self_check(
+    output: str, capsys: pytest.CaptureFixture[str], **extra: Any
+) -> tuple[int, dict]:
+    cfg = pilot.load_config(
+        ["--backend", "granite", "--self-check"], {"PILOT_MODEL_REVISION": REV}
+    )
+    seen: list[Any] = []
+
+    def decode(c: Any, path: Path, start: float, end: float) -> list[float]:
+        seen.append((path, start, end))
+        return [0.0] * 5 * pilot.SAMPLE_RATE
+
+    rc = pilot.self_check(
+        cfg,
+        backend=FakeBackend(cfg, "granite", outputs=[output]),
+        decode=decode,
+        **extra,
+    )
+    assert seen == [(pilot.SELF_CHECK_AUDIO, 0.0, pilot.SELF_CHECK_MAX_SEC)]
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_self_check_passes_on_the_expected_english_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc, info = _self_check(
+        "Mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+        capsys,
+    )
+    assert rc == pilot.EXIT_OK and info["passed"] is True and info["wer"] == 0.0
+    assert info["expected"] == EXPECTED and info["degenerate_reason"] is None
+
+
+def test_self_check_fails_on_spanish_or_wrong_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc, info = _self_check(SPANISH, capsys)
+    assert rc == pilot.EXIT_SELF_CHECK_FAILED and info["passed"] is False
+    assert info["degenerate_reason"] == "language"
+    rc, info = _self_check(
+        "The weather is nice today and the market opens at nine.", capsys
+    )
+    assert rc == pilot.EXIT_SELF_CHECK_FAILED and info["wer"] > pilot.SELF_CHECK_MAX_WER
+    rc, info = _self_check("", capsys)
+    assert rc == pilot.EXIT_SELF_CHECK_FAILED and info["degenerate_reason"] == "empty"
+
+
+def test_self_check_missing_clip_is_a_config_error(tmp_path: Path) -> None:
+    cfg = pilot.load_config(
+        [
+            "--backend",
+            "canary",
+            "--self-check",
+            "--self-check-audio",
+            str(tmp_path / "nope.flac"),
+        ],
+        {"PILOT_MODEL_REVISION": REV},
+    )
+    assert (
+        pilot.self_check(cfg, backend=FakeBackend(cfg, "canary")) == pilot.EXIT_CONFIG
+    )
+
+
+def test_non_english_window_is_marked_degenerate_in_a_run() -> None:
+    out = tempfile.mkdtemp(prefix="pilot-lang-")
+    cfg = make_cfg("canary", "--out-dir", out)
+    conn = FakeConn([("B1", "/books/a/t.m4b", TID, 38.0)], [])
+    assert run(cfg, conn, FakeBackend(cfg, "canary", outputs=[SPANISH])) == 0
+    data = json.loads(next(Path(out).glob("*.json")).read_text(encoding="utf-8"))
+    assert [d["reason"] for d in data["degenerate_windows"]] == ["language"]
+    assert data["segments"][0]["degenerate_reason"] == "language"

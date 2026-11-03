@@ -156,7 +156,14 @@ tokens and ran at batch 1, an estimated ~14 h for the pilot set.
   - `repetition`: an n-gram repeats back-to-back (a single word 8 times, longer
     n-grams 4 to 5 times);
   - `token_limit`: the window hit its token limit;
-  - `empty`: no text came back.
+  - `empty`: no text came back;
+  - `language`: the text does not look like English. Two checks run with no
+    extra dependencies. Text whose letters are mostly non-Latin (Japanese, for
+    example) is flagged. Otherwise, with at least 8 tokens, the text is flagged
+    when fewer than 15% of them are common English function words and Spanish,
+    French, German or Portuguese function words score higher. Granite is
+    multilingual (en, fr, de, es, pt, ja) and its card documents no way to pin
+    the output language. Canary-Qwen is English-only, but it gets the same check.
 
   Its segment carries the optional keys `"degenerate": true` and
   `"degenerate_reason"`. The out-file lists every degenerate window.
@@ -210,7 +217,8 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `--dry-run` | Prints one JSON line per track a real run would process, after the already-done filter and `--limit-tracks`, with its window plan. It reads the DB in a read-only session. It loads no model, decodes no audio and writes nothing. |
 | `--bench` | Use with `--asin X --limit-tracks 1`. Runs the first `--bench-max-sec` of that track once per batch size in `--bench-batches`, then prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path, window_sec, max_sec, results: [{batch_size, batch_size_used, windows, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows}]}}`. No DB writes. It runs the same gaming and stop-file checks as a real run (exit 4 / 5, nothing printed). |
 | `--out-dir` | Where each finished track's JSON goes (plan, segments, metrics, degenerate windows). The default is `PILOT_OUT_DIR`, else `<tempdir>/earmark-asr-pilot-out`. |
-| `--self-check` | Loads the model and transcribes 5 s of silence. It cannot be combined with `--dry-run` or `--bench`. Prints `{backend, model, revision, torch, cuda, vram, output, attn_implementation, ffmpeg, ffprobe}`. Needs no DB. |
+| `--self-check` | Loads the model and transcribes a bundled English clip, decoded through the normal ffmpeg path. It prints one JSON line `{backend, model, revision, torch, cuda, vram, clip, expected, output, wer, max_wer, language_scores, degenerate_reason, passed, attn_implementation, ffmpeg, ffprobe}`. It exits **6** when the transcript is not English, is degenerate, or has a WER above 0.35 against the expected text, and **2** when the clip is missing. Needs no DB. It cannot be combined with `--dry-run` or `--bench`. |
+| `--self-check-audio PATH` | Clip for `--self-check`; the expected text is `PATH` with a `.txt` suffix. Default: `testdata/selfcheck_en.flac` next to `pilot.py`, a 5.9 s LibriSpeech dev-clean utterance under CC BY 4.0 (see `runner/testdata/README.md`). |
 
 ### Environment
 
@@ -227,7 +235,7 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `PILOT_OUT_DIR` | Default out dir when `--out-dir` is not given. |
 | `PILOT_STOP_FILE` | Optional path. If the file exists, the run stops cleanly with exit 5. |
 
-**Exit codes:** `0` ok, `2` config error, `3` some tracks failed, `4` stopped for gaming, `5` stopped by `PILOT_STOP_FILE`.
+**Exit codes:** `0` ok, `2` config error, `3` some tracks failed, `4` stopped for gaming, `5` stopped by `PILOT_STOP_FILE`, `6` `--self-check` transcript wrong or not English.
 
 ### Install layout
 
@@ -235,6 +243,9 @@ The asr_pilot_windows role (homelab-ansible) installs the pilot on desktop-2:
 
 - `C:\Program Files\earmark-asr-pilot\pilot.py`, fetched with a sha256 pin from
   an earmark ref.
+- `testdata\selfcheck_en.flac` and `selfcheck_en.txt` next to it, pinned the same
+  way (sha256 in `runner/testdata/README.md`). They are needed by `--self-check`;
+  without them it exits 2.
 - Two venvs: `...\venv-granite` (`requirements-pilot-granite.txt`) and
   `...\venv-canary` (`requirements-pilot-canary.txt`).
 - Data under `C:\ProgramData\earmark-asr-pilot\{hf,out,logs}`, plus its own
