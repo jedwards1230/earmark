@@ -9,22 +9,26 @@ embeddings: the only write is one INSERT (plus a DELETE of the same key under
 --force) per finished track, in one transaction. A track that does not finish
 writes nothing.
 
-Backends (ONLY these two):
-  granite  ibm-granite/granite-speech-4.1-2b-plus via transformers (>=5.8),
-           bf16, timestamp prompt -> words WITH start/end (lowercase, no
-           punctuation, like parakeet).
-  canary   nvidia/canary-qwen-2.5b via NeMo SALM (speechlm2), <=40 s windows,
-           NO timestamps -> one segment per window, words without start/end;
-           casing and punctuation kept verbatim.
+Backends (ONLY these two). Both are window-level text: one segment per window,
+words without start/end, has_word_times=false, casing and punctuation verbatim.
+The asr_vote step aligns that text against the production (parakeet) word times.
+  granite  ibm-granite/granite-speech-4.1-2b (base) via transformers (>=5.8),
+           bf16, plain ASR prompt with punctuation and capitalization.
+  canary   nvidia/canary-qwen-2.5b via NeMo SALM (speechlm2), <=40 s windows.
+
+Windows of a track, and across tracks, are transcribed in batches
+(--batch-size); a CUDA OOM halves the batch and retries it.
 
 This file is self-contained: it does NOT import runner.py (importing runner.py
 has side effects — required DATABASE_URL, signal handlers). The few helpers it
-needs (books path re-rooting, segmenting) are copied and kept small.
+needs (books path re-rooting) are copied and kept small.
 
 CLI:
     python pilot.py --backend {granite,canary} --asin A1,A2 [--scope full|findings]
                     [--limit-tracks N] [--track-limit-per-book N] [--force]
+                    [--batch-size N] [--repetition-penalty P]
                     [--dry-run] [--out-dir DIR] [--arbiter-url URL] [--self-check]
+                    [--bench [--bench-batches 1,8,16,32] [--bench-max-sec S]]
 
 Environment:
     DATABASE_URL          required (except --self-check). earmark Postgres DSN.
@@ -36,11 +40,11 @@ Environment:
     BOOKS_PATH_ENCODING   as runner.py: none | sfm.
     FFMPEG_BIN            default "ffmpeg" (runner.py resolves ffmpeg from PATH).
     FFPROBE_BIN           default "ffprobe" (only --self-check uses it).
-    PILOT_WINDOW_SEC      target window; granite default 90 (hard max 210),
+    PILOT_WINDOW_SEC      target window; granite default 240 (hard max 540),
                           canary default 38 (hard max 40).
     PILOT_DEVICE          default cuda.
-    PILOT_STOP_FILE       optional path; if it exists (checked before each track and
-                          window) the run stops cleanly with exit 5.
+    PILOT_STOP_FILE       optional path; if it exists (checked before each track,
+                          decode chunk and batch) the run stops cleanly with exit 5.
     PILOT_OUT_DIR         per-track JSON dir when --out-dir is not given
                           (default <tempdir>/earmark-asr-pilot-out).
 
@@ -54,11 +58,11 @@ import argparse
 import bisect
 import contextlib
 import hashlib
+import importlib.util
 import json
 import logging
 import math
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -66,7 +70,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -85,51 +89,41 @@ BACKENDS = ("granite", "canary")
 SCOPES = ("full", "findings")
 
 DEFAULT_MODEL_IDS: dict[str, str] = {
-    "granite": "ibm-granite/granite-speech-4.1-2b-plus",
+    "granite": "ibm-granite/granite-speech-4.1-2b",
     "canary": "nvidia/canary-qwen-2.5b",
 }
 # Target window length (s) and the hard maximum no window may exceed.
-# granite: the card says timestamps are reliable up to 3.5 min; canary: trained
-# on <=40 s audio (1024-token sequence cap).
-DEFAULT_WINDOW_SEC: dict[str, float] = {"granite": 90.0, "canary": 38.0}
-HARD_MAX_WINDOW_SEC: dict[str, float] = {"granite": 210.0, "canary": 40.0}
+# granite: the 4.1 family is evaluated up to 9 min per segment for plain ASR;
+# canary: trained on <=40 s audio (1024-token sequence cap).
+DEFAULT_WINDOW_SEC: dict[str, float] = {"granite": 240.0, "canary": 38.0}
+HARD_MAX_WINDOW_SEC: dict[str, float] = {"granite": 540.0, "canary": 40.0}
 MIN_WINDOW_SEC = 5.0
+DEFAULT_BATCH_SIZE: dict[str, int] = {"granite": 16, "canary": 32}
+DEFAULT_BENCH_BATCHES = "1,8,16,32"
+DEFAULT_BENCH_MAX_SEC = 1800.0
 
 # Cut search: the largest inter-word gap inside the last 25% of the target window.
 CUT_SEARCH_FRACTION = 0.25
 # findings scope: pad each held finding's chunk span by this much each side.
 FINDING_PAD_SEC = 5.0
 
-# Segmenting (same defaults as runner.py's ASR_SEGMENT_* geometry).
-SEGMENT_GAP_SECONDS = 0.6
-SEGMENT_MAX_SECONDS = 30.0
-SEGMENT_MAX_WORDS = 80
-
-# Granite generation (model card, granite-speech-4.1-2b-plus).
-GRANITE_SYSTEM_PROMPT = (
-    "Knowledge Cutoff Date: April 2024.\nToday's Date: December 19, 2024.\n"
-    "You are Granite, developed by IBM. You are a helpful AI assistant"
+# Granite generation (model card, granite-speech-4.1-2b "Preferred prompt by task").
+GRANITE_PROMPT = (
+    "<|audio|>transcribe the speech with proper punctuation and capitalization."
 )
-GRANITE_TIMESTAMP_PROMPT = (
-    "<|audio|> Timestamps: Transcribe the speech. After each word, add a "
-    "timestamp tag showing the end time in centiseconds, e.g. hello [T:45] world [T:82]"
-)
-GRANITE_TOKENS_PER_SECOND = 48
-GRANITE_TOKEN_MARGIN = 1.1
-GRANITE_MIN_NEW_TOKENS = 256
-GRANITE_REPETITION_PENALTY = 2.0
-GRANITE_NUM_BEAMS = 1
-GRANITE_TS_WRAP_SEC = 10.0  # [T:N] keeps only the last 3 centisecond digits
-GRANITE_SILENCE_TOKEN = "_"
-
+GRANITE_TOKENS_PER_SECOND = 12
+GRANITE_MIN_NEW_TOKENS = 64
 # Canary generation (model card, canary-qwen-2.5b).
 CANARY_PROMPT_TEMPLATE = "Transcribe the following: {tag}"
 CANARY_TOKENS_PER_SECOND = 8
 CANARY_MIN_NEW_TOKENS = 128
+# max_new_tokens = max(min, tokens/s x longest window in the batch x margin).
+TOKEN_MARGIN = 1.25
 
 # Repetition-loop guard: an n-gram repeated back-to-back this many times marks
 # the window degenerate (single words need a longer run: "no, no, no" is speech).
 REPEAT_MIN_RUNS: dict[int, int] = {1: 8, 2: 5, 3: 4, 4: 4, 5: 4, 6: 4}
+GRANITE_SILENCE_TOKEN = "_"  # never emitted in plain mode; kept out of the guard
 
 ARBITER_TIMEOUT_SEC = 5.0
 ARBITER_RETRY_DELAY_SEC = 2.0  # one retry of an unreadable /status
@@ -138,9 +132,11 @@ ARBITER_BUSY_STATES = frozenset({"gaming", "evicting"})
 MAX_TRACK_ROWS = 5000  # bound on the track-list query
 MAX_FINDING_SPANS = 5000  # bound on the per-track findings query
 
-# Audio is decoded per group of contiguous windows of at most this many seconds
-# (~115 MB of float32 at 16 kHz), so memory is bounded whatever the track length.
-DECODE_CHUNK_SEC = 1800.0
+# Audio is decoded per group of contiguous windows of at most
+# max(DECODE_CHUNK_MIN_SEC, batch_size x window_sec) seconds, so one chunk holds
+# a full batch and memory stays bounded whatever the track length (granite
+# 16 x 240 s = 64 min ~ 250 MB of float32 at 16 kHz).
+DECODE_CHUNK_MIN_SEC = 1800.0
 
 
 class ConfigError(Exception):
@@ -172,6 +168,11 @@ class Config:
     out_dir: Path | None = None
     arbiter_url: str | None = None
     self_check: bool = False
+    bench: bool = False
+    bench_batches: list[int] = field(default_factory=lambda: [1, 8, 16, 32])
+    bench_max_sec: float = DEFAULT_BENCH_MAX_SEC
+    batch_size: int = 1
+    repetition_penalty: float = 1.0
     stop_file: Path | None = None
     database_url: str = ""
     model_id: str = ""
@@ -187,12 +188,26 @@ class Config:
     )
     books_path_encoding: str = "none"
 
+    @property
+    def decode_chunk_sec(self) -> float:
+        return max(DECODE_CHUNK_MIN_SEC, self.batch_size * self.window_sec)
+
 
 def _positive_int(raw: str) -> int:
     value = int(raw)
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
     return value
+
+
+def _batch_list(raw: str) -> list[int]:
+    try:
+        values = [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a list of integers: {raw!r}") from exc
+    if not values or any(v < 1 for v in values):
+        raise argparse.ArgumentTypeError(f"batch sizes must be >= 1: {raw!r}")
+    return values
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -208,26 +223,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--scope",
         choices=SCOPES,
         default="full",
-        help="full: whole tracks; findings: only windows around held findings",
+        help="full (default): whole tracks; findings: only windows around held findings",
     )
     p.add_argument("--limit-tracks", type=_positive_int, default=None)
     p.add_argument("--track-limit-per-book", type=_positive_int, default=None)
     p.add_argument("--force", action="store_true", help="re-run tracks already stored")
     p.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=None,
+        help="windows per generate call (granite 16, canary 32)",
+    )
+    p.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.0,
+        help="granite generate() repetition_penalty (default 1.0 = off)",
+    )
+    p.add_argument(
         "--dry-run", action="store_true", help="print the plan; no model, no writes"
     )
     p.add_argument(
-        "--out-dir", type=Path, default=None, help="also write per-track JSON here"
+        "--out-dir", type=Path, default=None, help="per-track JSON directory"
     )
     p.add_argument(
         "--arbiter-url",
         default=None,
-        help="gpu-arbiter base URL (checked between windows)",
+        help="gpu-arbiter base URL (checked between batches)",
     )
     p.add_argument(
         "--self-check",
         action="store_true",
         help="load the model, transcribe 5 s of silence",
+    )
+    p.add_argument(
+        "--bench",
+        action="store_true",
+        help="sweep --bench-batches on one track; print JSON, no DB writes",
+    )
+    p.add_argument("--bench-batches", type=_batch_list, default=DEFAULT_BENCH_BATCHES)
+    p.add_argument(
+        "--bench-max-sec",
+        type=float,
+        default=DEFAULT_BENCH_MAX_SEC,
+        help="bench at most this much audio of the track (default 1800)",
     )
     return p
 
@@ -279,6 +318,17 @@ def load_config(
             f"PILOT_WINDOW_SEC={window} out of range for {backend}: "
             f"[{MIN_WINDOW_SEC}, {hard_max}]"
         )
+    if not math.isfinite(args.repetition_penalty) or args.repetition_penalty <= 0:
+        raise ConfigError(
+            f"--repetition-penalty must be > 0: {args.repetition_penalty}"
+        )
+    if args.bench and args.dry_run:
+        raise ConfigError("--bench and --dry-run are exclusive")
+    bench_batches = (
+        args.bench_batches
+        if isinstance(args.bench_batches, list)
+        else _batch_list(args.bench_batches)
+    )
 
     mount_raw = env.get("BOOKS_MOUNT", "/mnt/media/books")
     return Config(
@@ -296,6 +346,11 @@ def load_config(
         ),
         arbiter_url=(args.arbiter_url or "").rstrip("/") or None,
         self_check=args.self_check,
+        bench=args.bench,
+        bench_batches=bench_batches,
+        bench_max_sec=args.bench_max_sec,
+        batch_size=args.batch_size or DEFAULT_BATCH_SIZE[backend],
+        repetition_penalty=args.repetition_penalty,
         stop_file=Path(env["PILOT_STOP_FILE"].strip())
         if env.get("PILOT_STOP_FILE", "").strip()
         else None,
@@ -549,80 +604,6 @@ def production_word_spans(segments: Any) -> list[Span]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Output parsing / segmenting (pure)
-# ---------------------------------------------------------------------------
-
-_TS_SPLIT = re.compile(r"\[T:(\d+)\]")
-
-
-def parse_granite_timestamps(
-    text: str, window_start: float, window_len: float
-) -> list[dict[str, Any]]:
-    """Parse Granite `word [T:N]` output into absolute-time words.
-
-    N is the word END time in centiseconds modulo 1000 (it wraps every 10 s). A
-    drop of more than half the wrap period is a rollover (add 10 s); a smaller
-    backwards step is timestamp jitter and is clamped to the previous end. `_`
-    marks silence: dropped from the output but it advances the clock. A word's
-    start is the previous token's end (the window start for the first). Several
-    words before one tag share that interval evenly; trailing untagged words run
-    to the window end. Times are clamped to the window and offset by its start.
-    """
-    parts = _TS_SPLIT.split(text or "")
-    words: list[dict[str, Any]] = []
-    last_end = 0.0
-    offset = 0.0
-
-    def emit(chunk: str, t0: float, t1: float) -> None:
-        tokens = [t for t in chunk.split() if t != GRANITE_SILENCE_TOKEN]
-        if not tokens:
-            return
-        step = (t1 - t0) / len(tokens)
-        for i, tok in enumerate(tokens):
-            ws = t0 + i * step
-            we = t0 + (i + 1) * step
-            words.append(
-                {
-                    "word": tok,
-                    "start": round(window_start + ws, 3),
-                    "end": round(window_start + we, 3),
-                    "score": None,
-                    "speaker": None,
-                }
-            )
-
-    for chunk, ts in zip(parts[0::2], parts[1::2]):
-        raw = int(ts) / 100.0
-        while last_end - (raw + offset) > GRANITE_TS_WRAP_SEC / 2.0:
-            offset += GRANITE_TS_WRAP_SEC
-        end = min(max(raw + offset, last_end), window_len)
-        start = min(last_end, end)
-        emit(chunk, start, end)
-        last_end = max(last_end, end)
-    if len(parts) % 2 == 1 and parts[-1].strip():
-        emit(parts[-1], last_end, max(last_end, window_len))
-    return words
-
-
-def granite_degenerate_reason(text: str) -> str | None:
-    """Why a Granite timestamp-mode output is unusable, or None.
-
-    `no_timestamps`: text but no [T:N] tag, so every word time is a guess.
-    `no_words`: only tags and/or `_` silence tokens.
-    """
-    stripped = _TS_SPLIT.sub(" ", text or "")
-    real = [t for t in stripped.split() if t != GRANITE_SILENCE_TOKEN]
-    has_tags = _TS_SPLIT.search(text or "") is not None
-    if real and not has_tags:
-        return "no_timestamps"
-    if has_tags and not real:
-        return "no_words"
-    if not real and (text or "").strip():
-        return "no_words"  # only `_` tokens
-    return None
-
-
 def has_repetition_loop(tokens: Sequence[str]) -> bool:
     """True when some n-gram repeats back-to-back REPEAT_MIN_RUNS[n] times."""
     toks = [
@@ -644,46 +625,15 @@ def has_repetition_loop(tokens: Sequence[str]) -> bool:
     return False
 
 
-def words_to_segments(
-    words: list[dict[str, Any]], first_id: int
-) -> list[dict[str, Any]]:
-    """Group timed words into CONTRACT §1.2.1 segments (gap / duration / word caps)."""
-    segments: list[dict[str, Any]] = []
-    current: list[dict[str, Any]] = []
-
-    def flush() -> None:
-        if current:
-            segments.append(
-                {
-                    "id": first_id + len(segments),
-                    "start": min(w["start"] for w in current),
-                    "end": max(w["end"] for w in current),
-                    "text": " ".join(w["word"] for w in current),
-                    "speaker": None,
-                    "words": list(current),
-                }
-            )
-
-    for w in words:
-        if current:
-            gap = w["start"] - current[-1]["end"]
-            dur = current[-1]["end"] - current[0]["start"]
-            if (
-                gap > SEGMENT_GAP_SECONDS
-                or dur >= SEGMENT_MAX_SECONDS
-                or len(current) >= SEGMENT_MAX_WORDS
-            ):
-                flush()
-                current = []
-        current.append(w)
-    flush()
-    return segments
+# ---------------------------------------------------------------------------
+# Output (pure)
+# ---------------------------------------------------------------------------
 
 
-def canary_segment(
+def window_segment(
     text: str, start: float, end: float, seg_id: int
 ) -> dict[str, Any] | None:
-    """One segment per Canary window; words carry NO start/end keys (no timestamps)."""
+    """One segment per window; words carry NO start/end keys (no timestamps)."""
     text = (text or "").strip()
     if not text:
         return None
@@ -697,203 +647,50 @@ def canary_segment(
     }
 
 
-# ---------------------------------------------------------------------------
-# Backends (heavy imports are lazy: CI and --dry-run never import torch)
-# ---------------------------------------------------------------------------
+def degenerate_reason(text: str, hit_token_limit: bool) -> str | None:
+    """Why a window's output is unusable, or None."""
+    if not (text or "").strip():
+        return "empty"
+    if hit_token_limit:
+        return "token_limit"
+    if has_repetition_loop(text.split()):
+        return "repetition"
+    return None
 
 
-@dataclass
-class WindowResult:
-    text: str
-    words: list[dict[str, Any]]
-    hit_token_limit: bool = False
-    degenerate_reason: str | None = None
+def max_new_tokens(
+    tokens_per_second: float, minimum: int, window_lens: Sequence[float]
+) -> int:
+    """Generation cap for a batch: sized by its LONGEST window."""
+    longest = max(window_lens, default=0.0)
+    return max(minimum, int(tokens_per_second * longest * TOKEN_MARGIN))
 
 
-def granite_window_result(
-    text: str, window_start: float, window_len: float, hit_token_limit: bool = False
-) -> WindowResult:
-    """Parse one Granite window's output into a WindowResult (pure; shared by tests)."""
-    return WindowResult(
-        text=text,
-        words=parse_granite_timestamps(text, window_start, window_len),
-        hit_token_limit=hit_token_limit,
-        degenerate_reason=granite_degenerate_reason(text),
-    )
+def pad_audios(audios: Sequence[Any]) -> tuple[list[Any], list[int]]:
+    """Zero-pad windows to the longest one; returns (padded rows, original lengths).
+
+    Works on numpy arrays (np.pad) or plain sequences (tests).
+    """
+    lens = [len(a) for a in audios]
+    longest = max(lens, default=0)
+    rows: list[Any] = []
+    for a, n in zip(audios, lens):
+        if hasattr(a, "dtype"):
+            import numpy as np
+
+            rows.append(np.pad(a, (0, longest - n)))
+        else:
+            rows.append(list(a) + [0.0] * (longest - n))
+    return rows, lens
 
 
-class Backend:
-    name = ""
-    has_word_times = False
-
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self.torch: Any = None
-
-    def load(self) -> None:  # pragma: no cover - needs the GPU stack
-        raise NotImplementedError
-
-    def transcribe_window(
-        self, audio: Any, window_start: float
-    ) -> WindowResult:  # pragma: no cover
-        raise NotImplementedError
-
-    def reset_peak(self) -> None:
-        if self.torch is not None and self.torch.cuda.is_available():
-            self.torch.cuda.reset_peak_memory_stats()
-
-    def peak_mib(self) -> tuple[int | None, int | None]:
-        if self.torch is None or not self.torch.cuda.is_available():
-            return None, None
-        mib = 1024 * 1024
-        return (
-            int(self.torch.cuda.max_memory_allocated() // mib),
-            int(self.torch.cuda.max_memory_reserved() // mib),
-        )
-
-    def info(self) -> dict[str, Any]:
-        torch = self.torch
-        cuda = bool(torch is not None and torch.cuda.is_available())
-        vram: dict[str, Any] = {}
-        if cuda:
-            alloc, reserved = self.peak_mib()
-            vram = {
-                "device": torch.cuda.get_device_name(0),
-                "total_mib": int(
-                    torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
-                ),
-                "peak_allocated_mib": alloc,
-                "peak_reserved_mib": reserved,
-            }
-        return {
-            "backend": self.name,
-            "model": self.cfg.model_id,
-            "revision": self.cfg.model_revision,
-            "torch": getattr(torch, "__version__", None),
-            "cuda": getattr(getattr(torch, "version", None), "cuda", None)
-            if cuda
-            else None,
-            "vram": vram,
-        }
+def generated_rows(output: Sequence[Sequence[int]], input_len: int) -> list[list[int]]:
+    """Per-row new tokens of a left-padded batch generate(): everything past input_len."""
+    return [list(row[input_len:]) for row in output]
 
 
-class GraniteBackend(Backend):
-    """Granite Speech 4.1 2B-plus, timestamp mode (usage per the HF model card)."""
-
-    name = "granite"
-    has_word_times = True
-
-    def load(self) -> None:  # pragma: no cover - needs the GPU stack
-        import torch
-        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-
-        self.torch = torch
-        self.processor = AutoProcessor.from_pretrained(
-            self.cfg.model_id, revision=self.cfg.model_revision
-        )
-        self.tokenizer = self.processor.tokenizer
-        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.cfg.model_id,
-            revision=self.cfg.model_revision,
-            device_map=self.cfg.device,
-            dtype=torch.bfloat16,
-        )
-        self.model.eval()
-
-    def max_new_tokens(self, window_len: float) -> int:
-        return max(
-            GRANITE_MIN_NEW_TOKENS,
-            int(GRANITE_TOKENS_PER_SECOND * window_len * GRANITE_TOKEN_MARGIN),
-        )
-
-    def transcribe_window(
-        self, audio: Any, window_start: float
-    ) -> WindowResult:  # pragma: no cover
-        torch = self.torch
-        window_len = len(audio) / SAMPLE_RATE
-        chat = [
-            {"role": "system", "content": GRANITE_SYSTEM_PROMPT},
-            {"role": "user", "content": GRANITE_TIMESTAMP_PROMPT},
-        ]
-        prompt = self.tokenizer.apply_chat_template(
-            chat, tokenize=False, add_generation_prompt=True
-        )
-        wav = torch.from_numpy(audio).unsqueeze(0)
-        inputs = self.processor(
-            prompt, wav, device=self.cfg.device, return_tensors="pt"
-        ).to(self.cfg.device)
-        limit = self.max_new_tokens(window_len)
-        with torch.inference_mode():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=limit,
-                do_sample=False,
-                num_beams=GRANITE_NUM_BEAMS,
-                repetition_penalty=GRANITE_REPETITION_PENALTY,
-            )
-        new_tokens = out[0, inputs["input_ids"].shape[-1] :]
-        text = self.tokenizer.decode(
-            new_tokens, add_special_tokens=False, skip_special_tokens=True
-        )
-        return granite_window_result(
-            text, window_start, window_len, len(new_tokens) >= limit
-        )
-
-
-class CanaryBackend(Backend):
-    """Canary-Qwen 2.5B via NeMo SALM (usage per the HF model card / SALM.generate docstring)."""
-
-    name = "canary"
-    has_word_times = False
-
-    def load(self) -> None:  # pragma: no cover - needs the GPU stack
-        import torch
-        from huggingface_hub import snapshot_download
-        from nemo.collections.speechlm2.models import SALM
-
-        self.torch = torch
-        # snapshot_download pins the exact HF revision; SALM then loads the local dir.
-        local = snapshot_download(self.cfg.model_id, revision=self.cfg.model_revision)
-        # Weights stay in the checkpoint dtype (the card loads it as-is); bf16
-        # compute comes from autocast in transcribe_window, so the float32 audio
-        # tensor SALM.generate expects still matches the perception module.
-        self.model = SALM.from_pretrained(local).to(self.cfg.device).eval()
-
-    def transcribe_window(
-        self, audio: Any, window_start: float
-    ) -> WindowResult:  # pragma: no cover
-        torch = self.torch
-        window_len = len(audio) / SAMPLE_RATE
-        prompt = CANARY_PROMPT_TEMPLATE.format(tag=self.model.audio_locator_tag)
-        audios = torch.from_numpy(audio).unsqueeze(0).to(self.cfg.device)
-        audio_lens = torch.tensor(
-            [audios.shape[-1]], dtype=torch.int64, device=self.cfg.device
-        )
-        limit = max(CANARY_MIN_NEW_TOKENS, int(CANARY_TOKENS_PER_SECOND * window_len))
-        autocast = (
-            torch.autocast("cuda", dtype=torch.bfloat16)
-            if str(self.cfg.device).startswith("cuda")
-            else contextlib.nullcontext()
-        )
-        with torch.inference_mode(), autocast:
-            ids = self.model.generate(
-                prompts=[[{"role": "user", "content": prompt}]],
-                audios=audios,
-                audio_lens=audio_lens,
-                max_new_tokens=limit,
-            )
-        text = self.model.tokenizer.ids_to_text(ids[0].cpu()).strip()
-        return WindowResult(
-            text=text, words=[], hit_token_limit=int(ids.shape[-1]) >= limit
-        )
-
-
-def make_backend(cfg: Config) -> Backend:
-    if cfg.backend == "granite":
-        return GraniteBackend(cfg)
-    if cfg.backend == "canary":
-        return CanaryBackend(cfg)
-    raise ConfigError(f"unknown backend {cfg.backend!r}")
+def real_token_count(row: Sequence[int], pad_ids: set[int]) -> int:
+    return sum(1 for t in row if t not in pad_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +758,7 @@ def slice_audio(audio: Any, start: float, end: float) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# gpu-arbiter
+# gpu-arbiter and stop file
 # ---------------------------------------------------------------------------
 
 
@@ -1224,83 +1021,6 @@ def write_result(conn: Any, cfg: Config, track: Track, result: dict[str, Any]) -
         raise
 
 
-# ---------------------------------------------------------------------------
-# Per-track pipeline
-# ---------------------------------------------------------------------------
-
-DecodeFn = Callable[[Config, Path, float, float], Any]
-
-
-def transcribe_track(
-    cfg: Config,
-    backend: Backend,
-    plan: Sequence[Span],
-    decode_chunk: Callable[[float, float], Any],
-    gaming_check: Callable[[], None],
-) -> dict[str, Any]:
-    """Transcribe every planned window; raises GamingStop between windows.
-
-    Audio is decoded per group of contiguous windows (<= DECODE_CHUNK_SEC), so
-    only one chunk is in memory at a time. `decode_sec` is timed separately and
-    `wall_sec` covers transcription only.
-    """
-    segments: list[dict[str, Any]] = []
-    degenerate: list[dict[str, Any]] = []
-    audio_sec = decode_sec = wall_sec = 0.0
-    idx = 0
-    for group in group_windows(plan, DECODE_CHUNK_SEC):
-        gaming_check()
-        g0, g1 = group[0][0], group[-1][1]
-        t0 = time.monotonic()
-        audio = decode_chunk(g0, g1)
-        decode_sec += time.monotonic() - t0
-        for ws, we in group:
-            gaming_check()
-            window = slice_audio(audio, ws - g0, we - g0)
-            t0 = time.monotonic()
-            res = backend.transcribe_window(window, ws)
-            wall_sec += time.monotonic() - t0
-            audio_sec += we - ws
-            tokens = (
-                [w["word"] for w in res.words]
-                if res.words
-                else (res.text or "").split()
-            )
-            reason = res.degenerate_reason
-            if reason is None and res.hit_token_limit:
-                reason = "token_limit"
-            if reason is None and has_repetition_loop(tokens):
-                reason = "repetition"
-            if backend.has_word_times:
-                new = words_to_segments(res.words, len(segments))
-            else:
-                seg = canary_segment(res.text, ws, we, len(segments))
-                new = [seg] if seg else []
-            if reason:
-                degenerate.append(
-                    {"window": idx, "start": ws, "end": we, "reason": reason}
-                )
-                log.warning(
-                    "window %d [%.1f, %.1f] degenerate: %s", idx, ws, we, reason
-                )
-                for s in new:  # optional markers; §1.2.1 readers ignore them
-                    s["degenerate"] = True
-                    s["degenerate_reason"] = reason
-            segments.extend(new)
-            idx += 1
-        del audio
-    return {
-        "segments": segments,
-        "raw_text": " ".join(s["text"] for s in segments),
-        "has_word_times": backend.has_word_times,
-        "audio_sec": round(audio_sec, 3),
-        "decode_sec": round(decode_sec, 3),
-        "wall_sec": round(wall_sec, 3),
-        "rtfx": round(audio_sec / wall_sec, 3) if wall_sec > 0 else None,
-        "degenerate_windows": degenerate,
-    }
-
-
 def _out_file(cfg: Config, track: Track) -> Path | None:
     if cfg.out_dir is None:
         return None
@@ -1308,66 +1028,483 @@ def _out_file(cfg: Config, track: Track) -> Path | None:
     return cfg.out_dir / f"{track.asin}-{digest}-{cfg.backend}-{cfg.scope}.json"
 
 
-def process_track(
-    db: DbSession,
-    cfg: Config,
-    backend: Backend,
-    track: Track,
-    decode: DecodeFn = decode_audio,
-    gaming_check: Callable[[], None] | None = None,
-) -> str:
-    """Run one track end to end. Returns 'done' or 'skipped'; raises on failure/GamingStop.
+# ---------------------------------------------------------------------------
+# Backends (heavy imports are lazy: CI and --dry-run never import torch)
+# ---------------------------------------------------------------------------
 
-    The per-track JSON goes to the out dir BEFORE the DB write, so a failed
-    write never loses the GPU work; the connection is checked (and reopened if
-    it died during the track) right before the write.
+
+@dataclass
+class WindowResult:
+    text: str
+    hit_token_limit: bool = False
+
+
+class Backend:
+    name = ""
+    has_word_times = False  # both backends: window-level text only
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.torch: Any = None
+
+    def load(self) -> None:  # pragma: no cover - needs the GPU stack
+        raise NotImplementedError
+
+    def transcribe_batch(
+        self, audios: Sequence[Any]
+    ) -> list[WindowResult]:  # pragma: no cover
+        raise NotImplementedError
+
+    def is_oom(self, exc: BaseException) -> bool:
+        oom = getattr(getattr(self.torch, "cuda", None), "OutOfMemoryError", None)
+        if oom is not None and isinstance(exc, oom):
+            return True
+        return "out of memory" in str(exc).lower()
+
+    def clear_cache(self) -> None:
+        if self.torch is not None and self.torch.cuda.is_available():
+            self.torch.cuda.empty_cache()
+
+    def reset_peak(self) -> None:
+        if self.torch is not None and self.torch.cuda.is_available():
+            self.torch.cuda.reset_peak_memory_stats()
+
+    def peak_mib(self) -> tuple[int | None, int | None]:
+        if self.torch is None or not self.torch.cuda.is_available():
+            return None, None
+        mib = 1024 * 1024
+        return (
+            int(self.torch.cuda.max_memory_allocated() // mib),
+            int(self.torch.cuda.max_memory_reserved() // mib),
+        )
+
+    def info(self) -> dict[str, Any]:
+        torch = self.torch
+        cuda = bool(torch is not None and torch.cuda.is_available())
+        vram: dict[str, Any] = {}
+        if cuda:
+            alloc, reserved = self.peak_mib()
+            vram = {
+                "device": torch.cuda.get_device_name(0),
+                "total_mib": int(
+                    torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+                ),
+                "peak_allocated_mib": alloc,
+                "peak_reserved_mib": reserved,
+            }
+        return {
+            "backend": self.name,
+            "model": self.cfg.model_id,
+            "revision": self.cfg.model_revision,
+            "torch": getattr(torch, "__version__", None),
+            "cuda": getattr(getattr(torch, "version", None), "cuda", None)
+            if cuda
+            else None,
+            "vram": vram,
+        }
+
+
+class GraniteBackend(Backend):
+    """Granite Speech 4.1 2B (base), plain ASR with punctuation (usage per the HF card)."""
+
+    name = "granite"
+
+    def load(self) -> None:  # pragma: no cover - needs the GPU stack
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+        self.torch = torch
+        self.processor = AutoProcessor.from_pretrained(
+            self.cfg.model_id, revision=self.cfg.model_revision
+        )
+        self.tokenizer = self.processor.tokenizer
+        self.tokenizer.padding_side = "left"  # batched generate needs left padding
+        attn = (
+            "flash_attention_2"
+            if importlib.util.find_spec("flash_attn") is not None
+            else "sdpa"
+        )
+        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            self.cfg.model_id,
+            revision=self.cfg.model_revision,
+            device_map=self.cfg.device,
+            dtype=torch.bfloat16,
+            attn_implementation=attn,
+        )
+        self.model.eval()
+        self.attn_implementation = attn
+        chat = [{"role": "user", "content": GRANITE_PROMPT}]
+        self.prompt = self.tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
+        )
+
+    def transcribe_batch(
+        self, audios: Sequence[Any]
+    ) -> list[WindowResult]:  # pragma: no cover
+        torch = self.torch
+        rows, lens = pad_audios(audios)
+        wavs = torch.stack([torch.from_numpy(r) for r in rows])
+        inputs = self.processor(
+            [self.prompt] * len(rows),
+            wavs,
+            device=self.cfg.device,
+            return_tensors="pt",
+            padding=True,
+        ).to(self.cfg.device)
+        limit = max_new_tokens(
+            GRANITE_TOKENS_PER_SECOND,
+            GRANITE_MIN_NEW_TOKENS,
+            [n / SAMPLE_RATE for n in lens],
+        )
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=limit,
+                do_sample=False,
+                num_beams=1,
+                repetition_penalty=self.cfg.repetition_penalty,
+            )
+        new = generated_rows(out.tolist(), inputs["input_ids"].shape[-1])
+        pad = {
+            t
+            for t in (self.tokenizer.pad_token_id, self.tokenizer.eos_token_id)
+            if t is not None
+        }
+        texts = self.tokenizer.batch_decode(
+            new, add_special_tokens=False, skip_special_tokens=True
+        )
+        return [
+            WindowResult(
+                text=t.strip(), hit_token_limit=real_token_count(r, pad) >= limit
+            )
+            for t, r in zip(texts, new)
+        ]
+
+
+class CanaryBackend(Backend):
+    """Canary-Qwen 2.5B via NeMo SALM (usage per the HF card / SALM.generate docstring)."""
+
+    name = "canary"
+
+    def load(self) -> None:  # pragma: no cover - needs the GPU stack
+        import torch
+        from huggingface_hub import snapshot_download
+        from nemo.collections.speechlm2.models import SALM
+
+        self.torch = torch
+        # snapshot_download pins the exact HF revision; SALM then loads the local dir.
+        local = snapshot_download(self.cfg.model_id, revision=self.cfg.model_revision)
+        # Weights stay in the checkpoint dtype (the card loads it as-is); bf16
+        # compute comes from autocast in transcribe_batch, so the float32 audio
+        # tensor SALM.generate expects still matches the perception module.
+        self.model = SALM.from_pretrained(local).to(self.cfg.device).eval()
+
+    def transcribe_batch(
+        self, audios: Sequence[Any]
+    ) -> list[WindowResult]:  # pragma: no cover
+        torch = self.torch
+        rows, lens = pad_audios(audios)
+        batch = torch.stack([torch.from_numpy(r) for r in rows]).to(self.cfg.device)
+        audio_lens = torch.tensor(lens, dtype=torch.int64, device=self.cfg.device)
+        prompt = CANARY_PROMPT_TEMPLATE.format(tag=self.model.audio_locator_tag)
+        limit = max_new_tokens(
+            CANARY_TOKENS_PER_SECOND,
+            CANARY_MIN_NEW_TOKENS,
+            [n / SAMPLE_RATE for n in lens],
+        )
+        autocast = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if str(self.cfg.device).startswith("cuda")
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), autocast:
+            ids = self.model.generate(
+                prompts=[[{"role": "user", "content": prompt}]] * len(rows),
+                audios=batch,
+                audio_lens=audio_lens,
+                max_new_tokens=limit,
+            )
+        pad = {
+            t
+            for t in (
+                getattr(self.model, "text_pad_id", None),
+                getattr(self.model.tokenizer, "eos_id", None),
+            )
+            if t is not None
+        }
+        out: list[WindowResult] = []
+        for row in ids.cpu():
+            toks = row.tolist()
+            text = self.model.tokenizer.ids_to_text(
+                [t for t in toks if t not in pad]
+            ).strip()
+            out.append(
+                WindowResult(
+                    text=text, hit_token_limit=real_token_count(toks, pad) >= limit
+                )
+            )
+        return out
+
+
+def make_backend(cfg: Config) -> Backend:
+    if cfg.backend == "granite":
+        return GraniteBackend(cfg)
+    if cfg.backend == "canary":
+        return CanaryBackend(cfg)
+    raise ConfigError(f"unknown backend {cfg.backend!r}")
+
+
+class Batcher:
+    """Runs batches through a backend; a CUDA OOM halves the batch size and retries.
+
+    The halved size persists for the rest of the run (`size`), and the smallest
+    size used is reported per track.
     """
-    plan, _ = track_plan(db.conn, cfg, track)
-    if not plan:
+
+    def __init__(self, backend: Backend, size: int) -> None:
+        self.backend = backend
+        self.size = size
+
+    def run(self, audios: Sequence[Any]) -> tuple[list[WindowResult], int]:
+        """Transcribe all `audios`; returns (results, batch size in effect at the end)."""
+        results: list[WindowResult] = []
+        i = 0
+        while i < len(audios):
+            part = audios[i : i + self.size]
+            try:
+                got = self.backend.transcribe_batch(part)
+            except Exception as exc:
+                if self.size > 1 and self.backend.is_oom(exc):
+                    self.backend.clear_cache()
+                    self.size = max(1, self.size // 2)
+                    log.warning(
+                        "CUDA OOM; batch size halved to %d, retrying", self.size
+                    )
+                    continue
+                raise
+            if len(got) != len(part):
+                raise RuntimeError(
+                    f"backend returned {len(got)} results for {len(part)} windows"
+                )
+            results.extend(got)
+            i += len(part)
+        return results, self.size
+
+
+# ---------------------------------------------------------------------------
+# Pipeline: windows of a track — and across tracks — go through shared batches
+# ---------------------------------------------------------------------------
+
+DecodeFn = Callable[[Config, Path, float, float], Any]
+
+
+@dataclass
+class TrackState:
+    track: Track
+    plan: list[Span]
+    texts: list[WindowResult | None]
+    left: int
+    audio_sec: float = 0.0
+    decode_sec: float = 0.0
+    wall_sec: float = 0.0
+    peak_alloc: int | None = None
+    peak_reserved: int | None = None
+    batch_size_used: int | None = None
+    failed: bool = False
+
+
+@dataclass
+class WindowItem:
+    state: TrackState
+    idx: int
+    start: float
+    end: float
+    audio: Any
+
+
+def _max_opt(a: int | None, b: int | None) -> int | None:
+    return b if a is None else a if b is None else max(a, b)
+
+
+def build_result(cfg: Config, st: TrackState) -> dict[str, Any]:
+    segments: list[dict[str, Any]] = []
+    degenerate: list[dict[str, Any]] = []
+    for idx, ((ws, we), res) in enumerate(zip(st.plan, st.texts)):
+        assert res is not None
+        reason = degenerate_reason(res.text, res.hit_token_limit)
+        seg = window_segment(res.text, ws, we, len(segments))
+        if reason:
+            degenerate.append({"window": idx, "start": ws, "end": we, "reason": reason})
+            if seg:  # optional markers; §1.2.1 readers ignore them
+                seg["degenerate"] = True
+                seg["degenerate_reason"] = reason
+        if seg:
+            segments.append(seg)
+    return {
+        "segments": segments,
+        "raw_text": " ".join(s["text"] for s in segments),
+        "has_word_times": False,
+        "windows": len(st.plan),
+        "audio_sec": round(st.audio_sec, 3),
+        "decode_sec": round(st.decode_sec, 3),
+        "wall_sec": round(st.wall_sec, 3),
+        "rtfx": round(st.audio_sec / st.wall_sec, 3) if st.wall_sec > 0 else None,
+        "peak_vram_mib": st.peak_alloc,
+        "peak_reserved_mib": st.peak_reserved,
+        "batch_size": cfg.batch_size,
+        "batch_size_used": st.batch_size_used,
+        "degenerate_windows": degenerate,
+    }
+
+
+class Pipeline:
+    def __init__(
+        self,
+        db: DbSession,
+        cfg: Config,
+        backend: Backend,
+        decode: DecodeFn,
+        check: Callable[[], None],
+        write: bool = True,
+    ) -> None:
+        self.db = db
+        self.cfg = cfg
+        self.backend = backend
+        self.decode = decode
+        self.check = check
+        self.write = write
+        self.batcher = Batcher(backend, cfg.batch_size)
+        self.failed: list[str] = []
+        self.done: list[dict[str, Any]] = []
+
+    def _fail(self, st: TrackState | None, track: Track) -> None:
+        log.exception("track failed: %s", track.file_path)
+        if st is not None:
+            st.failed = True
+        self.failed.append(track.file_path)
+        with contextlib.suppress(Exception):
+            self.db.conn.rollback()
+
+    def windows(
+        self, tracks: Sequence[Track], max_sec: float | None = None
+    ) -> Iterator[WindowItem]:
+        """Yield every planned window (a writable audio copy each), one decode chunk at a time."""
+        for track in tracks:
+            st: TrackState | None = None
+            try:
+                plan, _ = track_plan(self.db.conn, self.cfg, track)
+                if max_sec is not None:
+                    plan = [w for w in plan if w[1] <= max_sec] or plan[:1]
+                if not plan:
+                    log.info(
+                        "skip %s: nothing to transcribe (scope=%s)",
+                        track.file_path,
+                        self.cfg.scope,
+                    )
+                    continue
+                self.check()
+                path = resolve_audio_path(self.cfg, track.file_path)
+                st = TrackState(track, plan, [None] * len(plan), len(plan))
+                idx = 0
+                for group in group_windows(plan, self.cfg.decode_chunk_sec):
+                    self.check()
+                    g0, g1 = group[0][0], group[-1][1]
+                    t0 = time.monotonic()
+                    audio = self.decode(self.cfg, path, g0, g1)
+                    st.decode_sec += time.monotonic() - t0
+                    for ws, we in group:
+                        if st.failed:
+                            break
+                        yield WindowItem(
+                            st, idx, ws, we, slice_audio(audio, ws - g0, we - g0)
+                        )
+                        idx += 1
+                    del audio
+                    if st.failed:
+                        break
+            except (GamingStop, StopRequested):
+                raise
+            except Exception:  # noqa: BLE001 - a bad track must not stop the run
+                self._fail(st, track)
+
+    def flush(self, batch: list[WindowItem]) -> None:
+        batch = [it for it in batch if not it.state.failed]
+        if not batch:
+            return
+        self.check()
+        self.backend.reset_peak()
+        t0 = time.monotonic()
+        try:
+            results, used = self.batcher.run([it.audio for it in batch])
+        except Exception:  # noqa: BLE001 - fail the batch's tracks, keep going
+            for st in {id(it.state): it.state for it in batch}.values():
+                self._fail(st, st.track)
+            return
+        wall = time.monotonic() - t0
+        alloc, reserved = self.backend.peak_mib()
+        total = sum(it.end - it.start for it in batch) or 1.0
+        for it, res in zip(batch, results):
+            st = it.state
+            share = (it.end - it.start) / total
+            st.texts[it.idx] = res
+            st.left -= 1
+            st.audio_sec += it.end - it.start
+            st.wall_sec += wall * share  # batch time split by audio length
+            st.peak_alloc = _max_opt(st.peak_alloc, alloc)
+            st.peak_reserved = _max_opt(st.peak_reserved, reserved)
+            st.batch_size_used = (
+                used if st.batch_size_used is None else min(st.batch_size_used, used)
+            )
+        for st in {id(it.state): it.state for it in batch}.values():
+            if st.left == 0 and not st.failed:
+                self.finish(st)
+
+    def finish(self, st: TrackState) -> None:
+        result = build_result(self.cfg, st)
+        self.done.append({"track": st.track, "result": result})
+        if not self.write:
+            return
+        try:
+            out = _out_file(self.cfg, st.track)
+            if out is not None:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(
+                    json.dumps(
+                        {
+                            "file_path": st.track.file_path,
+                            "transcript_id": st.track.transcript_id,
+                            "backend": self.cfg.backend,
+                            "model_id": self.cfg.model_id,
+                            "model_revision": self.cfg.model_revision,
+                            "scope": self.cfg.scope,
+                            "plan": st.plan,
+                            **result,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            write_result(self.db.ensure(), self.cfg, st.track, result)
+        except Exception:  # noqa: BLE001 - the out-file keeps the work
+            self._fail(st, st.track)
+            return
         log.info(
-            "skip %s: nothing to transcribe (scope=%s)", track.file_path, cfg.scope
-        )
-        return "skipped"
-    gaming = gaming_check or (lambda: check_gaming(cfg))
+            "done %s: %d windows, %.0f s audio, decode %.0f s, rtfx %s, peak %s MiB, batch %s, degenerate %d",
+            st.track.file_path, len(st.plan), result["audio_sec"], result["decode_sec"],
+            result["rtfx"], result["peak_vram_mib"], result["batch_size_used"],
+            len(result["degenerate_windows"]),
+        )  # fmt: skip
 
-    def check() -> None:
-        check_stop_file(cfg)
-        gaming()
-
-    check()
-    path = resolve_audio_path(cfg, track.file_path)
-    backend.reset_peak()
-    result = transcribe_track(
-        cfg, backend, plan, lambda s, e: decode(cfg, path, s, e), check
-    )
-    alloc, reserved = backend.peak_mib()
-    result.update(peak_vram_mib=alloc, peak_reserved_mib=reserved)
-    out = _out_file(cfg, track)
-    if out is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps(
-                {
-                    "file_path": track.file_path,
-                    "transcript_id": track.transcript_id,
-                    "backend": cfg.backend,
-                    "model_id": cfg.model_id,
-                    "model_revision": cfg.model_revision,
-                    "scope": cfg.scope,
-                    "plan": plan,
-                    **result,
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-    write_result(db.ensure(), cfg, track, result)
-    log.info(
-        "done %s: %d windows, %.0f s audio, decode %.0f s, rtfx %s, peak %s MiB, degenerate %d",
-        track.file_path, len(plan), result["audio_sec"], result["decode_sec"],
-        result["rtfx"], alloc, len(result["degenerate_windows"]),
-    )  # fmt: skip
-    return "done"
+    def run(self, tracks: Sequence[Track], max_sec: float | None = None) -> None:
+        batch: list[WindowItem] = []
+        for item in self.windows(tracks, max_sec):
+            if item.state.failed:
+                continue
+            batch.append(item)
+            if len(batch) >= self.batcher.size:
+                self.flush(batch)
+                batch = []
+        self.flush(batch)
 
 
 def dry_run(
@@ -1384,11 +1521,64 @@ def dry_run(
                     "duration_sec": t.duration,
                     "scope": cfg.scope,
                     "production_words": n_words,
+                    "batch_size": cfg.batch_size,
                     "windows": [[round(s, 2), round(e, 2)] for s, e in plan],
                 },
                 ensure_ascii=False,
             )
         )
+
+
+def bench(
+    db: DbSession,
+    cfg: Config,
+    backend: Backend,
+    track: Track,
+    decode: DecodeFn,
+    emit: Callable[[str], None] = print,
+) -> None:
+    """Sweep cfg.bench_batches over (at most bench_max_sec of) one track. No DB writes."""
+    rows: list[dict[str, Any]] = []
+    for size in cfg.bench_batches:
+        sub = Config(**{**cfg.__dict__, "batch_size": size})
+        pipe = Pipeline(
+            db, sub, backend, decode, lambda: check_stop_file(cfg), write=False
+        )
+        pipe.run([track], max_sec=cfg.bench_max_sec)
+        if not pipe.done:
+            rows.append({"batch_size": size, "error": "failed (see log)"})
+            continue
+        r = pipe.done[0]["result"]
+        rows.append(
+            {
+                "batch_size": size,
+                "batch_size_used": r["batch_size_used"],
+                "windows": r["windows"],
+                "audio_sec": r["audio_sec"],
+                "wall_sec": r["wall_sec"],
+                "decode_sec": r["decode_sec"],
+                "rtfx": r["rtfx"],
+                "peak_vram_mib": r["peak_vram_mib"],
+                "peak_reserved_mib": r["peak_reserved_mib"],
+                "degenerate_windows": len(r["degenerate_windows"]),
+            }
+        )
+    emit(
+        json.dumps(
+            {
+                "bench": {
+                    "backend": cfg.backend,
+                    "model_id": cfg.model_id,
+                    "model_revision": cfg.model_revision,
+                    "file_path": track.file_path,
+                    "window_sec": cfg.window_sec,
+                    "max_sec": cfg.bench_max_sec,
+                    "results": rows,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def self_check(
@@ -1399,9 +1589,10 @@ def self_check(
     backend = make_backend(cfg)
     backend.load()
     backend.reset_peak()
-    res = backend.transcribe_window(np.zeros(5 * SAMPLE_RATE, dtype=np.float32), 0.0)
+    res = backend.transcribe_batch([np.zeros(5 * SAMPLE_RATE, dtype=np.float32)])[0]
     info = backend.info()
     info["output"] = res.text[:200]
+    info["attn_implementation"] = getattr(backend, "attn_implementation", None)
     for name, binary in (("ffmpeg", cfg.ffmpeg_bin), ("ffprobe", cfg.ffprobe_bin)):
         try:
             out = subprocess.run(
@@ -1427,54 +1618,47 @@ def run(
     connect_fn: Callable[[], Any] | None = None,
 ) -> int:
     db = DbSession(conn, connect_fn or (lambda: connect(cfg)))
-    tracks = select_tracks(db.conn, cfg)
-    todo = tracks_to_do(db.conn, cfg, tracks)
-    if cfg.dry_run:
-        dry_run(db.conn, cfg, todo)
-        return EXIT_OK
-    if not todo:
-        return EXIT_OK
-    if backend is None:  # pragma: no cover - real model
-        backend = make_backend(cfg)
-        backend.load()
+    gaming = gaming_check or (lambda: check_gaming(cfg))
+
+    def check() -> None:
+        check_stop_file(cfg)
+        gaming()
+
     try:
-        return _run_tracks(db, cfg, backend, todo, decode, gaming_check)
+        tracks = select_tracks(db.conn, cfg)
+        if cfg.bench:
+            tracks = tracks[:1]
+            if not tracks:
+                log.error("--bench: no track for %s", ",".join(cfg.asins))
+                return EXIT_CONFIG
+            if backend is None:  # pragma: no cover - real model
+                backend = make_backend(cfg)
+                backend.load()
+            bench(db, cfg, backend, tracks[0], decode)
+            return EXIT_OK
+        todo = tracks_to_do(db.conn, cfg, tracks)
+        if cfg.dry_run:
+            dry_run(db.conn, cfg, todo)
+            return EXIT_OK
+        if not todo:
+            return EXIT_OK
+        if backend is None:  # pragma: no cover - real model
+            backend = make_backend(cfg)
+            backend.load()
+        pipe = Pipeline(db, cfg, backend, decode, check)
+        try:
+            pipe.run(todo)
+        except GamingStop as exc:
+            log.warning("stopping for gaming (%s); unfinished tracks not written", exc)
+            return EXIT_GAMING
+        except StopRequested as exc:
+            log.warning("stopping (%s); unfinished tracks not written", exc)
+            return EXIT_STOPPED
+        return EXIT_TRACKS_FAILED if pipe.failed else EXIT_OK
     finally:
         if db.conn is not conn:  # reconnected mid-run: the caller only closes its own
             with contextlib.suppress(Exception):
                 db.conn.close()
-
-
-def _run_tracks(
-    db: DbSession,
-    cfg: Config,
-    backend: Backend,
-    todo: Sequence[Track],
-    decode: DecodeFn,
-    gaming_check: Callable[[], None] | None,
-) -> int:
-    failed = 0
-    for track in todo:
-        try:
-            process_track(
-                db, cfg, backend, track, decode=decode, gaming_check=gaming_check
-            )
-        except GamingStop as exc:
-            log.warning(
-                "stopping for gaming (%s); %s not written", exc, track.file_path
-            )
-            return EXIT_GAMING
-        except StopRequested as exc:
-            log.warning("stopping (%s); %s not written", exc, track.file_path)
-            return EXIT_STOPPED
-        except Exception:
-            failed += 1
-            log.exception("track failed: %s", track.file_path)
-            try:
-                db.conn.rollback()
-            except Exception:  # noqa: BLE001
-                log.warning("rollback after failure also failed")
-    return EXIT_TRACKS_FAILED if failed else EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
