@@ -1291,21 +1291,24 @@ def _claim_job(
         return _claim_one(conn)
 
 
-def _heartbeat(conn: psycopg2.extensions.connection, job_id: str) -> bool:
+def _heartbeat(conn: psycopg2.extensions.connection, job_id: str) -> bool | None:
     """Update updated_at to prevent stale-claim recovery from the Go service.
-    Returns False when the write failed (the caller reconnects)."""
+    Guarded on this runner's claim, so it never keeps another claim's row
+    fresh. Returns True when stamped, False when the write failed (the caller
+    reconnects), None when the row is no longer claimed by this runner."""
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE transcription_jobs
                 SET    updated_at = now()
-                WHERE  id = %s AND status = 'claimed'
+                WHERE  id = %s AND status = 'claimed' AND claimed_by = %s
                 """,
-                (job_id,),
+                (job_id, RUNNER_IDENTITY),
             )
+            stamped = getattr(cur, "rowcount", 1) != 0
         conn.commit()
-        return True
+        return True if stamped else None
     except Exception as exc:
         log.warning("Heartbeat failed for job %s: %s", job_id, exc)
         try:
@@ -1344,7 +1347,17 @@ def _heartbeat_loop(
                 except Exception as exc:  # noqa: BLE001 — retried next tick
                     log.warning("Heartbeat connection failed for job %s: %s", job_id, exc)
                     continue
-            if not _heartbeat(hb_conn, job_id):
+            ok = _heartbeat(hb_conn, job_id)
+            if ok is None:
+                log.warning(
+                    "Job %s is no longer claimed by %s — heartbeat stopped; "
+                    "the job stops at its next window", job_id, RUNNER_IDENTITY,
+                )
+                ctx = _active_job
+                if ctx is not None and ctx.job_id == job_id:
+                    ctx.claim_lost.set()
+                return
+            if not ok:
                 _close_quietly(hb_conn)
                 hb_conn = None  # reconnect on the next tick
     finally:
@@ -1796,7 +1809,10 @@ def _has_provenance_columns(conn: psycopg2.extensions.connection) -> bool:
             """
         )
         row = cur.fetchone()
-    _PROVENANCE_COLUMNS = bool(row) and int(row[0]) == 4
+    # _connect() uses RealDictCursor: the row is a dict ({"count": n}), and
+    # row[0] on it raises KeyError — accept both shapes.
+    count = (next(iter(row.values())) if isinstance(row, dict) else row[0]) if row else 0
+    _PROVENANCE_COLUMNS = int(count) == 4
     return _PROVENANCE_COLUMNS
 
 
@@ -2304,6 +2320,10 @@ def _mark_done_with_retry(
     tries = 0
     while True:
         try:
+            # Reconnect here, inside the try, so a failed reconnect is this try
+            # (one budget unit), not a closed-connection error on the next one.
+            if _conn_closed(ref.conn):
+                ref.conn = _connect(connect_timeout=SIDE_CONNECT_TIMEOUT_SECONDS)
             if tries and _job_status(ref.conn, job_id) == "done":
                 log.info("Job %s already done (the earlier commit landed)", job_id)
                 return
@@ -2321,11 +2341,8 @@ def _mark_done_with_retry(
             log.warning("Job %s: DB error marking done (%s) — reconnecting, retry %d/%d in %.0f s",
                         job_id, exc, tries, RETRY_DB_ATTEMPTS, delay)
             _close_quietly(ref.conn)
+            ref.conn = None  # reconnected at the top of the next try
             _retry_wait(delay)
-            try:
-                ref.conn = _connect()
-            except Exception as cexc:  # noqa: BLE001 — counts as this try; retried
-                log.warning("Job %s: reconnect failed: %s", job_id, cexc)
 
 
 def _ffmpeg_timeout(audio_seconds: float | None) -> float:
@@ -2954,11 +2971,18 @@ class _JobContext:
         file_path: str,
         bias_terms: list[str] | None = None,
         should_yield: Any = None,
+        checksum: str | None = None,
     ) -> None:
         self.job_id = job_id
         self.file_path = file_path
         self.bias_terms = bias_terms
         self.should_yield = should_yield
+        # The job's content checksum (transcription_jobs.checksum): a same-size,
+        # same-mtime replacement of the file still invalidates its checkpoint.
+        self.checksum = checksum
+        # Set by the heartbeat thread when the row is no longer claimed by this
+        # runner; the chunked path stops at its next window.
+        self.claim_lost = threading.Event()
 
 
 # The job main() is transcribing, or None (direct calls, tests, self-check).
@@ -2998,6 +3022,9 @@ def _checkpoint_fingerprint(ctx: _JobContext, audio_path: Path) -> dict[str, Any
         "overlap_seconds": CHUNK_OVERLAP_SECONDS,
         "runner_version": RUNNER_VERSION,
         "bias_terms_sha256": bias,
+        "checksum": ctx.checksum,
+        # New weights under the same ASR_MODEL id must not mix into old windows.
+        "model_sha256": _ASR_MODEL_SHA256,
         # Everything else that shapes the output (dtype, geometry, biasing alpha…).
         "asr_params": _asr_params(),
     }
@@ -3381,6 +3408,10 @@ def _transcribe_chunked(
         win_idx += 1
         if checkpoint is not None:
             checkpoint.save(offset, win_idx, all_words, all_segments)
+        ctx = _active_job
+        if offset < duration_seconds and ctx is not None and ctx.claim_lost.is_set():
+            # The heartbeat found the row taken over: stop spending GPU on it.
+            raise _ClaimLost(f"job {ctx.job_id} is no longer claimed by {RUNNER_IDENTITY}")
         if offset < duration_seconds and checkpoint is not None and checkpoint.enabled:
             # Mid-job yield (CONTRACT §1.4): an eviction costs at most a window.
             # Only with a durable checkpoint — a yield without one would throw
@@ -4694,6 +4725,7 @@ def main() -> None:
             file_path,
             bias_terms=bias_terms,
             should_yield=lambda ref=ref: _mid_job_park_reason(ref),
+            checksum=checksum,
         )
         try:
             # Re-root the producer's BOOKS_DB_ROOT-relative file_path onto this

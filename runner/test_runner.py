@@ -4229,6 +4229,14 @@ class ChunkedResumeAndYieldTests(_CheckpointDirMixin):
             words, _ = self._run(model, self._ctx())
         free.assert_called_once()
         self.assertEqual(words, ["w0", "w1", "w2", "w3"])
+
+    def test_chunked_job_stops_at_the_next_window(self) -> None:
+        ctx = self._ctx()
+        ctx.claim_lost.set()
+        model = _WindowModel()
+        with self.assertRaises(runner._ClaimLost):
+            self._run(model, ctx)
+        self.assertEqual(model.calls, [0])
     def test_no_yield_without_a_checkpoint(self) -> None:
         with mock.patch.object(runner, "CHECKPOINT_DIR", None):
             words, _ = self._run(_WindowModel(), self._ctx(should_yield=lambda: "phase=analyze"))
@@ -4414,7 +4422,7 @@ class MarkDoneRetryTests(unittest.TestCase):
         self.assertTrue(any("SELECT status FROM transcription_jobs" in s for s, _ in after.executed))
 
     def test_budget_is_bounded_and_other_errors_are_not_retried(self) -> None:
-        with mock.patch.object(runner, "_connect", side_effect=lambda: _RetConn(fail_sql="INSERT")), \
+        with mock.patch.object(runner, "_connect", side_effect=lambda **_kw: _RetConn(fail_sql="INSERT")), \
                 self.assertRaises(FakeOperationalError):
             runner._mark_done_with_retry(
                 runner._ConnRef(_RetConn(fail_sql="INSERT")), "j", "f", "c", self.result
@@ -4813,3 +4821,80 @@ class ShareProbeTimeoutTests(unittest.TestCase):
             self.assertEqual(len(calls), 1, "no second probe while the first is hung")
             gate.set()
             runner._share_probe.join(2)  # type: ignore[union-attr]
+
+
+
+class ReviewRound3Tests(unittest.TestCase):
+    """RealDictCursor rows, reconnect budget, fingerprint, heartbeat claim guard."""
+
+    def test_provenance_probe_reads_a_realdict_row(self) -> None:
+        class _Cur(FakeCursor):
+            def fetchone(self) -> object:
+                return {"count": 4}  # what RealDictCursor returns; row[0] is a KeyError
+
+        class _Conn(FakeConn):
+            def cursor(self) -> FakeCursor:
+                return _Cur(self)
+
+        with mock.patch.object(runner, "_PROVENANCE_COLUMNS", None):
+            self.assertTrue(runner._has_provenance_columns(_Conn(None, None)))
+        with mock.patch.object(runner, "_PROVENANCE_COLUMNS", None):
+            self.assertFalse(runner._has_provenance_columns(FakeConn(None, None)))  # no row
+
+    def test_a_failed_reconnect_costs_one_try(self) -> None:
+        result = {"language": "en", "duration_seconds": 1.0, "speaker_count": None,
+                  "segments": [], "raw_text": ""}
+        good = _RetConn()
+        plan: list[Any] = [FakeOperationalError("still down"), good]
+
+        def connect(**kw: Any) -> Any:
+            self.assertEqual(kw, {"connect_timeout": runner.SIDE_CONNECT_TIMEOUT_SECONDS})
+            item = plan.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        ref = runner._ConnRef(_RetConn(fail_sql="INSERT INTO transcripts"))
+        with mock.patch.object(runner, "_retry_wait") as wait, \
+                mock.patch.object(runner, "_has_provenance_columns", return_value=False), \
+                mock.patch.object(runner, "_connect", side_effect=connect):
+            runner._mark_done_with_retry(ref, "job-1", "f", "c", result)
+        self.assertEqual(wait.call_count, 2, "insert failure + failed reconnect = two tries")
+        self.assertIs(ref.conn, good)
+
+    def test_fingerprint_covers_checksum_and_model_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            audio = Path(d) / "a.m4b"
+            audio.write_bytes(b"x")
+            ctx = runner._JobContext("j", "/books/a.m4b", checksum="aaa")
+            fp = runner._checkpoint_fingerprint(ctx, audio)
+            self.assertEqual(fp["checksum"], "aaa")
+            with mock.patch.object(runner, "_ASR_MODEL_SHA256", "w2"):
+                self.assertEqual(runner._checkpoint_fingerprint(ctx, audio)["model_sha256"], "w2")
+            other = runner._JobContext("j", "/books/a.m4b", checksum="bbb")
+            self.assertNotEqual(runner._checkpoint_fingerprint(other, audio), fp)
+
+    def test_heartbeat_is_guarded_and_reports_a_lost_claim(self) -> None:
+        class _Cur(FakeCursor):
+            rowcount = 0
+
+        class _Conn(FakeConn):
+            def cursor(self) -> FakeCursor:
+                return _Cur(self)
+
+        conn = _Conn(None, None)
+        self.assertIsNone(runner._heartbeat(conn, "job-1"))
+        sql, params = conn.executed[0]
+        self.assertIn("claimed_by = %s", sql)
+        self.assertEqual(params, ("job-1", runner.RUNNER_IDENTITY))
+        self.assertTrue(runner._heartbeat(FakeConn(None, None), "job-1"))
+
+    def test_lost_claim_stops_the_heartbeat_and_flags_the_job(self) -> None:
+        stop = threading.Event()
+        ctx = runner._JobContext("job-1", "f")
+        with mock.patch.object(runner, "_active_job", ctx), \
+                mock.patch.object(runner, "_heartbeat", return_value=None) as hb:
+            runner._heartbeat_loop(stop, "job-1", 0.001, lambda: _RetConn())  # returns by itself
+        self.assertEqual(hb.call_count, 1, "no further stamps after a lost claim")
+        self.assertTrue(ctx.claim_lost.is_set())
+
