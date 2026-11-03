@@ -891,3 +891,25 @@ def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
     assert seen["decoded"] == [[11, 12, 2], [21, 2, 2]]
     assert [r.text for r in res] == ["First row.", "Second."]
     assert not any(r.hit_token_limit for r in res)
+
+
+def test_bench_honours_the_gaming_check_between_batches(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = make_cfg(
+        "canary", "--bench", "--bench-batches", "1,4", "--bench-max-sec", "100"
+    )
+    conn = FakeConn([("B1", "/books/a/long.m4b", TID, 3600.0)], [])
+    # pre-load + track + chunk + 2 batches of the first sweep step; then a game starts.
+    states = iter(["available"] * 5 + ["gaming"] * 10)
+
+    def check() -> None:
+        pilot.check_gaming(
+            make_cfg("canary", "--arbiter-url", "http://arb:48750"),
+            fetch=lambda url: {"state": next(states)},
+        )
+
+    backend = FakeBackend(cfg, "canary")
+    assert run(cfg, conn, backend, gaming_check=check) == pilot.EXIT_GAMING
+    assert backend.batches == [1, 1]  # step 1 finished; step 2 never ran a batch
+    assert capsys.readouterr().out == "" and conn.writes() == []

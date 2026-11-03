@@ -1540,15 +1540,19 @@ def bench(
     backend: Backend,
     track: Track,
     decode: DecodeFn,
+    check: Callable[[], None],
     emit: Callable[[str], None] = print,
 ) -> None:
-    """Sweep cfg.bench_batches over (at most bench_max_sec of) one track. No DB writes."""
+    """Sweep cfg.bench_batches over (at most bench_max_sec of) one track. No DB writes.
+
+    `check` is the same stop-file + gaming check as a real run, applied before
+    each track, decode chunk and batch of every sweep step (GamingStop and
+    StopRequested propagate to run(), which exits 4 / 5 without printing).
+    """
     rows: list[dict[str, Any]] = []
     for size in cfg.bench_batches:
         sub = Config(**{**cfg.__dict__, "batch_size": size})
-        pipe = Pipeline(
-            db, sub, backend, decode, lambda: check_stop_file(cfg), write=False
-        )
+        pipe = Pipeline(db, sub, backend, decode, check, write=False)
         pipe.run([track], max_sec=cfg.bench_max_sec)
         if not pipe.done:
             rows.append({"batch_size": size, "error": "failed (see log)"})
@@ -1649,7 +1653,7 @@ def run(
                 backend = make_backend(cfg)
                 backend.load()
             if cfg.bench:
-                bench(db, cfg, backend, tracks[0], decode)
+                bench(db, cfg, backend, tracks[0], decode, check)
                 return EXIT_OK
             pipe = Pipeline(db, cfg, backend, decode, check)
             pipe.run(tracks)
