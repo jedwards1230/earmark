@@ -4841,6 +4841,41 @@ class ReviewRound3Tests(unittest.TestCase):
         with mock.patch.object(runner, "_PROVENANCE_COLUMNS", None):
             self.assertFalse(runner._has_provenance_columns(FakeConn(None, None)))  # no row
 
+    @unittest.skipUnless(
+        importlib.machinery.PathFinder.find_spec("psycopg2"),
+        "needs a real psycopg2: the subprocess uses a real RealDictRow",
+    )
+    def test_provenance_probe_with_a_real_realdictrow(self) -> None:
+        """The exact row type _connect()'s RealDictCursor returns, in a
+        subprocess where psycopg2 is real (it is stubbed in this process)."""
+        import subprocess as _sp
+
+        script = (
+            "import importlib.util, sys\n"
+            "import psycopg2.extras as x\n"
+            "spec = importlib.util.spec_from_file_location('r', sys.argv[1])\n"
+            "r = importlib.util.module_from_spec(spec); spec.loader.exec_module(r)\n"
+            "row = x.RealDictRow(); row['count'] = 4\n"
+            "try:\n    row[0]\nexcept KeyError:\n    pass\n"
+            "else:\n    sys.exit('RealDictRow[0] unexpectedly worked')\n"
+            "class Cur:\n"
+            "    def __enter__(self): return self\n"
+            "    def __exit__(self, *a): return None\n"
+            "    def execute(self, *a): pass\n"
+            "    def fetchone(self): return row\n"
+            "class Conn:\n"
+            "    def cursor(self): return Cur()\n"
+            "assert r._has_provenance_columns(Conn()) is True\n"
+            "print('ok')\n"
+        )
+        env = {**os.environ, "DATABASE_URL": "postgres://t@localhost/t"}
+        out = _sp.run(
+            [sys.executable, "-c", script, str(_RUNNER_PATH)],
+            capture_output=True, text=True, env=env, timeout=60, check=False,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("ok", out.stdout)
+
     def test_a_failed_reconnect_costs_one_try(self) -> None:
         result = {"language": "en", "duration_seconds": 1.0, "speaker_count": None,
                   "segments": [], "raw_text": ""}
