@@ -425,3 +425,81 @@ func TestRun_RejectsNegativePhaseTimeout(t *testing.T) {
 		t.Fatal("expected an error for a negative phase timeout")
 	}
 }
+
+// PhaseTimeout is a no-progress bound: a Phase A that keeps moving (done
+// climbing, claimed > 0 throughout) for longer than the timeout must finish.
+func TestRun_PhaseTimeoutResetsOnProgress(t *testing.T) {
+	statuses := []*db.QueueStats{{Pending: 40}}
+	for i := 0; i < 40; i++ {
+		statuses = append(statuses, &db.QueueStats{Pending: 40 - i, Claimed: 1, Done: i, RunLimit: ptr(10)})
+	}
+	statuses = append(statuses,
+		&db.QueueStats{Pending: 0, Claimed: 0, Done: 40, RunLimit: ptr(0)}, // Phase A done
+		&db.QueueStats{EmbedBacklog: 0},
+	)
+	store := newFakeStore(db.PhaseIdle, statuses...)
+	o := fastOpts()
+	o.PollInterval = 5 * time.Millisecond
+	o.PhaseTimeout = 100 * time.Millisecond // far below the ~200 ms Phase A takes
+	start := time.Now()
+	if err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o); err != nil {
+		t.Fatalf("Run: %v (a progressing Phase A must not time out)", err)
+	}
+	if elapsed := time.Since(start); elapsed < o.PhaseTimeout {
+		t.Fatalf("test invalid: Phase A took %s, not longer than the %s timeout", elapsed, o.PhaseTimeout)
+	}
+	want := []string{db.PhaseTranscribe, db.PhaseAnalyze, db.PhaseIdle}
+	if got := store.transitions(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("transitions = %v, want %v", got, want)
+	}
+}
+
+// slowCheckLock's Check blocks for a while and records whether its context was
+// cancelled underneath it (which, on the real pinned pgx conn, would break the
+// session and drop the lock).
+type slowCheckLock struct {
+	started   chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	cancelled bool
+}
+
+func (l *slowCheckLock) Check(ctx context.Context) error {
+	l.once.Do(func() { close(l.started) })
+	select {
+	case <-ctx.Done():
+		l.mu.Lock()
+		l.cancelled = true
+		l.mu.Unlock()
+		return ctx.Err()
+	case <-time.After(30 * time.Millisecond):
+		return nil
+	}
+}
+func (l *slowCheckLock) Successor(context.Context) (bool, error) { return false, nil }
+func (l *slowCheckLock) Release() error                          { return nil }
+func (l *slowCheckLock) wasCancelled() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.cancelled
+}
+
+// Closing stop, or cancelling the parent (SIGTERM), while a check is in flight
+// must not cancel that check's context; the heartbeat returns once it is done.
+func TestHeartbeat_StopAndParentCancelDoNotCancelInflightCheck(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	lock := &slowCheckLock{started: make(chan struct{})}
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- heartbeat(context.WithoutCancel(parent), stop, lock, time.Millisecond) }()
+
+	<-lock.started
+	cancelParent()
+	close(stop)
+	if err := <-done; err != nil {
+		t.Fatalf("heartbeat = %v, want nil on stop", err)
+	}
+	if lock.wasCancelled() {
+		t.Error("in-flight check was cancelled by stop/parent cancel; it must only end on its own deadline")
+	}
+}

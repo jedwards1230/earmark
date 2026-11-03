@@ -493,11 +493,18 @@ idle"; the window it leaves is the single round-trip between the lookup and the
 restore writes. Only binaries containing this guard take the lock: an older
 `earmark batch` running alongside is not excluded, so don't mix versions.
 
-**Phase A bound.** `--phase-timeout` (default `3h`, `0` = unbounded) caps each
-Phase A's wall clock. A runner that claims nothing — its host asleep, the
-service stopped — would otherwise hold the run (and a scheduled Job) in Phase A
-until `activeDeadlineSeconds`; on expiry the coordinator restores idle and exits
-`1` (`transcribe phase timed out`), never moving on to Phase B.
+**Phase A stall bound.** `--phase-timeout` (default `3h`, `0` = unbounded) is a
+**no-progress** bound, not a wall clock: the deadline restarts whenever the
+queue snapshot moves (`pending`, `claimed`, `done`, `failed` or `run_limit`
+changes), so a long batch that keeps transcribing is never cut off. A runner
+that claims nothing — its host asleep, the service stopped — would otherwise
+hold the run (and a scheduled Job) in Phase A until `activeDeadlineSeconds`;
+after `--phase-timeout` without progress the coordinator restores idle and exits
+`1` (`transcribe phase timed out`), never moving on to Phase B. Checked once per
+`--poll-interval`. The lock heartbeat's checks run on a context detached from
+the run's (their own 10 s deadline), so a `SIGTERM` can't cancel a check
+mid-query, which would break the pinned session and drop the lock right before
+the restore.
 The CronJob (§2.7, `batch.enabled`) additionally pins `concurrencyPolicy:
 Forbid`; the lock is what covers runs started any other way (a manual
 `kubectl create job --from`, a laptop).
@@ -2651,9 +2658,10 @@ value. Defaults: schedule `0 3 * * *`, `timeZone: null` (omitted — the
 controller's zone), `suspend: false` (always rendered, so a flip shows in
 every diff), `backoffLimit: 0` (the coordinator is
 resumable; the next run reconciles), `activeDeadlineSeconds: 21600` (on expiry
-the pod gets `SIGTERM` and restores idle), `terminationGracePeriodSeconds: 60`
-(schema minimum 45: the restore is bounded at 30 s and the lock release at
-10 s), `startingDeadlineSeconds: 600` (schema minimum 10, also for
+the pod gets `SIGTERM` and restores idle), `terminationGracePeriodSeconds: 90`
+(schema minimum 75: the worst-case cleanup is 55 s — restore 30 s including the
+successor lookup, heartbeat join 10 s, unlock 10 s, closing an unconfirmed
+session 5 s — plus headroom), `startingDeadlineSeconds: 600` (schema minimum 10, also for
 `evalBackfill`: the CronJob controller checks every 10 s, so less can skip
 runs), `ttlSecondsAfterFinished: 86400`, history limits 3/3; `resources` accepts
 `cpu`, `memory` and `ephemeral-storage`.

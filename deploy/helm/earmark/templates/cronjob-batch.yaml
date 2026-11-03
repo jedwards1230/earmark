@@ -10,7 +10,9 @@
 #     after --max-batches, or on SIGTERM. It transcribes nothing itself.
 #   - Every exit (incl. SIGTERM from activeDeadlineSeconds or a pod delete)
 #     restores phase=idle and the pre-batch run_limit; terminationGracePeriodSeconds
-#     must outlast that restore (30 s bound) plus the lock release (10 s).
+#     must outlast the whole cleanup: restore idle (30 s, incl. the successor
+#     lookup) + heartbeat join (in-flight check, 10 s) + unlock (10 s) + closing
+#     an unconfirmed session (5 s) = 55 s worst case. Schema floor 75, default 90.
 #   - Single instance: concurrencyPolicy is fixed at Forbid, and the coordinator
 #     also takes a Postgres advisory lock, so a run started any other way (a
 #     manual `kubectl create job --from`, a laptop) exits 0 untouched instead of

@@ -118,10 +118,10 @@ var ErrAlreadyRunning = errors.New("another earmark batch coordinator is running
 // coordinator, so it stops — restoring idle as on any exit — and fails.
 var ErrLockLost = errors.New("batch lock lost mid-run")
 
-// ErrPhaseTimeout is returned when a Phase A does not finish within
-// Options.PhaseTimeout — typically the ASR runner is down or its host asleep,
-// so nothing is claimed and the batch would otherwise wait until the Job's
-// activeDeadlineSeconds.
+// ErrPhaseTimeout is returned when a Phase A makes no progress (the queue
+// snapshot does not change) for Options.PhaseTimeout — typically the ASR
+// runner is down or its host asleep, so nothing is claimed and the batch would
+// otherwise wait until the Job's activeDeadlineSeconds.
 var ErrPhaseTimeout = errors.New("transcribe phase timed out")
 
 // lockCheckTimeout bounds one heartbeat round-trip.
@@ -227,8 +227,9 @@ type Options struct {
 	// Lock, when set, admits a single coordinator (CONTRACT §1.4). nil runs
 	// unguarded (unit tests; a caller that serialises runs itself).
 	Lock Locker
-	// PhaseTimeout bounds each Phase A's wall clock. 0 = unbounded. On expiry
-	// Run returns ErrPhaseTimeout (after restoring idle).
+	// PhaseTimeout bounds how long a Phase A may go WITHOUT PROGRESS (no change
+	// in pending/claimed/done/failed/run_limit). 0 = unbounded. On expiry Run
+	// returns ErrPhaseTimeout (after restoring idle).
 	PhaseTimeout time.Duration
 }
 
@@ -315,19 +316,28 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 		// holds the lock), and Run fails with ErrLockLost.
 		// The heartbeat is stopped (and joined) before Release, which
 		// registered first and so runs last.
+		//
+		// The heartbeat is NOT driven by the signal context: pgx breaks a
+		// connection whose query context is cancelled mid-flight, so a SIGTERM
+		// (or the stop below) landing during a Check would kill the pinned
+		// session and drop the lock right before the restore. Each Check runs
+		// on context.WithoutCancel + its own lockCheckTimeout, and the loop is
+		// stopped through its own channel; the join waits for an in-flight
+		// Check, which lockCheckTimeout bounds.
 		runCtx, cancelRun := context.WithCancelCause(ctx)
-		hbCtx, stopHB := context.WithCancel(ctx)
+		hbStop := make(chan struct{})
 		var lostErr error // written by the heartbeat; read only after hbDone
 		hbDone := make(chan struct{})
+		hbBase := context.WithoutCancel(ctx) // taken here: ctx is reassigned below
 		go func() {
 			defer close(hbDone)
-			if herr := heartbeat(hbCtx, lock, o.PollInterval); herr != nil {
+			if herr := heartbeat(hbBase, hbStop, lock, o.PollInterval); herr != nil {
 				lostErr = fmt.Errorf("%w: %w", ErrLockLost, herr)
 				cancelRun(lostErr)
 			}
 		}()
 		defer func() {
-			stopHB()
+			close(hbStop)
 			<-hbDone
 			cancelRun(nil)
 			if lostErr != nil {
@@ -524,59 +534,75 @@ func runTranscribePhase(ctx context.Context, p func(string, ...any), store Phase
 	}
 	p("Phase A (transcribe): run_limit=%d — waiting for the batch to transcribe...\n", n)
 
-	pctx := ctx
-	if o.PhaseTimeout > 0 {
-		var cancel context.CancelFunc
-		pctx, cancel = context.WithTimeout(ctx, o.PhaseTimeout)
-		defer cancel()
-	}
-	// timedOut distinguishes our own bound from a cancel of the run itself.
-	timedOut := func() bool { return ctx.Err() == nil && errors.Is(pctx.Err(), context.DeadlineExceeded) }
+	// PhaseTimeout is a NO-PROGRESS bound, not a wall clock: the deadline
+	// restarts whenever the queue moves (pending, claimed, done, failed or the
+	// run budget changes), so a long batch that keeps transcribing never trips
+	// it, while a runner that claims nothing (host asleep, service down) does.
+	lastProgress := time.Now()
+	var last *progressKey
 	for {
-		st, err := store.GetServiceStatus(pctx)
+		st, err := store.GetServiceStatus(ctx)
 		if err != nil {
-			if timedOut() {
-				return phaseTimeoutErr(o.PhaseTimeout)
-			}
 			return fmt.Errorf("poll transcribe status: %w", err)
 		}
 		if transcribeDone(st) {
 			p("Phase A complete (pending=%d, claimed=%d, run_limit reached).\n", st.Pending, st.Claimed)
 			return nil
 		}
-		if err := sleep(pctx, o.PollInterval); err != nil {
-			if timedOut() {
-				return phaseTimeoutErr(o.PhaseTimeout)
-			}
+		if k := progressOf(st); last == nil || k != *last {
+			last, lastProgress = &k, time.Now()
+		} else if o.PhaseTimeout > 0 && time.Since(lastProgress) >= o.PhaseTimeout {
+			return phaseTimeoutErr(o.PhaseTimeout)
+		}
+		if err := sleep(ctx, o.PollInterval); err != nil {
 			return err
 		}
 	}
 }
 
-func phaseTimeoutErr(d time.Duration) error {
-	return fmt.Errorf("%w: Phase A did not finish within %s (is the ASR runner up and its host awake?)", ErrPhaseTimeout, d)
+// progressKey is the part of a queue snapshot whose change counts as Phase A
+// progress for PhaseTimeout.
+type progressKey struct {
+	pending, claimed, done, failed int
+	runLimit                       int // -1 = unlimited (NULL)
 }
 
-// heartbeat checks lock every interval until ctx is done (nil) or a check
-// fails (that error). A check failing only because ctx ended is a shutdown,
-// not a loss.
-func heartbeat(ctx context.Context, lock Lock, every time.Duration) error {
+func progressOf(st *db.QueueStats) progressKey {
+	k := progressKey{pending: st.Pending, claimed: st.Claimed, done: st.Done, failed: st.Failed, runLimit: -1}
+	if st.RunLimit != nil {
+		k.runLimit = *st.RunLimit
+	}
+	return k
+}
+
+func phaseTimeoutErr(d time.Duration) error {
+	return fmt.Errorf("%w: Phase A made no progress for %s — nothing claimed or finished (is the ASR runner up and its host awake?)", ErrPhaseTimeout, d)
+}
+
+// heartbeat checks lock every interval until stop is closed (nil) or a check
+// fails (that error). base must not be cancellable (see Run): each check gets
+// its own lockCheckTimeout from it, so nothing but that deadline can cancel a
+// query on the pinned session. A check that completes after stop was closed is
+// ignored — the exit cleanup's own successor lookup decides the restore.
+func heartbeat(base context.Context, stop <-chan struct{}, lock Lock, every time.Duration) error {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-stop:
 			return nil
 		case <-t.C:
 		}
-		cctx, cancel := context.WithTimeout(ctx, lockCheckTimeout)
+		cctx, cancel := context.WithTimeout(base, lockCheckTimeout)
 		err := lock.Check(cctx)
 		cancel()
 		if err != nil {
-			if ctx.Err() != nil {
+			select {
+			case <-stop:
 				return nil
+			default:
+				return err
 			}
-			return err
 		}
 	}
 }

@@ -38,7 +38,7 @@ type options struct {
 	arbiterTimeout time.Duration // per-request timeout for the arbiter probe
 	arbiterWaitCmd string        // explicit gpu-arbiter binary override (flag overrides $ARBITER_WAIT_CMD)
 	lockedExitCode int           // exit code when another coordinator holds the batch lock
-	phaseTimeout   time.Duration // wall-clock bound per Phase A (0 = unbounded)
+	phaseTimeout   time.Duration // no-progress bound per Phase A (0 = unbounded)
 }
 
 // arbiterWaitCmdEnvVar overrides binary auto-detection (PATH lookup) with an
@@ -84,9 +84,11 @@ default, so an overlapping scheduled run (e.g. a CronJob) is a clean no-op; set
 The lock is re-checked every --poll-interval; if it is lost (its connection
 dropped) the run stops, restores idle, and exits 1.
 
-Phase A is bounded by --phase-timeout (default 3h; 0 = unbounded): if the
-runner claims nothing — its host asleep, the service down — the run restores
-idle and exits 1 instead of waiting out the whole schedule window.
+Phase A gives up after --phase-timeout without progress (default 3h; 0 =
+unbounded). Progress is any change in the pending/claimed/done/failed counts
+or the run budget, so a long batch that keeps transcribing is never cut off;
+a runner that claims nothing — its host asleep, the service down — makes the
+run restore idle and exit 1 instead of waiting out the whole schedule window.
 
 The coordinator is DB-driven and resumable: it keeps no critical state in
 memory. If it restarts mid-batch and finds phase=analyze, it finishes Phase B
@@ -122,7 +124,7 @@ func init() {
 	BatchCmd.Flags().StringVar(&opts.gpuArbiterURL, "gpu-arbiter-url", "", "gpu-arbiter /status URL (overrides $GPU_ARBITER_URL)")
 	BatchCmd.Flags().DurationVar(&opts.arbiterTimeout, "arbiter-timeout", 3*time.Second, "per-request timeout for the gpu-arbiter probe")
 	BatchCmd.Flags().IntVar(&opts.lockedExitCode, "already-running-exit-code", 0, "exit code when another `earmark batch` holds the batch lock (0 = a clean no-op, suits a CronJob)")
-	BatchCmd.Flags().DurationVar(&opts.phaseTimeout, "phase-timeout", 3*time.Hour, "wall-clock bound for each Phase A; on expiry restore idle and exit 1 (0 = unbounded)")
+	BatchCmd.Flags().DurationVar(&opts.phaseTimeout, "phase-timeout", 3*time.Hour, "give up a Phase A after this long without progress (no change in pending/claimed/done/failed or run budget); restore idle and exit 1 (0 = unbounded)")
 	BatchCmd.Flags().StringVar(&opts.arbiterWaitCmd, "arbiter-wait-cmd", "", "path to the gpu-arbiter binary to delegate waits to (overrides $ARBITER_WAIT_CMD and PATH auto-detection); empty falls back to auto-detection, then the built-in HTTP poll loop")
 }
 

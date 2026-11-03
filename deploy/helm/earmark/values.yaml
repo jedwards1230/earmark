@@ -331,10 +331,12 @@ batch:
   # --max-batches: stop after N batches. 0 = until the queue drains (the flag
   # is omitted); size activeDeadlineSeconds to match.
   maxBatches: 0
-  # --phase-timeout: wall-clock bound for each Phase A (Go duration, e.g. "3h";
-  # "0" = unbounded). If the ASR runner claims nothing — its host asleep, the
-  # service down — the run restores idle and fails instead of waiting out
-  # activeDeadlineSeconds. null omits the flag (the CLI default, 3h).
+  # --phase-timeout: give up a Phase A after this long WITHOUT PROGRESS (Go
+  # duration, e.g. "3h"; "0" = unbounded). Progress = any change in the
+  # pending/claimed/done/failed counts or the run budget, so a long batch that
+  # keeps transcribing is never cut off; a runner that claims nothing — its host
+  # asleep, the service down — makes the run restore idle and fail instead of
+  # waiting out activeDeadlineSeconds. null omits the flag (the CLI default, 3h).
   phaseTimeout: null
   # Full gpu-arbiter /status URL (http://<gpu-host>:48750/status) → GPU_ARBITER_URL,
   # so each batch waits out a game first. Must end in /status: the coordinator
@@ -360,9 +362,11 @@ batch:
   # the pod gets SIGTERM and restores idle. Keep it below the schedule
   # interval; null omits.
   activeDeadlineSeconds: 21600
-  # Must outlast the SIGTERM cleanup: restore idle (bounded at 30 s) + release
-  # the advisory lock (10 s).
-  terminationGracePeriodSeconds: 60
+  # Must outlast the SIGTERM cleanup, worst case 55 s: restore idle (30 s, incl.
+  # the successor lookup) + heartbeat join (an in-flight check, 10 s) + unlock
+  # (10 s) + closing an unconfirmed session (5 s). Schema minimum 75 (20 s
+  # headroom for process exit and scheduling).
+  terminationGracePeriodSeconds: 90
   # Garbage-collect finished Jobs after a day; null omits (history limits only).
   ttlSecondsAfterFinished: 86400
   # Annotations for the Job pods only (podAnnotations above is NOT applied: its

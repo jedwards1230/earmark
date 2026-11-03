@@ -309,7 +309,7 @@
         "failedJobsHistoryLimit":        { "type": "integer", "minimum": 0 },
         "backoffLimit":                  { "type": "integer", "minimum": 0 },
         "activeDeadlineSeconds":         { "type": ["integer", "null"], "minimum": 1 },
-        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 45 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 75 },
         "ttlSecondsAfterFinished":       { "type": ["integer", "null"], "minimum": 0 },
         "podAnnotations": {
           "type": "object",

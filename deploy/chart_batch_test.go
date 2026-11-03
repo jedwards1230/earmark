@@ -42,7 +42,7 @@ func TestBatchCronJob(t *testing.T) {
 
 	pod := cronPodSpec(t, cj)
 	assert.Equal(t, "Never", dig(t, pod, "restartPolicy"))
-	assert.Equal(t, 60, dig(t, pod, "terminationGracePeriodSeconds"))
+	assert.Equal(t, 90, dig(t, pod, "terminationGracePeriodSeconds"))
 	c := dig(t, pod, "containers", 0)
 	assert.Equal(t, "ghcr.io/jedwards1230/earmark:9.9.9", dig(t, c, "image"))
 	assert.Equal(t, []any{"batch", "--batch-size", "25", "--max-batches", "4", "--phase-timeout", "90m"}, dig(t, c, "args"))
@@ -95,6 +95,7 @@ func TestBatchSchemaRejectsBadValues(t *testing.T) {
 		"batch.maxBatches=-1",
 		"batch.concurrencyPolicy=Allow", // fixed at Forbid: not a value
 		"batch.terminationGracePeriodSeconds=5",
+		"batch.terminationGracePeriodSeconds=60",      // below the 55 s worst case + headroom
 		"batch.gpuArbiterUrl=http://192.0.2.10:48750", // must be the /status URL
 		"batch.gpuArbiterUrl=http://bad host:48750/status",
 		"batch.startingDeadlineSeconds=5",
