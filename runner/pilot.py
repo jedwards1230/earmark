@@ -27,7 +27,8 @@ CLI:
     python pilot.py --backend {granite,canary} --asin A1,A2 [--scope full|findings]
                     [--limit-tracks N] [--track-limit-per-book N] [--force]
                     [--batch-size N] [--repetition-penalty P]
-                    [--dry-run] [--out-dir DIR] [--arbiter-url URL] [--self-check]
+                    [--dry-run] [--out-dir DIR] [--arbiter-url URL]
+                    [--self-check [--self-check-audio CLIP]]
                     [--bench [--bench-batches 1,8,16,32] [--bench-max-sec S]]
 
 Environment:
@@ -49,7 +50,7 @@ Environment:
                           (default <tempdir>/earmark-asr-pilot-out).
 
 Exit codes: 0 ok, 2 config error, 3 some tracks failed, 4 stopped for gaming,
-5 stopped by PILOT_STOP_FILE.
+5 stopped by PILOT_STOP_FILE, 6 --self-check transcript wrong or not English.
 """
 
 from __future__ import annotations
@@ -82,6 +83,7 @@ EXIT_CONFIG = 2
 EXIT_TRACKS_FAILED = 3
 EXIT_GAMING = 4
 EXIT_STOPPED = 5
+EXIT_SELF_CHECK_FAILED = 6
 
 SAMPLE_RATE = 16000
 
@@ -139,6 +141,55 @@ MAX_FINDING_SPANS = 5000  # bound on the per-track findings query
 DECODE_CHUNK_MIN_SEC = 1800.0
 
 
+# --self-check feeds a real English clip (LibriSpeech dev-clean 1272-128104-0000,
+# CC BY 4.0; see testdata/README.md), not silence: speech LLMs hallucinate on
+# silence (Granite answered 5 s of zeros with a Spanish sentence).
+SELF_CHECK_AUDIO = Path(__file__).resolve().with_name("testdata") / "selfcheck_en.flac"
+SELF_CHECK_MAX_SEC = 30.0
+SELF_CHECK_MAX_WER = 0.35
+
+
+# Cheap output-language check (no extra deps): share of tokens that are common
+# function words, per language. Both pilot models are run on English books, so
+# a window whose words look like another supported Granite language (es, fr,
+# de, pt) — or that is mostly non-Latin script (ja) — is marked degenerate.
+def _wordset(text: str) -> frozenset[str]:
+    return frozenset(text.split())
+
+
+_STOPWORDS: dict[str, frozenset[str]] = {
+    "en": _wordset(
+        "the a an and or but of to in on at by for with from as is are was were be "
+        "been it its he she they we you i his her their our my your this that these "
+        "those not no so if then than there here what which who when where how all "
+        "have has had do does did will would can could should said into out up"
+    ),
+    "es": _wordset(
+        "el la los las un una unos unas y o pero de del en con por para que se es son "
+        "era fue está están su sus lo al como más muy ya ellos ellas yo tú él nosotros "
+        "este esta estos estas ese esa hay no sí"
+    ),
+    "fr": _wordset(
+        "le la les un une des et ou mais de du en dans avec pour par que qui se est "
+        "sont était il elle ils elles nous vous je tu ce cette ces son sa ses au aux "
+        "pas ne plus très sur"
+    ),
+    "de": _wordset(
+        "der die das den dem des ein eine einen und oder aber von zu in mit für auf "
+        "ist sind war waren er sie es wir ihr ich du nicht kein auch noch sich wie "
+        "dass im am"
+    ),
+    "pt": _wordset(
+        "o a os as um uma uns umas e ou mas de do da dos das em no na nos nas com por "
+        "para que se é são era foi ele ela eles elas eu você nós seu sua não sim mais "
+        "muito como ao"
+    ),
+}
+LANGUAGE_MIN_TOKENS = 8
+LANGUAGE_MIN_EN_RATIO = 0.15
+LANGUAGE_MAX_NON_LATIN = 0.5
+
+
 class ConfigError(Exception):
     """Bad CLI/env configuration (exit 2)."""
 
@@ -168,6 +219,7 @@ class Config:
     out_dir: Path | None = None
     arbiter_url: str | None = None
     self_check: bool = False
+    self_check_audio: Path = SELF_CHECK_AUDIO
     bench: bool = False
     bench_batches: list[int] = field(default_factory=lambda: [1, 8, 16, 32])
     bench_max_sec: float = DEFAULT_BENCH_MAX_SEC
@@ -254,7 +306,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--self-check",
         action="store_true",
-        help="load the model, transcribe 5 s of silence",
+        help="load the model, transcribe a short English clip, check the text",
+    )
+    p.add_argument(
+        "--self-check-audio",
+        type=Path,
+        default=SELF_CHECK_AUDIO,
+        help="clip for --self-check; expected text in the same path with .txt",
     )
     p.add_argument(
         "--bench",
@@ -348,6 +406,7 @@ def load_config(
         ),
         arbiter_url=(args.arbiter_url or "").rstrip("/") or None,
         self_check=args.self_check,
+        self_check_audio=args.self_check_audio,
         bench=args.bench,
         bench_batches=bench_batches,
         bench_max_sec=args.bench_max_sec,
@@ -657,7 +716,71 @@ def degenerate_reason(text: str, hit_token_limit: bool) -> str | None:
         return "token_limit"
     if has_repetition_loop(text.split()):
         return "repetition"
+    return language_reason(text)
+
+
+def _language_tokens(text: str) -> list[str]:
+    return [
+        t
+        for t in (w.strip(".,;:!?\"'()[]«»¡¿-—").lower() for w in (text or "").split())
+        if t
+    ]
+
+
+def language_scores(text: str) -> dict[str, float]:
+    """Share of tokens that are function words of each language."""
+    toks = _language_tokens(text)
+    if not toks:
+        return {lang: 0.0 for lang in _STOPWORDS}
+    return {
+        lang: round(sum(t in words for t in toks) / len(toks), 3)
+        for lang, words in _STOPWORDS.items()
+    }
+
+
+def language_reason(text: str, min_tokens: int = LANGUAGE_MIN_TOKENS) -> str | None:
+    """'language' when the text does not look like English, else None.
+
+    Mostly non-Latin letters (e.g. Japanese) -> not English. Otherwise, with at
+    least `min_tokens` tokens: English function words under LANGUAGE_MIN_EN_RATIO
+    while another language scores higher -> not English. Shorter text is not
+    judged (a few names or numbers prove nothing).
+    """
+    letters = [c for c in text or "" if c.isalpha()]
+    if letters:
+        non_latin = sum(1 for c in letters if ord(c) > 0x24F) / len(letters)
+        if non_latin > LANGUAGE_MAX_NON_LATIN:
+            return "language"
+    if len(_language_tokens(text)) < min_tokens:
+        return None
+    scores = language_scores(text)
+    en = scores.pop("en")
+    if en < LANGUAGE_MIN_EN_RATIO and max(scores.values()) > en:
+        return "language"
     return None
+
+
+def _wer_words(text: str) -> list[str]:
+    words = []
+    for w in _language_tokens(text):
+        w = "".join(c for c in w if c.isalnum() or c == "'")
+        if w:
+            words.append({"mr": "mister", "mrs": "missus", "dr": "doctor"}.get(w, w))
+    return words
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    """Word-level Levenshtein distance / reference length, case and punctuation ignored."""
+    ref, hyp = _wer_words(reference), _wer_words(hypothesis)
+    if not ref:
+        return 0.0 if not hyp else 1.0
+    prev = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        cur = [i] + [0] * len(hyp)
+        for j, h in enumerate(hyp, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (r != h))
+        prev = cur
+    return round(prev[-1] / len(ref), 3)
 
 
 def max_new_tokens(
@@ -1591,17 +1714,49 @@ def bench(
 
 
 def self_check(
-    cfg: Config, emit: Callable[[str], None] = print
-) -> int:  # pragma: no cover - GPU stack
-    import numpy as np
+    cfg: Config,
+    backend: Backend | None = None,
+    decode: DecodeFn = decode_audio,
+    emit: Callable[[str], None] = print,
+) -> int:
+    """Load the model, transcribe a known English clip, and check the transcript.
 
-    backend = make_backend(cfg)
-    backend.load()
+    Prints one JSON line. Exits 0 when the transcript is English and its WER
+    against the expected text is <= SELF_CHECK_MAX_WER; 6 otherwise; 2 when the
+    clip or its expected text is missing.
+    """
+    audio_path = cfg.self_check_audio
+    text_path = audio_path.with_suffix(".txt")
+    if not audio_path.is_file() or not text_path.is_file():
+        log.error(
+            "self-check clip missing: %s and %s (deploy runner/testdata/ next to pilot.py)",
+            audio_path,
+            text_path,
+        )
+        return EXIT_CONFIG
+    expected = text_path.read_text(encoding="utf-8").strip()
+    if backend is None:  # pragma: no cover - real model
+        backend = make_backend(cfg)
+        backend.load()
+    audio = decode(cfg, audio_path, 0.0, SELF_CHECK_MAX_SEC)
     backend.reset_peak()
-    res = backend.transcribe_batch([np.zeros(5 * SAMPLE_RATE, dtype=np.float32)])[0]
+    res = backend.transcribe_batch([audio])[0]
+    wer = word_error_rate(expected, res.text)
+    lang = language_reason(res.text, min_tokens=4)
+    reason = degenerate_reason(res.text, res.hit_token_limit)
+    passed = lang is None and reason is None and wer <= SELF_CHECK_MAX_WER
     info = backend.info()
-    info["output"] = res.text[:200]
-    info["attn_implementation"] = getattr(backend, "attn_implementation", None)
+    info.update(
+        clip=str(audio_path),
+        expected=expected,
+        output=res.text[:500],
+        wer=wer,
+        max_wer=SELF_CHECK_MAX_WER,
+        language_scores=language_scores(res.text),
+        degenerate_reason=reason or lang,
+        passed=passed,
+        attn_implementation=getattr(backend, "attn_implementation", None),
+    )
     for name, binary in (("ffmpeg", cfg.ffmpeg_bin), ("ffprobe", cfg.ffprobe_bin)):
         try:
             out = subprocess.run(
@@ -1614,8 +1769,8 @@ def self_check(
             )
         except OSError:
             info[name] = None
-    emit(json.dumps(info))
-    return EXIT_OK
+    emit(json.dumps(info, ensure_ascii=False))
+    return EXIT_OK if passed else EXIT_SELF_CHECK_FAILED
 
 
 def run(
