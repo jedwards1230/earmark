@@ -1870,11 +1870,11 @@ CREATE TABLE pilot_transcripts (
     model_id                 TEXT        NOT NULL,   -- HF model id
     model_revision           TEXT        NOT NULL,   -- HF commit sha
     scope                    TEXT        NOT NULL DEFAULT 'full' CHECK (scope IN ('full', 'findings')),
-    window_sec               REAL,
+    window_sec               DOUBLE PRECISION,
     has_word_times           BOOLEAN     NOT NULL,
     segments                 JSONB       NOT NULL CHECK (jsonb_typeof(segments) = 'array'),  -- §1.2.1 shape
     raw_text                 TEXT        NOT NULL,
-    audio_sec REAL, wall_sec REAL, rtfx REAL,         -- rtfx = audio_sec / wall_sec
+    audio_sec DOUBLE PRECISION, wall_sec DOUBLE PRECISION, rtfx DOUBLE PRECISION,  -- rtfx = audio_sec / wall_sec
     peak_vram_mib INTEGER, peak_reserved_mib INTEGER, -- torch max allocated / reserved, per track
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (file_path, model_id, model_revision, scope)
@@ -1885,7 +1885,7 @@ CREATE TABLE finding_asr_votes (
     pilot_transcript_id BIGINT      NOT NULL REFERENCES pilot_transcripts (id) ON DELETE CASCADE,
     model_id            TEXT        NOT NULL,
     chunk_text_sha256   TEXT,                        -- the chunk revision voted against
-    span_start_sec REAL, span_end_sec REAL,          -- the span's production word times
+    span_start_sec DOUBLE PRECISION, span_end_sec DOUBLE PRECISION,  -- the span's production word times (float8: float4 is ~4 ms coarse 10 h in)
     vote                TEXT        NOT NULL CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable', 'style_only')),
     heard_text          TEXT,                        -- as the pilot wrote it (case + punctuation kept)
     detail              JSONB       NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(detail) = 'object'),
@@ -1909,7 +1909,11 @@ CREATE TABLE finding_asr_votes (
   the findings and deletes the production transcript. `ON DELETE CASCADE`
   then deletes that track's pilot transcripts **and their votes**. They are
   not archived, because a pilot measured against text that no longer exists
-  measures nothing. Re-run the pilot after the new transcript lands. A
+  measures nothing. **`earmark requeue` prints a warning with the number of
+  pilot transcripts and votes it will delete** (`db.PilotRowsForJobs`), in the
+  preview and before `--yes` applies, so they can be backed up first. The
+  dashboard's requeue buttons do not warn. Re-run the pilot after the new
+  transcript lands. A
   finding's votes are deleted with the finding.
 - **Reads are bounded.**
   - Metadata comes in pages of ≤ 100 (`db.PilotTranscripts`).
@@ -1963,9 +1967,12 @@ The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
 
    Those tokens are aligned with the production tokens of the same time range
    by a **Myers O((N+M)·D) diff**. It is cheap for 540 s windows of ~1500
-   words, with at most 5000 tokens a side and 1500 differing tokens
-   (`window_too_large`). The pilot tokens between the nearest exactly agreeing
-   words left and right of the span are what it heard. The method is
+   words, with at most 5000 tokens a side (`window_too_large`) and 1500
+   differing tokens (`align_too_different`). The pilot tokens between the
+   nearest exactly agreeing words left and right of the span are what it
+   heard. A side with no agreeing word is bounded by the span's own columns,
+   widened past adjacent pilot-only columns ("bell rose" heard for
+   "belrose"). The method is
    `segment_align` or `time_align`. A pilot with word times and no agreeing
    neighbour falls back to its words with a midpoint in `[t0, t1]`
    (`time_only`).
@@ -1986,8 +1993,9 @@ The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
 6. **Style-only corrections** are counted apart. These are corrections that
    change only case or punctuation, or a spelling variant: a listed pair such
    as grey/gray, a British/American suffix (colour/color, realise/realize,
-   centre/center, travelled/traveled, defence/defense), or one edit in words
-   of at most 4 letters. Their vote is `style_only`, what was heard goes in
+   centre/center, travelled/traveled, defence/defense). There is no generic
+   short-word edit rule: pain/pan, mail/male and ned/ted are real
+   substitutions and are voted on normally. Their vote is `style_only`, what was heard goes in
    `detail.style_vote`, and `detail.style_only`/`vote_method`
    (`style_case_sensitive`, `style_variant`) are set. A `style_only` vote is
    **never** counted as agreement on the word.
@@ -1998,7 +2006,8 @@ The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
    - segments: `chunk_not_in_segments`, `segments_do_not_reproduce_chunk`,
      `span_has_no_words`, `no_timing`
    - pilot: `pilot_no_coverage` (the pilot did not transcribe that window),
-     `window_too_large`
+     `window_too_large`, `align_too_different` (the window's texts differ in
+     more than 1500 tokens, too little in common to place the span)
 
 `detail` also carries the window (`window_start`/`window_end`), the
 production span text, which sides were anchored, up to 40 aligned

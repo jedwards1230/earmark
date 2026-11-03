@@ -151,8 +151,8 @@ type Detail struct {
 	SimReplacement *float64    `json:"sim_replacement,omitempty"`
 	// VoteMethod is how the texts were compared: "normalized", or for a
 	// style-only correction "style_case_sensitive" (differs only in case or
-	// punctuation) / "style_variant" (a spelling variant: grey/gray,
-	// colour/color, or one edit in a word of at most 4 letters). StyleOnly
+	// punctuation) / "style_variant" (a listed spelling variant: grey/gray,
+	// colour/color, realise/realize, …). StyleOnly
 	// marks those, so a later recipe can leave them out.
 	VoteMethod string `json:"vote_method,omitempty"`
 	StyleOnly  bool   `json:"style_only,omitempty"`
@@ -401,6 +401,11 @@ func (p *Pilot) heard(prod []Token, first, last int, t0, t1 float64, d *Detail) 
 	}
 	pn, qn := norms(window), norms(cand)
 	pairs := Align(pn, qn)
+	if pairs == nil {
+		// The window's texts differ in more than MaxAlignEdits tokens: too
+		// little in common to place the span.
+		return nil, "align_too_different"
+	}
 	a, b := first-wlo, last-wlo
 	lo, hi, anchored := gap(pairs, a, b, pn, qn)
 	d.Anchored = anchored
@@ -444,12 +449,18 @@ func gap(pairs []Pair, a, b int, pn, qn []string) (lo, hi int, anchored string) 
 			hi, right = k, true
 		}
 	}
+	// An unanchored side is bounded by the span's own columns, widened past
+	// adjacent pilot-only columns: "bell rose" heard for "belrose" aligns as
+	// (-, bell) (belrose, rose), and "bell" belongs to the span.
 	if !left {
 		for k, pr := range pairs {
 			if pr.A >= a {
 				lo = k - 1
 				break
 			}
+		}
+		for lo >= 0 && pairs[lo].A < 0 {
+			lo--
 		}
 	}
 	if !right {
@@ -458,6 +469,9 @@ func gap(pairs []Pair, a, b int, pn, qn []string) (lo, hi int, anchored string) 
 				hi = k + 1
 				break
 			}
+		}
+		for hi < len(pairs) && pairs[hi].A < 0 {
+			hi++
 		}
 	}
 	switch {
@@ -563,8 +577,9 @@ func decideVote(heard []Token, original, replacement string, cased bool, d *Deta
 // spellingVariant reports whether two normalised texts differ only by
 // spelling variants, word for word: a listed variant pair (grey/gray), a
 // British/American suffix (colour/color, realise/realize, centre/center,
-// travelled/traveled, defence/defense, catalogue/catalog), or one edit in
-// words of at most 4 letters. At least one word must differ.
+// travelled/traveled, defence/defense, catalogue/catalog). There is no
+// generic short-word edit rule: pain/pan, mail/male, ned/ted are real
+// substitutions. At least one word must differ.
 func spellingVariant(a, b string) bool {
 	wa, wb := strings.Fields(a), strings.Fields(b)
 	if len(wa) != len(wb) || a == b {
@@ -602,8 +617,7 @@ func wordVariant(x, y string) bool {
 			}
 		}
 	}
-	rx, ry := []rune(x), []rune(y)
-	return len(rx) <= 4 && len(ry) <= 4 && levenshtein(rx, ry) == 1
+	return false
 }
 
 func compact(s string) string { return strings.ReplaceAll(s, " ", "") }

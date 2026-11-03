@@ -326,3 +326,24 @@ func TestReport(t *testing.T) {
 		t.Error("--format xml must fail")
 	}
 }
+
+// TestReportPairsCountATrackOnce: model X has both scopes on a track, Y only
+// full — the pair table holds one full-scope row with that track once.
+func TestReportPairsCountATrackOnce(t *testing.T) {
+	f := newFake()
+	f.pilots = append(f.pilots,
+		db.PilotTranscript{ID: 2, FilePath: "/books/Wilde/Dorian Gray/01.m4b", ProductionTranscriptID: tid,
+			ModelID: "granite", ModelRevision: "r1", Scope: db.PilotScopeFindings, HasWordTimes: true},
+		db.PilotTranscript{ID: 3, FilePath: "/books/Wilde/Dorian Gray/01.m4b", ProductionTranscriptID: tid,
+			ModelID: "canary", ModelRevision: "r9", Scope: db.PilotScopeFull})
+	f.pSegs[2] = []db.PilotSegment{pseg(3, "The portrait of Dorian Gray hung there.")}
+	f.pSegs[3] = f.pSegs[1]
+	rep, err := buildReport(context.Background(), f, f.pilots, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Cross) != 1 || rep.Cross[0].Tracks != 1 || rep.Cross[0].Scope != db.PilotScopeFull ||
+		rep.Cross[0].RefWords != 12 || rep.Cross[0].WERScope != "full" {
+		t.Errorf("cross = %+v, want one full row counting the track once", rep.Cross)
+	}
+}

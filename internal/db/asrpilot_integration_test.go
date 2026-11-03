@@ -105,7 +105,7 @@ func TestIntegrationASRPilot(t *testing.T) {
 		var id int64
 		if err := d.pool.QueryRow(ctx, `INSERT INTO pilot_transcripts (file_path, production_transcript_id, backend,
 			model_id, model_revision, scope, has_word_times, segments, raw_text, audio_sec, wall_sec, rtfx, peak_vram_mib, peak_reserved_mib)
-			VALUES ($1, $2, 'canary', $3, 'rev1', $4, false, $5::jsonb, 'x', 5, 1, 5, 9000, 12000) RETURNING id`,
+			VALUES ($1, $2, 'canary', $3, 'rev1', $4, false, $5::jsonb, 'x', 5, 1, 5.1, 9000, 12000) RETURNING id`,
 			path, tID, model, scope, segs).Scan(&id); err != nil {
 			t.Fatalf("insert pilot %s/%s: %v", model, scope, err)
 		}
@@ -130,7 +130,8 @@ func TestIntegrationASRPilot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(list) != 2 || list[0].ID != full || list[0].ProductionTranscriptID != tID || list[0].Scope != "full" ||
-		*list[0].RTFx != 5 || *list[0].PeakVRAMMiB != 9000 || list[1].Scope != "findings" {
+		*list[0].RTFx != 5.1 || // float8: exact, not 5.0999999
+		*list[0].PeakVRAMMiB != 9000 || list[1].Scope != "findings" {
 		t.Errorf("pilots = %+v", list)
 	}
 	if l, _ := d.PilotTranscripts(ctx, PilotFilter{BookDirs: []string{"/elsewhere"}, Limit: 10}); len(l) != 0 {
@@ -141,7 +142,7 @@ func TestIntegrationASRPilot(t *testing.T) {
 		t.Errorf("pilot segments = %+v, %v (words without times must decode with nil Start)", ps, err)
 	}
 
-	t0, t1 := 3.0, 4.5
+	t0, t1 := 36000.123, 36001.457 // 10 h in: float4 would round to ~4 ms
 	detail, _ := json.Marshal(map[string]any{"rule": "asr_vote@v1"})
 	vote := func(pilot int64, model, v string) FindingASRVote {
 		return FindingASRVote{FindingID: held, PilotTranscriptID: pilot, ModelID: model, ChunkTextSHA256: sha,
@@ -155,6 +156,13 @@ func TestIntegrationASRPilot(t *testing.T) {
 	}
 	if n := countRows(t, conn, `SELECT count(*) FROM finding_asr_votes`); n != 2 {
 		t.Errorf("%d vote rows after re-upsert, want 2", n)
+	}
+	var gotT0 float64
+	if err := conn.QueryRow(ctx, `SELECT span_start_sec FROM finding_asr_votes WHERE pilot_transcript_id = $1`, full).Scan(&gotT0); err != nil || gotT0 != t0 {
+		t.Errorf("span_start_sec = %v, want %v exactly (%v)", gotT0, t0, err)
+	}
+	if pt, pv, err := d.PilotRowsForJobs(ctx, []string{jobOf(t, d, tID)}); err != nil || pt != 3 || pv != 2 {
+		t.Errorf("PilotRowsForJobs = %d, %d, %v; want the 3 pilot transcripts and 2 votes a requeue would delete", pt, pv, err)
 	}
 	var gotDetail string
 	if err := conn.QueryRow(ctx, `SELECT detail->>'rule' FROM finding_asr_votes WHERE pilot_transcript_id = $1`, full).Scan(&gotDetail); err != nil || gotDetail != "asr_vote@v1" {

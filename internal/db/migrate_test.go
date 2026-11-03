@@ -623,6 +623,15 @@ func TestASRPilotMigration(t *testing.T) {
 	if strings.Contains(upper, "ALTER TABLE") || strings.Contains(upper, "FINDING_EVENTS") {
 		t.Error("00017 must not alter an existing table or touch finding_events")
 	}
+	lk := strings.Index(down, "LOCK TABLE pilot_transcripts, finding_asr_votes IN ACCESS EXCLUSIVE MODE;")
+	if dk := strings.Index(down, "DO $$"); lk < 0 || dk < lk {
+		t.Error("00017 Down must lock the pilot tables before the refusal check (no row may land between count and drop)")
+	}
+	for _, col := range []string{"window_sec", "audio_sec", "wall_sec", "rtfx", "span_start_sec", "span_end_sec"} {
+		if !strings.Contains(up, col+" DOUBLE PRECISION") {
+			t.Errorf("00017 %s must be DOUBLE PRECISION (float4 is ~4 ms coarse on a 10 h track)", col)
+		}
+	}
 	for _, want := range []string{
 		"SET LOCAL lock_timeout = '5s'",
 		"refusing to roll back migration 17",

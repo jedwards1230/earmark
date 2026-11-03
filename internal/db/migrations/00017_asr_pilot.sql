@@ -12,7 +12,10 @@
 --     pilot must never trigger. production_transcript_id names the
 --     production transcript the pilot ran against, ON DELETE CASCADE: a
 --     requeue deletes that transcript, and a pilot measured against text that
---     no longer exists measures nothing. scope 'full' is the whole track;
+--     no longer exists measures nothing. The pilot rows and their votes are
+--     NOT archived (they are GPU hours, but reproducible from the audio);
+--     `earmark requeue` prints how many it will delete before it runs, so
+--     back them up first if they matter. scope 'full' is the whole track;
 --     'findings' is only the windows around held findings (segments carry
 --     absolute track times, audio_sec is the sum of the window lengths).
 --     has_word_times is false for a model that emits segment times only;
@@ -50,14 +53,14 @@ CREATE TABLE pilot_transcripts (
     model_revision           TEXT        NOT NULL,
     scope                    TEXT        NOT NULL DEFAULT 'full'
                              CONSTRAINT pilot_transcripts_scope_valid CHECK (scope IN ('full', 'findings')),
-    window_sec               REAL,
+    window_sec               DOUBLE PRECISION,
     has_word_times           BOOLEAN     NOT NULL,
     segments                 JSONB       NOT NULL
                              CONSTRAINT pilot_transcripts_segments_array CHECK (jsonb_typeof(segments) = 'array'),
     raw_text                 TEXT        NOT NULL,
-    audio_sec                REAL,
-    wall_sec                 REAL,
-    rtfx                     REAL,
+    audio_sec                DOUBLE PRECISION,
+    wall_sec                 DOUBLE PRECISION,
+    rtfx                     DOUBLE PRECISION,
     peak_vram_mib            INTEGER,
     peak_reserved_mib        INTEGER,
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -72,8 +75,8 @@ CREATE TABLE finding_asr_votes (
     pilot_transcript_id BIGINT      NOT NULL REFERENCES pilot_transcripts (id) ON DELETE CASCADE,
     model_id            TEXT        NOT NULL,
     chunk_text_sha256   TEXT,
-    span_start_sec      REAL,
-    span_end_sec        REAL,
+    span_start_sec      DOUBLE PRECISION,
+    span_end_sec        DOUBLE PRECISION,
     vote                TEXT        NOT NULL
                         CONSTRAINT finding_asr_votes_vote_valid
                         CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable', 'style_only')),
@@ -93,6 +96,9 @@ CREATE INDEX finding_asr_votes_model_idx ON finding_asr_votes (model_id, vote);
 -- sets earmark.allow_data_loss = 'on' (14's guard). finding_asr_votes is
 -- recomputable from it and goes with it.
 SET LOCAL lock_timeout = '5s';
+-- Locked before the count, so no row pilot.py commits can land between the
+-- check and the DROP.
+LOCK TABLE pilot_transcripts, finding_asr_votes IN ACCESS EXCLUSIVE MODE;
 
 -- +goose StatementBegin
 DO $$

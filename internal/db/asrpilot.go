@@ -105,27 +105,17 @@ func pilotTranscripts(ctx context.Context, q rowQuerier, f PilotFilter) ([]Pilot
 	var out []PilotTranscript
 	for rows.Next() {
 		var p PilotTranscript
-		var window, audio, wall, rtfx *float32
 		if err := rows.Scan(&p.ID, &p.FilePath, &p.ProductionTranscriptID, &p.Backend, &p.ModelID,
-			&p.ModelRevision, &p.Scope, &window, &p.HasWordTimes, &audio, &wall, &rtfx,
+			&p.ModelRevision, &p.Scope, &p.WindowSec, &p.HasWordTimes, &p.AudioSec, &p.WallSec, &p.RTFx,
 			&p.PeakVRAMMiB, &p.PeakReservedMiB, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("pilot transcripts: scan: %w", err)
 		}
-		p.WindowSec, p.AudioSec, p.WallSec, p.RTFx = f64(window), f64(audio), f64(wall), f64(rtfx)
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("pilot transcripts: %w", err)
 	}
 	return out, nil
-}
-
-func f64(v *float32) *float64 {
-	if v == nil {
-		return nil
-	}
-	x := float64(*v)
-	return &x
 }
 
 // PilotSegments returns the segments of one pilot transcript (nil when the
@@ -428,4 +418,24 @@ func (db *DB) PilotVotePairs(ctx context.Context, bookDirs []string) ([]PilotVot
 		return nil, fmt.Errorf("pilot vote pairs: %w", err)
 	}
 	return out, nil
+}
+
+var pilotRowsForJobsSQL = `
+	SELECT count(DISTINCT p.id), count(v.id)
+	  FROM transcripts t
+	  JOIN pilot_transcripts p ON p.production_transcript_id = t.id
+	  LEFT JOIN finding_asr_votes v ON v.pilot_transcript_id = p.id
+	 WHERE t.job_id = ANY($1::uuid[])`
+
+// PilotRowsForJobs counts the pilot transcripts and asr votes a requeue of
+// these jobs would delete: they cascade from the production transcript and
+// are not archived (CONTRACT §1.11). An aggregate.
+func (db *DB) PilotRowsForJobs(ctx context.Context, jobIDs []string) (transcripts, votes int64, err error) {
+	if len(jobIDs) == 0 {
+		return 0, 0, nil
+	}
+	if err := db.pool.QueryRow(ctx, pilotRowsForJobsSQL, jobIDs).Scan(&transcripts, &votes); err != nil {
+		return 0, 0, fmt.Errorf("pilot rows for jobs: %w", err)
+	}
+	return transcripts, votes, nil
 }

@@ -1,6 +1,7 @@
 package asrpilot
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -374,7 +375,8 @@ func TestVoteStyleOnly(t *testing.T) {
 		want bool
 	}{
 		{"realise", "realize", true}, {"centre", "center", true}, {"travelled", "traveled", true},
-		{"cath", "kath", true}, {"basil", "hazel", false}, {"grey", "grey", false}, {"lord basil", "lord", false},
+		{"cath", "kath", false}, {"pain", "pan", false}, {"mail", "male", false}, {"ann", "anne", false},
+		{"basil", "hazel", false}, {"grey", "grey", false}, {"lord basil", "lord", false},
 	} {
 		if got := spellingVariant(tt.a, tt.b); got != tt.want {
 			t.Errorf("spellingVariant(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
@@ -393,6 +395,41 @@ func TestVoteWindowTooLarge(t *testing.T) {
 	}
 	got := Vote(NewTrack(segs), finding(chunkOf(segs), "dorian gravy", "dorian gray"), NewPilot([]db.PilotSegment{ps}, true))
 	if got.Vote != VoteUnmappable || got.Detail.Reason != "window_too_large" {
+		t.Fatalf("got %s %q", got.Vote, got.Detail.Reason)
+	}
+}
+
+// TestVoteUnanchoredSideKeepsPilotOnlyColumns: with no agreed word on the
+// left, the pilot-only column next to the span still belongs to it —
+// "bell rose" heard for "belrose".
+func TestVoteUnanchoredSideKeepsPilotOnlyColumns(t *testing.T) {
+	segs := []db.Segment{prodSeg(0, 0, "belrose hung there")}
+	got := Vote(NewTrack(segs), finding(chunkOf(segs), "belrose", "bell rose"),
+		NewPilot([]db.PilotSegment{timedPilot(0, "Bell rose hung there.")}, true))
+	if got.Vote != VoteHeardReplacement || got.HeardText != "Bell rose" || got.Detail.Anchored != "right" {
+		t.Fatalf("got %s heard %q %+v", got.Vote, got.HeardText, got.Detail)
+	}
+}
+
+// TestVoteAlignTooDifferent: a window whose texts share too little to align
+// is unmappable, not "nothing heard".
+func TestVoteAlignTooDifferent(t *testing.T) {
+	var segs []db.Segment
+	var pilot []string
+	for k := range 100 {
+		words := make([]string, 10)
+		for i := range words {
+			words[i] = fmt.Sprintf("p%d", k*10+i)
+			pilot = append(pilot, fmt.Sprintf("q%d", k*10+i))
+		}
+		segs = append(segs, prodSeg(k, float64(k)*5, strings.Join(words, " ")))
+	}
+	segs[50].Text = "x dorian gravy y z w v u t s"
+	segs[50] = prodSeg(50, 250, segs[50].Text)
+	f := finding(segs[50].Text, "dorian gravy", "dorian gray")
+	f.ChunkStartSec = 250
+	got := Vote(NewTrack(segs), f, NewPilot([]db.PilotSegment{untimedPilot(0, 500, strings.Join(pilot, " "))}, false))
+	if got.Vote != VoteUnmappable || got.Detail.Reason != "align_too_different" {
 		t.Fatalf("got %s %q", got.Vote, got.Detail.Reason)
 	}
 }
