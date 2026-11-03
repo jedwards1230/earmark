@@ -87,12 +87,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        # test_runner.py imports only stdlib + psycopg2 (no torch/NeMo), so the
-        # GPU runtime stack is not needed to run the suite.
+        # test_runner.py and test_pilot.py import only stdlib + psycopg2 (no
+        # torch/NeMo/transformers), so the GPU runtime stack is not needed.
         run: pip install psycopg2-binary pytest
 
       - name: Run runner unit tests
-        run: python -m pytest runner/test_runner.py -v
+        run: python -m pytest runner/test_runner.py runner/test_pilot.py -v
 
   lint:
     name: Lint
