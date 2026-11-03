@@ -220,7 +220,10 @@ Ingress, a Prometheus `PodMonitor`, and optionally a CloudNativePG PostgreSQL cl
 (`cnpg.enabled`), 1Password `OnePasswordItem` secrets (`secrets.enabled`), and an
 `earmark-eval-backfill` CronJob (`evalBackfill.enabled`, off by default) that runs
 `earmark eval --backfill-unevaluated --write --limit N` on a schedule — the judging pass for
-decoupled mode (`config.evalInPipeline: false`). It reuses the Deployments' image, env
+decoupled mode (`config.evalInPipeline: false`) — and an `earmark-batch` CronJob
+(`batch.enabled`, off by default) that runs the `earmark batch` GPU time-sharing coordinator on
+a schedule (`concurrencyPolicy: Forbid` plus an advisory lock, so a second run exits 0
+untouched). Both reuse the Deployments' image, env
 (`AI_ENDPOINTS`/`AI_ROLES`, the gateway key), security contexts and node placement. The books
 directory is expected as an existing `ReadOnlyMany` PVC named by `booksPvcName`.
 [`values.yaml`](deploy/helm/earmark/values.yaml) documents every key inline.

@@ -276,8 +276,9 @@ evalBackfill:
   extraEnv: []
   # Forbid: never start a run while the previous one is still judging.
   concurrencyPolicy: Forbid
-  # Seconds after a missed schedule a run may still start; null omits the field
-  # (no deadline). Also stops the controller giving up after 100 missed runs.
+  # Seconds after a missed schedule a run may still start (>= 10, schema-checked:
+  # the controller polls every 10 s); null omits the field (no deadline). Also
+  # stops the controller giving up after 100 missed runs.
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -301,6 +302,84 @@ evalBackfill:
     limits:
       cpu: 500m
       memory: 512Mi
+
+# `earmark batch` coordinator CronJob (CONTRACT §1.4): runs the pipeline in
+# transcribe→analyze batches so the ASR runner and the eval judge time-share one
+# GPU, then exits once no pending job remains (or after maxBatches). It only
+# flips runner_control.phase/run_limit and reads queue status — the external
+# ASR runner does the transcribing. Every exit, SIGTERM included, restores
+# phase=idle and the pre-batch run_limit.
+#
+# Single instance: concurrencyPolicy is fixed at Forbid (not a value), and the
+# coordinator takes a Postgres advisory lock — a second run started any other
+# way logs that and exits 0 without touching runner_control.
+#
+# Shares the Deployments' image, env (earmark.commonEnv), security contexts,
+# nodeSelector and tolerations, and the model registry mount when config.models
+# is set (MODELS_FILE must resolve). No books volume. Disabled by default.
+batch:
+  enabled: false
+  # Standard five-field cron, read in timeZone (or the controller's zone, UTC
+  # on k3s, when timeZone is null).
+  schedule: "0 3 * * *"
+  # IANA zone for schedule (e.g. America/New_York); null omits the field.
+  timeZone: null
+  # Pause scheduling without deleting the CronJob (or its history).
+  suspend: false
+  # --batch-size: jobs transcribed per batch (Phase A run_limit). >= 1.
+  batchSize: 10
+  # --max-batches: stop after N batches. 0 = until the queue drains (the flag
+  # is omitted); size activeDeadlineSeconds to match.
+  maxBatches: 0
+  # --phase-timeout: give up a Phase A after this long WITHOUT PROGRESS (Go
+  # duration, e.g. "3h"; "0" = unbounded). Progress = any change in the
+  # pending/claimed/done/failed counts or the run budget, so a long batch that
+  # keeps transcribing is never cut off; a runner that claims nothing — its host
+  # asleep, the service down — makes the run restore idle and fail instead of
+  # waiting out activeDeadlineSeconds. null omits the flag (the CLI default, 3h).
+  phaseTimeout: null
+  # Full gpu-arbiter /status URL (http://<gpu-host>:48750/status) → GPU_ARBITER_URL,
+  # so each batch waits out a game first. Must end in /status: the coordinator
+  # GETs it verbatim, and a bare base URL would read as "unreachable" and
+  # silently skip the game-yield. Empty = no game-yield (logged once per run).
+  gpuArbiterUrl: ""
+  # Extra `earmark batch` flags appended after the built-in ones, e.g.
+  # ["--poll-interval", "30s"] or ["--already-running-exit-code", "75"].
+  extraArgs: []
+  # Extra env vars (core/v1 EnvVar list) appended after the shared env.
+  # ADDITIONS ONLY: a name the shared env already sets, or GPU_ARBITER_URL
+  # (set from gpuArbiterUrl), fails the render.
+  extraEnv: []
+  # Seconds after a missed schedule a run may still start (>= 10: the CronJob
+  # controller checks schedules every 10 s, so less can skip runs); null omits.
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # 0: a failed run is not retried in-place — the coordinator is resumable, so
+  # the next scheduled run reconciles from runner_control and carries on.
+  backoffLimit: 0
+  # Hard wall-clock cap per run (a big backlog takes many batches). On expiry
+  # the pod gets SIGTERM and restores idle. Keep it below the schedule
+  # interval; null omits.
+  activeDeadlineSeconds: 21600
+  # Must outlast the SIGTERM cleanup, worst case 55 s: restore idle (30 s, incl.
+  # the successor lookup) + heartbeat join (an in-flight check, 10 s) + unlock
+  # (10 s) + closing an unconfirmed session (5 s). Schema minimum 75 (20 s
+  # headroom for process exit and scheduling).
+  terminationGracePeriodSeconds: 90
+  # Garbage-collect finished Jobs after a day; null omits (history limits only).
+  ttlSecondsAfterFinished: 86400
+  # Annotations for the Job pods only (podAnnotations above is NOT applied: its
+  # Velero hooks name volumes these pods don't have). podLabels IS applied.
+  podAnnotations: {}
+  # The coordinator only polls Postgres every few seconds.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
 
 # Schedule on amd64 nodes only.
 nodeSelector:

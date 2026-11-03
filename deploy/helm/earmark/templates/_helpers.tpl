@@ -88,6 +88,14 @@ suffix to Job names, which must stay within 63.
 {{- end }}
 
 {{/*
+batch component: name of the `earmark batch` CronJob. Truncated to 52 chars for
+the same reason as earmark.evalBackfill.name (the Job-name timestamp suffix).
+*/}}
+{{- define "earmark.batch.name" -}}
+{{- printf "%s-batch" (include "earmark.fullname" .) | trunc 52 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Config checksum annotation — roll pods when ConfigMap/env config changes.
 Pass the entire .Values.config as the checksum source.
 */}}

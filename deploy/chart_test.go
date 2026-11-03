@@ -398,7 +398,7 @@ func keys(m map[string]map[string]any) []string {
 }
 
 // podSpecs returns every pod spec that renders earmark.commonEnv: both
-// Deployments and, when enabled, the evalBackfill CronJob.
+// Deployments and, when enabled, the evalBackfill and batch CronJobs.
 func podSpecs(t *testing.T, docs map[string]map[string]any) map[string]any {
 	t.Helper()
 	out := map[string]any{}
@@ -439,7 +439,7 @@ func hasNamed(t *testing.T, v any, name string) map[string]any {
 // TestModelsFileOffByDefault: no config.models → no ConfigMap, no MODELS_FILE,
 // no mount anywhere (the pods run with an empty registry).
 func TestModelsFileOffByDefault(t *testing.T) {
-	docs := render(t, "evalBackfill.enabled=true")
+	docs := render(t, "evalBackfill.enabled=true", "batch.enabled=true")
 	assert.NotContains(t, keys(docs), "ConfigMap/earmark-models")
 	for k, spec := range podSpecs(t, docs) {
 		c := dig(t, spec, "containers", 0)
@@ -456,6 +456,8 @@ func TestModelsFileOffByDefault(t *testing.T) {
 func TestModelsFileWiredToEveryPod(t *testing.T) {
 	docs := render(t,
 		"evalBackfill.enabled=true",
+		// batch never calls a model, but LoadConfig fails on an unmounted MODELS_FILE.
+		"batch.enabled=true",
 		"config.models.steps.propose.expected_model=anthropic/claude-haiku-4-5-20251001",
 		"config.models.steps.propose.revision=r20251001",
 	)
@@ -466,7 +468,7 @@ func TestModelsFileWiredToEveryPod(t *testing.T) {
 	assert.Equal(t, "anthropic/claude-haiku-4-5-20251001", dig(t, file, "steps", "propose", "expected_model"))
 
 	specs := podSpecs(t, docs)
-	require.Len(t, specs, 3, "want both Deployments and the CronJob; got %v", keys(docs))
+	require.Len(t, specs, 4, "want both Deployments and both CronJobs; got %v", keys(docs))
 	for k, spec := range specs {
 		c := dig(t, spec, "containers", 0)
 		v, set := envValue(t, c, "MODELS_FILE")

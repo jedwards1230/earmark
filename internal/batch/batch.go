@@ -79,6 +79,85 @@ type EventSink interface {
 	AppendEvent(ctx context.Context, e db.PipelineEvent) error
 }
 
+// Locker admits one coordinator at a time (CONTRACT §1.4, "Single instance").
+// cmd/batch adapts *db.DB to it (a session-scoped pg_try_advisory_lock held on
+// a dedicated pooled connection for the whole run).
+//
+// TryBatchLock must not wait: acquired=false (err nil) means another
+// coordinator holds the lock.
+type Locker interface {
+	TryBatchLock(ctx context.Context) (lock Lock, acquired bool, err error)
+}
+
+// Lock is a held coordinator lock. Check reports whether it is still held (a
+// session lock dies silently with its connection); Run calls it every
+// PollInterval from a heartbeat goroutine. Release is called once the run's
+// restore-idle cleanup has finished, and may be called more than once. Check
+// and Release may be called from different goroutines.
+//
+// Successor answers the question the exit cleanup needs: does ANOTHER session
+// now hold the lock? true = a successor may own runner_control (skip the
+// restore); false = the lock is still ours or free (restoring is safe); an
+// error is inconclusive. It must not depend on the lock's own session, which
+// is typically the thing that died.
+type Lock interface {
+	Check(ctx context.Context) error
+	Successor(ctx context.Context) (bool, error)
+	Release() error
+}
+
+// ErrAlreadyRunning is returned by Run when Options.Lock reports another
+// coordinator holds the lock. Run returns it BEFORE any runner_control read or
+// write: the loser must not swap run_limit or restore idle, either of which
+// would clobber the live coordinator's batch. Callers pick the exit code (a
+// scheduled run treats it as a clean no-op).
+var ErrAlreadyRunning = errors.New("another earmark batch coordinator is running")
+
+// ErrLockLost is returned (wrapping the heartbeat's error) when the lock
+// heartbeat fails mid-run: the run is no longer protected against a second
+// coordinator, so it stops — restoring idle as on any exit — and fails.
+var ErrLockLost = errors.New("batch lock lost mid-run")
+
+// ErrPhaseTimeout is returned when a Phase A makes no progress (the queue
+// snapshot does not change) for Options.PhaseTimeout — typically the ASR
+// runner is down or its host asleep, so nothing is claimed and the batch would
+// otherwise wait until the Job's activeDeadlineSeconds.
+var ErrPhaseTimeout = errors.New("transcribe phase timed out")
+
+// lockCheckTimeout bounds one heartbeat round-trip.
+const lockCheckTimeout = 10 * time.Second
+
+// successorAttempts / successorBackoff: the exit cleanup's holder lookup is
+// retried on an inconclusive (error) answer before falling back to restoring.
+// Package vars so tests can shorten the backoff.
+var (
+	successorAttempts = 3
+	successorBackoff  = time.Second
+)
+
+// successorTakeover decides whether the exit cleanup must skip its restore.
+// Only a definitive "another session holds the lock" skips it. An answer that
+// stays inconclusive after successorAttempts restores anyway (with a warning):
+// a successor needs a fresh schedule or a manual run, while a skipped restore
+// leaves the ASR runner budget-gated until the next coordinator — and if the
+// database is truly unreachable the restore writes fail and log as before.
+func successorTakeover(ctx context.Context, p func(string, ...any), lock Lock) bool {
+	for attempt := 1; ; attempt++ {
+		other, err := lock.Successor(ctx)
+		if err == nil {
+			return other
+		}
+		if attempt >= successorAttempts {
+			p("WARNING: could not tell whether another coordinator holds the batch lock (%v) — restoring idle anyway.\n", err)
+			return false
+		}
+		if serr := sleep(ctx, successorBackoff*time.Duration(attempt)); serr != nil {
+			p("WARNING: holder lookup interrupted (%v) — restoring idle anyway.\n", serr)
+			return false
+		}
+	}
+}
+
 // nopSink discards events. Used as the default when no sink is injected so the
 // coordinator core never needs a nil check.
 type nopSink struct{}
@@ -145,6 +224,13 @@ type Options struct {
 	// false (default) Phase B completes when only the embed backlog reaches 0,
 	// preserving today's behavior. CONTRACT §1.4, §2.4.
 	EvalGatesEmbed bool
+	// Lock, when set, admits a single coordinator (CONTRACT §1.4). nil runs
+	// unguarded (unit tests; a caller that serialises runs itself).
+	Lock Locker
+	// PhaseTimeout bounds how long a Phase A may go WITHOUT PROGRESS (no change
+	// in pending/claimed/done/failed/run_limit). 0 = unbounded. On expiry Run
+	// returns ErrPhaseTimeout (after restoring idle).
+	PhaseTimeout time.Duration
 }
 
 const (
@@ -170,6 +256,9 @@ func (o *Options) normalize() error {
 	}
 	if o.Sink == nil {
 		o.Sink = nopSink{}
+	}
+	if o.PhaseTimeout < 0 {
+		return fmt.Errorf("phase timeout must be >= 0, got %s", o.PhaseTimeout)
 	}
 	return nil
 }
@@ -199,15 +288,94 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	defer stop()
 	ctx = sigCtx
 
+	// Single instance: take the lock before ANY runner_control access, and
+	// defer its release BEFORE the restore-idle defer so (LIFO) the restore runs
+	// while the lock is still held — a successor cannot start until this run
+	// has put the pipeline back to idle.
+	var held Lock // the coordinator lock, once taken; the restore re-checks it
+	if o.Lock != nil {
+		lock, acquired, lerr := o.Lock.TryBatchLock(ctx)
+		if lerr != nil {
+			return fmt.Errorf("take batch lock: %w", lerr)
+		}
+		if !acquired {
+			p("Another earmark batch coordinator holds the batch lock — exiting without touching runner_control.\n")
+			return ErrAlreadyRunning
+		}
+		held = lock
+		defer func() {
+			if rerr := lock.Release(); rerr != nil {
+				p("WARNING: releasing the batch lock: %v (the session was closed, which drops it)\n", rerr)
+			}
+		}()
+
+		// Heartbeat: a session lock vanishes silently when its connection
+		// drops, and the run would carry on unprotected. On a failed check the
+		// heartbeat cancels the run ctx, so the loop unwinds like a SIGTERM
+		// through the restore-idle defer (which restores unless a successor
+		// holds the lock), and Run fails with ErrLockLost.
+		// The heartbeat is stopped (and joined) before Release, which
+		// registered first and so runs last.
+		//
+		// The heartbeat is NOT driven by the signal context: pgx breaks a
+		// connection whose query context is cancelled mid-flight, so a SIGTERM
+		// (or the stop below) landing during a Check would kill the pinned
+		// session and drop the lock right before the restore. Each Check runs
+		// on context.WithoutCancel + its own lockCheckTimeout, and the loop is
+		// stopped through its own channel; the join waits for an in-flight
+		// Check, which lockCheckTimeout bounds.
+		runCtx, cancelRun := context.WithCancelCause(ctx)
+		hbStop := make(chan struct{})
+		var lostErr error // written by the heartbeat; read only after hbDone
+		hbDone := make(chan struct{})
+		hbBase := context.WithoutCancel(ctx) // taken here: ctx is reassigned below
+		go func() {
+			defer close(hbDone)
+			if herr := heartbeat(hbBase, hbStop, lock, o.PollInterval); herr != nil {
+				lostErr = fmt.Errorf("%w: %w", ErrLockLost, herr)
+				cancelRun(lostErr)
+			}
+		}()
+		defer func() {
+			close(hbStop)
+			<-hbDone
+			cancelRun(nil)
+			if lostErr != nil {
+				p("ERROR: %v — stopped the run.\n", lostErr)
+				err = lostErr
+			}
+		}()
+		ctx = runCtx
+	}
+
 	// Robustness: restore idle + the pre-batch run budget on EVERY exit path.
 	// restoreLimit starts nil (unlimited) and is overwritten once the pre-batch
 	// state has been read, so even an early failure leaves a runnable pipeline.
 	// Uses context.Background() (not ctx) so the cleanup still runs after a
 	// cancellation — the cancelled ctx would reject the writes otherwise.
+	//
+	// With a lock, the cleanup first asks whether ANOTHER session now holds it
+	// (over a pooled connection — the lock's own session is usually what died).
+	// If so, a successor may already own runner_control and resetting
+	// phase/run_limit would clobber its batch: the restore is skipped (the
+	// successor's own exit restores idle) and the run fails with ErrLockLost.
+	// Still ours, or free (we lost it and nobody took it): restore as usual.
+	// Inconclusive: retried, then restore (see successorTakeover). The window
+	// between the lookup and the two restore writes is one round-trip.
 	var restoreLimit *int
 	defer func() {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		if held != nil {
+			if successorTakeover(restoreCtx, p, held) {
+				p("NOT restoring idle on exit: another session now holds the batch lock — a successor coordinator owns runner_control; leaving phase/run_limit as they are.\n")
+				if err == nil {
+					err = fmt.Errorf("%w: another session holds it", ErrLockLost)
+				}
+				return
+			}
+			p("No other coordinator holds the batch lock — restoring idle.\n")
+		}
 		if rerr := restoreIdle(restoreCtx, store, restoreLimit); rerr != nil {
 			p("WARNING: failed to restore idle phase on exit: %v\n", rerr)
 			if err == nil {
@@ -225,6 +393,16 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 		return fmt.Errorf("read initial phase: %w", err)
 	}
 	restoreLimit = captureRestoreLimit(ctx, p, store, phase)
+	if phase == db.PhaseTranscribe {
+		// Residue of a coordinator that died mid-Phase-A (with the lock held,
+		// no live lock-taking one can own it — but a pre-#214 binary takes no
+		// lock, so an older coordinator running at the same time could; don't
+		// run mixed versions side by side). Nothing to finish: the run budget was just
+		// swapped to 0 and the first batch's Phase A sets a fresh one, while a
+		// job the runner still has claimed is waited out by Phase A's
+		// Claimed==0 check. captureRestoreLimit already chose unlimited for exit.
+		p("Resuming: found phase=transcribe from an interrupted run; starting a fresh Phase A.\n")
+	}
 	if phase == db.PhaseAnalyze {
 		p("Resuming: found phase=analyze; finishing the in-flight analyze batch first.\n")
 		// Clear any residual run budget left by a crash mid-Phase-A to 0. In the
@@ -356,6 +534,12 @@ func runTranscribePhase(ctx context.Context, p func(string, ...any), store Phase
 	}
 	p("Phase A (transcribe): run_limit=%d — waiting for the batch to transcribe...\n", n)
 
+	// PhaseTimeout is a NO-PROGRESS bound, not a wall clock: the deadline
+	// restarts whenever the queue moves (pending, claimed, done, failed or the
+	// run budget changes), so a long batch that keeps transcribing never trips
+	// it, while a runner that claims nothing (host asleep, service down) does.
+	lastProgress := time.Now()
+	var last *progressKey
 	for {
 		st, err := store.GetServiceStatus(ctx)
 		if err != nil {
@@ -365,8 +549,60 @@ func runTranscribePhase(ctx context.Context, p func(string, ...any), store Phase
 			p("Phase A complete (pending=%d, claimed=%d, run_limit reached).\n", st.Pending, st.Claimed)
 			return nil
 		}
+		if k := progressOf(st); last == nil || k != *last {
+			last, lastProgress = &k, time.Now()
+		} else if o.PhaseTimeout > 0 && time.Since(lastProgress) >= o.PhaseTimeout {
+			return phaseTimeoutErr(o.PhaseTimeout)
+		}
 		if err := sleep(ctx, o.PollInterval); err != nil {
 			return err
+		}
+	}
+}
+
+// progressKey is the part of a queue snapshot whose change counts as Phase A
+// progress for PhaseTimeout.
+type progressKey struct {
+	pending, claimed, done, failed int
+	runLimit                       int // -1 = unlimited (NULL)
+}
+
+func progressOf(st *db.QueueStats) progressKey {
+	k := progressKey{pending: st.Pending, claimed: st.Claimed, done: st.Done, failed: st.Failed, runLimit: -1}
+	if st.RunLimit != nil {
+		k.runLimit = *st.RunLimit
+	}
+	return k
+}
+
+func phaseTimeoutErr(d time.Duration) error {
+	return fmt.Errorf("%w: Phase A made no progress for %s — nothing claimed or finished (is the ASR runner up and its host awake?)", ErrPhaseTimeout, d)
+}
+
+// heartbeat checks lock every interval until stop is closed (nil) or a check
+// fails (that error). base must not be cancellable (see Run): each check gets
+// its own lockCheckTimeout from it, so nothing but that deadline can cancel a
+// query on the pinned session. A check that completes after stop was closed is
+// ignored — the exit cleanup's own successor lookup decides the restore.
+func heartbeat(base context.Context, stop <-chan struct{}, lock Lock, every time.Duration) error {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return nil
+		case <-t.C:
+		}
+		cctx, cancel := context.WithTimeout(base, lockCheckTimeout)
+		err := lock.Check(cctx)
+		cancel()
+		if err != nil {
+			select {
+			case <-stop:
+				return nil
+			default:
+				return err
+			}
 		}
 	}
 }

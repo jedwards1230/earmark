@@ -455,9 +455,59 @@ indefinitely and new books never transcribed.)
 It is **DB-driven and resumable**: it holds no critical state in memory and
 derives everything (current phase, job counts, backlog) from the DB. On restart
 it reconciles — if it finds `phase='analyze'`, it finishes Phase B before
-starting a new Phase A. If a game starts mid-batch, gpu-arbiter stops the runner
+starting a new Phase A; if it finds `phase='transcribe'` (a coordinator died
+mid-Phase-A) it logs that and starts a fresh Phase A — the startup swap has
+already parked the residual budget at `0`, Phase A sets a new one, and a job
+the runner still holds `claimed` is waited out by Phase A's `claimed == 0`
+check; the exit restores `NULL` as for any interrupted run. If a game starts mid-batch, gpu-arbiter stops the runner
 and judge; the coordinator's per-batch yield-check handles re-entry and the
 existing stale-job recovery (§1.3) reclaims interrupted jobs.
+
+**Single instance.** Before it reads or writes `runner_control` the
+coordinator takes a Postgres advisory lock — `pg_try_advisory_lock` on key
+`0x4541524D42544348` ("EARM","BTCH"; distinct from the schema-migration key,
+§1.8), session-scoped on one pooled connection pinned for the whole run. If
+another coordinator holds it, this one logs `Another earmark batch coordinator
+holds the batch lock` and exits **without touching anything**: swapping
+`run_limit` or restoring idle would clobber the live batch. The exit code is `0`
+by default (an overlapping scheduled run is a clean no-op) and
+`--already-running-exit-code N` (0–255) makes it visible instead. The lock is
+released only **after** the restore-idle cleanup, so a successor never starts
+while the pipeline is still mid-phase. An unlock failure closes the connection
+(bounded at 5 s), and a coordinator that dies loses its session, so the lock
+never outlives its holder. Because a session lock also vanishes **silently**
+when its connection drops, the coordinator re-checks ownership (`pg_locks` for
+its own `pg_backend_pid()`) every `--poll-interval`; a failed check cancels the
+run and it exits `1` (`batch lock lost mid-run`). Before restoring, the exit
+cleanup asks — over a pooled connection, since the lock's own session is
+usually what died — whether **another** session now holds the key (`pg_locks`,
+`pid <>` the pinned session's backend pid recorded at acquire). Only that
+definitive answer skips the restore (logged `NOT restoring idle`): a successor
+owns `runner_control`, and resetting `phase`/`run_limit` would clobber its batch
+(its own exit restores idle). Lock still ours, or lost but free: restore as
+usual (logged). An inconclusive lookup (query error) is retried 3 times with a
+short backoff, then the cleanup restores anyway with a warning — a successor
+needs a fresh schedule or a manual run to appear, while a skipped restore
+leaves the runner budget-gated. This is the one exception to "always restores
+idle"; the window it leaves is the single round-trip between the lookup and the
+restore writes. Only binaries containing this guard take the lock: an older
+`earmark batch` running alongside is not excluded, so don't mix versions.
+
+**Phase A stall bound.** `--phase-timeout` (default `3h`, `0` = unbounded) is a
+**no-progress** bound, not a wall clock: the deadline restarts whenever the
+queue snapshot moves (`pending`, `claimed`, `done`, `failed` or `run_limit`
+changes), so a long batch that keeps transcribing is never cut off. A runner
+that claims nothing — its host asleep, the service stopped — would otherwise
+hold the run (and a scheduled Job) in Phase A until `activeDeadlineSeconds`;
+after `--phase-timeout` without progress the coordinator restores idle and exits
+`1` (`transcribe phase timed out`), never moving on to Phase B. Checked once per
+`--poll-interval`. The lock heartbeat's checks run on a context detached from
+the run's (their own 10 s deadline), so a `SIGTERM` can't cancel a check
+mid-query, which would break the pinned session and drop the lock right before
+the restore.
+The CronJob (§2.7, `batch.enabled`) additionally pins `concurrencyPolicy:
+Forbid`; the lock is what covers runs started any other way (a manual
+`kubectl create job --from`, a laptop).
 
 **Keep-awake on an idle-sleeping GPU host.** When the runner lives on a host
 that sleeps when idle (e.g. a Windows GPU workstation, where `RUNNER_KEEP_AWAKE`
@@ -2590,6 +2640,31 @@ legitimate) but `NOTES` warns that both paths will judge. Defaults: schedule
 `17 * * * *`, `--limit 25` (`0` omits the flag = no cap), `concurrencyPolicy: Forbid`, `backoffLimit: 0`,
 `activeDeadlineSeconds: 3000`, `startingDeadlineSeconds: 600`,
 `ttlSecondsAfterFinished: 86400`, history limits 3/3.
+
+Only when `batch.enabled` (default `false`): CronJob `<release>-batch` runs the
+`earmark batch` coordinator (§1.4) — `earmark batch --batch-size N
+[--max-batches M] [--phase-timeout D]` (`batch.batchSize`, default 10;
+`batch.maxBatches`, default `0` = flag omitted = until the queue drains;
+`batch.phaseTimeout`, a Go duration, default `null` = flag omitted = the CLI's
+`3h`) plus `batch.extraArgs`. It shares
+`commonEnv`, the security contexts, `nodeSelector`/`tolerations` and (when
+`config.models` is set) the model-registry mount — `MODELS_FILE` must resolve or
+config loading fails — and mounts no books volume. `batch.gpuArbiterUrl` sets
+`GPU_ARBITER_URL` and must be the full `…/status` URL (the schema enforces it: a
+bare base reads as unreachable and silently drops the game-yield); empty =
+no game-yield, and `NOTES` warns. `batch.extraEnv` is additions only (also
+refuses `GPU_ARBITER_URL`). `concurrencyPolicy` is fixed at `Forbid`, not a
+value. Defaults: schedule `0 3 * * *`, `timeZone: null` (omitted — the
+controller's zone), `suspend: false` (always rendered, so a flip shows in
+every diff), `backoffLimit: 0` (the coordinator is
+resumable; the next run reconciles), `activeDeadlineSeconds: 21600` (on expiry
+the pod gets `SIGTERM` and restores idle), `terminationGracePeriodSeconds: 90`
+(schema minimum 75: the worst-case cleanup is 55 s — restore 30 s including the
+successor lookup, heartbeat join 10 s, unlock 10 s, closing an unconfirmed
+session 5 s — plus headroom), `startingDeadlineSeconds: 600` (schema minimum 10, also for
+`evalBackfill`: the CronJob controller checks every 10 s, so less can skip
+runs), `ttlSecondsAfterFinished: 86400`, history limits 3/3; `resources` accepts
+`cpu`, `memory` and `ephemeral-storage`.
 
 `mcp.extraEnv` and `ingest.extraEnv` are the same hook for the two Deployments
 (rendered after `commonEnv` and the pod's own env; additions only, one shared
