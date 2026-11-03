@@ -4678,6 +4678,8 @@ var resetSQL = `
 	DROP VIEW     IF EXISTS decide_scorecard;
 	DROP VIEW     IF EXISTS recipe_scorecard;
 	DROP VIEW     IF EXISTS finding_label_current;
+	DROP TABLE    IF EXISTS finding_asr_votes   CASCADE;
+	DROP TABLE    IF EXISTS pilot_transcripts   CASCADE;
 	DROP TABLE    IF EXISTS finding_labels      CASCADE;
 	DROP TABLE    IF EXISTS model_setting_events CASCADE;
 	DROP TABLE    IF EXISTS model_settings      CASCADE;

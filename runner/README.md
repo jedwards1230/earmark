@@ -95,3 +95,178 @@ python -m pytest runner/test_runner.py -v
 re-rooting, and the busy/pause gates with mocked Postgres. It imports only stdlib
 + psycopg2 — **no torch/NeMo**, so it runs on any machine with no GPU. earmark CI
 runs this suite on every push.
+
+## Pilot backends
+
+`pilot.py` is a **one-shot** second-ASR pilot, separate from the production
+runner. It re-transcribes the tracks of a few books with a second model and
+stores the result **alongside** production in `pilot_transcripts` (migration
+00017). It never touches `transcription_jobs`, `runner_control`, `transcripts`,
+chunks or embeddings. It does not import `runner.py`. Its only write is one
+transaction per finished track. A track that does not finish writes nothing.
+
+Both backends produce **window-level text**: one segment per window, words
+without start/end, `has_word_times=false`, casing and punctuation verbatim. The
+asr_vote step aligns that text against the production (parakeet) word times, so
+neither model needs timestamps.
+
+| `--backend` | Model (revision via `PILOT_MODEL_REVISION`) | Runtime | Window (default / hard max) | `--batch-size` default |
+|---|---|---|---|---|
+| `granite` | `ibm-granite/granite-speech-4.1-2b` (base; pin `823ca793aa49925d4eb2e758709b7f2c98513e8e`) | transformers, bf16, `sdpa` (`flash_attention_2` if `flash_attn` is importable) | 240 s / 540 s | 16 |
+| `canary` | `nvidia/canary-qwen-2.5b` | NeMo SALM (`speechlm2`), bf16 autocast on CUDA | 38 s / 40 s | 32 |
+
+The Granite -plus timestamp mode was dropped: it budgets about 4× the output
+tokens and ran at batch 1, an estimated ~14 h for the pilot set.
+
+### How a track is processed
+
+- **Track selection.** Tracks are the files of the given ASINs that have a
+  production transcript: `book_metadata.asin`, then `book_dir`, then the jobs
+  whose `file_path` directory equals `book_dir`, then `transcripts`.
+- **Window planning.** Windows are cut from the **production** (parakeet) word
+  times, read one track at a time. Each cut sits at the largest inter-word gap in
+  the last 25% of the target window, so no word is split. No window exceeds the
+  backend's hard max. With no production words, the cuts fall at fixed intervals.
+  A final window shorter than 5 s is folded into the previous one when the merged
+  window still fits the hard max.
+- **Batching.** Windows go through `generate()` in batches of `--batch-size`,
+  within a track and across tracks (short chapter files fill a batch together).
+  - Granite: the audio is zero-padded to the longest window, the prompt is
+    left-padded, and each row's new tokens are sliced off past the shared input
+    length.
+  - Canary: `SALM.generate` gets one prompt per row with padded `audios` and
+    `audio_lens`.
+  - `max_new_tokens` is sized by the batch's **longest** window: 12 tokens per
+    audio second for Granite and 8 for Canary, × 1.25, with a floor of 64 / 128.
+  - A CUDA OOM halves the batch size and retries that batch. The smaller size is
+    kept for the rest of the run, and the out-file records it as `batch_size_used`.
+- **Audio.** Audio is decoded in chunks of contiguous windows (`ffmpeg -ss … -t …`
+  to 16 kHz mono float32). A chunk lasts max(30 min, batch size × window) so it
+  holds a full batch: Granite 16 × 240 s gives 64 min, about 250 MB. In findings
+  scope, only the merged spans are decoded. ffmpeg's output is streamed into a
+  buffer sized for the chunk, so memory does not grow with track length. Each
+  chunk has a timeout of 120 s + 5% of its length, and each window gets its own
+  writable copy.
+- **Granite prompt.** Taken verbatim from the card: `<|audio|>transcribe the speech
+  with proper punctuation and capitalization.` It runs with `num_beams=1`,
+  `do_sample=False` and `--repetition-penalty` (default 1.0: the base card gives
+  none).
+- **Canary prompt.** `Transcribe the following: <audio_locator_tag>`, from the card.
+- **Degenerate windows.** A window is marked degenerate for one of these reasons:
+  - `repetition`: an n-gram repeats back-to-back (a single word 8 times, longer
+    n-grams 4 to 5 times);
+  - `token_limit`: the window hit its token limit;
+  - `empty`: no text came back.
+
+  Its segment carries the optional keys `"degenerate": true` and
+  `"degenerate_reason"`. The out-file lists every degenerate window.
+- **`--scope findings`** (flag only; `full` is the default). It transcribes just
+  the windows around a track's **held** findings, for targeted checks. A held
+  finding is `patch_state='proposed'`, not superseded, with
+  `end_sec > start_sec`, and its latest decision event not revoked by a `revoke`
+  event is a `hold`. Spans are padded by ±5 s, each padded edge snaps to the
+  largest production gap inside the pad, and overlapping spans are merged. Rows
+  carry `scope='findings'`.
+- **Idempotency.** A row is keyed by `(file_path, model_id, model_revision,
+  scope)`. Tracks already stored are skipped. `--force` deletes the old row and
+  inserts the new one in the same transaction.
+- **Gaming check.** With `--arbiter-url`, gpu-arbiter `GET /status` is read
+  before the model loads and before each track, decode chunk and batch. State `gaming` or `evicting` stops
+  the run with exit 4. An unreadable status is retried once after 2 s and then
+  counts as gaming.
+- **Stop file.** If `PILOT_STOP_FILE` is set and that file exists, checked at the
+  same points, the run stops cleanly with exit 5.
+- **On either stop:** unfinished tracks, including those in the current batch,
+  are not written. Finished tracks stay done, so a re-run resumes.
+- **Write order.** The per-track JSON is written to the out dir **before** the
+  DB write, so a failed write never loses the GPU work. Right before the write,
+  the connection is pinged and reopened if it died during the track.
+- **Metrics per track:**
+  - `audio_sec`;
+  - `wall_sec`: the track's share of batch time, split by audio length,
+    excluding decode;
+  - `rtfx = audio_sec / wall_sec`;
+  - `peak_vram_mib` and `peak_reserved_mib`: the max over the batches the track
+    was in;
+  - out-file only: `decode_sec`, `batch_size` and `batch_size_used`. The table
+    has no columns for these.
+
+### CLI
+
+```text
+python pilot.py --backend {granite,canary} --asin A1,A2,...
+                [--scope full|findings] [--limit-tracks N] [--track-limit-per-book N]
+                [--batch-size N] [--repetition-penalty P] [--force] [--dry-run]
+                [--out-dir DIR] [--arbiter-url URL] [--self-check]
+                [--bench [--bench-batches 1,8,16,32] [--bench-max-sec 1800]]
+```
+
+| Flag | Effect |
+|---|---|
+| `--track-limit-per-book N` | Keeps the first N tracks of each book (by `file_path`). The set is stable across re-runs. |
+| `--limit-tracks N` | Caps how many not-yet-done tracks this run processes. |
+| `--batch-size N` | Windows per `generate()` call. Defaults: granite 16, canary 32. |
+| `--repetition-penalty P` | Granite only. Default 1.0 (off). |
+| `--dry-run` | Prints one JSON line per track a real run would process, after the already-done filter and `--limit-tracks`, with its window plan. It reads the DB in a read-only session. It loads no model, decodes no audio and writes nothing. |
+| `--bench` | Use with `--asin X --limit-tracks 1`. Runs the first `--bench-max-sec` of that track once per batch size in `--bench-batches`, then prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path, window_sec, max_sec, results: [{batch_size, batch_size_used, windows, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows}]}}`. No DB writes. It runs the same gaming and stop-file checks as a real run (exit 4 / 5, nothing printed). |
+| `--out-dir` | Where each finished track's JSON goes (plan, segments, metrics, degenerate windows). The default is `PILOT_OUT_DIR`, else `<tempdir>/earmark-asr-pilot-out`. |
+| `--self-check` | Loads the model and transcribes 5 s of silence. It cannot be combined with `--dry-run` or `--bench`. Prints `{backend, model, revision, torch, cuda, vram, output, attn_implementation, ffmpeg, ffprobe}`. Needs no DB. |
+
+### Environment
+
+| Variable | Meaning |
+|---|---|
+| `DATABASE_URL` | Required, except with `--self-check`. |
+| `PILOT_MODEL_REVISION` | **Required.** The HF commit sha to load. Unpinned runs are refused (exit 2). |
+| `PILOT_MODEL_ID` | Defaults to the model in the table above. |
+| `HF_HOME` | The pilot's own HF cache. |
+| `BOOKS_MOUNT`, `BOOKS_DB_ROOT`, `BOOKS_PATH_ENCODING` | Same meaning as in `runner.py`. |
+| `FFMPEG_BIN`, `FFPROBE_BIN` | Default `ffmpeg` / `ffprobe`. `runner.py` has no env names for these; it runs them from `PATH`. |
+| `PILOT_WINDOW_SEC` | Target window length. Values above the backend's hard max are a config error. |
+| `PILOT_DEVICE` | Default `cuda`. bf16 autocast (Canary) is only used on a CUDA device. |
+| `PILOT_OUT_DIR` | Default out dir when `--out-dir` is not given. |
+| `PILOT_STOP_FILE` | Optional path. If the file exists, the run stops cleanly with exit 5. |
+
+**Exit codes:** `0` ok, `2` config error, `3` some tracks failed, `4` stopped for gaming, `5` stopped by `PILOT_STOP_FILE`.
+
+### Install layout
+
+The asr_pilot_windows role (homelab-ansible) installs the pilot on desktop-2:
+
+- `C:\Program Files\earmark-asr-pilot\pilot.py`, fetched with a sha256 pin from
+  an earmark ref.
+- Two venvs: `...\venv-granite` (`requirements-pilot-granite.txt`) and
+  `...\venv-canary` (`requirements-pilot-canary.txt`).
+- Data under `C:\ProgramData\earmark-asr-pilot\{hf,out,logs}`, plus its own
+  `uv-python`.
+
+Both venvs are **separate from the frozen production venv** (torch
+2.12.0+cu130, nemo_toolkit 2.7.3, transformers 4.57.6) and must never be
+installed into it. Granite needs transformers ≥ 5.8, and SALM needs NeMo trunk.
+The path must not contain `C:\Program Files\earmark-asr\runner.py`, because the
+one-runner reaper kills anything that does. Both requirements files are fully
+pinned for Windows x86_64 / CPython 3.12. `flash_attn` is not included, since it
+has no official Windows wheels, so Granite runs on `sdpa`. Install each with:
+
+```text
+uv pip install --no-deps -r <file> --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match
+```
+
+### Expected cost (UNMEASURED)
+
+None of this has run on real hardware. The pilot set is 143 h of audio.
+
+- **Target:** RTFx ≥ 100 for each backend, which is about 1 h per backend over
+  the whole set.
+- **Granite 2B (base):** the Open ASR leaderboard lists RTFx 231. Expect about
+  4–6 GB of bf16 weights plus activations for 16 × 240 s windows.
+- **Canary-Qwen 2.5B:** the model card reports RTFx 418 on an A100 (batched).
+  Expect about 5–6 GB of weights plus 32 × 38 s windows.
+
+Measure both with `--bench` on desktop-2 before a full run, and set
+`--batch-size` from the result.
+
+### Tests
+
+`python -m pytest runner/test_pilot.py -v` stubs the backend, the decoder and
+Postgres. It needs no torch, transformers, NeMo, numpy or ffmpeg.

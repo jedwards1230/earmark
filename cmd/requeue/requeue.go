@@ -25,6 +25,12 @@ type Requeuer interface {
 	ReembedJobs(ctx context.Context, substr string) ([]string, error)
 }
 
+// pilotCounter is optional (*db.DB implements it): the requeue preview warns
+// how many second-ASR pilot rows the transcript delete will cascade to.
+type pilotCounter interface {
+	PilotRowsForJobs(ctx context.Context, jobIDs []string) (transcripts, votes int64, err error)
+}
+
 type options struct {
 	reembed bool // re-embed only (delete chunks; keep transcript) — no re-transcription
 	failed  bool // target all failed jobs instead of a file-path substring
@@ -132,6 +138,20 @@ func run(ctx context.Context, out io.Writer, q Requeuer, substr string, o option
 
 	if !o.reembed {
 		p("\nTheir transcripts' findings (incl. human decisions) will be archived as superseded.\n")
+		if pc, ok := q.(pilotCounter); ok {
+			ids := make([]string, len(matches))
+			for i, m := range matches {
+				ids[i] = m.ID
+			}
+			pt, pv, err := pc.PilotRowsForJobs(ctx, ids)
+			if err != nil {
+				return err
+			}
+			if pt > 0 {
+				p("WARNING: %d ASR-pilot transcript(s) and %d asr vote(s) of these tracks will be DELETED, not archived "+
+					"(they cascade from the transcript; CONTRACT §1.11). Back them up first if they matter.\n", pt, pv)
+			}
+		}
 	}
 	if !o.yes {
 		p("\n(dry-run) pass --yes to %s these %d job(s).\n", action, len(matches))

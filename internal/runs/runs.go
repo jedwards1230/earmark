@@ -51,6 +51,8 @@ const (
 	StepEvalBook     = "eval_book"
 	StepEvalBackfill = "eval_backfill"
 	StepEvalRejudge  = "eval_rejudge"
+	// StepASRVote is `earmark asr-pilot vote` (CONTRACT §1.11).
+	StepASRVote = "asr_vote"
 )
 
 // Store is the slice of the database a Run writes (*db.DB implements it).
