@@ -229,6 +229,8 @@ def load_config(
     try:
         args = build_arg_parser().parse_args(argv)
     except SystemExit as exc:  # argparse exits 2 on bad flags; keep our own code path
+        if exc.code == 0:  # --help
+            raise
         raise ConfigError("invalid command line") from exc
 
     backend = args.backend
