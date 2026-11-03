@@ -16,6 +16,7 @@ package batch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -36,6 +37,7 @@ type options struct {
 	gpuArbiterURL  string        // gpu-arbiter /status URL (flag overrides GPU_ARBITER_URL)
 	arbiterTimeout time.Duration // per-request timeout for the arbiter probe
 	arbiterWaitCmd string        // explicit gpu-arbiter binary override (flag overrides $ARBITER_WAIT_CMD)
+	lockedExitCode int           // exit code when another coordinator holds the batch lock
 }
 
 // arbiterWaitCmdEnvVar overrides binary auto-detection (PATH lookup) with an
@@ -72,9 +74,17 @@ and the run budget put back to its pre-batch value (unlimited when it was unset,
 spent at 0, or left over from an interrupted run), so the pipeline returns to
 normal continuous mode instead of leaving the ASR runner budget-gated.
 
+Single instance: the coordinator takes a Postgres advisory lock (a
+session-scoped pg_try_advisory_lock on one pooled connection held for the whole
+run) before it reads or writes runner_control. If another coordinator holds it,
+this one logs that and exits WITHOUT touching anything — exit code 0 by
+default, so an overlapping scheduled run (e.g. a CronJob) is a clean no-op; set
+--already-running-exit-code to make it visible as a failure instead.
+
 The coordinator is DB-driven and resumable: it keeps no critical state in
 memory. If it restarts mid-batch and finds phase=analyze, it finishes Phase B
-before starting a new Phase A.
+before starting a new Phase A; phase=transcribe starts a fresh Phase A (and
+restores run_limit=unlimited on exit, as for any interrupted run).
 
 gpu-arbiter URL comes from --gpu-arbiter-url or $GPU_ARBITER_URL. If unset or
 unreachable, the coordinator logs it and proceeds (degrades gracefully — it
@@ -104,6 +114,7 @@ func init() {
 	BatchCmd.Flags().DurationVar(&opts.arbiterPoll, "arbiter-poll", 15*time.Second, "how often to re-check gpu-arbiter while gaming")
 	BatchCmd.Flags().StringVar(&opts.gpuArbiterURL, "gpu-arbiter-url", "", "gpu-arbiter /status URL (overrides $GPU_ARBITER_URL)")
 	BatchCmd.Flags().DurationVar(&opts.arbiterTimeout, "arbiter-timeout", 3*time.Second, "per-request timeout for the gpu-arbiter probe")
+	BatchCmd.Flags().IntVar(&opts.lockedExitCode, "already-running-exit-code", 0, "exit code when another `earmark batch` holds the batch lock (0 = a clean no-op, suits a CronJob)")
 	BatchCmd.Flags().StringVar(&opts.arbiterWaitCmd, "arbiter-wait-cmd", "", "path to the gpu-arbiter binary to delegate waits to (overrides $ARBITER_WAIT_CMD and PATH auto-detection); empty falls back to auto-detection, then the built-in HTTP poll loop")
 }
 
@@ -139,13 +150,34 @@ func runBatch(_ *cobra.Command, _ []string) {
 		// backlog and the embed backlog to reach 0 before advancing to the next
 		// batch (Phase B completion, CONTRACT §1.4, §2.4).
 		EvalGatesEmbed: cfg.EvalGatesEmbed,
+		// Single instance (CONTRACT §1.4): a second coordinator exits untouched.
+		Lock: database,
 	}
 
 	// SIGINT/SIGTERM handling lives inside batch.Run so the signal-aware scope
 	// strictly encloses its restore-idle defer (no signal-at-return-time race).
-	if err := batch.Run(context.Background(), os.Stdout, database, arbiter, cfgOpts); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+	err = batch.Run(context.Background(), os.Stdout, database, arbiter, cfgOpts)
+	if code, exit := exitCode(err, opts.lockedExitCode); exit {
+		if code != 0 {
+			fmt.Printf("Error: %v\n", err)
+		}
+		database.Close() // os.Exit skips the deferred Close
+		os.Exit(code)
+	}
+}
+
+// exitCode maps batch.Run's result to the process exit. exit=false means a
+// normal return (status 0 via main). Another coordinator holding the lock is
+// lockedCode (0 by default: a scheduled overlap is not a failure); any other
+// error is 1.
+func exitCode(err error, lockedCode int) (code int, exit bool) {
+	switch {
+	case err == nil:
+		return 0, false
+	case errors.Is(err, batch.ErrAlreadyRunning):
+		return lockedCode, true
+	default:
+		return 1, true
 	}
 }
 

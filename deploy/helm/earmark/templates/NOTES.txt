@@ -41,6 +41,19 @@ kubectl create job -n {{ .Release.Namespace }} --from=cronjob/{{ include "earmar
 {{- end }}
 {{- end }}
 
+{{- if .Values.batch.enabled }}
+
+━━━ Batch coordinator CronJob ─────────────────────────────────────────────────
+Schedule "{{ .Values.batch.schedule }}"{{ with .Values.batch.timeZone }} ({{ . }}){{ end }}{{ if .Values.batch.suspend }} — SUSPENDED{{ end }}: earmark batch --batch-size {{ .Values.batch.batchSize }}{{ with .Values.batch.maxBatches }} --max-batches {{ . }}{{ end }}
+kubectl get cronjob,jobs -n {{ .Release.Namespace }} -l app.kubernetes.io/component=batch
+# Run once now (a second coordinator exits 0 untouched — advisory lock):
+kubectl create job -n {{ .Release.Namespace }} --from=cronjob/{{ include "earmark.batch.name" . }} {{ include "earmark.batch.name" . }}-manual
+{{- if not .Values.batch.gpuArbiterUrl }}
+
+  ! batch.gpuArbiterUrl is empty: batches will not wait out games on the GPU host.
+{{- end }}
+{{- end }}
+
 ━━━ Prerequisites in namespace {{ .Release.Namespace }} ───────────────────────
 {{- if .Values.secrets.enabled }}
   ✓ OnePasswordItems will be created by this chart (1Password operator required)

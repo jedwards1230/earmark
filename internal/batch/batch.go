@@ -79,6 +79,24 @@ type EventSink interface {
 	AppendEvent(ctx context.Context, e db.PipelineEvent) error
 }
 
+// Locker admits one coordinator at a time (CONTRACT §1.4, "Single instance").
+// *db.DB satisfies it with a session-scoped pg_try_advisory_lock held on a
+// dedicated pooled connection for the whole run.
+//
+// TryBatchLock must not wait: acquired=false (err nil) means another
+// coordinator holds the lock. On success release is called once the run's
+// restore-idle cleanup has finished, and may be called more than once.
+type Locker interface {
+	TryBatchLock(ctx context.Context) (release func() error, acquired bool, err error)
+}
+
+// ErrAlreadyRunning is returned by Run when Options.Lock reports another
+// coordinator holds the lock. Run returns it BEFORE any runner_control read or
+// write: the loser must not swap run_limit or restore idle, either of which
+// would clobber the live coordinator's batch. Callers pick the exit code (a
+// scheduled run treats it as a clean no-op).
+var ErrAlreadyRunning = errors.New("another earmark batch coordinator is running")
+
 // nopSink discards events. Used as the default when no sink is injected so the
 // coordinator core never needs a nil check.
 type nopSink struct{}
@@ -145,6 +163,9 @@ type Options struct {
 	// false (default) Phase B completes when only the embed backlog reaches 0,
 	// preserving today's behavior. CONTRACT §1.4, §2.4.
 	EvalGatesEmbed bool
+	// Lock, when set, admits a single coordinator (CONTRACT §1.4). nil runs
+	// unguarded (unit tests; a caller that serialises runs itself).
+	Lock Locker
 }
 
 const (
@@ -199,6 +220,26 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	defer stop()
 	ctx = sigCtx
 
+	// Single instance: take the lock before ANY runner_control access, and
+	// defer its release BEFORE the restore-idle defer so (LIFO) the restore runs
+	// while the lock is still held — a successor cannot start until this run
+	// has put the pipeline back to idle.
+	if o.Lock != nil {
+		release, acquired, lerr := o.Lock.TryBatchLock(ctx)
+		if lerr != nil {
+			return fmt.Errorf("take batch lock: %w", lerr)
+		}
+		if !acquired {
+			p("Another earmark batch coordinator holds the batch lock — exiting without touching runner_control.\n")
+			return ErrAlreadyRunning
+		}
+		defer func() {
+			if rerr := release(); rerr != nil {
+				p("WARNING: releasing the batch lock: %v (the session was closed, which drops it)\n", rerr)
+			}
+		}()
+	}
+
 	// Robustness: restore idle + the pre-batch run budget on EVERY exit path.
 	// restoreLimit starts nil (unlimited) and is overwritten once the pre-batch
 	// state has been read, so even an early failure leaves a runnable pipeline.
@@ -225,6 +266,14 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 		return fmt.Errorf("read initial phase: %w", err)
 	}
 	restoreLimit = captureRestoreLimit(ctx, p, store, phase)
+	if phase == db.PhaseTranscribe {
+		// Residue of a coordinator that died mid-Phase-A (with the lock held,
+		// no live one can own it). Nothing to finish: the run budget was just
+		// swapped to 0 and the first batch's Phase A sets a fresh one, while a
+		// job the runner still has claimed is waited out by Phase A's
+		// Claimed==0 check. captureRestoreLimit already chose unlimited for exit.
+		p("Resuming: found phase=transcribe from an interrupted run; starting a fresh Phase A.\n")
+	}
 	if phase == db.PhaseAnalyze {
 		p("Resuming: found phase=analyze; finishing the in-flight analyze batch first.\n")
 		// Clear any residual run budget left by a crash mid-Phase-A to 0. In the

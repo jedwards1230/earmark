@@ -287,6 +287,57 @@
         }
       }
     },
+    "batch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled":                       { "type": "boolean" },
+        "schedule":                      { "type": "string", "minLength": 1 },
+        "timeZone":                      { "type": ["string", "null"], "minLength": 1 },
+        "suspend":                       { "type": "boolean" },
+        "batchSize":                     { "type": "integer", "minimum": 1 },
+        "maxBatches":                    { "type": "integer", "minimum": 0 },
+        "gpuArbiterUrl":                 { "type": "string", "pattern": "^$|^https?://[^/]+(/.*)?/status$" },
+        "extraArgs":                     { "type": "array", "items": { "type": "string" } },
+        "extraEnv": {
+          "type": "array",
+          "items": { "type": "object", "required": ["name"] }
+        },
+        "startingDeadlineSeconds":       { "type": ["integer", "null"], "minimum": 0 },
+        "successfulJobsHistoryLimit":    { "type": "integer", "minimum": 0 },
+        "failedJobsHistoryLimit":        { "type": "integer", "minimum": 0 },
+        "backoffLimit":                  { "type": "integer", "minimum": 0 },
+        "activeDeadlineSeconds":         { "type": ["integer", "null"], "minimum": 1 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 45 },
+        "ttlSecondsAfterFinished":       { "type": ["integer", "null"], "minimum": 0 },
+        "podAnnotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu":    { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu":    { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
     "nodeSelector": {
       "type": "object",
       "additionalProperties": { "type": "string" }

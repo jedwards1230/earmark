@@ -2,6 +2,7 @@ package batch
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -111,6 +112,34 @@ func TestBuildArbiter_FallbackSelection(t *testing.T) {
 			_, isWaiter := arb.(ibatch.Waiter)
 			if isWaiter != tc.wantDelegate {
 				t.Errorf("buildArbiter(%q, flag=%q) delegated = %v, want %v", tc.arbiterURL, tc.flagVal, isWaiter, tc.wantDelegate)
+			}
+		})
+	}
+}
+
+// TestExitCode: a held batch lock exits with the configured code (0 by default,
+// a clean CronJob no-op), any other error with 1, success falls through.
+func TestExitCode(t *testing.T) {
+	wrapped := fmt.Errorf("run: %w", ibatch.ErrAlreadyRunning)
+	cases := []struct {
+		name     string
+		err      error
+		locked   int
+		wantCode int
+		wantExit bool
+	}{
+		{"success", nil, 0, 0, false},
+		{"locked default", ibatch.ErrAlreadyRunning, 0, 0, true},
+		{"locked wrapped", wrapped, 0, 0, true},
+		{"locked custom", ibatch.ErrAlreadyRunning, 75, 75, true},
+		{"other error", errors.New("db down"), 75, 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, exit := exitCode(tc.err, tc.locked)
+			if code != tc.wantCode || exit != tc.wantExit {
+				t.Errorf("exitCode(%v, %d) = (%d, %v), want (%d, %v)",
+					tc.err, tc.locked, code, exit, tc.wantCode, tc.wantExit)
 			}
 		})
 	}

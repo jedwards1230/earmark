@@ -1,0 +1,125 @@
+{{- if .Values.batch.enabled }}
+{{- /* extraEnv is additions only — see earmark.extraEnvGuard. GPU_ARBITER_URL is
+  this workload's own env (from batch.gpuArbiterUrl). */}}
+{{- include "earmark.extraEnvGuard" (dict "root" . "key" "batch.extraEnv" "env" .Values.batch.extraEnv "reserved" (list "GPU_ARBITER_URL")) }}
+# Batch coordinator CronJob — `earmark batch` on a schedule (CONTRACT §1.4).
+#
+# Runs: earmark batch --batch-size N [--max-batches M]
+#   - Flips runner_control.phase transcribe→analyze per batch so the ASR runner
+#     and the eval judge time-share the GPU; exits when no pending job remains,
+#     after --max-batches, or on SIGTERM. It transcribes nothing itself.
+#   - Every exit (incl. SIGTERM from activeDeadlineSeconds or a pod delete)
+#     restores phase=idle and the pre-batch run_limit; terminationGracePeriodSeconds
+#     must outlast that restore (30 s bound) plus the lock release (10 s).
+#   - Single instance: concurrencyPolicy is fixed at Forbid, and the coordinator
+#     also takes a Postgres advisory lock, so a run started any other way (a
+#     manual `kubectl create job --from`, a laptop) exits 0 untouched instead of
+#     clobbering the live batch.
+#
+# Env comes from earmark.commonEnv (DATABASE_URL etc.), like the Deployments.
+# No books volume (it never reads audio) and no ports (the PodMonitor never picks
+# these pods up). The model registry IS mounted when config.models is set:
+# commonEnv then sets MODELS_FILE, and config loading fails on a missing file.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "earmark.batch.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "earmark.labels" . | nindent 4 }}
+    app.kubernetes.io/component: batch
+spec:
+  schedule: {{ required "batch.schedule is required" .Values.batch.schedule | quote }}
+  {{- with .Values.batch.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  # Fixed, not a value: two coordinators fight over runner_control.
+  concurrencyPolicy: Forbid
+  {{- if not (kindIs "invalid" .Values.batch.startingDeadlineSeconds) }}
+  startingDeadlineSeconds: {{ int .Values.batch.startingDeadlineSeconds }}
+  {{- end }}
+  successfulJobsHistoryLimit: {{ int .Values.batch.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ int .Values.batch.failedJobsHistoryLimit }}
+  {{- if .Values.batch.suspend }}
+  suspend: true
+  {{- end }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ int .Values.batch.backoffLimit }}
+      {{- if not (kindIs "invalid" .Values.batch.activeDeadlineSeconds) }}
+      activeDeadlineSeconds: {{ int .Values.batch.activeDeadlineSeconds }}
+      {{- end }}
+      {{- if not (kindIs "invalid" .Values.batch.ttlSecondsAfterFinished) }}
+      ttlSecondsAfterFinished: {{ int .Values.batch.ttlSecondsAfterFinished }}
+      {{- end }}
+      template:
+        metadata:
+          labels:
+            {{- include "earmark.labels" . | nindent 12 }}
+            app.kubernetes.io/component: batch
+            {{- with .Values.podLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.batch.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: {{ int .Values.batch.terminationGracePeriodSeconds }}
+          securityContext:
+            {{- include "earmark.podSecurityContext" . | nindent 12 }}
+
+          containers:
+            - name: batch
+              image: {{ include "earmark.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+              # args overrides the Dockerfile CMD — always explicit, never rely on CMD.
+              args:
+                - batch
+                - --batch-size
+                - {{ .Values.batch.batchSize | int | toString | quote }}
+                {{- with .Values.batch.maxBatches }}
+                - --max-batches
+                - {{ . | int | toString | quote }}
+                {{- end }}
+                {{- range .Values.batch.extraArgs }}
+                - {{ . | quote }}
+                {{- end }}
+
+              securityContext:
+                {{- include "earmark.containerSecurityContext" . | nindent 16 }}
+
+              env:
+                {{- include "earmark.commonEnv" . | nindent 16 }}
+                {{- with .Values.batch.gpuArbiterUrl }}
+                - name: GPU_ARBITER_URL
+                  value: {{ . | quote }}
+                {{- end }}
+                {{- with .Values.batch.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+
+              resources:
+                {{- toYaml .Values.batch.resources | nindent 16 }}
+
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- with include "earmark.modelsVolumeMount" . }}{{ . | nindent 16 }}{{- end }}
+
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- with include "earmark.modelsVolume" . }}{{ . | nindent 12 }}{{- end }}
+{{- end }}
