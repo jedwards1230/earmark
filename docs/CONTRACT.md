@@ -260,8 +260,11 @@ SET    status = 'done',
 WHERE  id     = $1 AND status = 'claimed' AND claimed_by = $2;
 ```
 
-If the UPDATE matches no row (the stale sweep re-pended the job and another claim
-took it over, or it was requeued), the whole transaction — the transcript INSERT
+The runner's INSERT adds `ON CONFLICT (job_id) DO NOTHING`, so a replayed write is
+harmless. If the UPDATE matches no row, the transaction is rolled back; a job that is
+already `done` (this write's earlier commit landed before its connection dropped) is
+success. Otherwise (the stale sweep re-pended the job and another claim
+took it over, or it was requeued) the whole transaction — the transcript INSERT
 included — is rolled back and the runner leaves the row alone (its checkpoint
 stays, for whoever holds the claim now). A reconnect-retried write can therefore
 never overwrite a job another claim finished or reset.

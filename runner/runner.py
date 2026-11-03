@@ -1847,6 +1847,7 @@ def _mark_done(
                      embedded_asin, asr_model_sha256, asr_runner_version, asr_params)
                 VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
                         %s, %s, %s, %s::jsonb)
+                ON CONFLICT (job_id) DO NOTHING
                 """,
                 base
                 + (
@@ -1863,10 +1864,12 @@ def _mark_done(
                     (job_id, file_path, checksum, language, duration_seconds,
                      speaker_count, segments, raw_text, model_name)
                 VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                ON CONFLICT (job_id) DO NOTHING
                 """,
                 base,
             )
-        # Guarded on this runner's claim: a reconnect-retried write (or a job
+        # The INSERT is ON CONFLICT (job_id) DO NOTHING so a replayed write is
+        # harmless. The UPDATE is guarded on this runner's claim: a reconnect-retried write (or a job
         # the stale sweep re-pended mid-run and another claim since took over,
         # requeued or finished) must never be overwritten to 'done'. No row
         # matched → roll back the transcript INSERT too and report _ClaimLost.
@@ -1879,9 +1882,15 @@ def _mark_done(
             """,
             (job_id, RUNNER_IDENTITY),
         )
-        if getattr(cur, "rowcount", 1) == 0:
-            conn.rollback()
-            raise _ClaimLost(f"job {job_id} is no longer claimed by {RUNNER_IDENTITY}")
+        claimed = getattr(cur, "rowcount", 1) != 0
+    if not claimed:
+        conn.rollback()
+        # Idempotent: a job already 'done' (an earlier commit of this very
+        # write landed before its connection dropped) is success, not a loss.
+        if _job_status(conn, job_id) == "done":
+            log.info("Job %s already done (an earlier commit landed)", job_id)
+            return
+        raise _ClaimLost(f"job {job_id} is no longer claimed by {RUNNER_IDENTITY}")
     conn.commit()
     log.info("Job %s marked done (file: %s)", job_id, file_path)
 

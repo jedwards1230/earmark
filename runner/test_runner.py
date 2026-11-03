@@ -4394,6 +4394,25 @@ class MarkDoneRetryTests(unittest.TestCase):
             runner._mark_done_with_retry(ref, "job-1", "f", "c", self.result)
         self.assertFalse(any("INSERT INTO transcripts" in s for s, _ in landed.executed))
 
+    def test_commit_succeeded_then_the_connection_dropped(self) -> None:
+        """The COMMIT reached the server but its reply was lost: the retry must
+        see 'done' and stop, never insert a second transcript or fail the job."""
+
+        class _LostReply(_RetConn):
+            def commit(self) -> None:
+                self.commits += 1  # applied server-side…
+                self.closed = True
+                raise FakeOperationalError("server closed the connection unexpectedly")  # …reply lost
+
+        first = _LostReply()
+        after = _RetConn(status="done")
+        ref = runner._ConnRef(first)
+        with mock.patch.object(runner, "_connect", return_value=after):
+            runner._mark_done_with_retry(ref, "job-1", "f", "c", self.result)
+        self.assertEqual(sum("INSERT INTO transcripts" in s for s, _ in first.executed), 1)
+        self.assertFalse(any("INSERT INTO transcripts" in s for s, _ in after.executed))
+        self.assertTrue(any("SELECT status FROM transcription_jobs" in s for s, _ in after.executed))
+
     def test_budget_is_bounded_and_other_errors_are_not_retried(self) -> None:
         with mock.patch.object(runner, "_connect", side_effect=lambda: _RetConn(fail_sql="INSERT")), \
                 self.assertRaises(FakeOperationalError):
@@ -4706,13 +4725,31 @@ class ClaimGuardTests(unittest.TestCase):
         self.assertEqual(params, ("job-1", runner.RUNNER_IDENTITY))
         self.assertEqual(conn.commits, 1)
 
+    def test_inserts_ignore_a_replayed_job_id(self) -> None:
+        for prov in (False, True):
+            conn = self._conn(1)
+            with self.subTest(provenance=prov), \
+                    mock.patch.object(runner, "_has_provenance_columns", return_value=prov):
+                runner._mark_done(conn, "job-1", "f", "c", self.result)
+                ins = next(s for s, _ in conn.executed if "INSERT INTO transcripts" in s)
+                self.assertIn("ON CONFLICT (job_id) DO NOTHING", ins)
+
+    def test_unmatched_update_on_a_done_job_is_success(self) -> None:
+        conn = self._conn(0)
+        conn.status = "done"
+        with mock.patch.object(runner, "_has_provenance_columns", return_value=False):
+            runner._mark_done(conn, "job-1", "f", "c", self.result)  # no _ClaimLost
+
     def test_lost_claim_rolls_back_the_transcript_and_raises(self) -> None:
         conn = self._conn(0)
         with mock.patch.object(runner, "_has_provenance_columns", return_value=False), \
                 self.assertRaises(runner._ClaimLost):
             runner._mark_done(conn, "job-1", "f", "c", self.result)
-        self.assertEqual(conn.commits, 0)
-        self.assertEqual(conn.log[-1], "rollback", "the INSERT is rolled back with it")
+        # INSERT, UPDATE, then rollback (the INSERT goes with it) before the
+        # status read; the only commit is that read's own.
+        upd = conn.log.index("UPDATE")
+        self.assertEqual(conn.log[upd + 1 : upd + 3], ["rollback", "SELECT"])
+        self.assertEqual(conn.commits, 1)
 
     def test_lost_claim_is_not_retried(self) -> None:
         with mock.patch.object(runner, "_mark_done", side_effect=runner._ClaimLost("gone")), \
