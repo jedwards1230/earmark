@@ -23,6 +23,8 @@ type fakeLocker struct {
 	tryErr    error
 	relErr    error
 	lostAfter int
+	onLost    func() // runs once, at the first failing Check (successor takes over)
+	lostFired bool
 	checks    int
 	tries     int
 	releases  int
@@ -50,6 +52,10 @@ func (f fakeLock) Check(context.Context) error {
 	defer f.l.mu.Unlock()
 	f.l.checks++
 	if f.l.lostAfter > 0 && f.l.checks >= f.l.lostAfter {
+		if !f.l.lostFired && f.l.onLost != nil {
+			f.l.lostFired = true
+			f.l.onLost()
+		}
 		return errors.New("conn closed")
 	}
 	return nil
@@ -215,14 +221,24 @@ func TestRun_ResumeFromTranscribeStartsFreshPhaseA(t *testing.T) {
 	}
 }
 
-// A lost lock (the pinned connection dropped) stops the run: the loop unwinds,
-// idle is restored, the lock is released, and Run fails with ErrLockLost.
-func TestRun_LockLostStopsRunAndRestores(t *testing.T) {
+// A lost lock (the pinned connection dropped) stops the run and does NOT
+// restore: a successor that took the lock meanwhile owns runner_control, and an
+// idle/run_limit reset would clobber its batch. Run fails with ErrLockLost.
+func TestRun_LockLostSkipsRestoreAndLeavesSuccessorState(t *testing.T) {
 	store := newFakeStore(db.PhaseIdle,
 		&db.QueueStats{Pending: 5},
 		&db.QueueStats{Pending: 5, Claimed: 1, RunLimit: ptr(1)}, // Phase A never finishes
 	)
+	var phasesBeforeSuccessor int
 	lock := &fakeLocker{lostAfter: 3}
+	lock.onLost = func() {
+		// The successor coordinator takes over: its own Phase A budget + phase.
+		phasesBeforeSuccessor = len(store.transitions())
+		store.mu.Lock()
+		store.phase = db.PhaseTranscribe
+		store.runLimit = ptr(7)
+		store.mu.Unlock()
+	}
 	o := fastOpts()
 	o.Lock = lock
 
@@ -231,18 +247,39 @@ func TestRun_LockLostStopsRunAndRestores(t *testing.T) {
 	if !errors.Is(err, ErrLockLost) {
 		t.Fatalf("Run error = %v, want ErrLockLost", err)
 	}
-	got := store.transitions()
-	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
-		t.Errorf("idle must be restored after a lost lock; transitions=%v", got)
+	if got := store.transitions(); len(got) != phasesBeforeSuccessor {
+		t.Errorf("no phase write allowed after the lock was lost; transitions=%v (successor took over after %d)", got, phasesBeforeSuccessor)
 	}
-	if store.currentRunLimit() != nil {
-		t.Errorf("pre-batch run_limit (unlimited) must be restored, got %d", *store.currentRunLimit())
+	if store.phase != db.PhaseTranscribe {
+		t.Errorf("successor's phase clobbered: got %q", store.phase)
 	}
-	if checks, rel := lock.counts(); checks < 3 || rel != 1 {
-		t.Errorf("checks=%d releases=%d, want >=3 checks and exactly 1 release", checks, rel)
+	if rl := store.currentRunLimit(); rl == nil || *rl != 7 {
+		t.Errorf("successor's run_limit clobbered: got %v, want 7", rl)
 	}
-	if !strings.Contains(out.String(), "batch lock lost") {
-		t.Errorf("expected a lost-lock log line, got:\n%s", out.String())
+	if _, rel := lock.counts(); rel != 1 {
+		t.Errorf("release calls = %d, want 1", rel)
+	}
+	for _, want := range []string{"batch lock lost", "NOT restoring idle"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("expected %q in the log, got:\n%s", want, out.String())
+		}
+	}
+}
+
+// A loss the heartbeat has not seen yet (the run ends normally) is caught by
+// the pre-restore check: no restore, and the run reports ErrLockLost.
+func TestRun_PreRestoreCheckCatchesUndetectedLoss(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle, &db.QueueStats{}) // no work: straight to exit
+	lock := &fakeLocker{lostAfter: 1}
+	o := fastOpts()
+	o.PollInterval = time.Hour // the heartbeat never ticks
+	o.Lock = lock
+	err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Run error = %v, want ErrLockLost", err)
+	}
+	if got := store.transitions(); len(got) != 0 {
+		t.Errorf("no restore allowed without the lock; transitions=%v", got)
 	}
 }
 

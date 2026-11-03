@@ -253,6 +253,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	// defer its release BEFORE the restore-idle defer so (LIFO) the restore runs
 	// while the lock is still held — a successor cannot start until this run
 	// has put the pipeline back to idle.
+	var held Lock // the coordinator lock, once taken; the restore re-checks it
 	if o.Lock != nil {
 		lock, acquired, lerr := o.Lock.TryBatchLock(ctx)
 		if lerr != nil {
@@ -262,6 +263,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 			p("Another earmark batch coordinator holds the batch lock — exiting without touching runner_control.\n")
 			return ErrAlreadyRunning
 		}
+		held = lock
 		defer func() {
 			if rerr := lock.Release(); rerr != nil {
 				p("WARNING: releasing the batch lock: %v (the session was closed, which drops it)\n", rerr)
@@ -270,8 +272,9 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 
 		// Heartbeat: a session lock vanishes silently when its connection
 		// drops, and the run would carry on unprotected. On a failed check the
-		// heartbeat cancels the run ctx, so the loop unwinds through the
-		// restore-idle defer like a SIGTERM, then Run fails with ErrLockLost.
+		// heartbeat cancels the run ctx, so the loop unwinds like a SIGTERM;
+		// the restore-idle defer then finds the lock gone and skips the
+		// restore, and Run fails with ErrLockLost.
 		// The heartbeat is stopped (and joined) before Release, which
 		// registered first and so runs last.
 		runCtx, cancelRun := context.WithCancelCause(ctx)
@@ -290,7 +293,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 			<-hbDone
 			cancelRun(nil)
 			if lostErr != nil {
-				p("ERROR: %v — stopped the run (pipeline restored to idle).\n", lostErr)
+				p("ERROR: %v — stopped the run (idle NOT restored: a successor may own runner_control).\n", lostErr)
 				err = lostErr
 			}
 		}()
@@ -302,10 +305,28 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	// state has been read, so even an early failure leaves a runnable pipeline.
 	// Uses context.Background() (not ctx) so the cleanup still runs after a
 	// cancellation — the cancelled ctx would reject the writes otherwise.
+	//
+	// With a lock, ownership is re-checked immediately before restoring: once
+	// the lock is gone a successor may already own runner_control, and
+	// resetting phase/run_limit would clobber its batch. Then the restore is
+	// skipped (and the run fails with ErrLockLost); the successor's own exit
+	// restores idle. This narrows, not closes, the window — a loss between the
+	// check and the two writes is still possible — but the session holding the
+	// lock is the one doing the check, so the gap is one round-trip.
 	var restoreLimit *int
 	defer func() {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		if held != nil {
+			if cerr := held.Check(restoreCtx); cerr != nil {
+				p("NOT restoring idle on exit: the batch lock is no longer held (%v) — a successor coordinator may own runner_control; leaving phase/run_limit as they are.\n", cerr)
+				if err == nil {
+					err = fmt.Errorf("%w: %w", ErrLockLost, cerr)
+				}
+				return
+			}
+			p("Batch lock still held — restoring idle.\n")
+		}
 		if rerr := restoreIdle(restoreCtx, store, restoreLimit); rerr != nil {
 			p("WARNING: failed to restore idle phase on exit: %v\n", rerr)
 			if err == nil {
