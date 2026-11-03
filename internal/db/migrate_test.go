@@ -577,3 +577,49 @@ func TestDecideDuplicatesMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestRunnerArbiterYieldMigration pins 00016 (CONTRACT §1.4, §1.8): two
+// additive, idempotent columns on runner_control — gpu-arbiter's own yield
+// flag and its timestamp — under the 5s lock timeout, and nothing else.
+func TestRunnerArbiterYieldMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00016_runner_arbiter_yield.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	for name, part := range map[string]string{"Up": up, "Down": down} {
+		i := strings.Index(part, "SET LOCAL lock_timeout = '5s';")
+		a := strings.Index(part, "ALTER TABLE")
+		if i < 0 || a < i {
+			t.Errorf("%s: want SET LOCAL lock_timeout before any ALTER", name)
+		}
+		if n := strings.Count(part, "ALTER TABLE runner_control"); n != 2 || strings.Count(part, "ALTER TABLE") != n {
+			t.Errorf("%s: want exactly two ALTERs, both on runner_control; got %q", name, part)
+		}
+	}
+	for _, want := range []string{
+		"ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS arbiter_yield BOOLEAN NOT NULL DEFAULT false;",
+		"ALTER TABLE runner_control ADD COLUMN IF NOT EXISTS arbiter_yield_at TIMESTAMPTZ;",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("Up lacks %q", want)
+		}
+	}
+	for _, want := range []string{
+		"ALTER TABLE runner_control DROP COLUMN IF EXISTS arbiter_yield_at;",
+		"ALTER TABLE runner_control DROP COLUMN IF EXISTS arbiter_yield;",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("Down lacks %q", want)
+		}
+	}
+	for _, banned := range []string{"UPDATE ", "DELETE ", "phase"} {
+		if strings.Contains(up, banned) {
+			t.Errorf("Up must be purely additive and leave phase alone; found %q", banned)
+		}
+	}
+}
