@@ -1,0 +1,61 @@
+# Pilot backend: IBM Granite Speech 4.1 2B-plus (runner/pilot.py --backend granite).
+#
+# A SEPARATE venv from the frozen production runner venv (torch 2.12.0+cu130,
+# nemo_toolkit 2.7.3, transformers 4.57.6): Granite needs transformers>=5.8.
+# Fully pinned for Windows x86_64 / CPython 3.12, resolved on 2026-11-03 with:
+#   uv pip compile <direct deps> --python-version 3.12 \
+#     --python-platform x86_64-pc-windows-msvc \
+#     --extra-index-url https://download.pytorch.org/whl/cu130 \
+#     --index-strategy unsafe-best-match
+# Direct deps: torch==2.12.0 (cu130), transformers==5.22.1, accelerate==1.15.0,
+#   torchaudio==2.11.1, torchcodec==0.17.0 (cu130), soundfile==0.14.0,
+#   numpy==2.5.4, psycopg2-binary==2.9.13, hf-xet==1.8.0.
+# Install (everything is pinned, so skip re-resolution):
+#   uv pip install --no-deps -r requirements-pilot-granite.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cu130 \
+#     --index-strategy unsafe-best-match
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+accelerate==1.15.0
+annotated-doc==0.0.5
+anyio==4.16.0
+cffi==2.1.1
+click==8.5.0
+colorama==0.4.6
+filelock==4.2.7
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.8.0
+httpcore2==2.16.0
+httpx2==2.16.0
+huggingface-hub==2.4.0
+idna==3.20
+jinja2==3.1.6
+markdown-it-py==4.2.0
+markupsafe==3.0.4
+mdurl==0.1.2
+mpmath==1.3.0
+networkx==3.7
+numpy==2.5.4
+packaging==26.3
+psutil==7.2.2
+psycopg2-binary==2.9.13
+pycparser==3.12
+pygments==2.21.0
+pyyaml==6.0.3
+regex==2026.9.29
+rich==15.0.0
+safetensors==0.8.0
+setuptools==81.0.0
+shellingham==1.5.4
+soundfile==0.14.0
+sympy==1.14.0
+tokenizers==0.23.3
+torch==2.12.0+cu130
+torchaudio==2.11.1
+torchcodec==0.17.0+cu130
+tqdm==4.70.1
+transformers==5.22.1
+truststore==0.10.5
+typer==0.27.3
+typing-extensions==4.16.0
