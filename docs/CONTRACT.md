@@ -260,8 +260,10 @@ SET    status = 'done',
 WHERE  id     = $1;
 ```
 
-Both writes MUST be in a single transaction. If the INSERT fails, the job
-remains `claimed` and the heartbeat will expire it back to `pending`.
+Both writes MUST be in a single transaction. A lost connection is retried on a
+fresh one (see "Transient vs permanent failures" below); if the write still
+cannot land, the job is released to `pending` (attempt kept), and if even that
+fails it stays `claimed` until the stale sweep expires it back to `pending`.
 
 #### Mark failed (Python runner, on unrecoverable error)
 
@@ -271,6 +273,65 @@ SET    status = 'failed',
        error  = $2          -- truncated error message, max 2000 chars
 WHERE  id     = $1;
 ```
+
+Only a **permanent** failure marks a job failed (see below).
+
+#### Transient vs permanent failures (Python runner)
+
+The runner classifies every job failure:
+
+| Class | What | Handling |
+|---|---|---|
+| transient `db` | psycopg2 `OperationalError` / `InterfaceError` (connection lost) | in `_mark_done`: reconnect and retry up to `RUNNER_RETRY_DB_ATTEMPTS` (3) times; before re-writing, a job already `done` means the earlier commit landed |
+| transient `oom` | `torch.cuda.OutOfMemoryError` (or `CUDA out of memory` in the text) | per window (or single pass): `gc.collect()` + `torch.cuda.empty_cache()`, retry up to `RUNNER_RETRY_OOM_ATTEMPTS` (2) times |
+| transient `io` | network `OSError` (WinError 53/59/64/67/1231, `ETIMEDOUT`, `EHOSTUNREACH`, `ECONNRESET`, `EIO`, …), an ffmpeg/ffprobe I/O error, or any file/ffmpeg error **while the books share is unreachable** | retry up to `RUNNER_RETRY_IO_ATTEMPTS` (3) times with backoff |
+| transient `timeout` | an ffmpeg/ffprobe call outlived its timeout (`max(RUNNER_FFMPEG_TIMEOUT_FLOOR_SECONDS, RUNNER_FFMPEG_TIMEOUT_FACTOR × audio seconds)`; ffprobe gets the floor) | as `io` |
+| permanent | everything else — a missing file, permission error or undecodable audio on a **reachable** share, a path-traversal reject, empty model output, a constraint violation | `_mark_failed` (terminal), as before |
+
+Backoff is exponential with jitter: `min(RUNNER_RETRY_MAX_SECONDS, BASE × FACTOR^(n-1)) × U(1 ± JITTER)`
+(defaults 10 s × 3, ±20 %: ~10, ~30, ~90 s). When the retries in place run out, the job is
+**released without refunding the attempt**, so the `attempts < 3` claim filter still bounds it,
+and the error is recorded; the claim that used the last attempt fails the job instead of leaving
+it `pending` at the cap (a row no claim and no stale sweep would pick up again):
+
+```sql
+UPDATE transcription_jobs
+SET    status     = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'pending' END,
+       claimed_by = CASE WHEN attempts >= 3 THEN claimed_by END,
+       claimed_at = CASE WHEN attempts >= 3 THEN claimed_at END,
+       error      = CASE WHEN attempts >= 3
+                         THEN 'max attempts reached; last transient error: ' || $2
+                         ELSE $2 END,      -- a pending job may now carry the last error
+       updated_at = now()
+WHERE  id = $1 AND status = 'claimed' AND claimed_by = $3
+RETURNING status;
+```
+
+The main loop then waits before its next claim — the same backoff over the number of
+consecutive transient releases, capped at `RUNNER_TRANSIENT_BACKOFF_MAX_SECONDS` (600 s) and
+reset by the next completed job — and after an `io` release it does not claim at all until the
+books share answers again, so an outage does not burn every queued job's attempts.
+
+#### Resume checkpoints (Python runner, chunked path)
+
+A chunked job (audio over `ASR_CHUNK_THRESHOLD_SECONDS`) writes a **local** checkpoint after
+every finished window: the stitched words + segments so far and the next window's offset, as
+`job-<job id>.json` in `RUNNER_CHECKPOINT_DIR` (default `C:\ProgramData\earmark-asr\checkpoints`
+on Windows, `<RUNNER_TMP_DIR>/earmark-asr-checkpoints` elsewhere; `off` disables), written
+atomically (temp file + fsync + `os.replace`). It is keyed by job id and invalidated by a
+fingerprint of the DB `file_path`, the file's size and mtime, `ASR_BACKEND`, `ASR_MODEL`,
+`ASR_COMPUTE_TYPE`, the window/overlap geometry, the runner version and the bias terms. A claim
+that finds a valid checkpoint skips the finished windows; a mismatched or corrupt one is
+deleted. The checkpoint is deleted once `_mark_done` commits (or on a permanent failure) and
+kept across a release, so a stop, a crash, a mid-job yield (§1.4) or an exhausted transient
+retry costs at most the window in flight. Checkpoints older than 7 days are pruned at startup.
+Nothing about it is in the database: the transcript is still written once, at the end, and the
+Go worker chunks and embeds that finished transcript exactly as before. A checkpoint I/O failure
+turns checkpointing off for that job; it never fails it.
+
+The per-job heartbeat thread reconnects after a failed connection or stamp instead of going
+quiet for the rest of the job (a silent heartbeat lets the stale sweep below re-pend a job that
+is still running).
 
 #### GPU/ASR host busy gate
 
@@ -306,6 +367,8 @@ CREATE TABLE IF NOT EXISTS runner_control (
                                             ('idle','requested','updating','success','failed')),
     runner_update_error    TEXT,         -- failure detail for the last update attempt
     runner_update_at       TIMESTAMPTZ,  -- when the update state last changed
+    arbiter_yield    BOOLEAN NOT NULL DEFAULT false, -- gpu-arbiter's yield request (00016)
+    arbiter_yield_at TIMESTAMPTZ,                    -- when gpu-arbiter last wrote it
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by TEXT
 );
@@ -498,6 +561,27 @@ The Go service exposes these write shapes (see §2.7 Control API):
 resume/run set `run_limit` **before** flipping `paused=false`, so the runner is
 never momentarily unbounded.
 
+#### gpu-arbiter yield — `runner_control.arbiter_yield` (migration 00016)
+
+`arbiter_yield` is gpu-arbiter's **own** request that the ASR runner step off the GPU (a
+higher-priority tenant — a game, ComfyUI — wants the card). It is written **only** by
+gpu-arbiter's `gpu_gate` (homelab-ansible): yield sets it `true` and `arbiter_yield_at = now()`;
+resume sets it `false` and `arbiter_yield_at = now()`. With it, `phase` has one writer again —
+`earmark batch` and operators — instead of the gate borrowing `phase='analyze'` (the legacy
+hold, `updated_by LIKE 'gpu-arbiter:yield:%'`, which the new gate's resume still undoes so an
+in-flight old-style hold is released after the upgrade; the new gate never writes `phase`).
+
+The runner parks when **paused OR phase='analyze' (any non-GPU phase) OR arbiter_yield** — at
+the gate between jobs and, for a chunked job, **between windows** (the checkpoint keeps the
+finished windows; the job is released with its attempt refunded, as on a stop, and the next gate
+parks). An eviction therefore costs at most one window. A runner reads the column defensively:
+absent (a database older than 00016), a missing row or a read error is `false`. The Go service
+only reads it — `/api/v1/status` `pipeline.arbiterYield` / `arbiterYieldAt` ("held by
+gpu-arbiter"). **Deploy order:** an earmark release containing 00016 and a runner pin bump in
+homelab-ansible (`asr_runner_windows_source_ref`) first; the `gpu_gate` change that writes
+`arbiter_yield` ships with or after that pin bump, never before (the gate does not tolerate a
+schema without the column).
+
 #### GPU phase control + self-parking — `runner_control.phase`
 
 To let a single GPU host **time-share** between the ASR model and a (future)
@@ -536,10 +620,11 @@ Phase values **as the runner interprets them**:
 | `'analyze'` | judge phase — the runner must step off the GPU | **parked to CPU** |
 | any other value | unrecognised → fail safe (treat as "do not use the GPU") | **parked to CPU** |
 
-**Self-parking rule.** Between jobs (never mid-transcription) the runner decides:
+**Self-parking rule.** Between jobs — and between the windows of a chunked job, which then
+yields (see `arbiter_yield` above) — the runner decides:
 
 ```
-park the model OFF the GPU  iff  paused  OR  phase NOT IN (NULL, 'idle', 'transcribe')
+park the model OFF the GPU  iff  paused  OR  phase NOT IN (NULL, 'idle', 'transcribe')  OR  arbiter_yield
 ```
 
 When parking, the runner moves its model to host RAM (`asr_model.cpu()` +
@@ -1190,6 +1275,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
 | 14 | `00014_finding_labels_scorecard.sql` | Model quality over time (§2.15 "Labels and scorecards"): the append-only `finding_labels` table (UPDATE/DELETE refused by a row trigger, TRUNCATE by a statement trigger; generated `correction_key` and `target`), the `finding_correction_key()` function (13's `correction_key` expression verbatim), and the read-only views `finding_label_current`, `recipe_scorecard` and `decide_scorecard`. One new table, three views, two functions; no ALTER, no backfill, no lock beyond the ACCESS SHARE a view takes (`lock_timeout` 5s). Down refuses while `finding_labels` has rows unless the session sets `earmark.allow_data_loss = 'on'`. |
 | 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. The representative CHECK is added `NOT VALID`, so Up after an opted-in Down (which keeps the append-only log's `duplicate` decisions and drops their pointer) succeeds. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
+| 16 | `00016_runner_arbiter_yield.sql` | gpu-arbiter's own yield request (§1.4 "gpu-arbiter yield"): `runner_control.arbiter_yield BOOLEAN NOT NULL DEFAULT false` and `arbiter_yield_at TIMESTAMPTZ`, both `ADD COLUMN IF NOT EXISTS` (Down `DROP COLUMN IF EXISTS`). A constant default rewrites nothing; ACCESS EXCLUSIVE on the one-row `runner_control` only, `lock_timeout` 5s. Merge before 00017; if they merge in the other order, renumber the later one. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -2238,6 +2324,11 @@ vars are new and **optional** — see §2.13 for the vocabulary.
 | `BOOKS_DB_ROOT` | no | `/books` — the producer-side root that absolute DB `file_path`s are rooted at (the Go service's container `BOOKS_DIR`). Always parsed as a POSIX path, whatever OS the runner is on. |
 | `BOOKS_PATH_ENCODING` | no | `none` (default) or `sfm`; any other value fails startup. `sfm` encodes NTFS-illegal characters in each re-rooted path component (never the `BOOKS_MOUNT` prefix) to the Services-for-Mac private-use code points: U+0001–U+001F → U+F001–U+F01F, `"` → U+F020, `*` → U+F021, `:` → U+F022, `<` → U+F023, `>` → U+F024, `?` → U+F025, `\` → U+F026, `\|` → U+F027. This is Samba's `macos_string_replace_map` (`source3/lib/string_replace.c`), which `vfs_fruit` installs as `catia:mappings` under `fruit:encoding = native`. As in Samba, there is no trailing-space or trailing-period rule. Use it when a Windows runner reads a share configured that way, so names containing `:` etc. resolve. |
 | `RUNNER_KEEP_AWAKE` | no | `auto` (default: on for Windows, off elsewhere), `true` or `false` (also `1`/`0`, `yes`/`no`, `on`/`off`; case-insensitive); any other value fails startup and `--self-check`. When on, the runner keeps an idle-sleeping host awake via `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED)` from its main-loop thread (never display-required or away mode), changing it only on a state transition. It holds while a job is in flight, while a claimable job (`pending`, `attempts < 3`) exists and the gate would let it be claimed (not `paused`, `run_limit` NULL or > 0, `phase` ≠ `analyze`), or while the batch `phase` is `transcribe` or `analyze` (§1.4); otherwise, or when an evaluation fails (e.g. the DB is unreachable), it releases and the host's normal idle timer resumes. Forcing `true` on a non-Windows host logs once and does nothing. Off → no extra queries. |
+| `RUNNER_RETRY_BASE_SECONDS` / `RUNNER_RETRY_FACTOR` / `RUNNER_RETRY_MAX_SECONDS` / `RUNNER_RETRY_JITTER` | no | `10` / `3` / `300` / `0.2` — transient-retry backoff, `min(MAX, BASE × FACTOR^(n-1)) × U(1 ± JITTER)` (§1.3 "Transient vs permanent failures") |
+| `RUNNER_RETRY_IO_ATTEMPTS` / `RUNNER_RETRY_OOM_ATTEMPTS` / `RUNNER_RETRY_DB_ATTEMPTS` | no | `3` / `2` / `3` — retries in place per operation for SMB/ffmpeg I/O + timeouts, CUDA OOM (per window), and DB errors in `_mark_done` |
+| `RUNNER_TRANSIENT_BACKOFF_MAX_SECONDS` | no | `600` — cap on the main loop's wait before the next claim after consecutive transient releases |
+| `RUNNER_FFMPEG_TIMEOUT_FLOOR_SECONDS` / `RUNNER_FFMPEG_TIMEOUT_FACTOR` | no | `120` / `0.5` — each ffmpeg call times out after `max(FLOOR, FACTOR × seconds of audio it decodes)`; ffprobe after `FLOOR` |
+| `RUNNER_CHECKPOINT_DIR` | no | `C:\ProgramData\earmark-asr\checkpoints` on Windows, `<RUNNER_TMP_DIR>/earmark-asr-checkpoints` elsewhere; `off` disables. Per-job resume checkpoints (§1.3 "Resume checkpoints"); created at startup, older than 7 days pruned |
 
 **Breaking changes: none** for the existing runner — every new var is optional
 and the defaults preserve current behavior, with one intended exception:
@@ -2458,6 +2549,8 @@ actions (`/actions/*`, guarded by the `HX-Request` header). It writes the
   "embedBacklog":    3,     // completed transcripts not yet embedded
   "gpuCommitted":    true,  // pipeline currently owns the GPU (transcribing or evaluating)
   "gpuProbed":       true,  // gpu-arbiter probe is configured and reachable
+  "arbiterYield":    false, // gpu-arbiter holds the ASR runner off the GPU (runner_control.arbiter_yield, §1.4)
+  "arbiterYieldAt":  "2026-11-03T11:00:00Z", // last gpu-arbiter yield/resume write; omitted until one
   "fullyDone":       false, // all stages complete (pending==0 && claimed==0 && embedBacklog==0 && eval covered)
 
   // Per-track stage bucket counts for the segmented pipeline bar.

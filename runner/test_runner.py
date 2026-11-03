@@ -16,6 +16,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1580,8 +1581,9 @@ class MonoDownmixTests(unittest.TestCase):
             source_path = Path("/fake/stereo.m4b")
             result = runner._transcribe_file(source_path, mock_model, None)
 
-        # _to_mono_wav must have been called with the source audio path.
-        mock_tmw.assert_called_once_with(source_path)
+        # _to_mono_wav must have been called with the source audio path (and its
+        # duration, which scales the ffmpeg timeout).
+        mock_tmw.assert_called_once_with(source_path, audio_seconds=60.0)
         # The mono temp file MUST be cleaned up (finally block in single-pass path).
         mock_unlink.assert_called()
         # The model's transcribe must receive the mono path, not the original.
@@ -1628,7 +1630,7 @@ class MonoDownmixTests(unittest.TestCase):
             result = runner._transcribe_file(source_path, mock_model, None)
 
         # Even a mono source goes through _to_mono_wav (resample to 16 kHz).
-        mock_tmw.assert_called_once_with(source_path)
+        mock_tmw.assert_called_once_with(source_path, audio_seconds=30.0)
         mock_unlink.assert_called()
         transcribed_path = mock_model.transcribe.call_args[0][0][0]
         self.assertEqual(transcribed_path, str(mono_path))
@@ -3357,7 +3359,8 @@ class GateGpuInputsTests(unittest.TestCase):
         conn = _PhaseConn(
             control_row={"paused": True, "run_limit": 4}, phase_row={"phase": "analyze"}
         )
-        self.assertEqual(runner._read_gate_inputs(conn), (True, 4, "analyze"))
+        # arbiter_yield (4th) reads False: _PhaseConn has no arbiter_yield row.
+        self.assertEqual(runner._read_gate_inputs(conn), (True, 4, "analyze", False))
 
     def test_passed_inputs_do_not_requery_runner_control(self) -> None:
         conn = _PhaseConn(raise_on="runner_control WHERE")  # any read would degrade/raise
@@ -3775,3 +3778,695 @@ class ResolveNemoPathTests(unittest.TestCase):
 
         with self._with_hub(boom):
             self.assertIsNone(runner._resolve_nemo_path("nvidia/parakeet-tdt-1.1b"))
+
+
+# ── Hardening: transient vs permanent failures, retry, resume, mid-job yield ──
+# (CONTRACT §1.3 "Transient vs permanent failures" / "Resume checkpoints",
+# §1.4 arbiter_yield.)
+
+
+def _pg_error(name: str) -> type[Exception]:
+    """A stand-in for a psycopg2 error class (psycopg2 is stubbed here): the
+    classifier matches by class name + module, so no real driver is needed."""
+    cls = type(name, (Exception,), {})
+    cls.__module__ = "psycopg2"
+    return cls
+
+
+FakeOperationalError = _pg_error("OperationalError")
+FakeInterfaceError = _pg_error("InterfaceError")
+FakeIntegrityError = _pg_error("IntegrityError")
+
+
+class ClassifyFailureTests(unittest.TestCase):
+    def _classify(self, exc: BaseException, reachable: bool = True) -> str | None:
+        with mock.patch.object(runner, "_books_share_reachable", return_value=reachable):
+            return runner._classify_failure(exc)
+
+    def test_db_connection_errors_are_transient(self) -> None:
+        self.assertEqual(self._classify(FakeOperationalError("server closed")), runner.TRANSIENT_DB)
+        self.assertEqual(self._classify(FakeInterfaceError("connection already closed")), runner.TRANSIENT_DB)
+
+    def test_other_db_errors_are_permanent(self) -> None:
+        self.assertIsNone(self._classify(FakeIntegrityError("duplicate key")))
+        # Same class name outside psycopg2 is not a DB error.
+        self.assertIsNone(self._classify(type("OperationalError", (Exception,), {})("x")))
+
+    def test_cuda_oom_by_class_name_or_message(self) -> None:
+        oom_cls = type("OutOfMemoryError", (RuntimeError,), {})
+        self.assertEqual(self._classify(oom_cls("boom")), runner.TRANSIENT_OOM)
+        self.assertEqual(
+            self._classify(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")),
+            runner.TRANSIENT_OOM,
+        )
+
+    def test_subprocess_timeout_is_transient(self) -> None:
+        import subprocess as _sp
+
+        self.assertEqual(self._classify(_sp.TimeoutExpired("ffmpeg", 120)), runner.TRANSIENT_TIMEOUT)
+
+    def test_network_oserrors_are_transient_even_on_a_reachable_share(self) -> None:
+        import errno as _errno
+
+        for winerror in (53, 59, 64, 67, 1231):
+            exc = OSError("network")
+            exc.winerror = winerror  # type: ignore[attr-defined]
+            with self.subTest(winerror=winerror):
+                self.assertEqual(self._classify(exc), runner.TRANSIENT_IO)
+        for code in (_errno.ETIMEDOUT, _errno.EHOSTUNREACH, _errno.ECONNRESET, _errno.EIO):
+            with self.subTest(errno=code):
+                self.assertEqual(self._classify(OSError(code, "x")), runner.TRANSIENT_IO)
+
+    def test_missing_file_is_permanent_only_on_a_reachable_share(self) -> None:
+        import errno as _errno
+
+        missing = FileNotFoundError(_errno.ENOENT, "Audio file not found")
+        self.assertIsNone(self._classify(missing, reachable=True))
+        self.assertEqual(self._classify(missing, reachable=False), runner.TRANSIENT_IO)
+        self.assertIsNone(self._classify(PermissionError(_errno.EACCES, "denied"), reachable=True))
+
+    def test_ffmpeg_io_error_is_transient_bad_audio_permanent(self) -> None:
+        import subprocess as _sp
+
+        io_err = _sp.CalledProcessError(1, "ffmpeg", stderr="in.m4b: Input/output error\n")
+        bad = _sp.CalledProcessError(1, "ffmpeg", stderr="Invalid data found when processing input")
+        self.assertEqual(self._classify(io_err), runner.TRANSIENT_IO)
+        self.assertIsNone(self._classify(bad, reachable=True))
+        self.assertEqual(self._classify(bad, reachable=False), runner.TRANSIENT_IO)
+
+    def test_ffprobe_wrapped_error_follows_the_cause_chain(self) -> None:
+        import subprocess as _sp
+
+        cause = _sp.CalledProcessError(1, "ffprobe", stderr="Connection timed out")
+        try:
+            try:
+                raise cause
+            except _sp.CalledProcessError as exc:
+                raise RuntimeError("ffprobe failed (exit 1)") from exc
+        except RuntimeError as wrapped:
+            self.assertEqual(self._classify(wrapped), runner.TRANSIENT_IO)
+
+    def test_everything_else_is_permanent(self) -> None:
+        for exc in (ValueError("traversal"), RuntimeError("empty hypotheses"), KeyError("x")):
+            with self.subTest(exc=exc):
+                self.assertIsNone(self._classify(exc, reachable=False))
+
+    def test_failure_message_appends_ffmpeg_stderr(self) -> None:
+        import subprocess as _sp
+
+        exc = _sp.CalledProcessError(1, ["ffmpeg"], stderr="line1\nI/O error here\n")
+        self.assertIn("I/O error here", runner._failure_message(exc))
+        self.assertEqual(runner._failure_message(ValueError("v")), "v")
+
+
+class BackoffTests(unittest.TestCase):
+    def test_exponential_schedule_without_jitter(self) -> None:
+        with mock.patch.object(runner, "RETRY_JITTER", 0.0):
+            self.assertEqual([runner._backoff_delay(n) for n in (1, 2, 3)], [10.0, 30.0, 90.0])
+            self.assertEqual(runner._backoff_delay(9), runner.RETRY_MAX_SECONDS)
+            self.assertEqual(runner._backoff_delay(9, cap=600.0), 600.0)
+
+    def test_jitter_stays_within_bounds(self) -> None:
+        for _ in range(50):
+            d = runner._backoff_delay(2)
+            self.assertGreaterEqual(d, 30.0 * (1 - runner.RETRY_JITTER))
+            self.assertLessEqual(d, 30.0 * (1 + runner.RETRY_JITTER))
+
+
+class WithRetriesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.waits: list[float] = []
+        patcher = mock.patch.object(runner, "_retry_wait", side_effect=self.waits.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_transient_io_is_retried_with_backoff_then_succeeds(self) -> None:
+        import subprocess as _sp
+
+        fn = mock.Mock(side_effect=[_sp.TimeoutExpired("ffmpeg", 1), _sp.TimeoutExpired("ffmpeg", 1), "ok"])
+        self.assertEqual(runner._with_retries("t", fn, 1, k=2), "ok")
+        self.assertEqual(fn.call_count, 3)
+        fn.assert_called_with(1, k=2)
+        self.assertEqual(len(self.waits), 2)
+        self.assertLess(self.waits[0], self.waits[1])
+
+    def test_io_budget_is_bounded(self) -> None:
+        import subprocess as _sp
+
+        fn = mock.Mock(side_effect=_sp.TimeoutExpired("ffmpeg", 1))
+        with self.assertRaises(_sp.TimeoutExpired):
+            runner._with_retries("t", fn)
+        self.assertEqual(fn.call_count, runner.RETRY_IO_ATTEMPTS + 1)
+
+    def test_oom_frees_cuda_memory_and_retries_without_sleeping(self) -> None:
+        oom = RuntimeError("CUDA out of memory")
+        fn = mock.Mock(side_effect=[oom, oom, oom])
+        with mock.patch.object(runner, "_free_cuda_memory") as free, self.assertRaises(RuntimeError):
+            runner._with_retries("t", fn)
+        self.assertEqual(fn.call_count, runner.RETRY_OOM_ATTEMPTS + 1)
+        self.assertEqual(free.call_count, runner.RETRY_OOM_ATTEMPTS)
+        self.assertEqual(self.waits, [])
+
+    def test_permanent_error_is_not_retried(self) -> None:
+        fn = mock.Mock(side_effect=ValueError("bad"))
+        with self.assertRaises(ValueError):
+            runner._with_retries("t", fn)
+        self.assertEqual(fn.call_count, 1)
+
+    def test_db_error_is_left_to_the_caller(self) -> None:
+        fn = mock.Mock(side_effect=FakeOperationalError("down"))
+        with self.assertRaises(FakeOperationalError):
+            runner._with_retries("t", fn)
+        self.assertEqual(fn.call_count, 1)
+
+
+
+class RetryWaitTests(unittest.TestCase):
+    def test_stop_during_backoff_raises_shutdown(self) -> None:
+        runner._shutdown.set()
+        self.addCleanup(runner._shutdown.clear)
+        with self.assertRaises(runner._ShutdownInterrupt):
+            runner._retry_wait(5)
+
+    def test_waits_without_a_stop(self) -> None:
+        runner._shutdown.clear()
+        runner._retry_wait(0)  # returns normally
+
+
+class FreeCudaMemoryTests(unittest.TestCase):
+    def test_empties_the_cache_when_torch_is_loaded(self) -> None:
+        torch = mock.MagicMock()
+        torch.cuda.is_available.return_value = True
+        with mock.patch.dict(sys.modules, {"torch": torch}):
+            runner._free_cuda_memory()
+        torch.cuda.empty_cache.assert_called_once()
+
+    def test_noop_without_torch(self) -> None:
+        with mock.patch.dict(sys.modules, {"torch": None}):
+            runner._free_cuda_memory()  # must not raise or import torch
+
+
+class FfmpegTimeoutTests(unittest.TestCase):
+    def test_timeout_scales_with_audio_and_has_a_floor(self) -> None:
+        floor = runner.FFMPEG_TIMEOUT_FLOOR_SECONDS
+        self.assertEqual(runner._ffmpeg_timeout(None), floor)
+        self.assertEqual(runner._ffmpeg_timeout(10.0), floor)
+        self.assertEqual(runner._ffmpeg_timeout(3600.0), runner.FFMPEG_TIMEOUT_FACTOR * 3600.0)
+
+    def test_cut_window_and_downmix_pass_a_timeout(self) -> None:
+        with mock.patch.object(runner.subprocess, "run") as run, \
+                mock.patch.object(runner.tempfile, "mkstemp", return_value=(99, "/tmp/x.wav")), \
+                mock.patch.object(runner.os, "close"):
+            runner._cut_window(Path("/fake/a.m4b"), 600.0, 615.0, 1)
+            runner._to_mono_wav(Path("/fake/a.m4b"), audio_seconds=800.0)
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"], runner._ffmpeg_timeout(615.0))
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], runner._ffmpeg_timeout(800.0))
+        self.assertTrue(all(c.kwargs["check"] for c in run.call_args_list))
+
+    def test_ffprobe_passes_a_timeout(self) -> None:
+        fake = mock.Mock(stdout='{"format": {"duration": "1"}, "streams": [{}]}', stderr="")
+        with mock.patch.object(runner.subprocess, "run", return_value=fake) as run:
+            runner._audio_probe(Path("/fake/a.m4b"))
+        self.assertEqual(run.call_args.kwargs["timeout"], runner._ffmpeg_timeout(None))
+
+    def test_cut_window_timeout_cleans_up_and_is_transient(self) -> None:
+        import subprocess as _sp
+
+        with mock.patch.object(runner.subprocess, "run", side_effect=_sp.TimeoutExpired("ffmpeg", 1)), \
+                mock.patch.object(runner.tempfile, "mkstemp", return_value=(99, "/tmp/x.wav")), \
+                mock.patch.object(runner.os, "close"), \
+                mock.patch.object(runner.os, "unlink") as unlink, \
+                self.assertRaises(_sp.TimeoutExpired) as ctx:
+            runner._cut_window(Path("/fake/a.m4b"), 0.0, 600.0, 0)
+        unlink.assert_called_once_with("/tmp/x.wav")
+        self.assertEqual(runner._classify_failure(ctx.exception), runner.TRANSIENT_TIMEOUT)
+
+
+class _CheckpointDirMixin(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name) / "ckpt"
+        self.dir.mkdir()
+        patcher = mock.patch.object(runner, "CHECKPOINT_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.audio = Path(self._tmp.name) / "book.m4b"
+        self.audio.write_bytes(b"x" * 100)
+
+    def _ctx(self, job_id: str = "job-a", **kw: Any) -> Any:
+        return runner._JobContext(job_id, "/books/A/book.m4b", **kw)
+
+
+class CheckpointTests(_CheckpointDirMixin):
+    def _open(self, ctx: Any) -> Any:
+        with mock.patch.object(runner, "_active_job", ctx):
+            return runner._open_checkpoint(self.audio)
+
+    def test_save_load_roundtrip_is_atomic(self) -> None:
+        ck = self._open(self._ctx())
+        words = [{"word": "a", "start": 1.0, "end": 1.2}]
+        segs = [{"segment": "a", "start": 1.0, "end": 1.2}]
+        ck.save(600.0, 1, words, segs)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["job-job-a.json"])  # no .tmp left
+        self.assertEqual(self._open(self._ctx()).load(), (600.0, 1, words, segs))
+
+    def test_fingerprint_change_invalidates(self) -> None:
+        self._open(self._ctx()).save(600.0, 1, [], [])
+        changes = {
+            "ASR_MODEL_ID": "nvidia/other",
+            "ASR_COMPUTE_TYPE": "float16",
+            "CHUNK_WINDOW_SECONDS": 300.0,
+            "CHUNK_OVERLAP_SECONDS": 5.0,
+            "RUNNER_VERSION": "v9.9.9",
+        }
+        for name, value in changes.items():
+            with self.subTest(changed=name), mock.patch.object(runner, name, value):
+                self.assertIsNone(self._open(self._ctx()).load())
+                self.assertFalse((self.dir / "job-job-a.json").exists(), "stale checkpoint deleted")
+            self._open(self._ctx()).save(600.0, 1, [], [])
+        self.assertIsNone(self._open(self._ctx(bias_terms=["Muad'Dib"])).load())
+        self._open(self._ctx()).save(600.0, 1, [], [])
+        self.audio.write_bytes(b"y" * 101)  # size (and mtime) of the source changed
+        self.assertIsNone(self._open(self._ctx()).load())
+
+    def test_corrupt_checkpoint_is_discarded(self) -> None:
+        (self.dir / "job-job-a.json").write_text("{not json", encoding="utf-8")
+        self.assertIsNone(self._open(self._ctx()).load())
+        self.assertFalse((self.dir / "job-job-a.json").exists())
+
+    def test_save_failure_disables_but_never_raises(self) -> None:
+        ck = self._open(self._ctx())
+        with mock.patch.object(runner.os, "replace", side_effect=OSError("disk full")):
+            ck.save(600.0, 1, [], [])
+        self.assertFalse(ck.enabled)
+        self.assertEqual(list(self.dir.iterdir()), [], "temp file cleaned up")
+        ck.save(1200.0, 2, [], [])  # disabled: a no-op
+
+    def test_no_context_or_disabled_means_no_checkpoint(self) -> None:
+        self.assertIsNone(self._open(None))
+        with mock.patch.object(runner, "CHECKPOINT_DIR", None):
+            self.assertIsNone(self._open(self._ctx()))
+
+    def test_job_id_is_sanitised_into_the_file_name(self) -> None:
+        self.assertEqual(runner._checkpoint_path("../x\\y").name, "job-.._x_y.json")
+
+    def test_startup_prunes_checkpoints_older_than_seven_days(self) -> None:
+        old, new = self.dir / "job-old.json", self.dir / "job-new.json"
+        stray = self.dir / "job-old.json.abc.tmp"
+        for p in (old, new, stray):
+            p.write_text("{}", encoding="utf-8")
+        now = 10_000_000.0
+        eight_days = 8 * 24 * 3600
+        os.utime(old, (now - eight_days, now - eight_days))
+        os.utime(stray, (now - eight_days, now - eight_days))
+        os.utime(new, (now - 3600, now - 3600))
+        runner._init_checkpoint_dir(now=now)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["job-new.json"])
+
+    def test_uncreatable_dir_disables_resume(self) -> None:
+        blocker = Path(self._tmp.name) / "file"
+        blocker.write_text("", encoding="utf-8")
+        with mock.patch.object(runner, "CHECKPOINT_DIR", blocker / "sub"):
+            runner._init_checkpoint_dir()
+            self.assertIsNone(runner.CHECKPOINT_DIR)
+
+    def test_default_dir(self) -> None:
+        with mock.patch.dict(os.environ, {"PROGRAMDATA": r"C:\ProgramData"}):
+            self.assertEqual(
+                str(runner._default_checkpoint_dir("nt")).replace("/", "\\"),
+                r"C:\ProgramData\earmark-asr\checkpoints",
+            )
+        self.assertEqual(
+            runner._default_checkpoint_dir("posix"), runner.RUNNER_TMP_DIR / "earmark-asr-checkpoints"
+        )
+        self.assertIsNone(runner._parse_checkpoint_dir("off"))
+
+
+class _WindowModel:
+    """Fake NeMo model: one word at window-relative 1 s per transcribe call,
+    named after the clip's window index (the _cut_window stub encodes it)."""
+
+    def __init__(self, fail_on: int | None = None) -> None:
+        self.calls: list[int] = []
+        self.fail_on = fail_on
+
+    def transcribe(self, paths: list[str], **_kw: Any) -> list[Any]:
+        idx = int(Path(paths[0]).stem.rsplit("-", 1)[1])
+        self.calls.append(idx)
+        if idx == self.fail_on:
+            raise ValueError(f"model died on window {idx}")
+        w = {"word": f"w{idx}", "start": 1.0, "end": 1.5}
+        s = {"segment": f"w{idx}", "start": 1.0, "end": 1.5}
+        return [runner._StitchedHypothesis(f"w{idx}", [w], [s])]
+
+
+class ChunkedResumeAndYieldTests(_CheckpointDirMixin):
+    """The per-window hook in _transcribe_chunked: checkpoint after every
+    window, resume from it, and yield between windows when the gate closes."""
+
+    DURATION = 2400.0  # four 600 s windows
+
+    def _run(self, model: _WindowModel, ctx: Any) -> Any:
+        def cut(_audio: Path, _off: float, _len: float, idx: int) -> Path:
+            p = Path(self._tmp.name) / f"clip-{idx}.wav"
+            p.write_bytes(b"")
+            return p
+
+        with mock.patch.object(runner, "_active_job", ctx), \
+                mock.patch.object(runner, "_cut_window", side_effect=cut):
+            hyps, n = runner._transcribe_chunked(model, self.audio, self.DURATION)
+        return [w["word"] for w in hyps[0].timestamp["word"]], n
+
+    def test_resume_skips_finished_windows_and_matches_a_full_run(self) -> None:
+        full, _ = self._run(_WindowModel(), None)
+
+        with self.assertRaises(ValueError):
+            self._run(_WindowModel(fail_on=2), self._ctx())
+        model = _WindowModel()
+        words, n = self._run(model, self._ctx())
+        self.assertEqual(model.calls, [2, 3], "windows 0-1 came from the checkpoint")
+        self.assertEqual(words, full)
+        self.assertEqual(n, 4)
+
+    def test_checkpoint_is_written_after_every_window(self) -> None:
+        saves: list[tuple[float, int]] = []
+        real = runner._Checkpoint.save
+
+        def spy(ck: Any, off: float, idx: int, w: Any, s: Any) -> None:
+            saves.append((off, idx))
+            real(ck, off, idx, w, s)
+
+        with mock.patch.object(runner._Checkpoint, "save", spy):
+            self._run(_WindowModel(), self._ctx())
+        self.assertEqual(saves, [(600.0, 1), (1200.0, 2), (1800.0, 3), (2400.0, 4)])
+
+    def test_yield_between_windows_after_the_checkpoint(self) -> None:
+        asked: list[int] = []
+
+        def should_yield() -> str | None:
+            asked.append(1)
+            return "held by gpu-arbiter (arbiter_yield)" if len(asked) == 2 else None
+
+        model = _WindowModel()
+        with self.assertRaises(runner._YieldInterrupt):
+            self._run(model, self._ctx(should_yield=should_yield))
+        self.assertEqual(model.calls, [0, 1], "at most the in-flight window is lost")
+        resumed = self._open_state()
+        self.assertEqual(resumed[:2], (1200.0, 2))
+
+        model2 = _WindowModel()
+        self._run(model2, self._ctx(should_yield=lambda: None))
+        self.assertEqual(model2.calls, [2, 3])
+
+    def test_no_yield_check_after_the_last_window(self) -> None:
+        asked: list[int] = []
+        self._run(_WindowModel(), self._ctx(should_yield=lambda: asked.append(1)))
+        self.assertEqual(len(asked), 3)
+
+    def test_failing_yield_check_keeps_working(self) -> None:
+        def boom() -> str:
+            raise FakeOperationalError("conn dead")
+
+        words, _ = self._run(_WindowModel(), self._ctx(should_yield=boom))
+        self.assertEqual(len(words), 4)
+
+    def test_window_oom_is_retried_in_place(self) -> None:
+        model = _WindowModel()
+        real = model.transcribe
+        state = {"oom": True}
+
+        def flaky(paths: list[str], **kw: Any) -> list[Any]:
+            if state["oom"] and paths[0].endswith("clip-1.wav"):
+                state["oom"] = False
+                raise RuntimeError("CUDA out of memory")
+            return real(paths, **kw)
+
+        model.transcribe = flaky  # type: ignore[method-assign]
+        with mock.patch.object(runner, "_free_cuda_memory") as free:
+            words, _ = self._run(model, self._ctx())
+        free.assert_called_once()
+        self.assertEqual(words, ["w0", "w1", "w2", "w3"])
+
+    def _open_state(self) -> Any:
+        with mock.patch.object(runner, "_active_job", self._ctx()):
+            return runner._open_checkpoint(self.audio).load()
+
+
+class ParkGateArbiterYieldTests(unittest.TestCase):
+    def test_should_park_on_arbiter_yield(self) -> None:
+        self.assertTrue(runner._should_park(False, "idle", True))
+        self.assertTrue(runner._should_park(False, None, True))
+        self.assertFalse(runner._should_park(False, "transcribe", False))
+
+    def test_read_arbiter_yield_values_and_fallbacks(self) -> None:
+        class _Cur(FakeCursor):
+            def fetchone(self) -> object:
+                return self.conn.control_row
+
+        class _Conn(FakeConn):
+            def cursor(self) -> FakeCursor:
+                return _Cur(self)
+
+        self.assertTrue(runner._read_arbiter_yield(_Conn({"arbiter_yield": True}, None)))
+        self.assertTrue(runner._read_arbiter_yield(_Conn((True,), None)))
+        self.assertFalse(runner._read_arbiter_yield(_Conn(None, None)))
+        missing = _PhaseConn(raise_on="arbiter_yield")  # pre-00016 schema
+        self.assertFalse(runner._read_arbiter_yield(missing))
+        self.assertEqual(missing.rollbacks, 1)
+
+    def test_gate_parks_on_arbiter_yield_and_publishes_it(self) -> None:
+        conn = _PhaseConn()
+        provider = _RecordingProvider()
+        self.assertTrue(runner._gate_gpu(conn, provider, (False, None, "idle", True)))
+        self.assertEqual(provider.parked, 1)
+        self.assertEqual(conn.parked_stamps, [True])
+
+    def test_mid_job_park_reason(self) -> None:
+        with mock.patch.object(runner, "_read_gate_inputs", return_value=(False, None, "idle", True)):
+            self.assertEqual(runner._mid_job_park_reason(None), "held by gpu-arbiter (arbiter_yield)")
+        with mock.patch.object(runner, "_read_gate_inputs", return_value=(False, None, "analyze", False)):
+            self.assertEqual(runner._mid_job_park_reason(None), "phase=analyze")
+        with mock.patch.object(runner, "_read_gate_inputs", return_value=(True, None, "idle", False)):
+            self.assertEqual(runner._mid_job_park_reason(None), "paused")
+        with mock.patch.object(runner, "_read_gate_inputs", return_value=(False, None, "transcribe", False)):
+            self.assertIsNone(runner._mid_job_park_reason(None))
+
+
+class _RetCursor(FakeCursor):
+    def fetchone(self) -> object:
+        if "SELECT status FROM transcription_jobs" in self.conn.last_sql:
+            return {"status": self.conn.status}
+        return super().fetchone()
+
+
+class _RetConn(_ClosableConn):
+    def __init__(self, status: str = "claimed", fail_sql: str | None = None, **kw: Any) -> None:
+        super().__init__(control_row=None, job_row={"status": "pending"})
+        self.status = status
+        self.fail_sql = fail_sql
+        self.closed = False
+
+    def cursor(self) -> FakeCursor:
+        cur = _RetCursor(self)
+        if self.fail_sql is not None:
+            orig = cur.execute
+
+            def execute(sql: str, params: object = None) -> None:
+                if self.fail_sql in sql:
+                    raise FakeOperationalError("server closed the connection unexpectedly")
+                orig(sql, params)
+
+            cur.execute = execute  # type: ignore[method-assign]
+        return cur
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ReleaseTransientTests(unittest.TestCase):
+    def test_keeps_the_attempt_records_the_error_and_fails_at_the_cap(self) -> None:
+        conn = _RetConn()
+        runner._release_job_transient(conn, "job-1", "transient io error: share gone")
+        sql, params = next((s, p) for s, p in conn.executed if "UPDATE transcription_jobs" in s)
+        self.assertNotIn("attempts - 1", sql, "a transient release must not refund the attempt")
+        self.assertIn(f"attempts >= {runner.MAX_ATTEMPTS} THEN 'failed' ELSE 'pending'", sql)
+        self.assertIn("claimed_by = %s", sql)
+        self.assertEqual(params[2:], ("job-1", runner.RUNNER_IDENTITY))
+        self.assertEqual(params[0], "transient io error: share gone")
+
+    def test_retries_once_on_a_fresh_connection(self) -> None:
+        dead = _RetConn(fail_sql="UPDATE transcription_jobs")
+        fresh = _RetConn()
+        with mock.patch.object(runner, "_connect", return_value=fresh):
+            runner._release_job_transient(dead, "job-1", "x")
+        self.assertTrue(any("UPDATE transcription_jobs" in s for s, _ in fresh.executed))
+        self.assertTrue(fresh.closed)
+
+
+class MarkDoneRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for name, value in (("_retry_wait", None), ("_has_provenance_columns", False)):
+            p = mock.patch.object(runner, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.result = {
+            "language": "en", "duration_seconds": 1.0, "speaker_count": None,
+            "segments": [], "raw_text": "",
+        }
+
+    def test_reconnects_and_retries_a_db_error(self) -> None:
+        dead = _RetConn(fail_sql="INSERT INTO transcripts")
+        fresh = _RetConn(status="claimed")
+        ref = runner._ConnRef(dead)
+        with mock.patch.object(runner, "_connect", return_value=fresh):
+            runner._mark_done_with_retry(ref, "job-1", "f", "c", self.result)
+        self.assertIs(ref.conn, fresh, "the caller gets the live connection back")
+        self.assertTrue(dead.closed)
+        self.assertTrue(any("SET    status = 'done'" in s for s, _ in fresh.executed))
+
+    def test_a_commit_that_landed_is_not_written_twice(self) -> None:
+        dead = _RetConn(fail_sql="INSERT INTO transcripts")
+        landed = _RetConn(status="done")
+        ref = runner._ConnRef(dead)
+        with mock.patch.object(runner, "_connect", return_value=landed):
+            runner._mark_done_with_retry(ref, "job-1", "f", "c", self.result)
+        self.assertFalse(any("INSERT INTO transcripts" in s for s, _ in landed.executed))
+
+    def test_budget_is_bounded_and_other_errors_are_not_retried(self) -> None:
+        with mock.patch.object(runner, "_connect", side_effect=lambda: _RetConn(fail_sql="INSERT")), \
+                self.assertRaises(FakeOperationalError):
+            runner._mark_done_with_retry(
+                runner._ConnRef(_RetConn(fail_sql="INSERT")), "j", "f", "c", self.result
+            )
+        connect = mock.Mock()
+        with mock.patch.object(runner, "_mark_done", side_effect=FakeIntegrityError("dup")), \
+                mock.patch.object(runner, "_connect", connect), self.assertRaises(FakeIntegrityError):
+            runner._mark_done_with_retry(runner._ConnRef(_RetConn()), "j", "f", "c", self.result)
+        connect.assert_not_called()
+
+
+class HeartbeatLoopTests(unittest.TestCase):
+    def test_reconnects_after_a_failed_open_and_a_failed_stamp(self) -> None:
+        stop = threading.Event()
+        good = _RetConn()
+        bad = _RetConn(fail_sql="UPDATE transcription_jobs")
+        opened: list[Any] = []
+        plan: list[Any] = [RuntimeError("db down"), bad, good]
+
+        def connect() -> Any:
+            item = plan.pop(0) if plan else good
+            if isinstance(item, Exception):
+                raise item
+            opened.append(item)
+            return item
+
+        def stamped() -> bool:
+            return sum("SET    updated_at = now()" in s for s, _ in good.executed) >= 2
+
+        t = threading.Thread(target=runner._heartbeat_loop, args=(stop, "job-1", 0.001, connect))
+        t.start()
+        for _ in range(2000):
+            if stamped():
+                break
+            threading.Event().wait(0.001)
+        stop.set()
+        t.join(timeout=2)
+        self.assertTrue(stamped(), "kept stamping after reconnecting")
+        self.assertEqual(opened[:2], [bad, good])
+        self.assertTrue(bad.closed and good.closed)
+
+
+class TransientFailureMainLoopTests(_MainLoopHarness):
+    """End to end through main(): transient → released (attempt kept) + loop
+    backoff; permanent → failed; mid-job yield → released with a refund."""
+
+    control_row = (False, None)
+    job_row: ClassVar[dict[str, str]] = {"id": "job-1", "file_path": "A/B/01.mp3", "checksum": "abc"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.claims = 0
+        real_claim = runner._claim_job
+
+        def claim_once(conn: Any) -> Any:
+            self.claims += 1
+            if self.claims > 1:
+                runner._shutdown.set()
+                return None
+            return real_claim(conn)
+
+        for p in (
+            mock.patch.object(runner, "_claim_job", side_effect=claim_once),
+            mock.patch.object(runner, "_backoff_delay", return_value=0.0),
+            mock.patch.object(runner, "_init_checkpoint_dir"),
+            mock.patch.object(runner, "_write_run_metrics"),
+            mock.patch.object(runner, "_books_share_reachable", return_value=True),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, on_transcribe: Any) -> tuple[Any, Any, Any]:
+        with mock.patch.object(runner, "_make_provider", return_value=_LoopProvider(on_transcribe)), \
+                mock.patch.object(runner, "_resolve_audio_path") as resolve, \
+                mock.patch.object(runner, "_mark_done") as mark_done, \
+                mock.patch.object(runner, "_mark_failed") as mark_failed, \
+                mock.patch.object(runner, "_delete_checkpoint") as delete:
+            resolve.return_value.exists.return_value = True
+            runner.main()
+        return mark_done, mark_failed, delete
+
+    def _raise(self, exc: BaseException) -> Any:
+        def go() -> None:
+            raise exc
+        return go
+
+    def test_transient_failure_releases_without_refund_and_backs_off(self) -> None:
+        import subprocess as _sp
+
+        mark_done, mark_failed, delete = self._run(self._raise(_sp.TimeoutExpired("ffmpeg", 1)))
+        mark_failed.assert_not_called()
+        mark_done.assert_not_called()
+        delete.assert_not_called()  # the checkpoint is kept for the next claim
+        released = [s for s in self._sql() if "THEN 'failed' ELSE 'pending'" in s]
+        self.assertEqual(len(released), 1)
+        self.assertFalse(any("GREATEST(attempts - 1, 0)" in s for s in self._sql()))
+        runner._backoff_delay.assert_called_with(1, cap=runner.TRANSIENT_BACKOFF_MAX_SECONDS)
+
+    def test_permanent_failure_marks_failed_and_drops_the_checkpoint(self) -> None:
+        _done, mark_failed, delete = self._run(self._raise(ValueError("bad audio")))
+        mark_failed.assert_called_once()
+        self.assertEqual(mark_failed.call_args[0][1:], ("job-1", "bad audio"))
+        delete.assert_called_once_with("job-1")
+        runner._backoff_delay.assert_not_called()
+
+    def test_mid_job_yield_releases_with_a_refund(self) -> None:
+        _done, mark_failed, delete = self._run(self._raise(runner._YieldInterrupt("phase=analyze")))
+        mark_failed.assert_not_called()
+        delete.assert_not_called()
+        self.assertTrue(any("GREATEST(attempts - 1, 0)" in s for s in self._sql()))
+        self.assertIsNone(runner._active_job)
+
+    def test_success_deletes_the_checkpoint(self) -> None:
+        mark_done, mark_failed, delete = self._run(None)
+        mark_done.assert_called_once()
+        mark_failed.assert_not_called()
+        delete.assert_called_once_with("job-1")
+
+    def test_unreachable_share_holds_claims_after_an_io_release(self) -> None:
+        import errno as _errno
+
+        self.claims = 0
+        runner._books_share_reachable.return_value = False  # type: ignore[attr-defined]
+        waits = {"n": 0}
+
+        def stop_after_three(delay: float) -> bool:
+            waits["n"] += 1
+            if waits["n"] >= 3:
+                runner._shutdown.set()
+            return runner._shutdown.is_set()
+
+        with mock.patch.object(runner, "_retry_wait"), \
+                mock.patch.object(runner._shutdown, "wait", side_effect=stop_after_three):
+            self._run(self._raise(OSError(_errno.EHOSTUNREACH, "no route")))
+        self.assertEqual(self.claims, 1, "no claim while the share stays down")
