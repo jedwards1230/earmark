@@ -1190,6 +1190,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 12 | `00012_model_settings.sql` | `model_settings` (one row per AI step overriding its env model, §2.20) and the append-only `model_setting_events` history (an append-only trigger refuses UPDATE/DELETE). Two new tables; no ALTER, no lock on an existing table, nothing backfilled — an empty `model_settings` is exactly the env behaviour. |
 | 14 | `00014_finding_labels_scorecard.sql` | Model quality over time (§2.15 "Labels and scorecards"): the append-only `finding_labels` table (UPDATE/DELETE refused by a row trigger, TRUNCATE by a statement trigger; generated `correction_key` and `target`), the `finding_correction_key()` function (13's `correction_key` expression verbatim), and the read-only views `finding_label_current`, `recipe_scorecard` and `decide_scorecard`. One new table, three views, two functions; no ALTER, no backfill, no lock beyond the ACCESS SHARE a view takes (`lock_timeout` 5s). Down refuses while `finding_labels` has rows unless the session sets `earmark.allow_data_loss = 'on'`. |
 | 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. The representative CHECK is added `NOT VALID`, so Up after an opted-in Down (which keeps the append-only log's `duplicate` decisions and drops their pointer) succeeds. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
+| 17 | `00017_asr_pilot.sql` | The second-ASR pilot (§1.11): `pilot_transcripts` (one row per track × model × revision × scope, written by `runner/pilot.py`; `production_transcript_id` → `transcripts(id) ON DELETE CASCADE`) and `finding_asr_votes` (one asr_vote per finding × pilot transcript, written by `earmark asr-pilot vote --yes`; cascades from both the finding and the pilot transcript). Two new tables, no ALTER, no backfill; the two foreign keys take SHARE ROW EXCLUSIVE on `transcript_findings` then `transcripts` (locked up front, a requeue's order, `lock_timeout` 5s). Down refuses while `pilot_transcripts` has rows unless `earmark.allow_data_loss = 'on'`. **Merge 16 (the runner_control arbiter columns) first**; if 17 lands first, renumber the later one. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -1790,6 +1791,7 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 | `eval_sample` / `eval_book` | `write` with `--write` | `--sample N` / NULL | `evaluated`, `errors`, `findings` | `asking <model>` |
 | `eval_backfill` | `write` with `--write` | NULL (`--limit` counts latched transcripts, not visited ones) | one per visited transcript: `latched`, `failed`, `not_embedded`, `skipped`; plus `chunks`, `chunk_errors`, `findings` | `judging <file> · asking <model>` |
 | `eval_rejudge` | `write` with `--write` | NULL | one per judge call (chunk): `judged`, `cached`, `failed`, each tick adding the call's reported cost; per transcript `transcripts_complete` / `transcripts_partial` / `transcripts_failed` / `transcripts_skipped`, plus `findings` (rows inserted) | `asking <model>` |
+| `asr_vote` | `write` with `--yes`, else `dry_run` | NULL | one per held finding voted: `heard_replacement`, `heard_original`, `neither`, `unmappable`; plus `written` (rows upserted, `--yes`) and `tracks_skipped` (no production or pilot segments) | `track i/n` |
 
 `done` counts finished items; `cost_usd` sums the calls' reported cost
 (cached calls are free).
@@ -1847,6 +1849,138 @@ Prometheus series `earmark_step_run_items_total{outcome="duplicate"}` and
 - **Reads** are two index-backed `LIMIT` queries (`db.StepRuns`): the open
   runs newest first (partial index), and the newest other runs.
 - `DEBUG_DB_RESET` drops the table with the rest (§1.8).
+### 1.11 Second-ASR pilot — `pilot_transcripts`, `finding_asr_votes`
+
+A pilot runs a second ASR model (IBM Granite Speech 4.1 2B-plus, NVIDIA
+Canary-Qwen 2.5B) over tracks that already have a production transcript, to
+measure it against production (`parakeet-tdt-1.1b`) and to record, for each
+held finding, which reading the second model heard. **Pilot output never
+touches production**: no `transcripts` row, no job, no chunk, no embedding,
+and the decide step reads neither table — its apply policy, evidence kinds and
+`finding_events` are unchanged (§2.19). A vote is evidence for a later,
+versioned decide recipe.
+
+```sql
+CREATE TABLE pilot_transcripts (
+    id                       BIGSERIAL   PRIMARY KEY,
+    file_path                TEXT        NOT NULL,   -- = transcription_jobs.file_path
+    production_transcript_id UUID        NOT NULL REFERENCES transcripts (id) ON DELETE CASCADE,
+    backend                  TEXT        NOT NULL,   -- granite | canary
+    model_id                 TEXT        NOT NULL,   -- HF model id
+    model_revision           TEXT        NOT NULL,   -- HF commit sha
+    scope                    TEXT        NOT NULL DEFAULT 'full' CHECK (scope IN ('full', 'findings')),
+    window_sec               REAL,
+    has_word_times           BOOLEAN     NOT NULL,
+    segments                 JSONB       NOT NULL CHECK (jsonb_typeof(segments) = 'array'),  -- §1.2.1 shape
+    raw_text                 TEXT        NOT NULL,
+    audio_sec REAL, wall_sec REAL, rtfx REAL,         -- rtfx = audio_sec / wall_sec
+    peak_vram_mib INTEGER, peak_reserved_mib INTEGER, -- torch max allocated / reserved, per track
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (file_path, model_id, model_revision, scope)
+);
+CREATE TABLE finding_asr_votes (
+    id                  BIGSERIAL   PRIMARY KEY,
+    finding_id          UUID        NOT NULL REFERENCES transcript_findings (id) ON DELETE CASCADE,
+    pilot_transcript_id BIGINT      NOT NULL REFERENCES pilot_transcripts (id) ON DELETE CASCADE,
+    model_id            TEXT        NOT NULL,
+    chunk_text_sha256   TEXT,                        -- the chunk revision voted against
+    span_start_sec REAL, span_end_sec REAL,          -- the span's production word times
+    vote                TEXT        NOT NULL CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable')),
+    heard_text          TEXT,                        -- as the pilot wrote it (case + punctuation kept)
+    detail              JSONB       NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(detail) = 'object'),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (finding_id, pilot_transcript_id)
+);
+```
+
+- **Writer of `pilot_transcripts`**: `runner/pilot.py` only, INSERT only
+  (skips a `(file_path, model_id, model_revision, scope)` already present
+  unless `--force`). Scope `full` is the whole track; scope `findings` is only
+  the windows around held findings — its segments carry absolute track times
+  and `audio_sec` is the sum of the window lengths. With
+  `has_word_times = false` (Canary) each segment is one window and its words
+  carry no `start`/`end` keys.
+- **Lifetime**: a requeue deletes the production transcript, which deletes
+  its pilot transcripts and their votes (a pilot measured against text that no
+  longer exists measures nothing). A finding's votes go with the finding.
+- **Reads are bounded**: metadata in pages of ≤ 100 (`db.PilotTranscripts`),
+  segments one pilot transcript at a time, production segments through
+  `db.GetTranscriptSegments` one track at a time.
+
+**`earmark asr-pilot vote --model <model_id> [--revision R] (--asin A,… | --book-dir D) [--limit N] [--yes]`**
+votes on every **held** finding (`patch_state = 'proposed'` whose latest
+unrevoked decision is a `hold`) of the selected tracks, pages of 100 per
+track, one pilot transcript per track (scope `full` over `findings`, then the
+newest). Without `--revision` the model must have one revision in scope.
+Dry-run unless `--yes` (prints counts, reasons, a sample); `--yes` upserts on
+`(finding_id, pilot_transcript_id)`. Recorded in `step_runs` as `asr_vote`
+(§1.10). Rule `asr_vote@v1` (`internal/asrpilot`), recorded in `detail.rule`:
+
+1. **Locate** the span with `patch.Locate` against the chunk's pristine text
+   `COALESCE(source_text, text)`, after checking `chunk_text_sha256` still
+   matches it. `anchor_offset` is the judge's *self-reported* rune index and
+   is often wrong (§2.17); the ladder's occurrence / unique-match rungs
+   recover the span, never the raw offset alone. `detail.anchor` = `offset`
+   (the offset held) or `recovered`.
+2. **Span → words**: the chunk is whole segments joined by one space
+   (decide's segment mapping, §2.19): from the first segment starting at the
+   chunk's `start_sec`, the joined segment texts must reproduce the chunk
+   exactly; the span's rune range then picks segment fields, each timed by the
+   word at the same position (or, when a segment's words do not pair one to
+   one with its fields, interpolated by rune position — `detail.prod_times`).
+   `[t0, t1]` = first word start … last word end (`span_start_sec`/`_end_sec`;
+   the finding's own `start_sec`/`end_sec` are the whole chunk).
+3. **Pilot window**: with word times, the pilot words overlapping
+   `[t0 − 3 s, t1 + 3 s]`; without, the pilot segments overlapping
+   `[t0 − 0.5 s, t1 + 0.5 s]`. Those tokens are aligned (Needleman–Wunsch,
+   normalised words) with the production tokens of the same range; the pilot
+   tokens between the nearest exactly agreeing words left and right of the
+   span are what it heard (`method` `time_align` / `segment_align`; a timed
+   pilot with no agreeing neighbour falls back to its words with a midpoint in
+   `[t0, t1]`, `time_only`).
+4. **Vote**, on normalised text (lowercase, no punctuation, whitespace
+   collapsed): equal to the replacement → `heard_replacement`; to the original
+   → `heard_original`; equal ignoring spaces counts too; otherwise the
+   normalised similarity (1 − Levenshtein / max length) must reach 0.8 and
+   lead the other reading by 0.1, else `neither`. A correction that differs
+   from the original only in case or punctuation is compared case-sensitively
+   when the pilot writes case (≥ 1% of its words carry an uppercase letter),
+   else it is `unmappable` (`case_only_uncased_pilot`).
+5. **`unmappable`** whenever the span cannot be placed in time, with
+   `detail.reason`: `chunk_missing`, `chunk_changed`, `anchor_not_found`,
+   `anchor_ambiguous`, `chunk_not_in_segments`,
+   `segments_do_not_reproduce_chunk`, `span_has_no_words`, `no_timing`,
+   `pilot_no_coverage` (the pilot did not transcribe that window),
+   `window_too_large`.
+
+`detail` also carries the window (`window_start`/`window_end`), the
+production span text, which sides were anchored, up to 40 aligned
+`[production, pilot]` columns and the two similarities.
+
+**`earmark asr-pilot report [--asin A,… | --book-dir D] [--format text|json]`**
+(read-only) prints per model (`model_id@revision`) and scope: tracks, audio
+hours, **RTFx** = Σ audio_sec / Σ wall_sec, **peak VRAM** = max
+`peak_vram_mib` / max `peak_reserved_mib`, **WER vs parakeet-tdt-1.1b** — the
+word-level edit distance of the normalised pilot text against the production
+transcript, Σ errors / Σ production words, one track at a time; production is
+a reference, not ground truth — **casing rate** (share of words with an
+uppercase letter) and **punctuation rate** (share with a punctuation mark),
+plus the same rates for production. For scope `findings` the WER is computed
+**only over the covered windows** (the union of the pilot's segment
+start/end), each window on its own, and labelled `covered windows only` /
+`"wer_scope": "covered_windows_only"`. Every pair of pilot models on the same
+track (Canary vs Granite) is compared the same way over the windows both
+cover. From `finding_asr_votes` (the latest vote per finding and model): held
+findings voted and **resolved** (`heard_replacement` + `heard_original`) per
+model, and the two-model agreement (equal votes among findings both mapped,
+and among findings both resolved).
+
+**Never run a binary built from an unmerged branch against the production
+database**: like every command, both subcommands connect through `db.New`,
+which applies pending migrations on connect — even for a dry run or the
+read-only report.
+
 ---
 
 ## 2. DEPLOYMENT INTERFACE CONTRACT
@@ -2750,7 +2884,7 @@ id, a UUID, a hash, a number, a timestamp, a boolean, a closed-vocabulary token
 large by what a model, a host or an upstream says.
 
 `step` is one of `decide`, `decide_revert`, `scan`, `eval_sample`, `eval_book`,
-`eval_backfill`, `eval_rejudge` (`internal/runs`).
+`eval_backfill`, `eval_rejudge`, `asr_vote` (`internal/runs`).
 
 Embeddings (`transcript_chunks.embedding`), transcript text and segments, and
 every other table are not reachable through this endpoint.
@@ -4525,7 +4659,7 @@ judge's bounded drop `reason` and the three-value quality scope (`library` · `a
 | `earmark_stale_items` | gauge | `step` | Rows of the `stale_work` view per step that has a current recipe (0 included). Ingest pod; refreshed every 5 min (one aggregate per step, ~15 ms at 39k chunks + 34k findings). |
 | `earmark_decisions` | gauge | `outcome` (`apply` · `hold` · `reject` · `duplicate`), `issue_type`, `evidence` (`asin_verbatim` · `exact_repeat` · `none`), `recipe` (full decide recipe id) | Findings counted by their **latest unrevoked** decide-recipe `decision` event (§2.17 "Version history", §2.19); findings a requeue superseded excluded. Ingest pod; one aggregate over `finding_events`, refreshed every 5 min. No series until a decision is written. |
 | `earmark_quality_index` | gauge | `scope` (`library` · `asin_matched` · `unmatched`), `recipe` | Mean chunk-scan quality per scan recipe, normalized to 0..1, boilerplate (`p_boilerplate > 0.5`) excluded, over chunks whose current text was scanned (§1.9 "Chunk scan"). Ingest pod; refreshed every 5 min. No series until a scan has written rows. |
-| `earmark_step_run_active` | gauge | `step` (`decide` · `decide_revert` · `scan` · `eval_sample` · `eval_book` · `eval_backfill` · `eval_rejudge`), `mode` (`dry_run` · `write`) | Step runs (§1.10) open with a live heartbeat (≤ 2 min old); a stale run is not counted. Ingest pod; read from `step_runs` every 15 s. No series while nothing runs. |
+| `earmark_step_run_active` | gauge | `step` (`decide` · `decide_revert` · `scan` · `eval_sample` · `eval_book` · `eval_backfill` · `eval_rejudge` · `asr_vote`), `mode` (`dry_run` · `write`) | Step runs (§1.10) open with a live heartbeat (≤ 2 min old); a stale run is not counted. Ingest pod; read from `step_runs` every 15 s. No series while nothing runs. |
 | `earmark_step_run_progress_ratio` | gauge | `step` | `done / total` (0..1) of the step's newest live run that knows its total. No series without one. Ingest pod, every 15 s. |
 | `earmark_step_run_items_total` | counter | `step`, `outcome` (the run counters of §1.10: `apply`, `hold`, `reject`, `reanchor`, `cached`, `errors`, `scanned`, `written`, `evaluated`, `latched`, …) | Every counter summed over every recorded run in `step_runs` (an observable counter read from the table, so it survives pod restarts). Ingest pod, every 15 s. **No run id is ever a label.** The `outcome` values are not one unit: for `step="decide"`, `outcome="duplicate"` counts findings of the run's own work list classified duplicate (part of `done`) and `outcome="duplicates"` the rows `--yes` wrote as duplicates, group members outside the page included (not part of `done`) — summing them double-counts, as does adding `cached`, `errors` or `conflict_asks` to the decision outcomes (§1.10). |
 | `earmark_judge_dropped_findings_total` | counter | `reason` (`empty_span` · `empty_correction` · `cosmetic_only` · `unsupported_issue_type` · `anchor_missing` · `not_word_bounded` · `not_substitution` · `window_too_long` · `bad_insertion` · `not_a_removal` · `below_min_confidence` · `over_cap`) | Findings the judge returned that were dropped before recording (§2.15 "Noise filters"). A rise in one reason after a prompt or model change is the regression signal. |
