@@ -23,12 +23,17 @@ type fakeLocker struct {
 	tryErr    error
 	relErr    error
 	lostAfter int
-	onLost    func() // runs once, at the first failing Check (successor takes over)
+	onLost    func() // runs once, at the first failing Check
 	lostFired bool
-	checks    int
-	tries     int
-	releases  int
-	onRelease func()
+	// Successor scripting: successor is the definitive answer; successorErrs
+	// failing lookups come first (-1 = every lookup fails).
+	successor      bool
+	successorErrs  int
+	successorCalls int
+	checks         int
+	tries          int
+	releases       int
+	onRelease      func()
 }
 
 func (l *fakeLocker) TryBatchLock(context.Context) (Lock, bool, error) {
@@ -59,6 +64,16 @@ func (f fakeLock) Check(context.Context) error {
 		return errors.New("conn closed")
 	}
 	return nil
+}
+
+func (f fakeLock) Successor(context.Context) (bool, error) {
+	f.l.mu.Lock()
+	defer f.l.mu.Unlock()
+	f.l.successorCalls++
+	if f.l.successorErrs < 0 || f.l.successorCalls <= f.l.successorErrs {
+		return false, errors.New("holder lookup timed out")
+	}
+	return f.l.successor, nil
 }
 
 func (f fakeLock) Release() error {
@@ -221,9 +236,9 @@ func TestRun_ResumeFromTranscribeStartsFreshPhaseA(t *testing.T) {
 	}
 }
 
-// A lost lock (the pinned connection dropped) stops the run and does NOT
-// restore: a successor that took the lock meanwhile owns runner_control, and an
-// idle/run_limit reset would clobber its batch. Run fails with ErrLockLost.
+// A lost lock with a successor holding it: the run stops and does NOT
+// restore — the successor owns runner_control, and an idle/run_limit reset
+// would clobber its batch. Run fails with ErrLockLost.
 func TestRun_LockLostSkipsRestoreAndLeavesSuccessorState(t *testing.T) {
 	store := newFakeStore(db.PhaseIdle,
 		&db.QueueStats{Pending: 5},
@@ -231,8 +246,8 @@ func TestRun_LockLostSkipsRestoreAndLeavesSuccessorState(t *testing.T) {
 	)
 	var phasesBeforeSuccessor int
 	lock := &fakeLocker{lostAfter: 3}
-	lock.onLost = func() {
-		// The successor coordinator takes over: its own Phase A budget + phase.
+	lock.onLost = func() { // runs under lock.mu
+		lock.successor = true
 		phasesBeforeSuccessor = len(store.transitions())
 		store.mu.Lock()
 		store.phase = db.PhaseTranscribe
@@ -248,7 +263,7 @@ func TestRun_LockLostSkipsRestoreAndLeavesSuccessorState(t *testing.T) {
 		t.Fatalf("Run error = %v, want ErrLockLost", err)
 	}
 	if got := store.transitions(); len(got) != phasesBeforeSuccessor {
-		t.Errorf("no phase write allowed after the lock was lost; transitions=%v (successor took over after %d)", got, phasesBeforeSuccessor)
+		t.Errorf("no phase write allowed after the successor took over; transitions=%v (took over after %d)", got, phasesBeforeSuccessor)
 	}
 	if store.phase != db.PhaseTranscribe {
 		t.Errorf("successor's phase clobbered: got %q", store.phase)
@@ -266,20 +281,83 @@ func TestRun_LockLostSkipsRestoreAndLeavesSuccessorState(t *testing.T) {
 	}
 }
 
-// A loss the heartbeat has not seen yet (the run ends normally) is caught by
-// the pre-restore check: no restore, and the run reports ErrLockLost.
-func TestRun_PreRestoreCheckCatchesUndetectedLoss(t *testing.T) {
+// A lost lock nobody has taken (the session died, no successor yet): the
+// restore still runs — nothing can be clobbered, and skipping it would leave
+// the runner budget-gated — and the run still fails with ErrLockLost.
+func TestRun_LockLostWithoutSuccessorRestores(t *testing.T) {
+	store := newFakeStore(db.PhaseIdle,
+		&db.QueueStats{Pending: 5},
+		&db.QueueStats{Pending: 5, Claimed: 1, RunLimit: ptr(1)},
+	)
+	o := fastOpts()
+	o.Lock = &fakeLocker{lostAfter: 3}
+	err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Run error = %v, want ErrLockLost", err)
+	}
+	got := store.transitions()
+	if len(got) == 0 || got[len(got)-1] != db.PhaseIdle {
+		t.Errorf("idle must be restored when no successor holds the lock; transitions=%v", got)
+	}
+	if store.currentRunLimit() != nil {
+		t.Errorf("pre-batch run_limit (unlimited) must be restored, got %d", *store.currentRunLimit())
+	}
+}
+
+// A successor present at exit, even if the heartbeat never noticed a loss,
+// blocks the restore.
+func TestRun_SuccessorAtExitSkipsRestore(t *testing.T) {
 	store := newFakeStore(db.PhaseIdle, &db.QueueStats{}) // no work: straight to exit
-	lock := &fakeLocker{lostAfter: 1}
 	o := fastOpts()
 	o.PollInterval = time.Hour // the heartbeat never ticks
-	o.Lock = lock
+	o.Lock = &fakeLocker{successor: true}
 	err := Run(context.Background(), io.Discard, store, &fakeArbiter{}, o)
 	if !errors.Is(err, ErrLockLost) {
 		t.Fatalf("Run error = %v, want ErrLockLost", err)
 	}
 	if got := store.transitions(); len(got) != 0 {
-		t.Errorf("no restore allowed without the lock; transitions=%v", got)
+		t.Errorf("no restore allowed with a successor holding the lock; transitions=%v", got)
+	}
+}
+
+// An inconclusive holder lookup is retried; transient errors followed by a
+// clean "no successor" restore normally, and errors throughout still restore
+// (with a warning) rather than leaving the runner budget-gated.
+func TestRun_InconclusiveHolderLookupStillRestores(t *testing.T) {
+	old := successorBackoff
+	successorBackoff = time.Millisecond
+	t.Cleanup(func() { successorBackoff = old })
+
+	for _, tc := range []struct {
+		name      string
+		errs      int
+		wantCalls int
+		wantWarn  bool
+	}{
+		{"transient then clean", 1, 2, false},
+		{"always failing", -1, successorAttempts, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore(db.PhaseIdle, &db.QueueStats{})
+			lock := &fakeLocker{successorErrs: tc.errs}
+			o := fastOpts()
+			o.PollInterval = time.Hour
+			o.Lock = lock
+			var out bytes.Buffer
+			if err := Run(context.Background(), &out, store, &fakeArbiter{}, o); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			got := store.transitions()
+			if len(got) != 1 || got[0] != db.PhaseIdle {
+				t.Errorf("idle must be restored; transitions=%v", got)
+			}
+			if lock.successorCalls != tc.wantCalls {
+				t.Errorf("holder lookups = %d, want %d", lock.successorCalls, tc.wantCalls)
+			}
+			if warned := strings.Contains(out.String(), "restoring idle anyway"); warned != tc.wantWarn {
+				t.Errorf("warning logged = %v, want %v:\n%s", warned, tc.wantWarn, out.String())
+			}
+		})
 	}
 }
 

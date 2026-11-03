@@ -478,13 +478,19 @@ while the pipeline is still mid-phase. An unlock failure closes the connection
 never outlives its holder. Because a session lock also vanishes **silently**
 when its connection drops, the coordinator re-checks ownership (`pg_locks` for
 its own `pg_backend_pid()`) every `--poll-interval`; a failed check cancels the
-run and it exits `1` (`batch lock lost mid-run`). The exit cleanup re-checks
-ownership **immediately before** restoring and, when the lock is gone, skips
-the restore and logs `NOT restoring idle`: a successor may already own
-`runner_control`, and resetting `phase`/`run_limit` would clobber its batch
-(the successor's own exit restores idle). This is the one exception to "always
-restores idle"; the window it leaves is the single round-trip between the check
-and the restore writes. Only binaries containing this guard take the lock: an older
+run and it exits `1` (`batch lock lost mid-run`). Before restoring, the exit
+cleanup asks — over a pooled connection, since the lock's own session is
+usually what died — whether **another** session now holds the key (`pg_locks`,
+`pid <>` the pinned session's backend pid recorded at acquire). Only that
+definitive answer skips the restore (logged `NOT restoring idle`): a successor
+owns `runner_control`, and resetting `phase`/`run_limit` would clobber its batch
+(its own exit restores idle). Lock still ours, or lost but free: restore as
+usual (logged). An inconclusive lookup (query error) is retried 3 times with a
+short backoff, then the cleanup restores anyway with a warning — a successor
+needs a fresh schedule or a manual run to appear, while a skipped restore
+leaves the runner budget-gated. This is the one exception to "always restores
+idle"; the window it leaves is the single round-trip between the lookup and the
+restore writes. Only binaries containing this guard take the lock: an older
 `earmark batch` running alongside is not excluded, so don't mix versions.
 
 **Phase A bound.** `--phase-timeout` (default `3h`, `0` = unbounded) caps each

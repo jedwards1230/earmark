@@ -79,9 +79,20 @@ func TestBatchLockIntegration(t *testing.T) {
 	if err := lockB.Release(); err == nil {
 		t.Fatal("Release on a dead session must report the unconfirmed unlock")
 	}
+	// Dead session, nobody else holding: no successor (restoring is safe).
+	if other, err := lockB.Successor(ctx); err != nil || other {
+		t.Fatalf("Successor with the lock free = (%v, %v), want (false, nil)", other, err)
+	}
 	lockC, ok, err := a.TryBatchLock(ctx)
 	if err != nil || !ok {
 		t.Fatalf("TryBatchLock after the holder died = (%v, %v), want acquired", ok, err)
+	}
+	// Now another session holds it: B sees a successor, C sees none.
+	if other, err := lockB.Successor(ctx); err != nil || !other {
+		t.Fatalf("Successor after C took the lock = (%v, %v), want (true, nil)", other, err)
+	}
+	if other, err := lockC.Successor(ctx); err != nil || other {
+		t.Fatalf("holder's own Successor = (%v, %v), want (false, nil)", other, err)
 	}
 	if err := lockC.Release(); err != nil {
 		t.Fatalf("release C: %v", err)

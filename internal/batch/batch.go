@@ -94,8 +94,15 @@ type Locker interface {
 // PollInterval from a heartbeat goroutine. Release is called once the run's
 // restore-idle cleanup has finished, and may be called more than once. Check
 // and Release may be called from different goroutines.
+//
+// Successor answers the question the exit cleanup needs: does ANOTHER session
+// now hold the lock? true = a successor may own runner_control (skip the
+// restore); false = the lock is still ours or free (restoring is safe); an
+// error is inconclusive. It must not depend on the lock's own session, which
+// is typically the thing that died.
 type Lock interface {
 	Check(ctx context.Context) error
+	Successor(ctx context.Context) (bool, error)
 	Release() error
 }
 
@@ -119,6 +126,37 @@ var ErrPhaseTimeout = errors.New("transcribe phase timed out")
 
 // lockCheckTimeout bounds one heartbeat round-trip.
 const lockCheckTimeout = 10 * time.Second
+
+// successorAttempts / successorBackoff: the exit cleanup's holder lookup is
+// retried on an inconclusive (error) answer before falling back to restoring.
+// Package vars so tests can shorten the backoff.
+var (
+	successorAttempts = 3
+	successorBackoff  = time.Second
+)
+
+// successorTakeover decides whether the exit cleanup must skip its restore.
+// Only a definitive "another session holds the lock" skips it. An answer that
+// stays inconclusive after successorAttempts restores anyway (with a warning):
+// a successor needs a fresh schedule or a manual run, while a skipped restore
+// leaves the ASR runner budget-gated until the next coordinator — and if the
+// database is truly unreachable the restore writes fail and log as before.
+func successorTakeover(ctx context.Context, p func(string, ...any), lock Lock) bool {
+	for attempt := 1; ; attempt++ {
+		other, err := lock.Successor(ctx)
+		if err == nil {
+			return other
+		}
+		if attempt >= successorAttempts {
+			p("WARNING: could not tell whether another coordinator holds the batch lock (%v) — restoring idle anyway.\n", err)
+			return false
+		}
+		if serr := sleep(ctx, successorBackoff*time.Duration(attempt)); serr != nil {
+			p("WARNING: holder lookup interrupted (%v) — restoring idle anyway.\n", serr)
+			return false
+		}
+	}
+}
 
 // nopSink discards events. Used as the default when no sink is injected so the
 // coordinator core never needs a nil check.
@@ -272,9 +310,9 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 
 		// Heartbeat: a session lock vanishes silently when its connection
 		// drops, and the run would carry on unprotected. On a failed check the
-		// heartbeat cancels the run ctx, so the loop unwinds like a SIGTERM;
-		// the restore-idle defer then finds the lock gone and skips the
-		// restore, and Run fails with ErrLockLost.
+		// heartbeat cancels the run ctx, so the loop unwinds like a SIGTERM
+		// through the restore-idle defer (which restores unless a successor
+		// holds the lock), and Run fails with ErrLockLost.
 		// The heartbeat is stopped (and joined) before Release, which
 		// registered first and so runs last.
 		runCtx, cancelRun := context.WithCancelCause(ctx)
@@ -293,7 +331,7 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 			<-hbDone
 			cancelRun(nil)
 			if lostErr != nil {
-				p("ERROR: %v — stopped the run (idle NOT restored: a successor may own runner_control).\n", lostErr)
+				p("ERROR: %v — stopped the run.\n", lostErr)
 				err = lostErr
 			}
 		}()
@@ -306,26 +344,27 @@ func Run(ctx context.Context, out io.Writer, store PhaseStore, arb Arbiter, o Op
 	// Uses context.Background() (not ctx) so the cleanup still runs after a
 	// cancellation — the cancelled ctx would reject the writes otherwise.
 	//
-	// With a lock, ownership is re-checked immediately before restoring: once
-	// the lock is gone a successor may already own runner_control, and
-	// resetting phase/run_limit would clobber its batch. Then the restore is
-	// skipped (and the run fails with ErrLockLost); the successor's own exit
-	// restores idle. This narrows, not closes, the window — a loss between the
-	// check and the two writes is still possible — but the session holding the
-	// lock is the one doing the check, so the gap is one round-trip.
+	// With a lock, the cleanup first asks whether ANOTHER session now holds it
+	// (over a pooled connection — the lock's own session is usually what died).
+	// If so, a successor may already own runner_control and resetting
+	// phase/run_limit would clobber its batch: the restore is skipped (the
+	// successor's own exit restores idle) and the run fails with ErrLockLost.
+	// Still ours, or free (we lost it and nobody took it): restore as usual.
+	// Inconclusive: retried, then restore (see successorTakeover). The window
+	// between the lookup and the two restore writes is one round-trip.
 	var restoreLimit *int
 	defer func() {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if held != nil {
-			if cerr := held.Check(restoreCtx); cerr != nil {
-				p("NOT restoring idle on exit: the batch lock is no longer held (%v) — a successor coordinator may own runner_control; leaving phase/run_limit as they are.\n", cerr)
+			if successorTakeover(restoreCtx, p, held) {
+				p("NOT restoring idle on exit: another session now holds the batch lock — a successor coordinator owns runner_control; leaving phase/run_limit as they are.\n")
 				if err == nil {
-					err = fmt.Errorf("%w: %w", ErrLockLost, cerr)
+					err = fmt.Errorf("%w: another session holds it", ErrLockLost)
 				}
 				return
 			}
-			p("Batch lock still held — restoring idle.\n")
+			p("No other coordinator holds the batch lock — restoring idle.\n")
 		}
 		if rerr := restoreIdle(restoreCtx, store, restoreLimit); rerr != nil {
 			p("WARNING: failed to restore idle phase on exit: %v\n", rerr)

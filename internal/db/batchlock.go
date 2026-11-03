@@ -60,6 +60,20 @@ var batchLockHeldSQL = `
 		  AND ((classid::bigint << 32) | objid::bigint) = $1
 	)`
 
+// batchLockOtherHolderSQL reports whether a session OTHER than $2 (the pinned
+// session's backend pid, recorded at acquire) holds the lock. It runs on a
+// pooled connection, not the pinned one, so it answers definitively even when
+// the pinned session is already dead.
+var batchLockOtherHolderSQL = `
+	SELECT EXISTS (
+		SELECT 1 FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND pid <> $2
+		  AND objsubid = 1
+		  AND granted
+		  AND ((classid::bigint << 32) | objid::bigint) = $1
+	)`
+
 // ErrBatchLockLost is returned by BatchLock.Check when the pinned session no
 // longer holds the lock (its connection dropped, or it was unlocked).
 var ErrBatchLockLost = errors.New("batch lock lost")
@@ -69,7 +83,9 @@ var ErrBatchLockLost = errors.New("batch lock lost")
 // use of the one pinned connection, which pgx does not allow concurrently.
 type BatchLock struct {
 	mu       sync.Mutex
+	pool     *pgxpool.Pool // for Successor: a connection other than conn
 	conn     *pgxpool.Conn
+	pid      uint32 // conn's backend pid, recorded at acquire
 	released bool
 	relErr   error
 }
@@ -104,7 +120,7 @@ func (db *DB) TryBatchLock(ctx context.Context) (lock *BatchLock, acquired bool,
 		conn.Release()
 		return nil, false, nil
 	}
-	return &BatchLock{conn: conn}, true, nil
+	return &BatchLock{pool: db.pool, conn: conn, pid: conn.Conn().PgConn().PID()}, true, nil
 }
 
 // Check verifies the pinned session still holds the lock. Any error — a query
@@ -124,6 +140,19 @@ func (l *BatchLock) Check(ctx context.Context) error {
 		return fmt.Errorf("%w: this session no longer holds it", ErrBatchLockLost)
 	}
 	return nil
+}
+
+// Successor reports whether another session now holds the lock — i.e. a
+// successor coordinator may own runner_control. It asks over a pooled
+// connection, so the answer does not depend on the pinned session being
+// alive. false means the lock is still this session's or nobody's. An error
+// is inconclusive (the caller decides how to treat it).
+func (l *BatchLock) Successor(ctx context.Context) (bool, error) {
+	var other bool
+	if err := l.pool.QueryRow(ctx, batchLockOtherHolderSQL, batchLockKey, l.pid).Scan(&other); err != nil {
+		return false, fmt.Errorf("batch lock: holder lookup: %w", err)
+	}
+	return other, nil
 }
 
 // Release drops the lock and returns the connection to the pool, or closes it
