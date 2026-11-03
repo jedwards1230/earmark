@@ -4675,3 +4675,104 @@ class HeartbeatConnectTimeoutTests(unittest.TestCase):
         with mock.patch.object(runner, "_connect", side_effect=connect) as c:
             runner._heartbeat_loop(stop, "job-1", interval=0.001)
         self.assertEqual(c.call_args.kwargs, {"connect_timeout": runner.SIDE_CONNECT_TIMEOUT_SECONDS})
+
+
+class ClaimGuardTests(unittest.TestCase):
+    """_mark_done / _mark_failed only ever write a row this runner still holds."""
+
+    result: ClassVar[dict[str, Any]] = {
+        "language": "en", "duration_seconds": 1.0, "speaker_count": None,
+        "segments": [], "raw_text": "",
+    }
+
+    def _conn(self, rowcount: int) -> Any:
+        conn = _OrderConn()
+        orig = conn.cursor
+
+        def cursor() -> Any:
+            cur = orig()
+            cur.rowcount = rowcount
+            return cur
+
+        conn.cursor = cursor  # type: ignore[method-assign]
+        return conn
+
+    def test_done_update_is_guarded_on_the_claim(self) -> None:
+        conn = self._conn(1)
+        with mock.patch.object(runner, "_has_provenance_columns", return_value=False):
+            runner._mark_done(conn, "job-1", "f", "c", self.result)
+        sql, params = next((s, p) for s, p in conn.executed if "SET    status = 'done'" in s)
+        self.assertIn("status = 'claimed' AND claimed_by = %s", sql)
+        self.assertEqual(params, ("job-1", runner.RUNNER_IDENTITY))
+        self.assertEqual(conn.commits, 1)
+
+    def test_lost_claim_rolls_back_the_transcript_and_raises(self) -> None:
+        conn = self._conn(0)
+        with mock.patch.object(runner, "_has_provenance_columns", return_value=False), \
+                self.assertRaises(runner._ClaimLost):
+            runner._mark_done(conn, "job-1", "f", "c", self.result)
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.log[-1], "rollback", "the INSERT is rolled back with it")
+
+    def test_lost_claim_is_not_retried(self) -> None:
+        with mock.patch.object(runner, "_mark_done", side_effect=runner._ClaimLost("gone")), \
+                mock.patch.object(runner, "_connect") as connect, self.assertRaises(runner._ClaimLost):
+            runner._mark_done_with_retry(runner._ConnRef(_RetConn()), "j", "f", "c", self.result)
+        connect.assert_not_called()
+
+    def test_failed_update_is_guarded_on_the_claim(self) -> None:
+        conn = _RetConn()
+        runner._mark_failed(conn, "job-1", "bad audio")
+        sql, params = next((s, p) for s, p in conn.executed if "SET    status = 'failed'" in s)
+        self.assertIn("status = 'claimed' AND claimed_by = %s", sql)
+        self.assertEqual(params, ("bad audio", "job-1", runner.RUNNER_IDENTITY))
+
+
+class ClaimLostMainLoopTests(_MainLoopHarness):
+    control_row = (False, None)
+    job_row: ClassVar[dict[str, str]] = {"id": "job-1", "file_path": "A/B/01.mp3", "checksum": "abc"}
+
+    def test_lost_claim_leaves_the_row_and_the_checkpoint(self) -> None:
+        claims = [0]
+
+        def claim_once(_conn: Any) -> Any:
+            claims[0] += 1
+            if claims[0] > 1:
+                runner._shutdown.set()
+                return None
+            return dict(self.job_row)
+
+        with mock.patch.object(runner, "_make_provider", return_value=_LoopProvider()), \
+                mock.patch.object(runner, "_claim_job", side_effect=claim_once), \
+                mock.patch.object(runner, "_resolve_audio_path") as resolve, \
+                mock.patch.object(runner, "_mark_done", side_effect=runner._ClaimLost("taken over")), \
+                mock.patch.object(runner, "_mark_failed") as mark_failed, \
+                mock.patch.object(runner, "_release_job") as release, \
+                mock.patch.object(runner, "_delete_checkpoint") as delete, \
+                mock.patch.object(runner, "_init_checkpoint_dir"):
+            resolve.return_value.exists.return_value = True
+            runner.main()
+        mark_failed.assert_not_called()
+        release.assert_not_called()
+        delete.assert_not_called()
+
+
+class ShareProbeTimeoutTests(unittest.TestCase):
+    def test_a_hung_listing_answers_unreachable_without_piling_up_threads(self) -> None:
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        calls: list[int] = []
+
+        def hang(_path: Any) -> Any:
+            calls.append(1)
+            gate.wait(5)
+            raise OSError("late")
+
+        with mock.patch.object(runner.os, "scandir", side_effect=hang), \
+                mock.patch.object(runner, "SHARE_PROBE_TIMEOUT_SECONDS", 0.05), \
+                mock.patch.object(runner, "_share_probe", None):
+            self.assertFalse(runner._books_share_reachable())
+            self.assertFalse(runner._books_share_reachable())
+            self.assertEqual(len(calls), 1, "no second probe while the first is hung")
+            gate.set()
+            runner._share_probe.join(2)  # type: ignore[union-attr]

@@ -253,12 +253,18 @@ INSERT INTO transcripts (job_id, file_path, checksum, language, duration_seconds
                          speaker_count, segments, raw_text, model_name)
 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9);
 
--- Then mark the job done
+-- Then mark the job done — only if this runner still holds the claim
 UPDATE transcription_jobs
 SET    status = 'done',
        error  = NULL
-WHERE  id     = $1;
+WHERE  id     = $1 AND status = 'claimed' AND claimed_by = $2;
 ```
+
+If the UPDATE matches no row (the stale sweep re-pended the job and another claim
+took it over, or it was requeued), the whole transaction — the transcript INSERT
+included — is rolled back and the runner leaves the row alone (its checkpoint
+stays, for whoever holds the claim now). A reconnect-retried write can therefore
+never overwrite a job another claim finished or reset.
 
 Both writes MUST be in a single transaction. A lost connection is retried on a
 fresh one (see "Transient vs permanent failures" below); if the write still
@@ -271,7 +277,7 @@ fails it stays `claimed` until the stale sweep expires it back to `pending`.
 UPDATE transcription_jobs
 SET    status = 'failed',
        error  = $2          -- truncated error message, max 2000 chars
-WHERE  id     = $1;
+WHERE  id     = $1 AND status = 'claimed' AND claimed_by = $3;
 ```
 
 Only a **permanent** failure marks a job failed (see below).
@@ -284,7 +290,7 @@ The runner classifies every job failure:
 |---|---|---|
 | transient `db` | a lost connection: psycopg2 `InterfaceError`, or `OperationalError` with no SQLSTATE (client-side loss) or SQLSTATE class `08` / `57P01`–`57P03`; any other `OperationalError` (statement or lock timeout, disk full) is permanent | in `_mark_done`: reconnect and retry up to `RUNNER_RETRY_DB_ATTEMPTS` (3) times; before re-writing, a job already `done` means the earlier commit landed |
 | transient `oom` | `torch.cuda.OutOfMemoryError` (or `CUDA out of memory` in the text) | per window (or single pass): `gc.collect()` + `torch.cuda.empty_cache()`, retry up to `RUNNER_RETRY_OOM_ATTEMPTS` (2) times |
-| transient `io` | network `OSError` (WinError 53/59/64/67/1231, `ETIMEDOUT`, `EHOSTUNREACH`, `ECONNRESET`, `EIO`, …), an ffmpeg/ffprobe I/O error, or any file/ffmpeg error **while the books share is unreachable** — "reachable" means `BOOKS_MOUNT` lists at least one entry, so a dropped Linux mount (an empty mountpoint dir) counts as down | retry up to `RUNNER_RETRY_IO_ATTEMPTS` (3) times with backoff |
+| transient `io` | network `OSError` (WinError 53/59/64/67/1231, `ETIMEDOUT`, `EHOSTUNREACH`, `ECONNRESET`, `EIO`, …), an ffmpeg/ffprobe I/O error, or any file/ffmpeg error **while the books share is unreachable** — "reachable" means `BOOKS_MOUNT` lists at least one entry within 10 s (the probe runs in a daemon thread, so a hung mount cannot stall the loop), so a dropped Linux mount (an empty mountpoint dir) counts as down | retry up to `RUNNER_RETRY_IO_ATTEMPTS` (3) times with backoff |
 | transient `timeout` | an ffmpeg/ffprobe call outlived its timeout (`max(RUNNER_FFMPEG_TIMEOUT_FLOOR_SECONDS, RUNNER_FFMPEG_TIMEOUT_FACTOR × audio seconds)`; ffprobe gets the floor) | as `io` |
 | permanent | everything else — a missing file, permission error or undecodable audio on a **reachable** share, a path-traversal reject, empty model output, a constraint violation | `_mark_failed` (terminal), as before |
 
@@ -586,7 +592,9 @@ before parking: a single-pass file (at or under `ASR_CHUNK_THRESHOLD_SECONDS`, o
 anyway), and a chunked job whose checkpoint is disabled or failed to save — yielding without one
 would discard the finished windows, so a flapping gate could cycle the job with no progress. The
 mid-job check reconnects the job connection if it was lost (a dead connection would otherwise
-read "keep going"). A runner reads the column defensively:
+read "keep going"). A yield refunds the job's **attempt** but not `run_limit`: the claim
+decremented it, so a bounded run (`earmark batch`) spends one more unit when the yielded job is
+claimed again — a bounded run counts claims, not books. A runner reads the column defensively:
 absent (a database older than 00016), a missing row or a read error is `false`. The Go service
 only reads it — `/api/v1/status` `pipeline.arbiterYield` / `arbiterYieldAt` ("held by
 gpu-arbiter"). **Deploy order:** an earmark release containing 00016 and a runner pin bump in

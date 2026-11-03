@@ -1800,6 +1800,13 @@ def _has_provenance_columns(conn: psycopg2.extensions.connection) -> bool:
     return _PROVENANCE_COLUMNS
 
 
+class _ClaimLost(Exception):
+    """The job row is no longer claimed by this runner (the stale sweep re-pended
+    it, or another claim took it over): this runner must not write its status.
+    Not a failure of the job — the main loop leaves the row alone and keeps the
+    checkpoint, so whoever holds the claim now can resume from it."""
+
+
 def _mark_done(
     conn: psycopg2.extensions.connection,
     job_id: str,
@@ -1859,15 +1866,22 @@ def _mark_done(
                 """,
                 base,
             )
+        # Guarded on this runner's claim: a reconnect-retried write (or a job
+        # the stale sweep re-pended mid-run and another claim since took over,
+        # requeued or finished) must never be overwritten to 'done'. No row
+        # matched → roll back the transcript INSERT too and report _ClaimLost.
         cur.execute(
             """
             UPDATE transcription_jobs
             SET    status = 'done',
                    error  = NULL
-            WHERE  id = %s
+            WHERE  id = %s AND status = 'claimed' AND claimed_by = %s
             """,
-            (job_id,),
+            (job_id, RUNNER_IDENTITY),
         )
+        if getattr(cur, "rowcount", 1) == 0:
+            conn.rollback()
+            raise _ClaimLost(f"job {job_id} is no longer claimed by {RUNNER_IDENTITY}")
     conn.commit()
     log.info("Job %s marked done (file: %s)", job_id, file_path)
 
@@ -1978,9 +1992,9 @@ def _mark_failed(
                 UPDATE transcription_jobs
                 SET    status = 'failed',
                        error  = %s
-                WHERE  id = %s
+                WHERE  id = %s AND status = 'claimed' AND claimed_by = %s
                 """,
-                (truncated, job_id),
+                (truncated, job_id, RUNNER_IDENTITY),
             )
 
     try:
@@ -2024,6 +2038,10 @@ _FFMPEG_TRANSIENT_RE = re.compile(
 )
 
 
+SHARE_PROBE_TIMEOUT_SECONDS: float = 10.0
+_share_probe: threading.Thread | None = None
+
+
 def _books_share_reachable() -> bool:
     """Whether the books mount (BOOKS_MOUNT, a UNC share on Windows) answers.
     Distinguishes "file is missing" (permanent) from "share is down" (transient).
@@ -2031,12 +2049,32 @@ def _books_share_reachable() -> bool:
     It must list at least one entry, not merely exist: on Linux the mountpoint
     directory outlives a dropped NFS/SMB mount (isdir stays true, the dir is
     empty), and a books share is never legitimately empty. Only the first
-    entry is read. On Windows a down UNC share fails the listing outright."""
-    try:
-        with os.scandir(BOOKS_MOUNT) as it:
-            return next(it, None) is not None
-    except Exception:  # noqa: BLE001 — unreachable either way
+    entry is read. On Windows a down UNC share fails the listing outright.
+
+    The listing runs in a daemon thread bounded by SHARE_PROBE_TIMEOUT_SECONDS,
+    so a hung NFS/SMB mount cannot stall the main loop (and with it the
+    heartbeat and the GPU gate); a probe that is still hung from an earlier
+    call answers "unreachable" without starting another thread.
+    """
+    global _share_probe
+    if _share_probe is not None and _share_probe.is_alive():
         return False
+    result: list[bool] = []
+
+    def probe() -> None:
+        try:
+            with os.scandir(BOOKS_MOUNT) as it:
+                result.append(next(it, None) is not None)
+        except Exception:  # noqa: BLE001 — unreachable either way
+            result.append(False)
+
+    _share_probe = threading.Thread(target=probe, name="books-share-probe", daemon=True)
+    _share_probe.start()
+    _share_probe.join(SHARE_PROBE_TIMEOUT_SECONDS)
+    if _share_probe.is_alive():
+        log.warning("Books share probe of %s timed out after %.0f s", BOOKS_MOUNT, SHARE_PROBE_TIMEOUT_SECONDS)
+        return False
+    return bool(result and result[0])
 
 
 def _exc_chain(exc: BaseException) -> list[BaseException]:
@@ -4671,6 +4709,8 @@ def main() -> None:
                 "Shutdown requested mid-transcription — releasing job %s", job_id
             )
             _release_job(ref.live(), job_id)
+        except _ClaimLost as exc:
+            log.warning("Job %s: %s — leaving the row alone (checkpoint kept)", job_id, exc)
         except _YieldInterrupt as yi:
             # The checkpoint holds every finished window; refund the attempt (a
             # yield is not the job's fault) and park at the next gate, at once.
