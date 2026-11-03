@@ -1894,9 +1894,10 @@ CREATE TABLE finding_asr_votes (
 );
 ```
 
-- **Writer of `pilot_transcripts`**: `runner/pilot.py` only, INSERT only
-  (skips a `(file_path, model_id, model_revision, scope)` already present
-  unless `--force`). Scope `full` is the whole track; scope `findings` is only
+- **Writer of `pilot_transcripts`**: `runner/pilot.py` only
+  (jedwards1230/earmark#213). It skips a `(file_path, model_id,
+  model_revision, scope)` already present; `--force` deletes that row (and,
+  by cascade, its votes) and inserts a new one. Scope `full` is the whole track; scope `findings` is only
   the windows around held findings — its segments carry absolute track times
   and `audio_sec` is the sum of the window lengths. With
   `has_word_times = false` (Canary) each segment is one window and its words
