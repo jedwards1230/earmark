@@ -1987,6 +1987,12 @@ type QueueStats struct {
 	// an empty queue is idle-done; a stale value is the runner actually gone. nil
 	// until the runner has stamped at least once (column default NULL).
 	RunnerHeartbeatAt *time.Time
+	// ArbiterYield / ArbiterYieldAt mirror runner_control.arbiter_yield(_at)
+	// (migration 00018, CONTRACT §1.4): true while gpu-arbiter holds the ASR
+	// runner off the GPU (e.g. a game is running), and when the arbiter last
+	// wrote it. Read-only here — only gpu-arbiter's gpu_gate writes it.
+	ArbiterYield   bool
+	ArbiterYieldAt *time.Time
 
 	// Runner self-update (CONTRACT §1.4 + §2.12). RunnerVersion is the tag the
 	// runner reports it is RUNNING (stamped on the heartbeat); DesiredRunnerVersion
@@ -2168,16 +2174,21 @@ func (db *DB) GetServiceStatus(ctx context.Context) (*QueueStats, error) {
 	}
 
 	// Global control row (runner_control singleton): pause flag + bounded-run
-	// counter. Tolerate a missing row by defaulting to not-paused/unlimited; the
+	// counter. arbiter_yield(_at) is read in the same query on purpose: it needs
+	// migration 00018, which db.New applies before anything serves or polls, so
+	// a schema without it only exists under a rolled-back database (then every
+	// status read fails loudly rather than silently reporting "not held"). Tolerate a missing row by defaulting to not-paused/unlimited; the
 	// init seed normally guarantees it exists.
 	if err := db.pool.QueryRow(ctx,
 		`SELECT paused, run_limit, runner_heartbeat_at,
 		        runner_version, desired_runner_version,
-		        runner_update_state, runner_update_error, runner_update_at
+		        runner_update_state, runner_update_error, runner_update_at,
+		        arbiter_yield, arbiter_yield_at
 		 FROM runner_control WHERE id = 1`,
 	).Scan(&q.Paused, &q.RunLimit, &q.RunnerHeartbeatAt,
 		&q.RunnerVersion, &q.DesiredRunnerVersion,
 		&q.RunnerUpdateState, &q.RunnerUpdateError, &q.RunnerUpdateAt,
+		&q.ArbiterYield, &q.ArbiterYieldAt,
 	); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("control row query: %w", err)
 	}

@@ -780,6 +780,14 @@ components:
             - idle
             - paused
           type: string
+        arbiterYield:
+          description: |
+            True while gpu-arbiter holds the ASR runner off the GPU (`runner_control.arbiter_yield`, CONTRACT §1.4) — "held by gpu-arbiter", independent of `phase`.
+          type: boolean
+        arbiterYieldAt:
+          description: UTC RFC 3339 timestamp of gpu-arbiter's last yield/resume write. Omitted until it has written once.
+          format: date-time
+          type: string
         embedBacklog:
           description: Completed transcripts not yet embedded.
           type: integer
@@ -841,6 +849,7 @@ components:
         - embedBacklog
         - gpuCommitted
         - gpuProbed
+        - arbiterYield
         - fullyDone
         - notStarted
         - transcribing

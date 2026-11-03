@@ -51,6 +51,12 @@ type pipelineLifecycle struct {
 	// GPUProbed is true when a gpu-arbiter probe is configured and reachable, so
 	// the consumer can distinguish "GPU free" from "GPU state unknown".
 	GPUProbed bool `json:"gpuProbed"`
+	// ArbiterYield is true while gpu-arbiter holds the ASR runner off the GPU
+	// (runner_control.arbiter_yield, CONTRACT §1.4) — "held by gpu-arbiter",
+	// independent of the batch phase. ArbiterYieldAt is when the arbiter last
+	// changed it, UTC RFC 3339 (absent until it has written once).
+	ArbiterYield   bool    `json:"arbiterYield"`
+	ArbiterYieldAt *string `json:"arbiterYieldAt,omitempty"`
 
 	// FullyDone is true when every stage has completed:
 	//   pending == 0 AND claimed == 0 AND embedBacklog == 0
@@ -112,6 +118,10 @@ func computePipelineLifecycle(
 		EmbedBacklog:    stats.EmbedBacklog,
 		EvalInPipeline:  evalEnabled,
 		GPUProbed:       gpuProbed,
+		ArbiterYield:    stats.ArbiterYield,
+	}
+	if stats.ArbiterYieldAt != nil {
+		lc.ArbiterYieldAt = rfc3339Ptr(*stats.ArbiterYieldAt)
 	}
 
 	// Eval coverage.

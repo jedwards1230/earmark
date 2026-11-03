@@ -47,6 +47,43 @@ docstring in `runner.py` for the full variable list. There are no secrets or
 host-specific values baked into the source — the code defaults are generic and
 the role supplies the real values.
 
+## Failures, retries and resume
+
+Failures are classified (`_classify_failure`, CONTRACT §1.3 "Transient vs
+permanent failures"). **Transient** ones — a lost DB connection, CUDA OOM, an
+unreachable books share or an SMB/ffmpeg I/O error, an ffmpeg/ffprobe timeout —
+are retried in place with exponential backoff and jitter; when those retries run
+out the job goes back to `pending` **without** its attempt refunded (so the
+3-attempt cap still bounds it; the last attempt fails it) with the error
+recorded, and the main loop backs off before the next claim (and holds claims
+while the share stays down). **Permanent** ones — a missing file on a reachable
+share, undecodable audio, a bad path — mark the job failed, as before.
+
+Long (chunked) jobs write a local checkpoint after every window, so a
+restart, a crash, an exhausted retry or a mid-job GPU yield resumes at the next
+window instead of 0 s (CONTRACT §1.3 "Resume checkpoints"). Between windows the
+runner re-checks the park gate — `paused`, `phase='analyze'`, or gpu-arbiter's
+`arbiter_yield` (migration 00018, CONTRACT §1.4) — and, if it closed, releases
+the job (attempt refunded) and parks: an eviction costs at most one window.
+Pausing therefore also stops a long job at its next window boundary. Single-pass
+files (≤ `ASR_CHUNK_THRESHOLD_SECONDS`) and jobs whose checkpoint is disabled
+finish first. While claims are held after a transient failure, the heartbeat,
+self-update check and GPU gate keep running every poll.
+
+| Variable | Default | What |
+|---|---|---|
+| `RUNNER_RETRY_BASE_SECONDS` | `10` | first backoff delay |
+| `RUNNER_RETRY_FACTOR` | `3` | backoff multiplier (10 → 30 → 90 s) |
+| `RUNNER_RETRY_MAX_SECONDS` | `300` | cap on one retry delay |
+| `RUNNER_RETRY_JITTER` | `0.2` | ± fraction of random jitter on each delay |
+| `RUNNER_RETRY_IO_ATTEMPTS` | `3` | retries for SMB/ffmpeg/ffprobe I/O errors and timeouts |
+| `RUNNER_RETRY_OOM_ATTEMPTS` | `2` | retries per window after a CUDA OOM (`gc` + `torch.cuda.empty_cache()`, no sleep) |
+| `RUNNER_RETRY_DB_ATTEMPTS` | `3` | reconnect-and-retry for a DB error while writing the transcript |
+| `RUNNER_TRANSIENT_BACKOFF_MAX_SECONDS` | `600` | cap on the main-loop wait after consecutive transient releases |
+| `RUNNER_FFMPEG_TIMEOUT_FLOOR_SECONDS` | `120` | minimum ffmpeg timeout; the ffprobe timeout |
+| `RUNNER_FFMPEG_TIMEOUT_FACTOR` | `0.5` | ffmpeg timeout = max(floor, factor × seconds of audio decoded) |
+| `RUNNER_CHECKPOINT_DIR` | `C:\ProgramData\earmark-asr\checkpoints` (Windows), `<RUNNER_TMP_DIR>/earmark-asr-checkpoints` (else) | resume checkpoints; `off` disables; pruned after 7 days |
+
 ## Running the tests
 
 ```bash

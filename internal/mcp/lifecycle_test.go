@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
@@ -550,5 +551,27 @@ func TestRunBudgetText(t *testing.T) {
 		if got := runBudgetText(tc.limit, tc.phase); got != tc.want {
 			t.Errorf("runBudgetText(%v, %q) = %q, want %q", tc.limit, tc.phase, got, tc.want)
 		}
+	}
+}
+
+// TestComputePipelineLifecycle_ArbiterYield: runner_control.arbiter_yield
+// (CONTRACT §1.4) is surfaced read-only, independent of the batch phase, with
+// its timestamp as UTC RFC 3339 and omitted until the arbiter has written once.
+func TestComputePipelineLifecycle_ArbiterYield(t *testing.T) {
+	at := time.Date(2026, 11, 3, 12, 0, 0, 0, time.FixedZone("x", 3600))
+	held := statsOf(3, 0, 1, 4, 0, 0, false)
+	held.ArbiterYield, held.ArbiterYieldAt = true, &at
+
+	lc := computePipelineLifecycle(held, db.PhaseIdle, arbiterStatus{}, false, false)
+	if !lc.ArbiterYield || lc.Phase != db.PhaseIdle {
+		t.Fatalf("want arbiterYield=true with phase untouched, got %+v", lc)
+	}
+	if lc.ArbiterYieldAt == nil || *lc.ArbiterYieldAt != "2026-11-03T11:00:00Z" {
+		t.Fatalf("arbiterYieldAt = %v, want 2026-11-03T11:00:00Z", lc.ArbiterYieldAt)
+	}
+
+	free := computePipelineLifecycle(statsOf(3, 0, 1, 4, 0, 0, false), db.PhaseIdle, arbiterStatus{}, false, false)
+	if free.ArbiterYield || free.ArbiterYieldAt != nil {
+		t.Fatalf("no yield recorded: want false/absent, got %v/%v", free.ArbiterYield, free.ArbiterYieldAt)
 	}
 }
