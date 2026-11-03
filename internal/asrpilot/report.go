@@ -114,17 +114,35 @@ func (c *Comparison) Add(o Comparison) {
 // WER is Errors / RefWords (0 with no reference words).
 func (c Comparison) WER() float64 { return ratio(c.Errors, c.RefWords) }
 
-// Compare is the word disagreement of hyp against ref over cov. Full coverage
-// compares the whole token sequences; otherwise each covered interval is
-// compared on its own — the tokens whose time midpoint lies in it — so text
-// outside the covered windows is never counted as deleted.
+// Window sizes of a full-track comparison (Compare).
+const (
+	// CompareWindowWords: a full track is compared in windows of about this
+	// many reference words, cut at the first segment boundary past it, so a
+	// 100k-word track costs ~n·250 cells instead of n².
+	CompareWindowWords = 250
+	// compareMaxWindowWords forces a cut inside an over-long segment.
+	compareMaxWindowWords = 1000
+)
+
+// Compare is the word disagreement of hyp against ref over cov.
+//
+// Full coverage compares the track in consecutive windows: cuts are placed
+// after every ~CompareWindowWords reference words at a segment boundary, at
+// the midpoint of the pause between the two segments, and every token (of
+// either side) goes to the window holding its time midpoint. A hypothesis
+// word that straddles a cut can be counted twice (a deletion in one window,
+// an insertion in the next); cutting at pauses keeps that rare. Partial
+// coverage compares each covered interval on its own — the tokens whose
+// midpoint lies in it — so text outside the windows never counts as deleted.
 func Compare(ref, hyp []Token, cov Coverage) Comparison {
 	if cov.Full {
-		return Comparison{
-			Errors:   int64(WordErrors(norms(ref), norms(hyp))),
-			RefWords: int64(len(ref)),
-			HypWords: int64(len(hyp)),
+		cuts := windowCuts(ref)
+		rw, hw := byWindow(ref, cuts), byWindow(hyp, cuts)
+		var out Comparison
+		for k := range rw {
+			out.Add(Comparison{Errors: int64(WordErrors(rw[k], hw[k])), RefWords: int64(len(rw[k])), HypWords: int64(len(hw[k]))})
 		}
+		return out
 	}
 	var out Comparison
 	for _, iv := range cov.Intervals {
@@ -134,6 +152,37 @@ func Compare(ref, hyp []Token, cov Coverage) Comparison {
 			RefWords: int64(len(r)),
 			HypWords: int64(len(h)),
 		})
+	}
+	return out
+}
+
+// windowCuts returns ascending cut times splitting ref into windows.
+func windowCuts(ref []Token) []float64 {
+	var cuts []float64
+	since := 0
+	for i := 1; i < len(ref); i++ {
+		since++
+		boundary := ref[i].Seg != ref[i-1].Seg
+		if (since >= CompareWindowWords && boundary) || since >= compareMaxWindowWords {
+			c := (ref[i-1].End + ref[i].Start) / 2
+			if len(cuts) == 0 || c > cuts[len(cuts)-1] {
+				cuts = append(cuts, c)
+				since = 0
+			}
+		}
+	}
+	return cuts
+}
+
+// byWindow buckets tokens by midpoint: window k holds cuts[k-1] ≤ mid < cuts[k].
+func byWindow(toks []Token, cuts []float64) [][]string {
+	out := make([][]string, len(cuts)+1)
+	for _, t := range toks {
+		k := sort.SearchFloat64s(cuts, t.Mid())
+		if k < len(cuts) && cuts[k] == t.Mid() {
+			k++
+		}
+		out[k] = append(out[k], t.Norm)
 	}
 	return out
 }
@@ -148,14 +197,23 @@ func within(toks []Token, iv Interval) []string {
 	return out
 }
 
-// VoteTally is one model's current votes on held findings.
+// VoteTally is one model's current votes on held findings. Style-only votes
+// are counted apart: StyleOnly in all, StyleResolved those whose style_vote
+// heard one reading.
 type VoteTally struct {
 	HeardReplacement, HeardOriginal, Neither, Unmappable int64
+	StyleOnly, StyleResolved                             int64
 }
 
-// Add counts n votes of kind vote.
-func (t *VoteTally) Add(vote string, n int64) {
+// Add counts n votes of kind vote (styleVote: a style_only vote's
+// detail.style_vote).
+func (t *VoteTally) Add(vote, styleVote string, n int64) {
 	switch vote {
+	case VoteStyleOnly:
+		t.StyleOnly += n
+		if resolved(styleVote) {
+			t.StyleResolved += n
+		}
 	case VoteHeardReplacement:
 		t.HeardReplacement += n
 	case VoteHeardOriginal:
@@ -170,20 +228,24 @@ func (t *VoteTally) Add(vote string, n int64) {
 // Voted is every finding with a vote; Resolved those the pilot settled one
 // way or the other (heard_replacement + heard_original).
 func (t VoteTally) Voted() int64 {
-	return t.HeardReplacement + t.HeardOriginal + t.Neither + t.Unmappable
+	return t.HeardReplacement + t.HeardOriginal + t.Neither + t.Unmappable + t.StyleOnly
 }
 
-// Resolved is heard_replacement + heard_original.
+// Resolved is heard_replacement + heard_original: style-only votes excluded.
 func (t VoteTally) Resolved() int64 { return t.HeardReplacement + t.HeardOriginal }
+
+// ResolvedWithStyle also counts the style-only votes that heard a reading.
+func (t VoteTally) ResolvedWithStyle() int64 { return t.Resolved() + t.StyleResolved }
 
 // PairAgreement is how often two models' votes on the same findings agree.
 type PairAgreement struct {
 	ModelA, ModelB string
 	// Both counts findings both voted on; Mapped those neither marked
-	// unmappable, Agree those with equal mapped votes. Resolved counts the
+	// unmappable or style_only (a style-only vote is never agreement on the
+	// word; StyleOnly counts those), Agree those with equal mapped votes. Resolved counts the
 	// findings both resolved (heard_*), ResolvedAgree those resolved the same
 	// way — the agreement that matters for evidence.
-	Both, Mapped, Agree, Resolved, ResolvedAgree int64
+	Both, Mapped, Agree, Resolved, ResolvedAgree, StyleOnly int64
 }
 
 // AgreementRate is Agree / Mapped.
@@ -214,6 +276,10 @@ func Agreement(cells []VoteCell) []PairAgreement {
 		}
 		p := &out[i]
 		p.Both += c.N
+		if c.VoteA == VoteStyleOnly || c.VoteB == VoteStyleOnly {
+			p.StyleOnly += c.N
+			continue
+		}
 		if c.VoteA == VoteUnmappable || c.VoteB == VoteUnmappable {
 			continue
 		}
@@ -284,8 +350,12 @@ func (m ModelStats) RTFx() float64 {
 // reference side.
 type CrossStats struct {
 	ModelA, ModelB string
-	Partial        bool // at least one side was scope 'findings'
-	Tracks         int
-	CoveredSec     float64
+	// Scope is both sides' scope: only like scopes are compared, so a
+	// model with both a full and a findings transcript of a track is never
+	// counted twice.
+	Scope      string
+	Partial    bool // scope 'findings': only the windows both covered
+	Tracks     int
+	CoveredSec float64
 	Comparison
 }

@@ -38,6 +38,12 @@ func TestIntegrationASRPilot(t *testing.T) {
 	held := seedFinding(t, d, tID, chunkID, 0, "proposed")
 	undecided := seedFinding(t, d, tID, chunkID, 0, "proposed")
 	revoked := seedFinding(t, d, tID, chunkID, 0, "proposed")
+	// hold, then a later reject: no longer held (the state is left proposed
+	// on purpose, so the decision rule alone must exclude it).
+	rejectedLater := seedFinding(t, d, tID, chunkID, 0, "proposed")
+	// hold, then a reject that was revoked: the hold is the latest live
+	// decision again, so it is held.
+	heldAgain := seedFinding(t, d, tID, chunkID, 0, "proposed")
 	sha := patch.ChunkHash("the portrait of dorian grey")
 	if _, err := d.pool.Exec(ctx, `UPDATE transcript_findings SET original_text = 'dorian grey',
 		suggested_correction = 'dorian gray', anchor_offset = 16, chunk_text_sha256 = $2 WHERE transcript_id = $1`, tID, sha); err != nil {
@@ -45,7 +51,7 @@ func TestIntegrationASRPilot(t *testing.T) {
 	}
 	r := strings.Repeat("a7", 32)
 	registerTestRecipe(t, conn, r, 3)
-	for _, f := range []string{held, revoked} {
+	for _, f := range []string{held, revoked, rejectedLater, heldAgain} {
 		if _, err := d.pool.Exec(ctx, `INSERT INTO finding_events (finding_id, transcript_id, kind, outcome, reason, actor, recipe_id)
 			VALUES ($1, $2, 'decision', 'hold', 'no_evidence', $3, $4)`, f, tID, "jev:"+r, r); err != nil {
 			t.Fatal(err)
@@ -56,15 +62,36 @@ func TestIntegrationASRPilot(t *testing.T) {
 		 WHERE finding_id = $1 AND kind = 'decision'`, revoked); err != nil {
 		t.Fatal(err)
 	}
+	for _, f := range []string{rejectedLater, heldAgain} {
+		if _, err := d.pool.Exec(ctx, `INSERT INTO finding_events (finding_id, transcript_id, kind, outcome, reason, actor, recipe_id)
+			VALUES ($1, $2, 'decision', 'reject', 'jev_reject', $3, $4)`, f, tID, "jev:"+r, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.pool.Exec(ctx, `INSERT INTO finding_events (finding_id, transcript_id, kind, actor, revokes_event_id)
+		SELECT finding_id, transcript_id, 'revoke', 'revert:test', id FROM finding_events
+		 WHERE finding_id = $1 AND kind = 'decision' AND outcome = 'reject'`, heldAgain); err != nil {
+		t.Fatal(err)
+	}
 
 	page, err := d.HeldFindings(ctx, tID, FirstFindingID, MaxPilotPage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page) != 1 || page[0].ID != held {
-		t.Fatalf("held = %+v, want only %s (not %s undecided, not %s revoked)", page, held, undecided, revoked)
+	got := map[string]bool{}
+	for _, h := range page {
+		got[h.ID] = true
 	}
-	h := page[0]
+	if len(page) != 2 || !got[held] || !got[heldAgain] {
+		t.Fatalf("held = %v, want %s and %s (held again after its reject was revoked); not %s undecided, %s revoked, %s rejected later",
+			got, held, heldAgain, undecided, revoked, rejectedLater)
+	}
+	var h HeldFinding
+	for _, x := range page {
+		if x.ID == held {
+			h = x
+		}
+	}
 	if !h.ChunkFound || h.ChunkText != "the portrait of dorian grey" || h.ChunkTextSHA256 != sha || h.AnchorOffset != 16 ||
 		h.AnchorOccurrence != -1 || h.ChunkEndSec != 5 || h.SuggestedCorrection != "dorian gray" {
 		t.Errorf("held finding = %+v (want the pristine source_text)", h)
@@ -141,12 +168,21 @@ func TestIntegrationASRPilot(t *testing.T) {
 	if _, err := d.UpsertFindingASRVotes(ctx, []FindingASRVote{vote(findings, "canary", "heard_original")}); err != nil {
 		t.Fatal(err)
 	}
+	styleDetail, _ := json.Marshal(map[string]any{"rule": "asr_vote@v1", "style_vote": "heard_replacement"})
+	sv := vote(other, "granite", "style_only")
+	sv.FindingID, sv.Detail = heldAgain, styleDetail
+	notHeld := vote(other, "granite", "heard_original")
+	notHeld.FindingID = rejectedLater // voted, then decided: left out of the tallies
+	if _, err := d.UpsertFindingASRVotes(ctx, []FindingASRVote{sv, notHeld}); err != nil {
+		t.Fatal(err)
+	}
 	counts, err := d.PilotVoteCounts(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []PilotVoteCount{{"canary", "rev1", "heard_original", 1}, {"granite", "rev1", "heard_replacement", 1}}
-	if len(counts) != 2 || counts[0] != want[0] || counts[1] != want[1] {
+	want := []PilotVoteCount{{"canary", "rev1", "heard_original", "", 1}, {"granite", "rev1", "heard_replacement", "", 1},
+		{"granite", "rev1", "style_only", "heard_replacement", 1}}
+	if len(counts) != 3 || counts[0] != want[0] || counts[1] != want[1] || counts[2] != want[2] {
 		t.Errorf("counts = %+v, want %+v", counts, want)
 	}
 	pairs, err := d.PilotVotePairs(ctx, []string{"/books/a/b"})

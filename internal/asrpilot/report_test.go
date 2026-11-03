@@ -1,7 +1,9 @@
 package asrpilot
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/jedwards1230/earmark/internal/db"
@@ -104,13 +106,14 @@ func TestAgreement(t *testing.T) {
 		{"canary", "granite", VoteNeither, VoteNeither, 2},
 		{"canary", "granite", VoteNeither, VoteHeardOriginal, 1},
 		{"canary", "granite", VoteUnmappable, VoteHeardOriginal, 3},
+		{"canary", "granite", VoteStyleOnly, VoteStyleOnly, 4}, // never agreement on the word
 	}
 	got := Agreement(cells)
 	if len(got) != 1 {
 		t.Fatalf("pairs = %d", len(got))
 	}
 	p := got[0]
-	if p.Both != 12 || p.Mapped != 9 || p.Agree != 7 || p.Resolved != 6 || p.ResolvedAgree != 5 {
+	if p.Both != 16 || p.StyleOnly != 4 || p.Mapped != 9 || p.Agree != 7 || p.Resolved != 6 || p.ResolvedAgree != 5 {
 		t.Errorf("agreement = %+v", p)
 	}
 	if math.Abs(p.AgreementRate()-7.0/9) > 1e-9 || math.Abs(p.ResolvedAgreementRate()-5.0/6) > 1e-9 {
@@ -120,13 +123,15 @@ func TestAgreement(t *testing.T) {
 
 func TestVoteTally(t *testing.T) {
 	var v VoteTally
-	v.Add(VoteHeardReplacement, 3)
-	v.Add(VoteHeardOriginal, 2)
-	v.Add(VoteNeither, 4)
-	v.Add(VoteUnmappable, 1)
-	v.Add("bogus", 9)
-	if v.Voted() != 10 || v.Resolved() != 5 {
-		t.Errorf("tally = %+v", v)
+	v.Add(VoteHeardReplacement, "", 3)
+	v.Add(VoteHeardOriginal, "", 2)
+	v.Add(VoteNeither, "", 4)
+	v.Add(VoteUnmappable, "", 1)
+	v.Add(VoteStyleOnly, VoteHeardReplacement, 6)
+	v.Add(VoteStyleOnly, VoteNeither, 2)
+	v.Add("bogus", "", 9)
+	if v.Voted() != 18 || v.Resolved() != 5 || v.ResolvedWithStyle() != 11 || v.StyleOnly != 8 {
+		t.Errorf("tally = %+v (voted %d resolved %d with style %d)", v, v.Voted(), v.Resolved(), v.ResolvedWithStyle())
 	}
 }
 
@@ -142,5 +147,34 @@ func TestModelStatsRTFxAndVRAM(t *testing.T) {
 	}
 	if (ModelStats{}).RTFx() != 0 {
 		t.Error("RTFx with no wall time is 0")
+	}
+}
+
+// TestCompareFullIsWindowed: a long track is cut into windows at segment
+// boundaries, and the windowed count equals the whole-track edit distance
+// when the differences sit inside windows.
+func TestCompareFullIsWindowed(t *testing.T) {
+	var segs []db.Segment
+	var pilot []db.PilotSegment
+	for k := range 6 {
+		words := make([]string, 120)
+		for i := range words {
+			words[i] = fmt.Sprintf("w%d", (k*120+i)%37)
+		}
+		start := float64(k) * 70
+		segs = append(segs, prodSeg(k, start, strings.Join(words, " ")))
+		words[60] = "different" // one substitution in the middle of every segment
+		pilot = append(pilot, timedPilot(start, strings.Join(words, " ")))
+	}
+	ref, hyp := ProductionTokens(segs), PilotTokens(pilot)
+	if cuts := windowCuts(ref); len(cuts) != 1 || cuts[0] != 204.95 { // after 360 words: the first boundary past 250, mid-pause
+		t.Fatalf("cuts = %v, want one per ~%d words at a segment boundary", cuts, CompareWindowWords)
+	}
+	c := Compare(ref, hyp, FullCoverage())
+	if c.Errors != 6 || c.RefWords != 720 || c.HypWords != 720 {
+		t.Errorf("windowed = %+v, want 6 errors over 720 words", c)
+	}
+	if whole := WordErrors(norms(ref), norms(hyp)); int64(whole) != c.Errors {
+		t.Errorf("windowed %d != whole-track %d", c.Errors, whole)
 	}
 }

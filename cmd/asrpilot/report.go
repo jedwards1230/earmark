@@ -43,7 +43,9 @@ var ReportCmd = &cobra.Command{
   WER vs ` + asrpilot.ProductionModel + `
                            word-level edit distance of the pilot text against the
                            production transcript, both normalised (lowercase, no
-                           punctuation), summed over tracks / production words.
+                           punctuation, numerals spelt out, mr/mrs/dr/st folded),
+                           summed over tracks / production words; full tracks are
+                           compared in ~250-word windows cut at pauses.
                            Production is a reference, not ground truth: this is
                            disagreement with the production model. For scope
                            'findings' only the covered windows (the union of the
@@ -52,10 +54,14 @@ var ReportCmd = &cobra.Command{
   casing / punctuation     share of the pilot's words with an uppercase letter /
                            a punctuation mark (production is ~0 for both)
 
-then, per pair of pilot models on the same tracks, their WER against each
-other (over the windows both covered), and from finding_asr_votes the held
-findings voted and resolved (heard_replacement + heard_original) per model
-and the two models' vote agreement.
+then, per pair of pilot models on the same tracks in the same scope, their
+WER against each other (over the windows both covered), and from
+finding_asr_votes — findings still held only — the findings voted and
+resolved (heard_replacement + heard_original) per model, without and with
+the style_only votes (case/punctuation/spelling-variant corrections), and
+the two models' vote agreement (style_only and unmappable excluded).
+
+Only tracks with both production and pilot segments are counted.
 
 Tracks are read one at a time (the production segments through the bounded
 segment loader, then each pilot transcript of that track).
@@ -80,13 +86,15 @@ func init() {
 
 // Report is the JSON form of `asr-pilot report`.
 type Report struct {
-	Reference  string        `json:"reference"`
-	Models     []ModelRow    `json:"models"`
-	Production TextRow       `json:"production_text"`
-	Cross      []CrossRow    `json:"cross"`
-	Votes      []VoteRow     `json:"votes"`
-	Agreement  []AgreeRow    `json:"agreement"`
-	Skipped    SkippedTracks `json:"skipped"`
+	Reference string `json:"reference"`
+	// Normalization states what the WER does and does not reconcile.
+	Normalization string        `json:"normalization"`
+	Models        []ModelRow    `json:"models"`
+	Production    TextRow       `json:"production_text"`
+	Cross         []CrossRow    `json:"cross"`
+	Votes         []VoteRow     `json:"votes"`
+	Agreement     []AgreeRow    `json:"agreement"`
+	Skipped       SkippedTracks `json:"skipped"`
 }
 
 // ModelRow is one model × scope.
@@ -122,6 +130,7 @@ type TextRow struct {
 type CrossRow struct {
 	ModelA       string  `json:"model_a"`
 	ModelB       string  `json:"model_b"`
+	Scope        string  `json:"scope"`
 	WERScope     string  `json:"wer_scope"`
 	Tracks       int     `json:"tracks"`
 	CoveredHours float64 `json:"covered_hours,omitempty"`
@@ -130,15 +139,20 @@ type CrossRow struct {
 	RefWords     int64   `json:"reference_words"`
 }
 
-// VoteRow is one model's held-finding votes.
+// VoteRow is one model's held-finding votes. Resolved excludes style-only
+// corrections (case/punctuation/spelling variants); ResolvedWithStyle adds
+// the style-only votes that heard one reading.
 type VoteRow struct {
-	Model            string `json:"model"`
-	Voted            int64  `json:"voted"`
-	Resolved         int64  `json:"resolved"`
-	HeardReplacement int64  `json:"heard_replacement"`
-	HeardOriginal    int64  `json:"heard_original"`
-	Neither          int64  `json:"neither"`
-	Unmappable       int64  `json:"unmappable"`
+	Model             string `json:"model"`
+	Voted             int64  `json:"voted"`
+	Resolved          int64  `json:"resolved"`
+	ResolvedWithStyle int64  `json:"resolved_with_style"`
+	StyleOnly         int64  `json:"style_only"`
+	StyleResolved     int64  `json:"style_resolved"`
+	HeardReplacement  int64  `json:"heard_replacement"`
+	HeardOriginal     int64  `json:"heard_original"`
+	Neither           int64  `json:"neither"`
+	Unmappable        int64  `json:"unmappable"`
 }
 
 // AgreeRow is two models' agreement on the findings both voted on.
@@ -149,6 +163,7 @@ type AgreeRow struct {
 	Mapped                int64   `json:"both_mapped"`
 	Agree                 int64   `json:"agree"`
 	AgreementRate         float64 `json:"agreement_rate"`
+	StyleOnly             int64   `json:"style_only"`
 	Resolved              int64   `json:"both_resolved"`
 	ResolvedAgree         int64   `json:"resolved_agree"`
 	ResolvedAgreementRate float64 `json:"resolved_agreement_rate"`
@@ -193,7 +208,7 @@ type loadedPilot struct {
 }
 
 func buildReport(ctx context.Context, st reportStore, pilots []db.PilotTranscript, dirs []string) (Report, error) {
-	rep := Report{Reference: asrpilot.ProductionModel}
+	rep := Report{Reference: asrpilot.ProductionModel, Normalization: asrpilot.NormalizationCaveat}
 	byTrack := map[string][]db.PilotTranscript{}
 	for _, p := range pilots {
 		byTrack[p.ProductionTranscriptID] = append(byTrack[p.ProductionTranscriptID], p)
@@ -210,19 +225,25 @@ func buildReport(ctx context.Context, st reportStore, pilots []db.PilotTranscrip
 		if err != nil {
 			return rep, err
 		}
-		var prod []asrpilot.Token
-		if segs := prodSegs[tid]; len(segs) > 0 {
-			prod = asrpilot.ProductionTokens(segs)
-			prodText.Add(prod)
-		} else {
+		segs := prodSegs[tid]
+		if len(segs) == 0 {
+			// Not counted anywhere: tracks, audio and RTFx all describe the
+			// same set of tracks the WER is computed over.
 			rep.Skipped.NoProductionSegments++
+			continue
 		}
+		prod := asrpilot.ProductionTokens(segs)
+		prodText.Add(prod)
 
 		var loaded []loadedPilot
 		for _, p := range byTrack[tid] {
 			segs, err := st.PilotSegments(ctx, p.ID)
 			if err != nil {
 				return rep, err
+			}
+			if len(segs) == 0 {
+				rep.Skipped.NoPilotSegments++
+				continue
 			}
 			k := modelKey(p.ModelID, p.ModelRevision)
 			s := stats[k+"|"+p.Scope]
@@ -231,32 +252,29 @@ func buildReport(ctx context.Context, st reportStore, pilots []db.PilotTranscrip
 				stats[k+"|"+p.Scope] = s
 			}
 			s.AddTrack(p)
-			if len(segs) == 0 {
-				rep.Skipped.NoPilotSegments++
-				continue
-			}
 			lp := loadedPilot{meta: p, key: k, toks: asrpilot.PilotTokens(segs), cov: asrpilot.CoverageFor(p.Scope, segs)}
 			s.Text.Add(lp.toks)
-			if prod != nil {
-				s.VsProduction.Add(asrpilot.Compare(prod, lp.toks, lp.cov))
-				s.CoveredSec += coveredSec(lp.cov, p)
-			}
+			s.VsProduction.Add(asrpilot.Compare(prod, lp.toks, lp.cov))
+			s.CoveredSec += coveredSec(lp.cov, p)
 			loaded = append(loaded, lp)
 		}
 
-		// Every pair of different models on this track, over what both cover.
+		// Every pair of different models on this track in the same scope,
+		// over what both cover (full with full, findings with findings), so
+		// a model with transcripts in both scopes is never counted twice.
 		sort.Slice(loaded, func(i, j int) bool { return loaded[i].key < loaded[j].key })
 		for i := range loaded {
 			for j := i + 1; j < len(loaded); j++ {
 				a, b := loaded[i], loaded[j]
-				if a.key == b.key {
+				if a.key == b.key || a.meta.Scope != b.meta.Scope {
 					continue
 				}
 				cov := asrpilot.Intersect(a.cov, b.cov)
-				c := cross[a.key+"|"+b.key]
+				ck := a.key + "|" + b.key + "|" + a.meta.Scope
+				c := cross[ck]
 				if c == nil {
-					c = &asrpilot.CrossStats{ModelA: a.key, ModelB: b.key}
-					cross[a.key+"|"+b.key] = c
+					c = &asrpilot.CrossStats{ModelA: a.key, ModelB: b.key, Scope: a.meta.Scope}
+					cross[ck] = c
 				}
 				c.Tracks++
 				c.Partial = c.Partial || !cov.Full
@@ -274,7 +292,7 @@ func buildReport(ctx context.Context, st reportStore, pilots []db.PilotTranscrip
 	rep.Production = textRow(prodText)
 	for _, k := range sortedKeys(cross) {
 		c := cross[k]
-		row := CrossRow{ModelA: c.ModelA, ModelB: c.ModelB, WERScope: "full", Tracks: c.Tracks,
+		row := CrossRow{ModelA: c.ModelA, ModelB: c.ModelB, Scope: c.Scope, WERScope: "full", Tracks: c.Tracks,
 			WER: c.WER(), Errors: c.Errors, RefWords: c.RefWords}
 		if c.Partial {
 			row.WERScope, row.CoveredHours = "covered_windows_only", c.CoveredSec/3600
@@ -292,12 +310,14 @@ func buildReport(ctx context.Context, st reportStore, pilots []db.PilotTranscrip
 		if tallies[k] == nil {
 			tallies[k] = &asrpilot.VoteTally{}
 		}
-		tallies[k].Add(c.Vote, c.N)
+		tallies[k].Add(c.Vote, c.StyleVote, c.N)
 	}
 	for _, k := range sortedKeys(tallies) {
 		t := tallies[k]
 		rep.Votes = append(rep.Votes, VoteRow{Model: k, Voted: t.Voted(), Resolved: t.Resolved(),
-			HeardReplacement: t.HeardReplacement, HeardOriginal: t.HeardOriginal, Neither: t.Neither, Unmappable: t.Unmappable})
+			ResolvedWithStyle: t.ResolvedWithStyle(),
+			HeardReplacement:  t.HeardReplacement, HeardOriginal: t.HeardOriginal, Neither: t.Neither, Unmappable: t.Unmappable,
+			StyleOnly: t.StyleOnly, StyleResolved: t.StyleResolved})
 	}
 
 	pairs, err := st.PilotVotePairs(ctx, dirs)
@@ -310,7 +330,7 @@ func buildReport(ctx context.Context, st reportStore, pilots []db.PilotTranscrip
 			VoteA: p.VoteA, VoteB: p.VoteB, N: p.N}
 	}
 	for _, a := range asrpilot.Agreement(cells) {
-		rep.Agreement = append(rep.Agreement, AgreeRow{ModelA: a.ModelA, ModelB: a.ModelB, Both: a.Both, Mapped: a.Mapped,
+		rep.Agreement = append(rep.Agreement, AgreeRow{ModelA: a.ModelA, ModelB: a.ModelB, Both: a.Both, Mapped: a.Mapped, StyleOnly: a.StyleOnly,
 			Agree: a.Agree, AgreementRate: a.AgreementRate(), Resolved: a.Resolved, ResolvedAgree: a.ResolvedAgree,
 			ResolvedAgreementRate: a.ResolvedAgreementRate()})
 	}
@@ -354,7 +374,8 @@ func printReport(out io.Writer, r Report) {
 		p("No pilot transcripts in scope.\n")
 		return
 	}
-	p("ASR pilot report · WER reference: %s (production; disagreement, not ground truth)\n\n", r.Reference)
+	p("ASR pilot report · WER reference: %s (production; disagreement, not ground truth)\n", r.Reference)
+	p("WER %s; full tracks are compared in ~%d-word windows cut at pauses\n\n", r.Normalization, asrpilot.CompareWindowWords)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "MODEL\tSCOPE\tTRACKS\tAUDIO h\tRTFx\tPEAK VRAM MiB (alloc/reserved)\tWER vs ref\tWER OVER\tCASED\tPUNCT")
 	for _, m := range r.Models {
@@ -370,42 +391,45 @@ func printReport(out io.Writer, r Report) {
 	p("production text: %d words · cased %.1f%% · punctuated %.1f%%\n",
 		r.Production.Words, 100*r.Production.CasingRate, 100*r.Production.PunctuationRate)
 	if r.Skipped.NoProductionSegments+r.Skipped.NoPilotSegments > 0 {
-		p("skipped from WER: %d track(s) without production segments, %d pilot transcript(s) without segments\n",
+		p("skipped (counted nowhere): %d track(s) without production segments, %d pilot transcript(s) without segments\n",
 			r.Skipped.NoProductionSegments, r.Skipped.NoPilotSegments)
 	}
 
 	if len(r.Cross) > 0 {
 		p("\nPilot vs pilot (A = reference):\n")
 		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		_, _ = fmt.Fprintln(tw, "A\tB\tTRACKS\tWER\tOVER")
+		_, _ = fmt.Fprintln(tw, "A\tB\tSCOPE\tTRACKS\tWER\tOVER")
 		for _, c := range r.Cross {
 			over := "full tracks"
 			if c.WERScope == "covered_windows_only" {
 				over = fmt.Sprintf("covered windows only (%.2f h)", c.CoveredHours)
 			}
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\t%.2f%% (%d/%d)\t%s\n", c.ModelA, c.ModelB, c.Tracks, 100*c.WER, c.Errors, c.RefWords, over)
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%.2f%% (%d/%d)\t%s\n", c.ModelA, c.ModelB, c.Scope, c.Tracks, 100*c.WER, c.Errors, c.RefWords, over)
 		}
 		_ = tw.Flush()
 	}
 
-	p("\nHeld findings (finding_asr_votes, current vote per model):\n")
+	p("\nStill-held findings (finding_asr_votes, current vote per model; findings decided since are left out):\n")
 	if len(r.Votes) == 0 {
 		p("  none voted yet (earmark asr-pilot vote --yes)\n")
 	} else {
 		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		_, _ = fmt.Fprintln(tw, "MODEL\tVOTED\tRESOLVED\theard_replacement\theard_original\tneither\tunmappable")
+		_, _ = fmt.Fprintln(tw, "MODEL\tVOTED\tRESOLVED (no style)\tRESOLVED (with style)\theard_replacement\theard_original\tneither\tunmappable\tstyle_only (resolved)")
 		for _, v := range r.Votes {
-			_, _ = fmt.Fprintf(tw, "%s\t%d\t%d (%.1f%%)\t%d\t%d\t%d\t%d\n", v.Model, v.Voted, v.Resolved,
-				100*ratio(v.Resolved, v.Voted), v.HeardReplacement, v.HeardOriginal, v.Neither, v.Unmappable)
+			_, _ = fmt.Fprintf(tw, "%s\t%d\t%d (%.1f%%)\t%d (%.1f%%)\t%d\t%d\t%d\t%d\t%d (%d)\n", v.Model, v.Voted,
+				v.Resolved, 100*ratio(v.Resolved, v.Voted-v.StyleOnly), v.ResolvedWithStyle, 100*ratio(v.ResolvedWithStyle, v.Voted),
+				v.HeardReplacement, v.HeardOriginal, v.Neither, v.Unmappable, v.StyleOnly, v.StyleResolved)
 		}
+		p("  RESOLVED (no style) = heard_replacement + heard_original, over the votes that are not style_only;\n")
+		p("  style_only = case/punctuation-only or spelling-variant corrections (grey/gray), never agreement on the word\n")
 		_ = tw.Flush()
 	}
 	if len(r.Agreement) > 0 {
-		p("\nTwo-model vote agreement:\n")
+		p("\nTwo-model vote agreement (still-held findings):\n")
 		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		_, _ = fmt.Fprintln(tw, "A\tB\tBOTH VOTED\tAGREE (both mapped)\tAGREE (both resolved)")
+		_, _ = fmt.Fprintln(tw, "A\tB\tBOTH VOTED\tSTYLE_ONLY (excluded)\tAGREE (both mapped)\tAGREE (both resolved)")
 		for _, a := range r.Agreement {
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\t%d/%d (%.1f%%)\t%d/%d (%.1f%%)\n", a.ModelA, a.ModelB, a.Both,
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d/%d (%.1f%%)\t%d/%d (%.1f%%)\n", a.ModelA, a.ModelB, a.Both, a.StyleOnly,
 				a.Agree, a.Mapped, 100*a.AgreementRate, a.ResolvedAgree, a.Resolved, 100*a.ResolvedAgreementRate)
 		}
 		_ = tw.Flush()

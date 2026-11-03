@@ -45,20 +45,28 @@ var VoteCmd = &cobra.Command{
 hold) on the selected books' tracks that the pilot model transcribed, find
 what the pilot heard at the finding's span (CONTRACT §1.11 "asr_vote"):
 
-  1. the span is located in the chunk's pristine text with patch.Locate — the
-     judge's anchor_offset is a self-reported rune index and often wrong, so
-     the occurrence / unique-match rungs recover it; the chunk hash must
-     still match the one recorded with the finding
+  1. the span is located in the chunk's pristine text — the
+     judge's anchor_offset is a self-reported rune index and often wrong: it
+     is used when the text is there, else original_text must occur exactly
+     once in the chunk (several matches are unmappable, anchor_ambiguous);
+     the chunk hash must still match the one recorded with the finding
   2. the span maps to production words through the segments the chunk was
      built from, giving its time window
   3. the pilot's words in that window (by word time, or for a pilot without
      word times the windows overlapping it) are aligned to the production
-     words, and the words between the agreed neighbours are what it heard
+     words (a Myers diff, cheap for 540 s windows), and the words between
+     the agreed neighbours are what it heard
 
   heard_replacement  the pilot heard the finding's correction
   heard_original     the pilot heard what production wrote
   neither            something else, or nothing
   unmappable         the span could not be placed (reason in detail)
+  style_only         the correction only changes case, punctuation or a
+                     spelling variant (grey/gray); what was heard is in
+                     detail.style_vote, counted apart in the report
+
+A heard_* vote needs an agreed word next to the span on at least one side
+and word-timestamped production words; otherwise it is capped to neither.
 
 Tracks are processed one at a time, findings in pages of 100. With a pilot
 transcript in both scopes for a track, the full one is used. Without --yes
@@ -70,7 +78,7 @@ policy are untouched. The run is recorded in step_runs as asr_vote.
 ` + migrateWarning + `
 
 Examples:
-  earmark asr-pilot vote --model ibm-granite/granite-speech-4.1-2b-plus --asin B075VF1R27
+  earmark asr-pilot vote --model ibm-granite/granite-speech-4.1-2b --asin B075VF1R27
   earmark asr-pilot vote --model nvidia/canary-qwen-2.5b --asin B075VF1R27,B00FQRCM9O --limit 50
   earmark asr-pilot vote --model nvidia/canary-qwen-2.5b --book-dir "/books/Mary Shelley/Frankenstein" --yes`,
 	Args: cobra.NoArgs,
@@ -285,11 +293,11 @@ func printVoteSummary(out io.Writer, o voteOptions, s voteSummary) {
 	p("asr-pilot vote · %s · %s\n", o.model, mode)
 	p("tracks voted %d · skipped %d (no production or pilot segments) · held findings %d\n",
 		s.Tracks, s.SkippedTracks, s.Findings)
-	for _, v := range []string{asrpilot.VoteHeardReplacement, asrpilot.VoteHeardOriginal, asrpilot.VoteNeither, asrpilot.VoteUnmappable} {
+	for _, v := range []string{asrpilot.VoteHeardReplacement, asrpilot.VoteHeardOriginal, asrpilot.VoteNeither, asrpilot.VoteUnmappable, asrpilot.VoteStyleOnly} {
 		p("  %-18s %d\n", v, s.Votes[v])
 	}
 	if len(s.Anchor) > 0 {
-		p("span located by: anchor_offset %d · recovered (offset wrong) %d\n", s.Anchor["offset"], s.Anchor["recovered"])
+		p("span located by: anchor_offset %d · unique match (offset wrong) %d · ambiguous %d\n", s.Anchor["offset"], s.Anchor["unique"], s.Reasons[asrpilot.VoteUnmappable+":anchor_ambiguous"])
 	}
 	if len(s.Methods) > 0 {
 		var parts []string

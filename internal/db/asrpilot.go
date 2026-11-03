@@ -207,23 +207,28 @@ type HeldFinding struct {
 	ChunkEndSec         float64
 }
 
-// heldFindingsSQL: held = proposed whose latest decision event (not revoked)
-// is a hold — the same latest-decision rule as decide's reads. Keyset paged
-// by finding id. $1 transcript, $2 after id, $3 limit.
-var heldFindingsSQL = `
-	SELECT f.id::text, f.chunk_index, f.original_text, COALESCE(f.suggested_correction, ''),
-	       COALESCE(f.anchor_offset, -1), COALESCE(f.anchor_occurrence, -1),
-	       COALESCE(f.chunk_text_sha256, ''),
-	       c.chunk_index IS NOT NULL, COALESCE(c.source_text, c.text, ''),
-	       COALESCE(c.start_sec, 0), COALESCE(c.end_sec, 0)
-	  FROM transcript_findings f
+// heldJoin keeps a finding f only while it is held: proposed, and its latest
+// decision event that was not revoked is a hold — the same latest-decision
+// rule as decide's reads (a later reject or apply ends the hold; revoking
+// that later decision brings the hold back).
+const heldJoin = `
 	  JOIN LATERAL (
 	        SELECT e.outcome FROM finding_events e
 	         WHERE e.finding_id = f.id AND e.kind = 'decision'
 	           AND NOT EXISTS (SELECT 1 FROM finding_events v
 	                            WHERE v.kind = 'revoke' AND v.revokes_event_id = e.id)
 	         ORDER BY e.id DESC
-	         LIMIT 1) ld ON ld.outcome = 'hold'
+	         LIMIT 1) ld ON ld.outcome = 'hold' AND f.patch_state = 'proposed'`
+
+// heldFindingsSQL pages a transcript's held findings by id.
+// $1 transcript, $2 after id, $3 limit.
+var heldFindingsSQL = `
+	SELECT f.id::text, f.chunk_index, f.original_text, COALESCE(f.suggested_correction, ''),
+	       COALESCE(f.anchor_offset, -1), COALESCE(f.anchor_occurrence, -1),
+	       COALESCE(f.chunk_text_sha256, ''),
+	       c.chunk_index IS NOT NULL, COALESCE(c.source_text, c.text, ''),
+	       COALESCE(c.start_sec, 0), COALESCE(c.end_sec, 0)
+	  FROM transcript_findings f` + heldJoin + `
 	  LEFT JOIN transcript_chunks c
 	    ON c.transcript_id = f.transcript_id AND c.chunk_index = f.chunk_index
 	 WHERE f.transcript_id = $1::uuid
@@ -328,26 +333,30 @@ func upsertFindingASRVotes(ctx context.Context, ex execer, votes []FindingASRVot
 	return tag.RowsAffected(), nil
 }
 
-// PilotVoteCount is the number of findings whose current vote by one pilot
-// model is Vote. "Current" = the most recently written vote of that finding
-// by that model (a finding voted against two scopes counts once).
+// PilotVoteCount is the number of STILL-HELD findings whose current vote by
+// one pilot model is Vote. "Current" = the most recently written vote of that
+// finding by that model (a finding voted against two scopes counts once). A
+// finding decided since it was voted on is not counted.
 type PilotVoteCount struct {
 	ModelID       string
 	ModelRevision string
 	Vote          string
-	N             int64
+	// StyleVote is a style_only vote's detail.style_vote ("" otherwise).
+	StyleVote string
+	N         int64
 }
 
 var pilotVoteCountsSQL = `
 	WITH cur AS (
 	    SELECT DISTINCT ON (v.finding_id, p.model_id, p.model_revision)
-	           v.finding_id, p.model_id, p.model_revision, v.vote
+	           v.finding_id, p.model_id, p.model_revision, v.vote, COALESCE(v.detail->>'style_vote', '') AS style_vote
 	      FROM finding_asr_votes v
 	      JOIN pilot_transcripts p ON p.id = v.pilot_transcript_id
+	      JOIN transcript_findings f ON f.id = v.finding_id` + heldJoin + `
 	     WHERE cardinality($1::text[]) = 0 OR regexp_replace(p.file_path, '/[^/]+$', '') = ANY($1::text[])
 	     ORDER BY v.finding_id, p.model_id, p.model_revision, v.updated_at DESC, v.id DESC)
-	SELECT model_id, model_revision, vote, count(*) FROM cur
-	 GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`
+	SELECT model_id, model_revision, vote, style_vote, count(*) FROM cur
+	 GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`
 
 // PilotVoteCounts tallies the current votes per model and vote (an aggregate:
 // a few rows per model).
@@ -363,7 +372,7 @@ func (db *DB) PilotVoteCounts(ctx context.Context, bookDirs []string) ([]PilotVo
 	var out []PilotVoteCount
 	for rows.Next() {
 		var c PilotVoteCount
-		if err := rows.Scan(&c.ModelID, &c.ModelRevision, &c.Vote, &c.N); err != nil {
+		if err := rows.Scan(&c.ModelID, &c.ModelRevision, &c.Vote, &c.StyleVote, &c.N); err != nil {
 			return nil, fmt.Errorf("pilot vote counts: scan: %w", err)
 		}
 		out = append(out, c)
@@ -374,7 +383,7 @@ func (db *DB) PilotVoteCounts(ctx context.Context, bookDirs []string) ([]PilotVo
 	return out, nil
 }
 
-// PilotVotePair counts the findings that two pilot models (A < B by
+// PilotVotePair counts the still-held findings that two pilot models (A < B by
 // model_id, then revision) both voted on, by the pair of current votes.
 type PilotVotePair struct {
 	ModelA, RevisionA, VoteA string
@@ -388,6 +397,7 @@ var pilotVotePairsSQL = `
 	           v.finding_id, p.model_id, p.model_revision, v.vote
 	      FROM finding_asr_votes v
 	      JOIN pilot_transcripts p ON p.id = v.pilot_transcript_id
+	      JOIN transcript_findings f ON f.id = v.finding_id` + heldJoin + `
 	     WHERE cardinality($1::text[]) = 0 OR regexp_replace(p.file_path, '/[^/]+$', '') = ANY($1::text[])
 	     ORDER BY v.finding_id, p.model_id, p.model_revision, v.updated_at DESC, v.id DESC)
 	SELECT a.model_id, a.model_revision, a.vote, b.model_id, b.model_revision, b.vote, count(*)

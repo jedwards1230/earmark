@@ -1,7 +1,6 @@
 package asrpilot
 
 import (
-	"errors"
 	"strings"
 	"unicode"
 
@@ -20,6 +19,11 @@ const (
 	VoteHeardOriginal    = "heard_original"
 	VoteNeither          = "neither"
 	VoteUnmappable       = "unmappable"
+	// VoteStyleOnly is a vote on a style-only correction (case/punctuation
+	// only, or a spelling variant such as grey/gray): what was heard is kept
+	// in detail.style_vote, but it is never agreement on the word, so it is
+	// counted apart from heard_replacement / heard_original.
+	VoteStyleOnly = "style_only"
 )
 
 // Vote parameters (part of VoteRule).
@@ -113,19 +117,26 @@ type Result struct {
 // Detail is the vote's finding_asr_votes.detail JSON.
 type Detail struct {
 	Rule string `json:"rule"`
-	// Reason says why a vote is unmappable or neither.
-	Reason string `json:"reason,omitempty"`
-	// Anchor is how patch.Locate placed the span: "offset" when the judge's
-	// anchor_offset held, "recovered" when the occurrence or unique-match
-	// rung found it (the stored offset is wrong).
+	// Reason says why a vote is unmappable or neither (capped_* when a
+	// decisive vote was capped to neither; UncappedVote keeps what it was).
+	Reason       string `json:"reason,omitempty"`
+	UncappedVote string `json:"uncapped_vote,omitempty"`
+	// Anchor is how the span was placed: "offset" when the judge's
+	// anchor_offset held, "unique" when it did not and original_text occurs
+	// exactly once in the chunk. Several matches with a wrong offset are
+	// unmappable (anchor_ambiguous) — the judge's occurrence index is
+	// self-reported too and is not trusted to pick one.
 	Anchor string `json:"anchor,omitempty"`
-	// Span is the production text of the span's words; ProdTimes "word" when
-	// their times are word timestamps, "interpolated" when estimated.
-	Span      string `json:"span,omitempty"`
-	ProdTimes string `json:"prod_times,omitempty"`
+	// Span is the production text of the span's whole words; ProdTimes
+	// "word" when their times are word timestamps, "interpolated" when
+	// estimated. SpanReplaced is Span with the correction substituted, when
+	// the span covers only part of a word (what the vote compares against).
+	Span         string `json:"span,omitempty"`
+	SpanReplaced string `json:"span_replaced,omitempty"`
+	ProdTimes    string `json:"prod_times,omitempty"`
 	// Method: "time_align" (pilot word times + alignment), "time_only"
-	// (pilot word times, alignment found no anchor), "segment_align" (pilot
-	// segment times + alignment).
+	// (pilot word times, alignment found no anchor — always capped to
+	// neither), "segment_align" (pilot segment times + alignment).
 	Method string `json:"method,omitempty"`
 	// WindowStart/WindowEnd bound the pilot tokens considered.
 	WindowStart float64 `json:"window_start,omitempty"`
@@ -138,14 +149,24 @@ type Detail struct {
 	Aligned        [][2]string `json:"aligned,omitempty"`
 	SimOriginal    *float64    `json:"sim_original,omitempty"`
 	SimReplacement *float64    `json:"sim_replacement,omitempty"`
-	CaseSensitive  bool        `json:"case_sensitive,omitempty"`
+	// VoteMethod is how the texts were compared: "normalized", or for a
+	// style-only correction "style_case_sensitive" (differs only in case or
+	// punctuation) / "style_variant" (a spelling variant: grey/gray,
+	// colour/color, or one edit in a word of at most 4 letters). StyleOnly
+	// marks those, so a later recipe can leave them out.
+	VoteMethod string `json:"vote_method,omitempty"`
+	StyleOnly  bool   `json:"style_only,omitempty"`
+	// StyleVote is what a style_only vote heard: heard_replacement,
+	// heard_original or neither.
+	StyleVote string `json:"style_vote,omitempty"`
 }
 
 // Vote decides what the pilot heard at f's span:
 //
-//  1. Locate the span (patch.Locate: the judge's rune offset if it holds,
-//     else the occurrence, else a unique match — never the raw offset alone)
-//     in the chunk's pristine text, verified against the recorded chunk hash.
+//  1. Locate the span in the chunk's pristine text, verified against the
+//     recorded chunk hash: at the judge's rune offset if the text is there,
+//     else the single occurrence of original_text — several occurrences and
+//     a wrong offset are unmappable, never guessed.
 //  2. Map it to production words: the chunk is whole segments joined by one
 //     space, so the span's rune range picks segments, then fields within them.
 //  3. Take the span's time window [t0, t1] from those words.
@@ -153,8 +174,13 @@ type Detail struct {
 //     word times the segments overlapping the window. Align those pilot
 //     tokens with the production tokens of the same range; the pilot tokens
 //     between the agreed words either side of the span are what it heard.
-//  5. Compare normalised (or, for a case/punctuation-only correction and a
-//     cased pilot, case-sensitively) with the original and the replacement.
+//  5. Compare the span's whole words, as production wrote them and with the
+//     correction substituted, normalised (or, for a case/punctuation-only
+//     correction and a cased pilot, case-sensitively) with what was heard.
+//  6. Cap: a heard_* vote with no agreed word on either side, or on
+//     interpolated production times, is recorded as neither.
+//  7. A style-only correction's vote is recorded as style_only (what was
+//     heard in detail.style_vote).
 //
 // Anything that cannot be placed in time is VoteUnmappable with a reason.
 func Vote(tr *Track, f Finding, p *Pilot) Result {
@@ -169,21 +195,13 @@ func Vote(tr *Track, f Finding, p *Pilot) Result {
 	if f.ChunkSHA256 != "" && patch.ChunkHash(f.ChunkText) != f.ChunkSHA256 {
 		return unmappable("chunk_changed")
 	}
-	span, err := patch.Locate(f.ChunkText, patch.Anchor{
-		OriginalText: f.OriginalText, Offset: f.AnchorOffset, Occurrence: f.AnchorOccurrence,
-	})
-	if err != nil {
-		if errors.Is(err, patch.ErrAnchorAmbiguous) {
-			return unmappable("anchor_ambiguous")
-		}
-		return unmappable("anchor_not_found")
+	span, anchor, reason := locateSpan(f.ChunkText, f.OriginalText, f.AnchorOffset)
+	if reason != "" {
+		return unmappable(reason)
 	}
-	res.Detail.Anchor = "recovered"
-	if span.Start == f.AnchorOffset {
-		res.Detail.Anchor = "offset"
-	}
+	res.Detail.Anchor = anchor
 
-	first, last, reason := tr.spanTokens(f, span)
+	first, last, wordStart, wordEnd, reason := tr.spanTokens(f, span)
 	if reason != "" {
 		return unmappable(reason)
 	}
@@ -201,24 +219,78 @@ func Vote(tr *Track, f Finding, p *Pilot) Result {
 			break
 		}
 	}
+	// Compare whole words: a span inside a word ("grey" in "greyish") is
+	// heard as the whole word.
+	runes := []rune(f.ChunkText)
+	original := string(runes[wordStart:wordEnd])
+	replacement := string(runes[wordStart:span.Start]) + f.Replacement + string(runes[span.End:wordEnd])
+	if wordStart != span.Start || wordEnd != span.End {
+		res.Detail.SpanReplaced = replacement
+	}
 
 	heard, reason := p.heard(toks, first, last, t0, t1, &res.Detail)
 	if reason != "" {
 		return unmappable(reason)
 	}
 	res.HeardText = rawText(heard)
-	res.Vote = decideVote(heard, f.OriginalText, f.Replacement, p.Cased, &res.Detail)
-	if res.Vote == VoteUnmappable && res.Detail.Reason == "" {
-		res.Detail.Reason = "unmappable"
+	res.Vote = decideVote(heard, original, replacement, p.Cased, &res.Detail)
+	if res.Vote == VoteHeardReplacement || res.Vote == VoteHeardOriginal {
+		capReason := ""
+		switch {
+		case res.Detail.Anchored == "none":
+			capReason = "capped_no_anchor"
+		case res.Detail.ProdTimes == "interpolated":
+			capReason = "capped_interpolated_times"
+		}
+		if capReason != "" {
+			res.Detail.UncappedVote, res.Vote, res.Detail.Reason = res.Vote, VoteNeither, capReason
+		}
+	}
+	if res.Detail.StyleOnly && res.Vote != VoteUnmappable {
+		res.Detail.StyleVote, res.Vote = res.Vote, VoteStyleOnly
 	}
 	return res
 }
 
+// locateSpan places original_text in the chunk (runes): at offset when it is
+// there ("offset"), else at its only occurrence ("unique"). Several
+// occurrences with a wrong or unknown offset are anchor_ambiguous; none is
+// anchor_not_found. Matches may overlap — "aa" occurs twice in "aaa" — so an
+// overlapping repeat is ambiguous too.
+func locateSpan(chunk, original string, offset int) (patch.Span, string, string) {
+	runes, target := []rune(chunk), []rune(original)
+	n := len(target)
+	if n == 0 {
+		return patch.Span{}, "", "anchor_not_found"
+	}
+	if offset >= 0 && offset+n <= len(runes) && string(runes[offset:offset+n]) == original {
+		return patch.Span{Start: offset, End: offset + n}, "offset", ""
+	}
+	at, count := -1, 0
+	for i := 0; i+n <= len(runes); i++ {
+		if string(runes[i:i+n]) == original {
+			if at < 0 {
+				at = i
+			}
+			count++
+		}
+	}
+	switch count {
+	case 0:
+		return patch.Span{}, "", "anchor_not_found"
+	case 1:
+		return patch.Span{Start: at, End: at + n}, "unique", ""
+	default:
+		return patch.Span{}, "", "anchor_ambiguous"
+	}
+}
+
 // spanTokens maps a rune span of the chunk to the indices of the production
-// tokens it touches, the way decide's segmentContext maps it to segments: the
-// segments from the first one starting at the chunk's start_sec, joined by one
-// space, must reproduce the chunk text exactly.
-func (tr *Track) spanTokens(f Finding, span patch.Span) (first, last int, reason string) {
+// tokens it touches, and the chunk rune range of those whole words, the way
+// decide's segmentContext maps it to segments: the segments from the first
+// one starting at the chunk's start_sec, joined by one space, must reproduce
+// the chunk text exactly.
+func (tr *Track) spanTokens(f Finding, span patch.Span) (first, last, wordStart, wordEnd int, reason string) {
 	segs := tr.Segments
 	lo := -1
 	for i, s := range segs {
@@ -228,7 +300,7 @@ func (tr *Track) spanTokens(f Finding, span patch.Span) (first, last int, reason
 		}
 	}
 	if lo < 0 {
-		return 0, 0, "chunk_not_in_segments"
+		return 0, 0, 0, 0, "chunk_not_in_segments"
 	}
 	runes := []rune(f.ChunkText)
 	var b strings.Builder
@@ -244,7 +316,7 @@ func (tr *Track) spanTokens(f Finding, span patch.Span) (first, last int, reason
 		b.WriteString(segs[hi].Text)
 	}
 	if n != len(runes) || b.String() != f.ChunkText {
-		return 0, 0, "segments_do_not_reproduce_chunk"
+		return 0, 0, 0, 0, "segments_do_not_reproduce_chunk"
 	}
 	first, last = -1, -1
 	for si := lo; si < hi; si++ {
@@ -253,16 +325,16 @@ func (tr *Track) spanTokens(f Finding, span patch.Span) (first, last int, reason
 			t := tr.Tokens[i]
 			if base+t.RuneStart < span.End && base+t.RuneEnd > span.Start {
 				if first < 0 {
-					first = i
+					first, wordStart = i, min(base+t.RuneStart, span.Start)
 				}
-				last = i
+				last, wordEnd = i, max(base+t.RuneEnd, span.End)
 			}
 		}
 	}
 	if first < 0 {
-		return 0, 0, "span_has_no_words"
+		return 0, 0, 0, 0, "span_has_no_words"
 	}
-	return first, last, ""
+	return first, last, wordStart, wordEnd, ""
 }
 
 // heard returns the pilot tokens heard at production tokens [first, last]
@@ -422,13 +494,14 @@ func alignedDetail(cols []Pair, a, b []Token) [][2]string {
 // decideVote compares what was heard with the two readings.
 func decideVote(heard []Token, original, replacement string, cased bool, d *Detail) string {
 	no, nr := Normalize(original), Normalize(replacement)
+	d.VoteMethod = "normalized"
 	if no == nr {
 		// A case/punctuation-only correction: normalising erases it.
+		d.StyleOnly, d.VoteMethod = true, "style_case_sensitive"
 		if !cased {
 			d.Reason = "case_only_uncased_pilot"
 			return VoteUnmappable
 		}
-		d.CaseSensitive = true
 		h := rawText(heard)
 		form := keepCase
 		if keepCase(original) == keepCase(replacement) {
@@ -446,6 +519,9 @@ func decideVote(heard []Token, original, replacement string, cased bool, d *Deta
 			d.Reason = "heard_other"
 			return VoteNeither
 		}
+	}
+	if spellingVariant(no, nr) {
+		d.StyleOnly, d.VoteMethod = true, "style_variant"
 	}
 
 	hn := strings.Join(norms(heard), " ")
@@ -482,6 +558,52 @@ func decideVote(heard []Token, original, replacement string, cased bool, d *Deta
 		d.Reason = "heard_other"
 	}
 	return VoteNeither
+}
+
+// spellingVariant reports whether two normalised texts differ only by
+// spelling variants, word for word: a listed variant pair (grey/gray), a
+// British/American suffix (colour/color, realise/realize, centre/center,
+// travelled/traveled, defence/defense, catalogue/catalog), or one edit in
+// words of at most 4 letters. At least one word must differ.
+func spellingVariant(a, b string) bool {
+	wa, wb := strings.Fields(a), strings.Fields(b)
+	if len(wa) != len(wb) || a == b {
+		return false
+	}
+	for i := range wa {
+		if wa[i] != wb[i] && !wordVariant(wa[i], wb[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+var variantWords = map[[2]string]bool{
+	{"grey", "gray"}: true, {"greys", "grays"}: true, {"greyer", "grayer"}: true, {"greyish", "grayish"}: true,
+	{"mould", "mold"}: true, {"plough", "plow"}: true, {"programme", "program"}: true, {"tyre", "tire"}: true,
+}
+
+var variantSuffixes = [][2]string{
+	{"our", "or"}, {"ours", "ors"}, {"ise", "ize"}, {"ised", "ized"}, {"ising", "izing"}, {"isation", "ization"},
+	{"yse", "yze"}, {"re", "er"}, {"res", "ers"}, {"lled", "led"}, {"lling", "ling"}, {"ller", "ler"},
+	{"ence", "ense"}, {"ogue", "og"},
+}
+
+func wordVariant(x, y string) bool {
+	if variantWords[[2]string{x, y}] || variantWords[[2]string{y, x}] {
+		return true
+	}
+	for _, sf := range variantSuffixes {
+		for _, pair := range [][2]string{{x, y}, {y, x}} {
+			sx, okx := strings.CutSuffix(pair[0], sf[0])
+			sy, oky := strings.CutSuffix(pair[1], sf[1])
+			if okx && oky && sx == sy && len([]rune(sx)) >= 2 {
+				return true
+			}
+		}
+	}
+	rx, ry := []rune(x), []rune(y)
+	return len(rx) <= 4 && len(ry) <= 4 && levenshtein(rx, ry) == 1
 }
 
 func compact(s string) string { return strings.ReplaceAll(s, " ", "") }

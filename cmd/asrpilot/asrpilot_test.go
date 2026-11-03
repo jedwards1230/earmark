@@ -129,9 +129,9 @@ func pseg(start float64, text string) db.PilotSegment {
 const tid = "11111111-1111-1111-1111-111111111111"
 
 // newFake: one track with two segments, 150 held findings on its second
-// segment's "dorian grey" (enough for two pages), one granite pilot.
+// segment's "dorian gravy" (enough for two pages), one granite pilot.
 func newFake() *fakeStore {
-	segs := []db.Segment{seg(0, 0, "it was a dark night"), seg(1, 3, "the portrait of dorian grey hung there")}
+	segs := []db.Segment{seg(0, 0, "it was a dark night"), seg(1, 3, "the portrait of dorian gravy hung there")}
 	chunk := segs[0].Text + " " + segs[1].Text
 	f := &fakeStore{
 		dirs: map[string]string{"B075VF1R27": "/books/Wilde/Dorian Gray"},
@@ -146,7 +146,7 @@ func newFake() *fakeStore {
 	}
 	for i := range 150 {
 		f.held[tid] = append(f.held[tid], db.HeldFinding{
-			ID: fmt.Sprintf("%08d-0000-0000-0000-000000000000", i+1), OriginalText: "dorian grey", SuggestedCorrection: "dorian gray",
+			ID: fmt.Sprintf("%08d-0000-0000-0000-000000000000", i+1), OriginalText: "dorian gravy", SuggestedCorrection: "dorian gray",
 			AnchorOffset: 7, AnchorOccurrence: -1, // wrong on purpose: Locate recovers it
 			ChunkTextSHA256: patch.ChunkHash(chunk), ChunkFound: true, ChunkText: chunk,
 		})
@@ -164,7 +164,7 @@ func TestVoteDryRunWritesNothing(t *testing.T) {
 		t.Fatalf("dry run wrote %d batches", len(f.upserts))
 	}
 	s := out.String()
-	for _, want := range []string{"DRY RUN", "held findings 150", "heard_replacement  150", "recovered (offset wrong) 150"} {
+	for _, want := range []string{"DRY RUN", "held findings 150", "heard_replacement  150", "unique match (offset wrong) 150"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("output lacks %q:\n%s", want, s)
 		}
@@ -192,7 +192,7 @@ func TestVoteYesUpsertsPages(t *testing.T) {
 		t.Errorf("vote row %+v", v)
 	}
 	var d map[string]any
-	if err := json.Unmarshal(v.Detail, &d); err != nil || d["rule"] != "asr_vote@v1" || d["anchor"] != "recovered" {
+	if err := json.Unmarshal(v.Detail, &d); err != nil || d["rule"] != "asr_vote@v1" || d["anchor"] != "unique" {
 		t.Errorf("detail %s (%v)", v.Detail, err)
 	}
 	if !strings.Contains(out.String(), "wrote 150 vote(s)") {
@@ -256,11 +256,21 @@ func TestReport(t *testing.T) {
 	f.pilots = append(f.pilots, db.PilotTranscript{ID: 2, FilePath: "/books/Wilde/Dorian Gray/01.m4b",
 		ProductionTranscriptID: tid, Backend: "canary", ModelID: "canary", ModelRevision: "r9",
 		Scope: db.PilotScopeFindings, AudioSec: fp(3.5), WallSec: fp(1)})
+	// A Granite findings-scope transcript of the same window: the only
+	// like-scope pair (granite full vs canary findings is never compared).
+	f.pilots = append(f.pilots, db.PilotTranscript{ID: 3, FilePath: "/books/Wilde/Dorian Gray/01.m4b",
+		ProductionTranscriptID: tid, Backend: "granite", ModelID: "granite", ModelRevision: "r1",
+		Scope: db.PilotScopeFindings, HasWordTimes: true, AudioSec: fp(3.5), WallSec: fp(0.25)})
+	f.pSegs[3] = []db.PilotSegment{pseg(3, "The portrait of Dorian Gray hung there.")}
+	// A pilot with no segments is counted nowhere.
+	f.pilots = append(f.pilots, db.PilotTranscript{ID: 4, FilePath: "/books/Wilde/Dorian Gray/02.m4b",
+		ProductionTranscriptID: tid, ModelID: "granite", ModelRevision: "r1", Scope: db.PilotScopeFull})
 	f.pSegs[2] = []db.PilotSegment{{Start: 3, End: 6.5, Text: "The portrait of Dorian Gray hung there.",
 		Words: []db.PilotWord{{Word: "The"}, {Word: "portrait"}, {Word: "of"}, {Word: "Dorian"}, {Word: "Gray"}, {Word: "hung"}, {Word: "there."}}}}
 	f.counts = []db.PilotVoteCount{
 		{ModelID: "granite", ModelRevision: "r1", Vote: "heard_replacement", N: 3},
 		{ModelID: "granite", ModelRevision: "r1", Vote: "neither", N: 1},
+		{ModelID: "granite", ModelRevision: "r1", Vote: "style_only", StyleVote: "heard_replacement", N: 2},
 	}
 	f.pairs = []db.PilotVotePair{{ModelA: "canary", RevisionA: "r9", VoteA: "heard_replacement",
 		ModelB: "granite", RevisionB: "r1", VoteB: "heard_replacement", N: 2}}
@@ -273,20 +283,27 @@ func TestReport(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Models) != 2 {
+	if len(r.Models) != 3 {
 		t.Fatalf("models %+v", r.Models)
 	}
-	c, g := r.Models[0], r.Models[1]
+	c, g := r.Models[0], r.Models[2] // sorted: canary, granite|findings, granite|full
+	if gf := r.Models[1]; gf.Scope != db.PilotScopeFindings || gf.Tracks != 1 {
+		t.Errorf("granite findings row %+v", gf)
+	}
+	if r.Skipped.NoPilotSegments != 1 || g.Tracks != 1 {
+		t.Errorf("a pilot without segments must be counted nowhere: skipped %+v, granite tracks %d", r.Skipped, g.Tracks)
+	}
 	if c.Model != "canary@r9" || c.WERScope != "covered_windows_only" || c.RefWords != 7 || c.Errors != 1 || c.CoveredHours*3600 != 3.5 {
 		t.Errorf("canary row %+v", c)
 	}
 	if g.Model != "granite@r1" || g.WERScope != "full" || g.RefWords != 12 || g.Errors != 1 || g.RTFx != 14 || g.CasingRate == 0 {
 		t.Errorf("granite row %+v", g)
 	}
-	if len(r.Cross) != 1 || r.Cross[0].WERScope != "covered_windows_only" || r.Cross[0].Errors != 0 || r.Cross[0].RefWords != 7 {
+	if len(r.Cross) != 1 || r.Cross[0].Scope != db.PilotScopeFindings || r.Cross[0].WERScope != "covered_windows_only" ||
+		r.Cross[0].Errors != 0 || r.Cross[0].RefWords != 7 || r.Cross[0].Tracks != 1 {
 		t.Errorf("cross %+v", r.Cross)
 	}
-	if len(r.Votes) != 1 || r.Votes[0].Voted != 4 || r.Votes[0].Resolved != 3 {
+	if len(r.Votes) != 1 || r.Votes[0].Voted != 6 || r.Votes[0].Resolved != 3 || r.Votes[0].ResolvedWithStyle != 5 || r.Votes[0].StyleOnly != 2 {
 		t.Errorf("votes %+v", r.Votes)
 	}
 	if len(r.Agreement) != 1 || r.Agreement[0].AgreementRate != 1 {
@@ -300,7 +317,7 @@ func TestReport(t *testing.T) {
 	if err := runReport(context.Background(), &out, f, reportOptions{format: "text"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"covered windows only", "granite@r1", "Two-model vote agreement", "not ground truth"} {
+	for _, want := range []string{"covered windows only", "granite@r1", "Two-model vote agreement", "not ground truth", "numerals spelt out", "Still-held", "RESOLVED (with style)"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("text report lacks %q:\n%s", want, out.String())
 		}

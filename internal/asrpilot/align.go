@@ -1,83 +1,130 @@
 package asrpilot
 
-// Pair is one column of a global alignment of two token sequences: A and B
-// index the two sequences, -1 for a gap on that side.
+// Pair is one column of an alignment of two token sequences: A and B index
+// the two sequences, -1 for a gap on that side.
 type Pair struct{ A, B int }
 
-// Alignment scores (Needleman-Wunsch). An exact match is worth more than a
-// gap pair, so two agreeing words are always aligned with each other; a
-// near match (similarity ≥ nearMatchSim, e.g. "colour"/"color") is preferred
-// to a plain substitution but is never an anchor.
+// Alignment bounds. Both pilot models emit window-level text (no word
+// times), and a Granite window is up to 540 s — ~1500 words a side — so the
+// alignment is a Myers O((N+M)·D) diff, D the number of differing tokens,
+// not an N·M table. Its trace keeps O(D²) ints.
 const (
-	scoreMatch    = 3
-	scoreNear     = 1
-	scoreMismatch = -1
-	scoreGap      = -2
-	nearMatchSim  = 0.8
+	// MaxAlignTokens caps each side; a window past it is unmappable.
+	MaxAlignTokens = 5000
+	// MaxAlignEdits caps D: two texts that differ in more tokens than this
+	// share too little to anchor a span (unmappable, ~18 MB of trace at the
+	// cap).
+	MaxAlignEdits = 1500
 )
 
-// MaxAlignTokens caps each side of Align; the vote's windows are a few
-// seconds to ~40 s of speech, far below it.
-const MaxAlignTokens = 2000
-
-// Align globally aligns a and b (Needleman-Wunsch, linear gap cost) and
-// returns the alignment columns in order. Ties prefer a diagonal step, then a
-// gap in b, so the result is deterministic. Each side is capped at
-// MaxAlignTokens (callers check; Align returns nil past it).
+// Align aligns a and b: the exact matches of a shortest edit script
+// (Myers' diff, i.e. a longest common subsequence), with each unmatched run
+// between two matches paired position by position as substitutions and the
+// longer side's remainder as gaps (before the substitutions in the leading
+// run, after them elsewhere). Columns come in order. nil when either
+// side exceeds MaxAlignTokens or the texts differ in more than
+// MaxAlignEdits tokens.
 func Align(a, b []string) []Pair {
-	n, m := len(a), len(b)
-	if n > MaxAlignTokens || m > MaxAlignTokens {
+	if len(a) > MaxAlignTokens || len(b) > MaxAlignTokens {
 		return nil
 	}
-	w := m + 1
-	score := make([]int, (n+1)*w)
-	for i := 1; i <= n; i++ {
-		score[i*w] = i * scoreGap
+	matches, ok := diffMatches(a, b, MaxAlignEdits)
+	if !ok {
+		return nil
 	}
-	for j := 1; j <= m; j++ {
-		score[j] = j * scoreGap
-	}
-	for i := 1; i <= n; i++ {
-		for j := 1; j <= m; j++ {
-			best := score[(i-1)*w+j-1] + pairScore(a[i-1], b[j-1])
-			if s := score[(i-1)*w+j] + scoreGap; s > best {
-				best = s
+	out := make([]Pair, 0, max(len(a), len(b)))
+	pi, pj := 0, 0
+	gapRun := func(i1, j1 int) {
+		if pi == 0 && pj == 0 {
+			// The leading run has no match on its left: align it to the
+			// right, so its tokens sit next to the first agreed word.
+			for d := (i1 - pi) - (j1 - pj); d > 0; d-- {
+				out = append(out, Pair{pi, -1})
+				pi++
 			}
-			if s := score[i*w+j-1] + scoreGap; s > best {
-				best = s
+			for d := (j1 - pj) - (i1 - pi); d > 0; d-- {
+				out = append(out, Pair{-1, pj})
+				pj++
 			}
-			score[i*w+j] = best
+		}
+		for ; pi < i1 && pj < j1; pi, pj = pi+1, pj+1 {
+			out = append(out, Pair{pi, pj})
+		}
+		for ; pi < i1; pi++ {
+			out = append(out, Pair{pi, -1})
+		}
+		for ; pj < j1; pj++ {
+			out = append(out, Pair{-1, pj})
 		}
 	}
-	out := make([]Pair, 0, n+m)
-	for i, j := n, m; i > 0 || j > 0; {
-		switch {
-		case i > 0 && j > 0 && score[i*w+j] == score[(i-1)*w+j-1]+pairScore(a[i-1], b[j-1]):
-			out = append(out, Pair{i - 1, j - 1})
-			i, j = i-1, j-1
-		case i > 0 && score[i*w+j] == score[(i-1)*w+j]+scoreGap:
-			out = append(out, Pair{i - 1, -1})
-			i--
-		default:
-			out = append(out, Pair{-1, j - 1})
-			j--
-		}
+	for _, mt := range matches {
+		gapRun(mt[0], mt[1])
+		out = append(out, Pair{mt[0], mt[1]})
+		pi, pj = mt[0]+1, mt[1]+1
 	}
-	for l, r := 0, len(out)-1; l < r; l, r = l+1, r-1 {
-		out[l], out[r] = out[r], out[l]
-	}
+	gapRun(len(a), len(b))
 	return out
 }
 
-func pairScore(x, y string) int {
-	switch {
-	case x == y:
-		return scoreMatch
-	case Similarity(x, y) >= nearMatchSim:
-		return scoreNear
-	default:
-		return scoreMismatch
+// diffMatches returns the matched (i, j) pairs of a shortest edit script
+// from a to b (Myers 1986, greedy forward pass with a trace), ascending. ok is
+// false when more than maxD edits are needed.
+func diffMatches(a, b []string, maxD int) (matches [][2]int, ok bool) {
+	n, m := len(a), len(b)
+	maxD = min(maxD, n+m)
+	off := maxD + 1
+	v := make([]int, 2*maxD+3) // v[off+k]: furthest x on diagonal k
+	var trace [][]int          // trace[d]: v[-d..d] before step d
+	found := -1
+	for d := 0; d <= maxD && found < 0; d++ {
+		trace = append(trace, append([]int(nil), v[off-d:off+d+1]...))
+		for k := -d; k <= d; k += 2 {
+			var x int
+			if k == -d || (k != d && v[off+k-1] < v[off+k+1]) {
+				x = v[off+k+1]
+			} else {
+				x = v[off+k-1] + 1
+			}
+			y := x - k
+			for x < n && y < m && a[x] == b[y] {
+				x, y = x+1, y+1
+			}
+			v[off+k] = x
+			if x >= n && y >= m {
+				found = d
+				break
+			}
+		}
 	}
+	if found < 0 {
+		return nil, false
+	}
+	x, y := n, m
+	for d := found; d > 0; d-- {
+		prev := trace[d] // v of step d-1, indexed k+d
+		k := x - y
+		var pk int
+		if k == -d || (k != d && prev[k-1+d] < prev[k+1+d]) {
+			pk = k + 1
+		} else {
+			pk = k - 1
+		}
+		px := prev[pk+d]
+		py := px - pk
+		for x > px && y > py {
+			x, y = x-1, y-1
+			matches = append(matches, [2]int{x, y})
+		}
+		x, y = px, py
+	}
+	for x > 0 && y > 0 { // d = 0: the common prefix
+		x, y = x-1, y-1
+		matches = append(matches, [2]int{x, y})
+	}
+	for l, r := 0, len(matches)-1; l < r; l, r = l+1, r-1 {
+		matches[l], matches[r] = matches[r], matches[l]
+	}
+	return matches, true
 }
 
 // Similarity is 1 − Levenshtein(a, b) / max(len(a), len(b)) over runes; 1 for
@@ -91,12 +138,23 @@ func Similarity(a, b string) float64 {
 	return 1 - float64(levenshtein(ra, rb))/float64(mx)
 }
 
+// levBuf is reusable row storage for levenshteinBuf.
+type levBuf struct{ prev, cur []int }
+
 func levenshtein[T comparable](a, b []T) int {
+	return levenshteinBuf(a, b, &levBuf{})
+}
+
+// levenshteinBuf is the edit distance of a and b in two rows, kept in buf
+// across calls.
+func levenshteinBuf[T comparable](a, b []T, buf *levBuf) int {
 	if len(a) < len(b) {
 		a, b = b, a
 	}
-	prev := make([]int, len(b)+1)
-	cur := make([]int, len(b)+1)
+	if cap(buf.prev) < len(b)+1 {
+		buf.prev, buf.cur = make([]int, len(b)+1), make([]int, len(b)+1)
+	}
+	prev, cur := buf.prev[:len(b)+1], buf.cur[:len(b)+1]
 	for j := range prev {
 		prev[j] = j
 	}

@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/phonetic"
 )
 
 // Token is one comparison word of a transcript, normalised, with its time.
@@ -39,27 +40,157 @@ type Token struct {
 // Mid is the token's time midpoint.
 func (t Token) Mid() float64 { return (t.Start + t.End) / 2 }
 
-// Normalize lowercases s, turns dashes and slashes into spaces, drops every
-// other punctuation and symbol rune, and collapses whitespace. The result is
-// the space-joined comparison form ("Dorian's well-known" → "dorians well
-// known").
+// Normalize is the comparison form of s, space-joined: lowercase; dashes
+// and slashes split words; numerals spelt out (integers as cardinals, years
+// 1100–1999 and 2010–2099 paired, "3.5" → "three point five", "1,000" →
+// "one thousand", "21st" → "twenty first"); the titles mr/mister, mrs/missus,
+// dr/doctor and st/saint folded to one form; every other punctuation and
+// symbol rune dropped ("Dorian's" → "dorians"). Spoken ASR output writes
+// numbers as words and an ITN model writes digits, so without this every
+// number would count as an error. What it does not reconcile — currency and
+// percent signs, roman numerals, "and" inside spoken numbers, other
+// abbreviations — still counts (NormalizationCaveat).
 func Normalize(s string) string {
 	return strings.Join(normFields(s), " ")
 }
 
+// NormalizationCaveat is printed with every WER the report shows.
+const NormalizationCaveat = "normalised: lowercase, punctuation dropped, numerals spelt out (years paired), " +
+	"mr/mrs/dr/st folded; still counted as errors: currency/percent signs, roman numerals, " +
+	`"and" inside spoken numbers, other abbreviations`
+
 func normFields(s string) []string {
+	var out []string
+	for _, field := range strings.FieldsFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || r == '-' || r == '/' || unicode.Is(unicode.Pd, r)
+	}) {
+		out = append(out, normWord(field)...)
+	}
+	return out
+}
+
+func isPunctOrSymbol(r rune) bool { return unicode.IsPunct(r) || unicode.IsSymbol(r) }
+
+// normWord normalises one dash-free field into zero or more words.
+func normWord(field string) []string {
+	w := strings.ToLower(strings.TrimFunc(field, isPunctOrSymbol))
+	if n := numberWords(w); n != "" {
+		return strings.Fields(n)
+	}
 	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case unicode.IsSpace(r), r == '-', r == '/', unicode.Is(unicode.Pd, r):
-			b.WriteByte(' ')
-		case unicode.IsPunct(r), unicode.IsSymbol(r):
-			// dropped: "don't" → "dont", "Mr." → "mr"
-		default:
-			b.WriteRune(unicode.ToLower(r))
+	for _, r := range w {
+		if !isPunctOrSymbol(r) {
+			b.WriteRune(r)
 		}
 	}
-	return strings.Fields(b.String())
+	w = b.String()
+	if w == "" {
+		return nil
+	}
+	if c, ok := titles[w]; ok {
+		w = c
+	}
+	return []string{w}
+}
+
+// titles folds a spoken title and its abbreviation to one form.
+var titles = map[string]string{
+	"mister": "mr", "missus": "mrs", "missis": "mrs", "doctor": "dr", "saint": "st",
+}
+
+// numberWords spells a numeral token ("1984", "3.5", "1,000", "21st"); ""
+// when w is not one.
+func numberWords(w string) string {
+	if w == "" || w[0] < '0' || w[0] > '9' {
+		return ""
+	}
+	for _, suf := range []string{"st", "nd", "rd", "th"} {
+		if d, ok := strings.CutSuffix(w, suf); ok && allDigits(d) {
+			return ordinal(phonetic.NumberWords(d))
+		}
+	}
+	if allDigits(strings.ReplaceAll(w, ",", "")) && thousandsGrouped(w) {
+		return integerWords(strings.ReplaceAll(w, ",", ""))
+	}
+	if i, f, ok := strings.Cut(w, "."); ok && allDigits(i) && allDigits(f) && f != "" {
+		parts := []string{integerWords(i), "point"}
+		for _, c := range f {
+			parts = append(parts, phonetic.NumberWords(string(c)))
+		}
+		return strings.Join(parts, " ")
+	}
+	return ""
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// thousandsGrouped: no commas, or commas every three digits ("1,000").
+func thousandsGrouped(w string) bool {
+	if !strings.Contains(w, ",") {
+		return true
+	}
+	groups := strings.Split(w, ",")
+	if len(groups[0]) < 1 || len(groups[0]) > 3 {
+		return false
+	}
+	for _, g := range groups[1:] {
+		if len(g) != 3 {
+			return false
+		}
+	}
+	return true
+}
+
+// integerWords reads an integer as a cardinal, except four-digit years,
+// which are read in pairs ("1984" → "nineteen eighty four", "1900" →
+// "nineteen hundred", "1905" → "nineteen oh five").
+func integerWords(d string) string {
+	if len(d) == 4 && d[0] != '0' {
+		hi, lo := d[:2], d[2:]
+		if (hi >= "11" && hi <= "19") || (hi == "20" && lo >= "10") {
+			switch {
+			case lo == "00":
+				return phonetic.NumberWords(hi) + " hundred"
+			case lo[0] == '0':
+				return phonetic.NumberWords(hi) + " oh " + phonetic.NumberWords(lo[1:])
+			default:
+				return phonetic.NumberWords(hi) + " " + phonetic.NumberWords(lo)
+			}
+		}
+	}
+	return phonetic.NumberWords(d)
+}
+
+// ordinal turns a cardinal's last word into its ordinal ("twenty one" →
+// "twenty first").
+func ordinal(cardinal string) string {
+	if cardinal == "" {
+		return ""
+	}
+	words := strings.Fields(cardinal)
+	last := words[len(words)-1]
+	irregular := map[string]string{"one": "first", "two": "second", "three": "third", "five": "fifth",
+		"eight": "eighth", "nine": "ninth", "twelve": "twelfth"}
+	switch {
+	case irregular[last] != "":
+		last = irregular[last]
+	case strings.HasSuffix(last, "y"):
+		last = strings.TrimSuffix(last, "y") + "ieth"
+	default:
+		last += "th"
+	}
+	words[len(words)-1] = last
+	return strings.Join(words, " ")
 }
 
 // fieldSpan is one whitespace-separated field of a text with its rune range.

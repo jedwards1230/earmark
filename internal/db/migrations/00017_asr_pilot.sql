@@ -19,16 +19,23 @@
 --     its words then carry no start/end.
 --   * finding_asr_votes — one row per (finding, pilot transcript), written by
 --     `earmark asr-pilot vote --yes` (upsert): heard_replacement /
---     heard_original / neither, or unmappable when the span could not be
---     placed in time. chunk_text_sha256 is the chunk revision the vote was
+--     heard_original / neither, unmappable when the span could not be
+--     placed in time, or style_only for a correction that changes only case,
+--     punctuation or a spelling variant (what was heard is in
+--     detail.style_vote; it is never counted as agreement on the word). chunk_text_sha256 is the chunk revision the vote was
 --     made against. Nothing reads it in decide; it is evidence for a later,
 --     versioned decide recipe. finding_events is untouched.
 --
 -- Locks. Two new tables; each foreign key takes SHARE ROW EXCLUSIVE on the
 -- table it references (blocking its writers, not its readers, for the
--- length of the migration). Both are taken up front, transcript_findings
--- first — the order a requeue takes them (findings, then the transcript) —
--- under a 5s lock timeout. No ALTER, no rewrite, no backfill.
+-- length of the migration). Both are taken up front under a 5s lock
+-- timeout, transcript_findings first. A requeue row-locks its transcripts
+-- (FOR UPDATE: ROW SHARE, which SHARE ROW EXCLUSIVE does not conflict
+-- with), then writes transcript_findings, then deletes the transcripts. Taken
+-- in this order, a requeue that is under way only makes the migration wait
+-- at its first lock (or the requeue wait at its findings write) — never
+-- each holding what the other needs, as transcripts-first would against the
+-- requeue's DELETE. No ALTER, no rewrite, no backfill.
 
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
@@ -69,7 +76,7 @@ CREATE TABLE finding_asr_votes (
     span_end_sec        REAL,
     vote                TEXT        NOT NULL
                         CONSTRAINT finding_asr_votes_vote_valid
-                        CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable')),
+                        CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable', 'style_only')),
     heard_text          TEXT,
     detail              JSONB       NOT NULL DEFAULT '{}'
                         CONSTRAINT finding_asr_votes_detail_object CHECK (jsonb_typeof(detail) = 'object'),

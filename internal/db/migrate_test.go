@@ -610,7 +610,7 @@ func TestASRPilotMigration(t *testing.T) {
 		"CREATE TABLE finding_asr_votes",
 		"finding_id UUID NOT NULL REFERENCES transcript_findings (id) ON DELETE CASCADE",
 		"pilot_transcript_id BIGINT NOT NULL REFERENCES pilot_transcripts (id) ON DELETE CASCADE",
-		"CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable'))",
+		"CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable', 'style_only'))",
 		"UNIQUE (finding_id, pilot_transcript_id)",
 		"CREATE INDEX finding_asr_votes_pilot_idx ON finding_asr_votes (pilot_transcript_id)",
 		"CREATE INDEX pilot_transcripts_production_idx ON pilot_transcripts (production_transcript_id)",
