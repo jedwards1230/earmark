@@ -322,6 +322,8 @@ def load_config(
         raise ConfigError(
             f"--repetition-penalty must be > 0: {args.repetition_penalty}"
         )
+    if args.self_check and (args.dry_run or args.bench):
+        raise ConfigError("--self-check cannot be combined with --dry-run or --bench")
     if args.bench and args.dry_run:
         raise ConfigError("--bench and --dry-run are exclusive")
     bench_batches = (
@@ -732,6 +734,7 @@ def decode_audio(
             assert proc.stdout is not None
             while True:
                 if filled == len(buf):  # longer than expected: grow by 1 s
+                    view.release()  # a bytearray cannot resize while exported
                     buf.extend(bytes(SAMPLE_RATE * 4))
                     view = memoryview(buf)
                 n = proc.stdout.readinto(view[filled:])
@@ -1142,11 +1145,15 @@ class GraniteBackend(Backend):
         self, audios: Sequence[Any]
     ) -> list[WindowResult]:  # pragma: no cover
         torch = self.torch
-        rows, lens = pad_audios(audios)
-        wavs = torch.stack([torch.from_numpy(r) for r in rows])
+        # Pass the windows UNPADDED as a list: the feature extractor pads them
+        # itself and derives per-row audio_embed_sizes + input_features_mask
+        # from each row's real length (transformers 5.22.1,
+        # GraniteSpeechFeatureExtractor._get_audios_and_audio_lengths). A
+        # pre-stacked tensor would make every row the longest one's length.
+        lens = [len(a) for a in audios]
         inputs = self.processor(
-            [self.prompt] * len(rows),
-            wavs,
+            [self.prompt] * len(audios),
+            [torch.from_numpy(a) for a in audios],
             device=self.cfg.device,
             return_tensors="pt",
             padding=True,
@@ -1392,7 +1399,7 @@ class Pipeline:
         for track in tracks:
             st: TrackState | None = None
             try:
-                plan, _ = track_plan(self.db.conn, self.cfg, track)
+                plan, _ = track_plan(self.db.ensure(), self.cfg, track)
                 if max_sec is not None:
                     plan = [w for w in plan if w[1] <= max_sec] or plan[:1]
                 if not plan:
@@ -1625,29 +1632,29 @@ def run(
         gaming()
 
     try:
-        tracks = select_tracks(db.conn, cfg)
+        tracks = select_tracks(db.ensure(), cfg)
         if cfg.bench:
             tracks = tracks[:1]
             if not tracks:
                 log.error("--bench: no track for %s", ",".join(cfg.asins))
                 return EXIT_CONFIG
+        else:
+            tracks = tracks_to_do(db.ensure(), cfg, tracks)
+            if cfg.dry_run:
+                dry_run(db.ensure(), cfg, tracks)
+                return EXIT_OK
+            if not tracks:
+                return EXIT_OK
+        try:
+            check()  # before the multi-GB model load, not only after it
             if backend is None:  # pragma: no cover - real model
                 backend = make_backend(cfg)
                 backend.load()
-            bench(db, cfg, backend, tracks[0], decode)
-            return EXIT_OK
-        todo = tracks_to_do(db.conn, cfg, tracks)
-        if cfg.dry_run:
-            dry_run(db.conn, cfg, todo)
-            return EXIT_OK
-        if not todo:
-            return EXIT_OK
-        if backend is None:  # pragma: no cover - real model
-            backend = make_backend(cfg)
-            backend.load()
-        pipe = Pipeline(db, cfg, backend, decode, check)
-        try:
-            pipe.run(todo)
+            if cfg.bench:
+                bench(db, cfg, backend, tracks[0], decode)
+                return EXIT_OK
+            pipe = Pipeline(db, cfg, backend, decode, check)
+            pipe.run(tracks)
         except GamingStop as exc:
             log.warning("stopping for gaming (%s); unfinished tracks not written", exc)
             return EXIT_GAMING

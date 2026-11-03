@@ -445,8 +445,8 @@ def test_gaming_between_batches_exits_4_and_keeps_done_tracks() -> None:
     cfg = make_cfg("canary", "--batch-size", "1", "--arbiter-url", "http://arb:48750/")
     assert cfg.arbiter_url == "http://arb:48750"
     conn = FakeConn(TRACKS, SEGMENTS)
-    # Track 1 = 4 windows: track check + chunk check + 4 batch checks; then gaming.
-    states = iter(["available"] * 6 + ["gaming"] * 10)
+    # Pre-load check, then track 1 = 4 windows: track + chunk + 4 batch checks.
+    states = iter(["available"] * 7 + ["gaming"] * 10)
 
     def check() -> None:
         pilot.check_gaming(cfg, fetch=lambda url: {"state": next(states)})
@@ -634,6 +634,9 @@ def test_bench_sweeps_batch_sizes_and_writes_nothing(
 def test_bench_and_dry_run_are_exclusive() -> None:
     with pytest.raises(pilot.ConfigError):
         make_cfg("granite", "--bench", "--dry-run")
+    for flag in ("--dry-run", "--bench"):
+        with pytest.raises(pilot.ConfigError):
+            make_cfg("granite", "--self-check", flag)
     with pytest.raises(pilot.ConfigError):
         make_cfg("granite", "--bench", "--bench-batches", "0,2")
 
@@ -653,12 +656,42 @@ def test_out_file_written_before_db_write_and_kept_on_failure() -> None:
 def test_dead_connection_is_replaced_before_the_write() -> None:
     cfg = make_cfg("canary")
     conn = FakeConn([TRACKS[1]], SEGMENTS)
-    conn.dead = True
-    fresh = FakeConn([], SEGMENTS)
-    assert run(cfg, conn, connect_fn=lambda: fresh) == 0
+    fresh = FakeConn([TRACKS[1]], SEGMENTS)
+
+    class DropAfterTranscribe(FakeBackend):
+        def transcribe_batch(self, audios: Any) -> list[Any]:
+            conn.dead = True  # the session dies while the GPU works
+            return super().transcribe_batch(audios)
+
+    assert (
+        run(cfg, conn, DropAfterTranscribe(cfg, "canary"), connect_fn=lambda: fresh)
+        == 0
+    )
     assert conn.inserts() == [] and conn.closed == 1
     assert [p[0] for p in fresh.inserts()] == ["/books/a/t2.m4b"]
-    assert fresh.closed == 1
+    assert fresh.closed == 1  # run closes a connection it opened itself
+
+
+def test_dead_connection_before_planning_is_replaced() -> None:
+    cfg = make_cfg("canary")
+    conn = FakeConn(TRACKS, SEGMENTS)
+    conn.dead = True  # dropped before the run starts reading (e.g. during model load)
+    fresh = FakeConn(TRACKS, SEGMENTS)
+    assert run(cfg, conn, connect_fn=lambda: fresh) == 0
+    assert [p[0] for p in fresh.inserts()] == ["/books/a/t1.m4b", "/books/a/t2.m4b"]
+    assert not any("FROM transcripts" in q for q, _ in conn.executed)
+
+
+def test_gaming_check_runs_before_the_model_loads() -> None:
+    cfg = make_cfg("granite")
+    conn = FakeConn(TRACKS, SEGMENTS)
+
+    def gaming() -> None:
+        raise pilot.GamingStop("state=gaming")
+
+    # backend=None would import torch and load the model; exit 4 first proves the order.
+    rc = pilot.run(cfg, conn, backend=None, decode=fake_decode, gaming_check=gaming)
+    assert rc == pilot.EXIT_GAMING and conn.writes() == []
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────

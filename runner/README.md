@@ -134,7 +134,7 @@ tokens and ran at batch 1, an estimated ~14 h for the pilot set.
   scope)`. Tracks already stored are skipped. `--force` deletes the old row and
   inserts the new one in the same transaction.
 - **Gaming check.** With `--arbiter-url`, gpu-arbiter `GET /status` is read
-  before each track, decode chunk and batch. State `gaming` or `evicting` stops
+  before the model loads and before each track, decode chunk and batch. State `gaming` or `evicting` stops
   the run with exit 4. An unreadable status is retried once after 2 s and then
   counts as gaming.
 - **Stop file.** If `PILOT_STOP_FILE` is set and that file exists, checked at the
@@ -173,7 +173,7 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `--dry-run` | Prints one JSON line per track a real run would process, after the already-done filter and `--limit-tracks`, with its window plan. It reads the DB in a read-only session. It loads no model, decodes no audio and writes nothing. |
 | `--bench` | Use with `--asin X --limit-tracks 1`. Runs the first `--bench-max-sec` of that track once per batch size in `--bench-batches`, then prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path, window_sec, max_sec, results: [{batch_size, batch_size_used, windows, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows}]}}`. No DB writes. |
 | `--out-dir` | Where each finished track's JSON goes (plan, segments, metrics, degenerate windows). The default is `PILOT_OUT_DIR`, else `<tempdir>/earmark-asr-pilot-out`. |
-| `--self-check` | Loads the model and transcribes 5 s of silence. Prints `{backend, model, revision, torch, cuda, vram, output, attn_implementation, ffmpeg, ffprobe}`. Needs no DB. |
+| `--self-check` | Loads the model and transcribes 5 s of silence. It cannot be combined with `--dry-run` or `--bench`. Prints `{backend, model, revision, torch, cuda, vram, output, attn_implementation, ffmpeg, ffprobe}`. Needs no DB. |
 
 ### Environment
 
