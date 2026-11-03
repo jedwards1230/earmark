@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/jedwards1230/earmark/cmd"
+	"github.com/jedwards1230/earmark/cmd/asrpilot"
 	"github.com/jedwards1230/earmark/cmd/audit"
 	"github.com/jedwards1230/earmark/cmd/backfill"
 	"github.com/jedwards1230/earmark/cmd/batch"
@@ -43,6 +44,7 @@ func main() {
 	rootCmd.AddCommand(labels.LabelsCmd)
 	rootCmd.AddCommand(prunechunks.PruneChunksCmd)
 	rootCmd.AddCommand(batch.BatchCmd)
+	rootCmd.AddCommand(asrpilot.ASRPilotCmd)
 	rootCmd.AddCommand(backfill.BackfillCmd)
 	rootCmd.AddCommand(mcp.MCPCmd)
 	rootCmd.AddCommand(version.VersionCmd)

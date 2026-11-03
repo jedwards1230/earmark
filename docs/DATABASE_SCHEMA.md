@@ -751,7 +751,7 @@ a closing status). Read by the "Running now" panel, `GET /api/v1/runs` and the
 ```sql
 CREATE TABLE step_runs (
     id           BIGSERIAL   PRIMARY KEY,
-    step         TEXT        NOT NULL,              -- decide | decide_revert | scan | eval_sample | eval_book | eval_backfill | eval_rejudge
+    step         TEXT        NOT NULL,              -- decide | decide_revert | scan | eval_sample | eval_book | eval_backfill | eval_rejudge | asr_vote
     mode         TEXT        NOT NULL,              -- dry_run | write
     recipe_id    TEXT,                              -- no FK (a rung-0 replay never registers its recipe)
     model        TEXT,

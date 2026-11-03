@@ -577,3 +577,78 @@ func TestDecideDuplicatesMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestASRPilotMigration pins 00017: lock timeout, then both referenced tables
+// locked (transcript_findings first, a requeue's order) before any DDL; two
+// new tables and no ALTER; the scope column in the unique key; the vote
+// CHECK; cascades from the production transcript and the finding; a Down
+// that refuses to drop pilot transcripts unless earmark.allow_data_loss is
+// on; and resetSQL drops both tables.
+func TestASRPilotMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00017_asr_pilot.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	i := strings.Index(up, "SET LOCAL lock_timeout = '5s'")
+	l := strings.Index(up, "LOCK TABLE transcript_findings, transcripts IN SHARE ROW EXCLUSIVE MODE;")
+	c := strings.Index(up, "CREATE ")
+	if i < 0 || l < i || c < l {
+		t.Error("Up: want lock_timeout, then LOCK transcript_findings, transcripts, before any DDL")
+	}
+	for _, want := range []string{
+		"CREATE TABLE pilot_transcripts",
+		"production_transcript_id UUID NOT NULL REFERENCES transcripts (id) ON DELETE CASCADE",
+		"scope TEXT NOT NULL DEFAULT 'full' CONSTRAINT pilot_transcripts_scope_valid CHECK (scope IN ('full', 'findings'))",
+		"has_word_times BOOLEAN NOT NULL",
+		"CHECK (jsonb_typeof(segments) = 'array')",
+		"UNIQUE (file_path, model_id, model_revision, scope)",
+		"CREATE TABLE finding_asr_votes",
+		"finding_id UUID NOT NULL REFERENCES transcript_findings (id) ON DELETE CASCADE",
+		"pilot_transcript_id BIGINT NOT NULL REFERENCES pilot_transcripts (id) ON DELETE CASCADE",
+		"CHECK (vote IN ('heard_replacement', 'heard_original', 'neither', 'unmappable', 'style_only'))",
+		"UNIQUE (finding_id, pilot_transcript_id)",
+		"CREATE INDEX finding_asr_votes_pilot_idx ON finding_asr_votes (pilot_transcript_id)",
+		"CREATE INDEX pilot_transcripts_production_idx ON pilot_transcripts (production_transcript_id)",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("00017 Up is missing %q", want)
+		}
+	}
+	upper := strings.ToUpper(up)
+	if strings.Contains(upper, "ALTER TABLE") || strings.Contains(upper, "FINDING_EVENTS") {
+		t.Error("00017 must not alter an existing table or touch finding_events")
+	}
+	lk := strings.Index(down, "LOCK TABLE pilot_transcripts, finding_asr_votes IN ACCESS EXCLUSIVE MODE;")
+	if dk := strings.Index(down, "DO $$"); lk < 0 || dk < lk {
+		t.Error("00017 Down must lock the pilot tables before the refusal check (no row may land between count and drop)")
+	}
+	for _, col := range []string{"window_sec", "audio_sec", "wall_sec", "rtfx", "span_start_sec", "span_end_sec"} {
+		if !strings.Contains(up, col+" DOUBLE PRECISION") {
+			t.Errorf("00017 %s must be DOUBLE PRECISION (float4 is ~4 ms coarse on a 10 h track)", col)
+		}
+	}
+	for _, want := range []string{
+		"SET LOCAL lock_timeout = '5s'",
+		"refusing to roll back migration 17",
+		"current_setting('earmark.allow_data_loss', true)",
+		"DROP TABLE finding_asr_votes;",
+		"DROP TABLE pilot_transcripts;",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("00017 Down is missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"DROP TABLE    IF EXISTS finding_asr_votes",
+		"DROP TABLE    IF EXISTS pilot_transcripts",
+	} {
+		if !strings.Contains(resetSQL, want) {
+			t.Errorf("resetSQL is missing %q (every migration-created object is reset)", want)
+		}
+	}
+}

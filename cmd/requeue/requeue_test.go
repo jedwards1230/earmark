@@ -144,3 +144,36 @@ func TestRun_PreviewWarnsFindingsAreSuperseded(t *testing.T) {
 		})
 	}
 }
+
+// pilotFake is a requeuer that also counts the pilot rows a requeue deletes.
+type pilotFake struct {
+	fakeRequeuer
+	ids []string
+}
+
+func (f *pilotFake) PilotRowsForJobs(_ context.Context, ids []string) (int64, int64, error) {
+	f.ids = ids
+	return 3, 41, nil
+}
+
+// TestRun_WarnsAboutPilotRows: the preview says how many ASR-pilot rows the
+// transcript delete will cascade to (they are not archived); re-embed keeps
+// transcripts, so it does not ask.
+func TestRun_WarnsAboutPilotRows(t *testing.T) {
+	f := &pilotFake{fakeRequeuer: fakeRequeuer{jobs: []db.JobMatch{{ID: "j1", FilePath: "/b/Dune.m4b", Status: "done"}}}}
+	var out strings.Builder
+	if err := run(context.Background(), &out, f, "Dune", options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "3 ASR-pilot transcript(s) and 41 asr vote(s)") || len(f.ids) != 1 || f.ids[0] != "j1" {
+		t.Errorf("no pilot warning (ids %v):\n%s", f.ids, out.String())
+	}
+	f.ids = nil
+	out.Reset()
+	if err := run(context.Background(), &out, f, "Dune", options{reembed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if f.ids != nil || strings.Contains(out.String(), "ASR-pilot") {
+		t.Errorf("re-embed must not warn about pilot rows:\n%s", out.String())
+	}
+}
