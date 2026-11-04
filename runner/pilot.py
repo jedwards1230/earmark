@@ -37,7 +37,9 @@ Environment:
     PILOT_MODEL_ID        default per backend (see DEFAULT_MODEL_IDS).
     PILOT_MODEL_REVISION  required: the HF commit sha to load. Unpinned runs are refused.
     HF_HOME               HF cache (the pilot's own, not production's); snapshots are
-                          read from HF_HUB_CACHE, else $HF_HOME/hub, offline only.
+                          read from huggingface_hub's cache dir (HF_HUB_CACHE,
+                          HUGGINGFACE_HUB_CACHE, $HF_HOME/hub, $XDG_CACHE_HOME/
+                          huggingface/hub), offline only.
     PILOT_QWEN_MODEL_ID   canary's LLM repo (default Qwen/Qwen3-1.7B).
     PILOT_QWEN_REVISION   its pinned commit (default 70d244cc…; see QWEN_REVISION).
     BOOKS_MOUNT           as runner.py: this host's books mount (UNC on Windows).
@@ -1163,10 +1165,13 @@ class Track:
     duration: float
 
 
-def connect(cfg: Config, timeout: int | None = None) -> Any:  # pragma: no cover
+def connect(
+    cfg: Config, timeout: int | None = None, **libpq: Any
+) -> Any:  # pragma: no cover
     import psycopg2
 
-    kw = {"connect_timeout": timeout} if timeout else {}
+    kw: dict[str, Any] = {"connect_timeout": timeout} if timeout else {}
+    kw.update(libpq)
     conn = psycopg2.connect(cfg.database_url, **kw)
     if cfg.dry_run:
         conn.set_session(readonly=True)
@@ -1380,15 +1385,26 @@ class SnapshotSpec:
     allow_patterns: tuple[str, ...]
 
 
+def _expand(path: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(path)))
+
+
 def hf_hub_cache(env: dict[str, str]) -> Path:
-    """The hub cache huggingface_hub would use: HF_HUB_CACHE, else $HF_HOME/hub."""
-    explicit = env.get("HF_HUB_CACHE", "").strip()
+    """The hub cache huggingface_hub 2.4.0 would use (constants.py), same precedence:
+
+    HF_HUB_CACHE, else HUGGINGFACE_HUB_CACHE, else $HF_HOME/hub, where HF_HOME
+    defaults to $XDG_CACHE_HOME/huggingface (XDG_CACHE_HOME defaulting to ~/.cache).
+    """
+    explicit = (
+        env.get("HF_HUB_CACHE") or env.get("HUGGINGFACE_HUB_CACHE") or ""
+    ).strip()
     if explicit:
-        return Path(explicit)
-    home = env.get("HF_HOME", "").strip()
-    if home:
-        return Path(home) / "hub"
-    return Path.home() / ".cache" / "huggingface" / "hub"
+        return _expand(explicit)
+    home = (env.get("HF_HOME") or "").strip()
+    if not home:
+        xdg = (env.get("XDG_CACHE_HOME") or "").strip() or os.path.join("~", ".cache")
+        home = os.path.join(xdg, "huggingface")
+    return _expand(home) / "hub"
 
 
 def snapshot_specs(cfg: Config) -> list[SnapshotSpec]:
@@ -1919,9 +1935,12 @@ class StepRunRecorder:
     writer thread writes at most every STEP_RUN_INTERVAL_SEC and at least every
     STEP_RUN_HEARTBEAT_SEC (a heartbeat even while one long batch runs, so the
     run is never shown stale); finish() closes it with done / failed /
-    cancelled. Writes use their own autocommit connection with a 5 s statement
-    timeout. Recording never fails the run: every error is logged (the first,
-    then every 20th) and swallowed, and a failed insert is retried later.
+    cancelled. Writes use their own autocommit connection: 5 s connect timeout,
+    5 s statement timeout, TCP keepalives (a dead peer is noticed in ~25 s), and
+    finish() waits at most 10 s for the writer thread plus 15 s for the lock, so
+    the run's exit is delayed by at most that. Recording never fails the run:
+    every error is logged (the first, then every 20th) and swallowed, and a
+    failed insert is retried later.
     """
 
     def __init__(
@@ -1988,11 +2007,12 @@ class StepRunRecorder:
 
     def _write(self, status: str | None = None, error: str | None = None) -> None:
         # The final write may wait a little for an in-flight heartbeat, never
-        # long: a step_runs problem must not delay the run's exit.
+        # long: a step_runs problem delays the run's exit by at most this wait.
         if not self._lock.acquire(timeout=STEP_RUN_LOCK_WAIT_SEC):
-            self._error(
-                "write", TimeoutError("previous step_runs write still in flight")
-            )
+            # Count and log only: the connection belongs to the thread holding
+            # the lock, so it must not be closed from here.
+            self.errors += 1
+            log.warning("step_runs write skipped: previous write still in flight")
             return
         try:
             # Count attempts, not successes, toward the throttle: during an
@@ -2401,6 +2421,8 @@ def bench(
             prod[t.file_path] = production_word_texts(read_production_segments(conn, t))
         except Exception:  # completeness is optional; the timing rows still run
             log.exception("bench: no production words for %s", t.file_path)
+            with contextlib.suppress(Exception):
+                conn.rollback()
             prod[t.file_path] = []
     rows: list[dict[str, Any]] = []
     failed_rows = 0
@@ -2723,7 +2745,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     rec = (
         None
         if (cfg.dry_run or cfg.bench)
-        else StepRunRecorder(lambda: connect(cfg, timeout=STEP_RUN_CONNECT_TIMEOUT_SEC))
+        else StepRunRecorder(
+            lambda: connect(
+                cfg,
+                timeout=STEP_RUN_CONNECT_TIMEOUT_SEC,
+                # A half-open TCP connection would otherwise block a write in
+                # recv() indefinitely: keepalives find a dead peer in ~25 s.
+                keepalives=1,
+                keepalives_idle=10,
+                keepalives_interval=5,
+                keepalives_count=3,
+            )
+        )
     )
     try:
         return run(cfg, conn, recorder=rec)

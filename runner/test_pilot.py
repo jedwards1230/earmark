@@ -1911,3 +1911,61 @@ def test_word_completeness_is_multiset_recall_per_window() -> None:
     # window 1: the, cat matched (2 of 3 'the cat the'); window 2: dog missed.
     assert pilot.word_completeness(windows, prod) == 0.5
     assert pilot.word_completeness(windows, []) is None
+
+
+def test_hf_hub_cache_matches_huggingface_hub_precedence() -> None:
+    home = Path("~").expanduser()
+    assert pilot.hf_hub_cache({}) == home / ".cache" / "huggingface" / "hub"
+    assert pilot.hf_hub_cache({"XDG_CACHE_HOME": "/xdg"}) == Path(
+        "/xdg/huggingface/hub"
+    )
+    assert pilot.hf_hub_cache({"XDG_CACHE_HOME": "/xdg", "HF_HOME": "/hf"}) == Path(
+        "/hf/hub"
+    )
+    assert pilot.hf_hub_cache(
+        {"HF_HOME": "/hf", "HUGGINGFACE_HUB_CACHE": "/old"}
+    ) == Path("/old")
+    assert pilot.hf_hub_cache(
+        {"HUGGINGFACE_HUB_CACHE": "/old", "HF_HUB_CACHE": "/new"}
+    ) == Path("/new")
+    assert pilot.hf_hub_cache({"HF_HOME": "~/hfh"}) == home / "hfh" / "hub"
+
+
+def test_step_run_lock_timeout_leaves_the_connection_to_its_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pilot, "STEP_RUN_LOCK_WAIT_SEC", 0.01)
+    runs = RunsConn()
+    rec = pilot.StepRunRecorder(lambda: runs, interval=0.0, threaded=False)
+    rec.start(model="m", args="a", total=1, message="loading model")
+    held = rec.conn
+    rec._lock.acquire()
+    rec.progress(done=0, counters={}, message="x")
+    assert rec.errors == 1 and rec.conn is held and runs.closed == 0  # untouched
+    rec._lock.release()
+
+
+def test_bench_rolls_back_after_a_failed_production_read(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg(
+        "canary", "--bench", "--bench-batches", "1", "--bench-max-sec", "100"
+    )
+    conn = FakeConn(BENCH_TRACKS, [])
+    rollbacks: list[int] = []
+    conn.rollback = lambda: rollbacks.append(1)  # type: ignore[method-assign]
+
+    def broken(c: Any, t: Any) -> Any:
+        raise OSError("transient")
+
+    monkeypatch.setattr(pilot, "read_production_segments", broken)
+    monkeypatch.setattr(
+        pilot, "track_plan", lambda c, cf, t: ([(0.0, 38.0), (38.0, 76.0)], 0)
+    )
+    n = len(rollbacks)
+    assert run(cfg, conn) == 0
+    assert len(rollbacks) > n
+    assert (
+        json.loads(capsys.readouterr().out)["bench"]["results"][0]["word_completeness"]
+        is None
+    )

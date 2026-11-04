@@ -287,7 +287,7 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `DATABASE_URL` | Required, except with `--self-check`. |
 | `PILOT_MODEL_REVISION` | **Required.** The HF commit sha to load. Unpinned runs are refused (exit 2). |
 | `PILOT_MODEL_ID` | Defaults to the model in the table above. |
-| `HF_HOME` | The pilot's own HF cache. Snapshots are read from `HF_HUB_CACHE`, else `$HF_HOME/hub`. |
+| `HF_HOME` | The pilot's own HF cache. Snapshots are read from the cache huggingface_hub 2.4.0 itself uses: `HF_HUB_CACHE`, else `HUGGINGFACE_HUB_CACHE`, else `$HF_HOME/hub`, with `HF_HOME` defaulting to `$XDG_CACHE_HOME/huggingface` (`~/.cache/huggingface`). |
 | `PILOT_QWEN_MODEL_ID`, `PILOT_QWEN_REVISION` | Canary's LLM snapshot. Defaults: `Qwen/Qwen3-1.7B` at `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`. |
 | `BOOKS_MOUNT`, `BOOKS_DB_ROOT`, `BOOKS_PATH_ENCODING` | Same meaning as in `runner.py`. |
 | `FFMPEG_BIN`, `FFPROBE_BIN` | Default `ffmpeg` / `ffprobe`. `runner.py` has no env names for these; it runs them from `PATH`. |
