@@ -1274,6 +1274,8 @@ def test_canary_load_gives_salm_local_paths_only(
 def test_canary_load_qwen_override_and_missing_qwen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")  # restored after the test
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
     _snapshot(
         tmp_path,
         "nvidia/canary-qwen-2.5b",
@@ -1459,3 +1461,46 @@ def test_print_prefetch_spec_refuses_a_default_revision_for_another_model() -> N
         },
     )
     assert pilot.prefetch_spec(cfg)["snapshots"][0]["revision"] == "a" * 40
+
+
+def test_missing_prefetch_during_load_is_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg("canary", env={"HF_HUB_CACHE": str(tmp_path)})
+    conn = FakeConn(TRACKS, SEGMENTS)
+
+    class Unfetched(FakeBackend):
+        def load(self) -> None:
+            pilot.resolve_snapshot(tmp_path, pilot.snapshot_specs(self.cfg)[0])
+
+    backend = Unfetched(cfg, "canary")
+    # run() loads the model itself only when no backend is passed; patch the factory.
+    monkeypatch.setattr(pilot, "make_backend", lambda c: backend)
+    rc = pilot.run(cfg, conn, backend=None, decode=fake_decode, gaming_check=no_gaming)
+    assert rc == pilot.EXIT_CONFIG and conn.writes() == []
+
+
+def test_bench_skips_an_unplannable_track_and_fails_when_none_plan(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg(
+        "canary", "--bench", "--bench-batches", "1", "--bench-max-sec", "100"
+    )
+    conn = FakeConn(BENCH_TRACKS, [])
+    real = pilot.track_plan
+
+    def flaky(c: Any, cf: Any, track: Any) -> Any:
+        if track.file_path == "/books/a/1.m4b":
+            raise OSError("server closed the connection")
+        return real(c, cf, track)
+
+    monkeypatch.setattr(pilot, "track_plan", flaky)
+    assert run(cfg, conn) == 0
+    assert json.loads(capsys.readouterr().out)["bench"]["tracks"] == ["/books/a/2.m4b"]
+
+    def broken(*a: Any) -> Any:
+        raise OSError("nope")
+
+    monkeypatch.setattr(pilot, "track_plan", broken)
+    assert run(cfg, FakeConn(BENCH_TRACKS, [])) == pilot.EXIT_TRACKS_FAILED
+    assert capsys.readouterr().out == ""

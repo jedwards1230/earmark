@@ -1892,7 +1892,15 @@ def gather_bench_plans(
     out: list[tuple[Track, list[Span]]] = []
     n, audio, capped = 0, 0.0, False
     for t in tracks:
-        plan, _ = track_plan(conn, cfg, t)
+        try:
+            plan, _ = track_plan(conn, cfg, t)
+        except Exception:  # one unplannable track must not end the bench
+            log.exception(
+                "bench: skipping track that cannot be planned: %s", t.file_path
+            )
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            continue
         take: list[Span] = []
         for w in plan:
             length = w[1] - w[0]
@@ -1919,8 +1927,11 @@ def bench(
     decode: DecodeFn,
     check: Callable[[], None],
     emit: Callable[[str], None] = print,
-) -> None:
+) -> int:
     """Sweep cfg.bench_batches over windows gathered across `tracks`. No DB writes.
+
+    Returns EXIT_OK, or EXIT_TRACKS_FAILED when no window could be gathered
+    (nothing is printed then).
 
     Windows come from the tracks in order until there are max(bench_batches) x 2
     of them, capped at cfg.bench_max_sec of audio, so every batch size gets full
@@ -1930,6 +1941,9 @@ def bench(
     StopRequested propagate to run(), which exits 4 / 5 without printing).
     """
     gathered = gather_bench_plans(db.ensure(), cfg, tracks)
+    if not gathered:
+        log.error("--bench: no window could be planned for %s", ",".join(cfg.asins))
+        return EXIT_TRACKS_FAILED
     plans = {t.file_path: p for t, p in gathered}
     bench_tracks = [t for t, _ in gathered]
     total = sum(len(p) for p in plans.values())
@@ -2005,6 +2019,7 @@ def bench(
             ensure_ascii=False,
         )
     )
+    return EXIT_OK
 
 
 def self_check(
@@ -2105,8 +2120,7 @@ def run(
                 backend = make_backend(cfg)
                 backend.load()
             if cfg.bench:
-                bench(db, cfg, backend, tracks, decode, check)
-                return EXIT_OK
+                return bench(db, cfg, backend, tracks, decode, check)
             pipe = Pipeline(db, cfg, backend, decode, check)
             pipe.run(tracks)
         except GamingStop as exc:
@@ -2115,6 +2129,9 @@ def run(
         except StopRequested as exc:
             log.warning("stopping (%s); unfinished tracks not written", exc)
             return EXIT_STOPPED
+        except PrefetchMissing as exc:  # operator-fixable: re-run the role's prefetch
+            log.error("%s", exc)
+            return EXIT_CONFIG
         return EXIT_TRACKS_FAILED if pipe.failed else EXIT_OK
     finally:
         if db.conn is not conn:  # reconnected mid-run: the caller only closes its own
@@ -2137,7 +2154,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(prefetch_spec(cfg)))
         return EXIT_OK
     if cfg.self_check:  # pragma: no cover - GPU stack
-        return self_check(cfg)
+        try:
+            return self_check(cfg)
+        except PrefetchMissing as exc:
+            log.error("%s", exc)
+            return EXIT_CONFIG
     conn = connect(cfg)
     try:
         return run(cfg, conn)
