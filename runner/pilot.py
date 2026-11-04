@@ -1074,10 +1074,11 @@ class Track:
     duration: float
 
 
-def connect(cfg: Config) -> Any:  # pragma: no cover - thin psycopg2 wrapper
+def connect(cfg: Config, timeout: int | None = None) -> Any:  # pragma: no cover
     import psycopg2
 
-    conn = psycopg2.connect(cfg.database_url)
+    kw = {"connect_timeout": timeout} if timeout else {}
+    conn = psycopg2.connect(cfg.database_url, **kw)
     if cfg.dry_run:
         conn.set_session(readonly=True)
     return conn
@@ -1715,6 +1716,8 @@ StepRunDone, StepRunFailed, StepRunCancelled = "done", "failed", "cancelled"
 STEP_RUN_INTERVAL_SEC = 2.0  # at most one write per interval ...
 STEP_RUN_HEARTBEAT_SEC = 30.0  # ... and at least one per heartbeat
 STEP_RUN_TIMEOUT_MS = 5000
+STEP_RUN_CONNECT_TIMEOUT_SEC = 5  # libpq connect_timeout for the recorder's connection
+STEP_RUN_LOCK_WAIT_SEC = 15.0  # finish() waits at most this for an in-flight write
 
 _STEP_RUN_INSERT_SQL = """
     INSERT INTO step_runs (step, mode, model, args, host, total, last_message)
@@ -1820,28 +1823,38 @@ class StepRunRecorder:
         self.id = int(row[0])
 
     def _write(self, status: str | None = None, error: str | None = None) -> None:
-        with self._lock:
-            try:
-                if self.id is None:
-                    self._insert()
-                st = self._state
-                with self._cursor_conn().cursor() as cur:
-                    cur.execute(
-                        _STEP_RUN_UPDATE_SQL,
-                        (
-                            st["total"],
-                            st["done"],
-                            json.dumps(st["counters"]),
-                            (st["message"] or "")[:512] or None,
-                            status,
-                            status,
-                            (error or "")[:2000] or None,
-                            self.id,
-                        ),
-                    )
-                self._last_write = self.clock()
-            except Exception as exc:  # noqa: BLE001 - recording never fails the run
-                self._error("write", exc)
+        # The final write may wait a little for an in-flight heartbeat, never
+        # long: a step_runs problem must not delay the run's exit.
+        if not self._lock.acquire(timeout=STEP_RUN_LOCK_WAIT_SEC):
+            self._error(
+                "write", TimeoutError("previous step_runs write still in flight")
+            )
+            return
+        try:
+            # Count attempts, not successes, toward the throttle: during an
+            # outage that is one connect per interval, not one per batch.
+            self._last_write = self.clock()
+            if self.id is None:
+                self._insert()
+            st = self._state
+            with self._cursor_conn().cursor() as cur:
+                cur.execute(
+                    _STEP_RUN_UPDATE_SQL,
+                    (
+                        st["total"],
+                        st["done"],
+                        json.dumps(st["counters"]),
+                        (st["message"] or "")[:512] or None,
+                        status,
+                        status,
+                        (error or "")[:2000] or None,
+                        self.id,
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 - recording never fails the run
+            self._error("write", exc)
+        finally:
+            self._lock.release()
 
     def _loop(self) -> None:
         while not self.closed:
@@ -2454,7 +2467,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             log.error("%s", exc)
             return EXIT_CONFIG
     conn = connect(cfg)
-    rec = None if (cfg.dry_run or cfg.bench) else StepRunRecorder(lambda: connect(cfg))
+    rec = (
+        None
+        if (cfg.dry_run or cfg.bench)
+        else StepRunRecorder(lambda: connect(cfg, timeout=STEP_RUN_CONNECT_TIMEOUT_SEC))
+    )
     try:
         return run(cfg, conn, recorder=rec)
     finally:

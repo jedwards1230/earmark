@@ -1705,3 +1705,41 @@ def test_bench_exits_3_when_a_sweep_row_fails(
     rows = json.loads(capsys.readouterr().out)["bench"]["results"]
     assert rows[0]["batch_size"] == 1 and "error" not in rows[0]
     assert rows[1] == {"batch_size": 2, "error": "failed (see log)"}
+
+
+def test_step_run_outage_retries_once_per_interval_not_per_batch() -> None:
+    now = [0.0]
+    connects: list[int] = []
+
+    def no_db() -> Any:
+        connects.append(1)
+        raise OSError("connection refused")
+
+    rec = pilot.StepRunRecorder(
+        no_db, interval=2.0, threaded=False, clock=lambda: now[0]
+    )
+    rec.start(model="m", args="a", total=3, message="loading model")
+    assert len(connects) == 1
+    for t in (0.5, 1.0, 1.9):  # batches inside the interval: no new attempt
+        now[0] = t
+        rec.progress(done=0, counters={}, message="x")
+    assert len(connects) == 1
+    now[0] = 2.5
+    rec.progress(done=1, counters={}, message="y")
+    assert len(connects) == 2
+
+
+def test_step_run_finish_never_waits_long_for_a_stuck_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time as _time
+
+    monkeypatch.setattr(pilot, "STEP_RUN_LOCK_WAIT_SEC", 0.05)
+    runs = RunsConn()
+    rec = pilot.StepRunRecorder(lambda: runs, interval=0.0, threaded=False)
+    rec.start(model="m", args="a", total=1, message="loading model")
+    rec._lock.acquire()  # a heartbeat stuck in a slow connect
+    t0 = _time.monotonic()
+    rec.finish("done")
+    assert _time.monotonic() - t0 < 1.0 and rec.errors == 1
+    rec._lock.release()
