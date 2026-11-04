@@ -2013,7 +2013,7 @@ Prometheus series `earmark_step_run_items_total{outcome="duplicate"}` and
 
 A pilot runs a second ASR model over tracks that already have a production
 transcript: IBM Granite Speech 4.1 2B (base, `ibm-granite/granite-speech-4.1-2b`,
-plain ASR, 240 s windows, at most 540 s) and NVIDIA Canary-Qwen 2.5B (≤ 40 s
+plain ASR, 90 s windows, at most 120 s — longer windows re-read and drop speech) and NVIDIA Canary-Qwen 2.5B (≤ 40 s
 windows). The pilot measures each against production (`parakeet-tdt-1.1b`) and
 records, for each held finding, which reading the second model heard. **Pilot
 output never touches production**: no `transcripts` row, no job, no chunk, no
@@ -2126,7 +2126,7 @@ The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
      `[t0 − 0.5 s, t1 + 0.5 s]`.
 
    Those tokens are aligned with the production tokens of the same time range
-   by a **Myers O((N+M)·D) diff**. It is cheap for 540 s windows of ~1500
+   by a **Myers O((N+M)·D) diff**. It is cheap even for 540 s windows of ~1500
    words, with at most 5000 tokens a side (`window_too_large`) and 1500
    differing tokens (`align_too_different`). The pilot tokens between the
    nearest exactly agreeing words left and right of the span are what it

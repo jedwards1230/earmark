@@ -376,7 +376,7 @@ def test_batches_fill_to_batch_size_within_a_track() -> None:
     conn = FakeConn([("B1", "/books/a/long.m4b", TID, 600.0)], [])
     backend = FakeBackend(cfg, "granite")
     assert run(cfg, conn, backend) == 0
-    assert backend.batches == [2, 1]  # windows 240 + 240 + 120
+    assert backend.batches == [2, 2, 2, 1]  # 6 x 90 s + one 60 s window
 
 
 def test_oom_batch_size_used_is_recorded_in_out_file() -> None:
@@ -405,7 +405,7 @@ def test_run_writes_one_row_per_track_in_its_own_commit() -> None:
         and row[2] == "granite"
         and row[3] == "ibm-granite/granite-speech-4.1-2b"
     )
-    assert row[4] == REV and row[5] == "full" and row[6] == 240.0
+    assert row[4] == REV and row[5] == "full" and row[6] == 90.0
     assert row[7] is False  # has_word_times: window-level text only
     segs = json.loads(row[8])
     assert segs[0]["text"] == "Hello, World." and "start" not in segs[0]["words"][0]
@@ -595,15 +595,18 @@ def test_zero_duration_track_is_skipped_with_warning(
 
 
 def test_decode_is_chunked_to_hold_a_full_batch_and_bounded() -> None:
-    cfg = make_cfg("granite")  # batch 16 x 240 s -> 3840 s chunks
-    assert cfg.decode_chunk_sec == 3840.0
+    cfg = make_cfg("granite", "--batch-size", "32")  # 32 x 90 s -> 2880 s chunks
+    assert cfg.decode_chunk_sec == 2880.0
+    assert (
+        make_cfg("granite").decode_chunk_sec == pilot.DECODE_CHUNK_MIN_SEC
+    )  # 16 x 90 < 1800
     assert make_cfg("canary").decode_chunk_sec == pilot.DECODE_CHUNK_MIN_SEC
     conn = FakeConn([("B1", "/books/a/long.m4b", TID, 7200.0)], [])
     DECODES.clear()
     backend = FakeBackend(cfg, "granite")
     assert run(cfg, conn, backend) == 0
-    assert DECODES == [(0.0, 3840.0), (3840.0, 7200.0)]
-    assert backend.batches == [16, 14]
+    assert DECODES == [(0.0, 2880.0), (2880.0, 5760.0), (5760.0, 7200.0)]
+    assert backend.batches == [32, 32, 16]
 
 
 def test_bench_sweeps_batch_sizes_and_writes_nothing(
@@ -699,7 +702,7 @@ def test_gaming_check_runs_before_the_model_loads() -> None:
 def test_backend_defaults() -> None:
     g, c = make_cfg("granite"), make_cfg("canary")
     assert (g.model_id, g.window_sec, g.hard_max_sec, g.batch_size) == (
-        "ibm-granite/granite-speech-4.1-2b", 240.0, 540.0, 16,
+        "ibm-granite/granite-speech-4.1-2b", 90.0, 120.0, 16,
     )  # fmt: skip
     assert (c.model_id, c.window_sec, c.hard_max_sec, c.batch_size) == (
         "nvidia/canary-qwen-2.5b", 38.0, 40.0, 32,
@@ -714,8 +717,8 @@ def test_load_config_rejects_window_above_hard_max() -> None:
     with pytest.raises(pilot.ConfigError):
         make_cfg("canary", env={"PILOT_WINDOW_SEC": "41"})
     with pytest.raises(pilot.ConfigError):
-        make_cfg("granite", env={"PILOT_WINDOW_SEC": "541"})
-    assert make_cfg("granite", env={"PILOT_WINDOW_SEC": "540"}).window_sec == 540.0
+        make_cfg("granite", env={"PILOT_WINDOW_SEC": "121"})
+    assert make_cfg("granite", env={"PILOT_WINDOW_SEC": "120"}).window_sec == 120.0
 
 
 def test_config_errors_exit_2(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -836,13 +839,53 @@ class _FakeTorch:
     def stack(self, *a: Any, **k: Any) -> Any:
         raise AssertionError("Granite must not stack/pad the batch itself")
 
+    bool = "torch.bool"
+
     def inference_mode(self) -> Any:
         import contextlib
 
         return contextlib.nullcontext()
 
+    def tensor(self, data: Any, dtype: Any = None, device: Any = None) -> Any:
+        return ("tensor", list(data), dtype, device)
 
-def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
+
+class _RowsTensor:
+    """Just enough of a (batch, seq) LongTensor for the stopping criterion."""
+
+    device = "cuda:0"
+
+    def __init__(self, rows: list[list[int]]) -> None:
+        self.rows = rows
+
+    def __getitem__(self, key: Any) -> Any:
+        _, cols = key
+        return _RowsTensor([r[cols] for r in self.rows])
+
+    def tolist(self) -> list[list[int]]:
+        return self.rows
+
+
+def _stub_stopping(monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+
+    mod = types.ModuleType("transformers")
+
+    class StoppingCriteria:
+        pass
+
+    class StoppingCriteriaList(list):
+        pass
+
+    mod.StoppingCriteria = StoppingCriteria  # type: ignore[attr-defined]
+    mod.StoppingCriteriaList = StoppingCriteriaList  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", mod)
+
+
+def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_stopping(monkeypatch)
     cfg = make_cfg("granite")
     b = pilot.GraniteBackend(cfg)
     b.torch = _FakeTorch()
@@ -868,7 +911,7 @@ def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
 
         def batch_decode(self, rows: Any, **kw: Any) -> list[str]:
             seen["decoded"] = rows
-            return [" First row. ", "Second."]
+            return [" First <|fim_middle|>row.<|fim_middle|> ", "Second."]
 
     b.processor, b.model, b.tokenizer = processor, Model(), Tok()
     long_row = [0.1] * (3 * pilot.SAMPLE_RATE)
@@ -887,10 +930,19 @@ def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
     assert seen["gen"]["input_features_mask"] is mask
     assert seen["gen"]["num_beams"] == 1 and seen["gen"]["do_sample"] is False
     assert seen["gen"]["repetition_penalty"] == 1.0
-    assert seen["gen"]["max_new_tokens"] == pilot.max_new_tokens(12, 64, [3.0, 1.0])
+    assert seen["gen"]["max_new_tokens"] == pilot.max_new_tokens(5, 64, [3.0, 1.0])
+    assert "no_repeat_ngram_size" not in seen["gen"]  # off by default
+    # A per-row stopping criterion: row 0 re-reads an 8-gram 3 times, row 1 does not.
+    (crit,) = seen["gen"]["stopping_criteria"]
+    loop = list(range(100, 108)) * 3
+    flags = crit(_RowsTensor([[0, 5, 6, *loop], [5, 6, 7, *range(200, 224)]]), None)
+    assert flags == ("tensor", [True, False], "torch.bool", "cuda:0")
     # New tokens are sliced per row past the shared input length.
     assert seen["decoded"] == [[11, 12, 2], [21, 2, 2]]
-    assert [r.text for r in res] == ["First row.", "Second."]
+    assert [r.text for r in res] == [
+        "First row.",
+        "Second.",
+    ]  # leaked <|fim_*|> stripped
     assert not any(r.hit_token_limit for r in res)
 
 
@@ -1363,14 +1415,20 @@ def test_granite_load_uses_the_local_snapshot_dir(
 
 # ── --bench window gathering ───────────────────────────────────────────────────
 BENCH_TRACKS = [
-    ("B1", "/books/a/1.m4b", TID, 595.6),  # 3 granite windows (240 + 240 + 115.6)
-    ("B1", "/books/a/2.m4b", TID, 1200.0),  # 5
-    ("B2", "/books/b/1.m4b", TID, 2400.0),  # 10
+    ("B1", "/books/a/1.m4b", TID, 223.35),  # 3 granite windows (90 + 90 + 43.35)
+    ("B1", "/books/a/2.m4b", TID, 450.0),  # 5
+    ("B2", "/books/b/1.m4b", TID, 900.0),  # 10
 ]
 
 
 def test_bench_default_cap_follows_batches_and_window() -> None:
-    assert make_cfg("granite", "--bench").bench_max_sec == 32 * 2 * 240.0  # 15360 s
+    assert make_cfg("granite", "--bench").bench_max_sec == 32 * 2 * 90.0  # 5760 s
+    # With a window sweep the cap follows the longest window.
+    sweep = make_cfg("granite", "--bench", "--bench-windows", "60,120")
+    assert (
+        sweep.bench_windows == [60.0, 120.0] and sweep.bench_max_sec == 32 * 2 * 120.0
+    )
+    assert make_cfg("granite", "--bench").bench_windows == [90.0]
     assert (
         make_cfg("canary", "--bench", "--bench-batches", "1,4").bench_max_sec
         == 4 * 2 * 38.0
@@ -1395,14 +1453,14 @@ def test_bench_gathers_windows_across_tracks_until_enough() -> None:
 
 def test_bench_gathering_respects_the_audio_cap() -> None:
     cfg = make_cfg(
-        "granite", "--bench", "--bench-batches", "1,32", "--bench-max-sec", "1000"
+        "granite", "--bench", "--bench-batches", "1,32", "--bench-max-sec", "375"
     )
     conn = FakeConn(BENCH_TRACKS, [])
     plans = pilot.gather_bench_plans(conn, cfg, pilot.select_tracks(conn, cfg))
-    # 595.6 s of track 1, then 240 s of track 2; the next 240 s would cross 1000.
+    # 223.35 s of track 1, then 90 s of track 2; the next 90 s would cross 375.
     assert [(t.file_path, p) for t, p in plans] == [
-        ("/books/a/1.m4b", [(0.0, 240.0), (240.0, 480.0), (480.0, 595.6)]),
-        ("/books/a/2.m4b", [(0.0, 240.0)]),
+        ("/books/a/1.m4b", [(0.0, 90.0), (90.0, 180.0), (180.0, 223.35)]),
+        ("/books/a/2.m4b", [(0.0, 90.0)]),
     ]
     tiny = make_cfg("granite", "--bench", "--bench-max-sec", "10")
     ((_t, p),) = pilot.gather_bench_plans(conn, tiny, pilot.select_tracks(conn, tiny))
@@ -1413,7 +1471,7 @@ def test_bench_rows_report_batches_and_starvation(
     capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
     cfg = make_cfg(
-        "granite", "--bench", "--bench-batches", "1,4,16", "--bench-max-sec", "1000",
+        "granite", "--bench", "--bench-batches", "1,4,16", "--bench-max-sec", "375",
         "--limit-tracks", "1",
     )  # fmt: skip
     conn = FakeConn(BENCH_TRACKS, [])
@@ -1424,7 +1482,8 @@ def test_bench_rows_report_batches_and_starvation(
     # --limit-tracks is ignored in bench mode: two tracks were gathered.
     assert b["tracks"] == ["/books/a/1.m4b", "/books/a/2.m4b"]
     assert b["file_path"] == "/books/a/1.m4b" and b["windows"] == 4
-    assert b["windows_wanted"] == 32 and b["max_sec"] == 1000.0
+    assert b["windows_wanted"] == 32 and b["max_sec"] == 375.0
+    assert b["window_secs"] == [90.0]
     rows = {r["batch_size"]: r for r in b["results"]}
     assert set(rows) == {1, 4, 16}
     for r in rows.values():
@@ -1432,8 +1491,11 @@ def test_bench_rows_report_batches_and_starvation(
             "batch_size", "batch_size_used", "tracks", "windows", "batches",
             "windows_per_batch", "starved", "audio_sec", "wall_sec", "decode_sec",
             "rtfx", "peak_vram_mib", "peak_reserved_mib", "degenerate_windows",
+            "window_sec", "degenerate_rate", "word_completeness",
         }  # fmt: skip
-        assert r["tracks"] == 2 and r["windows"] == 4 and r["audio_sec"] == 835.6
+        assert r["tracks"] == 2 and r["windows"] == 4 and r["audio_sec"] == 313.35
+        assert r["window_sec"] == 90.0 and r["degenerate_rate"] == 0.0
+        assert r["word_completeness"] is None  # no production words in this fixture
     assert (rows[1]["batches"], rows[1]["windows_per_batch"]) == (
         4,
         {"mean": 1.0, "min": 1},
@@ -1704,7 +1766,7 @@ def test_bench_exits_3_when_a_sweep_row_fails(
     assert run(cfg, FakeConn(BENCH_TRACKS, []), backend) == pilot.EXIT_TRACKS_FAILED
     rows = json.loads(capsys.readouterr().out)["bench"]["results"]
     assert rows[0]["batch_size"] == 1 and "error" not in rows[0]
-    assert rows[1] == {"batch_size": 2, "error": "failed (see log)"}
+    assert rows[1] == {"window_sec": 38.0, "batch_size": 2, "error": "failed (see log)"}
 
 
 def test_step_run_outage_retries_once_per_interval_not_per_batch() -> None:
@@ -1743,3 +1805,109 @@ def test_step_run_finish_never_waits_long_for_a_stuck_write(
     rec.finish("done")
     assert _time.monotonic() - t0 < 1.0 and rec.errors == 1
     rec._lock.release()
+
+
+# ── Degenerate-window guards (desktop-2 diagnosis, The Fifth Season) ───────────
+def test_repeats_ngram_checks_the_newest_8gram() -> None:
+    head = list(range(8))
+    assert not pilot.repeats_ngram(head * 2)
+    assert pilot.repeats_ngram(head * 3)
+    assert not pilot.repeats_ngram(head * 3 + [99])  # newest 8-gram differs
+    assert pilot.row_stop_flags([head * 3, list(range(30))]) == [True, False]
+
+
+def test_reread_and_overlong_are_degenerate() -> None:
+    sentence = (
+        "the sun rose slowly over the broken city of yumenes and nobody in the "
+        "whole quiet world saw it"
+    )
+    reread = f"{sentence} and then more words follow here. {sentence}"
+    assert pilot.has_repetition_loop(reread.split())  # 16-gram twice
+    eight = "one two three four five six seven eight"
+    assert pilot.has_repetition_loop(f"{eight} a {eight} b {eight}".split())
+    assert not pilot.has_repetition_loop(f"{eight} a {eight}".split())
+    normal = " ".join(f"word{i}" for i in range(200))
+    assert pilot.degenerate_reason(normal, False, 90.0) is None  # 2.2 words/s
+    assert pilot.degenerate_reason(normal, False, 40.0) == "overlong"  # 5 words/s
+    assert pilot.degenerate_reason(normal, False) is None  # no window: not judged
+
+
+def test_strip_special_tokens() -> None:
+    raw = "le|><|fim_middle|><|fim_middle|>humanity.<|fim_middle|>human. <|endoftext|>"
+    assert pilot.strip_special_tokens(raw) == "le|> humanity. human."
+    assert pilot.strip_special_tokens("a < b | c > d") == "a < b | c > d"
+
+
+def test_granite_defaults_follow_the_diagnosis() -> None:
+    cfg = make_cfg("granite")
+    assert (cfg.window_sec, cfg.hard_max_sec) == (90.0, 120.0)
+    assert pilot.GRANITE_TOKENS_PER_SECOND == 5 and pilot.TOKEN_MARGIN == 1.25
+    assert pilot.max_new_tokens(5, 64, [90.0]) == 562
+    assert make_cfg("granite", "--no-repeat-ngram-size", "6").no_repeat_ngram_size == 6
+    with pytest.raises(pilot.ConfigError):
+        make_cfg("granite", "--bench", "--bench-windows", "60,150")
+
+
+def test_degenerate_overlong_window_marked_in_a_run() -> None:
+    out = tempfile.mkdtemp(prefix="pilot-overlong-")
+    cfg = make_cfg("canary", "--out-dir", out)
+    conn = FakeConn([("B1", "/books/a/t.m4b", TID, 38.0)], [])
+    many = " ".join(f"w{i}" for i in range(200))  # > 4 words/s x 38 s
+    assert run(cfg, conn, FakeBackend(cfg, "canary", outputs=[many])) == 0
+    data = json.loads(next(Path(out).glob("*.json")).read_text(encoding="utf-8"))
+    assert [d["reason"] for d in data["degenerate_windows"]] == ["overlong"]
+
+
+def _prod_segments(duration: float) -> list[dict]:
+    words = [
+        {"word": f"w{i}", "start": i * 0.5, "end": i * 0.5 + 0.3}
+        for i in range(int(duration * 2))
+    ]
+    return [{"words": words}]
+
+
+def test_bench_sweeps_window_lengths_on_the_same_audio_with_completeness(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-windows", "60,120", "--bench-batches", "2",
+        "--bench-max-sec", "240",
+    )  # fmt: skip
+    conn = FakeConn([("B1", "/books/a/1.m4b", TID, 600.0)], _prod_segments(600.0))
+
+    class Echo(FakeBackend):
+        """Plausible-length text that matches no production word."""
+
+        def transcribe_batch(self, audios: Any) -> list[Any]:
+            self.batches.append(len(audios))
+            out = []
+            for a in audios:
+                n = round(len(a) / pilot.SAMPLE_RATE * 2)
+                out.append(pilot.WindowResult(text=" ".join(f"z{i}" for i in range(n))))
+            return out
+
+    assert run(cfg, conn, Echo(cfg, "granite")) == 0
+    b = json.loads(capsys.readouterr().out)["bench"]
+    assert b["window_secs"] == [60.0, 120.0]
+    short, long_ = b["results"]
+    # Gathered once at the longest window (two ~120 s windows cut at production
+    # pauses, capped at 240 s), then re-planned per window: same audio, more windows.
+    assert (short["window_sec"], long_["window_sec"]) == (60.0, 120.0)
+    assert short["audio_sec"] == long_["audio_sec"] and long_["windows"] == 2
+    assert short["windows"] > long_["windows"]
+    for r in b["results"]:
+        assert r["word_completeness"] == 0.0  # "z<i>" never matches a production word
+        assert r["degenerate_rate"] == 0.0
+
+
+def test_word_completeness_is_multiset_recall_per_window() -> None:
+    prod = [
+        (0.0, 0.5, "The"),
+        (1.0, 1.5, "cat,"),
+        (2.0, 2.5, "the"),
+        (60.0, 60.5, "dog"),
+    ]
+    windows = [(0.0, 30.0, "the cat"), (30.0, 90.0, "")]
+    # window 1: the, cat matched (2 of 3 'the cat the'); window 2: dog missed.
+    assert pilot.word_completeness(windows, prod) == 0.5
+    assert pilot.word_completeness(windows, []) is None
