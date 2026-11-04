@@ -439,6 +439,10 @@ def load_config(
         )
     if args.self_check and (args.dry_run or args.bench):
         raise ConfigError("--self-check cannot be combined with --dry-run or --bench")
+    if args.bench_max_sec is not None and not (
+        math.isfinite(args.bench_max_sec) and args.bench_max_sec > 0
+    ):
+        raise ConfigError(f"--bench-max-sec must be > 0: {args.bench_max_sec}")
     if args.bench and args.dry_run:
         raise ConfigError("--bench and --dry-run are exclusive")
     bench_batches = (
@@ -1883,7 +1887,8 @@ def dry_run(
 def gather_bench_plans(
     conn: Any, cfg: Config, tracks: Sequence[Track]
 ) -> list[tuple[Track, list[Span]]]:
-    """Windows for --bench: tracks in order until max(bench_batches) x 2 windows.
+    """Windows for --bench: tracks in --asin order (then by file_path, as
+    select_tracks returns them within a book) until max(bench_batches) x 2 windows.
 
     The total planned audio is capped at cfg.bench_max_sec; the window that
     would cross the cap is not taken (but at least one window always is).
@@ -1891,7 +1896,10 @@ def gather_bench_plans(
     need = max(cfg.bench_batches) * BENCH_WINDOWS_PER_BATCH
     out: list[tuple[Track, list[Span]]] = []
     n, audio, capped = 0, 0.0, False
-    for t in tracks:
+    rank = {a: i for i, a in reversed(list(enumerate(cfg.asins)))}
+    # select_tracks sorts by ASIN; the operator's --asin order decides which book
+    # is benched first. sorted() is stable, so file_path order holds per book.
+    for t in sorted(tracks, key=lambda t: rank.get(t.asin, len(rank))):
         try:
             plan, _ = track_plan(conn, cfg, t)
         except Exception:  # one unplannable track must not end the bench
@@ -1933,7 +1941,7 @@ def bench(
     Returns EXIT_OK, or EXIT_TRACKS_FAILED when no window could be gathered
     (nothing is printed then).
 
-    Windows come from the tracks in order until there are max(bench_batches) x 2
+    Windows come from the tracks in --asin order until there are max(bench_batches) x 2
     of them, capped at cfg.bench_max_sec of audio, so every batch size gets full
     batches. A row whose batch size exceeds the windows available is `starved`.
     `check` is the same stop-file + gaming check as a real run, applied before

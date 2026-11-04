@@ -1504,3 +1504,16 @@ def test_bench_skips_an_unplannable_track_and_fails_when_none_plan(
     monkeypatch.setattr(pilot, "track_plan", broken)
     assert run(cfg, FakeConn(BENCH_TRACKS, [])) == pilot.EXIT_TRACKS_FAILED
     assert capsys.readouterr().out == ""
+
+
+def test_bench_follows_asin_order_not_sort_order() -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-batches", "1", "--bench-max-sec", "100"
+    )
+    cfg.asins = ["B2", "B1"]  # select_tracks returns B1 first (ORDER BY asin)
+    conn = FakeConn(BENCH_TRACKS, [])
+    plans = pilot.gather_bench_plans(conn, cfg, pilot.select_tracks(conn, cfg))
+    assert [t.file_path for t, _ in plans] == ["/books/b/1.m4b"]
+    for bad in ("0", "-5", "nan"):
+        with pytest.raises(pilot.ConfigError):
+            make_cfg("granite", "--bench", "--bench-max-sec", bad)
