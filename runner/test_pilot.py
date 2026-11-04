@@ -14,10 +14,11 @@ import ast
 import importlib.util
 import itertools
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 import pytest
 
@@ -375,7 +376,7 @@ def test_batches_fill_to_batch_size_within_a_track() -> None:
     conn = FakeConn([("B1", "/books/a/long.m4b", TID, 600.0)], [])
     backend = FakeBackend(cfg, "granite")
     assert run(cfg, conn, backend) == 0
-    assert backend.batches == [2, 1]  # windows 240 + 240 + 120
+    assert backend.batches == [2, 2, 2, 1]  # 6 x 90 s + one 60 s window
 
 
 def test_oom_batch_size_used_is_recorded_in_out_file() -> None:
@@ -404,7 +405,7 @@ def test_run_writes_one_row_per_track_in_its_own_commit() -> None:
         and row[2] == "granite"
         and row[3] == "ibm-granite/granite-speech-4.1-2b"
     )
-    assert row[4] == REV and row[5] == "full" and row[6] == 240.0
+    assert row[4] == REV and row[5] == "full" and row[6] == 90.0
     assert row[7] is False  # has_word_times: window-level text only
     segs = json.loads(row[8])
     assert segs[0]["text"] == "Hello, World." and "start" not in segs[0]["words"][0]
@@ -594,15 +595,18 @@ def test_zero_duration_track_is_skipped_with_warning(
 
 
 def test_decode_is_chunked_to_hold_a_full_batch_and_bounded() -> None:
-    cfg = make_cfg("granite")  # batch 16 x 240 s -> 3840 s chunks
-    assert cfg.decode_chunk_sec == 3840.0
+    cfg = make_cfg("granite", "--batch-size", "32")  # 32 x 90 s -> 2880 s chunks
+    assert cfg.decode_chunk_sec == 2880.0
+    assert (
+        make_cfg("granite").decode_chunk_sec == pilot.DECODE_CHUNK_MIN_SEC
+    )  # 16 x 90 < 1800
     assert make_cfg("canary").decode_chunk_sec == pilot.DECODE_CHUNK_MIN_SEC
     conn = FakeConn([("B1", "/books/a/long.m4b", TID, 7200.0)], [])
     DECODES.clear()
     backend = FakeBackend(cfg, "granite")
     assert run(cfg, conn, backend) == 0
-    assert DECODES == [(0.0, 3840.0), (3840.0, 7200.0)]
-    assert backend.batches == [16, 14]
+    assert DECODES == [(0.0, 2880.0), (2880.0, 5760.0), (5760.0, 7200.0)]
+    assert backend.batches == [32, 32, 16]
 
 
 def test_bench_sweeps_batch_sizes_and_writes_nothing(
@@ -698,7 +702,7 @@ def test_gaming_check_runs_before_the_model_loads() -> None:
 def test_backend_defaults() -> None:
     g, c = make_cfg("granite"), make_cfg("canary")
     assert (g.model_id, g.window_sec, g.hard_max_sec, g.batch_size) == (
-        "ibm-granite/granite-speech-4.1-2b", 240.0, 540.0, 16,
+        "ibm-granite/granite-speech-4.1-2b", 90.0, 120.0, 16,
     )  # fmt: skip
     assert (c.model_id, c.window_sec, c.hard_max_sec, c.batch_size) == (
         "nvidia/canary-qwen-2.5b", 38.0, 40.0, 32,
@@ -713,8 +717,8 @@ def test_load_config_rejects_window_above_hard_max() -> None:
     with pytest.raises(pilot.ConfigError):
         make_cfg("canary", env={"PILOT_WINDOW_SEC": "41"})
     with pytest.raises(pilot.ConfigError):
-        make_cfg("granite", env={"PILOT_WINDOW_SEC": "541"})
-    assert make_cfg("granite", env={"PILOT_WINDOW_SEC": "540"}).window_sec == 540.0
+        make_cfg("granite", env={"PILOT_WINDOW_SEC": "121"})
+    assert make_cfg("granite", env={"PILOT_WINDOW_SEC": "120"}).window_sec == 120.0
 
 
 def test_config_errors_exit_2(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -835,13 +839,53 @@ class _FakeTorch:
     def stack(self, *a: Any, **k: Any) -> Any:
         raise AssertionError("Granite must not stack/pad the batch itself")
 
+    bool = "torch.bool"
+
     def inference_mode(self) -> Any:
         import contextlib
 
         return contextlib.nullcontext()
 
+    def tensor(self, data: Any, dtype: Any = None, device: Any = None) -> Any:
+        return ("tensor", list(data), dtype, device)
 
-def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
+
+class _RowsTensor:
+    """Just enough of a (batch, seq) LongTensor for the stopping criterion."""
+
+    device = "cuda:0"
+
+    def __init__(self, rows: list[list[int]]) -> None:
+        self.rows = rows
+
+    def __getitem__(self, key: Any) -> Any:
+        _, cols = key
+        return _RowsTensor([r[cols] for r in self.rows])
+
+    def tolist(self) -> list[list[int]]:
+        return self.rows
+
+
+def _stub_stopping(monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+
+    mod = types.ModuleType("transformers")
+
+    class StoppingCriteria:
+        pass
+
+    class StoppingCriteriaList(list):
+        pass
+
+    mod.StoppingCriteria = StoppingCriteria  # type: ignore[attr-defined]
+    mod.StoppingCriteriaList = StoppingCriteriaList  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", mod)
+
+
+def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_stopping(monkeypatch)
     cfg = make_cfg("granite")
     b = pilot.GraniteBackend(cfg)
     b.torch = _FakeTorch()
@@ -867,7 +911,7 @@ def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
 
         def batch_decode(self, rows: Any, **kw: Any) -> list[str]:
             seen["decoded"] = rows
-            return [" First row. ", "Second."]
+            return [" First <|fim_middle|>row.<|fim_middle|> ", "Second."]
 
     b.processor, b.model, b.tokenizer = processor, Model(), Tok()
     long_row = [0.1] * (3 * pilot.SAMPLE_RATE)
@@ -886,10 +930,19 @@ def test_granite_batch_passes_unpadded_rows_and_forwards_feature_mask() -> None:
     assert seen["gen"]["input_features_mask"] is mask
     assert seen["gen"]["num_beams"] == 1 and seen["gen"]["do_sample"] is False
     assert seen["gen"]["repetition_penalty"] == 1.0
-    assert seen["gen"]["max_new_tokens"] == pilot.max_new_tokens(12, 64, [3.0, 1.0])
+    assert seen["gen"]["max_new_tokens"] == pilot.max_new_tokens(5, 64, [3.0, 1.0])
+    assert "no_repeat_ngram_size" not in seen["gen"]  # off by default
+    # A per-row stopping criterion: row 0 re-reads an 8-gram 3 times, row 1 does not.
+    (crit,) = seen["gen"]["stopping_criteria"]
+    loop = list(range(100, 108)) * 3
+    flags = crit(_RowsTensor([[0, 5, 6, *loop], [5, 6, 7, *range(200, 224)]]), None)
+    assert flags == ("tensor", [True, False], "torch.bool", "cuda:0")
     # New tokens are sliced per row past the shared input length.
     assert seen["decoded"] == [[11, 12, 2], [21, 2, 2]]
-    assert [r.text for r in res] == ["First row.", "Second."]
+    assert [r.text for r in res] == [
+        "First row.",
+        "Second.",
+    ]  # leaked <|fim_*|> stripped
     assert not any(r.hit_token_limit for r in res)
 
 
@@ -1039,3 +1092,880 @@ def test_non_english_window_is_marked_degenerate_in_a_run() -> None:
     data = json.loads(next(Path(out).glob("*.json")).read_text(encoding="utf-8"))
     assert [d["reason"] for d in data["degenerate_windows"]] == ["language"]
     assert data["segments"][0]["degenerate_reason"] == "language"
+
+
+# ── Offline HF snapshots (deploy-time prefetch) ────────────────────────────────
+# Copied from jedwards1230/homelab-ansible roles/asr_pilot_windows/defaults/main.yaml
+# (origin/main, 2026-11-03): asr_pilot_windows_{granite,canary,canary_llm}_allow_patterns,
+# *_model_revision and asr_pilot_windows_hf_ignore_patterns. If this test fails,
+# pilot.py and the role disagree about what is prefetched: change both together.
+ROLE_PREFETCH = {
+    "granite": {
+        "revision": "823ca793aa49925d4eb2e758709b7f2c98513e8e",
+        "allow": ["*.json", "*.safetensors", "chat_template.jinja", "merges.txt"],
+    },
+    "canary": {
+        "revision": "b1469e1bba1cfe140205529c79c434ca47180960",
+        "allow": ["config.json", "model.safetensors"],
+    },
+    "canary_llm": {
+        "repo_id": "Qwen/Qwen3-1.7B",
+        "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+        "allow": [
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+        ],
+    },
+}
+ROLE_IGNORE = [".eval_results/*", "*.nemo"]
+CANARY_SHA = ROLE_PREFETCH["canary"]["revision"]
+QWEN_SHA = ROLE_PREFETCH["canary_llm"]["revision"]
+GRANITE_SHA = ROLE_PREFETCH["granite"]["revision"]
+
+
+def test_prefetch_lists_match_the_role() -> None:
+    for key, want in ROLE_PREFETCH.items():
+        assert pilot.PREFETCH_ALLOW_PATTERNS[key] == want["allow"], key
+    assert pilot.DEFAULT_MODEL_REVISIONS == {
+        "granite": GRANITE_SHA,
+        "canary": CANARY_SHA,
+    }
+    assert (pilot.QWEN_MODEL_ID, pilot.QWEN_REVISION) == ("Qwen/Qwen3-1.7B", QWEN_SHA)
+    assert pilot.PREFETCH_IGNORE_PATTERNS == ROLE_IGNORE
+
+
+def _snapshot(cache: Path, repo: str, sha: str, files: dict[str, str]) -> Path:
+    snap = cache / ("models--" + repo.replace("/", "--")) / "snapshots" / sha
+    for name, body in files.items():
+        f = snap / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(body, encoding="utf-8")
+    return snap
+
+
+CANARY_CONFIG = json.dumps(
+    {
+        "pretrained_llm": "Qwen/Qwen3-1.7B",
+        "pretrained_asr": "nvidia/canary-1b-flash",
+        "pretrained_weights": True,
+        "audio_locator_tag": "<|audioplaceholder|>",
+    }
+)
+QWEN_FILES = {n: "{}" for n in ROLE_PREFETCH["canary_llm"]["allow"]}
+
+
+def _hf_env(cache: Path, **extra: str) -> dict[str, str]:
+    return {"PILOT_MODEL_REVISION": CANARY_SHA, "HF_HUB_CACHE": str(cache), **extra}
+
+
+def test_print_prefetch_spec_needs_no_db_and_uses_the_pins(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PILOT_MODEL_REVISION", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HF_HOME", "/hf")
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    assert pilot.main(["--backend", "canary", "--print-prefetch-spec"]) == 0
+    spec = json.loads(capsys.readouterr().out)
+    assert spec["hf_hub_cache"] == str(Path("/hf") / "hub")
+    assert spec["ignore_patterns"] == ROLE_IGNORE
+    assert [
+        (s["role_key"], s["repo_id"], s["revision"], s["allow_patterns"])
+        for s in spec["snapshots"]
+    ] == [
+        (
+            "canary",
+            "nvidia/canary-qwen-2.5b",
+            CANARY_SHA,
+            ROLE_PREFETCH["canary"]["allow"],
+        ),
+        (
+            "canary_llm",
+            "Qwen/Qwen3-1.7B",
+            QWEN_SHA,
+            ROLE_PREFETCH["canary_llm"]["allow"],
+        ),
+    ]
+    assert pilot.main(["--backend", "granite", "--print-prefetch-spec"]) == 0
+    (g,) = json.loads(capsys.readouterr().out)["snapshots"]
+    assert (g["revision"], g["allow_patterns"]) == (
+        GRANITE_SHA,
+        ROLE_PREFETCH["granite"]["allow"],
+    )
+
+
+def test_resolve_snapshot_offline_without_refs_main(tmp_path: Path) -> None:
+    snap = _snapshot(tmp_path, "Qwen/Qwen3-1.7B", QWEN_SHA, QWEN_FILES)
+    spec = pilot.SnapshotSpec(
+        "canary_llm", "Qwen/Qwen3-1.7B", QWEN_SHA, tuple(QWEN_FILES)
+    )
+    assert pilot.resolve_snapshot(tmp_path, spec) == snap
+    assert not (tmp_path / "models--Qwen--Qwen3-1.7B" / "refs").exists()
+    # A branch name is resolved through refs/<name> when one exists.
+    ref = tmp_path / "models--Qwen--Qwen3-1.7B" / "refs" / "main"
+    ref.parent.mkdir(parents=True)
+    ref.write_text(QWEN_SHA)
+    branch = pilot.SnapshotSpec(
+        "canary_llm", "Qwen/Qwen3-1.7B", "main", tuple(QWEN_FILES)
+    )
+    assert pilot.resolve_snapshot(tmp_path, branch) == snap
+
+
+def test_resolve_snapshot_globs_and_missing_files_name_the_role(tmp_path: Path) -> None:
+    _snapshot(
+        tmp_path,
+        "ibm-granite/granite-speech-4.1-2b",
+        GRANITE_SHA,
+        {"config.json": "{}", "merges.txt": ""},
+    )
+    spec = pilot.SnapshotSpec(
+        "granite",
+        "ibm-granite/granite-speech-4.1-2b",
+        GRANITE_SHA,
+        tuple(ROLE_PREFETCH["granite"]["allow"]),
+    )
+    with pytest.raises(pilot.PrefetchMissing) as err:
+        pilot.resolve_snapshot(tmp_path, spec)
+    msg = str(err.value)
+    assert (
+        "*.safetensors" in msg
+        and "chat_template.jinja" in msg
+        and "*.json" not in msg.split("lacks")[1]
+    )
+    assert (
+        "asr_pilot_windows_granite_allow_patterns" in msg
+        and "--print-prefetch-spec" in msg
+    )
+    with pytest.raises(pilot.PrefetchMissing, match="not in the HF cache"):
+        pilot.resolve_snapshot(tmp_path / "empty", spec)
+
+
+class _FakeSALM:
+    instances: ClassVar[list[Any]] = []
+
+    def __init__(self, cfg: dict) -> None:
+        assert isinstance(cfg, dict)
+        self.cfg = cfg
+        self.loaded: Any = None
+        _FakeSALM.instances.append(self)
+
+    @classmethod
+    def from_pretrained(cls, *a: Any, **k: Any) -> Any:
+        raise AssertionError("from_pretrained would resolve Qwen by repo id")
+
+    @classmethod
+    def _load_as_safetensor(
+        cls, model: Any, path: str, map_location: str, strict: bool
+    ) -> Any:
+        model.loaded = (path, map_location, strict)
+        return model
+
+    def to(self, device: str) -> Self:
+        self.device = device
+        return self
+
+    def eval(self) -> Self:
+        return self
+
+
+def _stub_modules(monkeypatch: pytest.MonkeyPatch, **mods: Any) -> None:
+    import types
+
+    for name, attrs in mods.items():
+        mod = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_canary_load_gives_salm_local_paths_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")  # restored after the test
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    canary = _snapshot(
+        tmp_path,
+        "nvidia/canary-qwen-2.5b",
+        CANARY_SHA,
+        {"config.json": CANARY_CONFIG, "model.safetensors": "w"},
+    )
+    qwen = _snapshot(tmp_path, "Qwen/Qwen3-1.7B", QWEN_SHA, QWEN_FILES)
+    _FakeSALM.instances.clear()
+    _stub_modules(
+        monkeypatch,
+        torch={"bfloat16": "bf16"},
+        nemo={},
+        **{"nemo.collections": {}, "nemo.collections.speechlm2": {}},
+        **{"nemo.collections.speechlm2.models": {"SALM": _FakeSALM}},
+    )
+    cfg = pilot.load_config(["--backend", "canary", "--self-check"], _hf_env(tmp_path))
+    backend = pilot.CanaryBackend(cfg)
+    backend.load()
+    (m,) = _FakeSALM.instances
+    assert m.cfg["pretrained_llm"] == str(qwen) and m.cfg["tokenizer_path"] == str(qwen)
+    assert m.cfg["pretrained_weights"] is False and m.cfg["trust_remote_code"] is False
+    assert (
+        m.cfg["pretrained_asr"] == "nvidia/canary-1b-flash"
+    )  # untouched; not loaded when weights are off
+    assert m.loaded == (str(canary / "model.safetensors"), "cpu", False)
+    assert backend.local_dirs == {"model": str(canary), "llm": str(qwen)}
+    assert backend.model.device == "cuda"
+    assert (
+        os.environ["HF_HUB_OFFLINE"] == "1"
+        and os.environ["TRANSFORMERS_OFFLINE"] == "1"
+    )
+    # Nothing SALM got for the LLM or tokenizer is a repo id.
+    assert all(Path(m.cfg[k]).is_dir() for k in ("pretrained_llm", "tokenizer_path"))
+
+
+def test_canary_load_qwen_override_and_missing_qwen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")  # restored after the test
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    _snapshot(
+        tmp_path,
+        "nvidia/canary-qwen-2.5b",
+        CANARY_SHA,
+        {"config.json": CANARY_CONFIG, "model.safetensors": "w"},
+    )
+    _stub_modules(
+        monkeypatch,
+        torch={},
+        nemo={},
+        **{"nemo.collections": {}, "nemo.collections.speechlm2": {}},
+        **{"nemo.collections.speechlm2.models": {"SALM": _FakeSALM}},
+    )
+    other = "1" * 40
+    cfg = pilot.load_config(
+        ["--backend", "canary", "--self-check"],
+        _hf_env(tmp_path, PILOT_QWEN_REVISION=other),
+    )
+    assert cfg.qwen_revision == other
+    with pytest.raises(
+        pilot.PrefetchMissing, match="asr_pilot_windows_canary_llm_allow_patterns"
+    ):
+        pilot.CanaryBackend(cfg).load()
+
+
+def test_granite_load_uses_the_local_snapshot_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")  # restored after the test
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    files = {
+        "config.json": "{}",
+        "model-00001-of-00003.safetensors": "w",
+        "chat_template.jinja": "",
+        "merges.txt": "",
+    }
+    hub = tmp_path / "home" / "hub"  # HF_HOME/hub when HF_HUB_CACHE is unset
+    local = _snapshot(hub, "ibm-granite/granite-speech-4.1-2b", GRANITE_SHA, files)
+    seen: dict[str, Any] = {}
+
+    class Tok:
+        padding_side = "right"
+
+        def apply_chat_template(self, chat: Any, **k: Any) -> str:
+            return "PROMPT"
+
+    class Proc:
+        tokenizer = Tok()
+
+    class AutoProcessor:
+        @staticmethod
+        def from_pretrained(path: str, **k: Any) -> Any:
+            seen["processor"] = (path, k)
+            return Proc()
+
+    class Model:
+        def eval(self) -> None:
+            return None
+
+    class AutoModelForSpeechSeq2Seq:
+        @staticmethod
+        def from_pretrained(path: str, **k: Any) -> Any:
+            seen["model"] = (path, k)
+            return Model()
+
+    _stub_modules(
+        monkeypatch,
+        torch={"bfloat16": "bf16"},
+        transformers={
+            "AutoProcessor": AutoProcessor,
+            "AutoModelForSpeechSeq2Seq": AutoModelForSpeechSeq2Seq,
+        },
+    )
+    cfg = pilot.load_config(
+        ["--backend", "granite", "--self-check"],
+        {"PILOT_MODEL_REVISION": GRANITE_SHA, "HF_HOME": str(tmp_path / "home")},
+    )
+    backend = pilot.GraniteBackend(cfg)
+    backend.load()
+    assert seen["processor"] == (str(local), {})
+    path, kw = seen["model"]
+    assert path == str(local) and "revision" not in kw and kw["dtype"] == "bf16"
+    assert backend.tokenizer.padding_side == "left" and backend.prompt == "PROMPT"
+
+
+# ── --bench window gathering ───────────────────────────────────────────────────
+BENCH_TRACKS = [
+    ("B1", "/books/a/1.m4b", TID, 223.35),  # 3 granite windows (90 + 90 + 43.35)
+    ("B1", "/books/a/2.m4b", TID, 450.0),  # 5
+    ("B2", "/books/b/1.m4b", TID, 900.0),  # 10
+]
+
+
+def test_bench_default_cap_follows_batches_and_window() -> None:
+    assert make_cfg("granite", "--bench").bench_max_sec == 32 * 2 * 90.0  # 5760 s
+    # With a window sweep the cap follows the longest window.
+    sweep = make_cfg("granite", "--bench", "--bench-windows", "60,120")
+    assert (
+        sweep.bench_windows == [60.0, 120.0] and sweep.bench_max_sec == 32 * 2 * 120.0
+    )
+    assert make_cfg("granite", "--bench").bench_windows == [90.0]
+    assert (
+        make_cfg("canary", "--bench", "--bench-batches", "1,4").bench_max_sec
+        == 4 * 2 * 38.0
+    )
+    assert (
+        make_cfg("granite", "--bench", "--bench-max-sec", "500").bench_max_sec == 500.0
+    )
+
+
+def test_bench_gathers_windows_across_tracks_until_enough() -> None:
+    cfg = make_cfg("granite", "--bench", "--bench-batches", "1,4")  # wants 8 windows
+    plans = pilot.gather_bench_plans(
+        FakeConn(BENCH_TRACKS, []),
+        cfg,
+        pilot.select_tracks(FakeConn(BENCH_TRACKS, []), cfg),
+    )
+    assert [(t.file_path, len(p)) for t, p in plans] == [
+        ("/books/a/1.m4b", 3),
+        ("/books/a/2.m4b", 5),
+    ]
+
+
+def test_bench_gathering_respects_the_audio_cap() -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-batches", "1,32", "--bench-max-sec", "375"
+    )
+    conn = FakeConn(BENCH_TRACKS, [])
+    plans = pilot.gather_bench_plans(conn, cfg, pilot.select_tracks(conn, cfg))
+    # 223.35 s of track 1, then 90 s of track 2; the next 90 s would cross 375.
+    assert [(t.file_path, p) for t, p in plans] == [
+        ("/books/a/1.m4b", [(0.0, 90.0), (90.0, 180.0), (180.0, 223.35)]),
+        ("/books/a/2.m4b", [(0.0, 90.0)]),
+    ]
+    tiny = make_cfg("granite", "--bench", "--bench-max-sec", "10")
+    ((_t, p),) = pilot.gather_bench_plans(conn, tiny, pilot.select_tracks(conn, tiny))
+    assert len(p) == 1  # a cap below one window still benches one window
+
+
+def test_bench_rows_report_batches_and_starvation(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-batches", "1,4,16", "--bench-max-sec", "375",
+        "--limit-tracks", "1",
+    )  # fmt: skip
+    conn = FakeConn(BENCH_TRACKS, [])
+    backend = FakeBackend(cfg, "granite")
+    with caplog.at_level("WARNING"):
+        assert run(cfg, conn, backend) == 0
+    b = json.loads(capsys.readouterr().out)["bench"]
+    # --limit-tracks is ignored in bench mode: two tracks were gathered.
+    assert b["tracks"] == ["/books/a/1.m4b", "/books/a/2.m4b"]
+    assert b["file_path"] == "/books/a/1.m4b" and b["windows"] == 4
+    assert b["windows_wanted"] == 32 and b["max_sec"] == 375.0
+    assert b["window_secs"] == [90.0]
+    rows = {r["batch_size"]: r for r in b["results"]}
+    assert set(rows) == {1, 4, 16}
+    for r in rows.values():
+        assert set(r) == {
+            "batch_size", "batch_size_used", "tracks", "windows", "batches",
+            "windows_per_batch", "starved", "audio_sec", "wall_sec", "decode_sec",
+            "rtfx", "peak_vram_mib", "peak_reserved_mib", "degenerate_windows",
+            "window_sec", "degenerate_rate", "word_completeness",
+        }  # fmt: skip
+        assert r["tracks"] == 2 and r["windows"] == 4 and r["audio_sec"] == 313.35
+        assert r["window_sec"] == 90.0 and r["degenerate_rate"] == 0.0
+        assert r["word_completeness"] is None  # no production words in this fixture
+    assert (rows[1]["batches"], rows[1]["windows_per_batch"]) == (
+        4,
+        {"mean": 1.0, "min": 1},
+    )
+    # Batches span tracks: 3 windows of track 1 + 1 of track 2 fill one batch of 4.
+    assert (rows[4]["batches"], rows[4]["windows_per_batch"], rows[4]["starved"]) == (
+        1, {"mean": 4.0, "min": 4}, False,
+    )  # fmt: skip
+    assert rows[16]["starved"] is True and rows[1]["starved"] is False
+    assert any("batch_size=16 is starved" in r.getMessage() for r in caplog.records)
+    assert conn.writes() == []
+
+
+def test_print_prefetch_spec_refuses_a_default_revision_for_another_model() -> None:
+    with pytest.raises(pilot.ConfigError, match="PILOT_MODEL_REVISION"):
+        pilot.load_config(
+            ["--backend", "granite", "--print-prefetch-spec"],
+            {"PILOT_MODEL_ID": "ibm-granite/granite-speech-4.1-2b-nar"},
+        )
+    cfg = pilot.load_config(
+        ["--backend", "granite", "--print-prefetch-spec"],
+        {
+            "PILOT_MODEL_ID": "ibm-granite/granite-speech-4.1-2b-nar",
+            "PILOT_MODEL_REVISION": "a" * 40,
+        },
+    )
+    assert pilot.prefetch_spec(cfg)["snapshots"][0]["revision"] == "a" * 40
+
+
+def test_missing_prefetch_during_load_is_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg("canary", env={"HF_HUB_CACHE": str(tmp_path)})
+    conn = FakeConn(TRACKS, SEGMENTS)
+
+    class Unfetched(FakeBackend):
+        def load(self) -> None:
+            pilot.resolve_snapshot(tmp_path, pilot.snapshot_specs(self.cfg)[0])
+
+    backend = Unfetched(cfg, "canary")
+    # run() loads the model itself only when no backend is passed; patch the factory.
+    monkeypatch.setattr(pilot, "make_backend", lambda c: backend)
+    rc = pilot.run(cfg, conn, backend=None, decode=fake_decode, gaming_check=no_gaming)
+    assert rc == pilot.EXIT_CONFIG and conn.writes() == []
+
+
+def test_bench_skips_an_unplannable_track_and_fails_when_none_plan(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg(
+        "canary", "--bench", "--bench-batches", "1", "--bench-max-sec", "100"
+    )
+    conn = FakeConn(BENCH_TRACKS, [])
+    real = pilot.track_plan
+
+    def flaky(c: Any, cf: Any, track: Any) -> Any:
+        if track.file_path == "/books/a/1.m4b":
+            raise OSError("server closed the connection")
+        return real(c, cf, track)
+
+    monkeypatch.setattr(pilot, "track_plan", flaky)
+    assert run(cfg, conn) == 0
+    assert json.loads(capsys.readouterr().out)["bench"]["tracks"] == ["/books/a/2.m4b"]
+
+    def broken(*a: Any) -> Any:
+        raise OSError("nope")
+
+    monkeypatch.setattr(pilot, "track_plan", broken)
+    assert run(cfg, FakeConn(BENCH_TRACKS, [])) == pilot.EXIT_TRACKS_FAILED
+    assert capsys.readouterr().out == ""
+
+
+def test_bench_follows_asin_order_not_sort_order() -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-batches", "1", "--bench-max-sec", "100"
+    )
+    cfg.asins = ["B2", "B1"]  # select_tracks returns B1 first (ORDER BY asin)
+    conn = FakeConn(BENCH_TRACKS, [])
+    plans = pilot.gather_bench_plans(conn, cfg, pilot.select_tracks(conn, cfg))
+    assert [t.file_path for t, _ in plans] == ["/books/b/1.m4b"]
+    for bad in ("0", "-5", "nan"):
+        with pytest.raises(pilot.ConfigError):
+            make_cfg("granite", "--bench", "--bench-max-sec", bad)
+
+
+# ── step_runs recording (CONTRACT §1.10) ───────────────────────────────────────
+class RunsConn:
+    """A separate autocommit connection the recorder writes step_runs through."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.sql: list[tuple[str, Any]] = []
+        self.fail = fail
+        self.closed = 0
+        self.autocommit = False
+
+    def cursor(self) -> Any:
+        conn = self
+
+        class Cur:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *e: object) -> None:
+                return None
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                if conn.fail and "step_runs" in sql:
+                    raise OSError("relation step_runs is locked")
+                conn.sql.append((" ".join(sql.split()), params))
+
+            def fetchone(self) -> Any:
+                return (77,)
+
+        return Cur()
+
+    def close(self) -> None:
+        self.closed = 1
+
+    def updates(self) -> list[Any]:
+        return [p for q, p in self.sql if q.startswith("UPDATE step_runs")]
+
+    def inserts(self) -> list[Any]:
+        return [p for q, p in self.sql if q.startswith("INSERT INTO step_runs")]
+
+
+def _recorder(conn: RunsConn) -> Any:
+    return pilot.StepRunRecorder(lambda: conn, interval=0.0, threaded=False)
+
+
+def test_run_records_a_step_run_with_progress_and_done() -> None:
+    cfg = make_cfg("canary", "--batch-size", "1")
+    runs = RunsConn()
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), recorder=_recorder(runs)) == 0
+    assert runs.autocommit is True
+    assert runs.sql[0] == ("SET statement_timeout = 5000", None)
+    ((model, args, host, total, message),) = runs.inserts()
+    assert (
+        "INSERT INTO step_runs (step, mode, model, args, host, total, last_message) VALUES ('asr_pilot', 'write'"
+        in runs.sql[1][0]
+    )
+    assert model == f"nvidia/canary-qwen-2.5b@{REV[:12]}" and "--backend canary" in args
+    assert total == 2 and message == "loading model" and host
+    ups = runs.updates()
+    # one update per batch (6 windows) plus the final close
+    assert len(ups) == 7
+    *_, last = ups
+    total_, done, counters, msg, status, status2, error, run_id = last
+    assert (total_, done, status, status2, error, run_id) == (
+        2,
+        2,
+        "done",
+        "done",
+        None,
+        77,
+    )
+    c = json.loads(counters)
+    assert c["tracks_written"] == 2 and c["tracks_failed"] == 0 and c["windows"] == 6
+    assert c["degenerate"] == 0 and c["audio_sec"] == 180 and "eta_sec" in c
+    assert all(isinstance(v, int) for v in c.values())  # Go reads map[string]int64
+    assert msg.startswith("track 2/2 · 6 windows · 0 degenerate · rtfx ")
+    first = json.loads(ups[0][2])
+    assert first["windows"] == 1 and ups[0][4] is None  # a heartbeat, not a close
+
+
+def test_step_run_closes_cancelled_on_gaming_and_stop_file(tmp_path: Path) -> None:
+    cfg = make_cfg("canary", "--batch-size", "1")
+    runs = RunsConn()
+
+    def gaming() -> None:
+        raise pilot.GamingStop("state=gaming")
+
+    assert (
+        run(
+            cfg,
+            FakeConn(TRACKS, SEGMENTS),
+            gaming_check=gaming,
+            recorder=_recorder(runs),
+        )
+        == 4
+    )
+    last = runs.updates()[-1]
+    assert last[4] == "cancelled" and last[6].startswith("stopped for gaming")
+
+    stop = tmp_path / "STOP"
+    stop.touch()
+    cfg = make_cfg("canary", env={"PILOT_STOP_FILE": str(stop)})
+    runs = RunsConn()
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), recorder=_recorder(runs)) == 5
+    last = runs.updates()[-1]
+    assert last[4] == "cancelled" and last[6].startswith("stopped: stop file")
+
+
+def test_step_run_closes_failed_when_tracks_fail() -> None:
+    cfg = make_cfg("canary", "--batch-size", "1")
+    runs = RunsConn()
+    backend = FakeBackend(cfg, "canary", outputs=[RuntimeError("device-side assert")])
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), backend, recorder=_recorder(runs)) == 3
+    last = runs.updates()[-1]
+    assert last[4] == "failed" and last[6] == "1 track(s) failed"
+    c = json.loads(last[2])
+    assert (c["tracks_written"], c["tracks_failed"]) == (1, 1)
+
+
+def test_step_run_write_failures_never_fail_the_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cfg = make_cfg("canary")
+    conn = FakeConn(TRACKS, SEGMENTS)
+    broken = RunsConn(fail=True)
+    rec = _recorder(broken)
+    with caplog.at_level("WARNING"):
+        assert run(cfg, conn, recorder=rec) == 0
+    assert [p[0] for p in conn.inserts()] == ["/books/a/t1.m4b", "/books/a/t2.m4b"]
+    assert rec.errors >= 2 and rec.id is None
+    assert (
+        sum("step_runs" in r.getMessage() for r in caplog.records) == 1
+    )  # first error only
+
+    def no_db() -> Any:
+        raise OSError("connection refused")
+
+    rec = pilot.StepRunRecorder(no_db, interval=0.0, threaded=False)
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), recorder=rec) == 0
+
+
+def test_dry_run_and_bench_write_no_step_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runs = RunsConn()
+    assert (
+        run(
+            make_cfg("granite", "--dry-run"),
+            FakeConn(TRACKS, SEGMENTS),
+            recorder=_recorder(runs),
+        )
+        == 0
+    )
+    bench = make_cfg(
+        "canary", "--bench", "--bench-batches", "1", "--bench-max-sec", "50"
+    )
+    assert run(bench, FakeConn(TRACKS, SEGMENTS), recorder=_recorder(runs)) == 0
+    capsys.readouterr()
+    assert runs.sql == []
+
+
+def test_step_run_heartbeat_thread_writes_during_a_long_batch() -> None:
+    import time as _time
+
+    runs = RunsConn()
+    rec = pilot.StepRunRecorder(lambda: runs, interval=0.0, heartbeat=0.02)
+    rec.start(model="m", args="a", total=1, message="loading model")
+    _time.sleep(0.15)  # no progress() call: only heartbeats
+    beats = len(runs.updates())
+    rec.finish("done")
+    assert beats >= 2
+    assert runs.updates()[-1][4] == "done" and runs.closed == 1
+
+
+def test_bench_exits_3_when_a_sweep_row_fails(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = make_cfg(
+        "canary", "--bench", "--bench-batches", "1,2", "--bench-max-sec", "100"
+    )
+    backend = FakeBackend(
+        cfg, "canary", outputs=["Fine.", "Fine.", RuntimeError("boom")]
+    )
+    assert run(cfg, FakeConn(BENCH_TRACKS, []), backend) == pilot.EXIT_TRACKS_FAILED
+    rows = json.loads(capsys.readouterr().out)["bench"]["results"]
+    assert rows[0]["batch_size"] == 1 and "error" not in rows[0]
+    assert rows[1] == {"window_sec": 38.0, "batch_size": 2, "error": "failed (see log)"}
+
+
+def test_step_run_outage_retries_once_per_interval_not_per_batch() -> None:
+    now = [0.0]
+    connects: list[int] = []
+
+    def no_db() -> Any:
+        connects.append(1)
+        raise OSError("connection refused")
+
+    rec = pilot.StepRunRecorder(
+        no_db, interval=2.0, threaded=False, clock=lambda: now[0]
+    )
+    rec.start(model="m", args="a", total=3, message="loading model")
+    assert len(connects) == 1
+    for t in (0.5, 1.0, 1.9):  # batches inside the interval: no new attempt
+        now[0] = t
+        rec.progress(done=0, counters={}, message="x")
+    assert len(connects) == 1
+    now[0] = 2.5
+    rec.progress(done=1, counters={}, message="y")
+    assert len(connects) == 2
+
+
+def test_step_run_finish_never_waits_long_for_a_stuck_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time as _time
+
+    monkeypatch.setattr(pilot, "STEP_RUN_LOCK_WAIT_SEC", 0.05)
+    runs = RunsConn()
+    rec = pilot.StepRunRecorder(lambda: runs, interval=0.0, threaded=False)
+    rec.start(model="m", args="a", total=1, message="loading model")
+    rec._lock.acquire()  # a heartbeat stuck in a slow connect
+    t0 = _time.monotonic()
+    rec.finish("done")
+    assert _time.monotonic() - t0 < 1.0 and rec.errors == 1
+    rec._lock.release()
+
+
+# ── Degenerate-window guards (desktop-2 diagnosis, The Fifth Season) ───────────
+def test_repeats_ngram_checks_the_newest_8gram() -> None:
+    head = list(range(8))
+    assert not pilot.repeats_ngram(head * 2)
+    assert pilot.repeats_ngram(head * 3)
+    assert not pilot.repeats_ngram(head * 3 + [99])  # newest 8-gram differs
+    assert pilot.row_stop_flags([head * 3, list(range(30))]) == [True, False]
+
+
+def test_reread_and_overlong_are_degenerate() -> None:
+    sentence = (
+        "the sun rose slowly over the broken city of yumenes and nobody in the "
+        "whole quiet world saw it"
+    )
+    reread = f"{sentence} and then more words follow here. {sentence}"
+    assert pilot.has_repetition_loop(reread.split())  # 16-gram twice
+    eight = "one two three four five six seven eight"
+    assert pilot.has_repetition_loop(f"{eight} a {eight} b {eight}".split())
+    assert not pilot.has_repetition_loop(f"{eight} a {eight}".split())
+    normal = " ".join(f"word{i}" for i in range(200))
+    assert pilot.degenerate_reason(normal, False, 90.0) is None  # 2.2 words/s
+    assert pilot.degenerate_reason(normal, False, 40.0) == "overlong"  # 5 words/s
+    assert pilot.degenerate_reason(normal, False) is None  # no window: not judged
+
+
+def test_strip_special_tokens() -> None:
+    raw = "le|><|fim_middle|><|fim_middle|>humanity.<|fim_middle|>human. <|endoftext|>"
+    assert pilot.strip_special_tokens(raw) == "le|> humanity. human."
+    assert pilot.strip_special_tokens("a < b | c > d") == "a < b | c > d"
+
+
+def test_granite_defaults_follow_the_diagnosis() -> None:
+    cfg = make_cfg("granite")
+    assert (cfg.window_sec, cfg.hard_max_sec) == (90.0, 120.0)
+    assert pilot.GRANITE_TOKENS_PER_SECOND == 5 and pilot.TOKEN_MARGIN == 1.25
+    assert pilot.max_new_tokens(5, 64, [90.0]) == 562
+    assert make_cfg("granite", "--no-repeat-ngram-size", "6").no_repeat_ngram_size == 6
+    with pytest.raises(pilot.ConfigError):
+        make_cfg("granite", "--bench", "--bench-windows", "60,150")
+
+
+def test_degenerate_overlong_window_marked_in_a_run() -> None:
+    out = tempfile.mkdtemp(prefix="pilot-overlong-")
+    cfg = make_cfg("canary", "--out-dir", out)
+    conn = FakeConn([("B1", "/books/a/t.m4b", TID, 38.0)], [])
+    many = " ".join(f"w{i}" for i in range(200))  # > 4 words/s x 38 s
+    assert run(cfg, conn, FakeBackend(cfg, "canary", outputs=[many])) == 0
+    data = json.loads(next(Path(out).glob("*.json")).read_text(encoding="utf-8"))
+    assert [d["reason"] for d in data["degenerate_windows"]] == ["overlong"]
+
+
+def _prod_segments(duration: float) -> list[dict]:
+    words = [
+        {"word": f"w{i}", "start": i * 0.5, "end": i * 0.5 + 0.3}
+        for i in range(int(duration * 2))
+    ]
+    return [{"words": words}]
+
+
+def test_bench_sweeps_window_lengths_on_the_same_audio_with_completeness(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-windows", "60,120", "--bench-batches", "2",
+        "--bench-max-sec", "240",
+    )  # fmt: skip
+    conn = FakeConn([("B1", "/books/a/1.m4b", TID, 600.0)], _prod_segments(600.0))
+
+    class Echo(FakeBackend):
+        """Plausible-length text that matches no production word."""
+
+        def transcribe_batch(self, audios: Any) -> list[Any]:
+            self.batches.append(len(audios))
+            out = []
+            for a in audios:
+                n = round(len(a) / pilot.SAMPLE_RATE * 2)
+                out.append(pilot.WindowResult(text=" ".join(f"z{i}" for i in range(n))))
+            return out
+
+    assert run(cfg, conn, Echo(cfg, "granite")) == 0
+    b = json.loads(capsys.readouterr().out)["bench"]
+    assert b["window_secs"] == [60.0, 120.0]
+    short, long_ = b["results"]
+    # Gathered once at the longest window (two ~120 s windows cut at production
+    # pauses, capped at 240 s), then re-planned per window: same audio, more windows.
+    assert (short["window_sec"], long_["window_sec"]) == (60.0, 120.0)
+    assert short["audio_sec"] == long_["audio_sec"] and long_["windows"] == 2
+    assert short["windows"] > long_["windows"]
+    for r in b["results"]:
+        assert r["word_completeness"] == 0.0  # "z<i>" never matches a production word
+        assert r["degenerate_rate"] == 0.0
+
+
+def test_word_completeness_is_multiset_recall_per_window() -> None:
+    prod = [
+        (0.0, 0.5, "The"),
+        (1.0, 1.5, "cat,"),
+        (2.0, 2.5, "the"),
+        (60.0, 60.5, "dog"),
+    ]
+    windows = [(0.0, 30.0, "the cat"), (30.0, 90.0, "")]
+    # window 1: the, cat matched (2 of 3 'the cat the'); window 2: dog missed.
+    assert pilot.word_completeness(windows, prod) == 0.5
+    assert pilot.word_completeness(windows, []) is None
+
+
+def test_hf_hub_cache_matches_huggingface_hub_precedence() -> None:
+    home = Path("~").expanduser()
+    assert pilot.hf_hub_cache({}) == home / ".cache" / "huggingface" / "hub"
+    assert pilot.hf_hub_cache({"XDG_CACHE_HOME": "/xdg"}) == Path(
+        "/xdg/huggingface/hub"
+    )
+    assert pilot.hf_hub_cache({"XDG_CACHE_HOME": "/xdg", "HF_HOME": "/hf"}) == Path(
+        "/hf/hub"
+    )
+    assert pilot.hf_hub_cache(
+        {"HF_HOME": "/hf", "HUGGINGFACE_HUB_CACHE": "/old"}
+    ) == Path("/old")
+    assert pilot.hf_hub_cache(
+        {"HUGGINGFACE_HUB_CACHE": "/old", "HF_HUB_CACHE": "/new"}
+    ) == Path("/new")
+    assert pilot.hf_hub_cache({"HF_HOME": "~/hfh"}) == home / "hfh" / "hub"
+
+
+def test_step_run_lock_timeout_leaves_the_connection_to_its_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pilot, "STEP_RUN_LOCK_WAIT_SEC", 0.01)
+    runs = RunsConn()
+    rec = pilot.StepRunRecorder(lambda: runs, interval=0.0, threaded=False)
+    rec.start(model="m", args="a", total=1, message="loading model")
+    held = rec.conn
+    rec._lock.acquire()
+    rec.progress(done=0, counters={}, message="x")
+    assert rec.errors == 1 and rec.conn is held and runs.closed == 0  # untouched
+    rec._lock.release()
+
+
+def test_bench_rolls_back_after_a_failed_production_read(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg(
+        "canary", "--bench", "--bench-batches", "1", "--bench-max-sec", "100"
+    )
+    conn = FakeConn(BENCH_TRACKS, [])
+    rollbacks: list[int] = []
+    conn.rollback = lambda: rollbacks.append(1)  # type: ignore[method-assign]
+
+    def broken(c: Any, t: Any) -> Any:
+        raise OSError("transient")
+
+    monkeypatch.setattr(pilot, "read_production_segments", broken)
+    monkeypatch.setattr(
+        pilot, "track_plan", lambda c, cf, t: ([(0.0, 38.0), (38.0, 76.0)], 0)
+    )
+    n = len(rollbacks)
+    assert run(cfg, conn) == 0
+    assert len(rollbacks) > n
+    assert (
+        json.loads(capsys.readouterr().out)["bench"]["results"][0]["word_completeness"]
+        is None
+    )

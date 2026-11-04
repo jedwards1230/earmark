@@ -28,20 +28,26 @@ CLI:
                     [--limit-tracks N] [--track-limit-per-book N] [--force]
                     [--batch-size N] [--repetition-penalty P]
                     [--dry-run] [--out-dir DIR] [--arbiter-url URL]
-                    [--self-check [--self-check-audio CLIP]]
-                    [--bench [--bench-batches 1,8,16,32] [--bench-max-sec S]]
+                    [--self-check [--self-check-audio CLIP]] [--print-prefetch-spec]
+                    [--bench [--bench-batches 1,8,16,32] [--bench-windows 60,90,120]
+                             [--bench-max-sec S]] [--no-repeat-ngram-size N]
 
 Environment:
     DATABASE_URL          required (except --self-check). earmark Postgres DSN.
     PILOT_MODEL_ID        default per backend (see DEFAULT_MODEL_IDS).
     PILOT_MODEL_REVISION  required: the HF commit sha to load. Unpinned runs are refused.
-    HF_HOME               HF cache (the pilot's own, not production's).
+    HF_HOME               HF cache (the pilot's own, not production's); snapshots are
+                          read from huggingface_hub's cache dir (HF_HUB_CACHE,
+                          HUGGINGFACE_HUB_CACHE, $HF_HOME/hub, $XDG_CACHE_HOME/
+                          huggingface/hub), offline only.
+    PILOT_QWEN_MODEL_ID   canary's LLM repo (default Qwen/Qwen3-1.7B).
+    PILOT_QWEN_REVISION   its pinned commit (default 70d244cc…; see QWEN_REVISION).
     BOOKS_MOUNT           as runner.py: this host's books mount (UNC on Windows).
     BOOKS_DB_ROOT         as runner.py: default /books.
     BOOKS_PATH_ENCODING   as runner.py: none | sfm.
     FFMPEG_BIN            default "ffmpeg" (runner.py resolves ffmpeg from PATH).
     FFPROBE_BIN           default "ffprobe" (only --self-check uses it).
-    PILOT_WINDOW_SEC      target window; granite default 240 (hard max 540),
+    PILOT_WINDOW_SEC      target window; granite default 90 (hard max 120),
                           canary default 38 (hard max 40).
     PILOT_DEVICE          default cuda.
     PILOT_STOP_FILE       optional path; if it exists (checked before each track,
@@ -58,12 +64,15 @@ from __future__ import annotations
 import argparse
 import bisect
 import contextlib
+import fnmatch
 import hashlib
 import importlib.util
 import json
 import logging
 import math
 import os
+import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -90,19 +99,56 @@ SAMPLE_RATE = 16000
 BACKENDS = ("granite", "canary")
 SCOPES = ("full", "findings")
 
+# ---------------------------------------------------------------------------
+# HF snapshots (single source of truth for the deploy-time prefetch)
+# ---------------------------------------------------------------------------
+# Runs are offline (HF_HUB_OFFLINE=1): every model file is prefetched by the
+# homelab-ansible role asr_pilot_windows at apply time, and pilot.py resolves the
+# local snapshot DIRECTORIES itself — no hub call, no refs/ lookup. These lists
+# are what the role must prefetch; `pilot.py --print-prefetch-spec` prints them
+# (test_pilot.py asserts they equal the role's current lists).
+#
+# Canary-Qwen's config.json names pretrained_llm "Qwen/Qwen3-1.7B" (no revision).
+# SALM builds its tokenizer and LLM skeleton from that (pretrained_weights is
+# forced False, so the Qwen weights are never read); pilot.py points it at the
+# local Qwen snapshot pinned below instead of the repo id.
+DEFAULT_MODEL_REVISIONS: dict[str, str] = {
+    "granite": "823ca793aa49925d4eb2e758709b7f2c98513e8e",
+    "canary": "b1469e1bba1cfe140205529c79c434ca47180960",
+}
+QWEN_MODEL_ID = "Qwen/Qwen3-1.7B"
+QWEN_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+PREFETCH_ALLOW_PATTERNS: dict[str, list[str]] = {
+    "granite": ["*.json", "*.safetensors", "chat_template.jinja", "merges.txt"],
+    "canary": ["config.json", "model.safetensors"],
+    "canary_llm": [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+    ],
+}
+PREFETCH_IGNORE_PATTERNS: list[str] = [".eval_results/*", "*.nemo"]
+
 DEFAULT_MODEL_IDS: dict[str, str] = {
     "granite": "ibm-granite/granite-speech-4.1-2b",
     "canary": "nvidia/canary-qwen-2.5b",
 }
 # Target window length (s) and the hard maximum no window may exceed.
-# granite: the 4.1 family is evaluated up to 9 min per segment for plain ASR;
+# granite: measured on desktop-2 (The Fifth Season, 2026-11-04): windows under
+#   130 s were 0/5 degenerate and ~95% word-complete against production; at
+#   150 s and over, 45/65 were degenerate (the model transcribes the window,
+#   misses end-of-transcript and re-reads it) and even the clean ones dropped
+#   ~22% of the words. Hence 90 s, never above 120 s.
 # canary: trained on <=40 s audio (1024-token sequence cap).
-DEFAULT_WINDOW_SEC: dict[str, float] = {"granite": 240.0, "canary": 38.0}
-HARD_MAX_WINDOW_SEC: dict[str, float] = {"granite": 540.0, "canary": 40.0}
+DEFAULT_WINDOW_SEC: dict[str, float] = {"granite": 90.0, "canary": 38.0}
+HARD_MAX_WINDOW_SEC: dict[str, float] = {"granite": 120.0, "canary": 40.0}
 MIN_WINDOW_SEC = 5.0
 DEFAULT_BATCH_SIZE: dict[str, int] = {"granite": 16, "canary": 32}
 DEFAULT_BENCH_BATCHES = "1,8,16,32"
-DEFAULT_BENCH_MAX_SEC = 1800.0
+BENCH_WINDOWS_PER_BATCH = 2  # bench gathers max(--bench-batches) x this many windows
 
 # Cut search: the largest inter-word gap inside the last 25% of the target window.
 CUT_SEARCH_FRACTION = 0.25
@@ -113,7 +159,9 @@ FINDING_PAD_SEC = 5.0
 GRANITE_PROMPT = (
     "<|audio|>transcribe the speech with proper punctuation and capitalization."
 )
-GRANITE_TOKENS_PER_SECOND = 12
+# ~2.3 words/s of narration (production) is ~3 tokens/s; 12 gave ~3.5x headroom,
+# so a re-reading row ran ~5x more decode steps (and KV cache) than needed.
+GRANITE_TOKENS_PER_SECOND = 5
 GRANITE_MIN_NEW_TOKENS = 64
 # Canary generation (model card, canary-qwen-2.5b).
 CANARY_PROMPT_TEMPLATE = "Transcribe the following: {tag}"
@@ -125,6 +173,20 @@ TOKEN_MARGIN = 1.25
 # Repetition-loop guard: an n-gram repeated back-to-back this many times marks
 # the window degenerate (single words need a longer run: "no, no, no" is speech).
 REPEAT_MIN_RUNS: dict[int, int] = {1: 8, 2: 5, 3: 4, 4: 4, 5: 4, 6: 4}
+# Re-read guard (not back-to-back): the same 8-word run 3+ times, or the same
+# 16-word run twice, anywhere in a window — a re-read of a sentence or of the
+# whole window. Book prose essentially never does either within 2 minutes.
+REREAD_NGRAMS: dict[int, int] = {8: 3, 16: 2}
+# The per-row generate() stop: a row whose generated tokens repeat one 8-gram
+# 3 times stops (its remaining positions are padded), so one degenerate row
+# no longer runs the whole batch to max_new_tokens.
+STOP_NGRAM = 8
+STOP_NGRAM_COUNT = 3
+# More words than this per audio second is not narration (production is ~2.3).
+OVERLONG_WORDS_PER_SEC = 4.0
+# Chat-template / FIM special tokens that leak into decoded text (seen as
+# <|fim_middle|> in 40/45 degenerate Granite windows).
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|<>\s]{1,40}\|>")
 GRANITE_SILENCE_TOKEN = "_"  # never emitted in plain mode; kept out of the guard
 
 ARBITER_TIMEOUT_SEC = 5.0
@@ -137,7 +199,7 @@ MAX_FINDING_SPANS = 5000  # bound on the per-track findings query
 # Audio is decoded per group of contiguous windows of at most
 # max(DECODE_CHUNK_MIN_SEC, batch_size x window_sec) seconds, so one chunk holds
 # a full batch and memory stays bounded whatever the track length (granite
-# 16 x 240 s = 64 min ~ 250 MB of float32 at 16 kHz).
+# 16 x 120 s = 32 min ~ 120 MB of float32 at 16 kHz).
 DECODE_CHUNK_MIN_SEC = 1800.0
 
 
@@ -220,11 +282,17 @@ class Config:
     arbiter_url: str | None = None
     self_check: bool = False
     self_check_audio: Path = SELF_CHECK_AUDIO
+    print_prefetch_spec: bool = False
+    hf_cache: Path | None = None
+    qwen_model_id: str = QWEN_MODEL_ID
+    qwen_revision: str = QWEN_REVISION
     bench: bool = False
     bench_batches: list[int] = field(default_factory=lambda: [1, 8, 16, 32])
-    bench_max_sec: float = DEFAULT_BENCH_MAX_SEC
+    bench_max_sec: float = 0.0  # 0 = max(bench_batches) x 2 x window_sec
     batch_size: int = 1
     repetition_penalty: float = 1.0
+    no_repeat_ngram_size: int = 0
+    bench_windows: list[float] = field(default_factory=list)
     stop_file: Path | None = None
     database_url: str = ""
     model_id: str = ""
@@ -293,6 +361,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="granite generate() repetition_penalty (default 1.0 = off)",
     )
     p.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=0,
+        help="granite generate() no_repeat_ngram_size, for experiments (default 0 = off)",
+    )
+    p.add_argument(
         "--dry-run", action="store_true", help="print the plan; no model, no writes"
     )
     p.add_argument(
@@ -315,16 +389,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="clip for --self-check; expected text in the same path with .txt",
     )
     p.add_argument(
+        "--print-prefetch-spec",
+        action="store_true",
+        help="print the HF repos/revisions/allow-patterns a run needs offline (JSON)",
+    )
+    p.add_argument(
         "--bench",
         action="store_true",
-        help="sweep --bench-batches on one track; print JSON, no DB writes",
+        help="sweep --bench-batches over windows gathered across the --asin tracks; "
+        "print JSON, no DB writes",
     )
     p.add_argument("--bench-batches", type=_batch_list, default=DEFAULT_BENCH_BATCHES)
     p.add_argument(
+        "--bench-windows",
+        default="",
+        help="comma list of window seconds to sweep with --bench (default: the "
+        "configured window), e.g. 60,90,120",
+    )
+    p.add_argument(
         "--bench-max-sec",
         type=float,
-        default=DEFAULT_BENCH_MAX_SEC,
-        help="bench at most this much audio of the track (default 1800)",
+        default=None,
+        help="cap on the benched audio, all tracks together "
+        "(default max(--bench-batches) x 2 x window)",
     )
     return p
 
@@ -352,17 +439,26 @@ def load_config(
 
     backend = args.backend
     asins = [a.strip() for a in args.asin.split(",") if a.strip()]
-    if not args.self_check and not asins:
+    no_db = args.self_check or args.print_prefetch_spec
+    if not no_db and not asins:
         raise ConfigError("--asin is required (comma-separated ASINs)")
 
     revision = env.get("PILOT_MODEL_REVISION", "").strip()
+    model_id = env.get("PILOT_MODEL_ID", "").strip() or DEFAULT_MODEL_IDS[backend]
+    if not revision and args.print_prefetch_spec:
+        if model_id != DEFAULT_MODEL_IDS[backend]:
+            raise ConfigError(
+                f"PILOT_MODEL_ID={model_id} has no pinned default revision; "
+                "set PILOT_MODEL_REVISION"
+            )
+        revision = DEFAULT_MODEL_REVISIONS[backend]
     if not revision:
         raise ConfigError(
             "PILOT_MODEL_REVISION is required (HF commit sha); refusing to run unpinned"
         )
 
     database_url = env.get("DATABASE_URL", "").strip()
-    if not args.self_check and not database_url:
+    if not no_db and not database_url:
         raise ConfigError("DATABASE_URL is required")
 
     hard_max = HARD_MAX_WINDOW_SEC[backend]
@@ -382,6 +478,10 @@ def load_config(
         )
     if args.self_check and (args.dry_run or args.bench):
         raise ConfigError("--self-check cannot be combined with --dry-run or --bench")
+    if args.bench_max_sec is not None and not (
+        math.isfinite(args.bench_max_sec) and args.bench_max_sec > 0
+    ):
+        raise ConfigError(f"--bench-max-sec must be > 0: {args.bench_max_sec}")
     if args.bench and args.dry_run:
         raise ConfigError("--bench and --dry-run are exclusive")
     bench_batches = (
@@ -389,6 +489,20 @@ def load_config(
         if isinstance(args.bench_batches, list)
         else _batch_list(args.bench_batches)
     )
+    try:
+        bench_windows = [float(x) for x in args.bench_windows.split(",") if x.strip()]
+    except ValueError as exc:
+        raise ConfigError(
+            f"--bench-windows {args.bench_windows!r} is not a list of numbers"
+        ) from exc
+    for w in bench_windows:
+        if not math.isfinite(w) or w < MIN_WINDOW_SEC or w > hard_max:
+            raise ConfigError(
+                f"--bench-windows {w} out of range for {backend}: [{MIN_WINDOW_SEC}, {hard_max}]"
+            )
+    bench_windows = bench_windows or [window]
+    if args.no_repeat_ngram_size < 0:
+        raise ConfigError("--no-repeat-ngram-size must be >= 0")
 
     mount_raw = env.get("BOOKS_MOUNT", "/mnt/media/books")
     return Config(
@@ -407,16 +521,24 @@ def load_config(
         arbiter_url=(args.arbiter_url or "").rstrip("/") or None,
         self_check=args.self_check,
         self_check_audio=args.self_check_audio,
+        print_prefetch_spec=args.print_prefetch_spec,
+        hf_cache=hf_hub_cache(env),
+        qwen_model_id=env.get("PILOT_QWEN_MODEL_ID", "").strip() or QWEN_MODEL_ID,
+        qwen_revision=env.get("PILOT_QWEN_REVISION", "").strip() or QWEN_REVISION,
         bench=args.bench,
         bench_batches=bench_batches,
-        bench_max_sec=args.bench_max_sec,
+        bench_max_sec=args.bench_max_sec
+        if args.bench_max_sec is not None
+        else max(bench_batches) * BENCH_WINDOWS_PER_BATCH * max(bench_windows),
+        bench_windows=bench_windows,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
         batch_size=args.batch_size or DEFAULT_BATCH_SIZE[backend],
         repetition_penalty=args.repetition_penalty,
         stop_file=Path(env["PILOT_STOP_FILE"].strip())
         if env.get("PILOT_STOP_FILE", "").strip()
         else None,
         database_url=database_url,
-        model_id=env.get("PILOT_MODEL_ID", "").strip() or DEFAULT_MODEL_IDS[backend],
+        model_id=model_id,
         model_revision=revision,
         window_sec=window,
         hard_max_sec=hard_max,
@@ -666,11 +788,19 @@ def production_word_spans(segments: Any) -> list[Span]:
 
 
 def has_repetition_loop(tokens: Sequence[str]) -> bool:
-    """True when some n-gram repeats back-to-back REPEAT_MIN_RUNS[n] times."""
+    """True when some n-gram repeats back-to-back REPEAT_MIN_RUNS[n] times, or a
+    long n-gram recurs anywhere REREAD_NGRAMS[n] times (a re-read)."""
     toks = [
         t.lower().strip(".,;:!?\"'") for t in tokens if t and t != GRANITE_SILENCE_TOKEN
     ]
     n_tok = len(toks)
+    for n, min_count in REREAD_NGRAMS.items():
+        counts: dict[tuple[str, ...], int] = {}
+        for i in range(n_tok - n + 1):
+            gram = tuple(toks[i : i + n])
+            counts[gram] = counts.get(gram, 0) + 1
+            if counts[gram] >= min_count:
+                return True
     for n, min_runs in REPEAT_MIN_RUNS.items():
         if n * min_runs > n_tok:
             continue
@@ -708,14 +838,43 @@ def window_segment(
     }
 
 
-def degenerate_reason(text: str, hit_token_limit: bool) -> str | None:
+def strip_special_tokens(text: str) -> str:
+    """Drop leaked `<|...|>` special tokens and collapse the spaces they leave."""
+    return " ".join(_SPECIAL_TOKEN_RE.sub(" ", text or "").split())
+
+
+def repeats_ngram(
+    tokens: Sequence[int], n: int = STOP_NGRAM, count: int = STOP_NGRAM_COUNT
+) -> bool:
+    """True when the LAST n tokens already occurred `count` times in `tokens`.
+
+    Checked every decode step, so only the newest n-gram needs counting.
+    """
+    if len(tokens) < n * count:
+        return False
+    tail = list(tokens[-n:])
+    seen = 0
+    for i in range(len(tokens) - n + 1):
+        if list(tokens[i : i + n]) == tail:
+            seen += 1
+            if seen >= count:
+                return True
+    return False
+
+
+def degenerate_reason(
+    text: str, hit_token_limit: bool, window_sec: float | None = None
+) -> str | None:
     """Why a window's output is unusable, or None."""
     if not (text or "").strip():
         return "empty"
     if hit_token_limit:
         return "token_limit"
-    if has_repetition_loop(text.split()):
+    words = text.split()
+    if has_repetition_loop(words):
         return "repetition"
+    if window_sec and len(words) > OVERLONG_WORDS_PER_SEC * window_sec:
+        return "overlong"
     return language_reason(text)
 
 
@@ -1006,10 +1165,14 @@ class Track:
     duration: float
 
 
-def connect(cfg: Config) -> Any:  # pragma: no cover - thin psycopg2 wrapper
+def connect(
+    cfg: Config, timeout: int | None = None, **libpq: Any
+) -> Any:  # pragma: no cover
     import psycopg2
 
-    conn = psycopg2.connect(cfg.database_url)
+    kw: dict[str, Any] = {"connect_timeout": timeout} if timeout else {}
+    kw.update(libpq)
+    conn = psycopg2.connect(cfg.database_url, **kw)
     if cfg.dry_run:
         conn.set_session(readonly=True)
     return conn
@@ -1079,8 +1242,8 @@ def tracks_to_do(conn: Any, cfg: Config, tracks: Sequence[Track]) -> list[Track]
     return todo[: cfg.limit_tracks] if cfg.limit_tracks else todo
 
 
-def read_production_words(conn: Any, track: Track) -> list[Span]:
-    """One track's production word times (a single bounded row)."""
+def read_production_segments(conn: Any, track: Track) -> Any:
+    """One track's production segments JSON (a single bounded row)."""
     with conn.cursor() as cur:
         cur.execute(PRODUCTION_SEGMENTS_SQL, (track.transcript_id,))
         row = cur.fetchone()
@@ -1088,7 +1251,52 @@ def read_production_words(conn: Any, track: Track) -> list[Span]:
     segments = row[0] if row else None
     if isinstance(segments, str):
         segments = json.loads(segments)
-    return production_word_spans(segments)
+    return segments
+
+
+def read_production_words(conn: Any, track: Track) -> list[Span]:
+    """One track's production word times."""
+    return production_word_spans(read_production_segments(conn, track))
+
+
+def production_word_texts(segments: Any) -> list[tuple[float, float, str]]:
+    """(start, end, word) of every timed production word, sorted by start."""
+    out: list[tuple[float, float, str]] = []
+    for seg in segments or []:
+        for w in (seg or {}).get("words") or []:
+            s, e, word = w.get("start"), w.get("end"), w.get("word")
+            if isinstance(s, (int, float)) and isinstance(e, (int, float)) and word:
+                out.append((float(s), float(e), str(word)))
+    out.sort()
+    return out
+
+
+def word_completeness(
+    windows: Sequence[tuple[float, float, str]],
+    production: Sequence[tuple[float, float, str]],
+) -> float | None:
+    """Share of production words (in each window's span) the pilot text also has.
+
+    Multiset recall per window, case and punctuation ignored, summed over the
+    windows: a re-reading or truncated window shows up as < 1. None when there
+    are no production words in the spans.
+    """
+    starts = [w[0] for w in production]
+    matched = total = 0
+    for ws, we, text in windows:
+        lo, hi = bisect.bisect_left(starts, ws), bisect.bisect_left(starts, we)
+        ref = _wer_words(" ".join(w[2] for w in production[lo:hi]))
+        if not ref:
+            continue
+        have: dict[str, int] = {}
+        for tok in _wer_words(text):
+            have[tok] = have.get(tok, 0) + 1
+        for tok in ref:
+            if have.get(tok, 0) > 0:
+                have[tok] -= 1
+                matched += 1
+        total += len(ref)
+    return round(matched / total, 3) if total else None
 
 
 def read_finding_spans(conn: Any, track: Track) -> list[Span]:
@@ -1152,6 +1360,133 @@ def _out_file(cfg: Config, track: Track) -> Path | None:
         return None
     digest = hashlib.sha256(track.file_path.encode("utf-8")).hexdigest()[:16]
     return cfg.out_dir / f"{track.asin}-{digest}-{cfg.backend}-{cfg.scope}.json"
+
+
+# ---------------------------------------------------------------------------
+# Offline HF snapshot resolution (no huggingface_hub import, no network)
+# ---------------------------------------------------------------------------
+
+
+def force_hf_offline() -> None:
+    """Make transformers / huggingface_hub offline in-process too, not only via the deploy env."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+class PrefetchMissing(RuntimeError):
+    """A model file the run needs is not in the local HF cache."""
+
+
+@dataclass(frozen=True)
+class SnapshotSpec:
+    role_key: str  # the role's asr_pilot_windows_<role_key>_allow_patterns
+    repo_id: str
+    revision: str
+    allow_patterns: tuple[str, ...]
+
+
+def _expand(path: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(path)))
+
+
+def hf_hub_cache(env: dict[str, str]) -> Path:
+    """The hub cache huggingface_hub 2.4.0 would use (constants.py), same precedence:
+
+    HF_HUB_CACHE, else HUGGINGFACE_HUB_CACHE, else $HF_HOME/hub, where HF_HOME
+    defaults to $XDG_CACHE_HOME/huggingface (XDG_CACHE_HOME defaulting to ~/.cache).
+    """
+    explicit = (
+        env.get("HF_HUB_CACHE") or env.get("HUGGINGFACE_HUB_CACHE") or ""
+    ).strip()
+    if explicit:
+        return _expand(explicit)
+    home = (env.get("HF_HOME") or "").strip()
+    if not home:
+        xdg = (env.get("XDG_CACHE_HOME") or "").strip() or os.path.join("~", ".cache")
+        home = os.path.join(xdg, "huggingface")
+    return _expand(home) / "hub"
+
+
+def snapshot_specs(cfg: Config) -> list[SnapshotSpec]:
+    """The snapshots a backend loads, in load order."""
+    if cfg.backend == "granite":
+        return [
+            SnapshotSpec(
+                "granite",
+                cfg.model_id,
+                cfg.model_revision,
+                tuple(PREFETCH_ALLOW_PATTERNS["granite"]),
+            )
+        ]
+    return [
+        SnapshotSpec(
+            "canary",
+            cfg.model_id,
+            cfg.model_revision,
+            tuple(PREFETCH_ALLOW_PATTERNS["canary"]),
+        ),
+        SnapshotSpec(
+            "canary_llm",
+            cfg.qwen_model_id,
+            cfg.qwen_revision,
+            tuple(PREFETCH_ALLOW_PATTERNS["canary_llm"]),
+        ),
+    ]
+
+
+def prefetch_spec(cfg: Config) -> dict[str, Any]:
+    """JSON-able prefetch spec for cfg.backend (what --print-prefetch-spec prints)."""
+    return {
+        "backend": cfg.backend,
+        "hf_hub_cache": str(cfg.hf_cache) if cfg.hf_cache else None,
+        "ignore_patterns": list(PREFETCH_IGNORE_PATTERNS),
+        "snapshots": [
+            {
+                "role_key": sp.role_key,
+                "repo_id": sp.repo_id,
+                "revision": sp.revision,
+                "allow_patterns": list(sp.allow_patterns),
+            }
+            for sp in snapshot_specs(cfg)
+        ],
+    }
+
+
+def resolve_snapshot(cache: Path, spec: SnapshotSpec) -> Path:
+    """Local snapshot dir of spec.repo_id at spec.revision, checked against its allow list.
+
+    Reads the cache layout directly (models--<org>--<name>/snapshots/<sha>/), so
+    it never touches the network and never needs refs/main. A non-sha revision
+    is resolved through refs/<revision> if present. Every literal pattern must
+    exist and every glob must match at least one file; otherwise PrefetchMissing
+    names the role variable to fix.
+    """
+    repo_dir = cache / ("models--" + spec.repo_id.replace("/", "--"))
+    sha = spec.revision
+    if not (len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)):
+        ref = repo_dir / "refs" / sha
+        sha = ref.read_text(encoding="utf-8").strip() if ref.is_file() else sha
+    snap = repo_dir / "snapshots" / sha
+    hint = (
+        f"re-run the homelab-ansible asr_pilot_windows prefetch "
+        f"(asr_pilot_windows_{spec.role_key}_allow_patterns at {spec.repo_id}@{spec.revision}; "
+        f"`pilot.py --print-prefetch-spec` shows what pilot.py needs)"
+    )
+    if not snap.is_dir():
+        raise PrefetchMissing(
+            f"{spec.repo_id}@{spec.revision} is not in the HF cache {cache}: {hint}"
+        )
+    files = [p.relative_to(snap).as_posix() for p in snap.rglob("*") if p.is_file()]
+    missing = [
+        pat
+        for pat in spec.allow_patterns
+        if not any(fnmatch.fnmatch(f, pat) for f in files)
+    ]
+    if missing:
+        raise PrefetchMissing(
+            f"{spec.repo_id}@{spec.revision} in {snap} lacks {missing}: {hint}"
+        )
+    return snap
 
 
 # ---------------------------------------------------------------------------
@@ -1236,13 +1571,17 @@ class GraniteBackend(Backend):
     name = "granite"
 
     def load(self) -> None:  # pragma: no cover - needs the GPU stack
+        force_hf_offline()  # before the imports: both libraries read it early
         import torch
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
         self.torch = torch
-        self.processor = AutoProcessor.from_pretrained(
-            self.cfg.model_id, revision=self.cfg.model_revision
-        )
+        # A local snapshot directory, never the repo id: offline-safe, no refs/.
+        (local,) = [
+            resolve_snapshot(self.cfg.hf_cache, sp) for sp in snapshot_specs(self.cfg)
+        ]
+        self.local_dirs = {"model": str(local)}
+        self.processor = AutoProcessor.from_pretrained(str(local))
         self.tokenizer = self.processor.tokenizer
         self.tokenizer.padding_side = "left"  # batched generate needs left padding
         attn = (
@@ -1251,8 +1590,7 @@ class GraniteBackend(Backend):
             else "sdpa"
         )
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.cfg.model_id,
-            revision=self.cfg.model_revision,
+            str(local),
             device_map=self.cfg.device,
             dtype=torch.bfloat16,
             attn_implementation=attn,
@@ -1284,6 +1622,10 @@ class GraniteBackend(Backend):
             GRANITE_MIN_NEW_TOKENS,
             [n / SAMPLE_RATE for n in lens],
         )
+        prompt_len = inputs["input_ids"].shape[-1]
+        extra: dict[str, Any] = {}
+        if self.cfg.no_repeat_ngram_size:
+            extra["no_repeat_ngram_size"] = self.cfg.no_repeat_ngram_size
         with torch.inference_mode():
             out = self.model.generate(
                 **inputs,
@@ -1291,8 +1633,10 @@ class GraniteBackend(Backend):
                 do_sample=False,
                 num_beams=1,
                 repetition_penalty=self.cfg.repetition_penalty,
+                stopping_criteria=row_repeat_stopping(torch, prompt_len),
+                **extra,
             )
-        new = generated_rows(out.tolist(), inputs["input_ids"].shape[-1])
+        new = generated_rows(out.tolist(), prompt_len)
         pad = {
             t
             for t in (self.tokenizer.pad_token_id, self.tokenizer.eos_token_id)
@@ -1303,10 +1647,45 @@ class GraniteBackend(Backend):
         )
         return [
             WindowResult(
-                text=t.strip(), hit_token_limit=real_token_count(r, pad) >= limit
+                text=strip_special_tokens(t),
+                hit_token_limit=real_token_count(r, pad) >= limit,
             )
             for t, r in zip(texts, new)
         ]
+
+
+def row_stop_flags(rows: Sequence[Sequence[int]]) -> list[bool]:
+    """Per batch row: stop now (its newest 8-gram already occurred 3 times)."""
+    return [repeats_ngram(r) for r in rows]
+
+
+def row_repeat_stopping(torch: Any, prompt_len: int) -> Any:
+    """A transformers StoppingCriteriaList that stops each batch row on its own.
+
+    In transformers 5.22.1 a StoppingCriteria returns a (batch,) bool tensor;
+    generate() ANDs it into unfinished_sequences and pads finished rows with
+    pad_token_id (generation/utils.py `_sample`), so one re-reading row no
+    longer holds the whole batch until max_new_tokens.
+    """
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class RowRepeatStop(StoppingCriteria):
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+            flags = row_stop_flags(input_ids[:, prompt_len:].tolist())
+            return torch.tensor(flags, dtype=torch.bool, device=input_ids.device)
+
+    return StoppingCriteriaList([RowRepeatStop()])
+
+
+def _build_salm(salm_cls: Any, cfg: dict[str, Any], weights: Path) -> Any:
+    """SALM(cfg) + its safetensors, as NeMo's hf_hub._load_from_local_weights does.
+
+    Module-level on purpose, like NeMo's: Lightning's save_hyperparameters walks
+    the call stack and can mistake a frame with `__class__` in its closure for
+    an __init__ frame (NeMo's note on _distributed_from_pretrained).
+    """
+    model = salm_cls(cfg)
+    return salm_cls._load_as_safetensor(model, str(weights), "cpu", False)
 
 
 class CanaryBackend(Backend):
@@ -1314,18 +1693,39 @@ class CanaryBackend(Backend):
 
     name = "canary"
 
-    def load(self) -> None:  # pragma: no cover - needs the GPU stack
+    def load(self) -> None:
+        """Build SALM from local snapshots only.
+
+        SALM.from_pretrained(<dir>) would read pretrained_llm "Qwen/Qwen3-1.7B"
+        from config.json and resolve it by repo id (refs/main, offline). So this
+        does what NeMo's HFHubMixin._from_pretrained + _load_from_local_weights do
+        (NeMo e5d79d5a, speechlm2/parts/hf_hub.py), with pretrained_llm and
+        tokenizer_path pointed at the pinned local Qwen snapshot:
+          cfg = config.json; cfg[pretrained_weights] = False; SALM(cfg);
+          SALM._load_as_safetensor(model, model.safetensors, "cpu", strict=False).
+        Weights stay in the checkpoint dtype; bf16 compute comes from autocast in
+        transcribe_batch, so the float32 audio SALM.generate expects still matches.
+        """
+        force_hf_offline()  # before the imports: both libraries read it early
         import torch
-        from huggingface_hub import snapshot_download
         from nemo.collections.speechlm2.models import SALM
 
         self.torch = torch
-        # snapshot_download pins the exact HF revision; SALM then loads the local dir.
-        local = snapshot_download(self.cfg.model_id, revision=self.cfg.model_revision)
-        # Weights stay in the checkpoint dtype (the card loads it as-is); bf16
-        # compute comes from autocast in transcribe_batch, so the float32 audio
-        # tensor SALM.generate expects still matches the perception module.
-        self.model = SALM.from_pretrained(local).to(self.cfg.device).eval()
+        canary, qwen = (
+            resolve_snapshot(self.cfg.hf_cache, sp) for sp in snapshot_specs(self.cfg)
+        )
+        self.local_dirs = {"model": str(canary), "llm": str(qwen)}
+        cfg = json.loads((canary / "config.json").read_text(encoding="utf-8"))
+        if "pretrained_llm" not in cfg:
+            raise RuntimeError(f"{canary / 'config.json'} has no pretrained_llm")
+        cfg["pretrained_llm"] = str(qwen)
+        cfg["tokenizer_path"] = str(qwen)
+        cfg["pretrained_weights"] = (
+            False  # as _from_pretrained: never load sub-model weights
+        )
+        cfg["trust_remote_code"] = False
+        model = _build_salm(SALM, cfg, canary / "model.safetensors")
+        self.model = model.to(self.cfg.device).eval()
 
     def transcribe_batch(
         self, audios: Sequence[Any]
@@ -1363,9 +1763,9 @@ class CanaryBackend(Backend):
         out: list[WindowResult] = []
         for row in ids.cpu():
             toks = row.tolist()
-            text = self.model.tokenizer.ids_to_text(
-                [t for t in toks if t not in pad]
-            ).strip()
+            text = strip_special_tokens(
+                self.model.tokenizer.ids_to_text([t for t in toks if t not in pad])
+            )
             out.append(
                 WindowResult(
                     text=text, hit_token_limit=real_token_count(toks, pad) >= limit
@@ -1392,6 +1792,7 @@ class Batcher:
     def __init__(self, backend: Backend, size: int) -> None:
         self.backend = backend
         self.size = size
+        self.calls: list[int] = []  # windows per successful generate call
 
     def run(self, audios: Sequence[Any]) -> tuple[list[WindowResult], int]:
         """Transcribe all `audios`; returns (results, batch size in effect at the end)."""
@@ -1415,6 +1816,7 @@ class Batcher:
                     f"backend returned {len(got)} results for {len(part)} windows"
                 )
             results.extend(got)
+            self.calls.append(len(part))
             i += len(part)
         return results, self.size
 
@@ -1459,7 +1861,7 @@ def build_result(cfg: Config, st: TrackState) -> dict[str, Any]:
     degenerate: list[dict[str, Any]] = []
     for idx, ((ws, we), res) in enumerate(zip(st.plan, st.texts)):
         assert res is not None
-        reason = degenerate_reason(res.text, res.hit_token_limit)
+        reason = degenerate_reason(res.text, res.hit_token_limit, we - ws)
         seg = window_segment(res.text, ws, we, len(segments))
         if reason:
             degenerate.append({"window": idx, "start": ws, "end": we, "reason": reason})
@@ -1485,6 +1887,249 @@ def build_result(cfg: Config, st: TrackState) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# step_runs recorder (CONTRACT §1.10): pilot runs show up in GET /api/v1/runs
+# ---------------------------------------------------------------------------
+
+STEP_RUN_STEP = "asr_pilot"  # internal/runs StepASRPilot
+StepRunDone, StepRunFailed, StepRunCancelled = "done", "failed", "cancelled"
+STEP_RUN_INTERVAL_SEC = 2.0  # at most one write per interval ...
+STEP_RUN_HEARTBEAT_SEC = 30.0  # ... and at least one per heartbeat
+STEP_RUN_TIMEOUT_MS = 5000
+STEP_RUN_CONNECT_TIMEOUT_SEC = 5  # libpq connect_timeout for the recorder's connection
+STEP_RUN_LOCK_WAIT_SEC = 15.0  # finish() waits at most this for an in-flight write
+
+_STEP_RUN_INSERT_SQL = """
+    INSERT INTO step_runs (step, mode, model, args, host, total, last_message)
+    VALUES ('asr_pilot', 'write', %s, %s, %s, %s, %s)
+    RETURNING id
+"""
+# Same shape as internal/db/stepruns.go updateStepRunSQL: only an open row is
+# touched, so a late write never reopens a closed run.
+_STEP_RUN_UPDATE_SQL = """
+    UPDATE step_runs
+       SET heartbeat_at = now(),
+           total        = %s,
+           done         = %s,
+           counters     = %s::jsonb,
+           last_message = COALESCE(%s, last_message),
+           status       = COALESCE(%s, status),
+           finished_at  = CASE WHEN %s::text IS NULL THEN finished_at ELSE now() END,
+           error        = COALESCE(%s, error)
+     WHERE id = %s AND status = 'running'
+"""
+
+
+def _fmt_eta(sec: float | None) -> str:
+    if sec is None:
+        return "?"
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    return f"{h}h{rem // 60:02d}m" if h else f"{rem // 60}m{rem % 60:02d}s"
+
+
+class StepRunRecorder:
+    """Writes one step_runs row for a pilot run, like internal/runs does for Go steps.
+
+    Start inserts the row synchronously; progress() only updates memory, and a
+    writer thread writes at most every STEP_RUN_INTERVAL_SEC and at least every
+    STEP_RUN_HEARTBEAT_SEC (a heartbeat even while one long batch runs, so the
+    run is never shown stale); finish() closes it with done / failed /
+    cancelled. Writes use their own autocommit connection: 5 s connect timeout,
+    5 s statement timeout, TCP keepalives (a dead peer is noticed in ~25 s), and
+    finish() waits at most 10 s for the writer thread plus 15 s for the lock, so
+    the run's exit is delayed by at most that. Recording never fails the run:
+    every error is logged (the first, then every 20th) and swallowed, and a
+    failed insert is retried later.
+    """
+
+    def __init__(
+        self,
+        connect_fn: Callable[[], Any],
+        *,
+        interval: float = STEP_RUN_INTERVAL_SEC,
+        heartbeat: float = STEP_RUN_HEARTBEAT_SEC,
+        threaded: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.connect_fn = connect_fn
+        self.interval = interval
+        self.heartbeat = heartbeat
+        self.threaded = threaded
+        self.clock = clock
+        self.conn: Any = None
+        self.id: int | None = None
+        self.errors = 0
+        self.closed = False
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_write = 0.0
+        self._start_spec: tuple[Any, ...] | None = None
+        self._state: dict[str, Any] = {
+            "total": None,
+            "done": 0,
+            "counters": {},
+            "message": None,
+        }
+
+    # -- plumbing ----------------------------------------------------------
+    def _error(self, what: str, exc: BaseException) -> None:
+        self.errors += 1
+        if self.errors == 1 or self.errors % 20 == 0:
+            log.warning(
+                "step_runs %s failed (%d so far; the run continues): %s",
+                what,
+                self.errors,
+                exc,
+            )
+        with contextlib.suppress(Exception):
+            if self.conn is not None:
+                self.conn.close()
+        self.conn = None
+
+    def _cursor_conn(self) -> Any:
+        if self.conn is None or getattr(self.conn, "closed", 0):
+            conn = self.connect_fn()
+            with contextlib.suppress(Exception):
+                conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {STEP_RUN_TIMEOUT_MS}")
+            self.conn = conn
+        return self.conn
+
+    def _insert(self) -> None:
+        assert self._start_spec is not None
+        with self._cursor_conn().cursor() as cur:
+            cur.execute(_STEP_RUN_INSERT_SQL, self._start_spec)
+            row = cur.fetchone()
+        self.id = int(row[0])
+
+    def _write(self, status: str | None = None, error: str | None = None) -> None:
+        # The final write may wait a little for an in-flight heartbeat, never
+        # long: a step_runs problem delays the run's exit by at most this wait.
+        if not self._lock.acquire(timeout=STEP_RUN_LOCK_WAIT_SEC):
+            # Count and log only: the connection belongs to the thread holding
+            # the lock, so it must not be closed from here.
+            self.errors += 1
+            log.warning("step_runs write skipped: previous write still in flight")
+            return
+        try:
+            # Count attempts, not successes, toward the throttle: during an
+            # outage that is one connect per interval, not one per batch.
+            self._last_write = self.clock()
+            if self.id is None:
+                self._insert()
+            st = self._state
+            with self._cursor_conn().cursor() as cur:
+                cur.execute(
+                    _STEP_RUN_UPDATE_SQL,
+                    (
+                        st["total"],
+                        st["done"],
+                        json.dumps(st["counters"]),
+                        (st["message"] or "")[:512] or None,
+                        status,
+                        status,
+                        (error or "")[:2000] or None,
+                        self.id,
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 - recording never fails the run
+            self._error("write", exc)
+        finally:
+            self._lock.release()
+
+    def _loop(self) -> None:
+        while not self.closed:
+            self._wake.wait(self.heartbeat)
+            if self.closed:
+                return
+            wait = self.interval - (self.clock() - self._last_write)
+            if wait > 0:
+                time.sleep(wait)
+                if self.closed:
+                    return
+            self._wake.clear()
+            self._write()
+
+    # -- API ---------------------------------------------------------------
+    def start(self, *, model: str, args: str, total: int, message: str) -> None:
+        self._start_spec = (
+            model[:256],
+            args[:256],
+            (os.environ.get("COMPUTERNAME") or socket.gethostname())[:256],
+            total,
+            message[:512],
+        )
+        self._state.update(total=total, message=message)
+        with self._lock:
+            try:
+                self._insert()
+                self._last_write = self.clock()
+            except Exception as exc:  # noqa: BLE001 - recording never fails the run
+                self._error("insert", exc)
+        if self.threaded:
+            self._thread = threading.Thread(
+                target=self._loop, name="step-runs", daemon=True
+            )
+            self._thread.start()
+
+    def progress(self, *, done: int, counters: dict[str, int], message: str) -> None:
+        self._state.update(done=done, counters=dict(counters), message=message)
+        if self.threaded:
+            self._wake.set()
+        elif self.clock() - self._last_write >= self.interval:
+            self._write()
+
+    def finish(self, status: str, error: str | None = None) -> None:
+        self.closed = True
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+        self._write(status=status, error=error)
+        with contextlib.suppress(Exception):
+            if self.conn is not None:
+                self.conn.close()
+
+
+def run_progress(
+    rec: StepRunRecorder,
+    tracks: Sequence[Track],
+    started: float,
+    clock: Callable[[], float],
+) -> Callable[[Pipeline], None]:
+    """Pipeline progress -> step_runs (done = finished tracks; counters are ints)."""
+    total_audio = sum(t.duration for t in tracks)
+
+    def update(pipe: Pipeline) -> None:
+        finished = pipe.written + len(pipe.failed) + pipe.skipped
+        elapsed = max(clock() - started, 1e-9)
+        rate = pipe.audio_done / elapsed  # audio s per wall s, decode included
+        eta = None
+        if pipe.cfg.scope == "full" and rate > 0:
+            eta = max(0.0, total_audio - pipe.audio_done) / rate
+        rec.progress(
+            done=finished,
+            counters={
+                "tracks_written": pipe.written,
+                "tracks_failed": len(pipe.failed),
+                "tracks_skipped": pipe.skipped,
+                "windows": pipe.windows_done,
+                "degenerate": pipe.degenerate,
+                "audio_sec": int(pipe.audio_done),
+                "rtfx": round(rate),
+                **({"eta_sec": int(eta)} if eta is not None else {}),
+            },
+            message=(
+                f"track {finished}/{len(tracks)} · {pipe.windows_done} windows · "
+                f"{pipe.degenerate} degenerate · rtfx {rate:.1f} · eta {_fmt_eta(eta)}"
+            ),
+        )
+
+    return update
+
+
 class Pipeline:
     def __init__(
         self,
@@ -1504,6 +2149,16 @@ class Pipeline:
         self.batcher = Batcher(backend, cfg.batch_size)
         self.failed: list[str] = []
         self.done: list[dict[str, Any]] = []
+        self.skipped = 0
+        self.written = 0
+        self.windows_done = 0
+        self.degenerate = 0
+        self.audio_done = 0.0
+        self.on_progress: Callable[[Pipeline], None] | None = None
+
+    def _progress(self) -> None:
+        if self.on_progress is not None:
+            self.on_progress(self)
 
     def _fail(self, st: TrackState | None, track: Track) -> None:
         log.exception("track failed: %s", track.file_path)
@@ -1512,23 +2167,29 @@ class Pipeline:
         self.failed.append(track.file_path)
         with contextlib.suppress(Exception):
             self.db.conn.rollback()
+        self._progress()
 
     def windows(
-        self, tracks: Sequence[Track], max_sec: float | None = None
+        self,
+        tracks: Sequence[Track],
+        plans: dict[str, list[Span]] | None = None,
     ) -> Iterator[WindowItem]:
         """Yield every planned window (a writable audio copy each), one decode chunk at a time."""
         for track in tracks:
             st: TrackState | None = None
             try:
-                plan, _ = track_plan(self.db.ensure(), self.cfg, track)
-                if max_sec is not None:
-                    plan = [w for w in plan if w[1] <= max_sec] or plan[:1]
+                if plans is not None:
+                    plan = plans.get(track.file_path, [])
+                else:
+                    plan, _ = track_plan(self.db.ensure(), self.cfg, track)
                 if not plan:
                     log.info(
                         "skip %s: nothing to transcribe (scope=%s)",
                         track.file_path,
                         self.cfg.scope,
                     )
+                    self.skipped += 1
+                    self._progress()
                     continue
                 self.check()
                 path = resolve_audio_path(self.cfg, track.file_path)
@@ -1583,9 +2244,14 @@ class Pipeline:
             st.batch_size_used = (
                 used if st.batch_size_used is None else min(st.batch_size_used, used)
             )
+            self.windows_done += 1
+            self.audio_done += it.end - it.start
+            if degenerate_reason(res.text, res.hit_token_limit, it.end - it.start):
+                self.degenerate += 1
         for st in {id(it.state): it.state for it in batch}.values():
             if st.left == 0 and not st.failed:
                 self.finish(st)
+        self._progress()
 
     def finish(self, st: TrackState) -> None:
         result = build_result(self.cfg, st)
@@ -1613,6 +2279,7 @@ class Pipeline:
                     encoding="utf-8",
                 )
             write_result(self.db.ensure(), self.cfg, st.track, result)
+            self.written += 1
         except Exception:  # noqa: BLE001 - the out-file keeps the work
             self._fail(st, st.track)
             return
@@ -1623,9 +2290,13 @@ class Pipeline:
             len(result["degenerate_windows"]),
         )  # fmt: skip
 
-    def run(self, tracks: Sequence[Track], max_sec: float | None = None) -> None:
+    def run(
+        self,
+        tracks: Sequence[Track],
+        plans: dict[str, list[Span]] | None = None,
+    ) -> None:
         batch: list[WindowItem] = []
-        for item in self.windows(tracks, max_sec):
+        for item in self.windows(tracks, plans):
             if item.state.failed:
                 continue
             batch.append(item)
@@ -1657,44 +2328,134 @@ def dry_run(
         )
 
 
+def gather_bench_plans(
+    conn: Any, cfg: Config, tracks: Sequence[Track]
+) -> list[tuple[Track, list[Span]]]:
+    """Windows for --bench: tracks in --asin order (then by file_path, as
+    select_tracks returns them within a book) until max(bench_batches) x 2 windows.
+
+    The total planned audio is capped at cfg.bench_max_sec; the window that
+    would cross the cap is not taken (but at least one window always is).
+    """
+    need = max(cfg.bench_batches) * BENCH_WINDOWS_PER_BATCH
+    out: list[tuple[Track, list[Span]]] = []
+    n, audio, capped = 0, 0.0, False
+    rank = {a: i for i, a in reversed(list(enumerate(cfg.asins)))}
+    # select_tracks sorts by ASIN; the operator's --asin order decides which book
+    # is benched first. sorted() is stable, so file_path order holds per book.
+    for t in sorted(tracks, key=lambda t: rank.get(t.asin, len(rank))):
+        try:
+            plan, _ = track_plan(conn, cfg, t)
+        except Exception:  # one unplannable track must not end the bench
+            log.exception(
+                "bench: skipping track that cannot be planned: %s", t.file_path
+            )
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            continue
+        take: list[Span] = []
+        for w in plan:
+            length = w[1] - w[0]
+            if n >= need:
+                break
+            if audio + length > cfg.bench_max_sec and n > 0:
+                capped = True
+                break
+            take.append(w)
+            n += 1
+            audio += length
+        if take:
+            out.append((t, take))
+        if n >= need or capped:
+            break
+    return out
+
+
+def bench_regions(plan: Sequence[Span]) -> list[Span]:
+    """Merge contiguous planned windows into the audio regions they cover."""
+    out: list[list[float]] = []
+    for ws, we in plan:
+        if out and abs(out[-1][1] - ws) < 1e-9:
+            out[-1][1] = we
+        else:
+            out.append([ws, we])
+    return [(a, b) for a, b in out]
+
+
 def bench(
     db: DbSession,
     cfg: Config,
     backend: Backend,
-    track: Track,
+    tracks: Sequence[Track],
     decode: DecodeFn,
     check: Callable[[], None],
     emit: Callable[[str], None] = print,
-) -> None:
-    """Sweep cfg.bench_batches over (at most bench_max_sec of) one track. No DB writes.
+) -> int:
+    """Sweep window length x batch size over audio gathered across `tracks`. No DB writes.
 
-    `check` is the same stop-file + gaming check as a real run, applied before
-    each track, decode chunk and batch of every sweep step (GamingStop and
-    StopRequested propagate to run(), which exits 4 / 5 without printing).
+    The audio is gathered once, at the longest --bench-windows length: tracks in
+    --asin order until there are max(bench_batches) x 2 windows, capped at
+    cfg.bench_max_sec. Every (window, batch) row re-plans those same regions at
+    its window length (cutting at production pauses), so rows compare like with
+    like. Each row reports the degenerate rate and, when production words exist,
+    word completeness against them. A row whose batch size exceeds its windows
+    is `starved`.
+
+    Returns EXIT_OK, or EXIT_TRACKS_FAILED when no window could be gathered
+    (nothing is printed then) or when any sweep row failed (the JSON is still
+    printed, with an `error` row). `check` is the same stop-file + gaming check
+    as a real run (GamingStop / StopRequested propagate to run(): exit 4 / 5).
     """
+    longest = max(cfg.bench_windows)
+    gather_cfg = Config(**{**cfg.__dict__, "window_sec": longest})
+    conn = db.ensure()
+    gathered = gather_bench_plans(conn, gather_cfg, tracks)
+    if not gathered:
+        log.error("--bench: no window could be planned for %s", ",".join(cfg.asins))
+        return EXIT_TRACKS_FAILED
+    bench_tracks = [t for t, _ in gathered]
+    regions = {t.file_path: bench_regions(p) for t, p in gathered}
+    prod: dict[str, list[tuple[float, float, str]]] = {}
+    for t in bench_tracks:
+        try:
+            prod[t.file_path] = production_word_texts(read_production_segments(conn, t))
+        except Exception:  # completeness is optional; the timing rows still run
+            log.exception("bench: no production words for %s", t.file_path)
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            prod[t.file_path] = []
     rows: list[dict[str, Any]] = []
-    for size in cfg.bench_batches:
-        sub = Config(**{**cfg.__dict__, "batch_size": size})
-        pipe = Pipeline(db, sub, backend, decode, check, write=False)
-        pipe.run([track], max_sec=cfg.bench_max_sec)
-        if not pipe.done:
-            rows.append({"batch_size": size, "error": "failed (see log)"})
-            continue
-        r = pipe.done[0]["result"]
-        rows.append(
-            {
-                "batch_size": size,
-                "batch_size_used": r["batch_size_used"],
-                "windows": r["windows"],
-                "audio_sec": r["audio_sec"],
-                "wall_sec": r["wall_sec"],
-                "decode_sec": r["decode_sec"],
-                "rtfx": r["rtfx"],
-                "peak_vram_mib": r["peak_vram_mib"],
-                "peak_reserved_mib": r["peak_reserved_mib"],
-                "degenerate_windows": len(r["degenerate_windows"]),
-            }
-        )
+    failed_rows = 0
+    for window in cfg.bench_windows:
+        plans = {
+            fp: [
+                w
+                for a, b in regs
+                for w in plan_windows(
+                    a,
+                    b,
+                    Gaps([(x[0], x[1]) for x in prod[fp]]),
+                    window,
+                    cfg.hard_max_sec,
+                )
+            ]
+            for fp, regs in regions.items()
+        }
+        for size in cfg.bench_batches:
+            sub = Config(**{**cfg.__dict__, "batch_size": size, "window_sec": window})
+            pipe = Pipeline(db, sub, backend, decode, check, write=False)
+            pipe.run(bench_tracks, plans=plans)
+            if len(pipe.done) != len(bench_tracks):
+                rows.append(
+                    {
+                        "window_sec": window,
+                        "batch_size": size,
+                        "error": "failed (see log)",
+                    }
+                )
+                failed_rows += 1
+                continue
+            rows.append(_bench_row(window, size, pipe, plans, prod))
     emit(
         json.dumps(
             {
@@ -1702,8 +2463,12 @@ def bench(
                     "backend": cfg.backend,
                     "model_id": cfg.model_id,
                     "model_revision": cfg.model_revision,
-                    "file_path": track.file_path,
+                    "file_path": bench_tracks[0].file_path,
+                    "tracks": [t.file_path for t in bench_tracks],
+                    "windows": sum(len(p) for _, p in gathered),
+                    "windows_wanted": max(cfg.bench_batches) * BENCH_WINDOWS_PER_BATCH,
                     "window_sec": cfg.window_sec,
+                    "window_secs": cfg.bench_windows,
                     "max_sec": cfg.bench_max_sec,
                     "results": rows,
                 }
@@ -1711,6 +2476,96 @@ def bench(
             ensure_ascii=False,
         )
     )
+    return EXIT_TRACKS_FAILED if failed_rows else EXIT_OK
+
+
+def _bench_row(
+    window: float,
+    size: int,
+    pipe: Pipeline,
+    plans: dict[str, list[Span]],
+    prod: dict[str, list[tuple[float, float, str]]],
+) -> dict[str, Any]:
+    results = [(d["track"], d["result"]) for d in pipe.done]
+    audio = sum(r["audio_sec"] for _, r in results)
+    wall = sum(r["wall_sec"] for _, r in results)
+    calls = pipe.batcher.calls
+    windows = sum(r["windows"] for _, r in results)
+    degenerate = sum(len(r["degenerate_windows"]) for _, r in results)
+    row = {
+        "window_sec": window,
+        "batch_size": size,
+        "batch_size_used": min(
+            (r["batch_size_used"] for _, r in results if r["batch_size_used"]),
+            default=None,
+        ),
+        "tracks": len(results),
+        "windows": windows,
+        "batches": len(calls),
+        "windows_per_batch": {
+            "mean": round(sum(calls) / len(calls), 2) if calls else None,
+            "min": min(calls, default=None),
+        },
+        "starved": windows < size,
+        "audio_sec": round(audio, 3),
+        "wall_sec": round(wall, 3),
+        "decode_sec": round(sum(r["decode_sec"] for _, r in results), 3),
+        "rtfx": round(audio / wall, 3) if wall > 0 else None,
+        "peak_vram_mib": max(
+            (r["peak_vram_mib"] for _, r in results if r["peak_vram_mib"] is not None),
+            default=None,
+        ),
+        "peak_reserved_mib": max(
+            (
+                r["peak_reserved_mib"]
+                for _, r in results
+                if r["peak_reserved_mib"] is not None
+            ),
+            default=None,
+        ),
+        "degenerate_windows": degenerate,
+        "degenerate_rate": round(degenerate / windows, 3) if windows else None,
+        "word_completeness": bench_completeness(results, plans, prod),
+    }
+    if row["starved"]:
+        log.warning(
+            "bench window=%gs batch_size=%d is starved: only %d windows "
+            "(raise --bench-max-sec or add --asin tracks)",
+            window,
+            size,
+            windows,
+        )
+    return row
+
+
+def bench_completeness(
+    results: Sequence[tuple[Track, dict[str, Any]]],
+    plans: dict[str, list[Span]],
+    prod: dict[str, list[tuple[float, float, str]]],
+) -> float | None:
+    """Word completeness over every benched window of every track.
+
+    A window with no text (empty output) counts as 0 of its production words.
+    None when no track has production words.
+    """
+    windows: list[tuple[float, float, str]] = []
+    words: list[tuple[float, float, str]] = []
+    offset = 0.0
+    for t, r in results:
+        texts = {(s["start"], s["end"]): s["text"] for s in r["segments"]}
+        span = max((w[1] for w in plans.get(t.file_path, [])), default=0.0) + 1.0
+        # Lay tracks end to end on one axis so a single pass covers them all.
+        for a, b in plans.get(t.file_path, []):
+            windows.append(
+                (offset + a, offset + b, texts.get((round(a, 3), round(b, 3)), ""))
+            )
+        words.extend(
+            (offset + s, offset + e, w) for s, e, w in prod.get(t.file_path, [])
+        )
+        offset += max(
+            span, max((x[1] for x in prod.get(t.file_path, [])), default=0.0) + 1.0
+        )
+    return word_completeness(windows, sorted(words))
 
 
 def self_check(
@@ -1780,7 +2635,11 @@ def run(
     decode: DecodeFn = decode_audio,
     gaming_check: Callable[[], None] | None = None,
     connect_fn: Callable[[], Any] | None = None,
+    recorder: StepRunRecorder | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
+    """One pilot run. With `recorder`, a real (non dry-run, non bench) run is
+    recorded in step_runs; main() passes one, tests pass a fake or none."""
     db = DbSession(conn, connect_fn or (lambda: connect(cfg)))
     gaming = gaming_check or (lambda: check_gaming(cfg))
 
@@ -1791,7 +2650,10 @@ def run(
     try:
         tracks = select_tracks(db.ensure(), cfg)
         if cfg.bench:
-            tracks = tracks[:1]
+            if cfg.limit_tracks:
+                log.info(
+                    "--bench ignores --limit-tracks (it gathers windows across tracks)"
+                )
             if not tracks:
                 log.error("--bench: no track for %s", ",".join(cfg.asins))
                 return EXIT_CONFIG
@@ -1802,23 +2664,57 @@ def run(
                 return EXIT_OK
             if not tracks:
                 return EXIT_OK
+        rec = recorder if not cfg.bench else None
+        if rec is not None:
+            rec.start(
+                model=f"{cfg.model_id}@{cfg.model_revision[:12]}",
+                args=(
+                    f"--backend {cfg.backend} --scope {cfg.scope} "
+                    f"--batch-size {cfg.batch_size} --asin {','.join(cfg.asins)}"
+                ),
+                total=len(tracks),
+                message="loading model",
+            )
+        status, error = StepRunFailed, None
         try:
-            check()  # before the multi-GB model load, not only after it
-            if backend is None:  # pragma: no cover - real model
-                backend = make_backend(cfg)
-                backend.load()
-            if cfg.bench:
-                bench(db, cfg, backend, tracks[0], decode, check)
-                return EXIT_OK
-            pipe = Pipeline(db, cfg, backend, decode, check)
-            pipe.run(tracks)
-        except GamingStop as exc:
-            log.warning("stopping for gaming (%s); unfinished tracks not written", exc)
-            return EXIT_GAMING
-        except StopRequested as exc:
-            log.warning("stopping (%s); unfinished tracks not written", exc)
-            return EXIT_STOPPED
-        return EXIT_TRACKS_FAILED if pipe.failed else EXIT_OK
+            try:
+                check()  # before the multi-GB model load, not only after it
+                if backend is None:  # pragma: no cover - real model
+                    backend = make_backend(cfg)
+                    backend.load()
+                if cfg.bench:
+                    return bench(db, cfg, backend, tracks, decode, check)
+                pipe = Pipeline(db, cfg, backend, decode, check)
+                if rec is not None:
+                    pipe.on_progress = run_progress(rec, tracks, clock(), clock)
+                pipe.run(tracks)
+            except GamingStop as exc:
+                log.warning(
+                    "stopping for gaming (%s); unfinished tracks not written", exc
+                )
+                status, error = StepRunCancelled, f"stopped for gaming: {exc}"
+                return EXIT_GAMING
+            except StopRequested as exc:
+                log.warning("stopping (%s); unfinished tracks not written", exc)
+                status, error = StepRunCancelled, f"stopped: {exc}"
+                return EXIT_STOPPED
+            except (
+                PrefetchMissing
+            ) as exc:  # operator-fixable: re-run the role's prefetch
+                log.error("%s", exc)
+                error = str(exc)
+                return EXIT_CONFIG
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                raise
+            if pipe.failed:
+                error = f"{len(pipe.failed)} track(s) failed"
+                return EXIT_TRACKS_FAILED
+            status = StepRunDone
+            return EXIT_OK
+        finally:
+            if rec is not None:
+                rec.finish(status, error)
     finally:
         if db.conn is not conn:  # reconnected mid-run: the caller only closes its own
             with contextlib.suppress(Exception):
@@ -1836,11 +2732,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         log.error("config error: %s", exc)
         return EXIT_CONFIG
+    if cfg.print_prefetch_spec:
+        print(json.dumps(prefetch_spec(cfg)))
+        return EXIT_OK
     if cfg.self_check:  # pragma: no cover - GPU stack
-        return self_check(cfg)
+        try:
+            return self_check(cfg)
+        except PrefetchMissing as exc:
+            log.error("%s", exc)
+            return EXIT_CONFIG
     conn = connect(cfg)
+    rec = (
+        None
+        if (cfg.dry_run or cfg.bench)
+        else StepRunRecorder(
+            lambda: connect(
+                cfg,
+                timeout=STEP_RUN_CONNECT_TIMEOUT_SEC,
+                # A half-open TCP connection would otherwise block a write in
+                # recv() indefinitely: keepalives find a dead peer in ~25 s.
+                keepalives=1,
+                keepalives_idle=10,
+                keepalives_interval=5,
+                keepalives_count=3,
+            )
+        )
+    )
     try:
-        return run(cfg, conn)
+        return run(cfg, conn, recorder=rec)
     finally:
         with contextlib.suppress(Exception):
             conn.close()

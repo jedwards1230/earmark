@@ -1951,6 +1951,7 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 | `eval_backfill` | `write` with `--write` | NULL (`--limit` counts latched transcripts, not visited ones) | one per visited transcript: `latched`, `failed`, `not_embedded`, `skipped`; plus `chunks`, `chunk_errors`, `findings` | `judging <file> · asking <model>` |
 | `eval_rejudge` | `write` with `--write` | NULL | one per judge call (chunk): `judged`, `cached`, `failed`, each tick adding the call's reported cost; per transcript `transcripts_complete` / `transcripts_partial` / `transcripts_failed` / `transcripts_skipped`, plus `findings` (rows inserted) | `asking <model>` |
 | `asr_vote` | `write` with `--yes`, else `dry_run` | NULL | one per held finding voted: `heard_replacement`, `heard_original`, `neither`, `unmappable`; plus `written` (rows upserted, `--yes`) and `tracks_skipped` (no production or pilot segments) | `track i/n` |
+| `asr_pilot` | `write` (written by `runner/pilot.py` itself; `--dry-run`, `--bench` and `--self-check` record nothing) | the tracks to do | `tracks_written`, `tracks_failed`, `tracks_skipped`, `windows`, `degenerate`, `audio_sec`, `rtfx` (rounded; wall clock incl. decode), `eta_sec` (full scope only) | `loading model`, then `track i/n · W windows · D degenerate · rtfx R · eta T`. Closed `done`, `failed` (a track failed, or an error), or `cancelled` (gaming via gpu-arbiter, or `PILOT_STOP_FILE`) |
 
 `done` counts finished items; `cost_usd` sums the calls' reported cost
 (cached calls are free).
@@ -2012,7 +2013,7 @@ Prometheus series `earmark_step_run_items_total{outcome="duplicate"}` and
 
 A pilot runs a second ASR model over tracks that already have a production
 transcript: IBM Granite Speech 4.1 2B (base, `ibm-granite/granite-speech-4.1-2b`,
-plain ASR, 240 s windows, at most 540 s) and NVIDIA Canary-Qwen 2.5B (≤ 40 s
+plain ASR, 90 s windows, at most 120 s — longer windows re-read and drop speech) and NVIDIA Canary-Qwen 2.5B (≤ 40 s
 windows). The pilot measures each against production (`parakeet-tdt-1.1b`) and
 records, for each held finding, which reading the second model heard. **Pilot
 output never touches production**: no `transcripts` row, no job, no chunk, no
@@ -2125,7 +2126,7 @@ The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
      `[t0 − 0.5 s, t1 + 0.5 s]`.
 
    Those tokens are aligned with the production tokens of the same time range
-   by a **Myers O((N+M)·D) diff**. It is cheap for 540 s windows of ~1500
+   by a **Myers O((N+M)·D) diff**. It is cheap even for 540 s windows of ~1500
    words, with at most 5000 tokens a side (`window_too_large`) and 1500
    differing tokens (`align_too_different`). The pilot tokens between the
    nearest exactly agreeing words left and right of the span are what it

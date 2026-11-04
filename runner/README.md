@@ -112,7 +112,7 @@ neither model needs timestamps.
 
 | `--backend` | Model (revision via `PILOT_MODEL_REVISION`) | Runtime | Window (default / hard max) | `--batch-size` default |
 |---|---|---|---|---|
-| `granite` | `ibm-granite/granite-speech-4.1-2b` (base; pin `823ca793aa49925d4eb2e758709b7f2c98513e8e`) | transformers, bf16, `sdpa` (`flash_attention_2` if `flash_attn` is importable) | 240 s / 540 s | 16 |
+| `granite` | `ibm-granite/granite-speech-4.1-2b` (base; pin `823ca793aa49925d4eb2e758709b7f2c98513e8e`) | transformers, bf16, `sdpa` (`flash_attention_2` if `flash_attn` is importable) | 90 s / 120 s | 16 |
 | `canary` | `nvidia/canary-qwen-2.5b` | NeMo SALM (`speechlm2`), bf16 autocast on CUDA | 38 s / 40 s | 32 |
 
 The Granite -plus timestamp mode was dropped: it budgets about 4× the output
@@ -136,13 +136,19 @@ tokens and ran at batch 1, an estimated ~14 h for the pilot set.
     length.
   - Canary: `SALM.generate` gets one prompt per row with padded `audios` and
     `audio_lens`.
-  - `max_new_tokens` is sized by the batch's **longest** window: 12 tokens per
+  - `max_new_tokens` is sized by the batch's **longest** window: 5 tokens per
     audio second for Granite and 8 for Canary, × 1.25, with a floor of 64 / 128.
+    Narration is about 2.3 words/s, roughly 3 tokens/s.
+  - **Per-row stop (Granite).** A `transformers` `StoppingCriteria` stops each
+    batch row on its own once its newest 8-token n-gram has occurred 3 times. In
+    transformers 5.22.1 a criterion returns one flag per row, and `generate()`
+    pads the finished rows. One re-reading row therefore no longer holds the
+    whole batch until `max_new_tokens`.
   - A CUDA OOM halves the batch size and retries that batch. The smaller size is
     kept for the rest of the run, and the out-file records it as `batch_size_used`.
 - **Audio.** Audio is decoded in chunks of contiguous windows (`ffmpeg -ss … -t …`
   to 16 kHz mono float32). A chunk lasts max(30 min, batch size × window) so it
-  holds a full batch: Granite 16 × 240 s gives 64 min, about 250 MB. In findings
+  holds a full batch: Granite 16 × 90 s fits in 30 min, about 115 MB. In findings
   scope, only the merged spans are decoded. ffmpeg's output is streamed into a
   buffer sized for the chunk, so memory does not grow with track length. Each
   chunk has a timeout of 120 s + 5% of its length, and each window gets its own
@@ -150,12 +156,44 @@ tokens and ran at batch 1, an estimated ~14 h for the pilot set.
 - **Granite prompt.** Taken verbatim from the card: `<|audio|>transcribe the speech
   with proper punctuation and capitalization.` It runs with `num_beams=1`,
   `do_sample=False` and `--repetition-penalty` (default 1.0: the base card gives
-  none).
+  none). `--no-repeat-ngram-size N` (default off) is for experiments only. Leaked
+  special tokens such as `<|fim_middle|>` are stripped from the decoded text of
+  both backends before it is stored.
+- **Why Granite windows are 90 s (max 120 s).** On desktop-2 (The Fifth Season),
+  windows under 130 s were 0/5 degenerate and about 95% word-complete against
+  production. At 150 s and over, 45/65 were degenerate: the model transcribes
+  the window, misses the end of the transcript, and re-reads it. Even the clean
+  long windows dropped about 22% of the words.
 - **Canary prompt.** `Transcribe the following: <audio_locator_tag>`, from the card.
+- **Offline model loading.** Runs set `HF_HUB_OFFLINE=1`, and every model file is
+  prefetched at deploy time. pilot.py reads the snapshot directories from the HF
+  cache layout itself (`models--<org>--<name>/snapshots/<sha>/`). It never calls
+  the hub, needs no `refs/main`, and hands the models local directories, never
+  repo ids.
+  - The snapshots are pinned in pilot.py as `DEFAULT_MODEL_REVISIONS`,
+    `QWEN_REVISION` and `PREFETCH_ALLOW_PATTERNS`, and
+    `--print-prefetch-spec` prints them.
+  - Granite loads from its snapshot of `ibm-granite/granite-speech-4.1-2b`.
+  - Canary needs two snapshots: `nvidia/canary-qwen-2.5b` (`config.json`,
+    `model.safetensors`), and `Qwen/Qwen3-1.7B` at `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`
+    for the LLM config and tokenizer files only.
+  - `SALM.from_pretrained` is not used for Canary, because it would resolve the
+    config's `pretrained_llm: Qwen/Qwen3-1.7B` by repo id. pilot.py repeats what
+    NeMo's `HFHubMixin._from_pretrained` does instead: it reads `config.json`,
+    points `pretrained_llm` and `tokenizer_path` at the local Qwen snapshot, sets
+    `pretrained_weights=False`, then calls `SALM(cfg)` and
+    `SALM._load_as_safetensor(model, model.safetensors, "cpu", strict=False)`.
+    The Qwen weights are never read.
+  - A missing snapshot or file fails the load. The error names the role's
+    `asr_pilot_windows_<key>_allow_patterns` variable to fix.
+  - Each load also sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
+    in-process, so the run stays offline even if the deploy forgets to.
 - **Degenerate windows.** A window is marked degenerate for one of these reasons:
   - `repetition`: an n-gram repeats back-to-back (a single word 8 times, longer
-    n-grams 4 to 5 times);
+    n-grams 4 to 5 times), or a re-read: the same 8-word run 3 times or the same
+    16-word run twice anywhere in the window;
   - `token_limit`: the window hit its token limit;
+  - `overlong`: more than 4 words per audio second (narration is about 2.3);
   - `empty`: no text came back;
   - `language`: the text does not look like English. Two checks run with no
     extra dependencies. Text whose letters are mostly non-Latin (Japanese, for
@@ -185,6 +223,24 @@ tokens and ran at batch 1, an estimated ~14 h for the pilot set.
   same points, the run stops cleanly with exit 5.
 - **On either stop:** unfinished tracks, including those in the current batch,
   are not written. Finished tracks stay done, so a re-run resumes.
+- **Run visibility (`step_runs`).** A real run writes one `step_runs` row
+  (step `asr_pilot`, mode `write`), so it shows in the dashboard's **Running now**
+  panel and `GET /api/v1/runs` next to decide and eval (CONTRACT §1.10).
+  - The row is inserted at start, with total = tracks to do and message
+    `loading model`.
+  - It is updated after every batch with done = finished tracks and the
+    message `track i/n · W windows · D degenerate · rtfx R · eta T`. The
+    counters are `tracks_written`, `tracks_failed`, `tracks_skipped`,
+    `windows`, `degenerate`, `audio_sec`, `rtfx` and `eta_sec`; all are integers,
+    and rtfx and the ETA are wall clock including decode.
+  - A writer thread heartbeats at least every 30 s (and at most every 2 s)
+    while a long batch runs.
+  - It is closed `done`; `failed` (a track failed, or an error); or `cancelled`
+    (gaming, or `PILOT_STOP_FILE`).
+  - It writes through its own autocommit connection with a 5 s statement
+    timeout. A failed write is logged once (then every 20th) and never affects
+    the run.
+  - `--dry-run`, `--bench` and `--self-check` record nothing.
 - **Write order.** The per-track JSON is written to the out dir **before** the
   DB write, so a failed write never loses the GPU work. Right before the write,
   the connection is pinged and reopened if it died during the track.
@@ -205,7 +261,8 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
                 [--scope full|findings] [--limit-tracks N] [--track-limit-per-book N]
                 [--batch-size N] [--repetition-penalty P] [--force] [--dry-run]
                 [--out-dir DIR] [--arbiter-url URL] [--self-check]
-                [--bench [--bench-batches 1,8,16,32] [--bench-max-sec 1800]]
+                [--bench [--bench-batches 1,8,16,32] [--bench-windows 60,90,120] [--bench-max-sec S]]
+                [--no-repeat-ngram-size N]
 ```
 
 | Flag | Effect |
@@ -215,9 +272,12 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `--batch-size N` | Windows per `generate()` call. Defaults: granite 16, canary 32. |
 | `--repetition-penalty P` | Granite only. Default 1.0 (off). |
 | `--dry-run` | Prints one JSON line per track a real run would process, after the already-done filter and `--limit-tracks`, with its window plan. It reads the DB in a read-only session. It loads no model, decodes no audio and writes nothing. |
-| `--bench` | Use with `--asin X --limit-tracks 1`. Runs the first `--bench-max-sec` of that track once per batch size in `--bench-batches`, then prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path, window_sec, max_sec, results: [{batch_size, batch_size_used, windows, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows}]}}`. No DB writes. It runs the same gaming and stop-file checks as a real run (exit 4 / 5, nothing printed). |
+| `--bench` | Gathers windows from the tracks in `--asin` order, then by `file_path` within a book, until it has `max(--bench-batches) × 2` of them at the longest `--bench-windows` length. Batches span tracks. The total benched audio is capped at `--bench-max-sec`, default `max(--bench-batches) × 2 × longest window`: granite at 32 × 90 s is 5760 s, canary at 32 × 38 s is 2432 s. The window that would cross the cap is not taken, though at least one window always is. **`--limit-tracks` is ignored** in bench mode; `--track-limit-per-book` still applies. Every window length × batch size row re-plans **the same audio regions** at its window length, cutting at production pauses. It prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path (first track), tracks, windows, windows_wanted, window_sec, window_secs, max_sec, results: [{window_sec, batch_size, batch_size_used, tracks, windows, batches, windows_per_batch: {mean, min}, starved, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows, degenerate_rate, word_completeness}]}}`. `batches` counts the generate calls made. `word_completeness` is the multiset recall of the production words in each window's span (case and punctuation ignored, empty windows count as 0), or null without production words. A row is `starved` when there are fewer windows than its batch size, and a warning is logged. No DB writes. It runs the same gaming and stop-file checks as a real run (exit 4 / 5, nothing printed). It exits 3 when a sweep row failed (that row is `{window_sec, batch_size, error}`) or no window could be planned. |
+| `--bench-windows 60,90,120` | Window lengths (s) for `--bench` to sweep, each within the backend's hard max. Default: the configured window. |
+| `--no-repeat-ngram-size N` | Granite `generate()` `no_repeat_ngram_size`, for experiments. Default 0 (off). |
 | `--out-dir` | Where each finished track's JSON goes (plan, segments, metrics, degenerate windows). The default is `PILOT_OUT_DIR`, else `<tempdir>/earmark-asr-pilot-out`. |
 | `--self-check` | Loads the model and transcribes a bundled English clip, decoded through the normal ffmpeg path. It prints one JSON line `{backend, model, revision, torch, cuda, vram, clip, expected, output, wer, max_wer, language_scores, degenerate_reason, passed, attn_implementation, ffmpeg, ffprobe}`. It exits **6** when the transcript is not English, is degenerate, or has a WER above 0.35 against the expected text, and **2** when the clip is missing. Needs no DB. It cannot be combined with `--dry-run` or `--bench`. |
+| `--print-prefetch-spec` | Prints the HF snapshots a backend loads as JSON (`{backend, hf_hub_cache, ignore_patterns, snapshots: [{role_key, repo_id, revision, allow_patterns}]}`), then exits 0. Needs no DB, no `--asin`, and no `PILOT_MODEL_REVISION`; the pinned default is used when it is unset. `test_pilot.py` asserts these lists match the homelab-ansible `asr_pilot_windows` role. |
 | `--self-check-audio PATH` | Clip for `--self-check`; the expected text is `PATH` with a `.txt` suffix. Default: `testdata/selfcheck_en.flac` next to `pilot.py`, a 5.9 s LibriSpeech dev-clean utterance under CC BY 4.0 (see `runner/testdata/README.md`). |
 
 ### Environment
@@ -227,7 +287,8 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `DATABASE_URL` | Required, except with `--self-check`. |
 | `PILOT_MODEL_REVISION` | **Required.** The HF commit sha to load. Unpinned runs are refused (exit 2). |
 | `PILOT_MODEL_ID` | Defaults to the model in the table above. |
-| `HF_HOME` | The pilot's own HF cache. |
+| `HF_HOME` | The pilot's own HF cache. Snapshots are read from the cache huggingface_hub 2.4.0 itself uses: `HF_HUB_CACHE`, else `HUGGINGFACE_HUB_CACHE`, else `$HF_HOME/hub`, with `HF_HOME` defaulting to `$XDG_CACHE_HOME/huggingface` (`~/.cache/huggingface`). |
+| `PILOT_QWEN_MODEL_ID`, `PILOT_QWEN_REVISION` | Canary's LLM snapshot. Defaults: `Qwen/Qwen3-1.7B` at `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`. |
 | `BOOKS_MOUNT`, `BOOKS_DB_ROOT`, `BOOKS_PATH_ENCODING` | Same meaning as in `runner.py`. |
 | `FFMPEG_BIN`, `FFPROBE_BIN` | Default `ffmpeg` / `ffprobe`. `runner.py` has no env names for these; it runs them from `PATH`. |
 | `PILOT_WINDOW_SEC` | Target window length. Values above the backend's hard max are a config error. |
@@ -270,7 +331,7 @@ None of this has run on real hardware. The pilot set is 143 h of audio.
 - **Target:** RTFx ≥ 100 for each backend, which is about 1 h per backend over
   the whole set.
 - **Granite 2B (base):** the Open ASR leaderboard lists RTFx 231. Expect about
-  4–6 GB of bf16 weights plus activations for 16 × 240 s windows.
+  4–6 GB of bf16 weights plus activations for 16 × 90 s windows.
 - **Canary-Qwen 2.5B:** the model card reports RTFx 418 on an A100 (batched).
   Expect about 5–6 GB of weights plus 32 × 38 s windows.
 
