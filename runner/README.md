@@ -173,6 +173,8 @@ tokens and ran at batch 1, an estimated ~14 h for the pilot set.
     The Qwen weights are never read.
   - A missing snapshot or file fails the load. The error names the role's
     `asr_pilot_windows_<key>_allow_patterns` variable to fix.
+  - Each load also sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
+    in-process, so the run stays offline even if the deploy forgets to.
 - **Degenerate windows.** A window is marked degenerate for one of these reasons:
   - `repetition`: an n-gram repeats back-to-back (a single word 8 times, longer
     n-grams 4 to 5 times);
@@ -226,7 +228,7 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
                 [--scope full|findings] [--limit-tracks N] [--track-limit-per-book N]
                 [--batch-size N] [--repetition-penalty P] [--force] [--dry-run]
                 [--out-dir DIR] [--arbiter-url URL] [--self-check]
-                [--bench [--bench-batches 1,8,16,32] [--bench-max-sec 1800]]
+                [--bench [--bench-batches 1,8,16,32] [--bench-max-sec S]]
 ```
 
 | Flag | Effect |
@@ -236,7 +238,7 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `--batch-size N` | Windows per `generate()` call. Defaults: granite 16, canary 32. |
 | `--repetition-penalty P` | Granite only. Default 1.0 (off). |
 | `--dry-run` | Prints one JSON line per track a real run would process, after the already-done filter and `--limit-tracks`, with its window plan. It reads the DB in a read-only session. It loads no model, decodes no audio and writes nothing. |
-| `--bench` | Use with `--asin X --limit-tracks 1`. Runs the first `--bench-max-sec` of that track once per batch size in `--bench-batches`, then prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path, window_sec, max_sec, results: [{batch_size, batch_size_used, windows, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows}]}}`. No DB writes. It runs the same gaming and stop-file checks as a real run (exit 4 / 5, nothing printed). |
+| `--bench` | Gathers windows from the `--asin` tracks in order until it has `max(--bench-batches) × 2` of them, so every batch size gets full batches. Batches span tracks. The total benched audio is capped at `--bench-max-sec`, default `max(--bench-batches) × 2 × window`: granite at 32 is 15360 s, canary at 32 is 2432 s. The window that would cross the cap is not taken, though at least one window always is. **`--limit-tracks` is ignored** in bench mode; `--track-limit-per-book` still applies. Each batch size runs once over the same windows. It prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path (first track), tracks, windows, windows_wanted, window_sec, max_sec, results: [{batch_size, batch_size_used, tracks, windows, batches, windows_per_batch: {mean, min}, starved, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows}]}}`. `batches` counts the generate calls made. A row is `starved` when there are fewer windows than its batch size, and a warning is logged. No DB writes. It runs the same gaming and stop-file checks as a real run (exit 4 / 5, nothing printed). |
 | `--out-dir` | Where each finished track's JSON goes (plan, segments, metrics, degenerate windows). The default is `PILOT_OUT_DIR`, else `<tempdir>/earmark-asr-pilot-out`. |
 | `--self-check` | Loads the model and transcribes a bundled English clip, decoded through the normal ffmpeg path. It prints one JSON line `{backend, model, revision, torch, cuda, vram, clip, expected, output, wer, max_wer, language_scores, degenerate_reason, passed, attn_implementation, ffmpeg, ffprobe}`. It exits **6** when the transcript is not English, is degenerate, or has a WER above 0.35 against the expected text, and **2** when the clip is missing. Needs no DB. It cannot be combined with `--dry-run` or `--bench`. |
 | `--print-prefetch-spec` | Prints the HF snapshots a backend loads as JSON (`{backend, hf_hub_cache, ignore_patterns, snapshots: [{role_key, repo_id, revision, allow_patterns}]}`), then exits 0. Needs no DB, no `--asin`, and no `PILOT_MODEL_REVISION`; the pinned default is used when it is unset. `test_pilot.py` asserts these lists match the homelab-ansible `asr_pilot_windows` role. |

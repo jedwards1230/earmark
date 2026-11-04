@@ -14,6 +14,7 @@ import ast
 import importlib.util
 import itertools
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1233,6 +1234,8 @@ def _stub_modules(monkeypatch: pytest.MonkeyPatch, **mods: Any) -> None:
 def test_canary_load_gives_salm_local_paths_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")  # restored after the test
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
     canary = _snapshot(
         tmp_path,
         "nvidia/canary-qwen-2.5b",
@@ -1260,6 +1263,10 @@ def test_canary_load_gives_salm_local_paths_only(
     assert m.loaded == (str(canary / "model.safetensors"), "cpu", False)
     assert backend.local_dirs == {"model": str(canary), "llm": str(qwen)}
     assert backend.model.device == "cuda"
+    assert (
+        os.environ["HF_HUB_OFFLINE"] == "1"
+        and os.environ["TRANSFORMERS_OFFLINE"] == "1"
+    )
     # Nothing SALM got for the LLM or tokenizer is a repo id.
     assert all(Path(m.cfg[k]).is_dir() for k in ("pretrained_llm", "tokenizer_path"))
 
@@ -1295,6 +1302,8 @@ def test_canary_load_qwen_override_and_missing_qwen(
 def test_granite_load_uses_the_local_snapshot_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")  # restored after the test
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
     files = {
         "config.json": "{}",
         "model-00001-of-00003.safetensors": "w",
@@ -1348,3 +1357,105 @@ def test_granite_load_uses_the_local_snapshot_dir(
     path, kw = seen["model"]
     assert path == str(local) and "revision" not in kw and kw["dtype"] == "bf16"
     assert backend.tokenizer.padding_side == "left" and backend.prompt == "PROMPT"
+
+
+# ── --bench window gathering ───────────────────────────────────────────────────
+BENCH_TRACKS = [
+    ("B1", "/books/a/1.m4b", TID, 595.6),  # 3 granite windows (240 + 240 + 115.6)
+    ("B1", "/books/a/2.m4b", TID, 1200.0),  # 5
+    ("B2", "/books/b/1.m4b", TID, 2400.0),  # 10
+]
+
+
+def test_bench_default_cap_follows_batches_and_window() -> None:
+    assert make_cfg("granite", "--bench").bench_max_sec == 32 * 2 * 240.0  # 15360 s
+    assert (
+        make_cfg("canary", "--bench", "--bench-batches", "1,4").bench_max_sec
+        == 4 * 2 * 38.0
+    )
+    assert (
+        make_cfg("granite", "--bench", "--bench-max-sec", "500").bench_max_sec == 500.0
+    )
+
+
+def test_bench_gathers_windows_across_tracks_until_enough() -> None:
+    cfg = make_cfg("granite", "--bench", "--bench-batches", "1,4")  # wants 8 windows
+    plans = pilot.gather_bench_plans(
+        FakeConn(BENCH_TRACKS, []),
+        cfg,
+        pilot.select_tracks(FakeConn(BENCH_TRACKS, []), cfg),
+    )
+    assert [(t.file_path, len(p)) for t, p in plans] == [
+        ("/books/a/1.m4b", 3),
+        ("/books/a/2.m4b", 5),
+    ]
+
+
+def test_bench_gathering_respects_the_audio_cap() -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-batches", "1,32", "--bench-max-sec", "1000"
+    )
+    conn = FakeConn(BENCH_TRACKS, [])
+    plans = pilot.gather_bench_plans(conn, cfg, pilot.select_tracks(conn, cfg))
+    # 595.6 s of track 1, then 240 s of track 2; the next 240 s would cross 1000.
+    assert [(t.file_path, p) for t, p in plans] == [
+        ("/books/a/1.m4b", [(0.0, 240.0), (240.0, 480.0), (480.0, 595.6)]),
+        ("/books/a/2.m4b", [(0.0, 240.0)]),
+    ]
+    tiny = make_cfg("granite", "--bench", "--bench-max-sec", "10")
+    ((_t, p),) = pilot.gather_bench_plans(conn, tiny, pilot.select_tracks(conn, tiny))
+    assert len(p) == 1  # a cap below one window still benches one window
+
+
+def test_bench_rows_report_batches_and_starvation(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = make_cfg(
+        "granite", "--bench", "--bench-batches", "1,4,16", "--bench-max-sec", "1000",
+        "--limit-tracks", "1",
+    )  # fmt: skip
+    conn = FakeConn(BENCH_TRACKS, [])
+    backend = FakeBackend(cfg, "granite")
+    with caplog.at_level("WARNING"):
+        assert run(cfg, conn, backend) == 0
+    b = json.loads(capsys.readouterr().out)["bench"]
+    # --limit-tracks is ignored in bench mode: two tracks were gathered.
+    assert b["tracks"] == ["/books/a/1.m4b", "/books/a/2.m4b"]
+    assert b["file_path"] == "/books/a/1.m4b" and b["windows"] == 4
+    assert b["windows_wanted"] == 32 and b["max_sec"] == 1000.0
+    rows = {r["batch_size"]: r for r in b["results"]}
+    assert set(rows) == {1, 4, 16}
+    for r in rows.values():
+        assert set(r) == {
+            "batch_size", "batch_size_used", "tracks", "windows", "batches",
+            "windows_per_batch", "starved", "audio_sec", "wall_sec", "decode_sec",
+            "rtfx", "peak_vram_mib", "peak_reserved_mib", "degenerate_windows",
+        }  # fmt: skip
+        assert r["tracks"] == 2 and r["windows"] == 4 and r["audio_sec"] == 835.6
+    assert (rows[1]["batches"], rows[1]["windows_per_batch"]) == (
+        4,
+        {"mean": 1.0, "min": 1},
+    )
+    # Batches span tracks: 3 windows of track 1 + 1 of track 2 fill one batch of 4.
+    assert (rows[4]["batches"], rows[4]["windows_per_batch"], rows[4]["starved"]) == (
+        1, {"mean": 4.0, "min": 4}, False,
+    )  # fmt: skip
+    assert rows[16]["starved"] is True and rows[1]["starved"] is False
+    assert any("batch_size=16 is starved" in r.getMessage() for r in caplog.records)
+    assert conn.writes() == []
+
+
+def test_print_prefetch_spec_refuses_a_default_revision_for_another_model() -> None:
+    with pytest.raises(pilot.ConfigError, match="PILOT_MODEL_REVISION"):
+        pilot.load_config(
+            ["--backend", "granite", "--print-prefetch-spec"],
+            {"PILOT_MODEL_ID": "ibm-granite/granite-speech-4.1-2b-nar"},
+        )
+    cfg = pilot.load_config(
+        ["--backend", "granite", "--print-prefetch-spec"],
+        {
+            "PILOT_MODEL_ID": "ibm-granite/granite-speech-4.1-2b-nar",
+            "PILOT_MODEL_REVISION": "a" * 40,
+        },
+    )
+    assert pilot.prefetch_spec(cfg)["snapshots"][0]["revision"] == "a" * 40

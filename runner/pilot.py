@@ -139,7 +139,7 @@ HARD_MAX_WINDOW_SEC: dict[str, float] = {"granite": 540.0, "canary": 40.0}
 MIN_WINDOW_SEC = 5.0
 DEFAULT_BATCH_SIZE: dict[str, int] = {"granite": 16, "canary": 32}
 DEFAULT_BENCH_BATCHES = "1,8,16,32"
-DEFAULT_BENCH_MAX_SEC = 1800.0
+BENCH_WINDOWS_PER_BATCH = 2  # bench gathers max(--bench-batches) x this many windows
 
 # Cut search: the largest inter-word gap inside the last 25% of the target window.
 CUT_SEARCH_FRACTION = 0.25
@@ -263,7 +263,7 @@ class Config:
     qwen_revision: str = QWEN_REVISION
     bench: bool = False
     bench_batches: list[int] = field(default_factory=lambda: [1, 8, 16, 32])
-    bench_max_sec: float = DEFAULT_BENCH_MAX_SEC
+    bench_max_sec: float = 0.0  # 0 = max(bench_batches) x 2 x window_sec
     batch_size: int = 1
     repetition_penalty: float = 1.0
     stop_file: Path | None = None
@@ -363,14 +363,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--bench",
         action="store_true",
-        help="sweep --bench-batches on one track; print JSON, no DB writes",
+        help="sweep --bench-batches over windows gathered across the --asin tracks; "
+        "print JSON, no DB writes",
     )
     p.add_argument("--bench-batches", type=_batch_list, default=DEFAULT_BENCH_BATCHES)
     p.add_argument(
         "--bench-max-sec",
         type=float,
-        default=DEFAULT_BENCH_MAX_SEC,
-        help="bench at most this much audio of the track (default 1800)",
+        default=None,
+        help="cap on the benched audio, all tracks together "
+        "(default max(--bench-batches) x 2 x window)",
     )
     return p
 
@@ -403,7 +405,13 @@ def load_config(
         raise ConfigError("--asin is required (comma-separated ASINs)")
 
     revision = env.get("PILOT_MODEL_REVISION", "").strip()
+    model_id = env.get("PILOT_MODEL_ID", "").strip() or DEFAULT_MODEL_IDS[backend]
     if not revision and args.print_prefetch_spec:
+        if model_id != DEFAULT_MODEL_IDS[backend]:
+            raise ConfigError(
+                f"PILOT_MODEL_ID={model_id} has no pinned default revision; "
+                "set PILOT_MODEL_REVISION"
+            )
         revision = DEFAULT_MODEL_REVISIONS[backend]
     if not revision:
         raise ConfigError(
@@ -462,14 +470,16 @@ def load_config(
         qwen_revision=env.get("PILOT_QWEN_REVISION", "").strip() or QWEN_REVISION,
         bench=args.bench,
         bench_batches=bench_batches,
-        bench_max_sec=args.bench_max_sec,
+        bench_max_sec=args.bench_max_sec
+        if args.bench_max_sec is not None
+        else max(bench_batches) * BENCH_WINDOWS_PER_BATCH * window,
         batch_size=args.batch_size or DEFAULT_BATCH_SIZE[backend],
         repetition_penalty=args.repetition_penalty,
         stop_file=Path(env["PILOT_STOP_FILE"].strip())
         if env.get("PILOT_STOP_FILE", "").strip()
         else None,
         database_url=database_url,
-        model_id=env.get("PILOT_MODEL_ID", "").strip() or DEFAULT_MODEL_IDS[backend],
+        model_id=model_id,
         model_revision=revision,
         window_sec=window,
         hard_max_sec=hard_max,
@@ -1212,6 +1222,12 @@ def _out_file(cfg: Config, track: Track) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
+def force_hf_offline() -> None:
+    """Make transformers / huggingface_hub offline in-process too, not only via the deploy env."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
 class PrefetchMissing(RuntimeError):
     """A model file the run needs is not in the local HF cache."""
 
@@ -1399,6 +1415,7 @@ class GraniteBackend(Backend):
     name = "granite"
 
     def load(self) -> None:  # pragma: no cover - needs the GPU stack
+        force_hf_offline()  # before the imports: both libraries read it early
         import torch
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
@@ -1503,6 +1520,7 @@ class CanaryBackend(Backend):
         Weights stay in the checkpoint dtype; bf16 compute comes from autocast in
         transcribe_batch, so the float32 audio SALM.generate expects still matches.
         """
+        force_hf_offline()  # before the imports: both libraries read it early
         import torch
         from nemo.collections.speechlm2.models import SALM
 
@@ -1588,6 +1606,7 @@ class Batcher:
     def __init__(self, backend: Backend, size: int) -> None:
         self.backend = backend
         self.size = size
+        self.calls: list[int] = []  # windows per successful generate call
 
     def run(self, audios: Sequence[Any]) -> tuple[list[WindowResult], int]:
         """Transcribe all `audios`; returns (results, batch size in effect at the end)."""
@@ -1611,6 +1630,7 @@ class Batcher:
                     f"backend returned {len(got)} results for {len(part)} windows"
                 )
             results.extend(got)
+            self.calls.append(len(part))
             i += len(part)
         return results, self.size
 
@@ -1710,15 +1730,18 @@ class Pipeline:
             self.db.conn.rollback()
 
     def windows(
-        self, tracks: Sequence[Track], max_sec: float | None = None
+        self,
+        tracks: Sequence[Track],
+        plans: dict[str, list[Span]] | None = None,
     ) -> Iterator[WindowItem]:
         """Yield every planned window (a writable audio copy each), one decode chunk at a time."""
         for track in tracks:
             st: TrackState | None = None
             try:
-                plan, _ = track_plan(self.db.ensure(), self.cfg, track)
-                if max_sec is not None:
-                    plan = [w for w in plan if w[1] <= max_sec] or plan[:1]
+                if plans is not None:
+                    plan = plans.get(track.file_path, [])
+                else:
+                    plan, _ = track_plan(self.db.ensure(), self.cfg, track)
                 if not plan:
                     log.info(
                         "skip %s: nothing to transcribe (scope=%s)",
@@ -1819,9 +1842,13 @@ class Pipeline:
             len(result["degenerate_windows"]),
         )  # fmt: skip
 
-    def run(self, tracks: Sequence[Track], max_sec: float | None = None) -> None:
+    def run(
+        self,
+        tracks: Sequence[Track],
+        plans: dict[str, list[Span]] | None = None,
+    ) -> None:
         batch: list[WindowItem] = []
-        for item in self.windows(tracks, max_sec):
+        for item in self.windows(tracks, plans):
             if item.state.failed:
                 continue
             batch.append(item)
@@ -1853,44 +1880,112 @@ def dry_run(
         )
 
 
+def gather_bench_plans(
+    conn: Any, cfg: Config, tracks: Sequence[Track]
+) -> list[tuple[Track, list[Span]]]:
+    """Windows for --bench: tracks in order until max(bench_batches) x 2 windows.
+
+    The total planned audio is capped at cfg.bench_max_sec; the window that
+    would cross the cap is not taken (but at least one window always is).
+    """
+    need = max(cfg.bench_batches) * BENCH_WINDOWS_PER_BATCH
+    out: list[tuple[Track, list[Span]]] = []
+    n, audio, capped = 0, 0.0, False
+    for t in tracks:
+        plan, _ = track_plan(conn, cfg, t)
+        take: list[Span] = []
+        for w in plan:
+            length = w[1] - w[0]
+            if n >= need:
+                break
+            if audio + length > cfg.bench_max_sec and n > 0:
+                capped = True
+                break
+            take.append(w)
+            n += 1
+            audio += length
+        if take:
+            out.append((t, take))
+        if n >= need or capped:
+            break
+    return out
+
+
 def bench(
     db: DbSession,
     cfg: Config,
     backend: Backend,
-    track: Track,
+    tracks: Sequence[Track],
     decode: DecodeFn,
     check: Callable[[], None],
     emit: Callable[[str], None] = print,
 ) -> None:
-    """Sweep cfg.bench_batches over (at most bench_max_sec of) one track. No DB writes.
+    """Sweep cfg.bench_batches over windows gathered across `tracks`. No DB writes.
 
+    Windows come from the tracks in order until there are max(bench_batches) x 2
+    of them, capped at cfg.bench_max_sec of audio, so every batch size gets full
+    batches. A row whose batch size exceeds the windows available is `starved`.
     `check` is the same stop-file + gaming check as a real run, applied before
     each track, decode chunk and batch of every sweep step (GamingStop and
     StopRequested propagate to run(), which exits 4 / 5 without printing).
     """
+    gathered = gather_bench_plans(db.ensure(), cfg, tracks)
+    plans = {t.file_path: p for t, p in gathered}
+    bench_tracks = [t for t, _ in gathered]
+    total = sum(len(p) for p in plans.values())
     rows: list[dict[str, Any]] = []
     for size in cfg.bench_batches:
         sub = Config(**{**cfg.__dict__, "batch_size": size})
         pipe = Pipeline(db, sub, backend, decode, check, write=False)
-        pipe.run([track], max_sec=cfg.bench_max_sec)
-        if not pipe.done:
+        pipe.run(bench_tracks, plans=plans)
+        if len(pipe.done) != len(bench_tracks):
             rows.append({"batch_size": size, "error": "failed (see log)"})
             continue
-        r = pipe.done[0]["result"]
-        rows.append(
-            {
-                "batch_size": size,
-                "batch_size_used": r["batch_size_used"],
-                "windows": r["windows"],
-                "audio_sec": r["audio_sec"],
-                "wall_sec": r["wall_sec"],
-                "decode_sec": r["decode_sec"],
-                "rtfx": r["rtfx"],
-                "peak_vram_mib": r["peak_vram_mib"],
-                "peak_reserved_mib": r["peak_reserved_mib"],
-                "degenerate_windows": len(r["degenerate_windows"]),
-            }
-        )
+        results = [d["result"] for d in pipe.done]
+        audio = sum(r["audio_sec"] for r in results)
+        wall = sum(r["wall_sec"] for r in results)
+        calls = pipe.batcher.calls
+        windows = sum(r["windows"] for r in results)
+        row = {
+            "batch_size": size,
+            "batch_size_used": min(
+                (r["batch_size_used"] for r in results if r["batch_size_used"]),
+                default=None,
+            ),
+            "tracks": len(results),
+            "windows": windows,
+            "batches": len(calls),
+            "windows_per_batch": {
+                "mean": round(sum(calls) / len(calls), 2) if calls else None,
+                "min": min(calls, default=None),
+            },
+            "starved": windows < size,
+            "audio_sec": round(audio, 3),
+            "wall_sec": round(wall, 3),
+            "decode_sec": round(sum(r["decode_sec"] for r in results), 3),
+            "rtfx": round(audio / wall, 3) if wall > 0 else None,
+            "peak_vram_mib": max(
+                (r["peak_vram_mib"] for r in results if r["peak_vram_mib"] is not None),
+                default=None,
+            ),
+            "peak_reserved_mib": max(
+                (
+                    r["peak_reserved_mib"]
+                    for r in results
+                    if r["peak_reserved_mib"] is not None
+                ),
+                default=None,
+            ),
+            "degenerate_windows": sum(len(r["degenerate_windows"]) for r in results),
+        }
+        if row["starved"]:
+            log.warning(
+                "bench batch_size=%d is starved: only %d windows (raise --bench-max-sec "
+                "or add --asin tracks)",
+                size,
+                windows,
+            )
+        rows.append(row)
     emit(
         json.dumps(
             {
@@ -1898,7 +1993,10 @@ def bench(
                     "backend": cfg.backend,
                     "model_id": cfg.model_id,
                     "model_revision": cfg.model_revision,
-                    "file_path": track.file_path,
+                    "file_path": bench_tracks[0].file_path if bench_tracks else None,
+                    "tracks": [t.file_path for t in bench_tracks],
+                    "windows": total,
+                    "windows_wanted": max(cfg.bench_batches) * BENCH_WINDOWS_PER_BATCH,
                     "window_sec": cfg.window_sec,
                     "max_sec": cfg.bench_max_sec,
                     "results": rows,
@@ -1987,7 +2085,10 @@ def run(
     try:
         tracks = select_tracks(db.ensure(), cfg)
         if cfg.bench:
-            tracks = tracks[:1]
+            if cfg.limit_tracks:
+                log.info(
+                    "--bench ignores --limit-tracks (it gathers windows across tracks)"
+                )
             if not tracks:
                 log.error("--bench: no track for %s", ",".join(cfg.asins))
                 return EXIT_CONFIG
@@ -2004,7 +2105,7 @@ def run(
                 backend = make_backend(cfg)
                 backend.load()
             if cfg.bench:
-                bench(db, cfg, backend, tracks[0], decode, check)
+                bench(db, cfg, backend, tracks, decode, check)
                 return EXIT_OK
             pipe = Pipeline(db, cfg, backend, decode, check)
             pipe.run(tracks)
