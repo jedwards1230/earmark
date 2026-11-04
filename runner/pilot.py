@@ -28,14 +28,17 @@ CLI:
                     [--limit-tracks N] [--track-limit-per-book N] [--force]
                     [--batch-size N] [--repetition-penalty P]
                     [--dry-run] [--out-dir DIR] [--arbiter-url URL]
-                    [--self-check [--self-check-audio CLIP]]
+                    [--self-check [--self-check-audio CLIP]] [--print-prefetch-spec]
                     [--bench [--bench-batches 1,8,16,32] [--bench-max-sec S]]
 
 Environment:
     DATABASE_URL          required (except --self-check). earmark Postgres DSN.
     PILOT_MODEL_ID        default per backend (see DEFAULT_MODEL_IDS).
     PILOT_MODEL_REVISION  required: the HF commit sha to load. Unpinned runs are refused.
-    HF_HOME               HF cache (the pilot's own, not production's).
+    HF_HOME               HF cache (the pilot's own, not production's); snapshots are
+                          read from HF_HUB_CACHE, else $HF_HOME/hub, offline only.
+    PILOT_QWEN_MODEL_ID   canary's LLM repo (default Qwen/Qwen3-1.7B).
+    PILOT_QWEN_REVISION   its pinned commit (default 70d244cc…; see QWEN_REVISION).
     BOOKS_MOUNT           as runner.py: this host's books mount (UNC on Windows).
     BOOKS_DB_ROOT         as runner.py: default /books.
     BOOKS_PATH_ENCODING   as runner.py: none | sfm.
@@ -58,6 +61,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import contextlib
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -89,6 +93,39 @@ SAMPLE_RATE = 16000
 
 BACKENDS = ("granite", "canary")
 SCOPES = ("full", "findings")
+
+# ---------------------------------------------------------------------------
+# HF snapshots (single source of truth for the deploy-time prefetch)
+# ---------------------------------------------------------------------------
+# Runs are offline (HF_HUB_OFFLINE=1): every model file is prefetched by the
+# homelab-ansible role asr_pilot_windows at apply time, and pilot.py resolves the
+# local snapshot DIRECTORIES itself — no hub call, no refs/ lookup. These lists
+# are what the role must prefetch; `pilot.py --print-prefetch-spec` prints them
+# (test_pilot.py asserts they equal the role's current lists).
+#
+# Canary-Qwen's config.json names pretrained_llm "Qwen/Qwen3-1.7B" (no revision).
+# SALM builds its tokenizer and LLM skeleton from that (pretrained_weights is
+# forced False, so the Qwen weights are never read); pilot.py points it at the
+# local Qwen snapshot pinned below instead of the repo id.
+DEFAULT_MODEL_REVISIONS: dict[str, str] = {
+    "granite": "823ca793aa49925d4eb2e758709b7f2c98513e8e",
+    "canary": "b1469e1bba1cfe140205529c79c434ca47180960",
+}
+QWEN_MODEL_ID = "Qwen/Qwen3-1.7B"
+QWEN_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+PREFETCH_ALLOW_PATTERNS: dict[str, list[str]] = {
+    "granite": ["*.json", "*.safetensors", "chat_template.jinja", "merges.txt"],
+    "canary": ["config.json", "model.safetensors"],
+    "canary_llm": [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+    ],
+}
+PREFETCH_IGNORE_PATTERNS: list[str] = [".eval_results/*", "*.nemo"]
 
 DEFAULT_MODEL_IDS: dict[str, str] = {
     "granite": "ibm-granite/granite-speech-4.1-2b",
@@ -220,6 +257,10 @@ class Config:
     arbiter_url: str | None = None
     self_check: bool = False
     self_check_audio: Path = SELF_CHECK_AUDIO
+    print_prefetch_spec: bool = False
+    hf_cache: Path | None = None
+    qwen_model_id: str = QWEN_MODEL_ID
+    qwen_revision: str = QWEN_REVISION
     bench: bool = False
     bench_batches: list[int] = field(default_factory=lambda: [1, 8, 16, 32])
     bench_max_sec: float = DEFAULT_BENCH_MAX_SEC
@@ -315,6 +356,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="clip for --self-check; expected text in the same path with .txt",
     )
     p.add_argument(
+        "--print-prefetch-spec",
+        action="store_true",
+        help="print the HF repos/revisions/allow-patterns a run needs offline (JSON)",
+    )
+    p.add_argument(
         "--bench",
         action="store_true",
         help="sweep --bench-batches on one track; print JSON, no DB writes",
@@ -352,17 +398,20 @@ def load_config(
 
     backend = args.backend
     asins = [a.strip() for a in args.asin.split(",") if a.strip()]
-    if not args.self_check and not asins:
+    no_db = args.self_check or args.print_prefetch_spec
+    if not no_db and not asins:
         raise ConfigError("--asin is required (comma-separated ASINs)")
 
     revision = env.get("PILOT_MODEL_REVISION", "").strip()
+    if not revision and args.print_prefetch_spec:
+        revision = DEFAULT_MODEL_REVISIONS[backend]
     if not revision:
         raise ConfigError(
             "PILOT_MODEL_REVISION is required (HF commit sha); refusing to run unpinned"
         )
 
     database_url = env.get("DATABASE_URL", "").strip()
-    if not args.self_check and not database_url:
+    if not no_db and not database_url:
         raise ConfigError("DATABASE_URL is required")
 
     hard_max = HARD_MAX_WINDOW_SEC[backend]
@@ -407,6 +456,10 @@ def load_config(
         arbiter_url=(args.arbiter_url or "").rstrip("/") or None,
         self_check=args.self_check,
         self_check_audio=args.self_check_audio,
+        print_prefetch_spec=args.print_prefetch_spec,
+        hf_cache=hf_hub_cache(env),
+        qwen_model_id=env.get("PILOT_QWEN_MODEL_ID", "").strip() or QWEN_MODEL_ID,
+        qwen_revision=env.get("PILOT_QWEN_REVISION", "").strip() or QWEN_REVISION,
         bench=args.bench,
         bench_batches=bench_batches,
         bench_max_sec=args.bench_max_sec,
@@ -1155,6 +1208,116 @@ def _out_file(cfg: Config, track: Track) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Offline HF snapshot resolution (no huggingface_hub import, no network)
+# ---------------------------------------------------------------------------
+
+
+class PrefetchMissing(RuntimeError):
+    """A model file the run needs is not in the local HF cache."""
+
+
+@dataclass(frozen=True)
+class SnapshotSpec:
+    role_key: str  # the role's asr_pilot_windows_<role_key>_allow_patterns
+    repo_id: str
+    revision: str
+    allow_patterns: tuple[str, ...]
+
+
+def hf_hub_cache(env: dict[str, str]) -> Path:
+    """The hub cache huggingface_hub would use: HF_HUB_CACHE, else $HF_HOME/hub."""
+    explicit = env.get("HF_HUB_CACHE", "").strip()
+    if explicit:
+        return Path(explicit)
+    home = env.get("HF_HOME", "").strip()
+    if home:
+        return Path(home) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def snapshot_specs(cfg: Config) -> list[SnapshotSpec]:
+    """The snapshots a backend loads, in load order."""
+    if cfg.backend == "granite":
+        return [
+            SnapshotSpec(
+                "granite",
+                cfg.model_id,
+                cfg.model_revision,
+                tuple(PREFETCH_ALLOW_PATTERNS["granite"]),
+            )
+        ]
+    return [
+        SnapshotSpec(
+            "canary",
+            cfg.model_id,
+            cfg.model_revision,
+            tuple(PREFETCH_ALLOW_PATTERNS["canary"]),
+        ),
+        SnapshotSpec(
+            "canary_llm",
+            cfg.qwen_model_id,
+            cfg.qwen_revision,
+            tuple(PREFETCH_ALLOW_PATTERNS["canary_llm"]),
+        ),
+    ]
+
+
+def prefetch_spec(cfg: Config) -> dict[str, Any]:
+    """JSON-able prefetch spec for cfg.backend (what --print-prefetch-spec prints)."""
+    return {
+        "backend": cfg.backend,
+        "hf_hub_cache": str(cfg.hf_cache) if cfg.hf_cache else None,
+        "ignore_patterns": list(PREFETCH_IGNORE_PATTERNS),
+        "snapshots": [
+            {
+                "role_key": sp.role_key,
+                "repo_id": sp.repo_id,
+                "revision": sp.revision,
+                "allow_patterns": list(sp.allow_patterns),
+            }
+            for sp in snapshot_specs(cfg)
+        ],
+    }
+
+
+def resolve_snapshot(cache: Path, spec: SnapshotSpec) -> Path:
+    """Local snapshot dir of spec.repo_id at spec.revision, checked against its allow list.
+
+    Reads the cache layout directly (models--<org>--<name>/snapshots/<sha>/), so
+    it never touches the network and never needs refs/main. A non-sha revision
+    is resolved through refs/<revision> if present. Every literal pattern must
+    exist and every glob must match at least one file; otherwise PrefetchMissing
+    names the role variable to fix.
+    """
+    repo_dir = cache / ("models--" + spec.repo_id.replace("/", "--"))
+    sha = spec.revision
+    if not (len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)):
+        ref = repo_dir / "refs" / sha
+        sha = ref.read_text(encoding="utf-8").strip() if ref.is_file() else sha
+    snap = repo_dir / "snapshots" / sha
+    hint = (
+        f"re-run the homelab-ansible asr_pilot_windows prefetch "
+        f"(asr_pilot_windows_{spec.role_key}_allow_patterns at {spec.repo_id}@{spec.revision}; "
+        f"`pilot.py --print-prefetch-spec` shows what pilot.py needs)"
+    )
+    if not snap.is_dir():
+        raise PrefetchMissing(
+            f"{spec.repo_id}@{spec.revision} is not in the HF cache {cache}: {hint}"
+        )
+    files = [p.relative_to(snap).as_posix() for p in snap.rglob("*") if p.is_file()]
+    missing = [
+        pat
+        for pat in spec.allow_patterns
+        if not any(fnmatch.fnmatch(f, pat) for f in files)
+    ]
+    if missing:
+        raise PrefetchMissing(
+            f"{spec.repo_id}@{spec.revision} in {snap} lacks {missing}: {hint}"
+        )
+    return snap
+
+
+# ---------------------------------------------------------------------------
 # Backends (heavy imports are lazy: CI and --dry-run never import torch)
 # ---------------------------------------------------------------------------
 
@@ -1240,9 +1403,12 @@ class GraniteBackend(Backend):
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
         self.torch = torch
-        self.processor = AutoProcessor.from_pretrained(
-            self.cfg.model_id, revision=self.cfg.model_revision
-        )
+        # A local snapshot directory, never the repo id: offline-safe, no refs/.
+        (local,) = [
+            resolve_snapshot(self.cfg.hf_cache, sp) for sp in snapshot_specs(self.cfg)
+        ]
+        self.local_dirs = {"model": str(local)}
+        self.processor = AutoProcessor.from_pretrained(str(local))
         self.tokenizer = self.processor.tokenizer
         self.tokenizer.padding_side = "left"  # batched generate needs left padding
         attn = (
@@ -1251,8 +1417,7 @@ class GraniteBackend(Backend):
             else "sdpa"
         )
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.cfg.model_id,
-            revision=self.cfg.model_revision,
+            str(local),
             device_map=self.cfg.device,
             dtype=torch.bfloat16,
             attn_implementation=attn,
@@ -1309,23 +1474,54 @@ class GraniteBackend(Backend):
         ]
 
 
+def _build_salm(salm_cls: Any, cfg: dict[str, Any], weights: Path) -> Any:
+    """SALM(cfg) + its safetensors, as NeMo's hf_hub._load_from_local_weights does.
+
+    Module-level on purpose, like NeMo's: Lightning's save_hyperparameters walks
+    the call stack and can mistake a frame with `__class__` in its closure for
+    an __init__ frame (NeMo's note on _distributed_from_pretrained).
+    """
+    model = salm_cls(cfg)
+    return salm_cls._load_as_safetensor(model, str(weights), "cpu", False)
+
+
 class CanaryBackend(Backend):
     """Canary-Qwen 2.5B via NeMo SALM (usage per the HF card / SALM.generate docstring)."""
 
     name = "canary"
 
-    def load(self) -> None:  # pragma: no cover - needs the GPU stack
+    def load(self) -> None:
+        """Build SALM from local snapshots only.
+
+        SALM.from_pretrained(<dir>) would read pretrained_llm "Qwen/Qwen3-1.7B"
+        from config.json and resolve it by repo id (refs/main, offline). So this
+        does what NeMo's HFHubMixin._from_pretrained + _load_from_local_weights do
+        (NeMo e5d79d5a, speechlm2/parts/hf_hub.py), with pretrained_llm and
+        tokenizer_path pointed at the pinned local Qwen snapshot:
+          cfg = config.json; cfg[pretrained_weights] = False; SALM(cfg);
+          SALM._load_as_safetensor(model, model.safetensors, "cpu", strict=False).
+        Weights stay in the checkpoint dtype; bf16 compute comes from autocast in
+        transcribe_batch, so the float32 audio SALM.generate expects still matches.
+        """
         import torch
-        from huggingface_hub import snapshot_download
         from nemo.collections.speechlm2.models import SALM
 
         self.torch = torch
-        # snapshot_download pins the exact HF revision; SALM then loads the local dir.
-        local = snapshot_download(self.cfg.model_id, revision=self.cfg.model_revision)
-        # Weights stay in the checkpoint dtype (the card loads it as-is); bf16
-        # compute comes from autocast in transcribe_batch, so the float32 audio
-        # tensor SALM.generate expects still matches the perception module.
-        self.model = SALM.from_pretrained(local).to(self.cfg.device).eval()
+        canary, qwen = (
+            resolve_snapshot(self.cfg.hf_cache, sp) for sp in snapshot_specs(self.cfg)
+        )
+        self.local_dirs = {"model": str(canary), "llm": str(qwen)}
+        cfg = json.loads((canary / "config.json").read_text(encoding="utf-8"))
+        if "pretrained_llm" not in cfg:
+            raise RuntimeError(f"{canary / 'config.json'} has no pretrained_llm")
+        cfg["pretrained_llm"] = str(qwen)
+        cfg["tokenizer_path"] = str(qwen)
+        cfg["pretrained_weights"] = (
+            False  # as _from_pretrained: never load sub-model weights
+        )
+        cfg["trust_remote_code"] = False
+        model = _build_salm(SALM, cfg, canary / "model.safetensors")
+        self.model = model.to(self.cfg.device).eval()
 
     def transcribe_batch(
         self, audios: Sequence[Any]
@@ -1836,6 +2032,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         log.error("config error: %s", exc)
         return EXIT_CONFIG
+    if cfg.print_prefetch_spec:
+        print(json.dumps(prefetch_spec(cfg)))
+        return EXIT_OK
     if cfg.self_check:  # pragma: no cover - GPU stack
         return self_check(cfg)
     conn = connect(cfg)

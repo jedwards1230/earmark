@@ -152,6 +152,27 @@ tokens and ran at batch 1, an estimated ~14 h for the pilot set.
   `do_sample=False` and `--repetition-penalty` (default 1.0: the base card gives
   none).
 - **Canary prompt.** `Transcribe the following: <audio_locator_tag>`, from the card.
+- **Offline model loading.** Runs set `HF_HUB_OFFLINE=1`, and every model file is
+  prefetched at deploy time. pilot.py reads the snapshot directories from the HF
+  cache layout itself (`models--<org>--<name>/snapshots/<sha>/`). It never calls
+  the hub, needs no `refs/main`, and hands the models local directories, never
+  repo ids.
+  - The snapshots are pinned in pilot.py as `DEFAULT_MODEL_REVISIONS`,
+    `QWEN_REVISION` and `PREFETCH_ALLOW_PATTERNS`, and
+    `--print-prefetch-spec` prints them.
+  - Granite loads from its snapshot of `ibm-granite/granite-speech-4.1-2b`.
+  - Canary needs two snapshots: `nvidia/canary-qwen-2.5b` (`config.json`,
+    `model.safetensors`), and `Qwen/Qwen3-1.7B` at `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`
+    for the LLM config and tokenizer files only.
+  - `SALM.from_pretrained` is not used for Canary, because it would resolve the
+    config's `pretrained_llm: Qwen/Qwen3-1.7B` by repo id. pilot.py repeats what
+    NeMo's `HFHubMixin._from_pretrained` does instead: it reads `config.json`,
+    points `pretrained_llm` and `tokenizer_path` at the local Qwen snapshot, sets
+    `pretrained_weights=False`, then calls `SALM(cfg)` and
+    `SALM._load_as_safetensor(model, model.safetensors, "cpu", strict=False)`.
+    The Qwen weights are never read.
+  - A missing snapshot or file fails the load. The error names the role's
+    `asr_pilot_windows_<key>_allow_patterns` variable to fix.
 - **Degenerate windows.** A window is marked degenerate for one of these reasons:
   - `repetition`: an n-gram repeats back-to-back (a single word 8 times, longer
     n-grams 4 to 5 times);
@@ -218,6 +239,7 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `--bench` | Use with `--asin X --limit-tracks 1`. Runs the first `--bench-max-sec` of that track once per batch size in `--bench-batches`, then prints one JSON object: `{"bench": {backend, model_id, model_revision, file_path, window_sec, max_sec, results: [{batch_size, batch_size_used, windows, audio_sec, wall_sec, decode_sec, rtfx, peak_vram_mib, peak_reserved_mib, degenerate_windows}]}}`. No DB writes. It runs the same gaming and stop-file checks as a real run (exit 4 / 5, nothing printed). |
 | `--out-dir` | Where each finished track's JSON goes (plan, segments, metrics, degenerate windows). The default is `PILOT_OUT_DIR`, else `<tempdir>/earmark-asr-pilot-out`. |
 | `--self-check` | Loads the model and transcribes a bundled English clip, decoded through the normal ffmpeg path. It prints one JSON line `{backend, model, revision, torch, cuda, vram, clip, expected, output, wer, max_wer, language_scores, degenerate_reason, passed, attn_implementation, ffmpeg, ffprobe}`. It exits **6** when the transcript is not English, is degenerate, or has a WER above 0.35 against the expected text, and **2** when the clip is missing. Needs no DB. It cannot be combined with `--dry-run` or `--bench`. |
+| `--print-prefetch-spec` | Prints the HF snapshots a backend loads as JSON (`{backend, hf_hub_cache, ignore_patterns, snapshots: [{role_key, repo_id, revision, allow_patterns}]}`), then exits 0. Needs no DB, no `--asin`, and no `PILOT_MODEL_REVISION`; the pinned default is used when it is unset. `test_pilot.py` asserts these lists match the homelab-ansible `asr_pilot_windows` role. |
 | `--self-check-audio PATH` | Clip for `--self-check`; the expected text is `PATH` with a `.txt` suffix. Default: `testdata/selfcheck_en.flac` next to `pilot.py`, a 5.9 s LibriSpeech dev-clean utterance under CC BY 4.0 (see `runner/testdata/README.md`). |
 
 ### Environment
@@ -227,7 +249,8 @@ python pilot.py --backend {granite,canary} --asin A1,A2,...
 | `DATABASE_URL` | Required, except with `--self-check`. |
 | `PILOT_MODEL_REVISION` | **Required.** The HF commit sha to load. Unpinned runs are refused (exit 2). |
 | `PILOT_MODEL_ID` | Defaults to the model in the table above. |
-| `HF_HOME` | The pilot's own HF cache. |
+| `HF_HOME` | The pilot's own HF cache. Snapshots are read from `HF_HUB_CACHE`, else `$HF_HOME/hub`. |
+| `PILOT_QWEN_MODEL_ID`, `PILOT_QWEN_REVISION` | Canary's LLM snapshot. Defaults: `Qwen/Qwen3-1.7B` at `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`. |
 | `BOOKS_MOUNT`, `BOOKS_DB_ROOT`, `BOOKS_PATH_ENCODING` | Same meaning as in `runner.py`. |
 | `FFMPEG_BIN`, `FFPROBE_BIN` | Default `ffmpeg` / `ffprobe`. `runner.py` has no env names for these; it runs them from `PATH`. |
 | `PILOT_WINDOW_SEC` | Target window length. Values above the backend's hard max are a config error. |

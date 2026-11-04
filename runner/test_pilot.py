@@ -17,7 +17,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 import pytest
 
@@ -1039,3 +1039,312 @@ def test_non_english_window_is_marked_degenerate_in_a_run() -> None:
     data = json.loads(next(Path(out).glob("*.json")).read_text(encoding="utf-8"))
     assert [d["reason"] for d in data["degenerate_windows"]] == ["language"]
     assert data["segments"][0]["degenerate_reason"] == "language"
+
+
+# ── Offline HF snapshots (deploy-time prefetch) ────────────────────────────────
+# Copied from jedwards1230/homelab-ansible roles/asr_pilot_windows/defaults/main.yaml
+# (origin/main, 2026-11-03): asr_pilot_windows_{granite,canary,canary_llm}_allow_patterns,
+# *_model_revision and asr_pilot_windows_hf_ignore_patterns. If this test fails,
+# pilot.py and the role disagree about what is prefetched: change both together.
+ROLE_PREFETCH = {
+    "granite": {
+        "revision": "823ca793aa49925d4eb2e758709b7f2c98513e8e",
+        "allow": ["*.json", "*.safetensors", "chat_template.jinja", "merges.txt"],
+    },
+    "canary": {
+        "revision": "b1469e1bba1cfe140205529c79c434ca47180960",
+        "allow": ["config.json", "model.safetensors"],
+    },
+    "canary_llm": {
+        "repo_id": "Qwen/Qwen3-1.7B",
+        "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+        "allow": [
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+        ],
+    },
+}
+ROLE_IGNORE = [".eval_results/*", "*.nemo"]
+CANARY_SHA = ROLE_PREFETCH["canary"]["revision"]
+QWEN_SHA = ROLE_PREFETCH["canary_llm"]["revision"]
+GRANITE_SHA = ROLE_PREFETCH["granite"]["revision"]
+
+
+def test_prefetch_lists_match_the_role() -> None:
+    for key, want in ROLE_PREFETCH.items():
+        assert pilot.PREFETCH_ALLOW_PATTERNS[key] == want["allow"], key
+    assert pilot.DEFAULT_MODEL_REVISIONS == {
+        "granite": GRANITE_SHA,
+        "canary": CANARY_SHA,
+    }
+    assert (pilot.QWEN_MODEL_ID, pilot.QWEN_REVISION) == ("Qwen/Qwen3-1.7B", QWEN_SHA)
+    assert pilot.PREFETCH_IGNORE_PATTERNS == ROLE_IGNORE
+
+
+def _snapshot(cache: Path, repo: str, sha: str, files: dict[str, str]) -> Path:
+    snap = cache / ("models--" + repo.replace("/", "--")) / "snapshots" / sha
+    for name, body in files.items():
+        f = snap / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(body, encoding="utf-8")
+    return snap
+
+
+CANARY_CONFIG = json.dumps(
+    {
+        "pretrained_llm": "Qwen/Qwen3-1.7B",
+        "pretrained_asr": "nvidia/canary-1b-flash",
+        "pretrained_weights": True,
+        "audio_locator_tag": "<|audioplaceholder|>",
+    }
+)
+QWEN_FILES = {n: "{}" for n in ROLE_PREFETCH["canary_llm"]["allow"]}
+
+
+def _hf_env(cache: Path, **extra: str) -> dict[str, str]:
+    return {"PILOT_MODEL_REVISION": CANARY_SHA, "HF_HUB_CACHE": str(cache), **extra}
+
+
+def test_print_prefetch_spec_needs_no_db_and_uses_the_pins(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PILOT_MODEL_REVISION", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HF_HOME", "/hf")
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    assert pilot.main(["--backend", "canary", "--print-prefetch-spec"]) == 0
+    spec = json.loads(capsys.readouterr().out)
+    assert spec["hf_hub_cache"] == str(Path("/hf") / "hub")
+    assert spec["ignore_patterns"] == ROLE_IGNORE
+    assert [
+        (s["role_key"], s["repo_id"], s["revision"], s["allow_patterns"])
+        for s in spec["snapshots"]
+    ] == [
+        (
+            "canary",
+            "nvidia/canary-qwen-2.5b",
+            CANARY_SHA,
+            ROLE_PREFETCH["canary"]["allow"],
+        ),
+        (
+            "canary_llm",
+            "Qwen/Qwen3-1.7B",
+            QWEN_SHA,
+            ROLE_PREFETCH["canary_llm"]["allow"],
+        ),
+    ]
+    assert pilot.main(["--backend", "granite", "--print-prefetch-spec"]) == 0
+    (g,) = json.loads(capsys.readouterr().out)["snapshots"]
+    assert (g["revision"], g["allow_patterns"]) == (
+        GRANITE_SHA,
+        ROLE_PREFETCH["granite"]["allow"],
+    )
+
+
+def test_resolve_snapshot_offline_without_refs_main(tmp_path: Path) -> None:
+    snap = _snapshot(tmp_path, "Qwen/Qwen3-1.7B", QWEN_SHA, QWEN_FILES)
+    spec = pilot.SnapshotSpec(
+        "canary_llm", "Qwen/Qwen3-1.7B", QWEN_SHA, tuple(QWEN_FILES)
+    )
+    assert pilot.resolve_snapshot(tmp_path, spec) == snap
+    assert not (tmp_path / "models--Qwen--Qwen3-1.7B" / "refs").exists()
+    # A branch name is resolved through refs/<name> when one exists.
+    ref = tmp_path / "models--Qwen--Qwen3-1.7B" / "refs" / "main"
+    ref.parent.mkdir(parents=True)
+    ref.write_text(QWEN_SHA)
+    branch = pilot.SnapshotSpec(
+        "canary_llm", "Qwen/Qwen3-1.7B", "main", tuple(QWEN_FILES)
+    )
+    assert pilot.resolve_snapshot(tmp_path, branch) == snap
+
+
+def test_resolve_snapshot_globs_and_missing_files_name_the_role(tmp_path: Path) -> None:
+    _snapshot(
+        tmp_path,
+        "ibm-granite/granite-speech-4.1-2b",
+        GRANITE_SHA,
+        {"config.json": "{}", "merges.txt": ""},
+    )
+    spec = pilot.SnapshotSpec(
+        "granite",
+        "ibm-granite/granite-speech-4.1-2b",
+        GRANITE_SHA,
+        tuple(ROLE_PREFETCH["granite"]["allow"]),
+    )
+    with pytest.raises(pilot.PrefetchMissing) as err:
+        pilot.resolve_snapshot(tmp_path, spec)
+    msg = str(err.value)
+    assert (
+        "*.safetensors" in msg
+        and "chat_template.jinja" in msg
+        and "*.json" not in msg.split("lacks")[1]
+    )
+    assert (
+        "asr_pilot_windows_granite_allow_patterns" in msg
+        and "--print-prefetch-spec" in msg
+    )
+    with pytest.raises(pilot.PrefetchMissing, match="not in the HF cache"):
+        pilot.resolve_snapshot(tmp_path / "empty", spec)
+
+
+class _FakeSALM:
+    instances: ClassVar[list[Any]] = []
+
+    def __init__(self, cfg: dict) -> None:
+        assert isinstance(cfg, dict)
+        self.cfg = cfg
+        self.loaded: Any = None
+        _FakeSALM.instances.append(self)
+
+    @classmethod
+    def from_pretrained(cls, *a: Any, **k: Any) -> Any:
+        raise AssertionError("from_pretrained would resolve Qwen by repo id")
+
+    @classmethod
+    def _load_as_safetensor(
+        cls, model: Any, path: str, map_location: str, strict: bool
+    ) -> Any:
+        model.loaded = (path, map_location, strict)
+        return model
+
+    def to(self, device: str) -> Self:
+        self.device = device
+        return self
+
+    def eval(self) -> Self:
+        return self
+
+
+def _stub_modules(monkeypatch: pytest.MonkeyPatch, **mods: Any) -> None:
+    import types
+
+    for name, attrs in mods.items():
+        mod = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_canary_load_gives_salm_local_paths_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canary = _snapshot(
+        tmp_path,
+        "nvidia/canary-qwen-2.5b",
+        CANARY_SHA,
+        {"config.json": CANARY_CONFIG, "model.safetensors": "w"},
+    )
+    qwen = _snapshot(tmp_path, "Qwen/Qwen3-1.7B", QWEN_SHA, QWEN_FILES)
+    _FakeSALM.instances.clear()
+    _stub_modules(
+        monkeypatch,
+        torch={"bfloat16": "bf16"},
+        nemo={},
+        **{"nemo.collections": {}, "nemo.collections.speechlm2": {}},
+        **{"nemo.collections.speechlm2.models": {"SALM": _FakeSALM}},
+    )
+    cfg = pilot.load_config(["--backend", "canary", "--self-check"], _hf_env(tmp_path))
+    backend = pilot.CanaryBackend(cfg)
+    backend.load()
+    (m,) = _FakeSALM.instances
+    assert m.cfg["pretrained_llm"] == str(qwen) and m.cfg["tokenizer_path"] == str(qwen)
+    assert m.cfg["pretrained_weights"] is False and m.cfg["trust_remote_code"] is False
+    assert (
+        m.cfg["pretrained_asr"] == "nvidia/canary-1b-flash"
+    )  # untouched; not loaded when weights are off
+    assert m.loaded == (str(canary / "model.safetensors"), "cpu", False)
+    assert backend.local_dirs == {"model": str(canary), "llm": str(qwen)}
+    assert backend.model.device == "cuda"
+    # Nothing SALM got for the LLM or tokenizer is a repo id.
+    assert all(Path(m.cfg[k]).is_dir() for k in ("pretrained_llm", "tokenizer_path"))
+
+
+def test_canary_load_qwen_override_and_missing_qwen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _snapshot(
+        tmp_path,
+        "nvidia/canary-qwen-2.5b",
+        CANARY_SHA,
+        {"config.json": CANARY_CONFIG, "model.safetensors": "w"},
+    )
+    _stub_modules(
+        monkeypatch,
+        torch={},
+        nemo={},
+        **{"nemo.collections": {}, "nemo.collections.speechlm2": {}},
+        **{"nemo.collections.speechlm2.models": {"SALM": _FakeSALM}},
+    )
+    other = "1" * 40
+    cfg = pilot.load_config(
+        ["--backend", "canary", "--self-check"],
+        _hf_env(tmp_path, PILOT_QWEN_REVISION=other),
+    )
+    assert cfg.qwen_revision == other
+    with pytest.raises(
+        pilot.PrefetchMissing, match="asr_pilot_windows_canary_llm_allow_patterns"
+    ):
+        pilot.CanaryBackend(cfg).load()
+
+
+def test_granite_load_uses_the_local_snapshot_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = {
+        "config.json": "{}",
+        "model-00001-of-00003.safetensors": "w",
+        "chat_template.jinja": "",
+        "merges.txt": "",
+    }
+    hub = tmp_path / "home" / "hub"  # HF_HOME/hub when HF_HUB_CACHE is unset
+    local = _snapshot(hub, "ibm-granite/granite-speech-4.1-2b", GRANITE_SHA, files)
+    seen: dict[str, Any] = {}
+
+    class Tok:
+        padding_side = "right"
+
+        def apply_chat_template(self, chat: Any, **k: Any) -> str:
+            return "PROMPT"
+
+    class Proc:
+        tokenizer = Tok()
+
+    class AutoProcessor:
+        @staticmethod
+        def from_pretrained(path: str, **k: Any) -> Any:
+            seen["processor"] = (path, k)
+            return Proc()
+
+    class Model:
+        def eval(self) -> None:
+            return None
+
+    class AutoModelForSpeechSeq2Seq:
+        @staticmethod
+        def from_pretrained(path: str, **k: Any) -> Any:
+            seen["model"] = (path, k)
+            return Model()
+
+    _stub_modules(
+        monkeypatch,
+        torch={"bfloat16": "bf16"},
+        transformers={
+            "AutoProcessor": AutoProcessor,
+            "AutoModelForSpeechSeq2Seq": AutoModelForSpeechSeq2Seq,
+        },
+    )
+    cfg = pilot.load_config(
+        ["--backend", "granite", "--self-check"],
+        {"PILOT_MODEL_REVISION": GRANITE_SHA, "HF_HOME": str(tmp_path / "home")},
+    )
+    backend = pilot.GraniteBackend(cfg)
+    backend.load()
+    assert seen["processor"] == (str(local), {})
+    path, kw = seen["model"]
+    assert path == str(local) and "revision" not in kw and kw["dtype"] == "bf16"
+    assert backend.tokenizer.padding_side == "left" and backend.prompt == "PROMPT"
