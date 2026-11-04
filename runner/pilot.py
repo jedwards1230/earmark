@@ -68,6 +68,7 @@ import json
 import logging
 import math
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1705,6 +1706,233 @@ def build_result(cfg: Config, st: TrackState) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# step_runs recorder (CONTRACT §1.10): pilot runs show up in GET /api/v1/runs
+# ---------------------------------------------------------------------------
+
+STEP_RUN_STEP = "asr_pilot"  # internal/runs StepASRPilot
+StepRunDone, StepRunFailed, StepRunCancelled = "done", "failed", "cancelled"
+STEP_RUN_INTERVAL_SEC = 2.0  # at most one write per interval ...
+STEP_RUN_HEARTBEAT_SEC = 30.0  # ... and at least one per heartbeat
+STEP_RUN_TIMEOUT_MS = 5000
+
+_STEP_RUN_INSERT_SQL = """
+    INSERT INTO step_runs (step, mode, model, args, host, total, last_message)
+    VALUES ('asr_pilot', 'write', %s, %s, %s, %s, %s)
+    RETURNING id
+"""
+# Same shape as internal/db/stepruns.go updateStepRunSQL: only an open row is
+# touched, so a late write never reopens a closed run.
+_STEP_RUN_UPDATE_SQL = """
+    UPDATE step_runs
+       SET heartbeat_at = now(),
+           total        = %s,
+           done         = %s,
+           counters     = %s::jsonb,
+           last_message = COALESCE(%s, last_message),
+           status       = COALESCE(%s, status),
+           finished_at  = CASE WHEN %s::text IS NULL THEN finished_at ELSE now() END,
+           error        = COALESCE(%s, error)
+     WHERE id = %s AND status = 'running'
+"""
+
+
+def _fmt_eta(sec: float | None) -> str:
+    if sec is None:
+        return "?"
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    return f"{h}h{rem // 60:02d}m" if h else f"{rem // 60}m{rem % 60:02d}s"
+
+
+class StepRunRecorder:
+    """Writes one step_runs row for a pilot run, like internal/runs does for Go steps.
+
+    Start inserts the row synchronously; progress() only updates memory, and a
+    writer thread writes at most every STEP_RUN_INTERVAL_SEC and at least every
+    STEP_RUN_HEARTBEAT_SEC (a heartbeat even while one long batch runs, so the
+    run is never shown stale); finish() closes it with done / failed /
+    cancelled. Writes use their own autocommit connection with a 5 s statement
+    timeout. Recording never fails the run: every error is logged (the first,
+    then every 20th) and swallowed, and a failed insert is retried later.
+    """
+
+    def __init__(
+        self,
+        connect_fn: Callable[[], Any],
+        *,
+        interval: float = STEP_RUN_INTERVAL_SEC,
+        heartbeat: float = STEP_RUN_HEARTBEAT_SEC,
+        threaded: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.connect_fn = connect_fn
+        self.interval = interval
+        self.heartbeat = heartbeat
+        self.threaded = threaded
+        self.clock = clock
+        self.conn: Any = None
+        self.id: int | None = None
+        self.errors = 0
+        self.closed = False
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_write = 0.0
+        self._start_spec: tuple[Any, ...] | None = None
+        self._state: dict[str, Any] = {
+            "total": None,
+            "done": 0,
+            "counters": {},
+            "message": None,
+        }
+
+    # -- plumbing ----------------------------------------------------------
+    def _error(self, what: str, exc: BaseException) -> None:
+        self.errors += 1
+        if self.errors == 1 or self.errors % 20 == 0:
+            log.warning(
+                "step_runs %s failed (%d so far; the run continues): %s",
+                what,
+                self.errors,
+                exc,
+            )
+        with contextlib.suppress(Exception):
+            if self.conn is not None:
+                self.conn.close()
+        self.conn = None
+
+    def _cursor_conn(self) -> Any:
+        if self.conn is None or getattr(self.conn, "closed", 0):
+            conn = self.connect_fn()
+            with contextlib.suppress(Exception):
+                conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {STEP_RUN_TIMEOUT_MS}")
+            self.conn = conn
+        return self.conn
+
+    def _insert(self) -> None:
+        assert self._start_spec is not None
+        with self._cursor_conn().cursor() as cur:
+            cur.execute(_STEP_RUN_INSERT_SQL, self._start_spec)
+            row = cur.fetchone()
+        self.id = int(row[0])
+
+    def _write(self, status: str | None = None, error: str | None = None) -> None:
+        with self._lock:
+            try:
+                if self.id is None:
+                    self._insert()
+                st = self._state
+                with self._cursor_conn().cursor() as cur:
+                    cur.execute(
+                        _STEP_RUN_UPDATE_SQL,
+                        (
+                            st["total"],
+                            st["done"],
+                            json.dumps(st["counters"]),
+                            (st["message"] or "")[:512] or None,
+                            status,
+                            status,
+                            (error or "")[:2000] or None,
+                            self.id,
+                        ),
+                    )
+                self._last_write = self.clock()
+            except Exception as exc:  # noqa: BLE001 - recording never fails the run
+                self._error("write", exc)
+
+    def _loop(self) -> None:
+        while not self.closed:
+            self._wake.wait(self.heartbeat)
+            if self.closed:
+                return
+            wait = self.interval - (self.clock() - self._last_write)
+            if wait > 0:
+                time.sleep(wait)
+                if self.closed:
+                    return
+            self._wake.clear()
+            self._write()
+
+    # -- API ---------------------------------------------------------------
+    def start(self, *, model: str, args: str, total: int, message: str) -> None:
+        self._start_spec = (
+            model[:256],
+            args[:256],
+            (os.environ.get("COMPUTERNAME") or socket.gethostname())[:256],
+            total,
+            message[:512],
+        )
+        self._state.update(total=total, message=message)
+        with self._lock:
+            try:
+                self._insert()
+                self._last_write = self.clock()
+            except Exception as exc:  # noqa: BLE001 - recording never fails the run
+                self._error("insert", exc)
+        if self.threaded:
+            self._thread = threading.Thread(
+                target=self._loop, name="step-runs", daemon=True
+            )
+            self._thread.start()
+
+    def progress(self, *, done: int, counters: dict[str, int], message: str) -> None:
+        self._state.update(done=done, counters=dict(counters), message=message)
+        if self.threaded:
+            self._wake.set()
+        elif self.clock() - self._last_write >= self.interval:
+            self._write()
+
+    def finish(self, status: str, error: str | None = None) -> None:
+        self.closed = True
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+        self._write(status=status, error=error)
+        with contextlib.suppress(Exception):
+            if self.conn is not None:
+                self.conn.close()
+
+
+def run_progress(
+    rec: StepRunRecorder,
+    tracks: Sequence[Track],
+    started: float,
+    clock: Callable[[], float],
+) -> Callable[[Pipeline], None]:
+    """Pipeline progress -> step_runs (done = finished tracks; counters are ints)."""
+    total_audio = sum(t.duration for t in tracks)
+
+    def update(pipe: Pipeline) -> None:
+        finished = pipe.written + len(pipe.failed) + pipe.skipped
+        elapsed = max(clock() - started, 1e-9)
+        rate = pipe.audio_done / elapsed  # audio s per wall s, decode included
+        eta = None
+        if pipe.cfg.scope == "full" and rate > 0:
+            eta = max(0.0, total_audio - pipe.audio_done) / rate
+        rec.progress(
+            done=finished,
+            counters={
+                "tracks_written": pipe.written,
+                "tracks_failed": len(pipe.failed),
+                "tracks_skipped": pipe.skipped,
+                "windows": pipe.windows_done,
+                "degenerate": pipe.degenerate,
+                "audio_sec": int(pipe.audio_done),
+                "rtfx": round(rate),
+                **({"eta_sec": int(eta)} if eta is not None else {}),
+            },
+            message=(
+                f"track {finished}/{len(tracks)} · {pipe.windows_done} windows · "
+                f"{pipe.degenerate} degenerate · rtfx {rate:.1f} · eta {_fmt_eta(eta)}"
+            ),
+        )
+
+    return update
+
+
 class Pipeline:
     def __init__(
         self,
@@ -1724,6 +1952,16 @@ class Pipeline:
         self.batcher = Batcher(backend, cfg.batch_size)
         self.failed: list[str] = []
         self.done: list[dict[str, Any]] = []
+        self.skipped = 0
+        self.written = 0
+        self.windows_done = 0
+        self.degenerate = 0
+        self.audio_done = 0.0
+        self.on_progress: Callable[[Pipeline], None] | None = None
+
+    def _progress(self) -> None:
+        if self.on_progress is not None:
+            self.on_progress(self)
 
     def _fail(self, st: TrackState | None, track: Track) -> None:
         log.exception("track failed: %s", track.file_path)
@@ -1732,6 +1970,7 @@ class Pipeline:
         self.failed.append(track.file_path)
         with contextlib.suppress(Exception):
             self.db.conn.rollback()
+        self._progress()
 
     def windows(
         self,
@@ -1752,6 +1991,8 @@ class Pipeline:
                         track.file_path,
                         self.cfg.scope,
                     )
+                    self.skipped += 1
+                    self._progress()
                     continue
                 self.check()
                 path = resolve_audio_path(self.cfg, track.file_path)
@@ -1806,9 +2047,14 @@ class Pipeline:
             st.batch_size_used = (
                 used if st.batch_size_used is None else min(st.batch_size_used, used)
             )
+            self.windows_done += 1
+            self.audio_done += it.end - it.start
+            if degenerate_reason(res.text, res.hit_token_limit):
+                self.degenerate += 1
         for st in {id(it.state): it.state for it in batch}.values():
             if st.left == 0 and not st.failed:
                 self.finish(st)
+        self._progress()
 
     def finish(self, st: TrackState) -> None:
         result = build_result(self.cfg, st)
@@ -1836,6 +2082,7 @@ class Pipeline:
                     encoding="utf-8",
                 )
             write_result(self.db.ensure(), self.cfg, st.track, result)
+            self.written += 1
         except Exception:  # noqa: BLE001 - the out-file keeps the work
             self._fail(st, st.track)
             return
@@ -1939,7 +2186,8 @@ def bench(
     """Sweep cfg.bench_batches over windows gathered across `tracks`. No DB writes.
 
     Returns EXIT_OK, or EXIT_TRACKS_FAILED when no window could be gathered
-    (nothing is printed then).
+    (nothing is printed then) or when any sweep row failed (the JSON is still
+    printed, with an `error` row).
 
     Windows come from the tracks in --asin order until there are max(bench_batches) x 2
     of them, capped at cfg.bench_max_sec of audio, so every batch size gets full
@@ -1956,12 +2204,14 @@ def bench(
     bench_tracks = [t for t, _ in gathered]
     total = sum(len(p) for p in plans.values())
     rows: list[dict[str, Any]] = []
+    failed_rows = 0
     for size in cfg.bench_batches:
         sub = Config(**{**cfg.__dict__, "batch_size": size})
         pipe = Pipeline(db, sub, backend, decode, check, write=False)
         pipe.run(bench_tracks, plans=plans)
         if len(pipe.done) != len(bench_tracks):
             rows.append({"batch_size": size, "error": "failed (see log)"})
+            failed_rows += 1
             continue
         results = [d["result"] for d in pipe.done]
         audio = sum(r["audio_sec"] for r in results)
@@ -2027,7 +2277,7 @@ def bench(
             ensure_ascii=False,
         )
     )
-    return EXIT_OK
+    return EXIT_TRACKS_FAILED if failed_rows else EXIT_OK
 
 
 def self_check(
@@ -2097,7 +2347,11 @@ def run(
     decode: DecodeFn = decode_audio,
     gaming_check: Callable[[], None] | None = None,
     connect_fn: Callable[[], Any] | None = None,
+    recorder: StepRunRecorder | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
+    """One pilot run. With `recorder`, a real (non dry-run, non bench) run is
+    recorded in step_runs; main() passes one, tests pass a fake or none."""
     db = DbSession(conn, connect_fn or (lambda: connect(cfg)))
     gaming = gaming_check or (lambda: check_gaming(cfg))
 
@@ -2122,25 +2376,57 @@ def run(
                 return EXIT_OK
             if not tracks:
                 return EXIT_OK
+        rec = recorder if not cfg.bench else None
+        if rec is not None:
+            rec.start(
+                model=f"{cfg.model_id}@{cfg.model_revision[:12]}",
+                args=(
+                    f"--backend {cfg.backend} --scope {cfg.scope} "
+                    f"--batch-size {cfg.batch_size} --asin {','.join(cfg.asins)}"
+                ),
+                total=len(tracks),
+                message="loading model",
+            )
+        status, error = StepRunFailed, None
         try:
-            check()  # before the multi-GB model load, not only after it
-            if backend is None:  # pragma: no cover - real model
-                backend = make_backend(cfg)
-                backend.load()
-            if cfg.bench:
-                return bench(db, cfg, backend, tracks, decode, check)
-            pipe = Pipeline(db, cfg, backend, decode, check)
-            pipe.run(tracks)
-        except GamingStop as exc:
-            log.warning("stopping for gaming (%s); unfinished tracks not written", exc)
-            return EXIT_GAMING
-        except StopRequested as exc:
-            log.warning("stopping (%s); unfinished tracks not written", exc)
-            return EXIT_STOPPED
-        except PrefetchMissing as exc:  # operator-fixable: re-run the role's prefetch
-            log.error("%s", exc)
-            return EXIT_CONFIG
-        return EXIT_TRACKS_FAILED if pipe.failed else EXIT_OK
+            try:
+                check()  # before the multi-GB model load, not only after it
+                if backend is None:  # pragma: no cover - real model
+                    backend = make_backend(cfg)
+                    backend.load()
+                if cfg.bench:
+                    return bench(db, cfg, backend, tracks, decode, check)
+                pipe = Pipeline(db, cfg, backend, decode, check)
+                if rec is not None:
+                    pipe.on_progress = run_progress(rec, tracks, clock(), clock)
+                pipe.run(tracks)
+            except GamingStop as exc:
+                log.warning(
+                    "stopping for gaming (%s); unfinished tracks not written", exc
+                )
+                status, error = StepRunCancelled, f"stopped for gaming: {exc}"
+                return EXIT_GAMING
+            except StopRequested as exc:
+                log.warning("stopping (%s); unfinished tracks not written", exc)
+                status, error = StepRunCancelled, f"stopped: {exc}"
+                return EXIT_STOPPED
+            except (
+                PrefetchMissing
+            ) as exc:  # operator-fixable: re-run the role's prefetch
+                log.error("%s", exc)
+                error = str(exc)
+                return EXIT_CONFIG
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                raise
+            if pipe.failed:
+                error = f"{len(pipe.failed)} track(s) failed"
+                return EXIT_TRACKS_FAILED
+            status = StepRunDone
+            return EXIT_OK
+        finally:
+            if rec is not None:
+                rec.finish(status, error)
     finally:
         if db.conn is not conn:  # reconnected mid-run: the caller only closes its own
             with contextlib.suppress(Exception):
@@ -2168,8 +2454,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             log.error("%s", exc)
             return EXIT_CONFIG
     conn = connect(cfg)
+    rec = None if (cfg.dry_run or cfg.bench) else StepRunRecorder(lambda: connect(cfg))
     try:
-        return run(cfg, conn)
+        return run(cfg, conn, recorder=rec)
     finally:
         with contextlib.suppress(Exception):
             conn.close()

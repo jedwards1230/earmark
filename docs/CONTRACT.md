@@ -1951,6 +1951,7 @@ CREATE INDEX step_runs_started_at_idx ON step_runs (started_at DESC, id DESC);
 | `eval_backfill` | `write` with `--write` | NULL (`--limit` counts latched transcripts, not visited ones) | one per visited transcript: `latched`, `failed`, `not_embedded`, `skipped`; plus `chunks`, `chunk_errors`, `findings` | `judging <file> · asking <model>` |
 | `eval_rejudge` | `write` with `--write` | NULL | one per judge call (chunk): `judged`, `cached`, `failed`, each tick adding the call's reported cost; per transcript `transcripts_complete` / `transcripts_partial` / `transcripts_failed` / `transcripts_skipped`, plus `findings` (rows inserted) | `asking <model>` |
 | `asr_vote` | `write` with `--yes`, else `dry_run` | NULL | one per held finding voted: `heard_replacement`, `heard_original`, `neither`, `unmappable`; plus `written` (rows upserted, `--yes`) and `tracks_skipped` (no production or pilot segments) | `track i/n` |
+| `asr_pilot` | `write` (written by `runner/pilot.py` itself; `--dry-run`, `--bench` and `--self-check` record nothing) | the tracks to do | `tracks_written`, `tracks_failed`, `tracks_skipped`, `windows`, `degenerate`, `audio_sec`, `rtfx` (rounded; wall clock incl. decode), `eta_sec` (full scope only) | `loading model`, then `track i/n · W windows · D degenerate · rtfx R · eta T`. Closed `done`, `failed` (a track failed, or an error), or `cancelled` (gaming via gpu-arbiter, or `PILOT_STOP_FILE`) |
 
 `done` counts finished items; `cost_usd` sums the calls' reported cost
 (cached calls are free).

@@ -1517,3 +1517,191 @@ def test_bench_follows_asin_order_not_sort_order() -> None:
     for bad in ("0", "-5", "nan"):
         with pytest.raises(pilot.ConfigError):
             make_cfg("granite", "--bench", "--bench-max-sec", bad)
+
+
+# ── step_runs recording (CONTRACT §1.10) ───────────────────────────────────────
+class RunsConn:
+    """A separate autocommit connection the recorder writes step_runs through."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.sql: list[tuple[str, Any]] = []
+        self.fail = fail
+        self.closed = 0
+        self.autocommit = False
+
+    def cursor(self) -> Any:
+        conn = self
+
+        class Cur:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *e: object) -> None:
+                return None
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                if conn.fail and "step_runs" in sql:
+                    raise OSError("relation step_runs is locked")
+                conn.sql.append((" ".join(sql.split()), params))
+
+            def fetchone(self) -> Any:
+                return (77,)
+
+        return Cur()
+
+    def close(self) -> None:
+        self.closed = 1
+
+    def updates(self) -> list[Any]:
+        return [p for q, p in self.sql if q.startswith("UPDATE step_runs")]
+
+    def inserts(self) -> list[Any]:
+        return [p for q, p in self.sql if q.startswith("INSERT INTO step_runs")]
+
+
+def _recorder(conn: RunsConn) -> Any:
+    return pilot.StepRunRecorder(lambda: conn, interval=0.0, threaded=False)
+
+
+def test_run_records_a_step_run_with_progress_and_done() -> None:
+    cfg = make_cfg("canary", "--batch-size", "1")
+    runs = RunsConn()
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), recorder=_recorder(runs)) == 0
+    assert runs.autocommit is True
+    assert runs.sql[0] == ("SET statement_timeout = 5000", None)
+    ((model, args, host, total, message),) = runs.inserts()
+    assert (
+        "INSERT INTO step_runs (step, mode, model, args, host, total, last_message) VALUES ('asr_pilot', 'write'"
+        in runs.sql[1][0]
+    )
+    assert model == f"nvidia/canary-qwen-2.5b@{REV[:12]}" and "--backend canary" in args
+    assert total == 2 and message == "loading model" and host
+    ups = runs.updates()
+    # one update per batch (6 windows) plus the final close
+    assert len(ups) == 7
+    *_, last = ups
+    total_, done, counters, msg, status, status2, error, run_id = last
+    assert (total_, done, status, status2, error, run_id) == (
+        2,
+        2,
+        "done",
+        "done",
+        None,
+        77,
+    )
+    c = json.loads(counters)
+    assert c["tracks_written"] == 2 and c["tracks_failed"] == 0 and c["windows"] == 6
+    assert c["degenerate"] == 0 and c["audio_sec"] == 180 and "eta_sec" in c
+    assert all(isinstance(v, int) for v in c.values())  # Go reads map[string]int64
+    assert msg.startswith("track 2/2 · 6 windows · 0 degenerate · rtfx ")
+    first = json.loads(ups[0][2])
+    assert first["windows"] == 1 and ups[0][4] is None  # a heartbeat, not a close
+
+
+def test_step_run_closes_cancelled_on_gaming_and_stop_file(tmp_path: Path) -> None:
+    cfg = make_cfg("canary", "--batch-size", "1")
+    runs = RunsConn()
+
+    def gaming() -> None:
+        raise pilot.GamingStop("state=gaming")
+
+    assert (
+        run(
+            cfg,
+            FakeConn(TRACKS, SEGMENTS),
+            gaming_check=gaming,
+            recorder=_recorder(runs),
+        )
+        == 4
+    )
+    last = runs.updates()[-1]
+    assert last[4] == "cancelled" and last[6].startswith("stopped for gaming")
+
+    stop = tmp_path / "STOP"
+    stop.touch()
+    cfg = make_cfg("canary", env={"PILOT_STOP_FILE": str(stop)})
+    runs = RunsConn()
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), recorder=_recorder(runs)) == 5
+    last = runs.updates()[-1]
+    assert last[4] == "cancelled" and last[6].startswith("stopped: stop file")
+
+
+def test_step_run_closes_failed_when_tracks_fail() -> None:
+    cfg = make_cfg("canary", "--batch-size", "1")
+    runs = RunsConn()
+    backend = FakeBackend(cfg, "canary", outputs=[RuntimeError("device-side assert")])
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), backend, recorder=_recorder(runs)) == 3
+    last = runs.updates()[-1]
+    assert last[4] == "failed" and last[6] == "1 track(s) failed"
+    c = json.loads(last[2])
+    assert (c["tracks_written"], c["tracks_failed"]) == (1, 1)
+
+
+def test_step_run_write_failures_never_fail_the_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cfg = make_cfg("canary")
+    conn = FakeConn(TRACKS, SEGMENTS)
+    broken = RunsConn(fail=True)
+    rec = _recorder(broken)
+    with caplog.at_level("WARNING"):
+        assert run(cfg, conn, recorder=rec) == 0
+    assert [p[0] for p in conn.inserts()] == ["/books/a/t1.m4b", "/books/a/t2.m4b"]
+    assert rec.errors >= 2 and rec.id is None
+    assert (
+        sum("step_runs" in r.getMessage() for r in caplog.records) == 1
+    )  # first error only
+
+    def no_db() -> Any:
+        raise OSError("connection refused")
+
+    rec = pilot.StepRunRecorder(no_db, interval=0.0, threaded=False)
+    assert run(cfg, FakeConn(TRACKS, SEGMENTS), recorder=rec) == 0
+
+
+def test_dry_run_and_bench_write_no_step_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runs = RunsConn()
+    assert (
+        run(
+            make_cfg("granite", "--dry-run"),
+            FakeConn(TRACKS, SEGMENTS),
+            recorder=_recorder(runs),
+        )
+        == 0
+    )
+    bench = make_cfg(
+        "canary", "--bench", "--bench-batches", "1", "--bench-max-sec", "50"
+    )
+    assert run(bench, FakeConn(TRACKS, SEGMENTS), recorder=_recorder(runs)) == 0
+    capsys.readouterr()
+    assert runs.sql == []
+
+
+def test_step_run_heartbeat_thread_writes_during_a_long_batch() -> None:
+    import time as _time
+
+    runs = RunsConn()
+    rec = pilot.StepRunRecorder(lambda: runs, interval=0.0, heartbeat=0.02)
+    rec.start(model="m", args="a", total=1, message="loading model")
+    _time.sleep(0.15)  # no progress() call: only heartbeats
+    beats = len(runs.updates())
+    rec.finish("done")
+    assert beats >= 2
+    assert runs.updates()[-1][4] == "done" and runs.closed == 1
+
+
+def test_bench_exits_3_when_a_sweep_row_fails(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = make_cfg(
+        "canary", "--bench", "--bench-batches", "1,2", "--bench-max-sec", "100"
+    )
+    backend = FakeBackend(
+        cfg, "canary", outputs=["Fine.", "Fine.", RuntimeError("boom")]
+    )
+    assert run(cfg, FakeConn(BENCH_TRACKS, []), backend) == pilot.EXIT_TRACKS_FAILED
+    rows = json.loads(capsys.readouterr().out)["bench"]["results"]
+    assert rows[0]["batch_size"] == 1 and "error" not in rows[0]
+    assert rows[1] == {"batch_size": 2, "error": "failed (see log)"}

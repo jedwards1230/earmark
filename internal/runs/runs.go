@@ -53,6 +53,10 @@ const (
 	StepEvalRejudge  = "eval_rejudge"
 	// StepASRVote is `earmark asr-pilot vote` (CONTRACT §1.11).
 	StepASRVote = "asr_vote"
+	// StepASRPilot is a runner/pilot.py run (CONTRACT §1.11). The Python
+	// runner writes its step_runs row itself, with this token; it is listed
+	// here so the step names live in one place.
+	StepASRPilot = "asr_pilot"
 )
 
 // Store is the slice of the database a Run writes (*db.DB implements it).
