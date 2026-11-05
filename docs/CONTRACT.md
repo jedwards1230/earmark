@@ -1350,7 +1350,7 @@ there is no other schema code. The version is recorded in `goose_db_version`.
 | 15 | `00015_decide_duplicates.sql` | The decide step records agreement and conflict (§2.17 "Version history", §2.19 "Agreeing and conflicting findings"): `finding_events.outcome` gains `duplicate` (a duplicate decision must name its representative), and `finding_events.related_finding_id` — a plain column, no foreign key on the append-only log — names a duplicate's representative or an `overlap_dup` loser's winner, with a partial index. Locks only `finding_events` (ACCESS EXCLUSIVE, `lock_timeout` 5s); no rewrite. The representative CHECK is added `NOT VALID`, so Up after an opted-in Down (which keeps the append-only log's `duplicate` decisions and drops their pointer) succeeds. Down refuses while any event names a related finding unless `earmark.allow_data_loss = 'on'`, and restores the old outcome CHECK `NOT VALID` (recorded `duplicate` decisions are kept). Its Down takes the lock before the refusal check. 14 (jedwards1230/earmark#193) must be merged first (versions are applied strictly in order). |
 | 17 | `00017_asr_pilot.sql` | The second-ASR pilot (§1.11): `pilot_transcripts` (one row per track × model × revision × scope, written by `runner/pilot.py`; `production_transcript_id` → `transcripts(id) ON DELETE CASCADE`) and `finding_asr_votes` (one asr_vote per finding × pilot transcript — `heard_replacement`, `heard_original`, `neither`, `unmappable` or `style_only` — written by `earmark asr-pilot vote --yes`; cascades from both the finding and the pilot transcript). Two new tables, no ALTER, no backfill; the two foreign keys take SHARE ROW EXCLUSIVE on `transcript_findings` then `transcripts`, locked up front (`lock_timeout` 5s) in the order that cannot deadlock against a requeue (which row-locks transcripts, writes findings, then deletes transcripts). Down refuses while `pilot_transcripts` has rows unless `earmark.allow_data_loss = 'on'`. |
 | 18 | `00018_runner_arbiter_yield.sql` | (Version 16 is unused: it was planned for this migration, which merged after 17.) gpu-arbiter's own yield request (§1.4 "gpu-arbiter yield"): `runner_control.arbiter_yield BOOLEAN NOT NULL DEFAULT false` and `arbiter_yield_at TIMESTAMPTZ`, both `ADD COLUMN IF NOT EXISTS` (Down `DROP COLUMN IF EXISTS`). A constant default rewrites nothing; ACCESS EXCLUSIVE on the one-row `runner_control` only, `lock_timeout` 5s. |
-| 19 | `00019_finding_events_detail.sql` | The audio-vote rung's audit record (§2.17 "Version history", §2.19 "Audio-vote rung"): `finding_events.detail JSONB`, nullable, with `CHECK (detail IS NULL OR jsonb_typeof(detail) = 'object')` added `NOT VALID` (every existing row is NULL, so a validating scan under the lock would prove nothing). No default, no rewrite, no backfill; ACCESS EXCLUSIVE on `finding_events` for a moment, `lock_timeout` 5s; the append-only triggers are row triggers and do not fire for DDL. Ends 17's "nothing reads it in decide": the rung reads `finding_asr_votes`. Down refuses while any row carries a detail unless `earmark.allow_data_loss = 'on'`. |
+| 19 | `00019_finding_events_detail.sql` | The audio-vote rung's audit record (§2.17 "Version history", §2.19 "Audio-vote rung"): `finding_events.detail JSONB`, nullable, with `CHECK (detail IS NULL OR jsonb_typeof(detail) = 'object')` added `NOT VALID` (every existing row is NULL, so a validating scan under the lock would prove nothing). No default, no rewrite, no backfill; neither statement is `IF NOT EXISTS`-guarded (goose applies the version once, in one transaction); ACCESS EXCLUSIVE on `finding_events` for a moment, `lock_timeout` 5s; the append-only triggers are row triggers and do not fire for DDL. Ends 17's "nothing reads it in decide": the rung reads `finding_asr_votes`. Down refuses while any row carries a detail unless `earmark.allow_data_loss = 'on'`. |
 
 **Rules.** Schema changes are new numbered files; a migration that has shipped
 is never edited. **Migrations are merged and deployed strictly in version
@@ -6407,7 +6407,8 @@ model. `earmark decide --audio-vote [--yes] [--limit N] [--max-accepts N]
 [--shard i/N] [--batch 20] [--book X] [--issue-type T] [--sample N] [--seed S]
 [--json] [--audio-rule R --audio-model <model_id>@<revision> …]`
 (`decide.AudioVote`). It cannot be combined with `--calibrate`,
-`--rung0-only`, `--dump`, `--human`, `--endpoint`, `--model` or `--policy`.
+`--rung0-only`, `--dump`, `--human`, `--endpoint`, `--model`, `--policy` or
+`--concurrency`.
 
 - **Configuration.** The rule and the models come from `MODELS_FILE`
   `audio_vote` (§2.18), or for one run from `--audio-rule` with two or more
@@ -6433,13 +6434,17 @@ model. `earmark decide --audio-vote [--yes] [--limit N] [--max-accepts N]
   `pilot_transcripts`), and `chunk_text_sha256` = the finding's. Among those,
   the current vote per model and revision is the most recently written
   (`updated_at`, then `id`). A vote under another rule, by another revision,
-  or against another chunk revision does not exist for the rung.
+  or against another chunk revision does not exist for the rung. The latest
+  vote is picked **among the counted votes only**, so the rung's tallies can
+  differ from `earmark asr-pilot report` (§1.11), which takes each model's
+  latest vote unfiltered (a newer vote under an older rule, or on a stale
+  chunk revision, wins there and is ignored here).
 - **Evaluation** (`AudioVoteRung.Evaluate`, pure; first match wins):
 
   | Condition | Outcome | Reason | Written |
   |---|---|---|---|
   | grouping makes it a duplicate of another representative | `duplicate` | `duplicate` | no |
-  | rung 0 fails, re-run now exactly as decide runs it (Check, grouping, `Dedupe` against the chunk's proposed findings and overlay) | `reject` | the rung-0 reason | yes, except `chunk_changed` / `anchor_missing` (re-anchoring's) |
+  | rung 0 fails, re-run now exactly as decide runs it (Check, grouping, `Dedupe` against the chunk's proposed findings and overlay; grouping's "decided here" tier is computed relative to `current_recipes.decide`, as the `should_apply` recipe sees it, not the rung's own recipe) | `reject` | the rung-0 reason | yes, except `chunk_changed` / `anchor_missing` (re-anchoring's) |
   | a configured model has no counted vote | `hold` | `asr_vote_missing` | no |
   | every configured model `heard_original` | `reject` | `asr_heard_original` | yes |
   | every model `heard_replacement`, issue type `dropped_word` / `number_artifact` | `hold` | `issue_type_capped` | no |
@@ -6476,14 +6481,19 @@ model. `earmark decide --audio-vote [--yes] [--limit N] [--max-accepts N]
   snapshot, because a vote row is overwritten when it is re-voted. **Holds are
   never written**: the hold the finding is held by stays its latest decision,
   so the `should_apply` recipe does not see a decision by another recipe and
-  re-decide it. `--max-accepts N` stops after N accepts (the rest get no
-  event and are decided by the next run); `--limit N` caps the findings
-  considered.
+  re-decide it. Each event is conditional on the hold it lifts: under the
+  finding's row lock, the write checks that the hold is still the latest
+  unrevoked decision (`db.DecisionEvent.RequiresLatestDecision`); if another
+  decision or a revoke landed since the run read it, the finding is
+  *skipped* and considered again next run. `--max-accepts N` stops after N
+  accepts (the rest get no event and are decided by the next run); `--limit
+  N` caps the findings considered.
 - **Dry run** (no `--yes`) writes **nothing** — no recipe row, no event — and
   previews what `--yes` would write under the same `--limit`, `--shard` and
   `--max-accepts`: counts by outcome and by outcome/reason, the reasons of the
   holds considered, the vote patterns, outcome × reason × issue type, and
-  `--sample` (default 20) findings chosen by `sha256(seed, id)`. `--json`
+  `--sample` (default 20; `--sample 0` lists none) findings chosen by
+  `sha256(seed, id)`. `--json`
   prints the same as JSON.
 - **Duplicates and conflicts** follow the existing rules: applying a
   representative leaves its duplicates `duplicate`, and reverting it rejects
@@ -6495,15 +6505,18 @@ model. `earmark decide --audio-vote [--yes] [--limit N] [--max-accepts N]
   decide recipe, so the `should_apply` recipe's next `--yes` re-checks it like
   any other ("Re-check under a new decide recipe"): its cached answer usually
   holds again, which keeps the fix and lists it as *held for review*; a
-  reject undoes it. An audio reject leaves `proposed`, so neither work list
-  sees it again. Those findings also count as `decide` work in `stale_work`
+  reject undoes it. An audio reject moves the finding out of `proposed` to
+  `rejected`, so neither work list sees it again. Those findings also count as `decide` work in `stale_work`
   (§1.9), since their latest decision is not the current recipe's. The
   scorecards (`decide_scorecard`, `earmark models report`) list the rung under
   `asr-vote`.
 - **Undo.** `earmark decide revert --recipe <audio recipe id>` (preview, then
-  `--yes`) undoes only the rung's decisions: `accepted → rejected`,
-  `rejected → proposed`, its decisions revoked, so each finding is held again
-  by the hold it had. The `should_apply` recipe's decisions are untouched.
+  `--yes`) undoes only the rung's decisions and revokes them. An undone
+  **apply** takes the fix out: `accepted → rejected` (`applied → reverted`
+  once a rebuild has replayed it), its duplicates rejected with it
+  (`duplicate_of_reverted`) — it does not return to `proposed`. Only an undone
+  **reject** returns its finding to `proposed`, where it is held again by the
+  hold it had. The `should_apply` recipe's decisions are untouched.
 
 #### `earmark decide revert` (undo)
 
