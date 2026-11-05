@@ -142,6 +142,7 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 	rec.SetRecipe(recipeID, ev.Model())
 
 	ws := &WriteStats{}
+	spellings := newSpellingPass(store) // one book model per book for the whole run
 	var all, shadows []*item
 	var grouping Grouping
 	scope := db.DecideWorkScope{
@@ -186,6 +187,9 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if err := spellings.run(ctx, prep.items); err != nil {
+			return nil, err
+		}
 		resolveConflicts(prep.items, &grouping, false)
 		// Written: the page's findings and the duplicates grouped with them.
 		// A conflict shadow was only asked for its p; it is decided on its
@@ -222,6 +226,7 @@ func Apply(ctx context.Context, store WriteStore, asker Asker, o ApplyOptions) (
 	rep.DryRun = false
 	rep.Write = ws
 	rep.Grouping = grouping
+	rep.SpellingSkippedBooks = spellings.skipped
 	rep.addShadowCalls(shadows)
 	return rep, nil
 }

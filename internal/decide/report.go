@@ -63,6 +63,9 @@ type Report struct {
 	// Grouping counts agreeing findings grouped as duplicates and conflicts
 	// ranked by p (CONTRACT §2.19 "Agreeing and conflicting findings").
 	Grouping Grouping `json:"grouping"`
+	// SpellingSkippedBooks counts the books the spelling pass skipped for
+	// being over a read cap (CONTRACT §2.19 "One spelling per book").
+	SpellingSkippedBooks int `json:"spelling_skipped_books,omitempty"`
 	// Cells is outcome × issue_type × evidence.
 	Cells []Cell `json:"cells"`
 	// Reasons counts the decision rule's reasons (holds and model rejects).
@@ -363,6 +366,9 @@ func (r *Report) Print(w io.Writer, asJSON bool) error {
 	p("rung-0 rejects:   %s\n", counts(r.Rung0Rejects, sortedKeys(r.Rung0Rejects)))
 	p("reanchor needed:  %s\n", counts(r.Reanchor, sortedKeys(r.Reanchor)))
 	r.Grouping.print(p)
+	if r.SpellingSkippedBooks > 0 {
+		p("spelling pass:    skipped %d book(s) over a read cap\n", r.SpellingSkippedBooks)
+	}
 	if r.Rung0Only {
 		r.printRung0Only(p)
 		_, err := io.WriteString(w, b.String())
