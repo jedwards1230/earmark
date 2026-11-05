@@ -148,7 +148,7 @@ type Detail struct {
 	// column, "" for a gap; at most 40 columns.
 	Aligned [][2]string `json:"aligned,omitempty"`
 	// SimOriginal and SimReplacement are the similarities of the heard
-	// text to each reading, over Core when it is set.
+	// text to each reading over the whole span (Core keeps the core's).
 	SimOriginal    *float64 `json:"sim_original,omitempty"`
 	SimReplacement *float64 `json:"sim_replacement,omitempty"`
 	// Core is what was compared once the words the two readings and the
@@ -174,6 +174,10 @@ type VoteCore struct {
 	Original    string `json:"original"`
 	Replacement string `json:"replacement"`
 	Heard       string `json:"heard"`
+	// SimOriginal and SimReplacement are the similarities of the heard core
+	// to each reading's core; nil for a pure insertion or deletion.
+	SimOriginal    *float64 `json:"sim_original,omitempty"`
+	SimReplacement *float64 `json:"sim_replacement,omitempty"`
 }
 
 // Vote decides what the pilot heard at f's span:
@@ -192,9 +196,9 @@ type VoteCore struct {
 //  5. Compare the span's whole words, as production wrote them and with the
 //     correction substituted, normalised (or, for a case/punctuation-only
 //     correction and a cased pilot, case-sensitively) with what was heard.
-//     Short of an exact match, only the differing core is compared: the
-//     words the two readings and the heard text all share at their ends are
-//     stripped first, so shared words cannot inflate the similarity.
+//     Short of an exact match, a similarity vote must also hold on the
+//     differing core, the words the two readings and the heard text all
+//     share at their ends stripped, so shared words cannot inflate it.
 //  6. Cap: a heard_* vote with no agreed word on either side, or on
 //     interpolated production times, is recorded as neither.
 //  7. A style-only correction's vote is recorded as style_only (what was
@@ -526,13 +530,15 @@ func alignedDetail(cols []Pair, a, b []Token) [][2]string {
 // decideVote compares what was heard with the two readings.
 //
 // Exact (and space-insensitive) matches of the whole span decide first.
-// Otherwise the comparison runs on the differing core (sharedEnds): words the
-// two readings and the heard text all carry at their ends are dropped, since
-// they score for both readings and would let a heard third word one letter
-// from one reading win ("person would voluntarily" heard for "person
-// voluntarily" → "person could voluntarily"). A core empty on one side is a
-// pure insertion or deletion: no competing reading for the similarity margin
-// to beat, so only an exact match of the other core counts.
+// Otherwise the similarity test runs on the whole span and, when the two
+// readings and the heard text share words at their ends (sharedEnds), again
+// on the differing core without them: shared words score for both readings
+// and would let a heard third word one letter from one reading win ("person
+// would voluntarily" heard for "person voluntarily" → "person could
+// voluntarily"). A heard_* vote must pass both tests, voting the same way, so
+// the core test only removes votes — scored alone, its shorter texts would
+// add some. A core empty on one side is a pure insertion or deletion: no
+// competing reading for the margin to beat, so only an exact match counts.
 func decideVote(heard []Token, original, replacement string, cased bool, d *Detail) string {
 	no, nr := Normalize(original), Normalize(replacement)
 	d.VoteMethod = "normalized"
@@ -588,32 +594,59 @@ func decideVote(heard []Token, original, replacement string, cased bool, d *Deta
 		}
 	}
 
-	wo, wr := strings.Fields(no), strings.Fields(nr)
-	if pre, suf := sharedEnds(wo, wr, wh); pre+suf > 0 {
-		core := func(w []string) string { return strings.Join(w[pre:len(w)-suf], " ") }
-		kh, kr, ko := core(wh), core(wr), core(wo)
-		d.Core = &VoteCore{Original: ko, Replacement: kr, Heard: kh}
-		ch, cr, co = compact(kh), compact(kr), compact(ko)
-		if cr == "" || co == "" {
-			// A pure insertion or deletion. An empty heard core, or one
-			// equal to a reading's core, matched the whole span above.
-			d.Reason = "heard_other"
-			return VoteNeither
-		}
-	}
 	sr, so := Similarity(ch, cr), Similarity(ch, co)
 	d.SimReplacement, d.SimOriginal = &sr, &so
+	vote, reason := simVote(sr, so)
+
+	wo, wr := strings.Fields(no), strings.Fields(nr)
+	pre, suf := sharedEnds(wo, wr, wh)
+	if pre+suf == 0 {
+		d.Reason = reason
+		return vote
+	}
+	core := func(w []string) string { return strings.Join(w[pre:len(w)-suf], " ") }
+	kh, kr, ko := core(wh), core(wr), core(wo)
+	d.Core = &VoteCore{Original: ko, Replacement: kr, Heard: kh}
+	if kr == "" || ko == "" {
+		// An empty core on a reading side is a pure insertion or deletion,
+		// so only an exact match counts, and that already returned above.
+		d.Reason = "heard_other"
+		return VoteNeither
+	}
+	// An empty heard core matches neither reading's differing words. The
+	// core test only ever removes votes: a heard_* vote must pass it and
+	// the whole-span test above, voting the same way in both.
+	ch, cr, co = compact(kh), compact(kr), compact(ko)
+	csr, cso := Similarity(ch, cr), Similarity(ch, co)
+	d.Core.SimReplacement, d.Core.SimOriginal = &csr, &cso
+	cvote, creason := simVote(csr, cso)
+	switch {
+	case cvote == VoteNeither:
+		d.Reason = creason
+		return VoteNeither
+	case vote == VoteNeither:
+		d.Reason = reason
+		return VoteNeither
+	case vote != cvote:
+		d.Reason = "no_margin"
+		return VoteNeither
+	}
+	return vote
+}
+
+// simVote applies MatchSim and MatchMargin to the similarities of the heard
+// text to the replacement (sr) and the original (so).
+func simVote(sr, so float64) (vote, reason string) {
 	switch {
 	case sr >= MatchSim && sr-so >= MatchMargin:
-		return VoteHeardReplacement
+		return VoteHeardReplacement, ""
 	case so >= MatchSim && so-sr >= MatchMargin:
-		return VoteHeardOriginal
+		return VoteHeardOriginal, ""
 	case sr >= MatchSim && so >= MatchSim:
-		d.Reason = "no_margin"
+		return VoteNeither, "no_margin"
 	default:
-		d.Reason = "heard_other"
+		return VoteNeither, "heard_other"
 	}
-	return VoteNeither
 }
 
 // sharedEnds counts the leading (pre) and trailing (suf) words that all of

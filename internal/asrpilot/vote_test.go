@@ -468,8 +468,17 @@ func TestDecideVoteDifferingCore(t *testing.T) {
 		// A substitution inside shared words is decided on the core alone.
 		{"he said cot then", "he said cat then", "he said cats then", VoteNeither, "heard_other",
 			&VoteCore{Original: "cot", Replacement: "cat", Heard: "cats"}},
-		{"he said gechter then", "he said gächter then", "he said gechtor then", VoteHeardOriginal, "",
+		// The core alone favours the original, but the whole span has no
+		// margin: both tests must agree.
+		{"he said gechter then", "he said gächter then", "he said gechtor then", VoteNeither, "no_margin",
 			&VoteCore{Original: "gechter", Replacement: "gächter", Heard: "gechtor"}},
+		// Scored alone, the shorter core would add a vote the whole span
+		// rejects (would/could 0.8, would/wood 0.6).
+		{"person wood", "person could", "person would", VoteNeither, "no_margin",
+			&VoteCore{Original: "wood", Replacement: "could", Heard: "would"}},
+		// Both tests vote the same way: the vote stands.
+		{"the color mauve", "the color purple", "the color purples", VoteHeardReplacement, "",
+			&VoteCore{Original: "mauve", Replacement: "purple", Heard: "purples"}},
 	} {
 		t.Run(tt.orig+"→"+tt.repl+"/"+tt.heard, func(t *testing.T) {
 			heard := PilotTokens([]db.PilotSegment{untimedPilot(0, 1, tt.heard)})
@@ -478,7 +487,8 @@ func TestDecideVoteDifferingCore(t *testing.T) {
 			if got != tt.want || d.Reason != tt.reason {
 				t.Errorf("vote %q (reason %q), want %q (%q); sims r=%v o=%v", got, d.Reason, tt.want, tt.reason, ptrVal(d.SimReplacement), ptrVal(d.SimOriginal))
 			}
-			if tt.core != nil && (d.Core == nil || *d.Core != *tt.core) {
+			if tt.core != nil && (d.Core == nil || d.Core.Original != tt.core.Original ||
+				d.Core.Replacement != tt.core.Replacement || d.Core.Heard != tt.core.Heard) {
 				t.Errorf("core %+v, want %+v", d.Core, *tt.core)
 			}
 		})
