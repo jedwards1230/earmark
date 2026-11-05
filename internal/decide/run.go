@@ -27,6 +27,13 @@ type RunStore interface {
 	fn.Store
 	DecideSample(ctx context.Context, s db.DecideScope) ([]db.DecideFinding, error)
 	DecideBacklog(ctx context.Context, s db.DecideScope) (map[string]int, error)
+	ChunkStore
+}
+
+// ChunkStore is the reads prepare makes: a run's chunks with their
+// competitors and overlay, and — for the model's context — the transcripts'
+// segments and the books' catalogue records.
+type ChunkStore interface {
 	DecideChunks(ctx context.Context, recipeID string, keys []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error)
 	GetTranscriptSegments(ctx context.Context, ids []string) (map[string][]db.Segment, error)
 	GetBookRecords(ctx context.Context, bookDirs []string) (map[string]db.BookRecord, error)
@@ -230,7 +237,16 @@ type prepared struct {
 // proposed findings, and its accepted/applied overlay). runRecipe is the
 // decide recipe the run decides under: db.DecideChunks marks the findings
 // already decided under it or a recipe equivalent to it ("" = none).
-func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p ShouldApplyParams, runRecipe string) (*prepared, error) {
+func prepare(ctx context.Context, store ChunkStore, sample []db.DecideFinding, p ShouldApplyParams, runRecipe string) (*prepared, error) {
+	return prepareWith(ctx, store, sample, p.PhoneticMinSim, runRecipe, true)
+}
+
+// prepareWith is prepare at rung-0 threshold threshold. withContext=false
+// skips the segments and catalogue records — the model's context and the text
+// evidence — for a caller that asks no model (the audio-vote rung): rung 0,
+// grouping and Dedupe are unchanged.
+func prepareWith(ctx context.Context, store ChunkStore, sample []db.DecideFinding, threshold float64, runRecipe string,
+	withContext bool) (*prepared, error) {
 	byTranscript := map[string][]db.DecideFinding{}
 	for _, f := range sample {
 		byTranscript[f.TranscriptID] = append(byTranscript[f.TranscriptID], f)
@@ -244,9 +260,12 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 	out := &prepared{}
 	for start := 0; start < len(tids); start += db.MaxDecideTranscriptBatch {
 		batch := tids[start:min(start+db.MaxDecideTranscriptBatch, len(tids))]
-		segs, err := store.GetTranscriptSegments(ctx, batch)
-		if err != nil {
-			return nil, fmt.Errorf("load segments of %d transcripts: %w", len(batch), err)
+		segs := map[string][]db.Segment{}
+		if withContext {
+			var err error
+			if segs, err = store.GetTranscriptSegments(ctx, batch); err != nil {
+				return nil, fmt.Errorf("load segments of %d transcripts: %w", len(batch), err)
+			}
 		}
 		var keys []db.ChunkKey
 		keySet := map[db.ChunkKey]bool{}
@@ -277,7 +296,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		}
 		sort.Strings(dirs)
 		records := map[string]db.BookRecord{}
-		for d0 := 0; d0 < len(dirs); d0 += db.MaxDecideBookBatch {
+		for d0 := 0; withContext && d0 < len(dirs); d0 += db.MaxDecideBookBatch {
 			part, err := store.GetBookRecords(ctx, dirs[d0:min(d0+db.MaxDecideBookBatch, len(dirs))])
 			if err != nil {
 				return nil, fmt.Errorf("load catalogue records of %d books: %w", len(dirs), err)
@@ -288,7 +307,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 		}
 
 		for _, t := range batch {
-			items, groups := prepareTranscript(byTranscript[t], chunks, segs[t], records, p)
+			items, groups := prepareTranscript(byTranscript[t], chunks, segs[t], records, threshold)
 			out.items = append(out.items, items...)
 			out.groups = append(out.groups, groups...)
 		}
@@ -297,7 +316,7 @@ func prepare(ctx context.Context, store RunStore, sample []db.DecideFinding, p S
 }
 
 func prepareTranscript(fs []db.DecideFinding, chunks map[db.ChunkKey]*db.DecideChunk,
-	segs []db.Segment, records map[string]db.BookRecord, p ShouldApplyParams) ([]*item, []DupGroup) {
+	segs []db.Segment, records map[string]db.BookRecord, threshold float64) ([]*item, []DupGroup) {
 	byChunk := map[db.ChunkKey][]db.DecideFinding{}
 	var order []db.ChunkKey
 	for _, f := range fs {
@@ -313,7 +332,7 @@ func prepareTranscript(fs []db.DecideFinding, chunks map[db.ChunkKey]*db.DecideC
 	var groups []DupGroup
 	for _, k := range order {
 		chunk := chunks[k]
-		plan := planChunk(byChunk[k], chunk, p.PhoneticMinSim)
+		plan := planChunk(byChunk[k], chunk, threshold)
 		mk := func(f db.DecideFinding, shadow bool) *item {
 			var rec *db.BookRecord
 			if r, ok := records[filepath.Dir(f.FilePath)]; ok {

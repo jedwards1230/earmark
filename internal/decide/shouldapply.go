@@ -465,6 +465,10 @@ type Outcome struct {
 	// ErrorClass is the bounded failure class of a jev_unavailable hold
 	// (genai.ErrorClass, "model_fallback" or "invalid_reply"); "" otherwise.
 	ErrorClass string
+	// Detail is the decision event's structured audit record
+	// (finding_events.detail): the audio-vote rung's vote snapshot; nil for
+	// should_apply.
+	Detail json.RawMessage
 	// Latency, tokens and cost of the call. A cache hit makes no request:
 	// its tokens and cost are zero.
 	Latency      time.Duration
