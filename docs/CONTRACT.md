@@ -6414,11 +6414,14 @@ model. `earmark decide --audio-vote [--yes] [--limit N] [--max-accepts N]
   `audio_vote` (§2.18), or for one run from `--audio-rule` with two or more
   `--audio-model` (both or neither; they replace the file block wholesale).
   Absent → the run refuses before connecting.
-- **Recipe.** `step = decide`, `model_alias = asr-vote`, `step_version` 1,
-  `prompt_version = asr_vote_decide@v1` (the hash is of the decision table
+- **Recipe.** `step = decide`, `model_alias = asr-vote`, `step_version` 2,
+  `prompt_version = asr_vote_decide@v2` (the hash is of the decision table
   below; there is no prompt), params: `fn = asr_vote_decide`, the `rule`, the
   `models` (`{model_id, revision}` sorted), `apply_hold_reasons`,
-  `capped_issue_types`, `rung0_version`, `phonetic_min_sim`. Changing the rule
+  `capped_issue_types`, `reject_held_issue_types`, `soundalike_min_key`,
+  `rung0_version`, `phonetic_min_sim`. Version 1 rejected every finding both
+  models heard the original of; version 2 holds the sound-alike ones and the
+  `reject_held_issue_types` ones (below). Changing the rule
   or any model or revision is another recipe. It is never
   `current_recipes.decide`, and it shares no equivalence class with the
   `should_apply` recipe (§1.9), so neither recipe's work list treats the
@@ -6446,6 +6449,8 @@ model. `earmark decide --audio-vote [--yes] [--limit N] [--max-accepts N]
   | grouping makes it a duplicate of another representative | `duplicate` | `duplicate` | no |
   | rung 0 fails, re-run now exactly as decide runs it (Check, grouping, `Dedupe` against the chunk's proposed findings and overlay; grouping's "decided here" tier is computed relative to `current_recipes.decide`, as the `should_apply` recipe sees it, not the rung's own recipe) | `reject` | the rung-0 reason | yes, except `chunk_changed` / `anchor_missing` (re-anchoring's) |
   | a configured model has no counted vote | `hold` | `asr_vote_missing` | no |
+  | every configured model `heard_original`, and the original and the replacement sound alike (below) | `hold` | `asr_soundalike` | no |
+  | every configured model `heard_original`, issue type in `reject_held_issue_types` (`misheard_proper_noun`) | `hold` | `asr_reject_type_held` | no |
   | every configured model `heard_original` | `reject` | `asr_heard_original` | yes |
   | every model `heard_replacement`, issue type `dropped_word` / `number_artifact` | `hold` | `issue_type_capped` | no |
   | every model `heard_replacement`, the hold has no `p` or its reason is not in `apply_hold_reasons` | `hold` | `asr_agree_vetoed` | no |
@@ -6470,7 +6475,32 @@ model. `earmark decide --audio-vote [--yes] [--limit N] [--max-accepts N]
      both applied.
 
   A reject on every model `heard_original` needs only rung 0 to pass, whatever
-  the hold.
+  the hold — and the two readings to sound different, and an issue type
+  outside `reject_held_issue_types`.
+- **Sound-alike** (`decide.SoundAlikeCore`, before every `heard_original`
+  reject). When a fix only re-spells a word that sounds the same, the audio
+  cannot tell the two apart, so `heard_original` is no evidence against it
+  (`sheana → sheeana`, `syanite → syenite`). Both texts are normalised as the
+  votes are (`asrpilot.Normalize`: lowercase, dashes split words, apostrophes
+  and other punctuation dropped, numerals spelt out) and the words they share
+  at both ends stripped. The differing cores sound alike when both are empty;
+  or neither is, and either they have as many words and every word pair is
+  identical or shares a Double Metaphone key (`internal/phonetic`, primary or
+  alternate), or the cores with spaces removed share one (a re-split or fused
+  word: `comm-less` / `commless`). A shared key must carry at least
+  `soundalike_min_key` = 2 consonant sounds (Metaphone's leading `A` for an
+  initial vowel not counted): Metaphone drops the other vowels, so a shorter
+  key would call `in` / `on` or `to` / `two` alike. A core empty on one side
+  only — an inserted or dropped word, `over black → over its black` — is a
+  sound the audio hears: not alike, rejected. Because Metaphone ignores
+  vowels, a vowel-only change (`picked → packed`) also counts as alike and is
+  held: the test errs toward holding.
+- **`reject_held_issue_types`** = `misheard_proper_noun`: the rung never
+  rejects one on the audio. A name spelt differently is what audio cannot
+  judge, and a near sound-alike name (`mabella → murbella`) can miss the keys.
+  Held, not written (`asr_reject_type_held`); a sound-alike one is held
+  `asr_soundalike` first. Applies are unchanged: both pilots independently
+  writing the corrected spelling is evidence.
 - **What is written** (`--yes`, through `db.ApplyDecisions`, `--batch`
   transcripts per transaction; §2.17 "More than one decide recipe"): only
   `apply` (→ `accepted`) and `reject` (→ `rejected`) decisions, actor and
@@ -6579,7 +6609,11 @@ one scope flag is required; together they narrow (AND). Dry-run unless
 
 1. **Dry run.** `earmark decide --audio-vote` (optionally `--book X`) — check
    the outcome and reason mix, the vote patterns and the listed sample. Nothing
-   is written.
+   is written. `hold/asr_soundalike` and `hold/asr_reject_type_held` are
+   heard_original findings the rung declines to reject (re-spellings that sound
+   the same, and names); they stay held for review. Spot-check the
+   `reject/asr_heard_original` sample: each should be a fix that changes the
+   sound.
 2. **Bounded run.** `earmark decide --audio-vote --yes --limit 2000
    --max-accepts 500`, while the pipeline is idle or in the analyze phase
    (every accept re-embeds its transcript). Repeat runs pick up the rest.

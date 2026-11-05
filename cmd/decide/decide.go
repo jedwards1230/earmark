@@ -169,12 +169,17 @@ decision a hold, by any decide recipe) with a current vote from the
 configured second-ASR models (MODELS_FILE audio_vote, or --audio-rule with
 two or more --audio-model <model_id>@<revision>, which then replace the file
 block), re-runs rung 0 exactly as decide does — a rung-0 failure rejects —
-and then: every model heard the original → reject asr_heard_original; every
-model heard the replacement → apply asr_agree, unless the finding's type is
+and then: every model heard the original → reject asr_heard_original,
+unless the original and the replacement sound alike (a re-spelling the audio
+cannot tell apart: same Double Metaphone keys word for word once shared end
+words are dropped; hold asr_soundalike) or the finding is a
+misheard_proper_noun (hold asr_reject_type_held); every model heard the
+replacement → apply asr_agree, unless the finding's type is
 dropped_word/number_artifact, its hold carries no model p or a reason other
 than uncertain/no_evidence/evidence_excluded, or it overlaps a different fix
 not recorded as having lost to it; anything else holds (asr_split,
-asr_vote_missing, asr_no_agreement, asr_agree_vetoed, asr_agree_conflict). A
+asr_vote_missing, asr_no_agreement, asr_agree_vetoed, asr_agree_conflict,
+asr_soundalike, asr_reject_type_held). A
 dry run writes nothing at all — not even the recipe row — and previews what
 --yes would write under the same --limit / --shard / --max-accepts; --sample
 and --seed pick the listed findings. --yes writes only the applies and

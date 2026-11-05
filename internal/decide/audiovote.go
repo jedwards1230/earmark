@@ -14,6 +14,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/asrpilot"
 	"github.com/jedwards1230/earmark/internal/config"
 	"github.com/jedwards1230/earmark/internal/db"
+	"github.com/jedwards1230/earmark/internal/phonetic"
 	"github.com/jedwards1230/earmark/internal/recipe"
 	"github.com/jedwards1230/earmark/internal/runs"
 )
@@ -24,7 +25,13 @@ import (
 // of the configured pilot models. No model is asked. It re-runs rung 0 exactly
 // as decide does, then:
 //
-//	every configured model heard the original     → reject asr_heard_original
+//	every configured model heard the original     → reject asr_heard_original,
+//	                                                 unless the two readings
+//	                                                 sound alike (hold
+//	                                                 asr_soundalike) or the
+//	                                                 issue type's rejects are
+//	                                                 held (hold
+//	                                                 asr_reject_type_held)
 //	every configured model heard the replacement  → apply  asr_agree, if no
 //	                                                 existing rung objects
 //	anything else                                  → hold (never written)
@@ -37,8 +44,8 @@ import (
 const (
 	AudioVoteName        = "asr_vote_decide"
 	AudioVoteModelAlias  = "asr-vote"
-	AudioVoteStepVersion = 1
-	AudioVoteRungVersion = "asr_vote_decide@v1"
+	AudioVoteStepVersion = 2
+	AudioVoteRungVersion = "asr_vote_decide@v2"
 	// AudioVoteDetailRung is finding_events.detail.rung on the rung's events.
 	AudioVoteDetailRung = "asr_vote"
 )
@@ -69,7 +76,96 @@ const (
 	// finding overlaps a different proposed fix that is not recorded as
 	// having lost to it (held overlap_pending naming it): held.
 	ReasonASRAgreeConflict = "asr_agree_conflict"
+	// ReasonASRSoundAlike — every model heard the original, but the original
+	// and the replacement sound alike (SoundAlikeCore): the audio cannot tell
+	// the two spellings apart, so heard_original is no evidence. Held.
+	ReasonASRSoundAlike = "asr_soundalike"
+	// ReasonASRRejectTypeHeld — every model heard the original and the
+	// readings do not sound alike by their keys, but the issue type is one
+	// whose audio rejects are held (AudioRejectHeldIssueTypes). Held.
+	ReasonASRRejectTypeHeld = "asr_reject_type_held"
 )
+
+// AudioRejectHeldIssueTypes are the issue types the rung never rejects on
+// heard_original: it holds them (asr_reject_type_held). A name spelt
+// differently is exactly what audio cannot judge, and a near sound-alike name
+// (mabella → murbella) can miss the phonetic keys. Sorted; a recipe param.
+var AudioRejectHeldIssueTypes = []string{IssueMisheardProperNoun}
+
+// SoundAlikeMinKey is how many consonant sounds a shared Double Metaphone key
+// must carry (its leading "A", Metaphone's mark for any initial vowel, not
+// counted) to call two different words alike. Metaphone drops every other
+// vowel, so a shorter key collapses short words that sound different (in/on/
+// an → AN) and common words whose spelling an ASR picks from context (to/two
+// → T): too little sound to call them alike. A recipe param.
+const SoundAlikeMinKey = 2
+
+// SoundAlikeCore reports whether original and replacement sound alike over
+// their differing core — whether audio can tell the two apart at all. Both
+// are normalised as the votes are (asrpilot.Normalize: lowercase, dashes
+// split words, other punctuation such as apostrophes dropped, numerals spelt
+// out), then the words they share at both ends are stripped. The cores sound
+// alike when:
+//
+//   - both are empty (the two say the same words);
+//   - neither is empty, and either they have as many words and every word
+//     pair is identical or its keys match, or the cores with spaces removed
+//     match (a re-split or fused word: "comm-less" / "commless", "a part" /
+//     "apart").
+//
+// Keys match when a Double Metaphone key (primary or alternate) of one equals
+// one of the other and carries at least SoundAlikeMinKey consonant sounds. A core empty on one
+// side only (an inserted or dropped word, "over black" → "over its black") is
+// a sound the audio can hear: not alike.
+func SoundAlikeCore(original, replacement string) bool {
+	a, b := strings.Fields(asrpilot.Normalize(original)), strings.Fields(asrpilot.Normalize(replacement))
+	n := min(len(a), len(b))
+	pre, suf := 0, 0
+	for pre < n && a[pre] == b[pre] {
+		pre++
+	}
+	for pre+suf < n && a[len(a)-1-suf] == b[len(b)-1-suf] {
+		suf++
+	}
+	a, b = a[pre:len(a)-suf], b[pre:len(b)-suf]
+	switch {
+	case len(a) == 0 && len(b) == 0:
+		return true
+	case len(a) == 0 || len(b) == 0:
+		return false
+	case len(a) == len(b) && wordsAlike(a, b):
+		return true
+	}
+	return keysMatch(strings.Join(a, ""), strings.Join(b, ""))
+}
+
+// wordsAlike reports whether every word pair of a and b (as long) matches.
+func wordsAlike(a, b []string) bool {
+	for i := range a {
+		if !keysMatch(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// keysMatch reports whether two normalised words are identical or share a
+// Double Metaphone key (primary or alternate) of at least SoundAlikeMinKey
+// consonant sounds.
+func keysMatch(x, y string) bool {
+	if x == y {
+		return true
+	}
+	cx, cy := phonetic.DoubleMetaphone(x, 0), phonetic.DoubleMetaphone(y, 0)
+	for _, kx := range []string{cx.Primary, cx.Alternate} {
+		for _, ky := range []string{cy.Primary, cy.Alternate} {
+			if kx == ky && len(strings.TrimPrefix(kx, "A")) >= SoundAlikeMinKey {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // AudioApplyHoldReasons are the should_apply holds an audio agreement may
 // lift: the pinned model answered (a decoded p in [0, 1]) and did not lean
@@ -85,6 +181,8 @@ var audioRuleTable = []string{
 	"duplicate of a representative → duplicate (not written)",
 	"rung 0 fails → reject <rung-0 reason>",
 	"a configured model has no current vote → hold asr_vote_missing",
+	"every model heard_original, original and replacement sound alike → hold asr_soundalike",
+	"every model heard_original, issue type in reject_held_issue_types → hold asr_reject_type_held",
 	"every model heard_original → reject asr_heard_original",
 	"every model heard_replacement, capped issue type → hold issue_type_capped",
 	"every model heard_replacement, hold without p or reason not in apply_hold_reasons → hold asr_agree_vetoed",
@@ -129,13 +227,15 @@ func NewAudioVoteRung(cfg config.AudioVoteConfig) (*AudioVoteRung, error) {
 		PromptVersion: AudioVoteRungVersion,
 		PromptSHA256:  recipe.PromptSHA256(audioRuleTable...),
 		Params: map[string]any{
-			"fn":                 AudioVoteName,
-			"rule":               cfg.Rule,
-			"models":             pins,
-			"apply_hold_reasons": slices.Clone(AudioApplyHoldReasons),
-			"capped_issue_types": capped,
-			"rung0_version":      Rung0Version,
-			"phonetic_min_sim":   DefaultShouldApplyParams().PhoneticMinSim,
+			"fn":                      AudioVoteName,
+			"rule":                    cfg.Rule,
+			"models":                  pins,
+			"apply_hold_reasons":      slices.Clone(AudioApplyHoldReasons),
+			"capped_issue_types":      capped,
+			"reject_held_issue_types": slices.Clone(AudioRejectHeldIssueTypes),
+			"soundalike_min_key":      SoundAlikeMinKey,
+			"rung0_version":           Rung0Version,
+			"phonetic_min_sim":        DefaultShouldApplyParams().PhoneticMinSim,
 		},
 	}}, nil
 }
@@ -151,6 +251,9 @@ func (r *AudioVoteRung) Config() config.AudioVoteConfig { return r.cfg }
 // finding.
 type AudioVoteInput struct {
 	FindingID, IssueType, ChunkHash string
+	// Original and Replacement are the finding's span text and its fix, for
+	// the sound-alike test before a heard_original reject.
+	Original, Replacement string
 	// Rung0 is the finding's rung-0 verdict, re-run now (planChunk).
 	Rung0 Verdict
 	// DuplicateOf is the representative grouping made it a duplicate of ("" =
@@ -221,6 +324,12 @@ func (r *AudioVoteRung) Evaluate(in AudioVoteInput) Outcome {
 	case missing > 0:
 		return set(DecisionHold, ReasonASRVoteMissing)
 	case original == n:
+		switch {
+		case SoundAlikeCore(in.Original, in.Replacement):
+			return set(DecisionHold, ReasonASRSoundAlike)
+		case slices.Contains(AudioRejectHeldIssueTypes, in.IssueType):
+			return set(DecisionHold, ReasonASRRejectTypeHeld)
+		}
 		return set(DecisionReject, ReasonASRHeardOriginal)
 	case replacement == n:
 		switch {
@@ -525,6 +634,7 @@ func evaluateAudioPage(ctx context.Context, store AudioVoteStore, rung *AudioVot
 		}
 		in := AudioVoteInput{
 			FindingID: w.ID, IssueType: w.IssueType, ChunkHash: w.ChunkTextSHA256, Rung0: v,
+			Original: w.Original, Replacement: w.Replacement,
 			ConflictsLost: lost, HoldReason: w.HoldReason, HoldP: w.HoldP, Votes: votes[w.ID],
 			HoldEventID: w.HoldEventID,
 		}
