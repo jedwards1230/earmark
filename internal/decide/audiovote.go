@@ -166,6 +166,9 @@ type AudioVoteInput struct {
 	HoldP      *float64
 	// Votes are the finding's current counted votes (db.CurrentASRVotes).
 	Votes []db.ASRVote
+	// HoldEventID is the finding_events id of that hold: a write is made
+	// only while it is still the latest live decision (0 = unchecked).
+	HoldEventID int64
 }
 
 // audioDetail is finding_events.detail on the rung's events: a snapshot of
@@ -179,7 +182,8 @@ type audioDetail struct {
 // Evaluate decides one held finding (pure). The outcome's P is nil and its
 // evidence none: the rung asks no model and reads no text evidence.
 func (r *AudioVoteRung) Evaluate(in AudioVoteInput) Outcome {
-	out := Outcome{FindingID: in.FindingID, Rung0: in.Rung0, ChunkHash: in.ChunkHash, Evidence: EvidenceNone}
+	out := Outcome{FindingID: in.FindingID, Rung0: in.Rung0, ChunkHash: in.ChunkHash, Evidence: EvidenceNone,
+		RequiresLatestDecision: in.HoldEventID}
 	votes := r.configuredVotes(in.Votes)
 	snapshot := make([]db.ASRVote, 0, len(votes))
 	for _, v := range votes {
@@ -259,6 +263,7 @@ type AudioVoteStore interface {
 	AudioVoteWork(ctx context.Context, s db.AudioVoteScope) ([]db.AudioVoteFinding, error)
 	CurrentASRVotes(ctx context.Context, findingIDs []string, rule string, models []config.AudioVoteModel) (map[string][]db.ASRVote, error)
 	LatestDecisions(ctx context.Context, findingIDs []string) (map[string]db.LatestDecision, error)
+	ListCurrentRecipes(ctx context.Context) ([]db.CurrentRecipe, error)
 }
 
 // DefaultAudioSample is how many findings the report lists when --sample is
@@ -276,9 +281,9 @@ type AudioVoteOptions struct {
 	Limit, Batch, MaxAccepts int
 	// Yes writes the apply and reject decisions; otherwise nothing is written.
 	Yes bool
-	// Sample is how many findings the report lists (0 = DefaultAudioSample),
-	// chosen by Seed.
-	Sample int
+	// Sample is how many findings the report lists (nil = DefaultAudioSample;
+	// 0 lists none), chosen by Seed.
+	Sample *int
 	Seed   string
 	// Progress records the run's live progress (nil = none).
 	Progress *runs.Run
@@ -339,7 +344,7 @@ type AudioSample struct {
 // db.ApplyDecisions (holds and duplicates are never written), Batch
 // transcripts per transaction, capped by MaxAccepts.
 func AudioVote(ctx context.Context, store AudioVoteStore, o AudioVoteOptions) (*AudioVoteReport, error) {
-	if o.Limit < 0 || o.MaxAccepts < 0 || o.Batch < 0 || o.Sample < 0 {
+	if o.Limit < 0 || o.MaxAccepts < 0 || o.Batch < 0 || (o.Sample != nil && *o.Sample < 0) {
 		return nil, errors.New("decide --audio-vote: limit, max-accepts, batch and sample must be >= 0")
 	}
 	rung, err := NewAudioVoteRung(o.Config)
@@ -347,7 +352,10 @@ func AudioVote(ctx context.Context, store AudioVoteStore, o AudioVoteOptions) (*
 		return nil, err
 	}
 	batch := cmp.Or(o.Batch, DefaultWriteBatch)
-	sampleN := cmp.Or(o.Sample, DefaultAudioSample)
+	sampleN := DefaultAudioSample
+	if o.Sample != nil {
+		sampleN = *o.Sample
+	}
 	var recipeID string
 	if o.Yes {
 		if recipeID, err = store.RegisterRecipe(ctx, rung.Recipe()); err != nil {
@@ -364,6 +372,14 @@ func AudioVote(ctx context.Context, store AudioVoteStore, o AudioVoteOptions) (*
 	scope := db.AudioVoteScope{Rule: cfg.Rule, Models: cfg.Models, Book: o.Book, IssueType: o.IssueType,
 		Shard: o.Shard, Shards: o.Shards}
 	threshold := DefaultShouldApplyParams().PhoneticMinSim
+	// Rung 0's grouping marks a finding decided "here" (the existing-
+	// representative tier) relative to the run's decide recipe. The rung
+	// re-runs rung 0 as the should_apply recipe would: relative to the
+	// current decide recipe, not its own (which decides nothing it groups).
+	groupRecipe, err := currentDecideRecipe(ctx, store)
+	if err != nil {
+		return nil, err
+	}
 	wouldAccept := 0
 	for page := 1; ; page++ {
 		scope.Limit = workPage
@@ -386,7 +402,7 @@ func AudioVote(ctx context.Context, store AudioVoteStore, o AudioVoteOptions) (*
 		scope.After = work[len(work)-1].ID
 
 		rec.Phase(fmt.Sprintf("page %d: loading chunks + rung-0 + votes", page))
-		items, err := evaluateAudioPage(ctx, store, rung, work, threshold, recipeID)
+		items, err := evaluateAudioPage(ctx, store, rung, work, threshold, groupRecipe)
 		if err != nil {
 			return nil, err
 		}
@@ -439,20 +455,34 @@ type audioItem struct {
 	votes []string // per configured model: its vote, "-" = none
 }
 
+// currentDecideRecipe is current_recipes.decide ("" when unset).
+func currentDecideRecipe(ctx context.Context, store AudioVoteStore) (string, error) {
+	cur, err := store.ListCurrentRecipes(ctx)
+	if err != nil {
+		return "", fmt.Errorf("current decide recipe: %w", err)
+	}
+	for _, c := range cur {
+		if c.Step == recipe.StepDecide {
+			return c.RecipeID, nil
+		}
+	}
+	return "", nil
+}
+
 // evaluateAudioPage runs rung 0 over a page (prepareWith: Check, grouping and
 // Dedupe against the chunk's proposed findings and overlay, exactly as
 // decide), loads the page's votes and the latest decisions of its conflicts,
 // and evaluates each finding. Shadow items (competitors outside the page) are
 // not decided here.
 func evaluateAudioPage(ctx context.Context, store AudioVoteStore, rung *AudioVoteRung, work []db.AudioVoteFinding,
-	threshold float64, recipeID string) ([]audioItem, error) {
+	threshold float64, groupRecipe string) ([]audioItem, error) {
 	fs := make([]db.DecideFinding, len(work))
 	byID := make(map[string]db.AudioVoteFinding, len(work))
 	ids := make([]string, len(work))
 	for i, w := range work {
 		fs[i], byID[w.ID], ids[i] = w.DecideFinding, w, w.ID
 	}
-	prep, err := prepareWith(ctx, store, fs, threshold, recipeID, false)
+	prep, err := prepareWith(ctx, store, fs, threshold, groupRecipe, false)
 	if err != nil {
 		return nil, err
 	}
@@ -496,6 +526,7 @@ func evaluateAudioPage(ctx context.Context, store AudioVoteStore, rung *AudioVot
 		in := AudioVoteInput{
 			FindingID: w.ID, IssueType: w.IssueType, ChunkHash: w.ChunkTextSHA256, Rung0: v,
 			ConflictsLost: lost, HoldReason: w.HoldReason, HoldP: w.HoldP, Votes: votes[w.ID],
+			HoldEventID: w.HoldEventID,
 		}
 		if it.outcome.Decision == DecisionDuplicate {
 			in.DuplicateOf = it.outcome.Related

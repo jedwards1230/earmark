@@ -294,6 +294,12 @@ type DecisionEvent struct {
 	// The audio-vote rung records the votes it rested on here (CONTRACT
 	// §2.19 "Audio-vote rung"); every other decider leaves it nil.
 	Detail json.RawMessage
+	// RequiresLatestDecision makes the decision conditional on the
+	// finding's latest live (unrevoked) decision event still being this id
+	// when the write holds the finding's row lock: otherwise the finding is
+	// skipped (another decision or a revoke landed since it was computed).
+	// Not recorded. 0 = unconditional.
+	RequiresLatestDecision int64
 }
 
 var decisionOutcomes = []string{OutcomeApply, OutcomeHold, OutcomeReject, OutcomeDuplicate}
@@ -322,6 +328,8 @@ func (e DecisionEvent) validate() error {
 		return fmt.Errorf("decision event %s: unknown evidence %q", e.FindingID, e.Evidence)
 	case e.Detail != nil && !jsonObject(e.Detail):
 		return fmt.Errorf("decision event %s: detail is not a JSON object", e.FindingID)
+	case e.RequiresLatestDecision < 0:
+		return fmt.Errorf("decision event %s: required latest decision %d is not an id", e.FindingID, e.RequiresLatestDecision)
 	}
 	return nil
 }
@@ -790,13 +798,35 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 		return ApplyResult{}, fmt.Errorf("lock decided chunks: %w", err)
 	}
 
+	// moved: the locked findings whose latest live decision is no longer the
+	// one their event was computed against (RequiresLatestDecision). Read
+	// under the row locks, so no other decide write can land in between.
+	var conditional []string
+	for _, e := range evs {
+		if _, ok := state[e.FindingID]; ok && e.RequiresLatestDecision != 0 {
+			conditional = append(conditional, e.FindingID)
+		}
+	}
+	moved := map[string]bool{}
+	if len(conditional) > 0 {
+		latest, err := latestDecisions(ctx, tx, conditional)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		for _, e := range evs {
+			if e.RequiresLatestDecision != 0 && latest[e.FindingID].ID != e.RequiresLatestDecision {
+				moved[e.FindingID] = true
+			}
+		}
+	}
+
 	// willAccept: the findings this call moves to accepted, for the
 	// conditional rejects (RequiresAccepted).
 	willAccept := map[string]bool{}
 	for _, e := range evs {
 		_, isLocked := state[e.FindingID]
 		cur, hasChunk := chunkSHA[e.FindingID]
-		if isLocked && hasChunk && (e.ChunkTextSHA256 == "" || e.ChunkTextSHA256 == cur) &&
+		if isLocked && hasChunk && !moved[e.FindingID] && (e.ChunkTextSHA256 == "" || e.ChunkTextSHA256 == cur) &&
 			decideMove(state[e.FindingID], e.Outcome, recheck) == patch.StateAccepted {
 			willAccept[e.FindingID] = true
 		}
@@ -814,7 +844,7 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 		cur, hasChunk := chunkSHA[e.FindingID]
 		// A decision about text the chunk no longer holds is not written; an
 		// event that names no hash still needs the chunk to exist.
-		if !isLocked || !hasChunk || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) ||
+		if !isLocked || !hasChunk || moved[e.FindingID] || (e.ChunkTextSHA256 != "" && e.ChunkTextSHA256 != cur) ||
 			(e.Outcome == OutcomeDuplicate && !repOK[e.RelatedFindingID]) {
 			res.Skipped = append(res.Skipped, e.FindingID)
 			continue
@@ -823,7 +853,7 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 			// The fix it lost to is not going in now: held, pending it.
 			e.Outcome, e.Reason = OutcomeHold, ReasonOverlapPending
 		}
-		e.RequiresAccepted = ""
+		e.RequiresAccepted, e.RequiresLatestDecision = "", 0
 		write = append(write, e)
 		if e.Outcome == OutcomeDuplicate {
 			res.Duplicates = append(res.Duplicates, e.FindingID)

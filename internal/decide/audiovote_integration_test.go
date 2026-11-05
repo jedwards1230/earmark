@@ -284,3 +284,210 @@ func TestIntegrationAudioVote(t *testing.T) {
 		t.Errorf("held after revert %v", heldIDs)
 	}
 }
+
+// seedHeld inserts proposed judge findings on seedDecide's chunk; dupOf
+// non-empty inserts a duplicate of that representative instead.
+func seedHeld(t *testing.T, conn *pgx.Conn, id, issue, orig, repl, dupOf, createdAt string) {
+	t.Helper()
+	state, dup := "proposed", any(nil)
+	if dupOf != "" {
+		state, dup = "duplicate", dupOf
+	}
+	if _, err := conn.Exec(context.Background(), `
+		INSERT INTO transcript_findings (id, transcript_id, file_path, chunk_index, start_sec, end_sec, original_text,
+		       issue_type, suggested_correction, confidence, model, patch_state, origin, chunk_text_sha256,
+		       anchor_offset, anchor_occurrence, duplicate_of, created_at)
+		VALUES ($1, $2, '/b/PHM/01.m4b', 0, 0, 6, $3, $4, $5, 0.9, 'judge-model', $6, 'judge', $7, $8, 0, $9, $10::timestamptz)`,
+		id, itT, orig, issue, repl, state, patch.ChunkHash(runText), patch.Occurrences(runText, orig)[0], dup, createdAt); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+// jevHolds makes the should_apply recipe current and holds the findings
+// under it (reason, p, related per finding).
+func jevHolds(t *testing.T, d *db.DB, evs ...db.DecisionEvent) string {
+	t.Helper()
+	ctx := context.Background()
+	jev, err := ShouldApplyFn(DefaultShouldApplyParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetCurrentRecipes(ctx, jev.Recipe("")); err != nil {
+		t.Fatal(err)
+	}
+	id := recipeID(t, jev.Recipe(""))
+	for i := range evs {
+		evs[i].RecipeID, evs[i].Outcome, evs[i].ChunkTextSHA256 = id, db.OutcomeHold, patch.ChunkHash(runText)
+	}
+	if res, err := d.ApplyDecisions(ctx, id, evs); err != nil || len(res.Held) != len(evs) {
+		t.Fatalf("seed holds: %+v, %v", res, err)
+	}
+	return id
+}
+
+// voteBoth records a full-scope vote by each fixture model.
+func voteBoth(t *testing.T, conn *pgx.Conn, finding string, a, b string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, m := range []struct{ model, rev, vote string }{{avA, avRevA, a}, {avB, avRevB, b}} {
+		if m.vote == "" {
+			continue
+		}
+		var pid int64
+		if err := conn.QueryRow(ctx, `INSERT INTO pilot_transcripts (file_path, production_transcript_id, backend,
+			model_id, model_revision, scope, has_word_times, segments, raw_text)
+			VALUES ('/b/PHM/01.m4b', $1, 'x', $2, $3, 'full', false, '[]', 'x')
+			ON CONFLICT (file_path, model_id, model_revision, scope) DO UPDATE SET raw_text = 'x'
+			RETURNING id`, itT, m.model, m.rev).Scan(&pid); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO finding_asr_votes (finding_id, pilot_transcript_id, model_id,
+			chunk_text_sha256, vote, detail) VALUES ($1, $2, $3, $4, $5, jsonb_build_object('rule', $6::text))`,
+			finding, pid, m.model, patch.ChunkHash(runText), m.vote, asrpilot.VoteRule); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func reasonOf(t *testing.T, conn *pgx.Conn, finding, actor string) string {
+	t.Helper()
+	var r string
+	if err := conn.QueryRow(context.Background(), `SELECT COALESCE(max(reason), '') FROM finding_events
+		WHERE finding_id = $1 AND kind = 'decision' AND actor = $2`, finding, actor).Scan(&r); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// The 00015 guarantees hold against the real database: a conflict's loser
+// stays held while its winner is held, and is rejected overlaps_overlay once
+// the winner is audio-applied; reverting an audio-applied representative
+// rejects its duplicates (duplicate_of_reverted).
+func TestIntegrationAudioVoteConflictsAndDuplicates(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedDecide(t, conn)
+	const (
+		loser = "00000000-0000-0000-0000-0000000000fb" // auto sebo → Arecebo, lost to f1
+		rep   = "00000000-0000-0000-0000-0000000000fc" // picked → packed, a representative
+		dup   = "00000000-0000-0000-0000-0000000000fd" // picked → packed, its duplicate
+	)
+	seedHeld(t, conn, loser, IssueMisheardProperNoun, "auto sebo", "Arecebo", "", "2026-01-01T00:00:00Z")
+	seedHeld(t, conn, rep, IssueMisheardWord, "picked", "packed", "", "2026-01-01T00:00:00Z")
+	seedHeld(t, conn, dup, IssueMisheardWord, "picked", "packed", rep, "2026-01-02T00:00:00Z")
+	pv := func(v float64) *float64 { return &v }
+	jevHolds(t, d,
+		db.DecisionEvent{FindingID: avIT1, Reason: ReasonUncertain, P: pv(0.6), Evidence: db.EvidenceNone},
+		db.DecisionEvent{FindingID: loser, Reason: ReasonOverlapPending, P: pv(0.5), Evidence: db.EvidenceNone, RelatedFindingID: avIT1},
+		db.DecisionEvent{FindingID: rep, Reason: ReasonUncertain, P: pv(0.5), Evidence: db.EvidenceNone},
+		db.DecisionEvent{FindingID: avIT2, Reason: ReasonJevUnavailable},
+	)
+	R := asrpilot.VoteHeardReplacement
+	voteBoth(t, conn, avIT1, R, "") // the winner: one vote so far
+	voteBoth(t, conn, loser, R, R)  // the loser: both agree, but it lost
+	voteBoth(t, conn, rep, R, R)
+
+	run := func() *AudioVoteReport {
+		t.Helper()
+		r, err := AudioVote(ctx, d, AudioVoteOptions{Config: avConfig(), Yes: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	first := run()
+	actor := "jev:" + first.RecipeID
+	st := findingStates(t, conn)
+	if st["f1"] != "proposed|" || st["fb"] != "proposed|" || reasonOf(t, conn, loser, actor) != "" {
+		t.Fatalf("winner held → loser must stay held: %v", st)
+	}
+	if first.Reasons["hold/"+ReasonASRAgreeVetoed] != 1 || first.Reasons["hold/"+ReasonASRVoteMissing] != 1 {
+		t.Errorf("first run reasons %v", first.Reasons)
+	}
+	if st["fc"] != "accepted|"+actor || st["fd"] != "duplicate|" {
+		t.Errorf("representative %q duplicate %q", st["fc"], st["fd"])
+	}
+
+	voteBoth(t, conn, avIT1, "", R) // the winner's second vote
+	second := run()
+	if st = findingStates(t, conn); st["f1"] != "accepted|"+actor || st["fb"] != "proposed|" {
+		t.Fatalf("winner applied, loser still held this run: %v (%v)", st, second.Reasons)
+	}
+	run()
+	if st = findingStates(t, conn); st["fb"] != "rejected|"+actor || reasonOf(t, conn, loser, actor) != ReasonOverlapsOverlay {
+		t.Errorf("once the winner is in, the loser is rejected overlaps_overlay: %q %q", st["fb"], reasonOf(t, conn, loser, actor))
+	}
+
+	if _, err := d.RevertDecisions(ctx, db.RevertScope{RecipeID: first.RecipeID}, true); err != nil {
+		t.Fatal(err)
+	}
+	st = findingStates(t, conn)
+	if st["fc"] != "rejected|revert:"+actor || st["fd"] != "rejected|revert:"+actor ||
+		reasonOf(t, conn, dup, "revert:"+actor) != db.ReasonDuplicateOfReverted {
+		t.Errorf("revert of the representative: rep %q dup %q (%q)", st["fc"], st["fd"], reasonOf(t, conn, dup, "revert:"+actor))
+	}
+}
+
+// Grouping is computed relative to the current decide recipe: a held
+// representative keeps its slot against a newer, undecided finding proposing
+// the same fix (relative to the rung's own recipe it would lose it on
+// "newest" and be left a duplicate).
+func TestIntegrationAudioVoteHeldRepKeepsSlot(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedDecide(t, conn)
+	const held, newer = "00000000-0000-0000-0000-0000000000fe", "00000000-0000-0000-0000-0000000000ff"
+	seedHeld(t, conn, held, IssueMisheardWord, "signal", "single", "", "2026-01-01T00:00:00Z")
+	pv := 0.5
+	jevHolds(t, d, db.DecisionEvent{FindingID: held, Reason: ReasonUncertain, P: &pv, Evidence: db.EvidenceNone})
+	seedHeld(t, conn, newer, IssueMisheardWord, "signal", "single", "", "2026-06-01T00:00:00Z")
+	R := asrpilot.VoteHeardReplacement
+	voteBoth(t, conn, held, R, R)
+
+	rep, err := AudioVote(ctx, d, AudioVoteOptions{Config: avConfig(), Yes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := findingStates(t, conn)
+	if st["fe"] != "accepted|jev:"+rep.RecipeID || st["ff"] != "proposed|" || rep.Outcomes[DecisionDuplicate] != 0 {
+		t.Errorf("held %q newer %q outcomes %v", st["fe"], st["ff"], rep.Outcomes)
+	}
+}
+
+// A decision computed against a hold that is no longer the latest live
+// decision when the write holds the row lock is skipped, not written.
+func TestIntegrationAudioVoteStaleHoldSkipped(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedDecide(t, conn)
+	pv := 0.5
+	jevHolds(t, d, db.DecisionEvent{FindingID: avIT1, Reason: ReasonUncertain, P: &pv, Evidence: db.EvidenceNone})
+	work, err := d.AudioVoteWork(ctx, db.AudioVoteScope{Rule: asrpilot.VoteRule, Models: avConfig().Models, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(work) != 0 {
+		t.Fatalf("no votes yet, work %v", work)
+	}
+	R := asrpilot.VoteHeardReplacement
+	voteBoth(t, conn, avIT1, R, R)
+	if work, err = d.AudioVoteWork(ctx, db.AudioVoteScope{Rule: asrpilot.VoteRule, Models: avConfig().Models, Limit: 10}); err != nil || len(work) != 1 {
+		t.Fatalf("work %v, %v", work, err)
+	}
+	hold := work[0].HoldEventID
+	rung := avRung(t)
+	rid, err := d.RegisterRecipe(ctx, rung.Recipe())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := db.DecisionEvent{FindingID: avIT1, RecipeID: rid, Outcome: db.OutcomeApply, Reason: ReasonASRAgree,
+		ChunkTextSHA256: patch.ChunkHash(runText), RequiresLatestDecision: hold + 1000}
+	res, err := d.ApplyDecisions(ctx, rid, []db.DecisionEvent{ev})
+	if err != nil || len(res.Skipped) != 1 || len(res.Accepted) != 0 {
+		t.Fatalf("stale hold: %+v, %v", res, err)
+	}
+	ev.RequiresLatestDecision = hold
+	if res, err = d.ApplyDecisions(ctx, rid, []db.DecisionEvent{ev}); err != nil || len(res.Accepted) != 1 {
+		t.Fatalf("current hold: %+v, %v", res, err)
+	}
+}

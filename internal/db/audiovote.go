@@ -62,9 +62,10 @@ func (s AudioVoteScope) modelArrays() (ids, revs []string) {
 // is held by: its latest live (unrevoked) decision.
 type AudioVoteFinding struct {
 	DecideFinding
-	// HoldRecipeID, HoldReason, HoldP and HoldRelated are that decision's
-	// recipe_id, reason, p (nil = none recorded) and related_finding_id
-	// ("" = none).
+	// HoldEventID, HoldRecipeID, HoldReason, HoldP and HoldRelated are that
+	// decision's event id, recipe_id, reason, p (nil = none recorded) and
+	// related_finding_id ("" = none).
+	HoldEventID  int64
 	HoldRecipeID string
 	HoldReason   string
 	HoldP        *float64
@@ -94,10 +95,10 @@ var audioVoteWorkSQL = `
 	       COALESCE(f.suggested_correction, ''), f.confidence, f.chunk_index,
 	       f.anchor_offset, COALESCE(f.anchor_occurrence, -1), f.chunk_text_sha256,
 	       f.patch_state, COALESCE(f.decided_by, ''),
-	       COALESCE(ld.recipe_id, ''), COALESCE(ld.reason, ''), ld.p, COALESCE(ld.related_finding_id::text, '')
+	       ld.id, COALESCE(ld.recipe_id, ''), COALESCE(ld.reason, ''), ld.p, COALESCE(ld.related_finding_id::text, '')
 	  FROM transcript_findings f
 	  JOIN LATERAL (
-	        SELECT e.recipe_id, e.outcome, e.reason, e.p, e.related_finding_id
+	        SELECT e.id, e.recipe_id, e.outcome, e.reason, e.p, e.related_finding_id
 	          FROM finding_events e
 	         WHERE e.finding_id = f.id AND e.kind = 'decision'
 	           AND NOT EXISTS (SELECT 1 FROM finding_events r
@@ -147,7 +148,7 @@ func audioVoteWork(ctx context.Context, q rowQuerier, s AudioVoteScope) ([]Audio
 		var f AudioVoteFinding
 		err := r.Scan(&f.ID, &f.TranscriptID, &f.FilePath, &f.IssueType, &f.Original, &f.Replacement,
 			&f.Confidence, &f.ChunkIndex, &f.AnchorOffset, &f.AnchorOccurrence, &f.ChunkTextSHA256,
-			&f.PatchState, &f.DecidedBy, &f.HoldRecipeID, &f.HoldReason, &f.HoldP, &f.HoldRelated)
+			&f.PatchState, &f.DecidedBy, &f.HoldEventID, &f.HoldRecipeID, &f.HoldReason, &f.HoldP, &f.HoldRelated)
 		return f, err
 	})
 	if err != nil {
@@ -220,6 +221,7 @@ func currentASRVotes(ctx context.Context, q rowQuerier, findingIDs []string, rul
 
 // LatestDecision is a finding's latest live (unrevoked) decision event.
 type LatestDecision struct {
+	ID       int64
 	RecipeID string
 	Outcome  string
 	Reason   string
@@ -228,10 +230,10 @@ type LatestDecision struct {
 }
 
 var latestDecisionsSQL = `
-	SELECT f.id::text, COALESCE(ld.recipe_id, ''), ld.outcome, COALESCE(ld.reason, ''), COALESCE(ld.related_finding_id::text, '')
+	SELECT f.id::text, ld.id, COALESCE(ld.recipe_id, ''), ld.outcome, COALESCE(ld.reason, ''), COALESCE(ld.related_finding_id::text, '')
 	  FROM transcript_findings f
 	  JOIN LATERAL (
-	        SELECT e.recipe_id, e.outcome, e.reason, e.related_finding_id
+	        SELECT e.id, e.recipe_id, e.outcome, e.reason, e.related_finding_id
 	          FROM finding_events e
 	         WHERE e.finding_id = f.id AND e.kind = 'decision'
 	           AND NOT EXISTS (SELECT 1 FROM finding_events r
@@ -260,7 +262,7 @@ func latestDecisions(ctx context.Context, q rowQuerier, findingIDs []string) (ma
 	}
 	var id string
 	var d LatestDecision
-	if _, err := pgx.ForEachRow(rows, []any{&id, &d.RecipeID, &d.Outcome, &d.Reason, &d.Related}, func() error {
+	if _, err := pgx.ForEachRow(rows, []any{&id, &d.ID, &d.RecipeID, &d.Outcome, &d.Reason, &d.Related}, func() error {
 		out[id] = d
 		return nil
 	}); err != nil {

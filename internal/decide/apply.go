@@ -265,6 +265,7 @@ func eventOf(recipeID string, o Outcome) (db.DecisionEvent, bool) {
 	e := db.DecisionEvent{
 		FindingID: o.FindingID, RecipeID: recipeID, Outcome: o.Decision, Reason: o.Reason,
 		P: o.P, ChunkTextSHA256: o.ChunkHash, RelatedFindingID: o.Related, Detail: o.Detail,
+		RequiresLatestDecision: o.RequiresLatestDecision,
 	}
 	if o.Rung0.Pass && o.Decision != DecisionDuplicate {
 		e.Evidence = o.Evidence

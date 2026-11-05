@@ -248,6 +248,15 @@ type fakeAudioStore struct {
 	votes  map[string][]db.ASRVote
 	latest map[string]db.LatestDecision
 	pages  []db.AudioVoteScope
+	// currentDecide is current_recipes.decide ("" = none); groupRecipes the
+	// run recipe each DecideChunks call was made relative to.
+	currentDecide string
+	groupRecipes  []string
+}
+
+func (s *fakeAudioStore) DecideChunks(ctx context.Context, rid string, keys []db.ChunkKey) (map[db.ChunkKey]*db.DecideChunk, error) {
+	s.groupRecipes = append(s.groupRecipes, rid)
+	return s.fakeRunStore.DecideChunks(ctx, rid, keys)
 }
 
 func (s *fakeAudioStore) AudioVoteWork(_ context.Context, sc db.AudioVoteScope) ([]db.AudioVoteFinding, error) {
@@ -269,6 +278,13 @@ func (s *fakeAudioStore) CurrentASRVotes(_ context.Context, ids []string, rule s
 		}
 	}
 	return out, nil
+}
+
+func (s *fakeAudioStore) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) {
+	if s.currentDecide == "" {
+		return nil, nil
+	}
+	return []db.CurrentRecipe{{Step: recipe.StepDecide, RecipeID: s.currentDecide}}, nil
 }
 
 func (s *fakeAudioStore) LatestDecisions(_ context.Context, ids []string) (map[string]db.LatestDecision, error) {
@@ -295,7 +311,7 @@ func newAudioStore() *fakeAudioStore {
 	path := "/b/PHM/01.m4b"
 	held := func(id, issue, orig, repl, reason string, p *float64) db.AudioVoteFinding {
 		return db.AudioVoteFinding{DecideFinding: finding(id, avT, path, issue, runText, orig, repl, 0, 0.9),
-			HoldReason: reason, HoldP: p}
+			HoldReason: reason, HoldP: p, HoldEventID: int64(len(id))*100 + int64(id[len(id)-1])}
 	}
 	fs := []db.AudioVoteFinding{
 		held(avApply, IssueMisheardProperNoun, "auto sebo", "Arecibo", ReasonNoEvidence, pf(0.9)),
@@ -359,7 +375,7 @@ func TestAudioVoteDryRunWritesNothing(t *testing.T) {
 		t.Errorf("json report: %v", err)
 	}
 	// The same seed lists the same findings in the same order.
-	again, err := AudioVote(context.Background(), newAudioStore(), AudioVoteOptions{Config: avConfig(), Seed: "q4", Sample: 2})
+	again, err := AudioVote(context.Background(), newAudioStore(), AudioVoteOptions{Config: avConfig(), Seed: "q4", Sample: new(2)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,5 +483,48 @@ func TestAudioVoteScopeAndPaging(t *testing.T) {
 	if p.Limit != 1 || p.After != avReject || p.Shard != 1 || p.Shards != 4 || p.Book != "PHM" || p.IssueType != IssueMisheardWord ||
 		p.Rule != asrpilot.VoteRule || len(p.Models) != 2 || p.Models[0].ModelID != avA {
 		t.Errorf("second page scope %+v", p)
+	}
+}
+
+// Grouping runs relative to the current decide recipe, not the rung's own:
+// a held representative (decided here by should_apply) keeps its slot
+// against a newer, undecided finding proposing the same fix, exactly as
+// decide would rank them.
+func TestAudioVoteGroupsAsDecideWould(t *testing.T) {
+	const newer = "00000000-0000-0000-0000-0000000000e9"
+	s := newAudioStore()
+	s.held = s.held[:1] // auto sebo → Arecibo, held by should_apply
+	s.currentDecide = strings.Repeat("c", 64)
+	k := db.ChunkKey{TranscriptID: avT, ChunkIndex: 0}
+	held := s.held[0].DecideFinding
+	held.CorrectionKey, held.DecidedHere = "ck", true // the chunk's view, relative to current decide
+	held.CreatedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	other := finding(newer, avT, "/b/PHM/01.m4b", IssueMisheardProperNoun, runText, "auto sebo", "Arecibo", 0, 0.9)
+	other.CorrectionKey, other.CreatedAt = "ck", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	s.chunks[k].Competitors = []db.DecideFinding{held, other}
+
+	rep, err := AudioVote(context.Background(), s, AudioVoteOptions{Config: avConfig(), Yes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.groupRecipes) == 0 || s.groupRecipes[0] != s.currentDecide {
+		t.Fatalf("grouped relative to %v, want the current decide recipe %s", s.groupRecipes, s.currentDecide)
+	}
+	if rep.Reasons["apply/"+ReasonASRAgree] != 1 || rep.Outcomes[DecisionDuplicate] != 0 {
+		t.Errorf("the held representative lost its slot to a newer undecided finding: %v", rep.Reasons)
+	}
+	if e := eventsByID(s.fresh)[avApply]; e.RequiresLatestDecision != s.held[0].HoldEventID {
+		t.Errorf("event requires latest decision %d, want the hold %d", e.RequiresLatestDecision, s.held[0].HoldEventID)
+	}
+}
+
+// --sample 0 lists nothing; unset lists DefaultAudioSample.
+func TestAudioVoteSampleZero(t *testing.T) {
+	rep, err := AudioVote(context.Background(), newAudioStore(), AudioVoteOptions{Config: avConfig(), Sample: new(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Sample) != 0 || rep.Findings != 5 {
+		t.Errorf("sample %d findings %d", len(rep.Sample), rep.Findings)
 	}
 }

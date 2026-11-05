@@ -33,6 +33,7 @@ func TestValidateAudioVote(t *testing.T) {
 		"yes with all":             func(o *options) { o.yes, o.limit, o.maxAccepts, o.shard, o.batch = true, 2000, 500, "1/4", 50 },
 		"book, issue, json":        func(o *options) { o.book, o.issueType, o.json = "Dune", decidepkg.IssueHomophone, true },
 		"sample and seed":          func(o *options) { o.sample, o.sampleSet, o.seed = 5, true, "q4" },
+		"sample zero":              func(o *options) { o.sample, o.sampleSet = 0, true },
 		"flag config":              func(o *options) { o.audioRule, o.audioModels = "asr_vote@v2", []string{fixA, fixB} },
 	} {
 		o := audioOpts()
@@ -49,6 +50,8 @@ func TestValidateAudioVote(t *testing.T) {
 		"endpoint":              func(o *options) { o.overrideEndpoint = "e" },
 		"model":                 func(o *options) { o.overrideModel = "clef:27b" },
 		"policy":                func(o *options) { o.policyFlags = []string{"apply_p=0.9"} },
+		"concurrency":           func(o *options) { o.concurrencySet = true },
+		"negative sample":       func(o *options) { o.sample, o.sampleSet = -1, true },
 		"yes with sample":       func(o *options) { o.yes, o.sampleSet = true, true },
 		"models without rule":   func(o *options) { o.audioModels = []string{fixA, fixB} },
 		"rule without models":   func(o *options) { o.audioRule = "asr_vote@v2" },
@@ -125,6 +128,9 @@ func (s *emptyAudioStore) AudioVoteWork(context.Context, db.AudioVoteScope) ([]d
 	return nil, nil
 }
 func (s *emptyAudioStore) CurrentASRVotes(context.Context, []string, string, []config.AudioVoteModel) (map[string][]db.ASRVote, error) {
+	return nil, nil
+}
+func (s *emptyAudioStore) ListCurrentRecipes(context.Context) ([]db.CurrentRecipe, error) {
 	return nil, nil
 }
 func (s *emptyAudioStore) LatestDecisions(context.Context, []string) (map[string]db.LatestDecision, error) {

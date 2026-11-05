@@ -31,17 +31,20 @@ import (
 )
 
 type options struct {
-	sample      int
-	sampleSet   bool // --sample given explicitly
-	seed        string
-	book        string
-	issueType   string
-	concurrency int
-	json        bool
-	calibrate   bool
-	human       []string
-	rung0Only   bool
-	dump        string // --dump path ("" = none)
+	sample    int
+	sampleSet bool // --sample given explicitly
+	// concurrencySet: --concurrency given explicitly (refused with
+	// --audio-vote, which makes no call).
+	concurrencySet bool
+	seed           string
+	book           string
+	issueType      string
+	concurrency    int
+	json           bool
+	calibrate      bool
+	human          []string
+	rung0Only      bool
+	dump           string // --dump path ("" = none)
 	// --yes run
 	yes        bool
 	limit      int
@@ -178,7 +181,8 @@ and --seed pick the listed findings. --yes writes only the applies and
 rejects, as jev:<audio recipe id>; holds are never written, so the
 should_apply recipe's work list is untouched. Undo with 'earmark decide
 revert --recipe <audio recipe id>'. Not combinable with --calibrate,
---rung0-only, --dump, --human, --endpoint, --model or --policy.
+--rung0-only, --dump, --human, --endpoint, --model, --policy or
+--concurrency. --sample lists N findings (default 20; 0 lists none).
 
 Examples:
   earmark decide --sample 200                    # preview 200 random findings
@@ -239,8 +243,10 @@ func parseShard(s string) (shard, shards int, err error) {
 
 func validate(o options) error {
 	switch {
-	case o.sample < 1 || o.sample > db.MaxDecideSample:
+	case !o.audioVote && (o.sample < 1 || o.sample > db.MaxDecideSample):
 		return fmt.Errorf("--sample must be 1..%d", db.MaxDecideSample)
+	case o.audioVote && (o.sample < 0 || o.sample > db.MaxDecideSample):
+		return fmt.Errorf("with --audio-vote, --sample (findings listed) must be 0..%d", db.MaxDecideSample)
 	case o.seed == "":
 		return errors.New("--seed must not be empty")
 	case o.concurrency < 1 || o.concurrency > 64:
@@ -252,8 +258,8 @@ func validate(o options) error {
 	case !o.audioVote && (len(o.audioModels) > 0 || o.audioRule != ""):
 		return errors.New("--audio-model and --audio-rule need --audio-vote")
 	case o.audioVote && (o.calibrate || o.rung0Only || o.dump != "" || len(o.human) > 0 ||
-		o.overrideEndpoint != "" || o.overrideModel != "" || len(o.policyFlags) > 0):
-		return errors.New("--audio-vote asks no model: it cannot be combined with --calibrate, --rung0-only, --dump, --human, --endpoint, --model or --policy")
+		o.overrideEndpoint != "" || o.overrideModel != "" || len(o.policyFlags) > 0 || o.concurrencySet):
+		return errors.New("--audio-vote asks no model: it cannot be combined with --calibrate, --rung0-only, --dump, --human, --endpoint, --model, --policy or --concurrency")
 	case o.audioVote && (len(o.audioModels) > 0) != (o.audioRule != ""):
 		return errors.New("--audio-model and --audio-rule replace MODELS_FILE audio_vote together: give both, or neither")
 	case !o.yes && !o.audioVote && (o.limit != 0 || o.shard != "" || o.maxAccepts != 0):
@@ -282,6 +288,7 @@ func knownIssueType(t string) bool {
 
 func runDecide(cmd *cobra.Command, _ []string) {
 	opts.sampleSet = cmd.Flags().Changed("sample")
+	opts.concurrencySet = cmd.Flags().Changed("concurrency")
 	if err := validate(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
@@ -485,7 +492,8 @@ func runAudio(ctx context.Context, out io.Writer, store decidepkg.AudioVoteStore
 		Limit: o.limit, Batch: o.batch, MaxAccepts: o.maxAccepts, Yes: o.yes, Seed: o.seed, Progress: rec,
 	}
 	if o.sampleSet {
-		ao.Sample = o.sample
+		n := o.sample
+		ao.Sample = &n
 	}
 	rep, err := decidepkg.AudioVote(ctx, store, ao)
 	if err != nil {

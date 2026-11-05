@@ -206,11 +206,12 @@ func TestDecisionEventValidate(t *testing.T) {
 			e.FindingID = "00000000-0000-0000-0000-000000000001"
 			e.RelatedFindingID = e.FindingID
 		},
-		"detail an array":   func(e *DecisionEvent) { e.Detail = json.RawMessage(`[1]`) },
-		"detail null":       func(e *DecisionEvent) { e.Detail = json.RawMessage(`null`) },
-		"detail not json":   func(e *DecisionEvent) { e.Detail = json.RawMessage(`{"a":`) },
-		"detail a string":   func(e *DecisionEvent) { e.Detail = json.RawMessage(`"x"`) },
-		"detail two values": func(e *DecisionEvent) { e.Detail = json.RawMessage(`{} {}`) },
+		"detail an array":                   func(e *DecisionEvent) { e.Detail = json.RawMessage(`[1]`) },
+		"detail null":                       func(e *DecisionEvent) { e.Detail = json.RawMessage(`null`) },
+		"detail not json":                   func(e *DecisionEvent) { e.Detail = json.RawMessage(`{"a":`) },
+		"detail a string":                   func(e *DecisionEvent) { e.Detail = json.RawMessage(`"x"`) },
+		"detail two values":                 func(e *DecisionEvent) { e.Detail = json.RawMessage(`{} {}`) },
+		"negative required latest decision": func(e *DecisionEvent) { e.RequiresLatestDecision = -1 },
 	}
 	for name, mutate := range bad {
 		e := ok

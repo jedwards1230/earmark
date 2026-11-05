@@ -469,6 +469,11 @@ type Outcome struct {
 	// (finding_events.detail): the audio-vote rung's vote snapshot; nil for
 	// should_apply.
 	Detail json.RawMessage
+	// RequiresLatestDecision, when not 0, is the decision event the outcome
+	// was computed against: it is written only while that event is still the
+	// finding's latest live decision (db.DecisionEvent.RequiresLatestDecision).
+	// The audio-vote rung sets it to the hold it lifts; should_apply leaves 0.
+	RequiresLatestDecision int64
 	// Latency, tokens and cost of the call. A cache hit makes no request:
 	// its tokens and cost are zero.
 	Latency      time.Duration
