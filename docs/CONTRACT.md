@@ -6434,7 +6434,17 @@ extraction, no word-type classification, no ebook, no web search.
   or more distinct spellings, or one finding goes A → B and another B → A.
   Findings **this run** rejects (on `p` or at rung 0) are left out, so a junk
   A → C at p = 0.02 does not hold a good A → B; the book's findings outside
-  the run count as stored.
+  the run count as stored. "This run" spans every page of a `--yes` run (the
+  rejected set accumulates page by page). **Order asymmetry:** `--yes`
+  decides `workPage` (500) findings at a time in finding-id order and writes
+  each page before the next, so a junk A → C that is rejected only on a
+  *later* page cannot un-hold an A → B already held on an earlier page (a
+  recipe's holds are final). A paged `--yes` run can therefore hold more than
+  the dry run, which decides its whole sample at once — never apply more. On
+  a book whose work fits one page the two agree exactly. Not made
+  order-independent because that would mean evaluating every page of a book
+  before writing any, which the paged, resumable `--yes` loop does not do;
+  the extra holds are revisited under the next recipe.
 - **Strong spelling** (exactly one, else none):
   1. `applied` — the one target of the group's **applied** findings (applied
      findings that disagree: no strong spelling, and the pilots are not

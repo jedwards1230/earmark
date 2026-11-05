@@ -240,3 +240,132 @@ func TestIntegrationSpellingConflictingShadowPair(t *testing.T) {
 		t.Errorf("%d overlap_pending holds on the loser naming the held winner", n)
 	}
 }
+
+// spellingReasons is each finding's decision under recipe, "outcome/reason"
+// keyed by the id's last two characters.
+func spellingReasons(t *testing.T, conn *pgx.Conn, recipeID string) map[string]string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), `SELECT right(finding_id::text, 2), outcome || '/' || reason FROM finding_events
+		WHERE kind = 'decision' AND recipe_id = $1`, recipeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	var k, v string
+	if _, err := pgx.ForEachRow(rows, []any{&k, &v}, func() error { out[k] = v; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// pagedOne makes --yes decide one finding per page (finding-id order: f1, f2).
+func pagedOne(t *testing.T) {
+	t.Helper()
+	old := workPage
+	workPage = 1
+	t.Cleanup(func() { workPage = old })
+}
+
+// A junk target rejected on an earlier page of a --yes run does not make a
+// later page's group contradictory: the rejected set spans the whole run.
+// Page 1 (f1, f2) loads the book model while f1 is still proposed and rejects
+// f1; page 2 (f3) must still see f1 as rejected.
+func TestIntegrationSpellingRejectOnEarlierPage(t *testing.T) {
+	d, conn := integrationDB(t)
+	ctx := context.Background()
+	seedSpelling(t, conn)
+	const text2 = "then ilmus sat down"
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO transcription_jobs (id, file_path, checksum, status) VALUES
+		  ('00000000-0000-0000-0000-00000000050b', '/b/Ilm/02.m4b', 'cs2', 'done');
+		INSERT INTO transcripts (id, job_id, file_path, checksum, language, duration_seconds, segments, raw_text, model_name) VALUES
+		  ('00000000-0000-0000-0000-0000000005e2', '00000000-0000-0000-0000-00000000050b', '/b/Ilm/02.m4b', 'cs2', 'en', 6,
+		   '[{"id":0,"start":0,"end":6,"text":"`+text2+`","words":[]}]', 'x', 'parakeet');
+		INSERT INTO transcript_chunks (id, transcript_id, file_path, chunk_index, start_sec, end_sec, text, source_text, embedding) VALUES
+		  ('00000000-0000-0000-0000-0000000005c2', '00000000-0000-0000-0000-0000000005e2', '/b/Ilm/02.m4b', 0, 0, 6, '`+text2+`', '`+text2+`', array_fill(0.1, ARRAY[768])::vector);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO transcript_findings (id, transcript_id, file_path, chunk_index, start_sec, end_sec, original_text,
+		       issue_type, suggested_correction, confidence, model, patch_state, origin, chunk_text_sha256,
+		       anchor_offset, anchor_occurrence)
+		VALUES ($1, '00000000-0000-0000-0000-0000000005e2', '/b/Ilm/02.m4b', 0, 0, 6, 'ilmus', $2, 'Ilmis', 0.9, 'judge-model',
+		        'proposed', 'judge', $3, $4, -1)`,
+		spS3, IssueMisheardProperNoun, patch.ChunkHash(text2), patch.Occurrences(text2, "ilmus")[0]); err != nil {
+		t.Fatal(err)
+	}
+	old := workPage
+	workPage = 2
+	t.Cleanup(func() { workPage = old })
+	// f1 (→ Ilmas) is junk at p 0.02; f2 and f3 (→ Ilmis) are good but have
+	// no evidence, so both stay held no_evidence — not spelling_conflict.
+	asker := &fakeAsker{p: func(s string) (float64, error) {
+		if strings.Contains(s, "Ilmis") {
+			return 0.97, nil
+		}
+		return 0.02, nil
+	}}
+	rep, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 1, Params: DefaultShouldApplyParams()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := spellingReasons(t, conn, rep.RecipeID)
+	want := map[string]string{
+		"f1": DecisionReject + "/" + ReasonJevReject,
+		"f2": DecisionHold + "/" + ReasonNoEvidence,
+		"f3": DecisionHold + "/" + ReasonNoEvidence,
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: %q, want %q (all %v)", k, got[k], v, got)
+		}
+	}
+}
+
+// The documented order asymmetry: a junk target rejected only on a LATER page
+// cannot un-hold an earlier page's finding, so a paged --yes run holds the
+// good fix that the dry run (one view of the whole sample) and a single-page
+// --yes run both apply.
+func TestIntegrationSpellingRejectOnLaterPage(t *testing.T) {
+	asker := &fakeAsker{p: func(s string) (float64, error) {
+		if strings.Contains(s, "Ilmis") {
+			return 0.02, nil // f2, junk, decided on page 2
+		}
+		return 0.97, nil // f1, good with asin_verbatim evidence, page 1
+	}}
+	ctx := context.Background()
+
+	t.Run("dry run and single page agree", func(t *testing.T) {
+		d, conn := integrationDB(t)
+		seedSpelling(t, conn)
+		dry, err := DryRun(ctx, d, asker, RunOptions{Scope: db.DecideScope{Sample: 10, Seed: "q4"}, Concurrency: 1,
+			Params: DefaultShouldApplyParams()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dry.Outcomes[DecisionApply] != 1 || dry.Outcomes[DecisionReject] != 1 || dry.Reasons[ReasonSpellingConflict] != 0 {
+			t.Fatalf("dry run outcomes %v reasons %v", dry.Outcomes, dry.Reasons)
+		}
+		rep, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 1, Params: DefaultShouldApplyParams()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := spellingReasons(t, conn, rep.RecipeID)
+		if got["f1"] != DecisionApply+"/"+ReasonConfident || got["f2"] != DecisionReject+"/"+ReasonJevReject {
+			t.Errorf("single-page --yes %v, want what the dry run said", got)
+		}
+	})
+	t.Run("paged holds more, never applies more", func(t *testing.T) {
+		d, conn := integrationDB(t)
+		seedSpelling(t, conn)
+		pagedOne(t)
+		rep, err := Apply(ctx, d, asker, ApplyOptions{Concurrency: 1, Params: DefaultShouldApplyParams()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := spellingReasons(t, conn, rep.RecipeID)
+		if got["f1"] != DecisionHold+"/"+ReasonSpellingConflict || got["f2"] != DecisionReject+"/"+ReasonJevReject {
+			t.Errorf("paged --yes %v, want f1 held spelling_conflict (asymmetry) and f2 rejected", got)
+		}
+	})
+}

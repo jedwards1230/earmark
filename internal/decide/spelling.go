@@ -77,12 +77,19 @@ var _ SpellingStore = (*db.DB)(nil)
 
 // spellingPass decides the spelling of a run's items, loading each book's
 // model once per run (a snapshot taken at first use: decisions written by
-// earlier pages of the same run are not seen). A book over a read cap
+// earlier pages of the same run are not seen). dead accumulates, across every
+// page of the run, the findings the run rejects (on p or at rung 0), so a
+// junk target rejected on an earlier page never makes a later page's group
+// contradictory. A junk target rejected only on a LATER page cannot un-hold
+// an earlier page's finding (its hold is already written and final under the
+// recipe): a paged --yes run can hold more than a single-page view, never
+// apply more (CONTRACT §2.19 "Contradiction"). A book over a read cap
 // (db.ErrSpellingCapExceeded) is skipped — logged, counted in skipped, its
 // items untouched — rather than failing the run.
 type spellingPass struct {
 	store   SpellingStore
 	books   map[string]*spelling.Book // nil value = skipped book
+	dead    map[string]bool           // finding ids this run rejected, all pages so far
 	skipped int
 }
 
@@ -90,7 +97,7 @@ type spellingPass struct {
 // SpellingStore yields a pass that changes nothing.
 func newSpellingPass(store any) *spellingPass {
 	ss, _ := store.(SpellingStore)
-	return &spellingPass{store: ss, books: map[string]*spelling.Book{}}
+	return &spellingPass{store: ss, books: map[string]*spelling.Book{}, dead: map[string]bool{}}
 }
 
 // spellingEligible: an outcome the pass may re-label — an apply, or a hold an
@@ -115,12 +122,12 @@ func (sp *spellingPass) run(ctx context.Context, items []*item) error {
 	if sp == nil || sp.store == nil {
 		return nil
 	}
-	// Findings this run rejects (on p or at rung 0) do not make a group
-	// contradictory: their targets are excluded from the run's view.
-	dead := map[string]bool{}
+	// Findings this run rejects (on p or at rung 0), on this page or an
+	// earlier one, do not make a group contradictory: their targets are
+	// excluded from the run's view.
 	for _, it := range items {
 		if it.outcome.Decision == DecisionReject || (it.outcome.Decision != DecisionDuplicate && !it.outcome.Rung0.Pass) {
-			dead[it.finding.ID] = true
+			sp.dead[it.finding.ID] = true
 		}
 	}
 	for _, it := range items {
@@ -134,7 +141,7 @@ func (sp *spellingPass) run(ctx context.Context, items []*item) error {
 		if err != nil {
 			return err
 		}
-		applySpelling(b, it, dead)
+		applySpelling(b, it, sp.dead)
 	}
 	return nil
 }
