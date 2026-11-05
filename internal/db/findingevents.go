@@ -809,7 +809,9 @@ func applyDecisionsWith(ctx context.Context, b txBeginner, recipeID string, evs 
 	}
 	moved := map[string]bool{}
 	if len(conditional) > 0 {
-		latest, err := latestDecisions(ctx, tx, conditional)
+		// Paged: a --yes batch can carry more conditional events than one
+		// LatestDecisions call takes.
+		latest, err := latestDecisionsPaged(ctx, tx, conditional)
 		if err != nil {
 			return ApplyResult{}, err
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -246,6 +247,20 @@ var latestDecisionsSQL = `
 // MaxDecideWorkPage findings; a finding never decided is absent.
 func (db *DB) LatestDecisions(ctx context.Context, findingIDs []string) (map[string]LatestDecision, error) {
 	return latestDecisions(ctx, db.pool, findingIDs)
+}
+
+// latestDecisionsPaged is latestDecisions over any number of ids, in
+// MaxDecideWorkPage slices, merged.
+func latestDecisionsPaged(ctx context.Context, q rowQuerier, findingIDs []string) (map[string]LatestDecision, error) {
+	out := map[string]LatestDecision{}
+	for start := 0; start < len(findingIDs); start += MaxDecideWorkPage {
+		part, err := latestDecisions(ctx, q, findingIDs[start:min(start+MaxDecideWorkPage, len(findingIDs))])
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(out, part)
+	}
+	return out, nil
 }
 
 func latestDecisions(ctx context.Context, q rowQuerier, findingIDs []string) (map[string]LatestDecision, error) {
