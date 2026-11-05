@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"regexp"
@@ -205,6 +206,11 @@ func TestDecisionEventValidate(t *testing.T) {
 			e.FindingID = "00000000-0000-0000-0000-000000000001"
 			e.RelatedFindingID = e.FindingID
 		},
+		"detail an array":   func(e *DecisionEvent) { e.Detail = json.RawMessage(`[1]`) },
+		"detail null":       func(e *DecisionEvent) { e.Detail = json.RawMessage(`null`) },
+		"detail not json":   func(e *DecisionEvent) { e.Detail = json.RawMessage(`{"a":`) },
+		"detail a string":   func(e *DecisionEvent) { e.Detail = json.RawMessage(`"x"`) },
+		"detail two values": func(e *DecisionEvent) { e.Detail = json.RawMessage(`{} {}`) },
 	}
 	for name, mutate := range bad {
 		e := ok
@@ -212,6 +218,19 @@ func TestDecisionEventValidate(t *testing.T) {
 		if err := e.validate(); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// A detail (migration 19) is a JSON object or absent.
+func TestDecisionEventValidateDetail(t *testing.T) {
+	e := DecisionEvent{FindingID: "f", RecipeID: testRecipe, Outcome: OutcomeApply, Reason: "asr_agree",
+		Detail: json.RawMessage(`{"rung":"asr_vote","votes":[{"vote_id":1}]}`)}
+	if err := e.validate(); err != nil {
+		t.Errorf("object detail refused: %v", err)
+	}
+	e.Detail = nil
+	if err := e.validate(); err != nil {
+		t.Errorf("no detail refused: %v", err)
 	}
 }
 
@@ -353,11 +372,11 @@ func TestApplyDecisionsDuplicateNeverRejects(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(rep))
 	mock.ExpectQuery(regexp.QuoteMeta("FOR SHARE OF c")).WithArgs([]string{rep, dup}).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "sha"}).AddRow(rep, "h").AddRow(dup, "h"))
-	any9 := make([]any, 9)
-	for i := range any9 {
-		any9[i] = pgxmock.AnyArg()
+	any10 := make([]any, 10) // insertDecisionEventsSQL: $1..$10 ($10 detail, migration 19)
+	for i := range any10 {
+		any10[i] = pgxmock.AnyArg()
 	}
-	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO finding_events")).WithArgs(any9...).
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO finding_events")).WithArgs(any10...).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(1)).AddRow(int64(2)))
 	mock.ExpectExec(regexp.QuoteMeta("set_config('earmark.actor'")).WithArgs("", "", ReasonDuplicate).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))

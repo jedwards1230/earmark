@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -288,6 +289,11 @@ type DecisionEvent struct {
 	// reason overlap_pending, naming it (CONTRACT §2.19: a conflict's loser is
 	// rejected only for a fix that is actually in). "" = unconditional.
 	RequiresAccepted string
+	// Detail is the decision's structured audit record
+	// (finding_events.detail, migration 19): a JSON object, or nil (NULL).
+	// The audio-vote rung records the votes it rested on here (CONTRACT
+	// §2.19 "Audio-vote rung"); every other decider leaves it nil.
+	Detail json.RawMessage
 }
 
 var decisionOutcomes = []string{OutcomeApply, OutcomeHold, OutcomeReject, OutcomeDuplicate}
@@ -314,8 +320,16 @@ func (e DecisionEvent) validate() error {
 		return fmt.Errorf("decision event %s: p %v is outside [0,1]", e.FindingID, *e.P)
 	case e.Evidence != "" && !slices.Contains([]string{EvidenceASINVerbatim, EvidenceExactRepeat, EvidenceNone}, e.Evidence):
 		return fmt.Errorf("decision event %s: unknown evidence %q", e.FindingID, e.Evidence)
+	case e.Detail != nil && !jsonObject(e.Detail):
+		return fmt.Errorf("decision event %s: detail is not a JSON object", e.FindingID)
 	}
 	return nil
+}
+
+// jsonObject reports whether raw is one valid JSON object.
+func jsonObject(raw json.RawMessage) bool {
+	var m map[string]json.RawMessage
+	return json.Unmarshal(raw, &m) == nil && m != nil
 }
 
 // insertDecisionEventsSQL appends the decisions in input order. transcript_id
@@ -325,13 +339,13 @@ func (e DecisionEvent) validate() error {
 var insertDecisionEventsSQL = `
 	INSERT INTO finding_events (finding_id, transcript_id, kind, outcome, reason, actor,
 	                            recipe_id, p, evidence, fn_call_id, chunk_text_sha256, issue_type,
-	                            related_finding_id)
+	                            related_finding_id, detail)
 	SELECT f.id, f.transcript_id, 'decision', d.outcome, d.reason, 'jev:' || d.recipe_id,
 	       d.recipe_id, d.p, NULLIF(d.evidence, ''), d.fn_call_id, NULLIF(d.chunk_sha, ''), f.issue_type,
-	       d.related
+	       d.related, d.detail::jsonb
 	  FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::text[],
-	              $7::bigint[], $8::text[], $9::uuid[])
-	       WITH ORDINALITY AS d(finding_id, recipe_id, outcome, reason, p, evidence, fn_call_id, chunk_sha, related, ord)
+	              $7::bigint[], $8::text[], $9::uuid[], $10::text[])
+	       WITH ORDINALITY AS d(finding_id, recipe_id, outcome, reason, p, evidence, fn_call_id, chunk_sha, related, detail, ord)
 	  JOIN transcript_findings f ON f.id = d.finding_id
 	 ORDER BY d.ord
 	RETURNING id
@@ -355,6 +369,7 @@ func InsertDecisionEvents(ctx context.Context, tx rowQuerier, evs []DecisionEven
 		fnCalls   = make([]*int64, len(evs))
 		chunkSHAs = make([]string, len(evs))
 		related   = make([]*string, len(evs))
+		details   = make([]*string, len(evs))
 	)
 	for i, e := range evs {
 		if err := e.validate(); err != nil {
@@ -366,9 +381,13 @@ func InsertDecisionEvents(ctx context.Context, tx rowQuerier, evs []DecisionEven
 			r := e.RelatedFindingID
 			related[i] = &r
 		}
+		if e.Detail != nil {
+			d := string(e.Detail)
+			details[i] = &d
+		}
 	}
 	rows, err := tx.Query(ctx, insertDecisionEventsSQL,
-		findings, recipes, outcomes, reasons, ps, evidence, fnCalls, chunkSHAs, related)
+		findings, recipes, outcomes, reasons, ps, evidence, fnCalls, chunkSHAs, related, details)
 	if err != nil {
 		return nil, fmt.Errorf("insert %d decision events: %w", len(evs), err)
 	}

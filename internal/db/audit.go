@@ -96,6 +96,8 @@ func clippedCol(name string) AuditColumn { return AuditColumn{Name: name, Clip: 
 // 00001, 00007, 00008, 00010, 00013, 00015); what each table leaves out, and
 // why, is in CONTRACT §2.12.2:
 //
+//	finding_events  detail (JSONB, migration 19: the audio-vote rung's vote
+//	                snapshot; read it with SQL)
 //	judge_passes    file_path (a library path), error (error text)
 //	fn_calls        input, output (the JSONB prompt and model reply)
 //	step_runs       args (the command line: book names, endpoint overrides),

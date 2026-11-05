@@ -698,3 +698,52 @@ func TestRunnerArbiterYieldMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestFindingEventsDetailMigration pins 00019 (CONTRACT §2.17, §2.19): one
+// nullable JSONB column on finding_events and its object CHECK, added NOT
+// VALID (no scan under the exclusive lock), under the 5s lock timeout; no
+// rewrite, no backfill, no trigger change. Down refuses to drop details
+// unless earmark.allow_data_loss is on.
+func TestFindingEventsDetailMigration(t *testing.T) {
+	b, err := migrationFiles.ReadFile("migrations/00019_finding_events_detail.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUp, rawDown, ok := strings.Cut(string(b), "-- +goose Down")
+	if !ok {
+		t.Fatal("no Down section")
+	}
+	up, down := norm(stripSQLComments(rawUp)), norm(stripSQLComments(rawDown))
+	for name, part := range map[string]string{"Up": up, "Down": down} {
+		i := strings.Index(part, "SET LOCAL lock_timeout = '5s';")
+		a := strings.Index(part, "ALTER TABLE")
+		if i < 0 || a < i {
+			t.Errorf("%s: want SET LOCAL lock_timeout before any ALTER", name)
+		}
+	}
+	for _, want := range []string{
+		"ALTER TABLE finding_events ADD COLUMN IF NOT EXISTS detail JSONB;",
+		"ALTER TABLE finding_events ADD CONSTRAINT finding_events_detail_object CHECK (detail IS NULL OR jsonb_typeof(detail) = 'object') NOT VALID;",
+	} {
+		if !strings.Contains(up, want) {
+			t.Errorf("Up lacks %q", want)
+		}
+	}
+	if n := strings.Count(up, "ALTER TABLE"); n != 2 {
+		t.Errorf("Up: want exactly two ALTERs, got %d: %q", n, up)
+	}
+	for _, banned := range []string{"UPDATE ", "DELETE ", "TRIGGER", "DEFAULT", "VALIDATE CONSTRAINT", "NOT NULL"} {
+		if strings.Contains(up, banned) {
+			t.Errorf("Up must be purely additive and rewrite nothing; found %q", banned)
+		}
+	}
+	for _, want := range []string{
+		"current_setting('earmark.allow_data_loss', true)",
+		"ALTER TABLE finding_events DROP CONSTRAINT IF EXISTS finding_events_detail_object;",
+		"ALTER TABLE finding_events DROP COLUMN IF EXISTS detail;",
+	} {
+		if !strings.Contains(down, want) {
+			t.Errorf("Down lacks %q", want)
+		}
+	}
+}

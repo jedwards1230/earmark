@@ -21,6 +21,7 @@ var wantAuditSources = []string{"finding_events", "judge_passes", "fn_calls", "s
 // (CONTRACT §2.12.2). The integration schema guard checks the same sets against
 // information_schema; here they must simply never be served.
 var auditExcluded = map[string][]string{
+	"finding_events":  {"detail"},
 	"judge_passes":    {"file_path", "error"},
 	"fn_calls":        {"input", "output"},
 	"step_runs":       {"args", "error", "last_message"},
