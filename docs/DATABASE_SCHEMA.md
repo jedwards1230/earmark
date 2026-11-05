@@ -599,7 +599,7 @@ CREATE TABLE finding_events (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     anchor_offset     INTEGER,                -- migration 13: the OLD offset on a reanchor_moved row
     related_finding_id UUID,                  -- migration 15: a duplicate's representative / an overlap_dup's winner (no FK)
-    detail            JSONB                   -- migration 19: a decision's audit record (the audio-vote rung's votes); object or NULL
+    detail            JSONB                   -- migration 19: a decision's audit record (the audio-vote rung's votes, rung "asr_vote"; the spelling pass's group, rung "spelling"); object or NULL
 );
 -- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at),
 --          finding_events_related_idx: (related_finding_id) WHERE related_finding_id IS NOT NULL
@@ -620,6 +620,16 @@ with `from_state = to_state` (the state before the UPDATE), reason
 the OLD `chunk_text_sha256` / `anchor_offset` whenever a
 finding's hash or offset changes; the row holds the new ones. An UPDATE that
 also changes `patch_state` appends both, the reanchor event first.
+
+A decision's `reason` is free text (no CHECK): rung 0's reasons, the
+should_apply reasons, the audio-vote rung's, and — since decide step_version
+4 — the spelling pass's `spelling_conflict`, `spelling_off_established`
+(holds) and `spelling_established` (apply). Their `detail` is
+`{"rung":"spelling","rule":"one_spelling@v1","group":[…],"spellings_total":n,
+"targets":[…],"original":…,"target":…,"contradictory":bool,"strong":…,
+"strong_source":"applied|pilots|","counts":{spelling:{"applied":n,
+"pilots":{model:n},"production":n}},"action":…,"prior_reason":…}` (CONTRACT
+§2.19 "One spelling per book"). No migration: both columns already exist.
 
 ### 11a. `judge_passes` — Judge passes (CONTRACT §2.15 "Lineage")
 

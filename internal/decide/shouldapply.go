@@ -18,6 +18,7 @@ import (
 	"github.com/jedwards1230/earmark/internal/fn"
 	"github.com/jedwards1230/earmark/internal/genai"
 	"github.com/jedwards1230/earmark/internal/recipe"
+	"github.com/jedwards1230/earmark/internal/spelling"
 	"github.com/jedwards1230/earmark/internal/systemone"
 )
 
@@ -34,8 +35,10 @@ const (
 	// findings are grouped (one representative decided, the rest recorded as
 	// duplicates) and overlapping different fixes are ranked by the model's p
 	// instead of judge confidence (CONTRACT §2.19 "Agreeing and conflicting
-	// findings").
-	ShouldApplyStepVersion = 3
+	// findings"). 4: the one-spelling-per-book pass (spelling.RuleID) runs
+	// between evaluation and conflict ranking (CONTRACT §2.19 "One spelling
+	// per book").
+	ShouldApplyStepVersion = 4
 	// questionKey is the System One question name.
 	questionKey = "should_apply"
 )
@@ -284,6 +287,8 @@ func (p ShouldApplyParams) recipeParams() map[string]any {
 		"max_relevant_runes":        MaxRelevantRunes,
 		"max_sentence_runes":        MaxSentenceRunes,
 		"clip_words":                ClipWords,
+		"spelling_rule":             spelling.RuleID,
+		"spelling_min_pilot":        spelling.MinPilot,
 	}
 }
 

@@ -425,11 +425,15 @@ func TestIntegrationShadowWinnerDefersLoser(t *testing.T) {
 	seedGroupRows(t, conn,
 		groupRow{id: gLuna, recipe: gemma, issue: IssueMisheardProperNoun, orig: "auto sebo", repl: "Arecibo", state: "proposed",
 			conf: 0.5, created: time.Now()},
-		groupRow{id: gConf, recipe: gemma, issue: IssueMisheardWord, orig: "auto sebo", repl: "Arrecibo", state: "proposed",
+		// A different, overlapping fix that spells the name the same way (a
+		// wider span): a second spelling such as "Arrecibo" would make the
+		// book's spelling group contradictory, and the one-spelling pass
+		// would hold the winner (CONTRACT §2.19 "One spelling per book").
+		groupRow{id: gConf, recipe: gemma, issue: IssueMisheardWord, orig: "at auto sebo", repl: "at Arecibo", state: "proposed",
 			conf: 0.9, created: time.Now()},
 	)
 	asker := &fakeAsker{p: func(state string) (float64, error) {
-		if strings.Contains(state, "[[Arrecibo]]") {
+		if strings.Contains(state, "[[at Arecibo]]") {
 			return 0.4, nil
 		}
 		return 0.97, nil

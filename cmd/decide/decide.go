@@ -163,6 +163,21 @@ all asked and ranked by the model's p; a loser is rejected overlap_dup when
 the winner applies and held overlap_pending while the winner is held. A dry run lists each group and each ranked conflict. Each accept re-embeds its whole transcript on the next rebuild:
 bound a run with --limit and --max-accepts. Undo with 'earmark decide revert'.
 
+One spelling per book (CONTRACT §2.19 "One spelling per book"): after the
+model is asked and before conflicts are ranked, each finding whose differing
+words (one or two, sounding alike) fall in a spelling group of its book — the
+book's live findings grouped by Double Metaphone key — is checked against the
+group. An apply or an uncertain/no_evidence/evidence_excluded hold is held
+spelling_off_established when the book established another spelling (the one
+spelling its applied findings target, else the only one two second-ASR pilot
+transcripts agree on), and spelling_conflict when the group proposes two or
+more spellings and none is established (findings this run rejects are left
+out); a no_evidence hold whose exact pair (original → spelling) an applied
+finding established is applied spelling_established. A book over a read cap
+is skipped (counted in the report). Rejects,
+duplicates and other holds are untouched. The group is recorded in
+finding_events.detail (rung "spelling"). A dry run shows the reasons too.
+
 --audio-vote runs the audio-vote rung instead (CONTRACT §2.19 "Audio-vote
 rung"): it asks no model. It takes every HELD finding (proposed, latest
 decision a hold, by any decide recipe) with a current vote from the

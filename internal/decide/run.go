@@ -154,6 +154,7 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 	}
 	var grouping Grouping
 	grouping.addGroups(prep.groups, true)
+	spellings := newSpellingPass(store)
 	if o.Rung0Only {
 		rec.Phase("rung-0")
 		rung0Outcomes(prep.items)
@@ -165,6 +166,9 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 	} else {
 		rec.Phase(askingPhase(o.Model))
 		evaluateAll(ctx, ev, prep.items, o.Concurrency, rec)
+		if err := spellings.run(ctx, prep.items); err != nil {
+			return nil, err
+		}
 		resolveConflicts(prep.items, &grouping, true)
 	}
 	if err := ctx.Err(); err != nil {
@@ -173,6 +177,7 @@ func DryRun(ctx context.Context, store RunStore, asker Asker, o RunOptions) (*Re
 	items, shadows := splitShadows(prep.items)
 	rep := buildReport(o, recipeID, items, backlog)
 	rep.Grouping = grouping
+	rep.SpellingSkippedBooks = spellings.skipped
 	rep.addShadowCalls(shadows)
 	if o.Scope.Calibrate {
 		sweep := o.Sweep

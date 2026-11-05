@@ -27,6 +27,19 @@
 // closed: any failure to get a usable answer is a retryable hold, never an
 // apply. Nothing here persists a decision or changes a finding's state.
 //
+// The spelling pass (spelling.go, CONTRACT §2.19 "One spelling per book")
+// runs after should_apply and before conflicts are ranked, in DryRun and
+// Apply: it groups the book's live findings by the sound of their differing
+// words (internal/spelling) and holds an apply or an audio-liftable hold that
+// contradicts the book's other spellings (spelling_conflict) or targets a
+// spelling other than the one the book established (spelling_off_established);
+// a no_evidence hold whose exact pair an applied finding of the book
+// established is applied (spelling_established). Findings the run itself
+// rejects do not count toward a contradiction; a book over a read cap is
+// skipped and counted. EstablishedSpellings exposes a book's
+// strong spellings for a future context consumer; nothing feeds them to a
+// model yet.
+//
 // DryRun (`earmark decide`) runs the whole step over a deterministic sample
 // and builds a Report — outcomes, reasons, a p histogram, cost and a backlog
 // projection — and, in calibration mode, agreement with decisions people

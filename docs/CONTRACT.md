@@ -5931,7 +5931,8 @@ an error: every failure after rung 0 is a retryable `hold`.
      include at least one non-stopword of ≥ 4 characters;
    - `none` — anything else, including every finding of a book with no
      reference.
-5. **Model call** — `fn` `should_apply`, step `decide` (`step_version` 3:
+5. **Model call** — `fn` `should_apply`, step `decide` (`step_version` 4:
+   3 plus the one-spelling-per-book pass, "One spelling per book" below; 3 was
    2 plus the grouping of agreeing findings and conflicts ranked by `p`),
    prompt `should_apply@v2`, the decide step's effective model — by default
    `jev-1.13.0`, or another pinned System One model through a runtime model
@@ -6082,7 +6083,8 @@ effective policy and its source (e.g. `db (reject_floor) over preset clef`).
 `phonetic_min_sim` (rung 0's sound-alike threshold, 0.67), `evidence_rule`,
 `rung0_version`, the context sizes (`context_words` 25, `neighbour_words` 20,
 `fallback_words` 25) and the relevance caps (`max_relevant_sentences` 4,
-`max_relevant_runes` 600, `max_sentence_runes` 200, `clip_words` 12) are all
+`max_relevant_runes` 600, `max_sentence_runes` 200, `clip_words` 12) and the
+spelling pass (`spelling_rule` `one_spelling@v1`, `spelling_min_pilot` 3) are all
 params of the decide recipe (§1.9), so changing any of them yields a new
 recipe. Params must satisfy the policy rules above and
 `0 < phonetic_min_sim ≤ 1`. *History:* `apply_p` was 0.95 until the
@@ -6399,6 +6401,140 @@ after rung 0's per-candidate checks and before its dedupe (`decide.groupChunk`,
   decisions by the recipe's `model_alias` (§2.12.1), so a Clef decision is
   never shown as Jev.
 
+#### One spelling per book
+
+A book spells each name one way. The judge, deciding chunk by chunk, does not:
+in the 10 pilot books (measured 2026-11-05, 4,431 proposed findings) it
+proposed "terrillyn" as both `terrin` and `terrilyn`, and "ilmus" as `ilmas`
+and `ilmis`. Applying each on its own `p` leaves the book with two spellings.
+The spelling pass (`decide/spelling.go` over the pure `internal/spelling`;
+rule `one_spelling@v1`, decide `step_version` 4) runs after `should_apply`
+and **before** conflicts are ranked, in the dry run and `--yes` alike. It
+works only from the findings and the transcripts — no name list, no name
+extraction, no word-type classification, no ebook, no web search.
+
+- **Core.** A finding's core is its differing words: both sides lower-cased
+  into word tokens (Unicode letters and digits, `’`→`'`, a possessive `'s`
+  dropped), the common leading
+  and trailing tokens removed (decide's `diffWindow`). A finding has a core
+  only when each side is 1–2 tokens, they differ, and they sound alike
+  (`phonetic.SoundAlike`, 0.67); anything else is ignored by the pass.
+- **Groups.** The book (`filepath.Dir(file_path)`; files in a sub-directory
+  of it are another book and excluded) is modelled once per run from its live
+  findings — `proposed`, `accepted`, `applied`, not superseded, not
+  duplicates (`db.SpellingFindings`). A book over a read cap (50,000
+  findings, 5,000 pilot rows, 200,000 chunks; `db.ErrSpellingCapExceeded`)
+  is **skipped**: logged, counted in the report's `spelling_skipped_books`,
+  its findings decided as if the pass did not exist; the run goes on.
+  Cores are keyed by the unbounded Double Metaphone primary code of their
+  letters (`spelling.MetaphoneKeyer`, behind a `Keyer` interface), and each
+  finding unions its two keys (union-find), so a group is every spelling
+  connected through a finding. A core with no code gets a key of its own.
+- **Contradiction.** A group is contradictory when its findings target two
+  or more distinct spellings, or one finding goes A → B and another B → A.
+  Findings **this run** rejects (on `p` or at rung 0) are left out, so a junk
+  A → C at p = 0.02 does not hold a good A → B; the book's findings outside
+  the run count as stored. "This run" spans every page of a `--yes` run (the
+  rejected set accumulates page by page). **Order asymmetry:** `--yes`
+  decides `workPage` (500) findings at a time in finding-id order and writes
+  each page before the next, so a junk A → C that is rejected only on a
+  *later* page cannot un-hold an A → B already held on an earlier page (a
+  recipe's holds are final). A paged `--yes` run can therefore hold more than
+  the dry run, which decides its whole sample at once — never apply more. On
+  a book whose work fits one page the two agree exactly. Not made
+  order-independent because that would mean evaluating every page of a book
+  before writing any, which the paged, resumable `--yes` loop does not do;
+  the extra holds are revisited under the next recipe.
+- **Strong spelling** (exactly one, else none):
+  1. `applied` — the one target of the group's **applied** findings (applied
+     findings that disagree: no strong spelling, and the pilots are not
+     consulted);
+  2. else `pilots` — the spelling that at least two pilot models'
+     transcripts of the book (`pilot_transcripts`, scope `full`, the newest
+     row per track and model) each contain at least `spelling_min_pilot` = 3
+     times, while **no other spelling of the group occurs in any pilot**.
+  Production counts (`COALESCE(source_text, text)` of the book's chunks) are
+  recorded, never decided on: the production text is what is being
+  corrected. Unigram and bigram counts are taken only for the group
+  spellings, row by row, keeping no text (every read is LIMITed).
+- **Transform.** Only an `apply`, or a hold whose reason is in
+  `AudioApplyHoldReasons` (`uncertain`, `no_evidence`, `evidence_excluded`),
+  on a rung-0 pass with a core in a group, is looked at. Rejects, duplicates,
+  rung-0 failures and every other hold (`jev_unavailable`,
+  `issue_type_capped`, `capitalised_replacement`, `overlap_pending`) are
+  untouched and get no detail.
+
+  | Group | Finding targets | Outcome |
+  |---|---|---|
+  | strong spelling | the strong spelling | unchanged — except a `no_evidence` hold when an **applied finding of the same pair** (this original core → the strong spelling) established it: **apply** `spelling_established` |
+  | strong spelling | another spelling | **hold** `spelling_off_established` |
+  | no strong, contradictory | — | **hold** `spelling_conflict` |
+  | no strong, consistent | — | unchanged |
+
+  Promotion needs the exact pair, not just the group: a shared Metaphone key
+  is not enough (`right`, `write`, `rot`, `root` all key `RT`, so an applied
+  `right → write` never promotes `rot → write`). A hold from the pass keeps the finding's `p`, is not retryable, and names
+  the reason it replaced (`detail.prior_reason`). A promotion keeps evidence
+  `none` (the column's CHECK) and records the applied spelling in `detail`.
+  **Pilot agreement never promotes** — the pilots agree on phonetic
+  misspellings of invented names (Fifth Season "shafa" for Schaffa, "nasun"
+  for Nassun; Catch-22 "peckham" 119/121 times for Peckem), so it may only
+  settle a contradiction in favour of the agreed spelling (proposals toward
+  it are not held for conflict) and hold proposals away from it.
+- **Conflicts run after.** `resolveConflicts` sees the pass's outcomes: a
+  winner the pass held holds its losers `overlap_pending`; a loser of an
+  applying winner is still rejected `overlap_dup`. Duplicates follow their
+  representative as before.
+- **Detail** (`finding_events.detail`, migration 19; one object on every
+  outcome the pass looked at): `{"rung":"spelling","rule":"one_spelling@v1",
+  "group":[…],"spellings_total":n,"targets":[…],"original":"ilmus",
+  "target":"ilmis","contradictory":true,"strong":"ilmas",
+  "strong_source":"applied|pilots|","counts":{"ilmas":{"applied":1,
+  "pilots":{"<model_id>":4},"production":0},…},"action":
+  "kept|promoted|held_off_established|held_conflict","prior_reason":"…"}`.
+  `group` lists at most 12 spellings (the finding's two, the strong one and
+  the targets first); `counts` covers those listed; `targets` and
+  `contradictory` are the run's view (its rejects left out). `action`
+  records **only the spelling pass's step**: conflict ranking runs after it
+  and may still make the outcome an `overlap_dup` reject or an
+  `overlap_pending` hold — the event's `outcome`/`reason` are final, `action`
+  is not.
+- **Measured** (10 pilot books, 2026-11-05, this grouping): 235
+  contradictory groups holding 2,543 of the 4,431 proposals (proper nouns
+  only: 94 groups, 1,165 proposals). An applied spelling: 136 proposals
+  toward. Pilot strong spellings by N (all issue types; groups / proposals
+  toward / away):
+
+  | N | groups | toward | away |
+  |---|---|---|---|
+  | 1 | 460 | 514 | 305 |
+  | 2 | 280 | 383 | 196 |
+  | 3 | 222 | 340 | 172 |
+  | 5 | 152 | 289 | 126 |
+  | 10 | 101 | 246 | 93 |
+
+  N = 3 (`spelling_min_pilot`) is chosen: N = 1 and 2 nearly double the groups
+  on one or two chance occurrences, while past 3 the groups fall off faster
+  than the proposals they settle.
+- **What is wired, what is provided.** Wired: the pass in `DryRun` and
+  `Apply`. **Not** wired: the audio-vote rung (`--audio-vote`) re-runs rung 0
+  via `prepareWith` and never calls the pass; it is covered indirectly —
+  `asr_agree` lifts only a hold whose reason is in `AudioApplyHoldReasons`,
+  and the `spelling_*` reasons are not, so a finding the pass held is vetoed
+  (`asr_agree_vetoed`). Running the pass inside the audio rung itself is a
+  follow-up once the parallel audio-vote change lands. Provided, not wired:
+  `decide.EstablishedSpellings` / `spelling.Book.EstablishedSpellings` (a
+  book's strong spellings) for a future context consumer; the
+  `should_apply` state is unchanged (that would be `should_apply@v3`, and the
+  state never states evidence).
+- **Known limitation.** `db.DecideWork` treats a recipe's holds as final (it
+  retries only `jev_unavailable` and settled `overlap_pending`), so a
+  `spelling_*` hold is revisited only under the next decide recipe — not when
+  a later apply settles the book's spelling. The book model is a snapshot at
+  its first use in a run: decisions written by earlier pages of the same run
+  are not seen.
+- **No migration.** Reasons are text; `detail` exists since migration 19.
+
 #### Audio-vote rung (`earmark decide --audio-vote`)
 
 A second, separately registered decide recipe that decides **held** findings
@@ -6602,7 +6738,26 @@ one scope flag is required; together they narrow (AND). Dry-run unless
 5. **Undo if needed.** `earmark decide revert --recipe <id>` to preview, then
    `--yes`; narrow with `--finding` or `--since`. Re-running the same recipe
    after a revert re-decides the same findings, so change the recipe
-   (thresholds, prompt) before deciding again.
+   (thresholds, prompt) before deciding again. The spelling pass's holds and
+   `spelling_established` applies are that recipe's decisions
+   (`jev:<recipe_id>`) and revert with it, unchanged.
+
+**Checking the spelling pass** ("One spelling per book"), per book, before
+any `--yes`:
+
+1. `earmark decide --book "<dir>" --json` (no `--yes`) and read
+   `reasons.spelling_conflict`, `reasons.spelling_off_established` and
+   `reasons.spelling_established`. This is still not free: it registers the
+   decide recipe row and makes the (paid, cached) model calls, which writes
+   `fn_calls`. `earmark decide --rung0-only` writes nothing, but asks no model
+   and so runs no spelling pass.
+2. After a `--yes` run, count the pass's decisions with a read-only query
+   (the audit registry filters finding_events by `recipe_id` and `kind`, not
+   by reason): `SELECT reason, count(*) FROM finding_events WHERE kind =
+   'decision' AND recipe_id = '<id>' AND detail->>'rung' = 'spelling' GROUP
+   BY reason`; page through single events with `earmark audit finding_events
+   -f recipe_id=<id> -f kind=decision --json`. The run's report also counts
+   them per reason.
 
 **Runbook: the audio-vote rung**, once the pilot votes are in
 (`earmark asr-pilot vote --yes`, §1.11):
