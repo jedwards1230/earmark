@@ -203,6 +203,28 @@
                   }
                 }
               }
+            },
+            "audio_vote": {
+              "description": "The decide step's audio-vote rung (CONTRACT §2.19 \"Audio-vote rung\"): the vote rule counted and the second-ASR models that must agree.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rule", "models"],
+              "properties": {
+                "rule": { "type": "string", "minLength": 1 },
+                "models": {
+                  "type": "array",
+                  "minItems": 2,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["model_id", "revision"],
+                    "properties": {
+                      "model_id": { "type": "string", "minLength": 1 },
+                      "revision": { "type": "string", "minLength": 1 }
+                    }
+                  }
+                }
+              }
             }
           }
         },

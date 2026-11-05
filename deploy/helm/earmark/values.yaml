@@ -191,6 +191,16 @@ config:
   #     steps:
   #       propose: {expected_model: anthropic/claude-haiku-4-5-20251001, revision: "20251001"}
   #       embed:   {expected_model: nomic-embed-text, revision: "sha256:0a109f422b47"}
+  # audio_vote configures `earmark decide --audio-vote` (CONTRACT §2.19
+  # "Audio-vote rung"): the vote rule it counts and the second-ASR pilot models
+  # (pilot_transcripts.model_id + model_revision) that must all agree, at least
+  # two. Without it the rung refuses to run unless given --audio-rule and
+  # --audio-model. The pilots this deployment runs:
+  #     audio_vote:
+  #       rule: asr_vote@v2
+  #       models:
+  #         - {model_id: ibm-granite/granite-speech-4.1-2b, revision: "823ca793aa49925d4eb2e758709b7f2c98513e8e"}
+  #         - {model_id: nvidia/canary-qwen-2.5b, revision: "b1469e1bba1cfe140205529c79c434ca47180960"}
 
   # ── Eval-layer chat endpoint (CONTRACT §2.15) ──────────────────────────────
   # Standalone EVAL_CHAT_* vars for internal/eval's read-only LLM judge, for when
