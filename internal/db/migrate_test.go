@@ -722,7 +722,7 @@ func TestFindingEventsDetailMigration(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"ALTER TABLE finding_events ADD COLUMN IF NOT EXISTS detail JSONB;",
+		"ALTER TABLE finding_events ADD COLUMN detail JSONB;",
 		"ALTER TABLE finding_events ADD CONSTRAINT finding_events_detail_object CHECK (detail IS NULL OR jsonb_typeof(detail) = 'object') NOT VALID;",
 	} {
 		if !strings.Contains(up, want) {
@@ -732,7 +732,7 @@ func TestFindingEventsDetailMigration(t *testing.T) {
 	if n := strings.Count(up, "ALTER TABLE"); n != 2 {
 		t.Errorf("Up: want exactly two ALTERs, got %d: %q", n, up)
 	}
-	for _, banned := range []string{"UPDATE ", "DELETE ", "TRIGGER", "DEFAULT", "VALIDATE CONSTRAINT", "NOT NULL"} {
+	for _, banned := range []string{"UPDATE ", "DELETE ", "TRIGGER", "DEFAULT", "VALIDATE CONSTRAINT", "NOT NULL", "IF NOT EXISTS"} {
 		if strings.Contains(up, banned) {
 			t.Errorf("Up must be purely additive and rewrite nothing; found %q", banned)
 		}

@@ -17,11 +17,14 @@
 -- triggers (BEFORE UPDATE OR DELETE) and do not fire for DDL. The CHECK is
 -- added NOT VALID: it holds for every row written from now on, and the rows
 -- already there are all NULL, so a validating scan of the table under the
--- exclusive lock would prove nothing.
+-- exclusive lock would prove nothing. Neither statement is guarded with IF NOT
+-- EXISTS (PostgreSQL has none for ADD CONSTRAINT): goose applies the version
+-- once, in one transaction, so both land or neither does. Down drops both with
+-- IF EXISTS.
 
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
-ALTER TABLE finding_events ADD COLUMN IF NOT EXISTS detail JSONB;
+ALTER TABLE finding_events ADD COLUMN detail JSONB;
 ALTER TABLE finding_events ADD CONSTRAINT finding_events_detail_object
     CHECK (detail IS NULL OR jsonb_typeof(detail) = 'object') NOT VALID;
 
