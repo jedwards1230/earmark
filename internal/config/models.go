@@ -45,6 +45,10 @@ import (
 //	    params:
 //	      usd_per_mtok_in: 0.042     # cost estimate when the gateway reports none
 //	      apply_p: 0.85              # decide policy (CONTRACT §2.19); optional
+//	audio_vote:                      # optional: `earmark decide --audio-vote` (CONTRACT §2.19)
+//	  rule: asr_vote@v2              # the vote rule (finding_asr_votes.detail.rule) it counts
+//	  models:                        # every pilot model that must agree (≥ 2)
+//	    - {model_id: <hf model id>, revision: <hf commit>}
 //
 // Unset → no pins: recipes are still stamped, with the requested model as the
 // expected one and no revision. A file that is unreadable, malformed, names an
@@ -119,6 +123,82 @@ func toFloat(v any) (float64, bool) {
 // ModelRegistry is the parsed MODELS_FILE.
 type ModelRegistry struct {
 	Steps map[string]ModelPin `yaml:"steps"`
+	// AudioVote configures the decide step's audio-vote rung (CONTRACT §2.19
+	// "Audio-vote rung"); nil = not configured.
+	AudioVote *AudioVoteConfig `yaml:"audio_vote"`
+}
+
+// AudioVoteConfig is the audio-vote rung's configuration: the vote rule it
+// counts (finding_asr_votes.detail->>'rule') and the second-ASR models whose
+// current votes must agree. Both are part of the rung's decide recipe, so a
+// change of either is a new recipe.
+type AudioVoteConfig struct {
+	Rule   string           `yaml:"rule"`
+	Models []AudioVoteModel `yaml:"models"`
+}
+
+// AudioVoteModel is one pilot model the audio-vote rung counts: its model id
+// (pilot_transcripts.model_id) and the revision it is pinned to
+// (pilot_transcripts.model_revision). A vote by another revision is ignored.
+type AudioVoteModel struct {
+	ModelID  string `yaml:"model_id"`
+	Revision string `yaml:"revision"`
+}
+
+// String is the model as the --audio-model flag spells it: <model_id>@<revision>.
+func (m AudioVoteModel) String() string { return m.ModelID + "@" + m.Revision }
+
+// MinAudioVoteModels is how many models the audio-vote rung needs: agreement
+// of one model with itself is no agreement.
+const MinAudioVoteModels = 2
+
+// Validate requires a rule and at least MinAudioVoteModels models, each with
+// a model id and a revision free of whitespace (and of "@" in the id, the
+// flag's separator), no model id listed twice: two revisions of one model are
+// one opinion, not two.
+func (a AudioVoteConfig) Validate() error {
+	if r := strings.TrimSpace(a.Rule); r == "" || r != a.Rule || strings.ContainsAny(r, " \t\r\n") {
+		return fmt.Errorf("audio_vote.rule %q must be a non-empty token without whitespace", a.Rule)
+	}
+	if len(a.Models) < MinAudioVoteModels {
+		return fmt.Errorf("audio_vote.models lists %d model(s); need at least %d", len(a.Models), MinAudioVoteModels)
+	}
+	seen := map[string]bool{}
+	for i, m := range a.Models {
+		switch {
+		case !audioToken(m.ModelID) || strings.Contains(m.ModelID, "@"):
+			return fmt.Errorf("audio_vote.models[%d].model_id %q must be a non-empty id without whitespace or '@'", i, m.ModelID)
+		case !audioToken(m.Revision):
+			return fmt.Errorf("audio_vote.models[%d].revision %q must be a non-empty revision without whitespace", i, m.Revision)
+		case seen[m.ModelID]:
+			return fmt.Errorf("audio_vote.models lists %q twice", m.ModelID)
+		}
+		seen[m.ModelID] = true
+	}
+	return nil
+}
+
+func audioToken(s string) bool {
+	return s != "" && strings.TrimSpace(s) == s && !strings.ContainsAny(s, " \t\r\n")
+}
+
+// ParseAudioModelFlag reads one --audio-model value, <model_id>@<revision>
+// (split at the last "@").
+func ParseAudioModelFlag(s string) (AudioVoteModel, error) {
+	i := strings.LastIndex(s, "@")
+	if i <= 0 || i == len(s)-1 {
+		return AudioVoteModel{}, fmt.Errorf("--audio-model %q must be <model_id>@<revision>", s)
+	}
+	return AudioVoteModel{ModelID: s[:i], Revision: s[i+1:]}, nil
+}
+
+// AudioVote is the audio-vote rung's configuration (nil when MODELS_FILE has
+// no audio_vote block).
+func (c *Config) AudioVote() *AudioVoteConfig {
+	if c == nil || c.Models == nil {
+		return nil
+	}
+	return c.Models.AudioVote
 }
 
 // stepRole maps the steps backed by an AI_ROLES endpoint to that role.
@@ -155,6 +235,11 @@ func ParseModelRegistry(r io.Reader) (*ModelRegistry, error) {
 	for step, pin := range reg.Steps {
 		if err := validatePinParams(step, pin.Params); err != nil {
 			return nil, fmt.Errorf("model registry: steps.%s.params%w", step, err)
+		}
+	}
+	if reg.AudioVote != nil {
+		if err := reg.AudioVote.Validate(); err != nil {
+			return nil, fmt.Errorf("model registry: %w", err)
 		}
 	}
 	return &reg, nil

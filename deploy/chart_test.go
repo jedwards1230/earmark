@@ -7,13 +7,17 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	"github.com/jedwards1230/earmark/internal/config"
 )
 
 const chartDir = "helm/earmark"
@@ -481,6 +485,47 @@ func TestModelsFileWiredToEveryPod(t *testing.T) {
 		vol := hasNamed(t, dig(t, spec, "volumes"), "models")
 		require.NotNil(t, vol, "%s has no models volume", k)
 		assert.Equal(t, "earmark-models", dig(t, vol, "configMap", "name"), k)
+	}
+}
+
+// TestModelsAudioVoteRendered: config.models.audio_vote is rendered into
+// models.yaml as the registry decodes it (CONTRACT §2.18, §2.19 "Audio-vote
+// rung"), and the schema refuses a half-configured block.
+func TestModelsAudioVoteRendered(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	values := filepath.Join(t.TempDir(), "values.yaml")
+	require.NoError(t, os.WriteFile(values, []byte(`config:
+  models:
+    audio_vote:
+      rule: asr_vote@v2
+      models:
+        - {model_id: org-a/asr-a, revision: "1111111111111111111111111111111111111111"}
+        - {model_id: org-b/asr-b, revision: "2222222222222222222222222222222222222222"}
+`), 0o600))
+	out, err := exec.Command("helm", "template", "earmark", chartDir, "-f", values, "--show-only", "templates/configmap-models.yaml").CombinedOutput()
+	require.NoError(t, err, "%s", out)
+	var cm map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &cm))
+	reg, err := config.ParseModelRegistry(strings.NewReader(dig(t, cm, "data", "models.yaml").(string)))
+	require.NoError(t, err)
+	require.NotNil(t, reg.AudioVote)
+	assert.Equal(t, "asr_vote@v2", reg.AudioVote.Rule)
+	assert.Equal(t, []config.AudioVoteModel{
+		{ModelID: "org-a/asr-a", Revision: "1111111111111111111111111111111111111111"},
+		{ModelID: "org-b/asr-b", Revision: "2222222222222222222222222222222222222222"},
+	}, reg.AudioVote.Models)
+
+	for _, set := range []string{
+		"config.models.audio_vote.rule=asr_vote@v2",
+		"config.models.audio_vote.models[0].model_id=a",
+		"config.models.audio_vote.bogus=x",
+	} {
+		t.Run(set, func(t *testing.T) {
+			out, err := exec.Command("helm", "template", "earmark", chartDir, "--set", set).CombinedOutput()
+			require.Error(t, err, "expected schema rejection, got:\n%s", out)
+		})
 	}
 }
 

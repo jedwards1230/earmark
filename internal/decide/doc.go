@@ -37,4 +37,9 @@
 // lock held and writing the decisions in short transactions through
 // db.ApplyDecisions and db.ApplyRecheckDecisions. db.RevertDecisions undoes
 // them.
+//
+// AudioVote (`earmark decide --audio-vote`) is a second, separately
+// registered decide recipe: it re-runs rung 0 on held findings and decides
+// them from the second-ASR pilot votes (AudioVoteRung.Evaluate), asking no
+// model and writing only applies and rejects.
 package decide

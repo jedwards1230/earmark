@@ -26,8 +26,7 @@ var workPage = 500
 type WriteStore interface {
 	RunStore
 	DecideWork(ctx context.Context, s db.DecideWorkScope) ([]db.DecideFinding, error)
-	ApplyDecisions(ctx context.Context, recipeID string, evs []db.DecisionEvent) (db.ApplyResult, error)
-	ApplyRecheckDecisions(ctx context.Context, recipeID string, evs []db.DecisionEvent) (db.ApplyResult, error)
+	DecisionWriter
 }
 
 // WorkCounter is the optional WriteStore extension that sizes a --yes run up
@@ -265,7 +264,8 @@ func eventOf(recipeID string, o Outcome) (db.DecisionEvent, bool) {
 	}
 	e := db.DecisionEvent{
 		FindingID: o.FindingID, RecipeID: recipeID, Outcome: o.Decision, Reason: o.Reason,
-		P: o.P, ChunkTextSHA256: o.ChunkHash, RelatedFindingID: o.Related,
+		P: o.P, ChunkTextSHA256: o.ChunkHash, RelatedFindingID: o.Related, Detail: o.Detail,
+		RequiresLatestDecision: o.RequiresLatestDecision,
 	}
 	if o.Rung0.Pass && o.Decision != DecisionDuplicate {
 		e.Evidence = o.Evidence
@@ -282,9 +282,15 @@ func eventOf(recipeID string, o Outcome) (db.DecisionEvent, bool) {
 	return e, true
 }
 
+// DecisionWriter is the two decision writes (*db.DB implements it).
+type DecisionWriter interface {
+	ApplyDecisions(ctx context.Context, recipeID string, evs []db.DecisionEvent) (db.ApplyResult, error)
+	ApplyRecheckDecisions(ctx context.Context, recipeID string, evs []db.DecisionEvent) (db.ApplyResult, error)
+}
+
 // writeItems writes items' decisions, Batch transcripts per transaction. The
 // phase is recorded before each transaction, never inside one.
-func writeItems(ctx context.Context, store WriteStore, recipeID string, items []*item, batch, maxAccepts int,
+func writeItems(ctx context.Context, store DecisionWriter, recipeID string, items []*item, batch, maxAccepts int,
 	ws *WriteStats, pr pageRecorder) error {
 	byTranscript := map[string][]*item{}
 	var tids []string

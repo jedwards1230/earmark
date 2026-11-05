@@ -211,6 +211,7 @@ func (c *Config) Clone() *Config {
 	n.Models = &ModelRegistry{Steps: map[string]ModelPin{}}
 	if c.Models != nil {
 		maps.Copy(n.Models.Steps, c.Models.Steps)
+		n.Models.AudioVote = c.Models.AudioVote // read-only after LoadConfig
 	}
 	n.stepSources = maps.Clone(c.stepSources)
 	n.policySources = maps.Clone(c.policySources)

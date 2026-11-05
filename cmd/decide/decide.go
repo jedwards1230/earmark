@@ -31,17 +31,20 @@ import (
 )
 
 type options struct {
-	sample      int
-	sampleSet   bool // --sample given explicitly
-	seed        string
-	book        string
-	issueType   string
-	concurrency int
-	json        bool
-	calibrate   bool
-	human       []string
-	rung0Only   bool
-	dump        string // --dump path ("" = none)
+	sample    int
+	sampleSet bool // --sample given explicitly
+	// concurrencySet: --concurrency given explicitly (refused with
+	// --audio-vote, which makes no call).
+	concurrencySet bool
+	seed           string
+	book           string
+	issueType      string
+	concurrency    int
+	json           bool
+	calibrate      bool
+	human          []string
+	rung0Only      bool
+	dump           string // --dump path ("" = none)
 	// --yes run
 	yes        bool
 	limit      int
@@ -55,6 +58,12 @@ type options struct {
 	// --policy key=value: the decide policy for this run only (CONTRACT
 	// §2.19 "Decide policy").
 	policyFlags []string
+	// --audio-vote: the audio-vote rung (CONTRACT §2.19 "Audio-vote rung"),
+	// configured by MODELS_FILE audio_vote or, all or nothing, by
+	// --audio-rule with --audio-model <model_id>@<revision> (repeatable).
+	audioVote   bool
+	audioModels []string
+	audioRule   string
 	// model is the resolved decision model (not a flag; zero = default).
 	model decidepkg.Model
 	// policy is the resolved decide policy (not a flag; zero = default).
@@ -154,6 +163,27 @@ all asked and ranked by the model's p; a loser is rejected overlap_dup when
 the winner applies and held overlap_pending while the winner is held. A dry run lists each group and each ranked conflict. Each accept re-embeds its whole transcript on the next rebuild:
 bound a run with --limit and --max-accepts. Undo with 'earmark decide revert'.
 
+--audio-vote runs the audio-vote rung instead (CONTRACT §2.19 "Audio-vote
+rung"): it asks no model. It takes every HELD finding (proposed, latest
+decision a hold, by any decide recipe) with a current vote from the
+configured second-ASR models (MODELS_FILE audio_vote, or --audio-rule with
+two or more --audio-model <model_id>@<revision>, which then replace the file
+block), re-runs rung 0 exactly as decide does — a rung-0 failure rejects —
+and then: every model heard the original → reject asr_heard_original; every
+model heard the replacement → apply asr_agree, unless the finding's type is
+dropped_word/number_artifact, its hold carries no model p or a reason other
+than uncertain/no_evidence/evidence_excluded, or it overlaps a different fix
+not recorded as having lost to it; anything else holds (asr_split,
+asr_vote_missing, asr_no_agreement, asr_agree_vetoed, asr_agree_conflict). A
+dry run writes nothing at all — not even the recipe row — and previews what
+--yes would write under the same --limit / --shard / --max-accepts; --sample
+and --seed pick the listed findings. --yes writes only the applies and
+rejects, as jev:<audio recipe id>; holds are never written, so the
+should_apply recipe's work list is untouched. Undo with 'earmark decide
+revert --recipe <audio recipe id>'. Not combinable with --calibrate,
+--rung0-only, --dump, --human, --endpoint, --model, --policy or
+--concurrency. --sample lists N findings (default 20; 0 lists none).
+
 Examples:
   earmark decide --sample 200                    # preview 200 random findings
   earmark decide --sample 200 --seed q4 --json   # the same 200, as JSON
@@ -166,7 +196,9 @@ Examples:
   earmark decide revert --recipe <id>            # preview the undo
   earmark decide revert --recipe <id> --yes
   earmark decide --sample 200 --seed q4 --endpoint litellm-s1 --model clef:27b
-  earmark decide --sample 200 --seed q4 --policy apply_p=0.9 --dump /tmp/d.jsonl`,
+  earmark decide --sample 200 --seed q4 --policy apply_p=0.9 --dump /tmp/d.jsonl
+  earmark decide --audio-vote --book "Children of Dune"   # preview the audio-vote rung
+  earmark decide --audio-vote --yes --limit 2000 --max-accepts 500`,
 	Run: runDecide,
 }
 
@@ -191,6 +223,9 @@ func init() {
 	f.StringVar(&opts.overrideEndpoint, "endpoint", "", "this run only: the AI_ENDPOINTS id (a systemone endpoint) to ask (default: the decide step's effective endpoint)")
 	f.StringVar(&opts.overrideModel, "model", "", "this run only: the pinned System One model id to ask (default: the decide step's effective model)")
 	f.StringArrayVar(&opts.policyFlags, "policy", nil, "this run only: a decide policy key=value (apply_p, reject_p, apply_evidence, reject_requires_lowercase, reject_floor) over the model's policy; repeatable")
+	f.BoolVar(&opts.audioVote, "audio-vote", false, "decide held findings from second-ASR votes (no model call; CONTRACT §2.19 \"Audio-vote rung\")")
+	f.StringArrayVar(&opts.audioModels, "audio-model", nil, "with --audio-vote: a pilot model <model_id>@<revision> that must agree; repeatable, at least 2; with --audio-rule, replaces MODELS_FILE audio_vote")
+	f.StringVar(&opts.audioRule, "audio-rule", "", "with --audio-vote: the vote rule counted (finding_asr_votes.detail.rule); with --audio-model, replaces MODELS_FILE audio_vote")
 	DecideCmd.AddCommand(RevertCmd)
 }
 
@@ -208,8 +243,10 @@ func parseShard(s string) (shard, shards int, err error) {
 
 func validate(o options) error {
 	switch {
-	case o.sample < 1 || o.sample > db.MaxDecideSample:
+	case !o.audioVote && (o.sample < 1 || o.sample > db.MaxDecideSample):
 		return fmt.Errorf("--sample must be 1..%d", db.MaxDecideSample)
+	case o.audioVote && (o.sample < 0 || o.sample > db.MaxDecideSample):
+		return fmt.Errorf("with --audio-vote, --sample (findings listed) must be 0..%d", db.MaxDecideSample)
 	case o.seed == "":
 		return errors.New("--seed must not be empty")
 	case o.concurrency < 1 || o.concurrency > 64:
@@ -218,7 +255,14 @@ func validate(o options) error {
 		return fmt.Errorf("--issue-type %q is not an issue type", o.issueType)
 	case o.yes && (o.sampleSet || o.calibrate):
 		return errors.New("--yes decides the whole scope: use --limit instead of --sample, and --calibrate is dry-run only")
-	case !o.yes && (o.limit != 0 || o.shard != "" || o.maxAccepts != 0):
+	case !o.audioVote && (len(o.audioModels) > 0 || o.audioRule != ""):
+		return errors.New("--audio-model and --audio-rule need --audio-vote")
+	case o.audioVote && (o.calibrate || o.rung0Only || o.dump != "" || len(o.human) > 0 ||
+		o.overrideEndpoint != "" || o.overrideModel != "" || len(o.policyFlags) > 0 || o.concurrencySet):
+		return errors.New("--audio-vote asks no model: it cannot be combined with --calibrate, --rung0-only, --dump, --human, --endpoint, --model, --policy or --concurrency")
+	case o.audioVote && (len(o.audioModels) > 0) != (o.audioRule != ""):
+		return errors.New("--audio-model and --audio-rule replace MODELS_FILE audio_vote together: give both, or neither")
+	case !o.yes && !o.audioVote && (o.limit != 0 || o.shard != "" || o.maxAccepts != 0):
 		return errors.New("--limit, --shard and --max-accepts need --yes")
 	case o.limit < 0 || o.maxAccepts < 0:
 		return errors.New("--limit and --max-accepts must be >= 0")
@@ -244,6 +288,7 @@ func knownIssueType(t string) bool {
 
 func runDecide(cmd *cobra.Command, _ []string) {
 	opts.sampleSet = cmd.Flags().Changed("sample")
+	opts.concurrencySet = cmd.Flags().Changed("concurrency")
 	if err := validate(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
@@ -252,12 +297,31 @@ func runDecide(cmd *cobra.Command, _ []string) {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	var audio config.AudioVoteConfig
+	if opts.audioVote {
+		// Resolved before connecting: a missing configuration fails before
+		// the database (and its migrations) is touched.
+		if audio, err = audioConfig(cfg, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(2)
+		}
+	}
 	database, err := db.New(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer database.Close()
+	if opts.audioVote {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err = runAudio(ctx, os.Stdout, database, audio, opts)
+		stop()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg, opts, err = resolve(context.Background(), database, cfg, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -378,6 +442,66 @@ func run(ctx context.Context, out io.Writer, store decidepkg.WriteStore, asker d
 	return rep.Print(out, o.json)
 }
 
+// audioConfig is the audio-vote rung's configuration: --audio-rule with
+// --audio-model when given (all or nothing: they replace the file block),
+// else MODELS_FILE audio_vote. Validated; absent is an error.
+func audioConfig(cfg *config.Config, o options) (config.AudioVoteConfig, error) {
+	var c config.AudioVoteConfig
+	switch {
+	case len(o.audioModels) > 0 || o.audioRule != "":
+		c.Rule = o.audioRule
+		for _, s := range o.audioModels {
+			m, err := config.ParseAudioModelFlag(s)
+			if err != nil {
+				return c, err
+			}
+			c.Models = append(c.Models, m)
+		}
+	case cfg.AudioVote() != nil:
+		c = *cfg.AudioVote()
+	default:
+		return c, errors.New("decide --audio-vote is not configured: set audio_vote (rule + models) in MODELS_FILE, " +
+			"or pass --audio-rule with --audio-model <model_id>@<revision> for each model (CONTRACT §2.19 \"Audio-vote rung\")")
+	}
+	if err := c.Validate(); err != nil {
+		return c, fmt.Errorf("decide --audio-vote: %w", err)
+	}
+	return c, nil
+}
+
+// runAudio is the --audio-vote core: the rung over the scope, recorded in
+// step_runs (CONTRACT §1.10) when store is the real database.
+func runAudio(ctx context.Context, out io.Writer, store decidepkg.AudioVoteStore, cfg config.AudioVoteConfig, o options) (err error) {
+	if err := validate(o); err != nil {
+		return err
+	}
+	if !o.audioVote {
+		return errors.New("decide: runAudio needs --audio-vote")
+	}
+	mode := db.StepRunDryRun
+	if o.yes {
+		mode = db.StepRunWrite
+	}
+	rec := runs.StartIfStore(ctx, store, runs.Spec{
+		Step: runs.StepDecide, Mode: mode, Model: decidepkg.AudioVoteModelAlias, Args: argsSummary(o),
+	})
+	defer func() { rec.Finish(err) }()
+	shard, shards, _ := parseShard(o.shard)
+	ao := decidepkg.AudioVoteOptions{
+		Config: cfg, Book: o.book, IssueType: o.issueType, Shard: shard, Shards: shards,
+		Limit: o.limit, Batch: o.batch, MaxAccepts: o.maxAccepts, Yes: o.yes, Seed: o.seed, Progress: rec,
+	}
+	if o.sampleSet {
+		n := o.sample
+		ao.Sample = &n
+	}
+	rep, err := decidepkg.AudioVote(ctx, store, ao)
+	if err != nil {
+		return err
+	}
+	return rep.Print(out, o.json)
+}
+
 // modelOrDefault names the model a run asks.
 func modelOrDefault(m decidepkg.Model) string {
 	if m.Alias == "" {
@@ -395,8 +519,13 @@ func argsSummary(o options) string {
 		}
 		fmt.Fprintf(&b, format, a...)
 	}
-	if o.yes {
-		add("--yes")
+	if o.audioVote {
+		add("--audio-vote")
+	}
+	if o.yes || o.audioVote {
+		if o.yes {
+			add("--yes")
+		}
 		if o.limit > 0 {
 			add("--limit %d", o.limit)
 		}

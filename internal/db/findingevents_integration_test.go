@@ -516,3 +516,47 @@ func TestIntegrationApplyDecisions(t *testing.T) {
 		t.Error("the accepted finding's chunk must be flagged")
 	}
 }
+
+// More conditional events (RequiresLatestDecision) than one LatestDecisions
+// page in a single write: the lookup is paged, every event is checked, and
+// only the one computed against a superseded hold is skipped.
+func TestIntegrationApplyDecisionsConditionalPaged(t *testing.T) {
+	ctx := context.Background()
+	dbURL, d := migratedTestDB(t)
+	conn := connect(t, dbURL)
+	n := MaxDecideWorkPage + 5
+	ids := seedFindingEvents(t, conn, n)
+	first, second := strings.Repeat("6a", 32), strings.Repeat("6b", 32)
+	registerTestRecipe(t, conn, first, 1)
+	registerTestRecipe(t, conn, second, 1)
+	holds := make([]DecisionEvent, n)
+	for i, id := range ids {
+		holds[i] = DecisionEvent{FindingID: id, RecipeID: first, Outcome: OutcomeHold, Reason: "uncertain"}
+	}
+	if res, err := d.ApplyDecisions(ctx, first, holds); err != nil || len(res.Held) != n {
+		t.Fatalf("seed holds: %d held, %v", len(res.Held), err)
+	}
+	latest := map[string]int64{}
+	for start := 0; start < n; start += MaxDecideWorkPage {
+		part, err := d.LatestDecisions(ctx, ids[start:min(start+MaxDecideWorkPage, n)])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range part {
+			latest[k] = v.ID
+		}
+	}
+	evs := make([]DecisionEvent, n)
+	for i, id := range ids {
+		evs[i] = DecisionEvent{FindingID: id, RecipeID: second, Outcome: OutcomeHold, Reason: "asr_split",
+			RequiresLatestDecision: latest[id]}
+	}
+	evs[n-1].RequiresLatestDecision++ // computed against a hold that is no longer the latest
+	res, err := d.ApplyDecisions(ctx, second, evs)
+	if err != nil {
+		t.Fatalf("a write of %d conditional events failed: %v", n, err)
+	}
+	if len(res.Held) != n-1 || len(res.Skipped) != 1 || res.Skipped[0] != ids[n-1] {
+		t.Errorf("held %d skipped %v; want %d held and only %s skipped", len(res.Held), res.Skipped, n-1, ids[n-1])
+	}
+}

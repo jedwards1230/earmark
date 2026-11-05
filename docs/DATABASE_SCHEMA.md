@@ -598,7 +598,8 @@ CREATE TABLE finding_events (
     revokes_event_id  BIGINT      REFERENCES finding_events (id),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     anchor_offset     INTEGER,                -- migration 13: the OLD offset on a reanchor_moved row
-    related_finding_id UUID                   -- migration 15: a duplicate's representative / an overlap_dup's winner (no FK)
+    related_finding_id UUID,                  -- migration 15: a duplicate's representative / an overlap_dup's winner (no FK)
+    detail            JSONB                   -- migration 19: a decision's audit record (the audio-vote rung's votes); object or NULL
 );
 -- indexes: (finding_id, id DESC), (recipe_id, created_at), (transcript_id, created_at),
 --          finding_events_related_idx: (related_finding_id) WHERE related_finding_id IS NOT NULL
