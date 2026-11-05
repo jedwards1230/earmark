@@ -60,7 +60,7 @@ func TestAudioVoteEvaluate(t *testing.T) {
 	pass := Verdict{Pass: true, Span: patch.Span{Start: 1, End: 3}}
 	both := func(a, b string) []db.ASRVote { return []db.ASRVote{vote(1, avA, avRevA, a), vote(2, avB, avRevB, b)} }
 	base := AudioVoteInput{FindingID: id, IssueType: IssueMisheardWord, ChunkHash: "h", Rung0: pass,
-		ConflictsLost: true, HoldReason: ReasonUncertain, HoldP: pf(0.5)}
+		Original: "steamed", Replacement: "screamed", ConflictsLost: true, HoldReason: ReasonUncertain, HoldP: pf(0.5)}
 	tests := []struct {
 		name             string
 		mut              func(*AudioVoteInput)
@@ -133,6 +133,18 @@ func TestAudioVoteEvaluate(t *testing.T) {
 		{"unresolved conflict stays held", func(in *AudioVoteInput) {
 			in.Votes, in.ConflictsLost = both(R, R), false
 		}, DecisionHold, ReasonASRAgreeConflict},
+		{"both original, sound-alike → hold", func(in *AudioVoteInput) {
+			in.Votes, in.Original, in.Replacement = both(O, O), "sheana", "sheeana"
+		}, DecisionHold, ReasonASRSoundAlike},
+		{"both original, proper noun → hold", func(in *AudioVoteInput) {
+			in.Votes, in.IssueType = both(O, O), IssueMisheardProperNoun
+		}, DecisionHold, ReasonASRRejectTypeHeld},
+		{"both replacement, sound-alike still applies", func(in *AudioVoteInput) {
+			in.Votes, in.Original, in.Replacement = both(R, R), "sheana", "sheeana"
+		}, DecisionApply, ReasonASRAgree},
+		{"rung-0 reject wins over sound-alike", func(in *AudioVoteInput) {
+			in.Votes, in.Original, in.Replacement, in.Rung0 = both(O, O), "sheana", "sheeana", Verdict{Reason: ReasonCosmeticOnly}
+		}, DecisionReject, ReasonCosmeticOnly},
 		{"conflict winner whose losers are pending applies", func(in *AudioVoteInput) {
 			in.Votes, in.Rung0.Conflicts = both(R, R), []string{"00000000-0000-0000-0000-0000000000f8"}
 		}, DecisionApply, ReasonASRAgree},
@@ -153,6 +165,110 @@ func TestAudioVoteEvaluate(t *testing.T) {
 				t.Errorf("identity %q %q", out.FindingID, out.ChunkHash)
 			}
 		})
+	}
+}
+
+// TestAudioVoteHeardOriginal is the heard_original decision on the live
+// dry run's rejects (2026-11-05): a fix that only re-spells a word sounding
+// the same is held, a sound-different one stays rejected, and every
+// misheard_proper_noun reject is held whatever its keys.
+func TestAudioVoteHeardOriginal(t *testing.T) {
+	O := asrpilot.VoteHeardOriginal
+	tests := []struct {
+		issue, original, replacement, reason string
+	}{
+		// Sound-alike: the audio cannot tell the spellings apart.
+		{IssueMisheardProperNoun, "sheana", "sheeana", ReasonASRSoundAlike},
+		{IssueMisheardProperNoun, "demaya", "damaya", ReasonASRSoundAlike},
+		{IssueMisheardWord, "syanite", "syenite", ReasonASRSoundAlike},
+		{IssueMisheardWord, "fulcrum origins", "fulcrum orogenes", ReasonASRSoundAlike},
+		{IssueMisheardProperNoun, "inan's", "innon's", ReasonASRSoundAlike},
+		{IssueMisheardWord, "dreidel's", "dreedle's", ReasonASRSoundAlike},
+		{IssueMisheardProperNoun, "corineus", "corinius", ReasonASRSoundAlike},
+		{IssueMisheardWord, "Sheana", "sheeana", ReasonASRSoundAlike},
+		// A near sound-alike name the keys miss: held as a proper noun only.
+		{IssueMisheardProperNoun, "mabella", "murbella", ReasonASRRejectTypeHeld},
+		{IssueMisheardWord, "mabella", "murbella", ReasonASRHeardOriginal},
+		// Sound-different: rejected.
+		{IssueMisheardWord, "mentat blur", "mental blur", ReasonASRHeardOriginal},
+		{IssueMisheardWord, "the clothes tell the story", "the clues tell the story", ReasonASRHeardOriginal},
+		{IssueMisheardWord, "steamed", "screamed", ReasonASRHeardOriginal},
+		{IssueMisheardWord, "in my hypnosis experiment", "in my hypothesis experiment", ReasonASRHeardOriginal},
+		{IssueMisheardWord, "kastrima", "Kestrel", ReasonASRHeardOriginal},
+		{IssueMisheardProperNoun, "kastrima", "Kestrel", ReasonASRRejectTypeHeld},
+		{IssueMisheardWord, "wired", "withered", ReasonASRHeardOriginal},
+		{IssueHomophone, "to facts", "two facts", ReasonASRHeardOriginal},
+		{IssueDroppedWord, "over black", "over its black", ReasonASRHeardOriginal},
+	}
+	r := avRung(t)
+	for _, tt := range tests {
+		t.Run(tt.issue+"/"+tt.original+"→"+tt.replacement, func(t *testing.T) {
+			out := r.Evaluate(AudioVoteInput{FindingID: "f", IssueType: tt.issue, Rung0: Verdict{Pass: true},
+				Original: tt.original, Replacement: tt.replacement, ConflictsLost: true,
+				HoldReason: ReasonUncertain, HoldP: pf(0.5),
+				Votes: []db.ASRVote{vote(1, avA, avRevA, O), vote(2, avB, avRevB, O)}})
+			want := DecisionHold
+			if tt.reason == ReasonASRHeardOriginal {
+				want = DecisionReject
+			}
+			if out.Decision != want || out.Reason != tt.reason {
+				t.Errorf("got %s %s, want %s %s", out.Decision, out.Reason, want, tt.reason)
+			}
+		})
+	}
+}
+
+// TestSoundAlikeCore is the sound-alike test on its own: the examples, and
+// the normalisation edges (hyphen and space, apostrophes, case, multi-word
+// cores, insertions).
+func TestSoundAlikeCore(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"sheana", "sheeana", true},
+		{"demaya", "damaya", true},
+		{"syanite", "syenite", true},
+		{"fulcrum origins", "fulcrum orogenes", true},
+		{"inan's", "innon's", true},
+		{"dreidel's", "dreedle's", true},
+		{"corineus", "corinius", true},
+		{"mabella", "murbella", false},
+		{"mentat blur", "mental blur", false},
+		{"the clothes tell the story", "the clues tell the story", false},
+		{"steamed", "screamed", false},
+		{"in my hypnosis experiment", "in my hypothesis experiment", false},
+		{"kastrima", "Kestrel", false},
+		{"wired", "withered", false},
+		{"to facts", "two facts", false},
+		{"over black", "over its black", false},
+		{"over its black", "over black", false},
+		// Hyphen, space and fusion.
+		{"comm-less", "commless", true},
+		{"comm less", "commless", true},
+		{"commless", "comm-less", true},
+		{"a part", "apart", true},
+		// Apostrophes and case.
+		{"Dorian's", "dorians", true},
+		{"SHEANA", "Sheeana", true},
+		{"Kastrima", "KESTREL", false},
+		// Multi-word cores: every word pair must match.
+		{"said sheana demaya now", "said sheeana damaya now", true},
+		{"said sheana blur now", "said sheeana blue now", false},
+		// One-letter keys are too short to call different words alike.
+		{"in the", "on the", false},
+		// The same words aloud.
+		{"the cat", "the cat", true},
+		{"", "", true},
+		{"", "cat", false},
+	}
+	for _, tt := range tests {
+		if got := SoundAlikeCore(tt.a, tt.b); got != tt.want {
+			t.Errorf("SoundAlikeCore(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+		if got := SoundAlikeCore(tt.b, tt.a); got != tt.want {
+			t.Errorf("SoundAlikeCore(%q, %q) = %v, want %v (not symmetric)", tt.b, tt.a, got, tt.want)
+		}
 	}
 }
 
@@ -195,6 +311,11 @@ func TestAudioVoteRecipe(t *testing.T) {
 	if rc.Step != recipe.StepDecide || rc.ModelAlias != AudioVoteModelAlias || rc.StepVersion != AudioVoteStepVersion ||
 		rc.PromptVersion != AudioVoteRungVersion || rc.Params["fn"] != AudioVoteName || rc.Params["rung0_version"] != Rung0Version {
 		t.Fatalf("recipe %+v", rc)
+	}
+	if !slices.Equal(rc.Params["reject_held_issue_types"].([]string), []string{IssueMisheardProperNoun}) ||
+		rc.Params["soundalike_min_key"] != SoundAlikeMinKey || rc.PromptVersion != "asr_vote_decide@v2" || rc.StepVersion != 2 {
+		t.Errorf("sound-alike params %v %v, version %s/%d", rc.Params["reject_held_issue_types"], rc.Params["soundalike_min_key"],
+			rc.PromptVersion, rc.StepVersion)
 	}
 	if !slices.Equal(rc.Params["apply_hold_reasons"].([]string), AudioApplyHoldReasons) {
 		t.Errorf("apply_hold_reasons %v", rc.Params["apply_hold_reasons"])
@@ -300,7 +421,7 @@ func (s *fakeAudioStore) LatestDecisions(_ context.Context, ids []string) (map[s
 const (
 	avT      = "00000000-0000-0000-0000-0000000000b1"
 	avApply  = "00000000-0000-0000-0000-0000000000c1" // auto sebo → Arecibo, both heard the replacement
-	avReject = "00000000-0000-0000-0000-0000000000c2" // picked → packed, both heard the original
+	avReject = "00000000-0000-0000-0000-0000000000c2" // picked → pickled, both heard the original (sound-different)
 	avSplit  = "00000000-0000-0000-0000-0000000000c3" // sat → sad, the models split
 	avR0     = "00000000-0000-0000-0000-0000000000c4" // dish → telescope: rung 0 rejects
 	avApply2 = "00000000-0000-0000-0000-0000000000c5" // the the → the, both heard the replacement (2nd accept)
@@ -315,7 +436,7 @@ func newAudioStore() *fakeAudioStore {
 	}
 	fs := []db.AudioVoteFinding{
 		held(avApply, IssueMisheardProperNoun, "auto sebo", "Arecibo", ReasonNoEvidence, pf(0.9)),
-		held(avReject, IssueMisheardWord, "picked", "packed", ReasonUncertain, pf(0.5)),
+		held(avReject, IssueMisheardWord, "picked", "pickled", ReasonUncertain, pf(0.5)),
 		held(avSplit, IssueMisheardWord, "sat", "sad", ReasonUncertain, pf(0.5)),
 		held(avR0, IssueMisheardWord, "dish", "telescope", ReasonJevUnavailable, nil),
 		held(avApply2, IssueRepeatedText, "the the cat", "the cat", ReasonUncertain, pf(0.6)),

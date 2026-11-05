@@ -25,7 +25,7 @@ import (
 const (
 	avIT1 = "00000000-0000-0000-0000-0000000000f1" // auto sebo → Arecibo: both heard the replacement → apply
 	avIT2 = "00000000-0000-0000-0000-0000000000f2" // dish → telescope: rung 0 rejects (not_soundalike)
-	avIT8 = "00000000-0000-0000-0000-0000000000f8" // picked → packed: both heard the original → reject
+	avIT8 = "00000000-0000-0000-0000-0000000000f8" // picked → pickled: both heard the original, sound-different → reject
 	avIT9 = "00000000-0000-0000-0000-0000000000f9" // sat → sad: one vote is on a stale chunk revision → hold
 	avITa = "00000000-0000-0000-0000-0000000000fa" // signal → single: both heard the replacement, over --max-accepts
 )
@@ -40,7 +40,7 @@ func seedAudioVote(t *testing.T, d *db.DB, conn *pgx.Conn) string {
 	hash := patch.ChunkHash(runText)
 	off := func(s string) int { return patch.Occurrences(runText, s)[0] }
 	for _, f := range []struct{ id, orig, repl string }{
-		{avIT8, "picked", "packed"}, {avIT9, "sat", "sad"}, {avITa, "signal", "single"},
+		{avIT8, "picked", "pickled"}, {avIT9, "sat", "sad"}, {avITa, "signal", "single"},
 	} {
 		if _, err := conn.Exec(ctx, `
 			INSERT INTO transcript_findings (id, transcript_id, file_path, chunk_index, start_sec, end_sec, original_text,
