@@ -11,7 +11,7 @@ import (
 // VoteRule names this vote procedure; it is recorded in every vote's detail
 // so a later decide recipe can tell votes of different rules apart. Bump it
 // on any change that can change a vote.
-const VoteRule = "asr_vote@v1"
+const VoteRule = "asr_vote@v2"
 
 // Votes (finding_asr_votes.vote).
 const (
@@ -146,9 +146,15 @@ type Detail struct {
 	Anchored string `json:"anchored,omitempty"`
 	// Aligned is the alignment around the span: [production, pilot] per
 	// column, "" for a gap; at most 40 columns.
-	Aligned        [][2]string `json:"aligned,omitempty"`
-	SimOriginal    *float64    `json:"sim_original,omitempty"`
-	SimReplacement *float64    `json:"sim_replacement,omitempty"`
+	Aligned [][2]string `json:"aligned,omitempty"`
+	// SimOriginal and SimReplacement are the similarities of the heard
+	// text to each reading, over Core when it is set.
+	SimOriginal    *float64 `json:"sim_original,omitempty"`
+	SimReplacement *float64 `json:"sim_replacement,omitempty"`
+	// Core is what was compared once the words the two readings and the
+	// heard text all share at their ends were stripped; nil when nothing
+	// was stripped.
+	Core *VoteCore `json:"core,omitempty"`
 	// VoteMethod is how the texts were compared: "normalized", or for a
 	// style-only correction "style_case_sensitive" (differs only in case or
 	// punctuation) / "style_variant" (a listed spelling variant: grey/gray,
@@ -159,6 +165,15 @@ type Detail struct {
 	// StyleVote is what a style_only vote heard: heard_replacement,
 	// heard_original or neither.
 	StyleVote string `json:"style_vote,omitempty"`
+}
+
+// VoteCore is the differing core of the two readings and of the heard text:
+// each normalised text without the leading and trailing words all three
+// share. An empty side is a pure insertion or deletion.
+type VoteCore struct {
+	Original    string `json:"original"`
+	Replacement string `json:"replacement"`
+	Heard       string `json:"heard"`
 }
 
 // Vote decides what the pilot heard at f's span:
@@ -177,6 +192,9 @@ type Detail struct {
 //  5. Compare the span's whole words, as production wrote them and with the
 //     correction substituted, normalised (or, for a case/punctuation-only
 //     correction and a cased pilot, case-sensitively) with what was heard.
+//     Short of an exact match, only the differing core is compared: the
+//     words the two readings and the heard text all share at their ends are
+//     stripped first, so shared words cannot inflate the similarity.
 //  6. Cap: a heard_* vote with no agreed word on either side, or on
 //     interpolated production times, is recorded as neither.
 //  7. A style-only correction's vote is recorded as style_only (what was
@@ -506,6 +524,15 @@ func alignedDetail(cols []Pair, a, b []Token) [][2]string {
 }
 
 // decideVote compares what was heard with the two readings.
+//
+// Exact (and space-insensitive) matches of the whole span decide first.
+// Otherwise the comparison runs on the differing core (sharedEnds): words the
+// two readings and the heard text all carry at their ends are dropped, since
+// they score for both readings and would let a heard third word one letter
+// from one reading win ("person would voluntarily" heard for "person
+// voluntarily" → "person could voluntarily"). A core empty on one side is a
+// pure insertion or deletion: no competing reading for the similarity margin
+// to beat, so only an exact match of the other core counts.
 func decideVote(heard []Token, original, replacement string, cased bool, d *Detail) string {
 	no, nr := Normalize(original), Normalize(replacement)
 	d.VoteMethod = "normalized"
@@ -538,7 +565,8 @@ func decideVote(heard []Token, original, replacement string, cased bool, d *Deta
 		d.StyleOnly, d.VoteMethod = true, "style_variant"
 	}
 
-	hn := strings.Join(norms(heard), " ")
+	wh := norms(heard)
+	hn := strings.Join(wh, " ")
 	if hn == "" {
 		d.Reason = "nothing_heard"
 		return VoteNeither
@@ -559,6 +587,20 @@ func decideVote(heard []Token, original, replacement string, cased bool, d *Deta
 			return VoteHeardOriginal
 		}
 	}
+
+	wo, wr := strings.Fields(no), strings.Fields(nr)
+	if pre, suf := sharedEnds(wo, wr, wh); pre+suf > 0 {
+		core := func(w []string) string { return strings.Join(w[pre:len(w)-suf], " ") }
+		kh, kr, ko := core(wh), core(wr), core(wo)
+		d.Core = &VoteCore{Original: ko, Replacement: kr, Heard: kh}
+		ch, cr, co = compact(kh), compact(kr), compact(ko)
+		if cr == "" || co == "" {
+			// A pure insertion or deletion. An empty heard core, or one
+			// equal to a reading's core, matched the whole span above.
+			d.Reason = "heard_other"
+			return VoteNeither
+		}
+	}
 	sr, so := Similarity(ch, cr), Similarity(ch, co)
 	d.SimReplacement, d.SimOriginal = &sr, &so
 	switch {
@@ -572,6 +614,20 @@ func decideVote(heard []Token, original, replacement string, cased bool, d *Deta
 		d.Reason = "heard_other"
 	}
 	return VoteNeither
+}
+
+// sharedEnds counts the leading (pre) and trailing (suf) words that all of
+// a, b and c carry, never overlapping within any of them.
+func sharedEnds(a, b, c []string) (pre, suf int) {
+	n := min(len(a), len(b), len(c))
+	for pre < n && a[pre] == b[pre] && a[pre] == c[pre] {
+		pre++
+	}
+	at := func(w []string, k int) string { return w[len(w)-1-k] }
+	for pre+suf < n && at(a, suf) == at(b, suf) && at(a, suf) == at(c, suf) {
+		suf++
+	}
+	return pre, suf
 }
 
 // spellingVariant reports whether two normalised texts differ only by

@@ -433,3 +433,61 @@ func TestVoteAlignTooDifferent(t *testing.T) {
 		t.Fatalf("got %s %q", got.Vote, got.Detail.Reason)
 	}
 }
+
+// TestDecideVoteDifferingCore: words the two readings share at their ends
+// must not inflate the similarity of a heard third word. Cases from the
+// 2026-11-04 dry run, plus pure insertions and deletions.
+func TestDecideVoteDifferingCore(t *testing.T) {
+	for _, tt := range []struct {
+		orig, repl, heard string
+		want, reason      string
+		core              *VoteCore
+	}{
+		// A heard third word a letter from the inserted one.
+		{"person voluntarily", "person could voluntarily", "person would voluntarily", VoteNeither, "heard_other",
+			&VoteCore{Original: "", Replacement: "could", Heard: "would"}},
+		// Correct votes from the same sample keep their verdicts.
+		{"bipheny", "biphenyl", "biphenyls,", VoteHeardReplacement, "", nil},
+		{"fair and gechter", "fehr and gächter", "Fehr and Gächter", VoteHeardReplacement, "", nil},
+		{"schwater", "Schweder", "Schwager", VoteHeardOriginal, "", nil},
+		{"writers", "riders", "riders", VoteHeardReplacement, "", nil},
+		{"writers", "riders", "writers", VoteHeardOriginal, "", nil},
+		{"denet", "dennett", "Then it", VoteNeither, "heard_other", nil},
+		{"muller liar illusions", "müller-lyer illusions", "Muller-Liar illusions.", VoteHeardOriginal, "", nil},
+		{"kaiser", "Keiser", "Kaiser", VoteHeardOriginal, "", nil},
+		// Pure insertion: heard the inserted word, nothing, or another word.
+		{"a b", "a x b", "a x b", VoteHeardReplacement, "", nil},
+		{"a b", "a x b", "a b", VoteHeardOriginal, "", nil},
+		{"the cat sat", "the black cat sat", "the block cat sat", VoteNeither, "heard_other",
+			&VoteCore{Original: "", Replacement: "black", Heard: "block"}},
+		// Pure deletion of an exact adjacent repeat.
+		{"the the cat", "the cat", "the cat", VoteHeardReplacement, "", nil},
+		{"the the cat", "the cat", "the the cat", VoteHeardOriginal, "", nil},
+		{"went to the the shop", "went to the shop", "went to the then shop", VoteNeither, "heard_other",
+			&VoteCore{Original: "the", Replacement: "", Heard: "then"}},
+		// A substitution inside shared words is decided on the core alone.
+		{"he said cot then", "he said cat then", "he said cats then", VoteNeither, "heard_other",
+			&VoteCore{Original: "cot", Replacement: "cat", Heard: "cats"}},
+		{"he said gechter then", "he said gächter then", "he said gechtor then", VoteHeardOriginal, "",
+			&VoteCore{Original: "gechter", Replacement: "gächter", Heard: "gechtor"}},
+	} {
+		t.Run(tt.orig+"→"+tt.repl+"/"+tt.heard, func(t *testing.T) {
+			heard := PilotTokens([]db.PilotSegment{untimedPilot(0, 1, tt.heard)})
+			var d Detail
+			got := decideVote(heard, tt.orig, tt.repl, true, &d)
+			if got != tt.want || d.Reason != tt.reason {
+				t.Errorf("vote %q (reason %q), want %q (%q); sims r=%v o=%v", got, d.Reason, tt.want, tt.reason, ptrVal(d.SimReplacement), ptrVal(d.SimOriginal))
+			}
+			if tt.core != nil && (d.Core == nil || *d.Core != *tt.core) {
+				t.Errorf("core %+v, want %+v", d.Core, *tt.core)
+			}
+		})
+	}
+}
+
+func ptrVal(p *float64) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}

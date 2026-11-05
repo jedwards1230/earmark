@@ -65,6 +65,12 @@ what the pilot heard at the finding's span (CONTRACT §1.11 "asr_vote"):
                      spelling variant (grey/gray); what was heard is in
                      detail.style_vote, counted apart in the report
 
+The heard words are compared with both readings normalised: an exact match
+(spaces ignored) decides; otherwise only the differing core is scored, the
+words both readings and the heard text share at their ends dropped, by
+similarity (1 - Levenshtein / max length, at least 0.8 and 0.1 ahead of the
+other reading). A pure insertion or deletion needs an exact match.
+
 A heard_* vote needs an agreed word next to the span on at least one side
 and word-timestamped production words; otherwise it is capped to neither.
 
