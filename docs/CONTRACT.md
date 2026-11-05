@@ -2095,7 +2095,7 @@ brings the hold back.
   upserts on `(finding_id, pilot_transcript_id)`.
 - The run is recorded in `step_runs` as `asr_vote` (§1.10).
 
-The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
+The vote rule is `asr_vote@v2` (`internal/asrpilot`), recorded in
 `detail.rule`:
 
 1. **Locate.** First check that `chunk_text_sha256` still matches the chunk's
@@ -2143,6 +2143,19 @@ The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
    - Otherwise the normalised similarity (1 − Levenshtein / max length) must
      reach 0.8 and lead the other reading by 0.1; if not, the vote is
      `neither`.
+   - When the original, the replacement and the heard text share leading or
+     trailing words, the same test is run again on the **differing core**
+     without them (`detail.core`, with its own similarities). Shared words
+     score for both readings, so left in they let a heard third word one
+     letter from one reading win ("person would voluntarily" heard for
+     "person voluntarily" → "person could voluntarily"). A `heard_*` vote
+     must pass both tests and vote the same way in each; otherwise it is
+     `neither`. The core test therefore only removes votes: scored alone,
+     its shorter texts would add some.
+   - A core empty on one side is a pure insertion or deletion. There is no
+     competing reading for a margin to beat, so anything short of an exact
+     match is `neither` (`heard_other`).
+   - `asr_vote@v1` ran only the whole-span test.
    - A case/punctuation-only correction is compared case-sensitively when the
      pilot writes case (≥ 1% of its words carry an uppercase letter). If it
      does not, the vote is `unmappable` (`case_only_uncased_pilot`).
@@ -2171,7 +2184,9 @@ The vote rule is `asr_vote@v1` (`internal/asrpilot`), recorded in
 
 `detail` also carries the window (`window_start`/`window_end`), the
 production span text, which sides were anchored, up to 40 aligned
-`[production, pilot]` columns and the two similarities.
+`[production, pilot]` columns, the two whole-span similarities and, when shared
+end words were dropped, the compared cores and their similarities
+(`core.original`, `core.replacement`, `core.heard`, `core.sim_*`).
 
 **`earmark asr-pilot report [--asin A,… | --book-dir D] [--format text|json]`**
 is read-only. It only counts tracks where both the production transcript and

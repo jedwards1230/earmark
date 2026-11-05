@@ -192,7 +192,7 @@ func TestVoteYesUpsertsPages(t *testing.T) {
 		t.Errorf("vote row %+v", v)
 	}
 	var d map[string]any
-	if err := json.Unmarshal(v.Detail, &d); err != nil || d["rule"] != "asr_vote@v1" || d["anchor"] != "unique" {
+	if err := json.Unmarshal(v.Detail, &d); err != nil || d["rule"] != "asr_vote@v2" || d["anchor"] != "unique" {
 		t.Errorf("detail %s (%v)", v.Detail, err)
 	}
 	if !strings.Contains(out.String(), "wrote 150 vote(s)") {
