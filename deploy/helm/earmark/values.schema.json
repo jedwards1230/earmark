@@ -387,6 +387,7 @@
         "enabled":   { "type": "boolean" },
         "imageName": { "type": "string", "minLength": 1 },
         "instances": { "type": "integer", "minimum": 1 },
+        "priorityClassName": { "type": "string" },
         "storage": {
           "type": "object",
           "required": ["size", "storageClass"],

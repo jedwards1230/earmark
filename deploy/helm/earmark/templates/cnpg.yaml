@@ -31,6 +31,9 @@ metadata:
     app.kubernetes.io/component: database
 spec:
   instances: {{ .Values.cnpg.instances }}
+  {{- with .Values.cnpg.priorityClassName }}
+  priorityClassName: {{ . | quote }}
+  {{- end }}
 
   # Standard image ships pgvector — verified via docker run (see comment above).
   # For CNPG 1.27 on PG16, this is the correct mechanism; do NOT use
