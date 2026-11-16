@@ -417,6 +417,12 @@ cnpg:
 
   instances: 1
 
+  # PriorityClass for the database pod. Empty = unset (cluster default, 0).
+  # Set it to a class at or above the app's tier, so the scheduler never evicts
+  # the single-instance primary to make room for something less important.
+  # The class must already exist: admission rejects pods that name a missing one.
+  priorityClassName: ""
+
   storage:
     size: 20Gi
     storageClass: nfs-databases
