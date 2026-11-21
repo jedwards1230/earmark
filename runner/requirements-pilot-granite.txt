@@ -46,7 +46,7 @@ pyyaml==6.0.3
 regex==2026.9.29
 rich==15.0.0
 safetensors==0.8.0
-setuptools==81.0.0
+setuptools==84.1.0
 shellingham==1.5.4
 soundfile==0.14.0
 sympy==1.14.0
